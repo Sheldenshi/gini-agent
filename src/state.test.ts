@@ -3,11 +3,10 @@ import { createEmptyState, createImprovementProposal, createMemory, createPromot
 
 describe("state primitives", () => {
   test("creates lane-aware task records", () => {
-    process.env.GINI_STATE_ROOT = "/tmp/gini-test-state";
     const task = createTask("sandbox", "remember useful context");
     expect(task.lane).toBe("sandbox");
     expect(task.status).toBe("queued");
-    expect(task.tracePath).toContain("/tmp/gini-test-state/sandbox/traces/");
+    expect(task.tracePath).toContain("/sandbox/traces/");
   });
 
   test("memory proposals are inspectable before activation", () => {

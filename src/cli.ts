@@ -509,6 +509,12 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
     await api(config, `/api/memory/${memory.id}/approve`, { method: "POST" });
     const job = await api(config, "/api/jobs", { method: "POST", body: JSON.stringify({ name: "smoke", intervalSeconds: 60, prompt: "smoke job task" }) });
     await api(config, `/api/jobs/${job.id}/run`, { method: "POST" });
+    const readTask = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "read README.md" }) });
+    await waitForTask(config, readTask.id);
+    const listTask = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "list src" }) });
+    await waitForTask(config, listTask.id);
+    const findTask = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "find Gini in README.md" }) });
+    await waitForTask(config, findTask.id);
     const proposal = await api(config, "/api/improvements", {
       method: "POST",
       body: JSON.stringify({
@@ -569,6 +575,9 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       taskId: task.id,
       approvedMemoryId: memory.id,
       jobId: job.id,
+      readTaskId: readTask.id,
+      listTaskId: listTask.id,
+      findTaskId: findTask.id,
       improvementId: proposal.id,
       pairedDeviceId: claimedDevice.device.id,
       mobileTaskCount: mobileState.tasks.length,

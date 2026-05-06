@@ -112,7 +112,7 @@ describe("runtime api", () => {
       method: "POST",
       body: JSON.stringify({ input: "remember Hermes parity should be searchable" })
     });
-    await Bun.sleep(30);
+    await waitForTask(handler, config, task.id);
 
     const search = await call(handler, config, "/api/search?q=Hermes");
     const toolsets = await call(handler, config, "/api/toolsets");
@@ -121,6 +121,7 @@ describe("runtime api", () => {
       method: "POST",
       body: JSON.stringify({ name: "reviewer", prompt: "review Hermes parity", parentTaskId: task.id, toolsets: ["memory"] })
     });
+    await waitForTask(handler, config, subagent.taskId);
     const mcp = await call(handler, config, "/api/mcp", {
       method: "POST",
       body: JSON.stringify({ name: "demo-mcp", command: "echo", args: ["ok"], exposedTools: ["demo.echo"] })
@@ -141,6 +142,36 @@ describe("runtime api", () => {
     expect(mcp.status).toBe("configured");
     expect(bridge.status).toBe("configured");
     expect(report.status).toBe("completed");
+  });
+
+  test("executes low-risk file tool tasks with trace and audit evidence", async () => {
+    const config = testConfig("file-tools");
+    config.workspaceRoot = process.cwd();
+    const handler = createHandler(config);
+
+    const read = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "read README.md" })
+    });
+    const readDetail = await waitForTask(handler, config, read.id);
+    const list = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "list src" })
+    });
+    const listDetail = await waitForTask(handler, config, list.id);
+    const find = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "find Gini in README.md" })
+    });
+    const findDetail = await waitForTask(handler, config, find.id);
+    const state = readState(config.lane);
+
+    expect(readDetail.task.status).toBe("completed");
+    expect(listDetail.task.summary).toContain("src/agent.ts");
+    expect(findDetail.task.summary).toContain("README.md");
+    expect(state.audit.some((event) => event.action === "file.read")).toBe(true);
+    expect(state.audit.some((event) => event.action === "file.list")).toBe(true);
+    expect(state.audit.some((event) => event.action === "file.search")).toBe(true);
   });
 });
 
@@ -184,4 +215,13 @@ function testConfig(lane: string): RuntimeConfig {
     stateRoot: `${root}/${lane}`,
     logRoot: `${root}-logs/${lane}`
   };
+}
+
+async function waitForTask(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, taskId: string) {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const detail = await call(handler, config, `/api/tasks/${taskId}`);
+    if (["completed", "failed", "waiting_approval"].includes(detail.task.status)) return detail;
+    await Bun.sleep(10);
+  }
+  throw new Error(`Task did not settle: ${taskId}`);
 }
