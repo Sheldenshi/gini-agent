@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gini Control Plane</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f7f8f5;
+        color: #17211b;
+      }
+      body { margin: 0; }
+      header {
+        display: flex; align-items: center; justify-content: space-between; gap: 16px;
+        padding: 18px 24px; border-bottom: 1px solid #d8ded2; background: #ffffff;
+      }
+      h1 { margin: 0; font-size: 22px; letter-spacing: 0; }
+      main { display: grid; grid-template-columns: 360px 1fr; min-height: calc(100vh - 70px); }
+      aside { border-right: 1px solid #d8ded2; padding: 16px; background: #fbfcf8; }
+      section { padding: 16px 20px; }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .stat { padding: 6px 9px; border: 1px solid #ced6c6; border-radius: 6px; background: #fff; font-size: 13px; }
+      input, textarea, button, select {
+        font: inherit; border: 1px solid #b9c2b1; border-radius: 6px; padding: 9px 10px; background: #fff; color: #17211b;
+      }
+      textarea { width: 100%; min-height: 86px; box-sizing: border-box; resize: vertical; }
+      button { cursor: pointer; background: #244832; color: #fff; border-color: #244832; }
+      button.secondary { background: #fff; color: #17211b; border-color: #b9c2b1; }
+      .list { display: grid; gap: 8px; margin-top: 14px; }
+      .item { border: 1px solid #d6ddd0; border-radius: 8px; padding: 10px; background: #fff; }
+      .item button { margin-top: 8px; }
+      .muted { color: #667160; font-size: 13px; }
+      .pill { display: inline-flex; padding: 3px 7px; border-radius: 999px; background: #e8efe2; font-size: 12px; }
+      pre { white-space: pre-wrap; overflow: auto; background: #111812; color: #eaf1e7; padding: 12px; border-radius: 8px; }
+      nav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+      nav button[aria-pressed="true"] { background: #244832; color: #fff; }
+      nav button { background: #fff; color: #17211b; }
+      @media (max-width: 850px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #d8ded2; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Gini</h1>
+      <div class="row">
+        <span class="stat">Lane __GINI_LANE__</span>
+        <span class="stat">Port __GINI_PORT__</span>
+        <span id="health" class="stat">Loading</span>
+      </div>
+    </header>
+    <main>
+      <aside>
+        <textarea id="taskInput" placeholder="Ask Gini to do something"></textarea>
+        <div class="row" style="margin-top:8px">
+          <button id="submitTask">Submit Task</button>
+          <button class="secondary" id="refresh">Refresh</button>
+        </div>
+        <div id="tasks" class="list"></div>
+      </aside>
+      <section>
+        <nav id="tabs"></nav>
+        <div id="panel"></div>
+      </section>
+    </main>
+    <script>
+      const token = "__GINI_TOKEN__";
+      const api = (path, options = {}) => fetch(path, {
+        ...options,
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}`, ...(options.headers || {}) }
+      }).then((res) => res.json());
+      let state = null;
+      let selectedTask = null;
+      let tab = "task";
+      const tabs = ["task", "approvals", "audit", "memory", "skills", "jobs", "connectors"];
+      document.getElementById("submitTask").onclick = async () => {
+        const input = document.getElementById("taskInput").value.trim();
+        if (!input) return;
+        await api("/api/tasks", { method: "POST", body: JSON.stringify({ input }) });
+        document.getElementById("taskInput").value = "";
+        await load();
+      };
+      document.getElementById("refresh").onclick = () => load();
+      async function load() {
+        state = await api("/api/state");
+        const status = await api("/api/status");
+        document.getElementById("health").textContent = `${status.pendingApprovals} approvals`;
+        renderTabs();
+        renderTasks();
+        renderPanel();
+      }
+      function renderTabs() {
+        document.getElementById("tabs").innerHTML = tabs.map((name) => `<button class="secondary" aria-pressed="${tab === name}" onclick="tab='${name}';renderPanel();renderTabs()">${name}</button>`).join("");
+      }
+      function renderTasks() {
+        document.getElementById("tasks").innerHTML = state.tasks.map((task) => `
+          <div class="item">
+            <div><strong>${escapeHtml(task.title)}</strong></div>
+            <span class="pill">${task.status}</span>
+            <div class="muted">${task.createdAt}</div>
+            <button class="secondary" onclick="selectedTask='${task.id}';tab='task';renderPanel();renderTabs()">Open</button>
+          </div>`).join("");
+      }
+      async function renderPanel() {
+        const panel = document.getElementById("panel");
+        if (tab === "task") {
+          const task = state.tasks.find((item) => item.id === selectedTask) || state.tasks[0];
+          if (!task) { panel.innerHTML = "<p>No tasks yet.</p>"; return; }
+          const detail = await api(`/api/tasks/${task.id}`);
+          panel.innerHTML = `<h2>${escapeHtml(task.title)}</h2><p><span class="pill">${task.status}</span></p><p>${escapeHtml(task.summary || task.currentStep || "")}</p><h3>Trace</h3><pre>${escapeHtml(JSON.stringify(detail.trace, null, 2))}</pre>`;
+          return;
+        }
+        if (tab === "approvals") {
+          panel.innerHTML = state.approvals.map((item) => `<div class="item"><strong>${item.action}</strong> <span class="pill">${item.status}</span><p>${escapeHtml(item.reason)}</p><p class="muted">${escapeHtml(item.target)}</p>${item.status === "pending" ? `<button onclick="approve('${item.id}')">Approve</button> <button class="secondary" onclick="deny('${item.id}')">Deny</button>` : ""}</div>`).join("") || "<p>No approvals.</p>";
+          return;
+        }
+        const key = tab === "connectors" ? "connectors" : tab;
+        panel.innerHTML = `<pre>${escapeHtml(JSON.stringify(state[key], null, 2))}</pre>`;
+      }
+      async function approve(id) { await api(`/api/approvals/${id}/approve`, { method: "POST" }); await load(); }
+      async function deny(id) { await api(`/api/approvals/${id}/deny`, { method: "POST" }); await load(); }
+      function escapeHtml(value) { return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char])); }
+      load();
+      setInterval(load, 2500);
+    </script>
+  </body>
+</html>

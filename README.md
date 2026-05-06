@@ -40,3 +40,95 @@ Gini Agent is the open source software layer people can install and use themselv
 The master plan lives at:
 
 `docs/master-plan.md`
+
+## v0 Developer Slice
+
+This repo now includes a Bun TypeScript v0 implementation of the local runtime trunk:
+
+- lane-aware CLI and runtime
+- authenticated localhost API
+- browser control plane served by the runtime
+- persistent tasks, traces, audit events, approvals, jobs, memories, skills, and demo connectors
+- approval-gated file writes and terminal commands
+- provider support with deterministic `echo`, Codex OAuth, and OpenAI API key modes
+- Hermes-inspired memory proposal flow and OpenClaw-inspired connector/skill scaffolding
+
+Run it locally:
+
+```bash
+bun run gini install
+bun run gini start
+bun run gini smoke
+```
+
+Open the control plane at the URL printed by `start`, usually:
+
+```text
+http://127.0.0.1:7337
+```
+
+Common commands:
+
+```bash
+bun run gini status
+bun run gini task submit "remember Gini should keep work inspectable"
+bun run gini approvals
+bun run gini memory list
+bun run gini job add heartbeat 60 "check runtime health"
+bun run gini connectors health
+bun run gini provider show
+```
+
+Use Codex OAuth as the model provider:
+
+```bash
+codex --login
+bun run gini provider set codex gpt-5.4
+bun run gini doctor
+```
+
+Gini reads existing Codex credentials from `CODEX_AUTH_JSON` or `~/.codex/auth.json` and does not write token values into Gini config.
+
+Use OpenAI API keys as a fallback:
+
+```bash
+export OPENAI_API_KEY=...
+bun run gini provider set openai gpt-5.4-mini
+bun run gini doctor
+```
+
+API keys are read from the environment and are not written to Gini config.
+
+Use lanes for isolated development:
+
+```bash
+bun run gini --lane sandbox reset
+bun run gini --lane sandbox start
+```
+
+Smoke tests are isolated by default:
+
+```bash
+bun run gini smoke
+```
+
+That creates an ephemeral `smoke-...` lane under `/tmp`, chooses a localhost port, runs through the real runtime/API, and stops that runtime afterward. Multiple coding agents can run smoke tests at the same time without sharing the `dev` lane.
+
+For a named persistent test lane, pass explicit roots and a port:
+
+```bash
+bun run gini smoke --lane codex-a --state-root /tmp/gini-codex-a --log-root /tmp/gini-codex-a-logs --port 7601
+```
+
+By default, Gini follows macOS user-level install conventions:
+
+```text
+~/Library/Application Support/Gini/<lane>/
+~/Library/Logs/Gini/<lane>/
+```
+
+For disposable development or tests, override those roots:
+
+```bash
+GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --lane sandbox smoke
+```

@@ -1,0 +1,20 @@
+{
+  "name": "gini-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "gini": "./src/cli.ts"
+  },
+  "scripts": {
+    "gini": "bun run src/cli.ts",
+    "runtime": "bun run src/runtime.ts",
+    "smoke": "bun run src/cli.ts smoke",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

@@ -484,6 +484,8 @@ Examples:
 
 These smoke tests should run locally and be runnable by coding agents. Some can run in CI; others may require a Mac host or a local simulator.
 
+Smoke tests must also be safe for concurrent coding-agent work. The default smoke path should allocate an isolated non-production lane, state root, log root, and localhost port when no lane is explicitly supplied. Named lanes are allowed for persistent harness work, but concurrent agents must not install, reset, or smoke-test against the same lane unless the test is intentionally exercising shared-lane contention.
+
 ### Orchestration model for coding agents
 
 Use a staged agent workflow:
@@ -588,6 +590,7 @@ New versions should move through a promotion path:
 
 3. Sandbox smoke tests
    - run required product flows
+   - use a unique lane/state root/port per concurrent coding agent
    - collect logs, traces, audit events, screenshots/snapshots where relevant
 
 4. Staged migration test
@@ -1685,6 +1688,7 @@ Quality bar:
 ### 6.10 Model/provider support
 
 Initial providers:
+- Codex OAuth using existing Codex CLI credentials, preferred for local user installs when available
 - OpenRouter or OpenAI-compatible endpoint
 - Anthropic/OpenAI direct optional
 - local Ollama/vLLM later
@@ -1692,7 +1696,7 @@ Initial providers:
 Requirements:
 - model switching
 - provider health
-- credential storage
+- credential discovery/storage that does not copy secrets into Gini config
 - cost tracking
 - model capability metadata
 
@@ -2525,6 +2529,7 @@ Includes:
 - basic runtime process
 - health/status/doctor
 - one model provider
+- Codex OAuth credential discovery or another real provider path
 - simple task execution
 - minimal structured logs
 - minimal trace per task
@@ -2533,6 +2538,7 @@ Success criteria:
 - runtime starts on macOS
 - CLI can start/stop/status/doctor
 - one provider can be configured
+- Codex OAuth provider can reuse an existing local Codex login without manual API key copy/paste
 - user can submit a simple task
 - task status and trace are persisted
 
@@ -2824,12 +2830,14 @@ Deliverables:
 - dev/sandbox lane support
 - reset/uninstall for selected lane
 - smoke test runner
+- ephemeral smoke lanes for concurrent coding agents
 - support/evidence bundle
 - isolation checks
 - harness run records
 
 Verification:
 - coding agent can run smoke tests against non-production lane
+- multiple coding agents can run smoke tests at the same time without sharing state, logs, or ports by default
 - reset affects only selected lane
 - evidence bundle links tests, logs, traces, audit, and runtime health
 - lane confusion is visible in doctor/status

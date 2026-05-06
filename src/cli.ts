@@ -1,0 +1,436 @@
+#!/usr/bin/env bun
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { spawn } from "node:child_process";
+import { configPath, loadConfig, parseLane, pidPath } from "./paths";
+import { install, resetLane, status } from "./http";
+import { normalizeProvider, providerHealth } from "./provider";
+import { readState, readTrace } from "./state";
+import type { RuntimeConfig } from "./types";
+
+const args = Bun.argv.slice(2);
+const cliArgs = stripGlobalArgs(args);
+const command = cliArgs[0] ?? "help";
+const ephemeralSmoke = command === "smoke" && !hasFlag(args, "--lane") && !process.env.GINI_LANE;
+applyGlobalEnvOverrides(args, ephemeralSmoke);
+const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
+const config = loadConfig(lane);
+
+async function main(): Promise<void> {
+  switch (command) {
+    case "install":
+      install(config);
+      print({ installed: true, lane: config.lane, stateRoot: config.stateRoot, port: config.port });
+      break;
+    case "start":
+      await start(config);
+      break;
+    case "stop":
+      stop(config);
+      break;
+    case "status":
+      print(await remoteOrLocalStatus(config));
+      break;
+    case "doctor":
+      print(await doctor(config));
+      break;
+    case "reset":
+      resetLane(config);
+      print({ reset: true, lane: config.lane, stateRoot: config.stateRoot });
+      break;
+    case "task":
+      await task(config);
+      break;
+    case "approval":
+    case "approvals":
+      await approval(config);
+      break;
+    case "memory":
+      await memory(config);
+      break;
+    case "skill":
+    case "skills":
+      await skill(config);
+      break;
+    case "job":
+    case "jobs":
+      await job(config);
+      break;
+    case "connector":
+    case "connectors":
+      await connector(config);
+      break;
+    case "provider":
+      provider(config);
+      break;
+    case "trace":
+      trace(config);
+      break;
+    case "audit":
+      print(readState(config.lane).audit);
+      break;
+    case "smoke":
+      await smoke(config, ephemeralSmoke);
+      break;
+    default:
+      help();
+  }
+}
+
+async function start(config: RuntimeConfig): Promise<boolean> {
+  if (await isRunning(config)) {
+    print({ running: true, url: url(config), lane: config.lane });
+    return false;
+  }
+  install(config);
+  config.port = await availablePort(config.port);
+  install(config);
+  const child = spawn(process.execPath, ["run", "src/runtime.ts", "--lane", config.lane], {
+    cwd: process.cwd(),
+    detached: true,
+    stdio: "ignore",
+    env: { ...process.env, GINI_LANE: config.lane, GINI_PORT: String(config.port) }
+  });
+  child.unref();
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (await isRunning(config)) {
+      print({ started: true, url: url(config), lane: config.lane });
+      return true;
+    }
+    await Bun.sleep(100);
+  }
+  throw new Error("Runtime did not become healthy within 5 seconds.");
+}
+
+async function availablePort(preferred: number): Promise<number> {
+  for (let port = preferred; port < preferred + 100; port += 1) {
+    if (await canListen(port)) return port;
+  }
+  throw new Error(`No available port found from ${preferred} to ${preferred + 99}.`);
+}
+
+function canListen(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = createServer()
+      .once("error", () => resolve(false))
+      .once("listening", () => server.close(() => resolve(true)))
+      .listen(port, "127.0.0.1");
+  });
+}
+
+function stop(config: RuntimeConfig): void {
+  const result = stopRuntime(config);
+  print(result);
+}
+
+function stopRuntime(config: RuntimeConfig) {
+  const path = pidPath(config.lane);
+  if (!existsSync(path)) {
+    return { stopped: false, reason: "No pid file", lane: config.lane };
+  }
+  const pid = Number(readFileSync(path, "utf8"));
+  try {
+    process.kill(pid, "SIGTERM");
+    rmSync(path, { force: true });
+    return { stopped: true, pid, lane: config.lane };
+  } catch (error) {
+    return { stopped: false, pid, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function task(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "submit") {
+    const input = restAfter(sub).join(" ").trim();
+    if (!input) throw new Error("Usage: gini task submit <prompt>");
+    print(await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input }) }));
+    return;
+  }
+  if (sub === "show") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini task show <task-id>");
+    print(await api(config, `/api/tasks/${id}`));
+    return;
+  }
+  print((await api(config, "/api/tasks")).map(compactTask));
+}
+
+async function approval(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "approve" || sub === "deny") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini approval ${sub} <approval-id>`);
+    print(await api(config, `/api/approvals/${id}/${sub === "approve" ? "approve" : "deny"}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/approvals"));
+}
+
+async function memory(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "add") {
+    const content = restAfter(sub).join(" ").trim();
+    if (!content) throw new Error("Usage: gini memory add <content>");
+    print(await api(config, "/api/memory", { method: "POST", body: JSON.stringify({ content, status: "active" }) }));
+    return;
+  }
+  if (sub === "approve" || sub === "reject") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini memory ${sub} <memory-id>`);
+    print(await api(config, `/api/memory/${id}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/memory"));
+}
+
+async function skill(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "add") {
+    const name = restAfter(sub)[0];
+    const description = restAfter(sub).slice(1).join(" ");
+    if (!name) throw new Error("Usage: gini skill add <name> [description]");
+    print(await api(config, "/api/skills", {
+      method: "POST",
+      body: JSON.stringify({ name, description, trigger: name, steps: [description || `Use ${name}`], status: "draft" })
+    }));
+    return;
+  }
+  if (sub === "validate") {
+    const state = readState(config.lane);
+    print({ valid: state.skills.every((item) => item.name && item.steps.length >= 0), count: state.skills.length });
+    return;
+  }
+  print(await api(config, "/api/skills"));
+}
+
+async function job(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "add") {
+    const [name, intervalRaw, ...promptParts] = restAfter(sub);
+    if (!name || !intervalRaw || promptParts.length === 0) throw new Error("Usage: gini job add <name> <interval-seconds> <prompt>");
+    print(await api(config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name, intervalSeconds: Number(intervalRaw), prompt: promptParts.join(" ") })
+    }));
+    return;
+  }
+  if (["run", "pause", "resume"].includes(sub)) {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini job ${sub} <job-id>`);
+    print(await api(config, `/api/jobs/${id}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/jobs"));
+}
+
+async function connector(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "health") {
+    const id = restAfter(sub)[0] ?? "conn_demo";
+    print(await api(config, `/api/connectors/${id}/health`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/connectors"));
+}
+
+function provider(config: RuntimeConfig): void {
+  const sub = cliArgs[1] ?? "show";
+  if (sub === "set") {
+    const name = restAfter(sub)[0];
+    const model = restAfter(sub)[1];
+    if (name !== "echo" && name !== "openai" && name !== "codex") {
+      throw new Error("Usage: gini provider set echo|openai|codex [model]");
+    }
+    config.provider = normalizeProvider({
+      name,
+      model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.4" : "gpt-5.4-mini")
+    });
+    writeFileSync(configPath(config.lane), `${JSON.stringify(config, null, 2)}\n`);
+    print({ updated: true, provider: providerHealth(config), configPath: configPath(config.lane) });
+    return;
+  }
+  print(providerHealth(config));
+}
+
+function trace(config: RuntimeConfig): void {
+  const id = restAfter(command)[0];
+  if (!id) throw new Error("Usage: gini trace <task-id>");
+  print(readTrace(config.lane, id));
+}
+
+async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
+  const started = await start(config);
+  try {
+    const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "remember Gini v0 prefers seamless Hermes-style continuity" }) });
+    await waitForTask(config, task.id);
+    const state = await api(config, "/api/state");
+    const memory = state.memories.find((item: { status: string }) => item.status === "proposed");
+    if (!memory) throw new Error("Smoke failed: no memory proposal created.");
+    await api(config, `/api/memory/${memory.id}/approve`, { method: "POST" });
+    const job = await api(config, "/api/jobs", { method: "POST", body: JSON.stringify({ name: "smoke", intervalSeconds: 60, prompt: "smoke job task" }) });
+    await api(config, `/api/jobs/${job.id}/run`, { method: "POST" });
+    const connectorHealth = await api(config, "/api/connectors/conn_demo/health", { method: "POST" });
+    const finalState = await api(config, "/api/state");
+    print({
+      ok: true,
+      lane: config.lane,
+      ephemeral,
+      stateRoot: config.stateRoot,
+      logRoot: config.logRoot,
+      port: config.port,
+      taskId: task.id,
+      approvedMemoryId: memory.id,
+      jobId: job.id,
+      connectorHealth: connectorHealth.health,
+      traces: finalState.tasks.length,
+      auditEvents: finalState.audit.length
+    });
+  } finally {
+    if (ephemeral && started) {
+      stopRuntime(config);
+    }
+  }
+}
+
+async function waitForTask(config: RuntimeConfig, taskId: string): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const detail = await api(config, `/api/tasks/${taskId}`);
+    if (["completed", "failed", "waiting_approval"].includes(detail.task.status)) return;
+    await Bun.sleep(100);
+  }
+  throw new Error(`Task did not settle: ${taskId}`);
+}
+
+async function doctor(config: RuntimeConfig) {
+  const running = await isRunning(config);
+  const state = readState(config.lane);
+  return {
+    ok: true,
+    bun: Bun.version,
+    lane: config.lane,
+    running,
+    stateRoot: config.stateRoot,
+    port: config.port,
+    tokenConfigured: Boolean(config.token),
+    provider: providerHealth(config),
+    tasks: state.tasks.length,
+    pendingApprovals: state.approvals.filter((item) => item.status === "pending").length,
+    recommendations: running ? [] : ["Run `bun run gini start` to launch the local runtime."]
+  };
+}
+
+async function remoteOrLocalStatus(config: RuntimeConfig) {
+  try {
+    return await api(config, "/api/status");
+  } catch {
+    return { ...status(config), ok: false, running: false };
+  }
+}
+
+async function isRunning(config: RuntimeConfig): Promise<boolean> {
+  try {
+    const response = await fetch(`${url(config)}/api/status`, { headers: auth(config) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function api(config: RuntimeConfig, path: string, options: RequestInit = {}) {
+  const response = await fetch(`${url(config)}${path}`, {
+    ...options,
+    headers: { "content-type": "application/json", ...auth(config), ...(options.headers ?? {}) }
+  });
+  const value = await response.json();
+  if (!response.ok) throw new Error(value.error ?? `HTTP ${response.status}`);
+  return value;
+}
+
+function auth(config: RuntimeConfig): Record<string, string> {
+  return { authorization: `Bearer ${config.token}` };
+}
+
+function url(config: RuntimeConfig): string {
+  return `http://127.0.0.1:${config.port}`;
+}
+
+function restAfter(marker: string): string[] {
+  const index = cliArgs.indexOf(marker);
+  return index >= 0 ? cliArgs.slice(index + 1) : [];
+}
+
+function stripGlobalArgs(values: string[]): string[] {
+  const stripped: string[] = [];
+  for (let index = 0; index < values.length; index += 1) {
+    if (["--lane", "--state-root", "--log-root", "--port"].includes(values[index] ?? "")) {
+      index += 1;
+      continue;
+    }
+    stripped.push(values[index]);
+  }
+  return stripped;
+}
+
+function applyGlobalEnvOverrides(values: string[], ephemeral: boolean): void {
+  const stateRoot = flagValue(values, "--state-root");
+  const logRoot = flagValue(values, "--log-root");
+  const port = flagValue(values, "--port");
+  if (stateRoot) process.env.GINI_STATE_ROOT = stateRoot;
+  if (logRoot) process.env.GINI_LOG_ROOT = logRoot;
+  if (port) process.env.GINI_PORT = port;
+  if (ephemeral) {
+    process.env.GINI_STATE_ROOT ??= `/tmp/gini-smoke-${process.pid}`;
+    process.env.GINI_LOG_ROOT ??= `/tmp/gini-smoke-${process.pid}-logs`;
+    process.env.GINI_PORT ??= String(7400 + Math.floor(Math.random() * 1000));
+  }
+}
+
+function flagValue(values: string[], flag: string): string | undefined {
+  const index = values.indexOf(flag);
+  return index >= 0 ? values[index + 1] : undefined;
+}
+
+function hasFlag(values: string[], flag: string): boolean {
+  return values.includes(flag);
+}
+
+function compactTask(task: { id: string; status: string; title: string; updatedAt: string }) {
+  return { id: task.id, status: task.status, title: task.title, updatedAt: task.updatedAt };
+}
+
+function print(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+function help(): void {
+  console.log(`Gini CLI
+
+Usage:
+  bun run gini install [--lane dev]
+  bun run gini start|stop|status|doctor|reset [--lane dev] [--port 7337]
+  bun run gini task submit <prompt>
+  bun run gini task list
+  bun run gini task show <task-id>
+  bun run gini approvals
+  bun run gini approval approve|deny <approval-id>
+  bun run gini memory list|add|approve|reject
+  bun run gini skills list|add|validate
+  bun run gini jobs list|add|run|pause|resume
+  bun run gini connectors list|health
+  bun run gini provider show|set echo|openai|codex [model]
+  bun run gini trace <task-id>
+  bun run gini audit
+  bun run gini smoke
+
+Global options:
+  --lane <name>        Select a persistent lane. Smoke uses an ephemeral lane when omitted.
+  --state-root <path>  Override state root for tests or parallel agents.
+  --log-root <path>    Override log root for tests or parallel agents.
+  --port <number>      Preferred localhost port. Start scans upward if busy.
+`);
+}
+
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
