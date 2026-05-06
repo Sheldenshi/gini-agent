@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { createServer } from "node:net";
 import { spawn } from "node:child_process";
 import { configPath, loadConfig, parseLane, pidPath } from "./paths";
@@ -60,6 +61,10 @@ async function main(): Promise<void> {
     case "connectors":
       await connector(config);
       break;
+    case "improvement":
+    case "improvements":
+      await improvement(config);
+      break;
     case "provider":
       provider(config);
       break;
@@ -68,6 +73,9 @@ async function main(): Promise<void> {
       break;
     case "audit":
       print(readState(config.lane).audit);
+      break;
+    case "evidence":
+      evidence(config);
       break;
     case "smoke":
       await smoke(config, ephemeralSmoke);
@@ -233,6 +241,33 @@ async function connector(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/connectors"));
 }
 
+async function improvement(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "propose") {
+    const [kind, title, sourceTaskId, ...contentParts] = restAfter(sub);
+    if (!kind || !title) throw new Error("Usage: gini improvement propose memory|skill|job <title> [source-task-id] [content]");
+    const content = contentParts.join(" ").trim() || title;
+    print(await api(config, "/api/improvements", {
+      method: "POST",
+      body: JSON.stringify({
+        kind,
+        title,
+        sourceTaskId,
+        rationale: sourceTaskId ? `Proposed from trace evidence for ${sourceTaskId}` : "Proposed by user",
+        payload: improvementPayload(kind, title, content)
+      })
+    }));
+    return;
+  }
+  if (sub === "approve" || sub === "reject") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini improvement ${sub} <proposal-id>`);
+    print(await api(config, `/api/improvements/${id}/${sub}`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/improvements"));
+}
+
 function provider(config: RuntimeConfig): void {
   const sub = cliArgs[1] ?? "show";
   if (sub === "set") {
@@ -258,6 +293,35 @@ function trace(config: RuntimeConfig): void {
   print(readTrace(config.lane, id));
 }
 
+function evidence(config: RuntimeConfig): void {
+  print(createEvidenceBundle(config));
+}
+
+function createEvidenceBundle(config: RuntimeConfig) {
+  const state = readState(config.lane);
+  const taskIds = state.tasks.map((task) => task.id);
+  const traces = Object.fromEntries(taskIds.map((taskId) => [taskId, readTrace(config.lane, taskId)]));
+  const bundle = {
+    createdAt: new Date().toISOString(),
+    lane: config.lane,
+    config: {
+      port: config.port,
+      stateRoot: config.stateRoot,
+      logRoot: config.logRoot,
+      workspaceRoot: config.workspaceRoot,
+      provider: providerHealth(config)
+    },
+    status: status(config),
+    state,
+    traces
+  };
+  const outDir = join(config.stateRoot, "evidence");
+  mkdirSync(outDir, { recursive: true });
+  const outPath = join(outDir, `bundle-${Date.now()}.json`);
+  writeFileSync(outPath, `${JSON.stringify(bundle, null, 2)}\n`);
+  return { ok: true, path: outPath, taskCount: taskIds.length, auditEvents: state.audit.length, improvements: state.improvements.length };
+}
+
 async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
   const started = await start(config);
   try {
@@ -269,8 +333,20 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
     await api(config, `/api/memory/${memory.id}/approve`, { method: "POST" });
     const job = await api(config, "/api/jobs", { method: "POST", body: JSON.stringify({ name: "smoke", intervalSeconds: 60, prompt: "smoke job task" }) });
     await api(config, `/api/jobs/${job.id}/run`, { method: "POST" });
+    const proposal = await api(config, "/api/improvements", {
+      method: "POST",
+      body: JSON.stringify({
+        kind: "skill",
+        title: "smoke-review",
+        sourceTaskId: task.id,
+        rationale: "Smoke validates trace-backed governed improvement proposals.",
+        payload: { name: "smoke-review", description: "Review smoke traces", trigger: "smoke", steps: ["Inspect task trace", "Summarize evidence"] }
+      })
+    });
+    await api(config, `/api/improvements/${proposal.id}/approve`, { method: "POST" });
     const connectorHealth = await api(config, "/api/connectors/conn_demo/health", { method: "POST" });
     const finalState = await api(config, "/api/state");
+    const bundle = createEvidenceBundle(config);
     print({
       ok: true,
       lane: config.lane,
@@ -281,15 +357,27 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       taskId: task.id,
       approvedMemoryId: memory.id,
       jobId: job.id,
+      improvementId: proposal.id,
       connectorHealth: connectorHealth.health,
       traces: finalState.tasks.length,
-      auditEvents: finalState.audit.length
+      auditEvents: finalState.audit.length,
+      evidencePath: bundle.path
     });
   } finally {
     if (ephemeral && started) {
       stopRuntime(config);
     }
   }
+}
+
+function improvementPayload(kind: string, title: string, content: string): Record<string, unknown> {
+  if (kind === "skill") {
+    return { name: title, description: content, trigger: title, steps: [content], status: "draft" };
+  }
+  if (kind === "job") {
+    return { name: title, prompt: content, intervalSeconds: 3600 };
+  }
+  return { content, scope: "project", confidence: 0.75 };
 }
 
 async function waitForTask(config: RuntimeConfig, taskId: string): Promise<void> {
@@ -417,9 +505,11 @@ Usage:
   bun run gini skills list|add|validate
   bun run gini jobs list|add|run|pause|resume
   bun run gini connectors list|health
+  bun run gini improvements list|propose|approve|reject
   bun run gini provider show|set echo|openai|codex [model]
   bun run gini trace <task-id>
   bun run gini audit
+  bun run gini evidence
   bun run gini smoke
 
 Global options:

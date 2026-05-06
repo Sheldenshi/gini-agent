@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createEmptyState, createMemory, createTask, taskCounts } from "./state";
+import { createEmptyState, createImprovementProposal, createMemory, createTask, taskCounts } from "./state";
 
 describe("state primitives", () => {
   test("creates lane-aware task records", () => {
@@ -22,6 +22,20 @@ describe("state primitives", () => {
     });
     expect(memory.status).toBe("proposed");
     expect(state.memories[0]?.id).toBe(memory.id);
+  });
+
+  test("improvement proposals are governed before application", () => {
+    const state = createEmptyState("sandbox");
+    const proposal = createImprovementProposal(state, {
+      kind: "skill",
+      title: "Add review skill",
+      rationale: "Trace showed repeated review steps.",
+      sourceTraceIds: ["trace_a"],
+      payload: { name: "review", steps: ["Inspect trace"] }
+    });
+    expect(proposal.status).toBe("proposed");
+    expect(state.improvements[0]?.id).toBe(proposal.id);
+    expect(state.audit[0]?.action).toBe("improvement.proposed");
   });
 
   test("task counts include all statuses", () => {

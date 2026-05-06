@@ -4,6 +4,7 @@ import type {
   Approval,
   AuditEvent,
   ConnectorRecord,
+  ImprovementProposal,
   JobRecord,
   Lane,
   MemoryRecord,
@@ -47,7 +48,8 @@ export function createEmptyState(lane: Lane): RuntimeState {
         updatedAt: at,
         health: "unknown"
       }
-    ]
+    ],
+    improvements: []
   };
 }
 
@@ -59,7 +61,8 @@ export function readState(lane: Lane): RuntimeState {
     writeState(lane, state);
     return state;
   }
-  return JSON.parse(readFileSync(path, "utf8")) as RuntimeState;
+  const state = JSON.parse(readFileSync(path, "utf8")) as RuntimeState;
+  return normalizeState(lane, state);
 }
 
 export function writeState(lane: Lane, state: RuntimeState): void {
@@ -232,6 +235,31 @@ export function createJob(state: RuntimeState, job: Omit<JobRecord, "id" | "lane
   return item;
 }
 
+export function createImprovementProposal(
+  state: RuntimeState,
+  proposal: Omit<ImprovementProposal, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+): ImprovementProposal {
+  const at = now();
+  const item: ImprovementProposal = {
+    id: id("impr"),
+    lane: state.lane,
+    status: "proposed",
+    createdAt: at,
+    updatedAt: at,
+    ...proposal
+  };
+  state.improvements.unshift(item);
+  addAudit(state, {
+    actor: "agent",
+    action: "improvement.proposed",
+    target: item.id,
+    risk: "medium",
+    taskId: item.sourceTaskId,
+    evidence: { kind: item.kind, sourceTraceIds: item.sourceTraceIds }
+  });
+  return item;
+}
+
 export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
   connector.lastHealthAt = now();
   connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
@@ -248,4 +276,17 @@ export function assertInsideWorkspace(workspaceRoot: string, targetPath: string)
     throw new Error(`Path is outside workspace: ${targetPath}`);
   }
   return target;
+}
+
+function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
+  state.lane = lane;
+  state.improvements ??= [];
+  state.connectors ??= [];
+  state.tasks ??= [];
+  state.approvals ??= [];
+  state.audit ??= [];
+  state.memories ??= [];
+  state.skills ??= [];
+  state.jobs ??= [];
+  return state;
 }

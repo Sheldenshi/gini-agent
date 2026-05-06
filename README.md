@@ -51,6 +51,8 @@ This repo now includes a Bun TypeScript v0 implementation of the local runtime t
 - persistent tasks, traces, audit events, approvals, jobs, memories, skills, and demo connectors
 - approval-gated file writes and terminal commands
 - provider support with deterministic `echo`, Codex OAuth, and OpenAI API key modes
+- trace-backed improvement proposals for memory, skill, and job changes
+- evidence bundles for smoke/reviewer agents
 - Hermes-inspired memory proposal flow and OpenClaw-inspired connector/skill scaffolding
 
 Run it locally:
@@ -76,6 +78,9 @@ bun run gini approvals
 bun run gini memory list
 bun run gini job add heartbeat 60 "check runtime health"
 bun run gini connectors health
+bun run gini improvement propose skill review-traces "" "Inspect trace evidence before proposing changes"
+bun run gini improvements
+bun run gini evidence
 bun run gini provider show
 ```
 

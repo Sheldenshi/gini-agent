@@ -72,7 +72,7 @@
       let state = null;
       let selectedTask = null;
       let tab = "task";
-      const tabs = ["task", "approvals", "audit", "memory", "skills", "jobs", "connectors"];
+      const tabs = ["task", "approvals", "audit", "memory", "skills", "jobs", "connectors", "improvements"];
       document.getElementById("submitTask").onclick = async () => {
         const input = document.getElementById("taskInput").value.trim();
         if (!input) return;
@@ -114,11 +114,17 @@
           panel.innerHTML = state.approvals.map((item) => `<div class="item"><strong>${item.action}</strong> <span class="pill">${item.status}</span><p>${escapeHtml(item.reason)}</p><p class="muted">${escapeHtml(item.target)}</p>${item.status === "pending" ? `<button onclick="approve('${item.id}')">Approve</button> <button class="secondary" onclick="deny('${item.id}')">Deny</button>` : ""}</div>`).join("") || "<p>No approvals.</p>";
           return;
         }
+        if (tab === "improvements") {
+          panel.innerHTML = state.improvements.map((item) => `<div class="item"><strong>${escapeHtml(item.title)}</strong> <span class="pill">${item.status}</span><p>${escapeHtml(item.rationale)}</p><p class="muted">${escapeHtml(item.kind)} ${escapeHtml(item.sourceTaskId || "")}</p>${item.status === "proposed" ? `<button onclick="approveImprovement('${item.id}')">Approve</button> <button class="secondary" onclick="rejectImprovement('${item.id}')">Reject</button>` : ""}<pre>${escapeHtml(JSON.stringify(item.payload, null, 2))}</pre></div>`).join("") || "<p>No improvement proposals.</p>";
+          return;
+        }
         const key = tab === "connectors" ? "connectors" : tab;
         panel.innerHTML = `<pre>${escapeHtml(JSON.stringify(state[key], null, 2))}</pre>`;
       }
       async function approve(id) { await api(`/api/approvals/${id}/approve`, { method: "POST" }); await load(); }
       async function deny(id) { await api(`/api/approvals/${id}/deny`, { method: "POST" }); await load(); }
+      async function approveImprovement(id) { await api(`/api/improvements/${id}/approve`, { method: "POST" }); await load(); }
+      async function rejectImprovement(id) { await api(`/api/improvements/${id}/reject`, { method: "POST" }); await load(); }
       function escapeHtml(value) { return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[char])); }
       load();
       setInterval(load, 2500);

@@ -14,6 +14,10 @@ export type JobStatus = "active" | "paused" | "failed";
 
 export type ProviderName = "echo" | "openai" | "codex";
 
+export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
+
+export type ImprovementKind = "memory" | "skill" | "job";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -43,6 +47,7 @@ export interface RuntimeState {
   skills: SkillRecord[];
   jobs: JobRecord[];
   connectors: ConnectorRecord[];
+  improvements: ImprovementProposal[];
 }
 
 export interface Task {
@@ -163,6 +168,21 @@ export interface ConnectorRecord {
   lastHealthAt?: string;
   health: "unknown" | "healthy" | "unhealthy";
   message?: string;
+}
+
+export interface ImprovementProposal {
+  id: string;
+  lane: Lane;
+  kind: ImprovementKind;
+  status: ImprovementStatus;
+  title: string;
+  rationale: string;
+  sourceTaskId?: string;
+  sourceTraceIds: string[];
+  payload: Record<string, unknown>;
+  appliedTargetId?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface RuntimeStatus {
