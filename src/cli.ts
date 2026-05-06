@@ -105,6 +105,14 @@ async function main(): Promise<void> {
     case "parity":
       await parity(config);
       break;
+    case "relay":
+    case "relays":
+      await relay(config);
+      break;
+    case "notification":
+    case "notifications":
+      await notification(config);
+      break;
     case "promotion":
     case "promotions":
       await promotion(config);
@@ -457,6 +465,45 @@ async function parity(config: RuntimeConfig): Promise<void> {
   print(await api(config, "/api/parity/hermes"));
 }
 
+async function relay(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "add") {
+    const [name = "local", endpoint = "local://localhost", mode = "local-only"] = restAfter(sub);
+    print(await api(config, "/api/relays", { method: "POST", body: JSON.stringify({ name, endpoint, mode }) }));
+    return;
+  }
+  if (sub === "health") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini relay health <relay-id-or-name>");
+    print(await api(config, `/api/relays/${encodeURIComponent(id)}/health`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/relays"));
+}
+
+async function notification(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "queue") {
+    const [kind = "runtime", target = "local", ...bodyParts] = restAfter(sub);
+    print(await api(config, "/api/notifications", {
+      method: "POST",
+      body: JSON.stringify({ kind, target, title: `Gini ${kind}`, body: bodyParts.join(" ") })
+    }));
+    return;
+  }
+  if (sub === "send") {
+    print(await api(config, "/api/notifications/send", { method: "POST" }));
+    return;
+  }
+  if (sub === "ack") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini notification ack <notification-id>");
+    print(await api(config, `/api/notifications/${id}/ack`, { method: "POST" }));
+    return;
+  }
+  print(await api(config, "/api/notifications"));
+}
+
 async function promotion(config: RuntimeConfig): Promise<void> {
   const sub = cliArgs[1] ?? "list";
   if (sub === "propose") {
@@ -592,6 +639,16 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
     });
     await api(config, `/api/profiles/${profileResult.id}/use`, { method: "POST" });
     const parityResult = await api(config, "/api/parity/hermes");
+    const relayResult = await api(config, "/api/relays", {
+      method: "POST",
+      body: JSON.stringify({ name: "smoke-relay", endpoint: "local://smoke", mode: "local-only" })
+    });
+    await api(config, `/api/relays/${relayResult.id}/health`, { method: "POST" });
+    const notificationResult = await api(config, "/api/notifications", {
+      method: "POST",
+      body: JSON.stringify({ kind: "runtime", target: "local", title: "Smoke notification", body: "Smoke notification delivery" })
+    });
+    await api(config, "/api/notifications/send", { method: "POST" });
     const snapshotResult = createSnapshot(config, "Smoke rollback baseline");
     const promotionResult = await api(config, "/api/promotions", {
       method: "POST",
@@ -627,6 +684,8 @@ async function smoke(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
       importReportId: importResult.id,
       profileId: profileResult.id,
       parityOk: parityResult.ok,
+      relayId: relayResult.id,
+      notificationId: notificationResult.id,
       snapshotId: snapshotResult.snapshotId,
       promotionId: promotionResult.id,
       connectorHealth: connectorHealth.health,
@@ -802,6 +861,8 @@ Usage:
   bun run gini import inspect hermes|openclaw <path>
   bun run gini profiles list|create|use
   bun run gini parity hermes
+  bun run gini relays list|add|health
+  bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
   bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]

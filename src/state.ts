@@ -16,6 +16,7 @@ import type {
   PairingCode,
   PairingStatus,
   ProfileRecord,
+  RelayRecord,
   PromotionProposal,
   RuntimeState,
   SkillRecord,
@@ -24,7 +25,8 @@ import type {
   Task,
   ToolRecord,
   ToolsetRecord,
-  TraceRecord
+  TraceRecord,
+  NotificationRecord
 } from "./types";
 import { ensureDir, laneRoot, logDir, statePath, traceDir } from "./paths";
 
@@ -74,7 +76,9 @@ export function createEmptyState(lane: Lane): RuntimeState {
     messagingBridges: [],
     importReports: [],
     profiles: [defaultProfile(lane, at)],
-    activeProfileId: "profile_default"
+    activeProfileId: "profile_default",
+    relays: [],
+    notifications: []
   };
 }
 
@@ -546,6 +550,49 @@ export function createProfileRecord(
   return item;
 }
 
+export function createRelayRecord(state: RuntimeState, relay: Omit<RelayRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">): RelayRecord {
+  const at = now();
+  const item: RelayRecord = {
+    id: id("relay"),
+    lane: state.lane,
+    status: "configured",
+    createdAt: at,
+    updatedAt: at,
+    ...relay
+  };
+  state.relays.unshift(item);
+  addAudit(state, {
+    actor: "user",
+    action: "relay.configured",
+    target: item.id,
+    risk: "medium",
+    evidence: { mode: item.mode, endpoint: item.endpoint }
+  });
+  return item;
+}
+
+export function createNotificationRecord(state: RuntimeState, notification: Omit<NotificationRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt">): NotificationRecord {
+  const at = now();
+  const item: NotificationRecord = {
+    id: id("notify"),
+    lane: state.lane,
+    status: "queued",
+    createdAt: at,
+    updatedAt: at,
+    ...notification
+  };
+  state.notifications.unshift(item);
+  addAudit(state, {
+    actor: "runtime",
+    action: "notification.queued",
+    target: item.id,
+    risk: "low",
+    taskId: item.taskId,
+    evidence: { kind: item.kind, target: item.target }
+  });
+  return item;
+}
+
 export function activateProfile(state: RuntimeState, idOrName: string): ProfileRecord {
   const profile = state.profiles.find((item) => item.id === idOrName || item.name === idOrName);
   if (!profile) throw new Error(`Profile not found: ${idOrName}`);
@@ -602,6 +649,8 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.importReports ??= [];
   state.profiles ??= [defaultProfile(lane, now())];
   state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;
+  state.relays ??= [];
+  state.notifications ??= [];
   expirePairingCodes(state);
   return state;
 }

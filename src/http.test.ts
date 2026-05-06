@@ -191,6 +191,26 @@ describe("runtime api", () => {
     expect(parity.ok).toBe(true);
     expect(parity.checks.some((item: { id: string; status: string }) => item.id === "profiles" && item.status === "pass")).toBe(true);
   });
+
+  test("supports relay degraded health and notification delivery records", async () => {
+    const config = testConfig("relay-notifications");
+    const handler = createHandler(config);
+
+    const relay = await call(handler, config, "/api/relays", {
+      method: "POST",
+      body: JSON.stringify({ name: "local", endpoint: "local://test", mode: "local-only" })
+    });
+    const health = await call(handler, config, `/api/relays/${relay.id}/health`, { method: "POST" });
+    const notification = await call(handler, config, "/api/notifications", {
+      method: "POST",
+      body: JSON.stringify({ kind: "runtime", target: "local", title: "Runtime check", body: "Relay test" })
+    });
+    const sent = await call(handler, config, "/api/notifications/send", { method: "POST" });
+
+    expect(health.status).toBe("degraded");
+    expect(notification.status).toBe("queued");
+    expect(sent.some((item: { id: string; status: string }) => item.id === notification.id && item.status === "sent")).toBe(true);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

@@ -26,6 +26,7 @@ import { inspectImportSource } from "./domain/importers";
 import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./domain/profiles";
 import { hermesParityChecks } from "./domain/parity";
+import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./domain/relay";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -104,6 +105,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/profiles$/, async (request) => json(createProfile(config, await body(request)), 201)],
     ["POST", /^\/api\/profiles\/([^/]+)\/use$/, (_request, params) => json(useProfile(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
+    ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
+    ["POST", /^\/api\/relays$/, async (request) => json(configureRelay(config, await body(request)), 201)],
+    ["POST", /^\/api\/relays\/([^/]+)\/health$/, (_request, params) => json(checkRelay(config, params[0]))],
+    ["GET", /^\/api\/notifications$/, () => json(readState(config.lane).notifications)],
+    ["POST", /^\/api\/notifications$/, async (request) => json(queueNotification(config, await body(request)), 201)],
+    ["POST", /^\/api\/notifications\/send$/, () => json(sendQueuedNotifications(config))],
+    ["POST", /^\/api\/notifications\/([^/]+)\/ack$/, (_request, params) => json(acknowledgeNotification(config, params[0]))],
     ["GET", /^\/api\/imports$/, () => json(readState(config.lane).importReports)],
     ["POST", /^\/api\/imports\/inspect$/, async (request) => {
       const input = await body(request);

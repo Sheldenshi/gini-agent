@@ -18,7 +18,8 @@ export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks
     check("messaging", "Messaging bridge", true, [`${state.messagingBridges.length} bridge records`, "add/health/disable APIs"], "partial"),
     check("profiles", "Config/profile equivalent", true, state.profiles.map((item) => `${item.name}:${item.status}`), state.profiles.length > 0 ? "pass" : "missing"),
     check("migration", "Hermes/OpenClaw import basics", true, [`${state.importReports.length} import inspection reports`], "partial"),
-    check("mobile", "Mobile/remote control structure", true, [`${state.devices.length} paired devices`, "mobile bootstrap contract"], "partial")
+    check("mobile", "Mobile/remote control structure", true, [`${state.devices.length} paired devices`, "mobile bootstrap contract"], "partial"),
+    check("relay", "Remote relay and notifications", true, [`${state.relays.length} relay records`, `${state.notifications.length} notifications`], state.relays.length > 0 || state.notifications.length > 0 ? "partial" : "partial")
   ];
   return { ok: checks.every((item) => item.status !== "missing"), checks };
 }

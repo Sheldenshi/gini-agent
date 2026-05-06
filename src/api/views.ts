@@ -23,7 +23,9 @@ export function mobileBootstrap(config: RuntimeConfig) {
     messagingBridges: state.messagingBridges,
     importReports: state.importReports,
     profiles: state.profiles,
-    activeProfileId: state.activeProfileId
+    activeProfileId: state.activeProfileId,
+    relays: state.relays,
+    notifications: state.notifications
   };
 }
 

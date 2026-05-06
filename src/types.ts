@@ -38,6 +38,10 @@ export type ImportSource = "hermes" | "openclaw";
 
 export type ProfileStatus = "active" | "inactive";
 
+export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
+
+export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -80,6 +84,8 @@ export interface RuntimeState {
   importReports: ImportReport[];
   profiles: ProfileRecord[];
   activeProfileId?: string;
+  relays: RelayRecord[];
+  notifications: NotificationRecord[];
 }
 
 export interface Task {
@@ -239,6 +245,34 @@ export interface ParityCheck {
   status: "pass" | "partial" | "missing";
   evidence: string[];
   requiredForV1: boolean;
+}
+
+export interface RelayRecord {
+  id: string;
+  lane: Lane;
+  name: string;
+  endpoint: string;
+  status: RelayStatus;
+  mode: "local-only" | "lan" | "hosted";
+  createdAt: string;
+  updatedAt: string;
+  lastHealthAt?: string;
+  message?: string;
+}
+
+export interface NotificationRecord {
+  id: string;
+  lane: Lane;
+  kind: "approval" | "job" | "task" | "runtime" | "promotion";
+  title: string;
+  body: string;
+  status: NotificationStatus;
+  target: string;
+  taskId?: string;
+  createdAt: string;
+  updatedAt: string;
+  sentAt?: string;
+  error?: string;
 }
 
 export interface AuditEvent {
