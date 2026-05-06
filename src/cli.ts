@@ -288,6 +288,18 @@ async function memory(config: RuntimeConfig): Promise<void> {
     print(await api(config, `/api/memory/${id}/${sub}`, { method: "POST" }));
     return;
   }
+  if (sub === "edit") {
+    const [id, ...contentParts] = restAfter(sub);
+    if (!id || contentParts.length === 0) throw new Error("Usage: gini memory edit <memory-id> <content>");
+    print(await api(config, `/api/memory/${id}`, { method: "PATCH", body: JSON.stringify({ content: contentParts.join(" ") }) }));
+    return;
+  }
+  if (sub === "archive" || sub === "delete") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini memory ${sub} <memory-id>`);
+    print(await api(config, `/api/memory/${id}`, { method: "DELETE" }));
+    return;
+  }
   print(await api(config, "/api/memory"));
 }
 

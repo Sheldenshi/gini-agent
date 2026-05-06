@@ -352,7 +352,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable";
   target: string;
   risk: RiskLevel;
   reason: string;

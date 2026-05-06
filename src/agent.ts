@@ -91,6 +91,9 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   if (lower.startsWith("write ")) {
     return requestFileWrite(config, task);
   }
+  if (lower.startsWith("patch ")) {
+    return requestFilePatch(config, task);
+  }
   if (lower.startsWith("read ")) {
     return readFile(config, task);
   }
@@ -200,6 +203,34 @@ function requestFileWrite(config: RuntimeConfig, task: Task): Task {
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for file write", data: { approvalId: approval.id, target } });
+    return item;
+  });
+}
+
+function requestFilePatch(config: RuntimeConfig, task: Task): Task {
+  const match = task.input.match(/^patch\s+(.+?)\s*::\s*([\s\S]+?)\s*=>\s*([\s\S]+)$/i);
+  if (!match) throw new Error("Use: patch <relative-path> :: <old-text> => <new-text>");
+  const [, target, oldText, newText] = match;
+  const path = assertInsideWorkspace(config.workspaceRoot, target);
+  if (!existsSync(path)) throw new Error(`Cannot patch missing file: ${target}`);
+  const before = readFileSync(path, "utf8");
+  if (!before.includes(oldText)) throw new Error(`Patch target text not found in ${target}`);
+  const after = before.replace(oldText, newText);
+  return mutateState(config.lane, (state) => {
+    const item = findTask(state, task.id);
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "file.patch",
+      target,
+      risk: "high",
+      reason: "File patches are side effects and require explicit approval.",
+      payload: { path: target, oldText, newText, diff: simpleDiff(oldText, newText), beforeBytes: before.length, afterBytes: after.length }
+    });
+    item.status = "waiting_approval";
+    item.currentStep = "Waiting for approval";
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for file patch", data: { approvalId: approval.id, target, diff: approval.payload.diff } });
     return item;
   });
 }
@@ -408,6 +439,30 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     return;
   }
 
+  if (approval.action === "file.patch") {
+    const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
+    const before = readFileSync(target, "utf8");
+    const oldText = String(approval.payload.oldText);
+    const newText = String(approval.payload.newText);
+    if (!before.includes(oldText)) throw new Error(`Patch target text no longer exists: ${approval.payload.path}`);
+    const after = before.replace(oldText, newText);
+    writeFileSync(target, after);
+    mutateState(config.lane, (state) => {
+      addAudit(state, {
+        actor: "runtime",
+        action: "file.patch",
+        target: String(approval.payload.path),
+        risk: "high",
+        taskId: approval.taskId,
+        approvalId: approval.id,
+        evidence: { diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
+      });
+      if (approval.taskId) completeApprovedTask(state, approval.taskId, "File patch completed.");
+    });
+    if (approval.taskId) appendTrace(config.lane, approval.taskId, { type: "tool", message: "File patched", data: { path: approval.payload.path, diff: approval.payload.diff } });
+    return;
+  }
+
   if (approval.action === "terminal.exec") {
     const command = String(approval.payload.command);
     const proc = spawn(["zsh", "-lc", command], {
@@ -433,6 +488,10 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     });
     if (approval.taskId) appendTrace(config.lane, approval.taskId, { type: "tool", message: "Command executed", data: { command, exitCode } });
   }
+}
+
+function simpleDiff(oldText: string, newText: string): string {
+  return [`--- before`, `+++ after`, ...oldText.split(/\r?\n/).map((line) => `-${line}`), ...newText.split(/\r?\n/).map((line) => `+${line}`)].join("\n");
 }
 
 function completeApprovedTask(state: RuntimeState, taskId: string, summary: string, error?: string): void {

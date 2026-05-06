@@ -7,7 +7,7 @@ import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./api/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
-import { createMemoryFromInput, updateMemory } from "./domain/memory";
+import { archiveMemory, createMemoryFromInput, editMemory, updateMemory } from "./domain/memory";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
 import { proposePromotion, reviewPromotion } from "./domain/promotions";
@@ -58,6 +58,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(createMemoryFromInput(config, await body(request)), 201);
     }],
+    ["PATCH", /^\/api\/memory\/([^/]+)$/, async (request, params) => json(editMemory(config, params[0], await body(request)))],
+    ["DELETE", /^\/api\/memory\/([^/]+)$/, (_request, params) => json(archiveMemory(config, params[0]))],
     ["POST", /^\/api\/memory\/([^/]+)\/approve$/, (_request, params) => json(updateMemory(config, params[0], "active"))],
     ["POST", /^\/api\/memory\/([^/]+)\/reject$/, (_request, params) => json(updateMemory(config, params[0], "rejected"))],
     ["GET", /^\/api\/skills$/, (request) => {

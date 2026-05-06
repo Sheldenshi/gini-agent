@@ -308,6 +308,36 @@ describe("runtime api", () => {
     expect(detail.messages).toHaveLength(2);
     expect(detail.taskIds).toContain(submitted.taskId);
   });
+
+  test("supports memory edit/archive and approval-gated file patch diffs", async () => {
+    const config = testConfig("memory-patch");
+    config.workspaceRoot = process.cwd();
+    const handler = createHandler(config);
+
+    const memory = await call(handler, config, "/api/memory", {
+      method: "POST",
+      body: JSON.stringify({ content: "original memory", scope: "user", status: "active" })
+    });
+    const edited = await call(handler, config, `/api/memory/${memory.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ content: "edited memory", scope: "temporary" })
+    });
+    const archived = await call(handler, config, `/api/memory/${memory.id}`, { method: "DELETE" });
+
+    const task = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "patch README.md :: Gini => Gini" })
+    });
+    const detail = await waitForTask(handler, config, task.id);
+    const approval = readState(config.lane).approvals.find((item) => item.taskId === task.id);
+
+    expect(edited.content).toBe("edited memory");
+    expect(edited.scope).toBe("temporary");
+    expect(archived.status).toBe("archived");
+    expect(detail.task.status).toBe("waiting_approval");
+    expect(approval?.action).toBe("file.patch");
+    expect(String(approval?.payload.diff)).toContain("--- before");
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
@@ -337,8 +367,8 @@ async function rawCall(handler: ReturnType<typeof createHandler>, config: Runtim
 }
 
 function testConfig(lane: string): RuntimeConfig {
-  const root = `/tmp/gini-http-test-${lane}`;
-  rmSync(root, { recursive: true, force: true });
+  const root = "/tmp/gini-http-tests";
+  rmSync(`${root}/${lane}`, { recursive: true, force: true });
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
   return {
