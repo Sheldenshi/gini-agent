@@ -45,6 +45,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
     ["GET", /^\/api\/audit$/, () => json(readState(config.lane).audit)],
     ["GET", /^\/api\/events$/, () => json(readState(config.lane).events)],
+    ["GET", /^\/api\/events\/stream$/, () => eventStream(config)],
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(createMemoryFromInput(config, await body(request)), 201);
@@ -166,6 +167,39 @@ function authorized(request: Request, config: RuntimeConfig): boolean {
 
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
+}
+
+function eventStream(config: RuntimeConfig): Response {
+  let closed = false;
+  let interval: Timer | undefined;
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    start(controller) {
+      const seen = new Set<string>();
+      const send = () => {
+        if (closed) return;
+        const events = readState(config.lane).events.slice().reverse();
+        for (const event of events) {
+          if (seen.has(event.id)) continue;
+          controller.enqueue(encoder.encode(`id: ${event.id}\nevent: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`));
+          seen.add(event.id);
+        }
+      };
+      send();
+      interval = setInterval(send, 1000);
+    },
+    cancel() {
+      closed = true;
+      if (interval) clearInterval(interval);
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive"
+    }
+  });
 }
 
 function webApp(config: RuntimeConfig): Response {

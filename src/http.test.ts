@@ -266,6 +266,25 @@ describe("runtime api", () => {
     expect(invoked.ok).toBe(true);
     expect(invoked.stdout).toContain("ok");
   });
+
+  test("exposes recorded runtime events as an SSE stream", async () => {
+    const config = testConfig("events-stream");
+    const handler = createHandler(config);
+
+    await call(handler, config, "/api/improvements", {
+      method: "POST",
+      body: JSON.stringify({ kind: "memory", title: "event-test", payload: { content: "events are observable" } })
+    });
+    const response = await rawCall(handler, config, "/api/events/stream", {}, config.token);
+    const reader = response.body?.getReader();
+    const chunk = await reader?.read();
+    await reader?.cancel();
+    const text = new TextDecoder().decode(chunk?.value);
+
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    expect(text).toContain("data:");
+    expect(text).toContain("event_");
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
