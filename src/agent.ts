@@ -34,6 +34,44 @@ export function submitTask(config: RuntimeConfig, input: string, jobId?: string,
   return created;
 }
 
+export function retryTask(config: RuntimeConfig, taskId: string): Task {
+  const task = mutateState(config.lane, (state) => {
+    const existing = findTask(state, taskId);
+    const retry = createTask(config.lane, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId);
+    upsertTask(state, retry);
+    addAudit(state, {
+      actor: "user",
+      action: "task.retry",
+      target: retry.id,
+      risk: "low",
+      taskId: retry.id,
+      evidence: { retriedTaskId: taskId }
+    });
+    return retry;
+  });
+  runTask(config, task.id).catch((error) => failTask(config, task.id, error));
+  return task;
+}
+
+export function cancelTask(config: RuntimeConfig, taskId: string): Task {
+  return mutateState(config.lane, (state) => {
+    const task = findTask(state, taskId);
+    if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") return task;
+    task.status = "cancelled";
+    task.currentStep = "Cancelled";
+    task.updatedAt = now();
+    addAudit(state, {
+      actor: "user",
+      action: "task.cancelled",
+      target: taskId,
+      risk: "low",
+      taskId
+    });
+    upsertTask(state, task);
+    return task;
+  });
+}
+
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
   let task = mutateState(config.lane, (state) => {
     const item = findTask(state, taskId);

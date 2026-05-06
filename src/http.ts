@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeConfig } from "./types";
-import { decideApproval, submitTask } from "./agent";
+import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./api/views";
@@ -23,6 +23,7 @@ import { createProfile, listProfiles, useProfile } from "./domain/profiles";
 import { hermesParityChecks } from "./domain/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./domain/relay";
 import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./domain/skills";
+import { createChat, getChatSession, listChatSessions, submitChatMessage, syncChatTaskResult } from "./domain/chat";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -31,6 +32,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
+    ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
+    ["POST", /^\/api\/chat$/, async (request) => json(createChat(config, await body(request)), 201)],
+    ["GET", /^\/api\/chat\/([^/]+)$/, (_request, params) => json(getChatSession(config, params[0]))],
+    ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(submitChatMessage(config, params[0], await body(request)), 201)],
+    ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, (_request, params) => json(syncChatTaskResult(config, params[0], params[1]))],
     ["GET", /^\/api\/tasks$/, () => json(readState(config.lane).tasks)],
     ["POST", /^\/api\/tasks$/, async (request) => json(submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
@@ -40,6 +46,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!task) return json({ error: "Task not found" }, 404);
       return json({ task, trace: readTrace(config.lane, task.id) });
     }],
+    ["POST", /^\/api\/tasks\/([^/]+)\/retry$/, (_request, params) => json(retryTask(config, params[0]))],
+    ["POST", /^\/api\/tasks\/([^/]+)\/cancel$/, (_request, params) => json(cancelTask(config, params[0]))],
     ["GET", /^\/api\/approvals$/, () => json(readState(config.lane).approvals)],
     ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],

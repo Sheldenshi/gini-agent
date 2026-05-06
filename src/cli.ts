@@ -42,6 +42,9 @@ async function main(): Promise<void> {
     case "task":
       await task(config);
       break;
+    case "chat":
+      await chat(config);
+      break;
     case "approval":
     case "approvals":
       await approval(config);
@@ -220,7 +223,44 @@ async function task(config: RuntimeConfig): Promise<void> {
     print(await api(config, `/api/tasks/${id}`));
     return;
   }
+  if (sub === "retry" || sub === "cancel") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error(`Usage: gini task ${sub} <task-id>`);
+    print(await api(config, `/api/tasks/${id}/${sub}`, { method: "POST" }));
+    return;
+  }
   print((await api(config, "/api/tasks")).map(compactTask));
+}
+
+async function chat(config: RuntimeConfig): Promise<void> {
+  const sub = cliArgs[1] ?? "list";
+  if (sub === "new") {
+    const title = restAfter(sub).join(" ").trim() || "New chat";
+    print(await api(config, "/api/chat", { method: "POST", body: JSON.stringify({ title }) }));
+    return;
+  }
+  if (sub === "send") {
+    const [sessionId, ...contentParts] = restAfter(sub);
+    if (!sessionId || contentParts.length === 0) throw new Error("Usage: gini chat send <session-id> <message>");
+    print(await api(config, `/api/chat/${sessionId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: contentParts.join(" ") })
+    }));
+    return;
+  }
+  if (sub === "sync") {
+    const [sessionId, taskId] = restAfter(sub);
+    if (!sessionId || !taskId) throw new Error("Usage: gini chat sync <session-id> <task-id>");
+    print(await api(config, `/api/chat/${sessionId}/tasks/${taskId}/sync`, { method: "POST" }));
+    return;
+  }
+  if (sub === "show") {
+    const id = restAfter(sub)[0];
+    if (!id) throw new Error("Usage: gini chat show <session-id>");
+    print(await api(config, `/api/chat/${id}`));
+    return;
+  }
+  print(await api(config, "/api/chat"));
 }
 
 async function approval(config: RuntimeConfig): Promise<void> {

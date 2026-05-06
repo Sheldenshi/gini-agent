@@ -57,6 +57,8 @@ export type RuntimeEventKind =
 
 export type JobRunStatus = "running" | "completed" | "failed";
 
+export type ChatMessageRole = "user" | "assistant" | "system";
+
 export interface ProviderConfig {
   name: ProviderName;
   model: string;
@@ -103,6 +105,8 @@ export interface RuntimeState {
   notifications: NotificationRecord[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
+  chatSessions: ChatSessionRecord[];
+  chatMessages: ChatMessageRecord[];
 }
 
 export interface Task {
@@ -139,6 +143,27 @@ export interface RuntimeEvent {
   risk: RiskLevel;
   summary: string;
   data?: Record<string, unknown>;
+}
+
+export interface ChatSessionRecord {
+  id: string;
+  lane: Lane;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageIds: string[];
+  taskIds: string[];
+  summary?: string;
+}
+
+export interface ChatMessageRecord {
+  id: string;
+  lane: Lane;
+  sessionId: string;
+  role: ChatMessageRole;
+  content: string;
+  createdAt: string;
+  taskId?: string;
 }
 
 export interface TraceRecord {

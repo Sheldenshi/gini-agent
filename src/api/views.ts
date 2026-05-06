@@ -27,7 +27,9 @@ export function mobileBootstrap(config: RuntimeConfig) {
     relays: state.relays,
     notifications: state.notifications,
     events: state.events,
-    jobRuns: state.jobRuns
+    jobRuns: state.jobRuns,
+    chatSessions: state.chatSessions,
+    chatMessages: state.chatMessages
   };
 }
 

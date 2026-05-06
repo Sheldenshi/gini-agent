@@ -3,6 +3,8 @@ import { join, relative, resolve } from "node:path";
 import type {
   Approval,
   AuditEvent,
+  ChatMessageRecord,
+  ChatSessionRecord,
   ConnectorRecord,
   DeviceStatus,
   ImportReport,
@@ -82,7 +84,9 @@ export function createEmptyState(lane: Lane): RuntimeState {
     relays: [],
     notifications: [],
     events: [],
-    jobRuns: []
+    jobRuns: [],
+    chatSessions: [],
+    chatMessages: []
   };
 }
 
@@ -222,6 +226,49 @@ export function createTask(lane: Lane, input: string, jobId?: string, parentTask
     parentTaskId,
     subagentId
   };
+}
+
+export function createChatSession(state: RuntimeState, title: string): ChatSessionRecord {
+  const at = now();
+  const session: ChatSessionRecord = {
+    id: id("chat"),
+    lane: state.lane,
+    title: title.slice(0, 80) || "Untitled chat",
+    createdAt: at,
+    updatedAt: at,
+    messageIds: [],
+    taskIds: []
+  };
+  state.chatSessions.unshift(session);
+  appendEvent(state, {
+    kind: "task",
+    action: "chat.session.created",
+    target: session.id,
+    risk: "low",
+    summary: `Chat session created: ${session.title}`
+  });
+  return session;
+}
+
+export function createChatMessage(
+  state: RuntimeState,
+  message: Omit<ChatMessageRecord, "id" | "lane" | "createdAt">
+): ChatMessageRecord {
+  const item: ChatMessageRecord = {
+    id: id("msg"),
+    lane: state.lane,
+    createdAt: now(),
+    ...message
+  };
+  state.chatMessages.push(item);
+  const session = state.chatSessions.find((candidate) => candidate.id === item.sessionId);
+  if (session) {
+    session.messageIds.push(item.id);
+    if (item.taskId && !session.taskIds.includes(item.taskId)) session.taskIds.push(item.taskId);
+    session.updatedAt = item.createdAt;
+    if (item.role === "assistant") session.summary = item.content.slice(0, 240);
+  }
+  return item;
 }
 
 export function createApproval(state: RuntimeState, approval: Omit<Approval, "id" | "lane" | "status" | "createdAt" | "updatedAt">): Approval {
@@ -711,6 +758,8 @@ function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.notifications ??= [];
   state.events ??= [];
   state.jobRuns ??= [];
+  state.chatSessions ??= [];
+  state.chatMessages ??= [];
   for (const skill of state.skills) {
     skill.tests ??= [];
     skill.successCount ??= 0;

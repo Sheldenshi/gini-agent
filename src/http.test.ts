@@ -285,6 +285,29 @@ describe("runtime api", () => {
     expect(text).toContain("data:");
     expect(text).toContain("event_");
   });
+
+  test("supports local chat sessions backed by task execution and retry contracts", async () => {
+    const config = testConfig("chat");
+    const handler = createHandler(config);
+
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "Hermes-style chat" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "remember chat history works" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+    const assistant = await call(handler, config, `/api/chat/${session.id}/tasks/${submitted.taskId}/sync`, { method: "POST" });
+    const retry = await call(handler, config, `/api/tasks/${submitted.taskId}/retry`, { method: "POST" });
+    const detail = await call(handler, config, `/api/chat/${session.id}`);
+
+    expect(assistant.role).toBe("assistant");
+    expect(retry.input).toContain("remember chat history works");
+    expect(detail.messages).toHaveLength(2);
+    expect(detail.taskIds).toContain(submitted.taskId);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
