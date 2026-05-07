@@ -68,7 +68,7 @@ export default function ChatPage() {
                 onChange={(event) => setTitle(event.target.value)}
                 placeholder="Title"
               />
-              <Button size="sm" disabled={create.isPending} onClick={() => create.mutate(title)}>
+              <Button size="sm" disabled={!title.trim() || create.isPending} onClick={() => create.mutate(title.trim())}>
                 Create
               </Button>
             </CardContent>
@@ -104,8 +104,8 @@ export default function ChatPage() {
           ) : session.data ? (
             <>
               <CardHeader className="border-b border-border">
-                <CardTitle className="text-sm">{session.data.session.title}</CardTitle>
-                <CardDescription className="font-mono text-[11px]">{session.data.session.id}</CardDescription>
+                <CardTitle className="text-sm">{session.data.title}</CardTitle>
+                <CardDescription className="font-mono text-[11px]">{session.data.id}</CardDescription>
               </CardHeader>
               <ScrollArea className="flex-1 p-4">
                 {session.data.messages.length === 0 ? (

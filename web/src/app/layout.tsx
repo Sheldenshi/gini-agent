@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/providers";
-import { Sidebar } from "@/components/Sidebar";
+import { MobileTopBar, Sidebar } from "@/components/Sidebar";
 import { runtimeLane } from "@/lib/runtime";
 
 export const dynamic = "force-dynamic";
@@ -23,7 +23,10 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
         <Providers>
           <div className="flex h-screen">
             <Sidebar lane={lane} />
-            <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
+            <div className="flex flex-1 flex-col overflow-hidden">
+              <MobileTopBar lane={lane} />
+              <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
+            </div>
           </div>
         </Providers>
       </body>

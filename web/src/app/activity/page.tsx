@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -8,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { useAudit, useEvents, useInvalidate } from "@/lib/queries";
+import { useRuntimeStream } from "@/lib/useRuntimeStream";
 
 export default function ActivityPage() {
   const audit = useAudit();
@@ -16,15 +17,10 @@ export default function ActivityPage() {
   const [search, setSearch] = useState("");
   const [liveCount, setLiveCount] = useState(0);
 
-  useEffect(() => {
-    const source = new EventSource("/api/runtime/events/stream");
-    source.onmessage = () => {
-      setLiveCount((value) => value + 1);
-      invalidate(["events", "audit", "state", "tasks"]);
-    };
-    source.onerror = () => source.close();
-    return () => source.close();
-  }, [invalidate]);
+  useRuntimeStream(useCallback(() => {
+    setLiveCount((value) => value + 1);
+    invalidate(["events", "audit", "state", "tasks", "approvals", "jobs", "memory", "skills"]);
+  }, [invalidate]));
 
   const filteredAudit = useMemo(
     () => (audit.data ?? []).filter((event) => !search || JSON.stringify(event).toLowerCase().includes(search.toLowerCase())).slice().reverse(),

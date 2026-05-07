@@ -19,6 +19,7 @@ export default function MemoryPage() {
   const memories = useMemories();
   const [scope, setScope] = useState<typeof SCOPES[number]>("all");
   const [content, setContent] = useState("");
+  const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null);
   const invalidate = useInvalidate();
 
   const create = useMutation({
@@ -41,6 +42,17 @@ export default function MemoryPage() {
   const archive = useMutation({
     mutationFn: (id: string) => api<MemoryRecord>(`/memory/${id}`, { method: "DELETE" }),
     onSuccess: () => invalidate(["memory", "state"])
+  });
+
+  const edit = useMutation({
+    mutationFn: ({ id, content }: { id: string; content: string }) =>
+      api<MemoryRecord>(`/memory/${id}`, { method: "PATCH", body: JSON.stringify({ content }) }),
+    onSuccess: () => {
+      setEditing(null);
+      toast.success("Memory updated");
+      invalidate(["memory", "state", "audit"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
   });
 
   const filtered = (memories.data ?? []).filter((m) => scope === "all" || m.scope === scope);
@@ -86,20 +98,51 @@ export default function MemoryPage() {
                         <CardDescription className="font-mono text-[11px]">{memory.id}</CardDescription>
                       </CardHeader>
                       <CardContent className="space-y-2">
-                        <p className="text-sm">{memory.content}</p>
+                        {editing?.id === memory.id ? (
+                          <div className="space-y-2">
+                            <Textarea
+                              value={editing.draft}
+                              onChange={(event) => setEditing({ id: memory.id, draft: event.target.value })}
+                              className="min-h-20"
+                            />
+                            <div className="flex gap-2">
+                              <Button
+                                size="sm"
+                                disabled={!editing.draft.trim() || edit.isPending}
+                                onClick={() => edit.mutate({ id: memory.id, content: editing.draft.trim() })}
+                              >
+                                {edit.isPending ? "Saving…" : "Save"}
+                              </Button>
+                              <Button size="sm" variant="outline" disabled={edit.isPending} onClick={() => setEditing(null)}>
+                                Cancel
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-sm">{memory.content}</p>
+                        )}
                         <p className="font-mono text-[10px] text-muted-foreground">
                           conf {memory.confidence.toFixed(2)} · {memory.provenance}
                           {memory.lastUsedAt ? ` · last used ${new Date(memory.lastUsedAt).toLocaleString()}` : ""}
                           {memory.sourceTaskId ? ` · task ${memory.sourceTaskId}` : ""}
                         </p>
-                        {memory.status === "proposed" ? (
-                          <div className="flex gap-2">
-                            <Button size="sm" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "approve" })}>Approve</Button>
-                            <Button size="sm" variant="outline" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "reject" })}>Reject</Button>
+                        {editing?.id !== memory.id ? (
+                          <div className="flex flex-wrap gap-2">
+                            {memory.status === "proposed" ? (
+                              <>
+                                <Button size="sm" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "approve" })}>Approve</Button>
+                                <Button size="sm" variant="outline" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "reject" })}>Reject</Button>
+                              </>
+                            ) : null}
+                            {memory.status !== "archived" && memory.status !== "rejected" ? (
+                              <Button size="sm" variant="outline" onClick={() => setEditing({ id: memory.id, draft: memory.content })}>
+                                Edit
+                              </Button>
+                            ) : null}
+                            {memory.status === "active" ? (
+                              <Button size="sm" variant="outline" disabled={archive.isPending} onClick={() => archive.mutate(memory.id)}>Archive</Button>
+                            ) : null}
                           </div>
-                        ) : null}
-                        {memory.status === "active" ? (
-                          <Button size="sm" variant="outline" disabled={archive.isPending} onClick={() => archive.mutate(memory.id)}>Archive</Button>
                         ) : null}
                       </CardContent>
                     </Card>

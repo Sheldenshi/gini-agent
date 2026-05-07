@@ -70,10 +70,11 @@ export function useMemories() {
   });
 }
 
-export function useSkills() {
+export function useSkills(query?: string) {
+  const trimmed = query?.trim() ?? "";
   return useQuery<SkillRecord[]>({
-    queryKey: ["skills"],
-    queryFn: () => api<SkillRecord[]>("/skills"),
+    queryKey: ["skills", trimmed],
+    queryFn: () => api<SkillRecord[]>(trimmed ? `/skills?q=${encodeURIComponent(trimmed)}` : "/skills"),
     refetchInterval: 5000
   });
 }
@@ -134,10 +135,12 @@ export function useChatSessions() {
   });
 }
 
+export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
+
 export function useChatSession(id: string | null) {
-  return useQuery<{ session: ChatSession; messages: ChatMessage[]; taskIds: string[] }>({
+  return useQuery<ChatSessionDetail>({
     queryKey: ["chat", id],
-    queryFn: () => api<{ session: ChatSession; messages: ChatMessage[]; taskIds: string[] }>(`/chat/${id}`),
+    queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
     enabled: Boolean(id),
     refetchInterval: 3000
   });

@@ -16,6 +16,7 @@ export interface ProxyOptions {
   runtimeUrl: string;
   token: string;
   fetcher?: typeof fetch;
+  signal?: AbortSignal;
 }
 
 export async function proxyRequest(
@@ -28,6 +29,8 @@ export async function proxyRequest(
   const headers = pickForwardHeaders(request.headers);
   headers.set("authorization", `Bearer ${options.token}`);
   const init: RequestInit = { method: request.method, headers };
+  const signal = options.signal ?? request.signal;
+  if (signal) init.signal = signal;
   if (!["GET", "HEAD"].includes(request.method)) {
     const body = await request.arrayBuffer();
     if (body.byteLength > 0) init.body = body;
@@ -36,12 +39,15 @@ export async function proxyRequest(
   const upstream = await fetcher(target, init);
   const isStream = upstream.headers.get("content-type")?.includes("text/event-stream");
   if (isStream) {
+    // Return the upstream body directly without materializing — preserves chunking
+    // and back-pressure. Client disconnect closes the upstream via request.signal.
     return new Response(upstream.body, {
       status: upstream.status,
       headers: {
         "content-type": upstream.headers.get("content-type") ?? "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache",
-        connection: "keep-alive"
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no"
       }
     });
   }

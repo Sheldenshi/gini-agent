@@ -14,7 +14,10 @@ const args = Bun.argv.slice(2);
 const cliArgs = stripGlobalArgs(args);
 const command = cliArgs[0] ?? "help";
 const ephemeralSmoke = command === "smoke" && !hasFlag(args, "--lane") && !process.env.GINI_LANE;
-const noWeb = hasFlag(args, "--no-web") || ephemeralSmoke;
+// Smoke always runs headless unless the user explicitly opts in with --web.
+// Decoupled from the ephemeral-lane decision so `gini smoke --lane <x>` stays headless.
+const smokeImpliesNoWeb = command === "smoke" && !hasFlag(args, "--web");
+const noWeb = hasFlag(args, "--no-web") || smokeImpliesNoWeb;
 applyGlobalEnvOverrides(args, ephemeralSmoke);
 const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
 const config = loadConfig(lane);
@@ -155,39 +158,72 @@ async function main(): Promise<void> {
 }
 
 async function start(config: RuntimeConfig): Promise<boolean> {
-  if (await isRunning(config)) {
-    print({ running: true, url: url(config), lane: config.lane });
-    return false;
-  }
-  install(config);
-  config.port = await availablePort(config.port);
-  install(config);
-  const child = spawn(process.execPath, ["run", "src/runtime.ts", "--lane", config.lane], {
-    cwd: process.cwd(),
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env, GINI_LANE: config.lane, GINI_PORT: String(config.port) }
-  });
-  child.unref();
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    if (await isRunning(config)) {
-      const webStarted = noWeb ? null : await startWeb(config);
-      const banner: Record<string, unknown> = { started: true, url: url(config), lane: config.lane };
-      if (webStarted) banner.webUrl = webStarted.webUrl;
-      print(banner);
-      return true;
+  const alreadyRunning = await isRunning(config);
+  let runtimeStarted = false;
+  if (!alreadyRunning) {
+    install(config);
+    config.port = await availablePort(config.port);
+    install(config);
+    const child = spawn(process.execPath, ["run", "src/runtime.ts", "--lane", config.lane], {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: "ignore",
+      env: { ...process.env, GINI_LANE: config.lane, GINI_PORT: String(config.port) }
+    });
+    child.unref();
+    let healthy = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (await isRunning(config)) { healthy = true; break; }
+      await Bun.sleep(100);
     }
-    await Bun.sleep(100);
+    if (!healthy) throw new Error("Runtime did not become healthy within 5 seconds.");
+    runtimeStarted = true;
   }
-  throw new Error("Runtime did not become healthy within 5 seconds.");
+  // Web launch runs whether or not the runtime was already up — a user whose
+  // web crashed should be able to recover with `gini start` without first stopping.
+  let webStarted: { webUrl: string } | null = null;
+  if (!noWeb) {
+    if (!isWebAlreadyAlive(config)) {
+      try {
+        webStarted = await startWeb(config);
+      } catch (error) {
+        print({
+          started: runtimeStarted,
+          running: alreadyRunning,
+          url: url(config),
+          lane: config.lane,
+          webError: error instanceof Error ? error.message : String(error)
+        });
+        return runtimeStarted;
+      }
+    }
+  }
+  const banner: Record<string, unknown> = runtimeStarted
+    ? { started: true, url: url(config), lane: config.lane }
+    : { running: true, url: url(config), lane: config.lane };
+  if (webStarted) banner.webUrl = webStarted.webUrl;
+  print(banner);
+  return runtimeStarted;
 }
 
-async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string } | null> {
+function isWebAlreadyAlive(config: RuntimeConfig): boolean {
+  const path = join(config.stateRoot, "web.pid");
+  if (!existsSync(path)) return false;
+  const pid = Number(readFileSync(path, "utf8"));
+  return processAlive(pid);
+}
+
+async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string }> {
   const webRoot = join(projectRoot(), "web");
-  if (!existsSync(join(webRoot, "package.json"))) return null;
+  if (!existsSync(join(webRoot, "package.json"))) {
+    throw new Error("Web app not found at web/. Cannot start the Next.js control plane.");
+  }
   const port = await availablePort(webPort);
   const built = existsSync(join(webRoot, ".next", "BUILD_ID"));
   const command = built ? ["run", "start", "--", "-p", String(port)] : ["run", "dev", "--", "-p", String(port)];
+  // detached: true puts the child in its own process group so we can SIGTERM
+  // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
+  // orphaned grandchild if we only kill the recorded pid).
   const child = spawn("bun", command, {
     cwd: webRoot,
     detached: true,
@@ -205,14 +241,26 @@ async function startWeb(config: RuntimeConfig): Promise<{ webUrl: string } | nul
     writeFileSync(join(config.stateRoot, "web.pid"), String(child.pid));
   }
   const webUrl = `http://127.0.0.1:${port}`;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  // Poll the actual root path (HEAD) so we only return a URL the browser can
+  // reach. Dev mode can take 10–20s to compile the first route, so the timeout
+  // is intentionally generous.
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (!processAlive(child.pid ?? -1)) {
+      throw new Error(`Next.js process exited before becoming healthy. webUrl=${webUrl}`);
+    }
     try {
-      const response = await fetch(webUrl, { redirect: "manual" });
+      const response = await fetch(webUrl, { method: "HEAD", redirect: "manual" });
       if (response.status < 500) return { webUrl };
     } catch { /* keep waiting */ }
-    await Bun.sleep(150);
+    await Bun.sleep(250);
   }
-  return { webUrl };
+  // Give up — kill the child and surface the failure rather than printing a dead URL.
+  if (typeof child.pid === "number") {
+    try { process.kill(-child.pid, "SIGTERM"); } catch { /* ignore */ }
+  }
+  rmSync(join(config.stateRoot, "web.pid"), { force: true });
+  throw new Error(`Next.js did not become healthy within 30s on ${webUrl}.`);
 }
 
 
@@ -257,10 +305,20 @@ function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reaso
   const path = join(config.stateRoot, "web.pid");
   if (!existsSync(path)) return { stopped: false, reason: "No web pid" };
   const pid = Number(readFileSync(path, "utf8"));
+  let groupKilled = false;
+  // The web pid is the group leader (we spawned with detached: true). Killing
+  // the group with -pid reaches every descendant: bun run -> next dev -> the
+  // actual server process. Falling back to a plain kill keeps us robust if the
+  // platform somehow rejects the group signal.
   try {
-    process.kill(pid, "SIGTERM");
+    process.kill(-pid, "SIGTERM");
+    groupKilled = true;
+  } catch {
+    try { process.kill(pid, "SIGTERM"); } catch { /* fall through */ }
+  }
+  try {
     rmSync(path, { force: true });
-    return { stopped: true, pid };
+    return { stopped: true, pid, ...(groupKilled ? { reason: "group SIGTERM" } : {}) };
   } catch (error) {
     return { stopped: false, pid, reason: error instanceof Error ? error.message : String(error) };
   }
@@ -981,7 +1039,7 @@ function stripGlobalArgs(values: string[]): string[] {
       index += 1;
       continue;
     }
-    if (values[index] === "--no-web") continue;
+    if (values[index] === "--no-web" || values[index] === "--web") continue;
     stripped.push(values[index]);
   }
   return stripped;
@@ -1064,6 +1122,7 @@ Global options:
   --port <number>      Preferred runtime localhost port. Start scans upward if busy.
   --web-port <number>  Preferred Next.js port (default 3000).
   --no-web             Don't launch the Next.js control plane (smoke uses this automatically).
+  --web                Force the Next.js control plane to launch even for smoke runs.
 `);
 }
 

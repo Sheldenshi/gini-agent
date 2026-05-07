@@ -11,6 +11,7 @@ import {
   Cog,
   Home,
   ListTodo,
+  Menu,
   MessageSquare,
   Moon,
   Sparkles,
@@ -20,6 +21,7 @@ import {
 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
+import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { useEffect, useState } from "react";
 
 const NAV = [
@@ -35,14 +37,14 @@ const NAV = [
   { href: "/settings", label: "Settings", icon: Cog }
 ] as const;
 
-export function Sidebar({ lane }: { lane: string }) {
+function SidebarBody({ lane, onNavigate }: { lane: string; onNavigate?: () => void }) {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
   return (
-    <aside className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-sidebar text-sidebar-foreground">
+    <div className="flex h-full flex-col bg-sidebar text-sidebar-foreground">
       <div className="flex items-center justify-between gap-2 px-4 py-4">
         <div className="flex items-center gap-2">
           <div className="flex h-7 w-7 items-center justify-center rounded-md bg-primary text-primary-foreground">
@@ -50,7 +52,7 @@ export function Sidebar({ lane }: { lane: string }) {
           </div>
           <div className="flex flex-col leading-none">
             <span className="text-sm font-semibold">Gini</span>
-            <span className="font-mono text-[10px] text-muted-foreground">{lane}</span>
+            <span className="font-mono text-[10px] text-sidebar-foreground/70">{lane}</span>
           </div>
         </div>
         {mounted ? (
@@ -73,6 +75,7 @@ export function Sidebar({ lane }: { lane: string }) {
             <Link
               key={item.href}
               href={item.href}
+              onClick={onNavigate}
               className={cn(
                 "flex items-center gap-2.5 rounded-md px-2.5 py-1.5 text-sm font-medium transition-colors",
                 active
@@ -86,6 +89,44 @@ export function Sidebar({ lane }: { lane: string }) {
           );
         })}
       </nav>
+    </div>
+  );
+}
+
+export function Sidebar({ lane }: { lane: string }) {
+  return (
+    <aside className="hidden h-full w-60 shrink-0 border-r border-border md:flex md:flex-col">
+      <SidebarBody lane={lane} />
     </aside>
+  );
+}
+
+export function MobileTopBar({ lane }: { lane: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background px-3 md:hidden">
+      <Sheet open={open} onOpenChange={setOpen}>
+        <SheetTrigger asChild>
+          <Button size="icon" variant="ghost" className="h-9 w-9" aria-label="Open navigation">
+            <Menu className="h-5 w-5" />
+          </Button>
+        </SheetTrigger>
+        <SheetContent side="left" className="w-60 p-0">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Navigation</SheetTitle>
+          </SheetHeader>
+          <SidebarBody lane={lane} onNavigate={() => setOpen(false)} />
+        </SheetContent>
+      </Sheet>
+      <div className="flex items-center gap-2">
+        <div className="flex h-6 w-6 items-center justify-center rounded-md bg-primary text-primary-foreground">
+          <Boxes className="h-3.5 w-3.5" />
+        </div>
+        <div className="flex items-center gap-2 leading-none">
+          <span className="text-sm font-semibold">Gini</span>
+          <span className="font-mono text-[10px] text-muted-foreground">{lane}</span>
+        </div>
+      </div>
+    </header>
   );
 }

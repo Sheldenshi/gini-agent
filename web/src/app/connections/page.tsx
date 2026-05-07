@@ -38,7 +38,7 @@ export default function ConnectionsPage() {
                       <CardTitle className="text-sm">{connector.name}</CardTitle>
                       <CardDescription className="font-mono text-[11px]">{connector.kind} · {connector.id}</CardDescription>
                     </div>
-                    <div className="flex flex-col items-end gap-1">
+                    <div className="flex flex-wrap items-center justify-end gap-1.5">
                       <StatusPill value={connector.status} />
                       <StatusPill value={connector.health} />
                     </div>

@@ -80,6 +80,39 @@ describe("runtime proxy", () => {
     expect(value.error).toBe("Not found");
   });
 
+  test("propagates the caller AbortSignal to upstream fetch (so client disconnect closes the stream)", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const fetcher = mockFetcher((_url, init) => {
+      receivedSignal = init.signal as AbortSignal | undefined;
+      return new Response("", { status: 200, headers: { "content-type": "text/event-stream" } });
+    });
+    const controller = new AbortController();
+    const request = new Request("http://localhost/api/runtime/events/stream", { method: "GET" });
+    await proxyRequest(request, ["events", "stream"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher, signal: controller.signal });
+
+    expect(receivedSignal).toBeDefined();
+    expect(receivedSignal).toBe(controller.signal);
+  });
+
+  test("returns SSE bodies without buffering (preserves named events)", async () => {
+    // The proxy must hand back upstream.body unchanged; if it materializes the
+    // body via .text(), the browser EventSource sees ERR_INCOMPLETE_CHUNKED_ENCODING
+    // and named events (event: <kind>) become unobservable.
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("event: task\ndata: {}\n\n"));
+        controller.close();
+      }
+    });
+    const upstream = new Response(upstreamBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+    const fetcher = mockFetcher(() => upstream);
+    const request = new Request("http://localhost/api/runtime/events/stream", { method: "GET" });
+    const response = await proxyRequest(request, ["events", "stream"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.body).toBe(upstream.body);
+    expect(response.headers.get("cache-control")).toContain("no-cache");
+  });
+
   test("preserves SSE stream bodies and headers", async () => {
     const encoder = new TextEncoder();
     const stream = new ReadableStream({

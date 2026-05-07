@@ -15,8 +15,9 @@ import { useInvalidate, useTask, useTasks } from "@/lib/queries";
 import type { Task } from "@/lib/types";
 
 const FILTERS = [
-  { key: "active", label: "Active", match: (t: Task) => ["queued", "running"].includes(t.status) },
+  { key: "active", label: "Active", match: (t: Task) => ["queued", "running", "waiting_approval"].includes(t.status) },
   { key: "waiting", label: "Waiting", match: (t: Task) => t.status === "waiting_approval" },
+  { key: "scheduled", label: "Scheduled", match: (t: Task) => Boolean(t.jobId) && (t.status === "queued" || t.status === "running") },
   { key: "completed", label: "Completed", match: (t: Task) => t.status === "completed" },
   { key: "failed", label: "Failed", match: (t: Task) => t.status === "failed" || t.status === "cancelled" },
   { key: "all", label: "All", match: () => true }
@@ -173,7 +174,7 @@ export default function TasksPage() {
                       </Section>
                     ) : null}
                     <Section title={`Trace (${detail.data.trace.length})`}>
-                      <pre className="overflow-auto rounded-md border border-border bg-card/50 p-3 font-mono text-[11px] text-muted-foreground">
+                      <pre className="overflow-x-auto rounded-md border border-border bg-card/50 p-3 font-mono text-[11px] text-muted-foreground">
                         {JSON.stringify(detail.data.trace, null, 2)}
                       </pre>
                     </Section>

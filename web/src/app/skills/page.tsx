@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,10 +13,16 @@ import { useInvalidate, useSkills } from "@/lib/queries";
 import type { SkillRecord } from "@/lib/types";
 
 export default function SkillsPage() {
-  const skills = useSkills();
   const [search, setSearch] = useState("");
+  const [debounced, setDebounced] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
+  const skills = useSkills(debounced);
   const invalidate = useInvalidate();
+
+  useEffect(() => {
+    const timer = setTimeout(() => setDebounced(search), 200);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   const action = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "test" | "trust" | "disable" | "rollback" }) =>
@@ -28,14 +34,30 @@ export default function SkillsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const filtered = (skills.data ?? []).filter((s) =>
-    !search || s.name.toLowerCase().includes(search.toLowerCase()) || s.description.toLowerCase().includes(search.toLowerCase())
-  );
+  const validate = useMutation({
+    mutationFn: () => api<{ ok: boolean; results: Array<{ id: string; name: string; ok: boolean; issues: string[] }> }>("/skills/validate"),
+    onSuccess: (result) => {
+      const failing = result.results.filter((r) => !r.ok).length;
+      toast.success(failing === 0 ? `All ${result.results.length} skills validated.` : `${failing} of ${result.results.length} skills have issues.`);
+      invalidate(["skills"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const filtered = skills.data ?? [];
   const detail = filtered.find((s) => s.id === selected) ?? filtered[0];
 
   return (
     <>
-      <PageHeader title="Skills" description="Procedures the agent can use" />
+      <PageHeader
+        title="Skills"
+        description="Procedures the agent can use"
+        actions={
+          <Button size="sm" variant="outline" disabled={validate.isPending} onClick={() => validate.mutate()}>
+            {validate.isPending ? "Validating…" : "Validate all"}
+          </Button>
+        }
+      />
       <div className="flex flex-1 gap-4 overflow-hidden p-6">
         <div className="flex w-80 flex-col gap-3">
           <Input placeholder="Search skills…" value={search} onChange={(event) => setSearch(event.target.value)} />

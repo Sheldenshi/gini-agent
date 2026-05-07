@@ -1,9 +1,11 @@
 "use client";
 
+import { useCallback } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
-import { useApprovals, useConnectors, useEvents, useJobs, useStatus, useTasks } from "@/lib/queries";
+import { useApprovals, useConnectors, useEvents, useInvalidate, useJobs, useStatus, useTasks } from "@/lib/queries";
+import { useRuntimeStream } from "@/lib/useRuntimeStream";
 
 export default function HomePage() {
   const status = useStatus();
@@ -12,6 +14,11 @@ export default function HomePage() {
   const jobs = useJobs();
   const connectors = useConnectors();
   const events = useEvents();
+  const invalidate = useInvalidate();
+
+  useRuntimeStream(useCallback(() => {
+    invalidate(["status", "state", "tasks", "approvals", "jobs", "connectors", "events"]);
+  }, [invalidate]));
 
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
   const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
@@ -25,7 +32,7 @@ export default function HomePage() {
       <div className="flex-1 space-y-6 overflow-auto p-6">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
           <Stat title="Health" value={status.data?.ok ? "Healthy" : status.isLoading ? "…" : "Down"} sub={`port ${status.data?.port ?? "—"}`} />
-          <Stat title="Active tasks" value={String(activeTasks.length)} sub={`${tasks.data?.length ?? 0} total`} />
+          <Stat title="Active tasks" value={String(activeTasks.length)} sub={activeTasks.length > 0 ? `of ${tasks.data?.length ?? 0} lifetime` : "no work in flight"} />
           <Stat title="Pending approvals" value={String(pending.length)} sub={pending.length > 0 ? "needs review" : "all clear"} />
           <Stat title="Failed jobs" value={String(failedJobs.length)} sub={`${jobs.data?.length ?? 0} jobs`} />
           <Stat title="Connector issues" value={String(connectorIssues.length)} sub={`${connectors.data?.length ?? 0} configured`} />
