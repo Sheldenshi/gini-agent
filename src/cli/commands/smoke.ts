@@ -94,7 +94,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     body: JSON.stringify({ kind: "runtime", target: "local", title: "Smoke notification", body: "Smoke notification delivery" })
   });
   await api(config, "/api/notifications/send", { method: "POST" });
-  const snapshotResult = createSnapshot(config, "Smoke rollback baseline");
+  const snapshotResult = await createSnapshot(config, "Smoke rollback baseline");
   const promotionResult = await api(config, "/api/promotions", {
     method: "POST",
     body: JSON.stringify({

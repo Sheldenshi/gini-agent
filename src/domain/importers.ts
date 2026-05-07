@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { ImportSource, RuntimeConfig } from "../types";
 import { createImportReport, mutateState } from "../state";
 
-export function inspectImportSource(config: RuntimeConfig, source: ImportSource, path: string) {
+export async function inspectImportSource(config: RuntimeConfig, source: ImportSource, path: string) {
   const report = inspectPath(source, path);
   return mutateState(config.lane, (state) => createImportReport(state, report));
 }

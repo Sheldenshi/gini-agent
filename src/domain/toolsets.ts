@@ -6,7 +6,7 @@ export function listToolsets(config: RuntimeConfig) {
   return { toolsets: state.toolsets, tools: state.tools };
 }
 
-export function setToolsetStatus(config: RuntimeConfig, name: string, status: "enabled" | "disabled") {
+export async function setToolsetStatus(config: RuntimeConfig, name: string, status: "enabled" | "disabled") {
   return mutateState(config.lane, (state) => {
     const toolset = state.toolsets.find((item) => item.name === name || item.id === name);
     if (!toolset) throw new Error(`Toolset not found: ${name}`);

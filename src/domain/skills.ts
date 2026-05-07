@@ -5,7 +5,7 @@ export function listSkills(config: RuntimeConfig) {
   return readState(config.lane).skills;
 }
 
-export function createSkillFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function createSkillFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => createSkill(state, {
     name: String(input.name ?? "Untitled skill"),
     description: String(input.description ?? ""),
@@ -33,7 +33,7 @@ export function searchSkills(config: RuntimeConfig, query: string) {
   });
 }
 
-export function updateSkill(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
+export async function updateSkill(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
@@ -66,7 +66,7 @@ export function updateSkill(config: RuntimeConfig, idOrName: string, input: Reco
   });
 }
 
-export function setSkillStatus(config: RuntimeConfig, idOrName: string, status: "trusted" | "disabled" | "archived") {
+export async function setSkillStatus(config: RuntimeConfig, idOrName: string, status: "trusted" | "disabled" | "archived") {
   return mutateState(config.lane, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
@@ -82,7 +82,7 @@ export function setSkillStatus(config: RuntimeConfig, idOrName: string, status: 
   });
 }
 
-export function rollbackSkill(config: RuntimeConfig, idOrName: string) {
+export async function rollbackSkill(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.lane, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
@@ -109,7 +109,7 @@ export function rollbackSkill(config: RuntimeConfig, idOrName: string) {
   });
 }
 
-export function testSkill(config: RuntimeConfig, idOrName: string) {
+export async function testSkill(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.lane, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);

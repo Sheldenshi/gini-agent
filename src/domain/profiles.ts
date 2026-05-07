@@ -6,7 +6,7 @@ export function listProfiles(config: RuntimeConfig) {
   return { activeProfileId: state.activeProfileId, profiles: state.profiles };
 }
 
-export function createProfile(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function createProfile(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "");
   if (!name) throw new Error("Profile name is required.");
   return mutateState(config.lane, (state) => createProfileRecord(state, {
@@ -19,7 +19,7 @@ export function createProfile(config: RuntimeConfig, input: Record<string, unkno
   }));
 }
 
-export function useProfile(config: RuntimeConfig, idOrName: string) {
+export async function useProfile(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.lane, (state) => activateProfile(state, idOrName));
 }
 

@@ -21,11 +21,11 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   };
 }
 
-export function createChat(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function createChat(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => createChatSession(state, String(input.title ?? "New chat")));
 }
 
-export function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
+export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
   const content = String(input.content ?? "").trim();
   if (!content) throw new Error("Chat message content is required.");
   const state = readState(config.lane);
@@ -37,14 +37,14 @@ export function submitChatMessage(config: RuntimeConfig, sessionId: string, inpu
     .map((message) => `${message.role}: ${message.content}`)
     .join("\n");
   const taskInput = recentContext ? `Chat context:\n${recentContext}\n\nUser: ${content}` : content;
-  const task = submitTask(config, taskInput);
-  mutateState(config.lane, (current) => {
+  const task = await submitTask(config, taskInput);
+  await mutateState(config.lane, (current) => {
     createChatMessage(current, { sessionId, role: "user", content, taskId: task.id });
   });
   return { sessionId, taskId: task.id, status: task.status };
 }
 
-export function syncChatTaskResult(config: RuntimeConfig, sessionId: string, taskId: string) {
+export async function syncChatTaskResult(config: RuntimeConfig, sessionId: string, taskId: string) {
   return mutateState(config.lane, (state) => {
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);

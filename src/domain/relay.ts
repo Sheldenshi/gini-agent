@@ -5,14 +5,14 @@ export function listRelays(config: RuntimeConfig) {
   return readState(config.lane).relays;
 }
 
-export function configureRelay(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function configureRelay(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "local");
   const endpoint = String(input.endpoint ?? "local://localhost");
   const mode = input.mode === "hosted" || input.mode === "lan" ? input.mode : "local-only";
   return mutateState(config.lane, (state) => createRelayRecord(state, { name, endpoint, mode }));
 }
 
-export function checkRelay(config: RuntimeConfig, idOrName: string) {
+export async function checkRelay(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.lane, (state) => {
     const relay = state.relays.find((item) => item.id === idOrName || item.name === idOrName);
     if (!relay) throw new Error(`Relay not found: ${idOrName}`);
@@ -33,7 +33,7 @@ export function checkRelay(config: RuntimeConfig, idOrName: string) {
   });
 }
 
-export function queueNotification(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function queueNotification(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => createNotificationRecord(state, {
     kind: input.kind === "approval" || input.kind === "job" || input.kind === "task" || input.kind === "promotion" ? input.kind : "runtime",
     title: String(input.title ?? "Gini notification"),
@@ -43,7 +43,7 @@ export function queueNotification(config: RuntimeConfig, input: Record<string, u
   }));
 }
 
-export function sendQueuedNotifications(config: RuntimeConfig) {
+export async function sendQueuedNotifications(config: RuntimeConfig) {
   return mutateState(config.lane, (state) => {
     for (const notification of state.notifications.filter((item) => item.status === "queued")) {
       notification.status = "sent";
@@ -62,7 +62,7 @@ export function sendQueuedNotifications(config: RuntimeConfig) {
   });
 }
 
-export function acknowledgeNotification(config: RuntimeConfig, notificationId: string) {
+export async function acknowledgeNotification(config: RuntimeConfig, notificationId: string) {
   return mutateState(config.lane, (state) => {
     const notification = state.notifications.find((item) => item.id === notificationId);
     if (!notification) throw new Error(`Notification not found: ${notificationId}`);

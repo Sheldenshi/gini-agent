@@ -365,7 +365,7 @@ describe("runtime api", () => {
 
     // Generate more events than the ring buffer holds (1000), so a fabricated
     // earlier id is guaranteed not to be retained.
-    mutateState(config.lane, (state) => {
+    await mutateState(config.lane, (state) => {
       for (let i = 0; i < 1100; i += 1) {
         appendEvent(state, {
           kind: "runtime",

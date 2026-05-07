@@ -33,12 +33,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
-    ["POST", /^\/api\/chat$/, async (request) => json(createChat(config, await body(request)), 201)],
+    ["POST", /^\/api\/chat$/, async (request) => json(await createChat(config, await body(request)), 201)],
     ["GET", /^\/api\/chat\/([^/]+)$/, (_request, params) => json(getChatSession(config, params[0]))],
-    ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(submitChatMessage(config, params[0], await body(request)), 201)],
-    ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, (_request, params) => json(syncChatTaskResult(config, params[0], params[1]))],
+    ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
+    ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     ["GET", /^\/api\/tasks$/, () => json(readState(config.lane).tasks)],
-    ["POST", /^\/api\/tasks$/, async (request) => json(submitTask(config, String((await body(request)).input ?? "")), 201)],
+    ["POST", /^\/api\/tasks$/, async (request) => json(await submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
     ["GET", /^\/api\/tasks\/([^/]+)$/, (_request, params) => {
       const state = readState(config.lane);
@@ -46,8 +46,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!task) return json({ error: "Task not found" }, 404);
       return json({ task, trace: readTrace(config.lane, task.id) });
     }],
-    ["POST", /^\/api\/tasks\/([^/]+)\/retry$/, (_request, params) => json(retryTask(config, params[0]))],
-    ["POST", /^\/api\/tasks\/([^/]+)\/cancel$/, (_request, params) => json(cancelTask(config, params[0]))],
+    ["POST", /^\/api\/tasks\/([^/]+)\/retry$/, async (_request, params) => json(await retryTask(config, params[0]))],
+    ["POST", /^\/api\/tasks\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelTask(config, params[0]))],
     ["GET", /^\/api\/approvals$/, () => json(readState(config.lane).approvals)],
     ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
@@ -56,88 +56,88 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
-      return json(createMemoryFromInput(config, await body(request)), 201);
+      return json(await createMemoryFromInput(config, await body(request)), 201);
     }],
-    ["PATCH", /^\/api\/memory\/([^/]+)$/, async (request, params) => json(editMemory(config, params[0], await body(request)))],
-    ["DELETE", /^\/api\/memory\/([^/]+)$/, (_request, params) => json(archiveMemory(config, params[0]))],
-    ["POST", /^\/api\/memory\/([^/]+)\/approve$/, (_request, params) => json(updateMemory(config, params[0], "active"))],
-    ["POST", /^\/api\/memory\/([^/]+)\/reject$/, (_request, params) => json(updateMemory(config, params[0], "rejected"))],
+    ["PATCH", /^\/api\/memory\/([^/]+)$/, async (request, params) => json(await editMemory(config, params[0], await body(request)))],
+    ["DELETE", /^\/api\/memory\/([^/]+)$/, async (_request, params) => json(await archiveMemory(config, params[0]))],
+    ["POST", /^\/api\/memory\/([^/]+)\/approve$/, async (_request, params) => json(await updateMemory(config, params[0], "active"))],
+    ["POST", /^\/api\/memory\/([^/]+)\/reject$/, async (_request, params) => json(await updateMemory(config, params[0], "rejected"))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
     }],
-    ["POST", /^\/api\/skills$/, async (request) => json(createSkillFromInput(config, await body(request)), 201)],
+    ["POST", /^\/api\/skills$/, async (request) => json(await createSkillFromInput(config, await body(request)), 201)],
     ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
-    ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(updateSkill(config, params[0], await body(request)))],
-    ["POST", /^\/api\/skills\/([^/]+)\/test$/, (_request, params) => json(testSkill(config, params[0]))],
-    ["POST", /^\/api\/skills\/([^/]+)\/trust$/, (_request, params) => json(setSkillStatus(config, params[0], "trusted"))],
-    ["POST", /^\/api\/skills\/([^/]+)\/disable$/, (_request, params) => json(setSkillStatus(config, params[0], "disabled"))],
-    ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, (_request, params) => json(rollbackSkill(config, params[0]))],
+    ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
+    ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
+    ["POST", /^\/api\/skills\/([^/]+)\/trust$/, async (_request, params) => json(await setSkillStatus(config, params[0], "trusted"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, async (_request, params) => json(await rollbackSkill(config, params[0]))],
     ["GET", /^\/api\/jobs$/, () => json(readState(config.lane).jobs)],
     ["POST", /^\/api\/jobs$/, async (request) => {
-      return json(createScheduledJob(config, await body(request)), 201);
+      return json(await createScheduledJob(config, await body(request)), 201);
     }],
-    ["PATCH", /^\/api\/jobs\/([^/]+)$/, async (request, params) => json(updateJob(config, params[0], await body(request)))],
-    ["DELETE", /^\/api\/jobs\/([^/]+)$/, (_request, params) => json(removeJob(config, params[0]))],
+    ["PATCH", /^\/api\/jobs\/([^/]+)$/, async (request, params) => json(await updateJob(config, params[0], await body(request)))],
+    ["DELETE", /^\/api\/jobs\/([^/]+)$/, async (_request, params) => json(await removeJob(config, params[0]))],
     ["GET", /^\/api\/job-runs$/, () => json(listJobRuns(config))],
     ["GET", /^\/api\/jobs\/([^/]+)\/runs$/, (_request, params) => json(listJobRuns(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/run$/, async (_request, params) => json(await runJobNow(config, params[0]))],
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
-    ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, (_request, params) => json(updateJobStatus(config, params[0], "paused"))],
-    ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, (_request, params) => json(updateJobStatus(config, params[0], "active"))],
+    ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
+    ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
     ["GET", /^\/api\/connectors$/, () => json(readState(config.lane).connectors)],
-    ["POST", /^\/api\/connectors\/([^/]+)\/health$/, (_request, params) => json(checkConnector(config, params[0]))],
+    ["POST", /^\/api\/connectors\/([^/]+)\/health$/, async (_request, params) => json(await checkConnector(config, params[0]))],
     ["GET", /^\/api\/improvements$/, () => json(readState(config.lane).improvements)],
-    ["POST", /^\/api\/improvements$/, async (request) => json(proposeImprovement(config, await body(request)), 201)],
-    ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, (_request, params) => json(reviewImprovement(config, params[0], "approve"))],
-    ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, (_request, params) => json(reviewImprovement(config, params[0], "reject"))],
+    ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
+    ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],
+    ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, async (_request, params) => json(await reviewImprovement(config, params[0], "reject"))],
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
-    ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, (_request, params) => json(revokePairedDevice(config, params[0]))],
-    ["POST", /^\/api\/pairing$/, async (request) => json(createPairing(config, await body(request)), 201)],
+    ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
+    ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.lane).promotions)],
-    ["POST", /^\/api\/promotions$/, async (request) => json(proposePromotion(config, await body(request)), 201)],
-    ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, (_request, params) => json(reviewPromotion(config, params[0], "approve"))],
-    ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, (_request, params) => json(reviewPromotion(config, params[0], "reject"))],
+    ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
+    ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
+    ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
-    ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, (_request, params) => json(setToolsetStatus(config, params[0], "enabled"))],
-    ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, (_request, params) => json(setToolsetStatus(config, params[0], "disabled"))],
-    ["GET", /^\/api\/subagents$/, () => json(listSubagents(config))],
-    ["POST", /^\/api\/subagents$/, async (request) => json(spawnSubagent(config, await body(request)), 201)],
+    ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
+    ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
+    ["GET", /^\/api\/subagents$/, async () => json(await listSubagents(config))],
+    ["POST", /^\/api\/subagents$/, async (request) => json(await spawnSubagent(config, await body(request)), 201)],
     ["GET", /^\/api\/mcp$/, () => json(readState(config.lane).mcpServers)],
-    ["POST", /^\/api\/mcp$/, async (request) => json(addMcpServer(config, await body(request)), 201)],
+    ["POST", /^\/api\/mcp$/, async (request) => json(await addMcpServer(config, await body(request)), 201)],
     ["POST", /^\/api\/mcp\/([^/]+)\/health$/, async (_request, params) => json(await checkMcpServer(config, params[0]))],
     ["POST", /^\/api\/mcp\/([^/]+)\/invoke$/, async (request, params) => {
       const input = await body(request);
       return json(await invokeMcpTool(config, params[0], String(input.toolName ?? ""), input.input && typeof input.input === "object" ? input.input as Record<string, unknown> : {}));
     }],
-    ["POST", /^\/api\/mcp\/([^/]+)\/disable$/, (_request, params) => json(removeMcpServer(config, params[0]))],
+    ["POST", /^\/api\/mcp\/([^/]+)\/disable$/, async (_request, params) => json(await removeMcpServer(config, params[0]))],
     ["GET", /^\/api\/messaging$/, () => json(readState(config.lane).messagingBridges)],
-    ["POST", /^\/api\/messaging$/, async (request) => json(addMessagingBridge(config, await body(request)), 201)],
+    ["POST", /^\/api\/messaging$/, async (request) => json(await addMessagingBridge(config, await body(request)), 201)],
     ["GET", /^\/api\/messaging\/messages$/, () => json(listMessagingMessages(config))],
     ["GET", /^\/api\/messaging\/([^/]+)\/messages$/, (_request, params) => json(listMessagingMessages(config, params[0]))],
-    ["POST", /^\/api\/messaging\/([^/]+)\/receive$/, async (request, params) => json(receiveMessagingInput(config, params[0], await body(request)), 201)],
-    ["POST", /^\/api\/messaging\/([^/]+)\/send$/, async (request, params) => json(sendMessagingOutput(config, params[0], await body(request)), 201)],
-    ["POST", /^\/api\/messaging\/([^/]+)\/health$/, (_request, params) => json(checkMessagingBridge(config, params[0]))],
-    ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, (_request, params) => json(disableMessagingBridge(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/receive$/, async (request, params) => json(await receiveMessagingInput(config, params[0], await body(request)), 201)],
+    ["POST", /^\/api\/messaging\/([^/]+)\/send$/, async (request, params) => json(await sendMessagingOutput(config, params[0], await body(request)), 201)],
+    ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
     ["GET", /^\/api\/profiles$/, () => json(listProfiles(config))],
-    ["POST", /^\/api\/profiles$/, async (request) => json(createProfile(config, await body(request)), 201)],
-    ["POST", /^\/api\/profiles\/([^/]+)\/use$/, (_request, params) => json(useProfile(config, params[0]))],
+    ["POST", /^\/api\/profiles$/, async (request) => json(await createProfile(config, await body(request)), 201)],
+    ["POST", /^\/api\/profiles\/([^/]+)\/use$/, async (_request, params) => json(await useProfile(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
-    ["POST", /^\/api\/relays$/, async (request) => json(configureRelay(config, await body(request)), 201)],
-    ["POST", /^\/api\/relays\/([^/]+)\/health$/, (_request, params) => json(checkRelay(config, params[0]))],
+    ["POST", /^\/api\/relays$/, async (request) => json(await configureRelay(config, await body(request)), 201)],
+    ["POST", /^\/api\/relays\/([^/]+)\/health$/, async (_request, params) => json(await checkRelay(config, params[0]))],
     ["GET", /^\/api\/notifications$/, () => json(readState(config.lane).notifications)],
-    ["POST", /^\/api\/notifications$/, async (request) => json(queueNotification(config, await body(request)), 201)],
-    ["POST", /^\/api\/notifications\/send$/, () => json(sendQueuedNotifications(config))],
-    ["POST", /^\/api\/notifications\/([^/]+)\/ack$/, (_request, params) => json(acknowledgeNotification(config, params[0]))],
+    ["POST", /^\/api\/notifications$/, async (request) => json(await queueNotification(config, await body(request)), 201)],
+    ["POST", /^\/api\/notifications\/send$/, async () => json(await sendQueuedNotifications(config))],
+    ["POST", /^\/api\/notifications\/([^/]+)\/ack$/, async (_request, params) => json(await acknowledgeNotification(config, params[0]))],
     ["GET", /^\/api\/imports$/, () => json(readState(config.lane).importReports)],
     ["POST", /^\/api\/imports\/inspect$/, async (request) => {
       const input = await body(request);
       const source = input.source === "openclaw" ? "openclaw" : "hermes";
-      return json(inspectImportSource(config, source, String(input.path ?? "")), 201);
+      return json(await inspectImportSource(config, source, String(input.path ?? "")), 201);
     }]
   ];
 
@@ -146,12 +146,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     if (url.pathname.startsWith("/api/")) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
         try {
-          return json(claimPairing(config, await body(request)), 201);
+          return json(await claimPairing(config, await body(request)), 201);
         } catch (error) {
           return json({ error: error instanceof Error ? error.message : String(error) }, 400);
         }
       }
-      if (!authorized(request, config)) return json({ error: "Unauthorized" }, 401);
+      if (!await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
       for (const [method, pattern, handler] of routes) {
         const match = url.pathname.match(pattern);
         if (request.method === method && match) {
@@ -182,7 +182,7 @@ async function body(request: Request): Promise<Record<string, unknown>> {
   return (await request.json()) as Record<string, unknown>;
 }
 
-function authorized(request: Request, config: RuntimeConfig): boolean {
+async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
   const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;

@@ -2,16 +2,16 @@ import { submitTask } from "../agent";
 import type { RuntimeConfig } from "../types";
 import { appendTrace, createSubagentRecord, mutateState, now, readState } from "../state";
 
-export function spawnSubagent(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function spawnSubagent(config: RuntimeConfig, input: Record<string, unknown>) {
   const prompt = String(input.prompt ?? "");
   if (!prompt) throw new Error("Subagent prompt is required.");
   const toolsets = Array.isArray(input.toolsets) ? input.toolsets.map(String) : ["file", "terminal", "memory", "session_search"];
   const parentTaskId = typeof input.parentTaskId === "string" ? input.parentTaskId : undefined;
   const name = String(input.name ?? "Subagent");
 
-  const subagent = mutateState(config.lane, (state) => createSubagentRecord(state, { name, prompt, parentTaskId, toolsets }));
-  const task = submitTask(config, prompt, undefined, parentTaskId, subagent.id);
-  mutateState(config.lane, (state) => {
+  const subagent = await mutateState(config.lane, (state) => createSubagentRecord(state, { name, prompt, parentTaskId, toolsets }));
+  const task = await submitTask(config, prompt, undefined, parentTaskId, subagent.id);
+  await mutateState(config.lane, (state) => {
     const item = state.subagents.find((candidate) => candidate.id === subagent.id);
     if (!item) return;
     item.taskId = task.id;
@@ -26,7 +26,7 @@ export function spawnSubagent(config: RuntimeConfig, input: Record<string, unkno
   return { ...subagent, taskId: task.id, status: "running" };
 }
 
-export function refreshSubagents(config: RuntimeConfig) {
+export async function refreshSubagents(config: RuntimeConfig) {
   return mutateState(config.lane, (state) => {
     for (const subagent of state.subagents) {
       if (!subagent.taskId || subagent.status === "completed" || subagent.status === "failed") continue;
@@ -49,7 +49,7 @@ export function refreshSubagents(config: RuntimeConfig) {
   });
 }
 
-export function listSubagents(config: RuntimeConfig) {
-  refreshSubagents(config);
+export async function listSubagents(config: RuntimeConfig) {
+  await refreshSubagents(config);
   return readState(config.lane).subagents;
 }

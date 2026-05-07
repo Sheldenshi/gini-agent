@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../types";
 import { addAudit, createMemory, mutateState, now } from "../state";
 
-export function createMemoryFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function createMemoryFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => createMemory(state, {
     content: String(input.content ?? ""),
     scope: normalizeScope(input.scope),
@@ -12,7 +12,7 @@ export function createMemoryFromInput(config: RuntimeConfig, input: Record<strin
   }));
 }
 
-export function updateMemory(config: RuntimeConfig, memoryId: string, statusValue: "active" | "rejected") {
+export async function updateMemory(config: RuntimeConfig, memoryId: string, statusValue: "active" | "rejected") {
   return mutateState(config.lane, (state) => {
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
@@ -29,7 +29,7 @@ export function updateMemory(config: RuntimeConfig, memoryId: string, statusValu
   });
 }
 
-export function editMemory(config: RuntimeConfig, memoryId: string, input: Record<string, unknown>) {
+export async function editMemory(config: RuntimeConfig, memoryId: string, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => {
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
@@ -50,7 +50,7 @@ export function editMemory(config: RuntimeConfig, memoryId: string, input: Recor
   });
 }
 
-export function archiveMemory(config: RuntimeConfig, memoryId: string) {
+export async function archiveMemory(config: RuntimeConfig, memoryId: string) {
   return mutateState(config.lane, (state) => {
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);

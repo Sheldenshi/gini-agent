@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../types";
 import { createPromotionProposal, decidePromotion, mutateState } from "../state";
 
-export function proposePromotion(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function proposePromotion(config: RuntimeConfig, input: Record<string, unknown>) {
   const candidateRef = String(input.candidateRef ?? "");
   if (!candidateRef) throw new Error("candidateRef is required.");
   return mutateState(config.lane, (state) => createPromotionProposal(state, {
@@ -12,6 +12,6 @@ export function proposePromotion(config: RuntimeConfig, input: Record<string, un
   }));
 }
 
-export function reviewPromotion(config: RuntimeConfig, promotionId: string, decision: "approve" | "reject") {
+export async function reviewPromotion(config: RuntimeConfig, promotionId: string, decision: "approve" | "reject") {
   return mutateState(config.lane, (state) => decidePromotion(state, promotionId, decision));
 }

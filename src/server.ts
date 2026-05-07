@@ -19,11 +19,9 @@ appendLog(config.lane, "runtime.started", { port: server.port, pid: process.pid 
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} lane=${config.lane}`);
 
 setInterval(() => {
-  try {
-    runDueJobs(config);
-  } catch (error) {
+  runDueJobs(config).catch((error) => {
     appendLog(config.lane, "scheduler.error", { error: error instanceof Error ? error.message : String(error) });
-  }
+  });
 }, 1000);
 
 process.on("SIGTERM", () => {

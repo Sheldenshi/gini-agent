@@ -4,7 +4,7 @@ import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { appendTrace, createApproval, mutateState, now } from "../state";
 import { findTask } from "../agent";
 
-export function requestCodeExecution(config: RuntimeConfig, task: Task): Task {
+export async function requestCodeExecution(config: RuntimeConfig, task: Task): Promise<Task> {
   const match = task.input.match(/^code\s+(\w+)\s*::\s*([\s\S]+)$/i);
   if (!match) throw new Error("Use: code js|python :: <code>");
   const [, language, code] = match;

@@ -28,9 +28,9 @@ import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
 
-export function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Task {
+export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Promise<Task> {
   const created = createTask(config.lane, input, jobId, parentTaskId, subagentId);
-  mutateState(config.lane, (state) => {
+  await mutateState(config.lane, (state) => {
     upsertTask(state, created);
     const audit = addAudit(state, {
       actor: jobId ? "runtime" : "user",
@@ -46,8 +46,8 @@ export function submitTask(config: RuntimeConfig, input: string, jobId?: string,
   return created;
 }
 
-export function retryTask(config: RuntimeConfig, taskId: string): Task {
-  const task = mutateState(config.lane, (state) => {
+export async function retryTask(config: RuntimeConfig, taskId: string): Promise<Task> {
+  const task = await mutateState(config.lane, (state) => {
     const existing = findTask(state, taskId);
     const retry = createTask(config.lane, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId);
     upsertTask(state, retry);
@@ -65,7 +65,7 @@ export function retryTask(config: RuntimeConfig, taskId: string): Task {
   return task;
 }
 
-export function cancelTask(config: RuntimeConfig, taskId: string): Task {
+export async function cancelTask(config: RuntimeConfig, taskId: string): Promise<Task> {
   return mutateState(config.lane, (state) => {
     const task = findTask(state, taskId);
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") return task;
@@ -85,7 +85,7 @@ export function cancelTask(config: RuntimeConfig, taskId: string): Task {
 }
 
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
-  let task = mutateState(config.lane, (state) => {
+  let task = await mutateState(config.lane, (state) => {
     const item = findTask(state, taskId);
     item.status = "running";
     item.currentStep = "Thinking";
@@ -112,7 +112,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   if (lower.startsWith("shell ")) return requestShell(config, task);
 
   // No tool matched: fall through to provider summarization.
-  const activeMemory = mutateState(config.lane, (state) => state.memories.filter((memory) => memory.status === "active"));
+  const activeMemory = await mutateState(config.lane, (state) => state.memories.filter((memory) => memory.status === "active"));
   const providerResult = await generateTaskSummary(config, task.input, activeMemory);
   appendTrace(config.lane, taskId, {
     type: "model",
@@ -125,7 +125,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     }
   });
 
-  task = mutateState(config.lane, (state) => {
+  task = await mutateState(config.lane, (state) => {
     const item = findTask(state, taskId);
     if (lower.includes("remember ")) {
       const content = item.input.split(/remember\s+/i).at(-1)?.trim() || item.input;
@@ -164,7 +164,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
-  mutateState(config.lane, (state) => {
+  await mutateState(config.lane, (state) => {
     const task = findTask(state, taskId);
     task.status = "failed";
     task.error = message;
@@ -185,14 +185,14 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
 // Shared between agent and tool modules. Tools that complete immediately
 // (file.read, file.list, file.search, web.fetch) call this to record the
 // audit, set the task summary, and mark it completed in one shot.
-export function completeLowRiskToolTask(
+export async function completeLowRiskToolTask(
   config: RuntimeConfig,
   taskId: string,
   summary: string,
   action: string,
   target: string,
   evidence: Record<string, unknown>
-): Task {
+): Promise<Task> {
   return mutateState(config.lane, (state) => {
     const task = findTask(state, taskId);
     addAudit(state, {
@@ -213,7 +213,7 @@ export function completeLowRiskToolTask(
 }
 
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
-  const approval = mutateState(config.lane, (state) => {
+  const approval = await mutateState(config.lane, (state) => {
     const item = state.approvals.find((candidate) => candidate.id === approvalId);
     if (!item) throw new Error(`Approval not found: ${approvalId}`);
     if (item.status !== "pending") throw new Error(`Approval is already ${item.status}`);
@@ -248,7 +248,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
     writeFileSync(target, String(approval.payload.content));
-    mutateState(config.lane, (state) => {
+    await mutateState(config.lane, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "file.write",
@@ -272,7 +272,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     if (!before.includes(oldText)) throw new Error(`Patch target text no longer exists: ${approval.payload.path}`);
     const after = before.replace(oldText, newText);
     writeFileSync(target, after);
-    mutateState(config.lane, (state) => {
+    await mutateState(config.lane, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "file.patch",
@@ -299,7 +299,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
     const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     clearTimeout(timeout);
-    mutateState(config.lane, (state) => {
+    await mutateState(config.lane, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "terminal.exec",

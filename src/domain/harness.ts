@@ -31,10 +31,10 @@ export function createEvidenceBundle(config: RuntimeConfig) {
   return { ok: true, path: outPath, taskCount: taskIds.length, auditEvents: state.audit.length, improvements: state.improvements.length };
 }
 
-export function createSnapshot(config: RuntimeConfig, reason: string) {
+export async function createSnapshot(config: RuntimeConfig, reason: string) {
   mkdirSync(snapshotsDir(config.lane), { recursive: true });
   let snapshotPath = "";
-  const record = mutateState(config.lane, (state) => {
+  const record = await mutateState(config.lane, (state) => {
     snapshotPath = join(snapshotsDir(config.lane), `snapshot-${Date.now()}.json`);
     return createSnapshotRecord(state, { path: snapshotPath, reason });
   });
@@ -43,7 +43,7 @@ export function createSnapshot(config: RuntimeConfig, reason: string) {
   return { ok: true, snapshotId: record.id, path: snapshotPath, reason };
 }
 
-export function restoreSnapshot(config: RuntimeConfig, snapshotId: string) {
+export async function restoreSnapshot(config: RuntimeConfig, snapshotId: string) {
   const current = readState(config.lane);
   const record = current.snapshots.find((item) => item.id === snapshotId);
   if (!record) throw new Error(`Snapshot not found: ${snapshotId}`);
@@ -53,7 +53,7 @@ export function restoreSnapshot(config: RuntimeConfig, snapshotId: string) {
     throw new Error(`Snapshot lane mismatch: expected ${config.lane}`);
   }
   writeState(config.lane, parsed.state);
-  mutateState(config.lane, (state) => {
+  await mutateState(config.lane, (state) => {
     addAudit(state, {
       actor: "user",
       action: "snapshot.restored",

@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../types";
 import { addAudit, createImprovementProposal, createJob, createMemory, createSkill, mutateState, now, readState, readTrace } from "../state";
 
-export function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
   const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
   const trace = taskId ? readTrace(config.lane, taskId) : [];
   const kind = input.kind === "skill" || input.kind === "job" ? input.kind : "memory";
@@ -20,7 +20,7 @@ export function proposeImprovement(config: RuntimeConfig, input: Record<string, 
   }));
 }
 
-export function reviewImprovement(config: RuntimeConfig, proposalId: string, decision: "approve" | "reject") {
+export async function reviewImprovement(config: RuntimeConfig, proposalId: string, decision: "approve" | "reject") {
   return mutateState(config.lane, (state) => {
     const proposal = state.improvements.find((candidate) => candidate.id === proposalId);
     if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
@@ -59,7 +59,7 @@ export function reviewImprovement(config: RuntimeConfig, proposalId: string, dec
   });
 }
 
-function applyImprovement(state: ReturnType<typeof readState>, proposal: ReturnType<typeof proposeImprovement>): string {
+function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited<ReturnType<typeof proposeImprovement>>): string {
   if (proposal.kind === "memory") {
     const memory = createMemory(state, {
       content: String(proposal.payload.content ?? proposal.title),

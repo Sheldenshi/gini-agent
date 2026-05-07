@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { createEmptyState, createImprovementProposal, createMemory, createPromotionProposal, createTask, decidePromotion, taskCounts } from "./state";
+import { rmSync } from "node:fs";
+import { addAudit, createEmptyState, createImprovementProposal, createMemory, createPromotionProposal, createTask, decidePromotion, mutateState, readState, taskCounts } from "./state";
 
 describe("state primitives", () => {
   test("creates lane-aware task records", () => {
@@ -60,5 +61,41 @@ describe("state primitives", () => {
     expect(counts.completed).toBe(1);
     expect(counts.waiting_approval).toBe(1);
     expect(counts.failed).toBe(0);
+  });
+
+  test("mutateState serializes concurrent writers per lane", async () => {
+    // Without per-lane serialization, two async tasks that each call
+    // mutateState can interleave their read-modify-write windows on the same
+    // file. The earlier writer's append is silently lost — last writer wins.
+    // The promise-chain queue in store.ts ensures every appended record
+    // survives even when N writers fire in parallel.
+    const root = "/tmp/gini-state-locking-test";
+    const lane = "store-locking" as const;
+    rmSync(`${root}/${lane}`, { recursive: true, force: true });
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+
+    const N = 50;
+    await Promise.all(
+      Array.from({ length: N }, (_unused, index) =>
+        // Wrap with Promise.resolve().then() so each starts on a separate
+        // microtask tick — this is the worst case for an unserialized RMW.
+        Promise.resolve().then(() =>
+          mutateState(lane, (state) => {
+            addAudit(state, {
+              actor: "user",
+              action: "store.locking.test",
+              target: `record-${index}`,
+              risk: "low"
+            });
+          })
+        )
+      )
+    );
+
+    const records = readState(lane).audit.filter((event) => event.action === "store.locking.test");
+    expect(records.length).toBe(N);
+    const targets = new Set(records.map((event) => event.target));
+    expect(targets.size).toBe(N);
   });
 });

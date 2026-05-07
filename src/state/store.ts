@@ -74,11 +74,30 @@ export function writeState(lane: Lane, state: RuntimeState): void {
   renameSync(tempPath, path);
 }
 
-export function mutateState<T>(lane: Lane, fn: (state: RuntimeState) => T): T {
-  const state = readState(lane);
-  const result = fn(state);
-  writeState(lane, state);
-  return result;
+// Per-lane serialization queue. mutateState is async so concurrent callers
+// from independent async tasks (HTTP handlers, scheduler ticks, subagents,
+// messaging bridges) never interleave their read-modify-write windows on the
+// same lane. Single-process per-lane is the deployment model, so an
+// in-process promise chain is sufficient — no file lock or semaphore needed.
+//
+// Reads (readState) stay lock-free because the file is written atomically
+// (writeFileSync to .tmp + renameSync) so a reader either sees the prior
+// state or the next state, never a torn write.
+const laneLocks = new Map<Lane, Promise<unknown>>();
+
+export async function mutateState<T>(lane: Lane, fn: (state: RuntimeState) => T): Promise<T> {
+  const previous = laneLocks.get(lane) ?? Promise.resolve();
+  const next = previous.then(() => {
+    const state = readState(lane);
+    const result = fn(state);
+    writeState(lane, state);
+    return result;
+  });
+  // Store a chained promise that swallows errors so a failed mutation does
+  // not poison the queue for subsequent callers; the original error still
+  // propagates to the caller via the returned `next`.
+  laneLocks.set(lane, next.catch(() => undefined));
+  return next;
 }
 
 export function expirePairingCodes(state: RuntimeState): void {

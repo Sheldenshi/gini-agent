@@ -3,7 +3,7 @@ import type { RuntimeConfig } from "../types";
 import { addAudit, appendEvent, appendTrace, createJob, createJobRun, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 
-export function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
   const intervalSeconds = Math.max(1, Number(input.intervalSeconds ?? 60));
   return mutateState(config.lane, (state) => createJob(state, {
     name: String(input.name ?? "Untitled job"),
@@ -19,16 +19,16 @@ export function createScheduledJob(config: RuntimeConfig, input: Record<string, 
   }));
 }
 
-export function runDueJobs(config: RuntimeConfig): void {
-  const due = mutateState(config.lane, (state) => {
+export async function runDueJobs(config: RuntimeConfig): Promise<void> {
+  const due = await mutateState(config.lane, (state) => {
     const dateNow = Date.now();
     return state.jobs.filter((job) => job.status === "active" && new Date(job.nextRunAt).getTime() <= dateNow);
   });
-  for (const job of due) runJobNow(config, job.id, "schedule");
+  for (const job of due) await runJobNow(config, job.id, "schedule");
 }
 
 export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "schedule" | "manual" | "replay" = "manual") {
-  const { job, run } = mutateState(config.lane, (state) => {
+  const { job, run } = await mutateState(config.lane, (state) => {
     const item = state.jobs.find((candidate) => candidate.id === jobId);
     if (!item) throw new Error(`Job not found: ${jobId}`);
     item.lastRunAt = now();
@@ -41,8 +41,8 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
   });
   if (job.script) return executeScriptJob(config, job.id, run.id, job.script, job.timeoutSeconds);
   const prompt = [job.context.length > 0 ? `Context:\n${job.context.join("\n")}` : "", job.prompt].filter(Boolean).join("\n\n");
-  const task = submitTask(config, prompt, job.id);
-  mutateState(config.lane, (state) => {
+  const task = await submitTask(config, prompt, job.id);
+  await mutateState(config.lane, (state) => {
     const item = state.jobs.find((candidate) => candidate.id === job.id);
     const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
     if (!item || !runItem) return;
@@ -61,7 +61,7 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
   return { jobId, runId: run.id, taskId: task.id };
 }
 
-export function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
+export async function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
   return mutateState(config.lane, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -77,7 +77,7 @@ export function updateJobStatus(config: RuntimeConfig, jobId: string, statusValu
   });
 }
 
-export function updateJob(config: RuntimeConfig, jobId: string, input: Record<string, unknown>) {
+export async function updateJob(config: RuntimeConfig, jobId: string, input: Record<string, unknown>) {
   return mutateState(config.lane, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -97,7 +97,7 @@ export function updateJob(config: RuntimeConfig, jobId: string, input: Record<st
   });
 }
 
-export function removeJob(config: RuntimeConfig, jobId: string) {
+export async function removeJob(config: RuntimeConfig, jobId: string) {
   return mutateState(config.lane, (state) => {
     const index = state.jobs.findIndex((candidate) => candidate.id === jobId);
     if (index < 0) throw new Error(`Job not found: ${jobId}`);
@@ -112,7 +112,7 @@ export function listJobRuns(config: RuntimeConfig, jobId?: string) {
   return jobId ? runs.filter((run) => run.jobId === jobId) : runs;
 }
 
-export function replayJobRun(config: RuntimeConfig, runId: string) {
+export async function replayJobRun(config: RuntimeConfig, runId: string) {
   const run = readState(config.lane).jobRuns.find((candidate) => candidate.id === runId);
   if (!run) throw new Error(`Job run not found: ${runId}`);
   return runJobNow(config, run.jobId, "replay");

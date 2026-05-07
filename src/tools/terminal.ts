@@ -6,7 +6,7 @@ import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import { appendTrace, createApproval, mutateState, now } from "../state";
 import { findTask } from "../agent";
 
-export function requestShell(config: RuntimeConfig, task: Task): Task {
+export async function requestShell(config: RuntimeConfig, task: Task): Promise<Task> {
   const command = task.input.replace(/^shell\s+/i, "").trim();
   return mutateState(config.lane, (state: RuntimeState) => {
     const item = findTask(state, task.id);

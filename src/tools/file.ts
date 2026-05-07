@@ -12,7 +12,7 @@ import {
 } from "../state";
 import { completeLowRiskToolTask, findTask } from "../agent";
 
-export function readFile(config: RuntimeConfig, task: Task): Task {
+export async function readFile(config: RuntimeConfig, task: Task): Promise<Task> {
   const target = task.input.replace(/^read\s+/i, "").trim();
   if (!target) throw new Error("Use: read <relative-path>");
   const path = assertInsideWorkspace(config.workspaceRoot, target);
@@ -23,7 +23,7 @@ export function readFile(config: RuntimeConfig, task: Task): Task {
   return completeLowRiskToolTask(config, task.id, `Read ${target}\n\n${content}`, "file.read", target, { bytes: content.length });
 }
 
-export function listFiles(config: RuntimeConfig, task: Task): Task {
+export async function listFiles(config: RuntimeConfig, task: Task): Promise<Task> {
   const target = task.input.replace(/^list\s+/i, "").trim() || ".";
   const path = assertInsideWorkspace(config.workspaceRoot, target);
   const entries = readdirSync(path)
@@ -37,7 +37,7 @@ export function listFiles(config: RuntimeConfig, task: Task): Task {
   return completeLowRiskToolTask(config, task.id, entries.join("\n") || "No entries.", "file.list", target, { entries: entries.length });
 }
 
-export function searchFiles(config: RuntimeConfig, task: Task): Task {
+export async function searchFiles(config: RuntimeConfig, task: Task): Promise<Task> {
   const [, rawPattern = "", rawDir = "."] = task.input.match(/^find\s+(.+?)(?:\s+in\s+(.+))?$/i) ?? [];
   const pattern = rawPattern.trim();
   if (!pattern) throw new Error("Use: find <pattern> [in relative-dir]");
@@ -54,7 +54,7 @@ export function searchFiles(config: RuntimeConfig, task: Task): Task {
   return completeLowRiskToolTask(config, task.id, matches.join("\n") || "No matches.", "file.search", pattern, { matches: matches.length });
 }
 
-export function requestFileWrite(config: RuntimeConfig, task: Task): Task {
+export async function requestFileWrite(config: RuntimeConfig, task: Task): Promise<Task> {
   const match = task.input.match(/^write\s+(.+?)\s*::\s*([\s\S]+)$/i);
   if (!match) throw new Error("Use: write <relative-path> :: <content>");
   const [, target, content] = match;
@@ -78,7 +78,7 @@ export function requestFileWrite(config: RuntimeConfig, task: Task): Task {
   });
 }
 
-export function requestFilePatch(config: RuntimeConfig, task: Task): Task {
+export async function requestFilePatch(config: RuntimeConfig, task: Task): Promise<Task> {
   const match = task.input.match(/^patch\s+(.+?)\s*::\s*([\s\S]+?)\s*=>\s*([\s\S]+)$/i);
   if (!match) throw new Error("Use: patch <relative-path> :: <old-text> => <new-text>");
   const [, target, oldText, newText] = match;
