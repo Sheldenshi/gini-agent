@@ -29,6 +29,13 @@ function TimelineRow({ record }: { record: TraceRecord }) {
             ? "bg-blue-500"
             : "bg-zinc-500";
   const target = traceTarget(record);
+  // Terminal/code outputs are written to a sibling artifact under the task's
+  // trace dir. The audit/trace records carry the workspace-relative path so
+  // the timeline can surface a "View full output" affordance — without this
+  // link the user would have no UI path to anything past the inline 4KB
+  // excerpt that ships in the audit evidence field.
+  const artifactRelPath = traceArtifactRelPath(record);
+  const truncated = isTerminalTruncated(record);
   return (
     <li className="flex items-start gap-3 rounded-md border border-border bg-card/40 px-2 py-1.5">
       <span className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${tone}`} aria-hidden />
@@ -44,6 +51,12 @@ function TimelineRow({ record }: { record: TraceRecord }) {
         {target ? (
           <p className="truncate font-mono text-[11px] text-muted-foreground">{target}</p>
         ) : null}
+        {artifactRelPath ? (
+          <p className="font-mono text-[11px] text-muted-foreground">
+            Full output: <span className="font-medium text-foreground">{artifactRelPath}</span>
+            {truncated ? <span className="ml-1 text-amber-500">(inline excerpt truncated)</span> : null}
+          </p>
+        ) : null}
       </div>
     </li>
   );
@@ -58,4 +71,15 @@ export function traceTarget(record: TraceRecord): string | null {
     if (typeof value === "string" && value.length > 0) return value;
   }
   return null;
+}
+
+function traceArtifactRelPath(record: TraceRecord): string | null {
+  const data = record.data ?? {};
+  const value = data.artifactRelPath;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function isTerminalTruncated(record: TraceRecord): boolean {
+  const data = record.data ?? {};
+  return data.stdoutTruncated === true || data.stderrTruncated === true;
 }

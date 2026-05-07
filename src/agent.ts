@@ -8,9 +8,11 @@
 // remain here because they are part of the orchestrator's contract with
 // the rest of the runtime.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { spawn } from "bun";
 import type { Approval, RuntimeConfig, RuntimeState, Task } from "./types";
+import { traceDir } from "./paths";
 import {
   addAudit,
   appendLog,
@@ -299,6 +301,14 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
     const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
     clearTimeout(timeout);
+    // Master plan §6.2: outputs may be truncated for at-a-glance display, but
+    // the full logs must be retrievable. The audit `evidence` field keeps the
+    // 4KB excerpt for inline reading (mobile, terminal); the full text is
+    // written to a sibling artifact under the task's trace directory and the
+    // audit + trace point at it so the UI can render "View full output".
+    const artifact = approval.taskId
+      ? writeTerminalArtifact(config.lane, approval.taskId, approval.id, { stdout, stderr })
+      : undefined;
     await mutateState(config.lane, (state) => {
       addAudit(state, {
         actor: "runtime",
@@ -307,12 +317,60 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         risk: "high",
         taskId: approval.taskId,
         approvalId: approval.id,
-        evidence: { exitCode, stdout: stdout.slice(0, 4000), stderr: stderr.slice(0, 4000) }
+        evidence: {
+          exitCode,
+          stdout: stdout.slice(0, 4000),
+          stderr: stderr.slice(0, 4000),
+          stdoutBytes: stdout.length,
+          stderrBytes: stderr.length,
+          stdoutTruncated: stdout.length > 4000,
+          stderrTruncated: stderr.length > 4000,
+          artifactPath: artifact?.path,
+          artifactRelPath: artifact?.relPath
+        }
       });
       if (approval.taskId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
     });
-    if (approval.taskId) appendTrace(config.lane, approval.taskId, { type: "tool", message: "Command executed", data: { command, exitCode } });
+    if (approval.taskId) {
+      appendTrace(config.lane, approval.taskId, {
+        type: "tool",
+        message: "Command executed",
+        data: {
+          command,
+          exitCode,
+          stdoutBytes: stdout.length,
+          stderrBytes: stderr.length,
+          stdoutTruncated: stdout.length > 4000,
+          stderrTruncated: stderr.length > 4000,
+          artifactPath: artifact?.path,
+          artifactRelPath: artifact?.relPath
+        }
+      });
+    }
   }
+}
+
+// Writes the full stdout/stderr for an approved terminal/code execution to a
+// sibling file under the task's trace directory. The audit evidence and the
+// trace record both reference the artifact so a downstream consumer (Tasks
+// timeline, evidence bundle, debugging) can recover the full text even when
+// the inline excerpt is truncated. Returns the absolute path and a workspace-
+// relative path; callers store both so URLs can resolve regardless of which
+// surface is displaying the trace.
+function writeTerminalArtifact(
+  lane: string,
+  taskId: string,
+  approvalId: string,
+  output: { stdout: string; stderr: string }
+): { path: string; relPath: string } {
+  const dir = join(traceDir(lane), taskId);
+  mkdirSync(dir, { recursive: true });
+  const filename = `terminal-${approvalId}.log`;
+  const path = join(dir, filename);
+  // Mark stream boundaries so a single-file artifact is still navigable.
+  const body = `--- stdout (${output.stdout.length} bytes) ---\n${output.stdout}\n--- stderr (${output.stderr.length} bytes) ---\n${output.stderr}\n`;
+  writeFileSync(path, body);
+  return { path, relPath: join("traces", taskId, filename) };
 }
 
 function completeApprovedTask(state: RuntimeState, taskId: string, summary: string, error?: string): void {

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
-import { appendEvent, mutateState, readState } from "./state";
+import { appendEvent, mutateState, readState, readTrace } from "./state";
 import type { RuntimeConfig } from "./types";
 
 describe("runtime api", () => {
@@ -491,6 +491,70 @@ describe("runtime api", () => {
     expect(value.name).toBe("gini-runtime");
     expect(value.lane).toBe(config.lane);
     expect(String(value.message)).toContain("Next.js");
+  });
+
+  test("preserves full terminal stdout in a trace artifact when audit evidence is truncated", async () => {
+    // Master plan §6.2 requires that "outputs are truncated intelligently
+    // with full logs stored." The audit `evidence` field caps stdout/stderr
+    // at 4KB for at-a-glance inline reading, but the full text must remain
+    // retrievable. agent.executeApprovedAction writes a sibling artifact
+    // under the task's trace directory and references it from both the
+    // audit evidence and the trace record.
+    const config = testConfig("terminal-output-preservation");
+    config.workspaceRoot = "/tmp";
+    const handler = createHandler(config);
+
+    // Generate >4KB of stdout to force the inline excerpt to truncate.
+    const command = "yes abcdefghij | head -n 500";
+    const submitted = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: `shell ${command}` })
+    });
+    const detail = await waitForTask(handler, config, submitted.id);
+    expect(detail.task.status).toBe("waiting_approval");
+
+    const approval = readState(config.lane).approvals.find((item) => item.taskId === submitted.id);
+    expect(approval).toBeDefined();
+    await call(handler, config, `/api/approvals/${approval!.id}/approve`, { method: "POST" });
+
+    const finalDetail = await waitForTask(handler, config, submitted.id);
+    expect(finalDetail.task.status).toBe("completed");
+
+    const auditEntry = readState(config.lane).audit.find(
+      (event) => event.action === "terminal.exec" && event.taskId === submitted.id
+    );
+    expect(auditEntry).toBeDefined();
+    const evidence = auditEntry!.evidence as Record<string, unknown>;
+
+    // Inline excerpt is truncated at 4000 bytes for display, but the audit
+    // carries metadata that signals truncation and points at the artifact.
+    expect(typeof evidence.stdout).toBe("string");
+    expect((evidence.stdout as string).length).toBeLessThanOrEqual(4000);
+    expect(evidence.stdoutTruncated).toBe(true);
+    expect(typeof evidence.stdoutBytes).toBe("number");
+    expect(evidence.stdoutBytes as number).toBeGreaterThan(4000);
+    expect(typeof evidence.artifactPath).toBe("string");
+    expect(typeof evidence.artifactRelPath).toBe("string");
+    expect(String(evidence.artifactRelPath)).toContain(`traces/${submitted.id}/terminal-`);
+
+    // The artifact file actually exists and contains the full output.
+    const artifactPath = String(evidence.artifactPath);
+    expect(existsSync(artifactPath)).toBe(true);
+    const body = readFileSync(artifactPath, "utf8");
+    expect(body).toContain("--- stdout");
+    expect(body).toContain("--- stderr");
+    expect(body.length).toBeGreaterThan(4000);
+
+    // The trace record for the executed command also references the artifact
+    // so the Tasks timeline UI can surface a "View full output" affordance.
+    const trace = readTrace(config.lane, submitted.id);
+    const toolRecord = trace.find(
+      (record) => record.type === "tool" && record.message === "Command executed"
+    );
+    expect(toolRecord).toBeDefined();
+    const data = toolRecord!.data as Record<string, unknown>;
+    expect(data.stdoutTruncated).toBe(true);
+    expect(typeof data.artifactRelPath).toBe("string");
   });
 
   test("reports V1 readiness from runtime evidence", async () => {
