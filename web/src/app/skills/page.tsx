@@ -10,7 +10,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useInvalidate, useSkills } from "@/lib/queries";
-import type { SkillRecord } from "@/lib/types";
+import type { SkillRecord } from "@runtime/types";
 
 export default function SkillsPage() {
   const [search, setSearch] = useState("");

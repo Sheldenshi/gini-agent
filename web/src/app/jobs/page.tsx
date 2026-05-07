@@ -15,7 +15,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
-import type { JobRecord, JobRunRecord, Task } from "@/lib/types";
+import type { JobRecord, JobRunRecord, Task } from "@runtime/types";
 
 export default function JobsPage() {
   const jobs = useJobs();

@@ -14,7 +14,8 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useChatSessions, useInvalidate, useState_, useTask, useTasks } from "@/lib/queries";
-import type { ChatSession, Task, TraceRecord } from "@/lib/types";
+import type { Task, TraceRecord } from "@runtime/types";
+import type { ChatSession } from "@/lib/view-types";
 
 const FILTERS = [
   { key: "active", label: "Active", match: (t: Task) => ["queued", "running", "waiting_approval"].includes(t.status) },

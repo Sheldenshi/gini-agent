@@ -8,7 +8,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useConnectors, useInvalidate } from "@/lib/queries";
-import type { ConnectorRecord } from "@/lib/types";
+import type { ConnectorRecord } from "@runtime/types";
 
 export default function ConnectionsPage() {
   const connectors = useConnectors();

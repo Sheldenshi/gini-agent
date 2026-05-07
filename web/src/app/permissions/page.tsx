@@ -9,7 +9,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate } from "@/lib/queries";
-import type { Approval } from "@/lib/types";
+import type { Approval } from "@runtime/types";
 
 export default function PermissionsPage() {
   const approvals = useApprovals();

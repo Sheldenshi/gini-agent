@@ -3,22 +3,24 @@ import { useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-
 import { api } from "@/lib/api";
 import type {
   Approval,
-  ChatMessage,
-  ChatSession,
   ConnectorRecord,
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
   MemoryRecord,
-  ReadinessResult,
   RuntimeEvent,
-  RuntimeStateSnapshot,
   RuntimeStatus,
   SkillRecord,
   Task,
   TraceRecord,
   AuditEvent
-} from "@/lib/types";
+} from "@runtime/types";
+import type {
+  ChatMessage,
+  ChatSession,
+  ReadinessResult,
+  RuntimeStateSnapshot
+} from "@/lib/view-types";
 
 export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
   return useQuery<RuntimeStatus>({

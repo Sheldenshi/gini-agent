@@ -11,7 +11,7 @@ import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { cn } from "@/lib/utils";
 import { useAudit, useEvents, useInvalidate } from "@/lib/queries";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
-import type { RiskLevel, RuntimeEventKind } from "@/lib/types";
+import type { RiskLevel, RuntimeEventKind } from "@runtime/types";
 
 const KIND_OPTIONS: RuntimeEventKind[] = [
   "task",

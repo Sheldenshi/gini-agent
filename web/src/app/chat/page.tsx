@@ -13,7 +13,8 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useChatSession, useChatSessions, useInvalidate } from "@/lib/queries";
-import type { ChatMessage, ChatSession, Task } from "@/lib/types";
+import type { Task } from "@runtime/types";
+import type { ChatMessage, ChatSession } from "@/lib/view-types";
 
 export default function ChatPage() {
   const sessions = useChatSessions();

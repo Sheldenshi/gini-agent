@@ -11,7 +11,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useInvalidate, useMemories } from "@/lib/queries";
-import type { MemoryRecord } from "@/lib/types";
+import type { MemoryRecord } from "@runtime/types";
 
 const SCOPES = ["all", "user", "project", "device", "temporary"] as const;
 
