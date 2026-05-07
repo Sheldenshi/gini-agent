@@ -3,7 +3,7 @@ import type { RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
-import { mobileBootstrap, publicState } from "./api/views";
+import { mobileBootstrap, publicState } from "./domain/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, updateMemory } from "./domain/memory";
