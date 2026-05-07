@@ -389,6 +389,10 @@ export interface MemoryRecord {
   status: MemoryStatus;
   sensitivity: "normal" | "sensitive";
   provenance: string;
+  // Hindsight phase 6: bag for migration breadcrumbs (e.g.
+  // `migratedToUnitId`). Stays optional so old persisted state files don't
+  // break — readState tolerates missing fields.
+  metadata?: Record<string, unknown>;
 }
 
 export interface SkillRecord {

@@ -15,6 +15,7 @@ import { install, status } from "../domain/runtime";
 import { providerHealth } from "../provider";
 import { readState } from "../state";
 import { probeMemoryDb } from "../state/memory-db";
+import { legacyMigrationStatus } from "../domain/memory";
 import { pidPath, projectRoot } from "../paths";
 import { api, auth, url } from "./api";
 
@@ -323,6 +324,13 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   // user (or `gini doctor` consumer) can confirm the schema is in place; phases
   // 2+ will add retain/recall metrics on top of the same probe.
   const memory = probeMemoryDb(config.lane);
+  // Phase 6: legacy MemoryRecord migration progress. Surfaced in doctor so a
+  // user can verify that all eligible rows have been migrated into the
+  // SQLite store before the legacy panel hides itself in the web UI.
+  const legacyMigration = legacyMigrationStatus(state.memories);
+  if (legacyMigration.pending > 0) {
+    recommendations.push(`${legacyMigration.pending} legacy memory rows are not yet migrated. Run \`gini memory migrate\`.`);
+  }
   return {
     ok: true,
     bun: Bun.version,
@@ -337,6 +345,7 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
     tasks: state.tasks.length,
     pendingApprovals: state.approvals.filter((item) => item.status === "pending").length,
     memory,
+    legacyMigration,
     recommendations
   };
 }

@@ -23,3 +23,6 @@ export { reflect, verbalizeProfile, buildReflectSystemMessage } from "./reflect"
 export type { ReflectInput, ReflectOutput } from "./reflect";
 
 export { reinforceOpinionsForUnits, applyVerdict } from "./reinforce";
+
+export { migrateLegacyMemories, migrateIfNeeded, legacyMigrationStatus } from "./migrate";
+export type { MigrationReport } from "./migrate";

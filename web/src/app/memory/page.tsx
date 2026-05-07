@@ -58,20 +58,30 @@ export default function MemoryPage() {
 
   const filtered = (memories.data ?? []).filter((m) => scope === "all" || m.scope === scope);
 
+  // Phase 6: hide the legacy panel once every migratable record carries the
+  // `migratedToUnitId` breadcrumb. Proposed/rejected rows still bring the
+  // legacy panel back so users can curate them in place.
+  const allMemories = memories.data ?? [];
+  const eligibleForMigration = allMemories.filter((m) => m.status === "active" || m.status === "archived");
+  const allMigrated = eligibleForMigration.length > 0 && eligibleForMigration.every((m) => Boolean((m as { metadata?: { migratedToUnitId?: string } }).metadata?.migratedToUnitId));
+  const showLegacy = !allMigrated || allMemories.some((m) => m.status === "proposed" || m.status === "rejected");
+
   return (
     <>
       <PageHeader title="Memory" description="Approve, reject, archive memories with provenance" />
       <div className="flex-1 space-y-6 overflow-auto p-6">
         <HindsightPanel />
 
-        <header>
-          <h2 className="text-lg font-semibold">Legacy memories</h2>
-          <p className="text-xs text-muted-foreground">
-            User-curated MemoryRecord rows. These will be migrated into the Hindsight store in a future release.
-          </p>
-        </header>
+        {showLegacy ? (
+          <>
+            <header>
+              <h2 className="text-lg font-semibold">Legacy memories</h2>
+              <p className="text-xs text-muted-foreground">
+                User-curated MemoryRecord rows. Once every active row is migrated to the Hindsight store this panel hides itself.
+              </p>
+            </header>
 
-        <Card>
+            <Card>
           <CardHeader>
             <CardTitle className="text-sm">Add memory</CardTitle>
             <CardDescription>Active by default. Use proposals from tasks for governed flow.</CardDescription>
@@ -162,6 +172,8 @@ export default function MemoryPage() {
             </TabsContent>
           ))}
         </Tabs>
+          </>
+        ) : null}
       </div>
     </>
   );

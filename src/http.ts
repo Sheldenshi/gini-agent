@@ -6,7 +6,7 @@ import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./domain/views";
 import { checkConnector } from "./domain/connectors";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, recall, reflect, retain, updateMemory } from "./domain/memory";
+import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./domain/memory";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./domain/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
@@ -58,6 +58,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(await createMemoryFromInput(config, await body(request)), 201);
+    }],
+    // Hindsight phase 6: one-time migration trigger.
+    ["POST", /^\/api\/memory\/migrate$/, async () => {
+      const report = await migrateLegacyMemories(config);
+      return json(report);
     }],
     // Hindsight phase 4: reflect pipeline.
     ["POST", /^\/api\/memory\/reflect$/, async (request) => {
