@@ -55,10 +55,10 @@ The V1 local runtime readiness map is documented at:
 
 ## Architecture in one sentence
 
-Gini's **runtime is the gateway** — a single Bun process per lane that owns all state and does all real work. The Next.js web app, the CLI, and the future mobile app are all clients of the same `/api/*` contract.
+Gini's **runtime is the gateway** — a single Bun process per instance that owns all state and does all real work. The Next.js web app, the CLI, and the future mobile app are all clients of the same `/api/*` contract.
 
 ```
-                 GATEWAY (server, one per lane)
+                 GATEWAY (server, one per instance)
                  Bun runtime — state, agent loop, tools
                             ↑
         ┌───────────────────┼───────────────────┐
@@ -73,7 +73,7 @@ See `docs/architecture-overview.md` for the full picture.
 
 This repo now includes a Bun TypeScript v0 implementation of the local runtime trunk:
 
-- lane-aware CLI and runtime
+- instance-aware CLI and runtime
 - authenticated localhost API (the gateway)
 - Next.js + Tailwind + shadcn/ui control plane (BFF for the browser; holds the bearer token server-side)
 - persistent tasks, traces, audit events, approvals, jobs, memories, skills, and demo connectors
@@ -82,7 +82,7 @@ This repo now includes a Bun TypeScript v0 implementation of the local runtime t
 - trace-backed improvement proposals for memory, skill, and job changes
 - evidence bundles for smoke/reviewer agents
 - paired-device auth and mobile bootstrap contracts for the future Expo app
-- lane-local snapshots and promotion proposal records for v2 promotion/rollback workflows
+- instance-local snapshots and promotion proposal records for v2 promotion/rollback workflows
 - Hermes-parity structure for session search, toolsets, subagents, MCP records, messaging bridge records, provider catalog metadata, and read-only import inspection
 - Hermes-inspired memory proposal flow and OpenClaw-inspired connector/skill scaffolding
 
@@ -90,14 +90,14 @@ Run it locally:
 
 ```bash
 bun run gini install
-bun run gini start         # daemon — lane keeps running after the terminal closes
+bun run gini start         # daemon — instance keeps running after the terminal closes
 bun run gini smoke
 ```
 
-Or run a lane in the foreground (lane dies when this terminal exits — use this for coding-agent worktrees):
+Or run a instance in the foreground (instance dies when this terminal exits — use this for coding-agent worktrees):
 
 ```bash
-bun run gini run --lane feature-x
+bun run gini run --instance feature-x
 ```
 
 `start` and `run` both print two URLs:
@@ -107,7 +107,7 @@ url     → runtime (gateway) — the API server
 webUrl  → Next.js control plane — open this in a browser
 ```
 
-For the `dev` lane those default to `http://127.0.0.1:7337` (runtime) and `http://127.0.0.1:3000` (web). Other lanes get their own deterministic ports automatically; both walk forward if the default is busy.
+For the `dev` instance those default to `http://127.0.0.1:7337` (runtime) and `http://127.0.0.1:3000` (web). Other instances get their own deterministic ports automatically; both walk forward if the default is busy.
 
 Common commands:
 
@@ -157,11 +157,11 @@ bun run gini doctor
 
 API keys are read from the environment and are not written to Gini config.
 
-Use lanes for isolated development:
+Use instances for isolated development:
 
 ```bash
-bun run gini --lane sandbox reset
-bun run gini --lane sandbox start
+bun run gini --instance sandbox reset
+bun run gini --instance sandbox start
 ```
 
 Smoke tests are isolated by default:
@@ -170,26 +170,26 @@ Smoke tests are isolated by default:
 bun run gini smoke
 ```
 
-That creates an ephemeral `smoke-...` lane under `/tmp`, chooses a localhost port, runs through the real runtime/API, and stops that runtime afterward. Multiple coding agents can run smoke tests at the same time without sharing the `dev` lane.
+That creates an ephemeral `smoke-...` instance under `/tmp`, chooses a localhost port, runs through the real runtime/API, and stops that runtime afterward. Multiple coding agents can run smoke tests at the same time without sharing the `dev` instance.
 
-For a named persistent test lane, pass explicit roots and a port:
+For a named persistent test instance, pass explicit roots and a port:
 
 ```bash
-bun run gini smoke --lane codex-a --state-root /tmp/gini-codex-a --log-root /tmp/gini-codex-a-logs --port 7601
+bun run gini smoke --instance codex-a --state-root /tmp/gini-codex-a --log-root /tmp/gini-codex-a-logs --port 7601
 ```
 
-By default, Gini stores per-lane state and logs under `~/.gini/`:
+By default, Gini stores per-instance state and logs under `~/.gini/`:
 
 ```text
-~/.gini/lanes/<lane>/       # config, state.json, memory.db, traces, snapshots, workspace
-~/.gini/logs/<lane>/         # rotated runtime logs
-~/.gini/models/              # Transformers.js embedding/reranker model cache (shared across lanes)
+~/.gini/instances/<instance>/       # config, state.json, memory.db, traces, snapshots, workspace
+~/.gini/logs/<instance>/         # rotated runtime logs
+~/.gini/models/              # Transformers.js embedding/reranker model cache (shared across instances)
 ```
 
-To wipe a single lane: `rm -rf ~/.gini/lanes/<lane>`. To wipe every lane while keeping the model cache and logs: `rm -rf ~/.gini/lanes`.
+To wipe a single instance: `rm -rf ~/.gini/instances/<instance>`. To wipe every instance while keeping the model cache and logs: `rm -rf ~/.gini/instances`.
 
 For disposable development or tests, override those roots:
 
 ```bash
-GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --lane sandbox smoke
+GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox smoke
 ```

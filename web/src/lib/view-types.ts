@@ -29,7 +29,7 @@ export type ChatMessage = ChatMessageRecord;
 // RuntimeState; the UI only consumes a subset of fields and treats some
 // records as opaque arrays.
 export interface RuntimeStateSnapshot {
-  lane: string;
+  instance: string;
   tasks: Task[];
   approvals: Approval[];
   audit: AuditEvent[];

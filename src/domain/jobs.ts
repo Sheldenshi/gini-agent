@@ -5,7 +5,7 @@ import { spawn } from "bun";
 
 export async function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
   const intervalSeconds = Math.max(1, Number(input.intervalSeconds ?? 60));
-  return mutateState(config.lane, (state) => createJob(state, {
+  return mutateState(config.instance, (state) => createJob(state, {
     name: String(input.name ?? "Untitled job"),
     prompt: String(input.prompt ?? ""),
     script: typeof input.script === "string" && input.script.trim() ? input.script : undefined,
@@ -20,7 +20,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
 }
 
 export async function runDueJobs(config: RuntimeConfig): Promise<void> {
-  const due = await mutateState(config.lane, (state) => {
+  const due = await mutateState(config.instance, (state) => {
     const dateNow = Date.now();
     return state.jobs.filter((job) => job.status === "active" && new Date(job.nextRunAt).getTime() <= dateNow);
   });
@@ -28,7 +28,7 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 }
 
 export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "schedule" | "manual" | "replay" = "manual") {
-  const { job, run } = await mutateState(config.lane, (state) => {
+  const { job, run } = await mutateState(config.instance, (state) => {
     const item = state.jobs.find((candidate) => candidate.id === jobId);
     if (!item) throw new Error(`Job not found: ${jobId}`);
     item.lastRunAt = now();
@@ -42,7 +42,7 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
   if (job.script) return executeScriptJob(config, job.id, run.id, job.script, job.timeoutSeconds);
   const prompt = [job.context.length > 0 ? `Context:\n${job.context.join("\n")}` : "", job.prompt].filter(Boolean).join("\n\n");
   const task = await submitTask(config, prompt, job.id);
-  await mutateState(config.lane, (state) => {
+  await mutateState(config.instance, (state) => {
     const item = state.jobs.find((candidate) => candidate.id === job.id);
     const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
     if (!item || !runItem) return;
@@ -57,12 +57,12 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
     runItem.summary = "Prompt job spawned task.";
     appendEvent(state, { kind: "job", action: "job.run.completed", target: job.id, jobId: job.id, taskId: task.id, risk: "low", summary: runItem.summary });
   });
-  appendTrace(config.lane, task.id, { type: "job", message: "Job spawned task", data: { jobId, runId: run.id, deliveryTargets: job.deliveryTargets } });
+  appendTrace(config.instance, task.id, { type: "job", message: "Job spawned task", data: { jobId, runId: run.id, deliveryTargets: job.deliveryTargets } });
   return { jobId, runId: run.id, taskId: task.id };
 }
 
 export async function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     job.status = statusValue;
@@ -78,7 +78,7 @@ export async function updateJobStatus(config: RuntimeConfig, jobId: string, stat
 }
 
 export async function updateJob(config: RuntimeConfig, jobId: string, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     if (typeof input.name === "string") job.name = input.name;
@@ -98,7 +98,7 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
 }
 
 export async function removeJob(config: RuntimeConfig, jobId: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const index = state.jobs.findIndex((candidate) => candidate.id === jobId);
     if (index < 0) throw new Error(`Job not found: ${jobId}`);
     const [job] = state.jobs.splice(index, 1);
@@ -108,12 +108,12 @@ export async function removeJob(config: RuntimeConfig, jobId: string) {
 }
 
 export function listJobRuns(config: RuntimeConfig, jobId?: string) {
-  const runs = readState(config.lane).jobRuns;
+  const runs = readState(config.instance).jobRuns;
   return jobId ? runs.filter((run) => run.jobId === jobId) : runs;
 }
 
 export async function replayJobRun(config: RuntimeConfig, runId: string) {
-  const run = readState(config.lane).jobRuns.find((candidate) => candidate.id === runId);
+  const run = readState(config.instance).jobRuns.find((candidate) => candidate.id === runId);
   if (!run) throw new Error(`Job run not found: ${runId}`);
   return runJobNow(config, run.jobId, "replay");
 }
@@ -123,7 +123,7 @@ async function executeScriptJob(config: RuntimeConfig, jobId: string, runId: str
   const timeout = setTimeout(() => proc.kill(), timeoutSeconds * 1000);
   const [stdout, stderr, exitCode] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   clearTimeout(timeout);
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     const run = state.jobRuns.find((candidate) => candidate.id === runId);
     if (!job || !run) throw new Error(`Job or run disappeared: ${jobId}/${runId}`);

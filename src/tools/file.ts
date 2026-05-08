@@ -19,7 +19,7 @@ export async function readFile(config: RuntimeConfig, task: Task): Promise<Task>
   const stat = statSync(path);
   if (!stat.isFile()) throw new Error(`Not a file: ${target}`);
   const content = readFileSync(path, "utf8").slice(0, 12_000);
-  appendTrace(config.lane, task.id, { type: "tool", message: "File read", data: { path: target, bytes: content.length } });
+  appendTrace(config.instance, task.id, { type: "tool", message: "File read", data: { path: target, bytes: content.length } });
   return completeLowRiskToolTask(config, task.id, `Read ${target}\n\n${content}`, "file.read", target, { bytes: content.length });
 }
 
@@ -33,7 +33,7 @@ export async function listFiles(config: RuntimeConfig, task: Task): Promise<Task
       const stat = statSync(full);
       return `${stat.isDirectory() ? "dir " : "file"} ${relative(config.workspaceRoot, full)}`;
     });
-  appendTrace(config.lane, task.id, { type: "tool", message: "Directory listed", data: { path: target, entries: entries.length } });
+  appendTrace(config.instance, task.id, { type: "tool", message: "Directory listed", data: { path: target, entries: entries.length } });
   return completeLowRiskToolTask(config, task.id, entries.join("\n") || "No entries.", "file.list", target, { entries: entries.length });
 }
 
@@ -50,7 +50,7 @@ export async function searchFiles(config: RuntimeConfig, task: Task): Promise<Ta
     const line = content.split(/\r?\n/).findIndex((value) => value.toLowerCase().includes(pattern.toLowerCase()));
     if (line >= 0) matches.push(`${relative(config.workspaceRoot, file)}:${line + 1}`);
   }
-  appendTrace(config.lane, task.id, { type: "tool", message: "Files searched", data: { pattern, dir: rawDir, matches: matches.length } });
+  appendTrace(config.instance, task.id, { type: "tool", message: "Files searched", data: { pattern, dir: rawDir, matches: matches.length } });
   return completeLowRiskToolTask(config, task.id, matches.join("\n") || "No matches.", "file.search", pattern, { matches: matches.length });
 }
 
@@ -59,7 +59,7 @@ export async function requestFileWrite(config: RuntimeConfig, task: Task): Promi
   if (!match) throw new Error("Use: write <relative-path> :: <content>");
   const [, target, content] = match;
   assertInsideWorkspace(config.workspaceRoot, target);
-  return mutateState(config.lane, (state: RuntimeState) => {
+  return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
     const approval = createApproval(state, {
       taskId: item.id,
@@ -73,7 +73,7 @@ export async function requestFileWrite(config: RuntimeConfig, task: Task): Promi
     item.currentStep = "Waiting for approval";
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for file write", data: { approvalId: approval.id, target } });
+    appendTrace(config.instance, item.id, { type: "approval", message: "Approval requested for file write", data: { approvalId: approval.id, target } });
     return item;
   });
 }
@@ -87,7 +87,7 @@ export async function requestFilePatch(config: RuntimeConfig, task: Task): Promi
   const before = readFileSync(path, "utf8");
   if (!before.includes(oldText)) throw new Error(`Patch target text not found in ${target}`);
   const after = before.replace(oldText, newText);
-  return mutateState(config.lane, (state: RuntimeState) => {
+  return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
     const approval = createApproval(state, {
       taskId: item.id,
@@ -101,7 +101,7 @@ export async function requestFilePatch(config: RuntimeConfig, task: Task): Promi
     item.currentStep = "Waiting for approval";
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for file patch", data: { approvalId: approval.id, target, diff: approval.payload.diff } });
+    appendTrace(config.instance, item.id, { type: "approval", message: "Approval requested for file patch", data: { approvalId: approval.id, target, diff: approval.payload.diff } });
     return item;
   });
 }

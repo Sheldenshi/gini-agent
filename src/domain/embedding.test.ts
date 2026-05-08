@@ -32,9 +32,9 @@ beforeEach(() => {
   closeAllMemoryDbs();
 });
 
-function makeConfig(lane: string): RuntimeConfig {
+function makeConfig(instance: string): RuntimeConfig {
   return {
-    lane,
+    instance,
     port: 0,
     token: "t",
     provider: { name: "echo", model: "gini-echo-v0" },
@@ -46,16 +46,16 @@ function makeConfig(lane: string): RuntimeConfig {
 
 describe("embeddingStatus", () => {
   test("reports the active provider + per-bank model breakdown", () => {
-    const lane = "embed-status";
-    ensureDefaultBank(lane);
-    insertMemoryUnit(lane, {
+    const instance = "embed-status";
+    ensureDefaultBank(instance);
+    insertMemoryUnit(instance, {
       bankId: DEFAULT_BANK_ID,
       text: "alice works at google",
       embedding: new Float32Array(32).fill(0.1),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const status = embeddingStatus(makeConfig(lane));
+    const status = embeddingStatus(makeConfig(instance));
     expect(status.provider.name).toBe("echo");
     expect(status.provider.model).toBe("echo-embed-v0");
     expect(status.byBank.length).toBeGreaterThan(0);
@@ -65,16 +65,16 @@ describe("embeddingStatus", () => {
   });
 
   test("flags model mismatch when a unit was embedded with a different model", () => {
-    const lane = "embed-status-mismatch";
-    ensureDefaultBank(lane);
-    insertMemoryUnit(lane, {
+    const instance = "embed-status-mismatch";
+    ensureDefaultBank(instance);
+    insertMemoryUnit(instance, {
       bankId: DEFAULT_BANK_ID,
       text: "old vector",
       embedding: new Float32Array(1536).fill(0.001),
       embeddingModel: "text-embedding-3-small",
       network: "world"
     });
-    const status = embeddingStatus(makeConfig(lane));
+    const status = embeddingStatus(makeConfig(instance));
     expect(status.provider.name).toBe("echo");
     expect(status.modelMismatch).toBe(true);
   });
@@ -82,18 +82,18 @@ describe("embeddingStatus", () => {
 
 describe("reembedBank", () => {
   test("walks active units, replaces their vectors with the active provider's model, and emits an audit event", async () => {
-    const lane = "embed-reembed";
-    const config = makeConfig(lane);
-    ensureDefaultBank(lane);
+    const instance = "embed-reembed";
+    const config = makeConfig(instance);
+    ensureDefaultBank(instance);
     // Seed two units, one with a stale model, one with no embedding at all.
-    insertMemoryUnit(lane, {
+    insertMemoryUnit(instance, {
       bankId: DEFAULT_BANK_ID,
       text: "alice works at google",
       embedding: new Float32Array(1536).fill(0.001),
       embeddingModel: "text-embedding-3-small",
       network: "world"
     });
-    insertMemoryUnit(lane, {
+    insertMemoryUnit(instance, {
       bankId: DEFAULT_BANK_ID,
       text: "bob works at apple",
       embedding: null,
@@ -107,7 +107,7 @@ describe("reembedBank", () => {
     expect(report.failed).toBe(0);
     expect(report.provider.name).toBe("echo");
 
-    const units = listMemoryUnits(lane, DEFAULT_BANK_ID);
+    const units = listMemoryUnits(instance, DEFAULT_BANK_ID);
     for (const unit of units) {
       expect(unit.embeddingModel).toBe("echo-embed-v0");
       expect(unit.embeddingDim).toBe(32);
@@ -115,17 +115,17 @@ describe("reembedBank", () => {
     }
 
     // Audit event landed.
-    const state = readState(lane);
+    const state = readState(instance);
     const audit = state.audit.find((entry) => entry.action === "embedding.reembed");
     expect(audit).toBeTruthy();
     expect((audit?.evidence as { migrated: number }).migrated).toBe(2);
   });
 
   test("dry run reports counts without touching the rows", async () => {
-    const lane = "embed-reembed-dry";
-    const config = makeConfig(lane);
-    ensureDefaultBank(lane);
-    insertMemoryUnit(lane, {
+    const instance = "embed-reembed-dry";
+    const config = makeConfig(instance);
+    ensureDefaultBank(instance);
+    insertMemoryUnit(instance, {
       bankId: DEFAULT_BANK_ID,
       text: "carol works at amazon",
       embedding: new Float32Array(1536).fill(0.001),
@@ -135,12 +135,12 @@ describe("reembedBank", () => {
     const report = await reembedBank(config, { dryRun: true });
     expect(report.dryRun).toBe(true);
     expect(report.migrated).toBe(1);
-    const [unit] = listMemoryUnits(lane, DEFAULT_BANK_ID);
+    const [unit] = listMemoryUnits(instance, DEFAULT_BANK_ID);
     // Untouched: vector, dim, model are exactly what we inserted.
     expect(unit?.embeddingModel).toBe("text-embedding-3-small");
     expect(unit?.embeddingDim).toBe(1536);
 
-    const state = readState(lane);
+    const state = readState(instance);
     expect(state.audit.find((entry) => entry.action === "embedding.reembed.dry-run")).toBeTruthy();
   });
 });

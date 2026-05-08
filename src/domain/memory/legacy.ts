@@ -2,7 +2,7 @@ import type { RuntimeConfig } from "../../types";
 import { addAudit, createMemory, mutateState, now } from "../../state";
 
 export async function createMemoryFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => createMemory(state, {
+  return mutateState(config.instance, (state) => createMemory(state, {
     content: String(input.content ?? ""),
     scope: normalizeScope(input.scope),
     confidence: Math.max(0, Math.min(1, Number(input.confidence ?? 1))),
@@ -13,7 +13,7 @@ export async function createMemoryFromInput(config: RuntimeConfig, input: Record
 }
 
 export async function updateMemory(config: RuntimeConfig, memoryId: string, statusValue: "active" | "rejected") {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     memory.status = statusValue;
@@ -30,7 +30,7 @@ export async function updateMemory(config: RuntimeConfig, memoryId: string, stat
 }
 
 export async function editMemory(config: RuntimeConfig, memoryId: string, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     if (typeof input.content === "string") memory.content = input.content;
@@ -51,7 +51,7 @@ export async function editMemory(config: RuntimeConfig, memoryId: string, input:
 }
 
 export async function archiveMemory(config: RuntimeConfig, memoryId: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     memory.status = "archived";

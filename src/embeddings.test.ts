@@ -39,7 +39,7 @@ afterEach(() => {
 
 function makeConfig(): RuntimeConfig {
   return {
-    lane: "embed-test",
+    instance: "embed-test",
     port: 0,
     token: "t",
     provider: { name: "echo", model: "gini-echo-v0" },

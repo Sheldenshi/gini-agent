@@ -17,6 +17,6 @@ export async function fetchWeb(config: RuntimeConfig, task: Task): Promise<Task>
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 12_000);
-  appendTrace(config.lane, task.id, { type: "tool", message: "Web page fetched", data: { url: parsed.toString(), status: response.status, bytes: text.length } });
+  appendTrace(config.instance, task.id, { type: "tool", message: "Web page fetched", data: { url: parsed.toString(), status: response.status, bytes: text.length } });
   return completeLowRiskToolTask(config, task.id, text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`, "web.fetch", parsed.toString(), { status: response.status, bytes: text.length });
 }

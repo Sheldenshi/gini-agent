@@ -39,9 +39,9 @@ afterEach(() => {
   clearEchoStructuredResponses();
 });
 
-function makeConfig(lane: string): RuntimeConfig {
+function makeConfig(instance: string): RuntimeConfig {
   return {
-    lane,
+    instance,
     port: 0,
     token: "test",
     provider: { name: "echo", model: "gini-echo-v0" },
@@ -101,10 +101,10 @@ describe("buildReflectSystemMessage bias modulation", () => {
 
 describe("reflect pipeline", () => {
   test("stores opinions returned by the LLM as opinion-network units", async () => {
-    const lane = "reflect-happy";
-    ensureDefaultBank(lane);
+    const instance = "reflect-happy";
+    ensureDefaultBank(instance);
     // Seed at least one fact so recall returns something (not strictly required).
-    insertMemoryUnit(lane, {
+    insertMemoryUnit(instance, {
       text: "Alice ships fast",
       embedding: echoEmbed("Alice ships fast"),
       embeddingModel: "echo-embed-v0",
@@ -116,11 +116,11 @@ describe("reflect pipeline", () => {
         { opinion: "I believe predictability matters more than speed.", confidence: 0.6, reasoning: "preference" }
       ]
     });
-    const result = await reflect(makeConfig(lane), { query: "What do you think of Alice?" });
+    const result = await reflect(makeConfig(instance), { query: "What do you think of Alice?" });
     expect(result.opinions.length).toBe(2);
     expect(result.opinions[0]!.network).toBe("opinion");
     expect(result.opinions[0]!.confidence).toBe(0.8);
-    const opinionUnits = listMemoryUnits(lane, DEFAULT_BANK_ID, { network: "opinion" });
+    const opinionUnits = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "opinion" });
     expect(opinionUnits.length).toBeGreaterThanOrEqual(2);
   });
 });
@@ -138,21 +138,21 @@ describe("reinforcement applyVerdict math", () => {
 
 describe("end-to-end: retain triggers opinion reinforcement", () => {
   test("a stored opinion's confidence shifts when a related fact is retained", async () => {
-    const lane = "reflect-reinforce-e2e";
-    ensureDefaultBank(lane);
+    const instance = "reflect-reinforce-e2e";
+    ensureDefaultBank(instance);
     // Seed the canonical Alice entity and link an opinion to it. This is the
     // shape the agent gets in production: an earlier reflect formed an opinion
     // about Alice and we already linked it via the bank's entity store.
     const { insertEntity, linkUnitToEntity } = await import("../../state");
-    const aliceEntity = insertEntity(lane, { canonicalName: "Alice", entityType: "PERSON" });
-    const opinion = insertMemoryUnit(lane, {
+    const aliceEntity = insertEntity(instance, { canonicalName: "Alice", entityType: "PERSON" });
+    const opinion = insertMemoryUnit(instance, {
       text: "I think Alice is reliable.",
       embedding: echoEmbed("I think Alice is reliable."),
       embeddingModel: "echo-embed-v0",
       network: "opinion",
       confidence: 0.5
     });
-    linkUnitToEntity(lane, opinion.id, aliceEntity.id, "Alice");
+    linkUnitToEntity(instance, opinion.id, aliceEntity.id, "Alice");
     // Stub retain to extract a fact mentioning Alice.
     setEchoStructuredResponse("fact-extraction", {
       facts: [
@@ -164,9 +164,9 @@ describe("end-to-end: retain triggers opinion reinforcement", () => {
     // Stub the assessment LLM call: reinforce.
     setEchoStructuredResponse(`assess:${opinion.id}`, { verdict: "reinforce", reasoning: "consistent shipping" });
 
-    await retain(makeConfig(lane), { text: "Alice shipped on time again.", mentionedAt: "2025-04-10T00:00:00Z" });
+    await retain(makeConfig(instance), { text: "Alice shipped on time again.", mentionedAt: "2025-04-10T00:00:00Z" });
 
-    const opinions = listMemoryUnits(lane, DEFAULT_BANK_ID, { network: "opinion" });
+    const opinions = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "opinion" });
     const refreshed = opinions.find((unit) => unit.id === opinion.id);
     expect(refreshed!.confidence).toBeCloseTo(0.6, 5);
   });
@@ -174,17 +174,17 @@ describe("end-to-end: retain triggers opinion reinforcement", () => {
 
 describe("bank profile CRUD", () => {
   test("updateBank patches columns and persists across reads", () => {
-    const lane = "bank-crud";
-    ensureDefaultBank(lane);
-    const updated = updateBank(lane, DEFAULT_BANK_ID, { skepticism: 5, biasStrength: 0.9, name: "Cynical Gini" });
+    const instance = "bank-crud";
+    ensureDefaultBank(instance);
+    const updated = updateBank(instance, DEFAULT_BANK_ID, { skepticism: 5, biasStrength: 0.9, name: "Cynical Gini" });
     expect(updated!.skepticism).toBe(5);
     expect(updated!.biasStrength).toBe(0.9);
     expect(updated!.name).toBe("Cynical Gini");
   });
   test("updateBank clamps slider values into the legal band", () => {
-    const lane = "bank-clamp";
-    ensureDefaultBank(lane);
-    const updated = updateBank(lane, DEFAULT_BANK_ID, { skepticism: 99, biasStrength: 5 });
+    const instance = "bank-clamp";
+    ensureDefaultBank(instance);
+    const updated = updateBank(instance, DEFAULT_BANK_ID, { skepticism: 99, biasStrength: 5 });
     expect(updated!.skepticism).toBe(5);
     expect(updated!.biasStrength).toBe(1);
   });

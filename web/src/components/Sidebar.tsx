@@ -37,7 +37,7 @@ const NAV = [
   { href: "/settings", label: "Settings", icon: Cog }
 ] as const;
 
-function SidebarBody({ lane, onNavigate }: { lane: string; onNavigate?: () => void }) {
+function SidebarBody({ instance, onNavigate }: { instance: string; onNavigate?: () => void }) {
   const pathname = usePathname();
   const { theme, setTheme } = useTheme();
   const [mounted, setMounted] = useState(false);
@@ -52,7 +52,7 @@ function SidebarBody({ lane, onNavigate }: { lane: string; onNavigate?: () => vo
           </div>
           <div className="flex flex-col leading-none">
             <span className="text-sm font-semibold">Gini</span>
-            <span className="font-mono text-[10px] text-sidebar-foreground/70">{lane}</span>
+            <span className="font-mono text-[10px] text-sidebar-foreground/70">{instance}</span>
           </div>
         </div>
         {mounted ? (
@@ -93,15 +93,15 @@ function SidebarBody({ lane, onNavigate }: { lane: string; onNavigate?: () => vo
   );
 }
 
-export function Sidebar({ lane }: { lane: string }) {
+export function Sidebar({ instance }: { instance: string }) {
   return (
     <aside className="hidden h-full w-60 shrink-0 border-r border-border md:flex md:flex-col">
-      <SidebarBody lane={lane} />
+      <SidebarBody instance={instance} />
     </aside>
   );
 }
 
-export function MobileTopBar({ lane }: { lane: string }) {
+export function MobileTopBar({ instance }: { instance: string }) {
   const [open, setOpen] = useState(false);
   return (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-background px-3 md:hidden">
@@ -115,7 +115,7 @@ export function MobileTopBar({ lane }: { lane: string }) {
           <SheetHeader className="sr-only">
             <SheetTitle>Navigation</SheetTitle>
           </SheetHeader>
-          <SidebarBody lane={lane} onNavigate={() => setOpen(false)} />
+          <SidebarBody instance={instance} onNavigate={() => setOpen(false)} />
         </SheetContent>
       </Sheet>
       <div className="flex items-center gap-2">
@@ -124,7 +124,7 @@ export function MobileTopBar({ lane }: { lane: string }) {
         </div>
         <div className="flex items-center gap-2 leading-none">
           <span className="text-sm font-semibold">Gini</span>
-          <span className="font-mono text-[10px] text-muted-foreground">{lane}</span>
+          <span className="font-mono text-[10px] text-muted-foreground">{instance}</span>
         </div>
       </div>
     </header>

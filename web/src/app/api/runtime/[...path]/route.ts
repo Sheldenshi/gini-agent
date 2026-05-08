@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { proxyRequest, runtimeLane, runtimeToken, runtimeUrl } from "@/lib/runtime";
+import { proxyRequest, runtimeInstance, runtimeToken, runtimeUrl } from "@/lib/runtime";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,7 +11,7 @@ async function forward(request: NextRequest, params: Promise<{ path: string[] }>
   // the local handler rather than being proxied to the runtime (which has no
   // such endpoint).
   if (path.length === 1 && path[0] === "__healthz") {
-    return Response.json({ ok: true, service: "gini-web", lane: runtimeLane() });
+    return Response.json({ ok: true, service: "gini-web", instance: runtimeInstance() });
   }
   return proxyRequest(request, path, {
     runtimeUrl: runtimeUrl(),

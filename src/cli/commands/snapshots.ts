@@ -18,5 +18,5 @@ export async function snapshot(ctx: CliContext): Promise<void> {
     print(await restoreSnapshot(config, id));
     return;
   }
-  print(readState(config.lane).snapshots);
+  print(readState(config.instance).snapshots);
 }

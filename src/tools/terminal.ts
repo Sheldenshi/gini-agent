@@ -8,7 +8,7 @@ import { findTask } from "../agent";
 
 export async function requestShell(config: RuntimeConfig, task: Task): Promise<Task> {
   const command = task.input.replace(/^shell\s+/i, "").trim();
-  return mutateState(config.lane, (state: RuntimeState) => {
+  return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
     const approval = createApproval(state, {
       taskId: item.id,
@@ -22,7 +22,7 @@ export async function requestShell(config: RuntimeConfig, task: Task): Promise<T
     item.currentStep = "Waiting for approval";
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for terminal command", data: { approvalId: approval.id, command } });
+    appendTrace(config.instance, item.id, { type: "approval", message: "Approval requested for terminal command", data: { approvalId: approval.id, command } });
     return item;
   });
 }

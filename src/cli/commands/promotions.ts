@@ -15,7 +15,7 @@ export async function promotion(ctx: CliContext): Promise<void> {
         candidateRef,
         evidencePath,
         summary: summaryParts.join(" ") || `Promote candidate ${candidateRef}`,
-        rollbackPlan: "Create a lane snapshot before promotion and restore it if verification fails."
+        rollbackPlan: "Create a instance snapshot before promotion and restore it if verification fails."
       })
     }));
     return;

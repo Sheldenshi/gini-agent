@@ -3,7 +3,7 @@ import { readState } from "../state";
 import { providerCatalog } from "../provider";
 
 export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks: ParityCheck[] } {
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   const checks: ParityCheck[] = [
     check("cli", "CLI workflow", true, ["install/start/status/task commands exist"], "pass"),
     check("events", "Runtime event stream", true, [`${state.events.length} events`, "events API feeds CLI/mobile/watch surfaces"], "pass"),

@@ -108,7 +108,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
   const bundle = createEvidenceBundle(config);
   print({
     ok: true,
-    lane: config.lane,
+    instance: config.instance,
     ephemeral,
     stateRoot: config.stateRoot,
     logRoot: config.logRoot,

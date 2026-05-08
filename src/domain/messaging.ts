@@ -6,7 +6,7 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
   const name = String(input.name ?? "");
   const kind = String(input.kind ?? "demo");
   if (!name) throw new Error("Messaging bridge name is required.");
-  return mutateState(config.lane, (state) => createMessagingBridgeRecord(state, {
+  return mutateState(config.instance, (state) => createMessagingBridgeRecord(state, {
     name,
     kind,
     deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : []
@@ -14,7 +14,7 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
 }
 
 export async function checkMessagingBridge(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const bridge = state.messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
     if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
     bridge.lastHealthAt = now();
@@ -40,19 +40,19 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
 }
 
 export function listMessagingMessages(config: RuntimeConfig, bridgeId?: string) {
-  const messages = readState(config.lane).messagingMessages;
+  const messages = readState(config.instance).messagingMessages;
   return bridgeId ? messages.filter((message) => message.bridgeId === bridgeId) : messages;
 }
 
 export async function receiveMessagingInput(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
-  const bridge = readState(config.lane).messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
+  const bridge = readState(config.instance).messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
   if (bridge.status !== "configured") throw new Error(`Messaging bridge is not configured: ${idOrName}`);
   const text = String(input.text ?? "").trim();
   if (!text) throw new Error("Inbound message text is required.");
   const target = String(input.target ?? "local");
   const task = await submitTask(config, text);
-  return mutateState(config.lane, (state) => createMessagingMessageRecord(state, {
+  return mutateState(config.instance, (state) => createMessagingMessageRecord(state, {
     bridgeId: bridge.id,
     direction: "inbound",
     status: "received",
@@ -63,7 +63,7 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
 }
 
 export async function sendMessagingOutput(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const bridge = state.messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
     if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
     const text = String(input.text ?? "").trim();
@@ -91,7 +91,7 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
 }
 
 export async function disableMessagingBridge(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const bridge = state.messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
     if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
     bridge.status = "disabled";

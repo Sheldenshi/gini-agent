@@ -1,4 +1,4 @@
-import { runtimeLane } from "@/lib/runtime";
+import { runtimeInstance } from "@/lib/runtime";
 
 // This route exists so the CLI can probe a Next.js-specific marker rather
 // than trusting that any HTTP server on the chosen port is ours. The CLI
@@ -11,6 +11,6 @@ export function GET(): Response {
   return Response.json({
     ok: true,
     service: "gini-web",
-    lane: runtimeLane()
+    instance: runtimeInstance()
   });
 }

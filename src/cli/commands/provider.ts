@@ -19,8 +19,8 @@ export async function provider(ctx: CliContext): Promise<void> {
       name,
       model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.4" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : "gpt-5.4-mini")
     });
-    writeFileSync(configPath(config.lane), `${JSON.stringify(config, null, 2)}\n`);
-    print({ updated: true, provider: providerHealth(config), configPath: configPath(config.lane) });
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    print({ updated: true, provider: providerHealth(config), configPath: configPath(config.instance) });
     return;
   }
   if (sub === "catalog") {

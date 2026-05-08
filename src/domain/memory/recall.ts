@@ -86,8 +86,8 @@ export interface RecallOutput {
 }
 
 export async function recall(config: RuntimeConfig, input: RecallInput): Promise<RecallOutput> {
-  const lane = config.lane;
-  ensureDefaultBank(lane);
+  const instance = config.instance;
+  ensureDefaultBank(instance);
   const bankId = input.bankId ?? DEFAULT_BANK_ID;
   const tokenBudget = input.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
 
@@ -99,11 +99,11 @@ export async function recall(config: RuntimeConfig, input: RecallInput): Promise
   // is scoped to the active provider's model — vectors from other models
   // live in a different space, so a cross-model cosine is meaningless.
   const [semanticHits, bm25Hits, temporalHits] = await Promise.all([
-    runSemanticChannel(lane, bankId, queryVector ?? null, embedProvider.model, input.network),
-    Promise.resolve(runBm25Channel(lane, bankId, input.query, input.network)),
-    Promise.resolve(runTemporalChannel(lane, bankId, input.query, input.reference, input.network))
+    runSemanticChannel(instance, bankId, queryVector ?? null, embedProvider.model, input.network),
+    Promise.resolve(runBm25Channel(instance, bankId, input.query, input.network)),
+    Promise.resolve(runTemporalChannel(instance, bankId, input.query, input.reference, input.network))
   ]);
-  const graphHits = runGraphChannel(lane, semanticHits.slice(0, GRAPH_SEED_K).map((entry) => entry.unit.id));
+  const graphHits = runGraphChannel(instance, semanticHits.slice(0, GRAPH_SEED_K).map((entry) => entry.unit.id));
 
   // 3. RRF fuse.
   const fused = fuseRrf({
@@ -133,11 +133,11 @@ export async function recall(config: RuntimeConfig, input: RecallInput): Promise
   // 6. Bump usage counters for the units we actually surfaced.
   const surfaceTime = new Date().toISOString();
   for (const entry of packed) {
-    updateMemoryUnitStats(lane, entry.unit.id, { lastUsedAt: surfaceTime, bumpUsageCount: true });
+    updateMemoryUnitStats(instance, entry.unit.id, { lastUsedAt: surfaceTime, bumpUsageCount: true });
   }
 
   if (input.sourceTaskId) {
-    appendTrace(lane, input.sourceTaskId, {
+    appendTrace(instance, input.sourceTaskId, {
       type: "memory",
       message: "recall completed",
       data: {
@@ -166,14 +166,14 @@ interface ChannelHit {
 }
 
 async function runSemanticChannel(
-  lane: string,
+  instance: string,
   bankId: string,
   queryVector: Float32Array | null,
   queryModel: string,
   networks: Network[] | undefined
 ): Promise<ChannelHit[]> {
   if (!queryVector) return [];
-  const db = getMemoryDb(lane);
+  const db = getMemoryDb(instance);
   const networkClause = networks && networks.length > 0
     ? `AND network IN (${networks.map(() => "?").join(",")})`
     : "";
@@ -200,13 +200,13 @@ async function runSemanticChannel(
 }
 
 function runBm25Channel(
-  lane: string,
+  instance: string,
   bankId: string,
   query: string,
   networks: Network[] | undefined
 ): ChannelHit[] {
   if (!query.trim()) return [];
-  const db = getMemoryDb(lane);
+  const db = getMemoryDb(instance);
   const networkClause = networks && networks.length > 0
     ? `AND mu.network IN (${networks.map(() => "?").join(",")})`
     : "";
@@ -290,9 +290,9 @@ function rowToUnit(row: RawUnitRow): MemoryUnit {
 // out to GRAPH_HOPS hops, decaying activation by δ * channel-multiplier per
 // hop. Stops at units below GRAPH_MIN_ACTIVATION. Returns one entry per
 // visited non-seed unit.
-function runGraphChannel(lane: string, seedIds: string[]): ChannelHit[] {
+function runGraphChannel(instance: string, seedIds: string[]): ChannelHit[] {
   if (seedIds.length === 0) return [];
-  const db = getMemoryDb(lane);
+  const db = getMemoryDb(instance);
   // activation map: unitId -> max activation observed so far.
   const activation = new Map<string, number>();
   for (const seedId of seedIds) activation.set(seedId, 1.0);
@@ -300,7 +300,7 @@ function runGraphChannel(lane: string, seedIds: string[]): ChannelHit[] {
   let frontier = new Set(seedIds);
   for (let hop = 0; hop < GRAPH_HOPS; hop++) {
     if (frontier.size === 0) break;
-    const links = linksFromMany(lane, [...frontier]);
+    const links = linksFromMany(instance, [...frontier]);
     const nextFrontier = new Set<string>();
     for (const link of links) {
       const sourceActivation = activation.get(link.fromUnit) ?? 0;
@@ -337,7 +337,7 @@ function runGraphChannel(lane: string, seedIds: string[]): ChannelHit[] {
 }
 
 function runTemporalChannel(
-  lane: string,
+  instance: string,
   bankId: string,
   query: string,
   reference: string | undefined,
@@ -346,7 +346,7 @@ function runTemporalChannel(
   const refDate = reference ? new Date(reference) : new Date();
   const range = extractTemporalRange(query, refDate);
   if (!range) return [];
-  const db = getMemoryDb(lane);
+  const db = getMemoryDb(instance);
   const networkClause = networks && networks.length > 0
     ? `AND network IN (${networks.map(() => "?").join(",")})`
     : "";

@@ -1,7 +1,7 @@
-// Lifecycle and lane-admin commands: install, start, stop, status, doctor, reset, run.
+// Lifecycle and instance-admin commands: install, start, stop, status, doctor, reset, run.
 import type { ChildProcess } from "node:child_process";
 import type { CliContext } from "../context";
-import { install, resetLane } from "../../domain/runtime";
+import { install, resetInstance } from "../../domain/runtime";
 import {
   doctor,
   isRunning,
@@ -14,7 +14,7 @@ import { print } from "../output";
 export async function install_(ctx: CliContext): Promise<void> {
   const { config } = ctx;
   install(config);
-  print({ installed: true, lane: config.lane, stateRoot: config.stateRoot, port: config.port });
+  print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
 }
 
 export async function start(ctx: CliContext): Promise<boolean> {
@@ -36,20 +36,20 @@ export async function doctorCmd(ctx: CliContext): Promise<void> {
 }
 
 export function reset(ctx: CliContext): void {
-  resetLane(ctx.config);
-  print({ reset: true, lane: ctx.config.lane, stateRoot: ctx.config.stateRoot });
+  resetInstance(ctx.config);
+  print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 
 // Foreground twin of `start`. Runs the runtime (and optionally Next.js)
 // attached to this CLI process: stdio inherits, no detach, signals tear the
-// children down. Use this from worktrees and CI where the lane should die
+// children down. Use this from worktrees and CI where the instance should die
 // when the launching session ends. `gini start` remains the daemon path.
 export async function runForeground(ctx: CliContext): Promise<void> {
-  // Refuse to attach to a runtime we did not spawn. If the lane is already up
+  // Refuse to attach to a runtime we did not spawn. If the instance is already up
   // (likely a previous `gini start`), our signal handlers cannot govern its
   // lifetime — that's exactly the bug `gini run` was created to avoid.
   if (await isRunning(ctx.config)) {
-    throw new Error(`Lane '${ctx.config.lane}' already has a runtime running. Stop it with \`gini stop --lane ${ctx.config.lane}\` before running in foreground.`);
+    throw new Error(`Instance '${ctx.config.instance}' already has a runtime running. Stop it with \`gini stop --instance ${ctx.config.instance}\` before running in foreground.`);
   }
   // Install signal handlers BEFORE start() so a Ctrl-C during startup still
   // tears down any partially-launched child.
@@ -74,7 +74,7 @@ export async function runForeground(ctx: CliContext): Promise<void> {
       // Stop files written by start()/startWeb(). The pid/port files are not
       // load-bearing for the foreground path (parent owns the children
       // directly), but cleaning them keeps `gini status` from misreporting
-      // a stale lane after we exit.
+      // a stale instance after we exit.
       stopRuntime(ctx.config);
       resolveDone?.();
     }

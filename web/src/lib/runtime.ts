@@ -11,8 +11,8 @@ export function runtimeToken(): string {
   return process.env.GINI_TOKEN ?? "";
 }
 
-export function runtimeLane(): string {
-  return process.env.GINI_LANE ?? "dev";
+export function runtimeInstance(): string {
+  return process.env.GINI_INSTANCE ?? "dev";
 }
 
 export interface ProxyOptions {

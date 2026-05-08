@@ -27,7 +27,7 @@ export interface WebOptions {
   noWeb: boolean;
   // True when the runtime port came from --port or GINI_PORT. Pinned ports
   // strict-fail on collision (the user asked for that exact port; silently
-  // walking would surprise them). Unpinned uses the lane default and walks.
+  // walking would surprise them). Unpinned uses the instance default and walks.
   runtimePortPinned?: boolean;
   // Foreground mode: don't detach/unref children, inherit their stdio so the
   // user sees logs live. Caller (gini run) attaches signal handlers and is
@@ -48,11 +48,11 @@ function readRecordedPort(path: string): number | null {
 }
 
 export function recordedRuntimePort(config: RuntimeConfig): number | null {
-  return readRecordedPort(runtimePortPath(config.lane));
+  return readRecordedPort(runtimePortPath(config.instance));
 }
 
 export function recordedWebPort(config: RuntimeConfig): number | null {
-  return readRecordedPort(webPortPath(config.lane));
+  return readRecordedPort(webPortPath(config.instance));
 }
 
 export async function start(config: RuntimeConfig, options: WebOptions): Promise<{ runtimeStarted: boolean; banner: Record<string, unknown>; children: ForegroundChildren }> {
@@ -70,15 +70,15 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     }
     config.port = claimedPort;
     install(config);
-    writeFileSync(runtimePortPath(config.lane), String(config.port));
+    writeFileSync(runtimePortPath(config.instance), String(config.port));
     // Foreground mode keeps the child attached to the CLI: no detached process
     // group, no unref, and stdio inherits so the user sees runtime logs live.
     // Daemon mode (gini start) preserves the original detach + ignore stdio.
-    const child = spawn(process.execPath, ["run", "src/server.ts", "--lane", config.lane], {
+    const child = spawn(process.execPath, ["run", "src/server.ts", "--instance", config.instance], {
       cwd: process.cwd(),
       detached: !foreground,
       stdio: foreground ? "inherit" : "ignore",
-      env: { ...process.env, GINI_LANE: config.lane, GINI_PORT: String(config.port) }
+      env: { ...process.env, GINI_INSTANCE: config.instance, GINI_PORT: String(config.port) }
     });
     if (!foreground) child.unref();
     if (foreground) children.runtime = child;
@@ -94,7 +94,7 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     // status/stop/doctor read the live value.
     const recorded = recordedRuntimePort(config);
     if (recorded !== config.port) {
-      writeFileSync(runtimePortPath(config.lane), String(config.port));
+      writeFileSync(runtimePortPath(config.instance), String(config.port));
     }
   }
   // Web launch runs whether or not the runtime was already up — a user whose
@@ -116,7 +116,7 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
             started: runtimeStarted,
             running: alreadyRunning,
             url: url(config),
-            lane: config.lane,
+            instance: config.instance,
             webError: error instanceof Error ? error.message : String(error)
           },
           children
@@ -125,8 +125,8 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     }
   }
   const banner: Record<string, unknown> = runtimeStarted
-    ? { started: true, url: url(config), lane: config.lane }
-    : { running: true, url: url(config), lane: config.lane };
+    ? { started: true, url: url(config), instance: config.instance }
+    : { running: true, url: url(config), instance: config.instance };
   if (webUrlValue) banner.webUrl = webUrlValue;
   if (foreground) banner.foreground = true;
   return { runtimeStarted, banner, children };
@@ -149,7 +149,7 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
   const pid = Number(readFileSync(path, "utf8"));
   if (!processAlive(pid)) {
     rmSync(path, { force: true });
-    rmSync(webPortPath(config.lane), { force: true });
+    rmSync(webPortPath(config.instance), { force: true });
     return null;
   }
   const recorded = recordedWebPort(config);
@@ -163,20 +163,20 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
     try {
       const response = await fetch(`${candidateUrl}/api/runtime/__healthz`, { redirect: "manual" });
       if (!response.ok) continue;
-      const body = (await response.json().catch(() => null)) as { ok?: boolean; service?: string; lane?: string } | null;
-      // Lane match is required: the healthz route returns the lane the web
-      // process was spawned for. Without this check, a different lane's web
+      const body = (await response.json().catch(() => null)) as { ok?: boolean; service?: string; instance?: string } | null;
+      // Instance match is required: the healthz route returns the instance the web
+      // process was spawned for. Without this check, a different instance's web
       // (or a stray Gini web from a previous session) is treated as healthy
-      // for THIS lane — which leads to "running" banners that point at the
+      // for THIS instance — which leads to "running" banners that point at the
       // wrong runtime.
-      if (body && body.ok === true && body.service === "gini-web" && body.lane === config.lane) {
+      if (body && body.ok === true && body.service === "gini-web" && body.instance === config.instance) {
         return candidateUrl;
       }
     } catch { /* try next port */ }
   }
   // Pid is alive but nothing healthy on the expected ports — treat as stale.
   rmSync(path, { force: true });
-  rmSync(webPortPath(config.lane), { force: true });
+  rmSync(webPortPath(config.instance), { force: true });
   return null;
 }
 
@@ -218,13 +218,13 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).
-  // Each lane gets its own `.next-<lane>` build dir. Without this, two
+  // Each instance gets its own `.next-<instance>` build dir. Without this, two
   // parallel `next dev` instances in the same web/ refuse to start: Next.js
   // grabs an exclusive lock at `<distDir>/lock`. The dist dir must stay
   // inside the project (Next.js rejects `../`-style paths), so we sanitize
-  // and namespace per lane. Standalone `bun run dev` still defaults to
+  // and namespace per instance. Standalone `bun run dev` still defaults to
   // `.next` because that env var is unset.
-  const laneSlug = config.lane.replace(/[^a-zA-Z0-9_-]/g, "_");
+  const instanceSlug = config.instance.replace(/[^a-zA-Z0-9_-]/g, "_");
   const foreground = options.foreground === true;
   // Foreground: keep the web child attached and inherit stdio so dev-server
   // logs stream to the user. Daemon (gini start) keeps the historic detached
@@ -237,8 +237,8 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       ...process.env,
       GINI_RUNTIME_URL: url(config),
       GINI_TOKEN: config.token,
-      GINI_LANE: config.lane,
-      GINI_DIST_DIR: `.next-${laneSlug}`,
+      GINI_INSTANCE: config.instance,
+      GINI_DIST_DIR: `.next-${instanceSlug}`,
       PORT: String(port)
     }
   });
@@ -249,10 +249,10 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // Persist the actual port so status/stop/doctor and `existingWebUrl` find
   // it without having to scan a port range. Cleared on stop and on stale-pid
   // detection above.
-  writeFileSync(webPortPath(config.lane), String(port));
+  writeFileSync(webPortPath(config.instance), String(port));
   const webUrl = `http://127.0.0.1:${port}`;
   try {
-    await waitForWebHealthz(webUrl, child.pid, config.lane);
+    await waitForWebHealthz(webUrl, child.pid, config.instance);
     return foreground ? { webUrl, child } : { webUrl };
   } catch (error) {
     // Kill the child group so we don't leak processes on failure. In foreground
@@ -265,7 +265,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       } catch { /* ignore */ }
     }
     rmSync(join(config.stateRoot, "web.pid"), { force: true });
-    rmSync(webPortPath(config.lane), { force: true });
+    rmSync(webPortPath(config.instance), { force: true });
     throw error;
   }
 }
@@ -280,14 +280,14 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
  *    stacks; a port that succeeds on net.createServer can still collide with
  *    something listening on ::.
  *
- * The healthz route returns a marker JSON identifying the runtime+lane. We
+ * The healthz route returns a marker JSON identifying the runtime+instance. We
  * verify both that we get the marker AND that the spawned child PID is still
  * alive — that combination tells us "the server we spawned is the one
  * answering on this port".
  */
-export async function waitForWebHealthz(webUrl: string, childPid: number | undefined, expectedLane: string): Promise<void> {
+export async function waitForWebHealthz(webUrl: string, childPid: number | undefined, expectedInstance: string): Promise<void> {
   const deadline = Date.now() + 30_000;
-  let sawLaneMismatch = false;
+  let sawInstanceMismatch = false;
   while (Date.now() < deadline) {
     if (childPid !== undefined && !processAlive(childPid)) {
       throw new Error(`Next.js process exited before becoming healthy. webUrl=${webUrl}`);
@@ -295,22 +295,22 @@ export async function waitForWebHealthz(webUrl: string, childPid: number | undef
     try {
       const response = await fetch(`${webUrl}/api/runtime/__healthz`, { redirect: "manual" });
       if (response.ok) {
-        const body = await response.json().catch(() => null) as { ok?: boolean; service?: string; lane?: string } | null;
+        const body = await response.json().catch(() => null) as { ok?: boolean; service?: string; instance?: string } | null;
         if (body && body.ok === true && body.service === "gini-web") {
-          // Lane must match the lane we spawned the child with. Mismatch means
-          // we're talking to a different Gini web (different lane on the same
-          // port — e.g. user has lane A's web running and started lane B that
+          // Instance must match the instance we spawned the child with. Mismatch means
+          // we're talking to a different Gini web (different instance on the same
+          // port — e.g. user has instance A's web running and started instance B that
           // bound to a port we then probed). Reject and keep waiting in case
           // the spawned child is still coming up.
-          if (body.lane === expectedLane) return;
-          sawLaneMismatch = true;
+          if (body.instance === expectedInstance) return;
+          sawInstanceMismatch = true;
         }
       }
     } catch { /* keep waiting */ }
     await Bun.sleep(250);
   }
-  if (sawLaneMismatch) {
-    throw new Error(`Next.js healthz on ${webUrl} reports a different lane than expected (${expectedLane}). Another Gini web is using this port.`);
+  if (sawInstanceMismatch) {
+    throw new Error(`Next.js healthz on ${webUrl} reports a different instance than expected (${expectedInstance}). Another Gini web is using this port.`);
   }
   throw new Error(`Next.js did not become healthy within 30s on ${webUrl}.`);
 }
@@ -347,12 +347,12 @@ function probe(port: number, host: string): Promise<boolean> {
 
 export function stopRuntime(config: RuntimeConfig) {
   const webResult = stopWeb(config);
-  const path = pidPath(config.lane);
+  const path = pidPath(config.instance);
   if (!existsSync(path)) {
     // Clean up any orphaned port file even when there's no pidfile — keeps
-    // the lane root tidy across upgrades and aborted starts.
-    rmSync(runtimePortPath(config.lane), { force: true });
-    return { stopped: false, reason: "No pid file", lane: config.lane, web: webResult };
+    // the instance root tidy across upgrades and aborted starts.
+    rmSync(runtimePortPath(config.instance), { force: true });
+    return { stopped: false, reason: "No pid file", instance: config.instance, web: webResult };
   }
   const pid = Number(readFileSync(path, "utf8"));
   // Process already dead → stale pidfile, treat as a successful stop. The
@@ -360,14 +360,14 @@ export function stopRuntime(config: RuntimeConfig) {
   // makes them re-run stop or rm the pidfile by hand.
   if (!processAlive(pid)) {
     rmSync(path, { force: true });
-    rmSync(runtimePortPath(config.lane), { force: true });
-    return { stopped: true, pid, reason: "process already dead", lane: config.lane, web: webResult };
+    rmSync(runtimePortPath(config.instance), { force: true });
+    return { stopped: true, pid, reason: "process already dead", instance: config.instance, web: webResult };
   }
   try {
     process.kill(pid, "SIGTERM");
     rmSync(path, { force: true });
-    rmSync(runtimePortPath(config.lane), { force: true });
-    return { stopped: true, pid, lane: config.lane, web: webResult };
+    rmSync(runtimePortPath(config.instance), { force: true });
+    return { stopped: true, pid, instance: config.instance, web: webResult };
   } catch (error) {
     return { stopped: false, pid, error: error instanceof Error ? error.message : String(error), web: webResult };
   }
@@ -376,13 +376,13 @@ export function stopRuntime(config: RuntimeConfig) {
 function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reason?: string } {
   const path = join(config.stateRoot, "web.pid");
   if (!existsSync(path)) {
-    rmSync(webPortPath(config.lane), { force: true });
+    rmSync(webPortPath(config.instance), { force: true });
     return { stopped: false, reason: "No web pid" };
   }
   const pid = Number(readFileSync(path, "utf8"));
   if (!processAlive(pid)) {
     rmSync(path, { force: true });
-    rmSync(webPortPath(config.lane), { force: true });
+    rmSync(webPortPath(config.instance), { force: true });
     return { stopped: true, pid, reason: "process already dead" };
   }
   let groupKilled = false;
@@ -398,7 +398,7 @@ function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reaso
   }
   try {
     rmSync(path, { force: true });
-    rmSync(webPortPath(config.lane), { force: true });
+    rmSync(webPortPath(config.instance), { force: true });
     return { stopped: true, pid, ...(groupKilled ? { reason: "group SIGTERM" } : {}) };
   } catch (error) {
     return { stopped: false, pid, reason: error instanceof Error ? error.message : String(error) };
@@ -434,7 +434,7 @@ export async function remoteOrLocalStatus(config: RuntimeConfig, options: WebOpt
 
 export async function doctor(config: RuntimeConfig, options: WebOptions) {
   const running = await isRunning(config);
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   const webPidFile = join(config.stateRoot, "web.pid");
   const webPid = existsSync(webPidFile) ? Number(readFileSync(webPidFile, "utf8")) : undefined;
   const webPidAlive = webPid ? processAlive(webPid) : false;
@@ -442,10 +442,10 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   const recommendations: string[] = [];
   if (!running) recommendations.push("Run `bun run gini start` to launch the local runtime.");
   if (running && !webHealthyUrl && !options.noWeb) recommendations.push("Next.js control plane not healthy — re-run `gini start` to relaunch.");
-  // Probe the per-lane SQLite memory store. Phase 1 surfaces row counts so a
+  // Probe the per-instance SQLite memory store. Phase 1 surfaces row counts so a
   // user (or `gini doctor` consumer) can confirm the schema is in place; phases
   // 2+ will add retain/recall metrics on top of the same probe.
-  const memory = probeMemoryDb(config.lane);
+  const memory = probeMemoryDb(config.instance);
   // Phase 6: legacy MemoryRecord migration progress. Surfaced in doctor so a
   // user can verify that all eligible rows have been migrated into the
   // SQLite store before the legacy panel hides itself in the web UI.
@@ -471,22 +471,22 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   return {
     ok: true,
     bun: Bun.version,
-    lane: config.lane,
+    instance: config.instance,
     running,
     stateRoot: config.stateRoot,
     workspaceRoot: config.workspaceRoot,
     port: config.port,
-    // Surface lane defaults vs. the actual recorded port so users can see
-    // when a port walk happened (e.g. another lane already grabbed the
-    // default). `recorded` is null when nothing has been started for this lane.
+    // Surface instance defaults vs. the actual recorded port so users can see
+    // when a port walk happened (e.g. another instance already grabbed the
+    // default). `recorded` is null when nothing has been started for this instance.
     ports: {
       runtime: {
-        default: defaultRuntimePort(config.lane),
+        default: defaultRuntimePort(config.instance),
         configured: config.port,
         recorded: recordedRuntimePort(config)
       },
       web: {
-        default: defaultWebPort(config.lane),
+        default: defaultWebPort(config.instance),
         configured: options.webPort,
         recorded: recordedWebPort(config)
       }

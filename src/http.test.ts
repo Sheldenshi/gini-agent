@@ -20,7 +20,7 @@ describe("runtime api", () => {
     });
 
     const applied = await call(handler, config, `/api/improvements/${proposal.id}/approve`, { method: "POST" });
-    const state = readState(config.lane);
+    const state = readState(config.instance);
 
     expect(applied.status).toBe("applied");
     expect(applied.appliedTargetId).toBeString();
@@ -42,7 +42,7 @@ describe("runtime api", () => {
     });
 
     const rejected = await call(handler, config, `/api/improvements/${proposal.id}/reject`, { method: "POST" });
-    const state = readState(config.lane);
+    const state = readState(config.instance);
 
     expect(rejected.status).toBe("rejected");
     expect(state.memories).toHaveLength(0);
@@ -62,7 +62,7 @@ describe("runtime api", () => {
     const devices = await call(handler, config, "/api/devices");
     const state = await call(handler, config, "/api/state");
 
-    expect(mobile.lane).toBe(config.lane);
+    expect(mobile.instance).toBe(config.instance);
     expect(devices[0].name).toBe("Test phone");
     expect(JSON.stringify(state)).not.toContain("tokenHash");
     expect(JSON.stringify(state)).not.toContain("codeHash");
@@ -101,7 +101,7 @@ describe("runtime api", () => {
 
     expect(rejected.status).toBe("rejected");
     expect(rejected.candidateRef).toBe("commit-abc");
-    expect(readState(config.lane).audit.some((event) => event.action === "promotion.rejected")).toBe(true);
+    expect(readState(config.instance).audit.some((event) => event.action === "promotion.rejected")).toBe(true);
   });
 
   test("supports Hermes-parity control records for search, toolsets, subagents, MCP, messaging, and imports", async () => {
@@ -164,7 +164,7 @@ describe("runtime api", () => {
       body: JSON.stringify({ input: "find Gini in README.md" })
     });
     const findDetail = await waitForTask(handler, config, find.id);
-    const state = readState(config.lane);
+    const state = readState(config.instance);
 
     expect(readDetail.task.status).toBe("completed");
     expect(listDetail.task.summary).toContain("src/agent.ts");
@@ -365,7 +365,7 @@ describe("runtime api", () => {
 
     // Generate more events than the ring buffer holds (1000), so a fabricated
     // earlier id is guaranteed not to be retained.
-    await mutateState(config.lane, (state) => {
+    await mutateState(config.instance, (state) => {
       for (let i = 0; i < 1100; i += 1) {
         appendEvent(state, {
           kind: "runtime",
@@ -445,7 +445,7 @@ describe("runtime api", () => {
       body: JSON.stringify({ input: "patch README.md :: Gini => Gini" })
     });
     const detail = await waitForTask(handler, config, task.id);
-    const approval = readState(config.lane).approvals.find((item) => item.taskId === task.id);
+    const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
 
     expect(edited.content).toBe("edited memory");
     expect(edited.scope).toBe("temporary");
@@ -485,11 +485,11 @@ describe("runtime api", () => {
     const handler = createHandler(config);
 
     const response = await handler(new Request(`http://127.0.0.1:${config.port}/`));
-    const value = (await response.json()) as { name?: string; lane?: string; message?: string };
+    const value = (await response.json()) as { name?: string; instance?: string; message?: string };
 
     expect(response.headers.get("content-type") ?? "").toContain("application/json");
     expect(value.name).toBe("gini-runtime");
-    expect(value.lane).toBe(config.lane);
+    expect(value.instance).toBe(config.instance);
     expect(String(value.message)).toContain("Next.js");
   });
 
@@ -513,14 +513,14 @@ describe("runtime api", () => {
     const detail = await waitForTask(handler, config, submitted.id);
     expect(detail.task.status).toBe("waiting_approval");
 
-    const approval = readState(config.lane).approvals.find((item) => item.taskId === submitted.id);
+    const approval = readState(config.instance).approvals.find((item) => item.taskId === submitted.id);
     expect(approval).toBeDefined();
     await call(handler, config, `/api/approvals/${approval!.id}/approve`, { method: "POST" });
 
     const finalDetail = await waitForTask(handler, config, submitted.id);
     expect(finalDetail.task.status).toBe("completed");
 
-    const auditEntry = readState(config.lane).audit.find(
+    const auditEntry = readState(config.instance).audit.find(
       (event) => event.action === "terminal.exec" && event.taskId === submitted.id
     );
     expect(auditEntry).toBeDefined();
@@ -547,7 +547,7 @@ describe("runtime api", () => {
 
     // The trace record for the executed command also references the artifact
     // so the Tasks timeline UI can surface a "View full output" affordance.
-    const trace = readTrace(config.lane, submitted.id);
+    const trace = readTrace(config.instance, submitted.id);
     const toolRecord = trace.find(
       (record) => record.type === "tool" && record.message === "Command executed"
     );
@@ -598,19 +598,19 @@ async function rawCall(handler: ReturnType<typeof createHandler>, config: Runtim
   return response;
 }
 
-function testConfig(lane: string): RuntimeConfig {
+function testConfig(instance: string): RuntimeConfig {
   const root = "/tmp/gini-http-tests";
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
-  rmSync(`${root}/lanes/${lane}`, { recursive: true, force: true });
+  rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
   return {
-    lane,
+    instance,
     port: 7337,
     token: "test-token",
     provider: { name: "echo", model: "gini-echo-v0" },
     workspaceRoot: "/tmp",
-    stateRoot: `${root}/lanes/${lane}`,
-    logRoot: `${root}-logs/${lane}`
+    stateRoot: `${root}/instances/${instance}`,
+    logRoot: `${root}-logs/${instance}`
   };
 }
 

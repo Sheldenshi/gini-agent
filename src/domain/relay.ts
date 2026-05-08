@@ -2,18 +2,18 @@ import type { RuntimeConfig } from "../types";
 import { addAudit, createNotificationRecord, createRelayRecord, mutateState, now, readState } from "../state";
 
 export function listRelays(config: RuntimeConfig) {
-  return readState(config.lane).relays;
+  return readState(config.instance).relays;
 }
 
 export async function configureRelay(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "local");
   const endpoint = String(input.endpoint ?? "local://localhost");
   const mode = input.mode === "hosted" || input.mode === "lan" ? input.mode : "local-only";
-  return mutateState(config.lane, (state) => createRelayRecord(state, { name, endpoint, mode }));
+  return mutateState(config.instance, (state) => createRelayRecord(state, { name, endpoint, mode }));
 }
 
 export async function checkRelay(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const relay = state.relays.find((item) => item.id === idOrName || item.name === idOrName);
     if (!relay) throw new Error(`Relay not found: ${idOrName}`);
     relay.lastHealthAt = now();
@@ -34,7 +34,7 @@ export async function checkRelay(config: RuntimeConfig, idOrName: string) {
 }
 
 export async function queueNotification(config: RuntimeConfig, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => createNotificationRecord(state, {
+  return mutateState(config.instance, (state) => createNotificationRecord(state, {
     kind: input.kind === "approval" || input.kind === "job" || input.kind === "task" || input.kind === "promotion" ? input.kind : "runtime",
     title: String(input.title ?? "Gini notification"),
     body: String(input.body ?? ""),
@@ -44,7 +44,7 @@ export async function queueNotification(config: RuntimeConfig, input: Record<str
 }
 
 export async function sendQueuedNotifications(config: RuntimeConfig) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     for (const notification of state.notifications.filter((item) => item.status === "queued")) {
       notification.status = "sent";
       notification.sentAt = now();
@@ -63,7 +63,7 @@ export async function sendQueuedNotifications(config: RuntimeConfig) {
 }
 
 export async function acknowledgeNotification(config: RuntimeConfig, notificationId: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const notification = state.notifications.find((item) => item.id === notificationId);
     if (!notification) throw new Error(`Notification not found: ${notificationId}`);
     notification.status = "acknowledged";

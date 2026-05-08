@@ -7,7 +7,7 @@ export function mobileBootstrap(config: RuntimeConfig) {
   const state = publicState(config);
   return {
     runtime: status(config),
-    lane: config.lane,
+    instance: config.instance,
     tasks: state.tasks,
     approvals: state.approvals,
     memories: state.memories,
@@ -35,12 +35,12 @@ export function mobileBootstrap(config: RuntimeConfig) {
 }
 
 export function publicState(config: RuntimeConfig) {
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   return {
     ...state,
     pairingCodes: state.pairingCodes.map((pairing) => ({
       id: pairing.id,
-      lane: pairing.lane,
+      instance: pairing.instance,
       status: pairing.status,
       createdAt: pairing.createdAt,
       expiresAt: pairing.expiresAt,

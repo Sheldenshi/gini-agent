@@ -1,4 +1,4 @@
-export type Lane = "dev" | "sandbox" | "production" | string;
+export type Instance = "dev" | "sandbox" | "production" | string;
 
 export type TaskStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
@@ -68,7 +68,7 @@ export interface ProviderConfig {
 }
 
 export interface RuntimeConfig {
-  lane: Lane;
+  instance: Instance;
   port: number;
   token: string;
   provider: ProviderConfig;
@@ -79,7 +79,7 @@ export interface RuntimeConfig {
 
 export interface RuntimeState {
   version: 1;
-  lane: Lane;
+  instance: Instance;
   createdAt: string;
   updatedAt: string;
   tasks: Task[];
@@ -116,7 +116,7 @@ export interface Task {
   title: string;
   input: string;
   status: TaskStatus;
-  lane: Lane;
+  instance: Instance;
   createdAt: string;
   updatedAt: string;
   currentStep?: string;
@@ -135,7 +135,7 @@ export interface Task {
 
 export interface RuntimeEvent {
   id: string;
-  lane: Lane;
+  instance: Instance;
   at: string;
   kind: RuntimeEventKind;
   action: string;
@@ -149,7 +149,7 @@ export interface RuntimeEvent {
 
 export interface ChatSessionRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   title: string;
   createdAt: string;
   updatedAt: string;
@@ -160,7 +160,7 @@ export interface ChatSessionRecord {
 
 export interface ChatMessageRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   sessionId: string;
   role: ChatMessageRole;
   content: string;
@@ -171,7 +171,7 @@ export interface ChatMessageRecord {
 export interface TraceRecord {
   id: string;
   taskId: string;
-  lane: Lane;
+  instance: Instance;
   at: string;
   type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error";
   message: string;
@@ -180,7 +180,7 @@ export interface TraceRecord {
 
 export interface ToolRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   description: string;
   toolset: string;
@@ -193,7 +193,7 @@ export interface ToolRecord {
 
 export interface ToolsetRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   description: string;
   status: ToolsetStatus;
@@ -205,7 +205,7 @@ export interface ToolsetRecord {
 
 export interface SubagentRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   prompt: string;
   status: SubagentStatus;
@@ -221,7 +221,7 @@ export interface SubagentRecord {
 
 export interface McpServerRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   command: string;
   args: string[];
@@ -236,7 +236,7 @@ export interface McpServerRecord {
 
 export interface MessagingBridgeRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   kind: "telegram" | "discord" | "slack" | "email" | "imessage" | "demo" | string;
   status: MessagingBridgeStatus;
@@ -249,7 +249,7 @@ export interface MessagingBridgeRecord {
 
 export interface MessagingMessageRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   bridgeId: string;
   direction: "inbound" | "outbound";
   status: MessagingMessageStatus;
@@ -264,7 +264,7 @@ export interface MessagingMessageRecord {
 
 export interface ImportReport {
   id: string;
-  lane: Lane;
+  instance: Instance;
   source: ImportSource;
   path: string;
   mode: "inspect";
@@ -277,7 +277,7 @@ export interface ImportReport {
 
 export interface SessionSearchResult {
   id: string;
-  lane: Lane;
+  instance: Instance;
   kind: "task" | "trace" | "memory" | "skill" | "audit";
   score: number;
   title: string;
@@ -301,7 +301,7 @@ export interface ProviderCatalogItem {
 
 export interface ProfileRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   status: ProfileStatus;
   providerName?: ProviderName | "openrouter" | "local";
@@ -323,7 +323,7 @@ export interface ParityCheck {
 
 export interface RelayRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   endpoint: string;
   status: RelayStatus;
@@ -336,7 +336,7 @@ export interface RelayRecord {
 
 export interface NotificationRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   kind: "approval" | "job" | "task" | "runtime" | "promotion";
   title: string;
   body: string;
@@ -351,7 +351,7 @@ export interface NotificationRecord {
 
 export interface AuditEvent {
   id: string;
-  lane: Lane;
+  instance: Instance;
   at: string;
   actor: "user" | "runtime" | "agent" | "system";
   action: string;
@@ -364,7 +364,7 @@ export interface AuditEvent {
 
 export interface Approval {
   id: string;
-  lane: Lane;
+  instance: Instance;
   status: ApprovalStatus;
   createdAt: string;
   updatedAt: string;
@@ -378,7 +378,7 @@ export interface Approval {
 
 export interface MemoryRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   content: string;
   scope: "user" | "project" | "device" | "temporary";
   sourceTaskId?: string;
@@ -397,7 +397,7 @@ export interface MemoryRecord {
 
 export interface SkillRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   description: string;
   trigger: string;
@@ -428,7 +428,7 @@ export interface SkillVersion {
 
 export interface JobRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   prompt: string;
   script?: string;
@@ -454,7 +454,7 @@ export interface JobRecord {
 
 export interface JobRunRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   jobId: string;
   status: JobRunStatus;
   createdAt: string;
@@ -479,7 +479,7 @@ export interface CostRecord {
 
 export interface ConnectorRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   kind: "demo" | "github" | string;
   status: "configured" | "disabled" | "error";
@@ -493,7 +493,7 @@ export interface ConnectorRecord {
 
 export interface ImprovementProposal {
   id: string;
-  lane: Lane;
+  instance: Instance;
   kind: ImprovementKind;
   status: ImprovementStatus;
   title: string;
@@ -508,7 +508,7 @@ export interface ImprovementProposal {
 
 export interface PairingCode {
   id: string;
-  lane: Lane;
+  instance: Instance;
   codeHash: string;
   status: PairingStatus;
   createdAt: string;
@@ -519,7 +519,7 @@ export interface PairingCode {
 
 export interface PairedDevice {
   id: string;
-  lane: Lane;
+  instance: Instance;
   name: string;
   tokenHash: string;
   status: DeviceStatus;
@@ -532,7 +532,7 @@ export interface PairedDevice {
 
 export interface PromotionProposal {
   id: string;
-  lane: Lane;
+  instance: Instance;
   status: PromotionStatus;
   candidateRef: string;
   evidencePath?: string;
@@ -545,7 +545,7 @@ export interface PromotionProposal {
 
 export interface SnapshotRecord {
   id: string;
-  lane: Lane;
+  instance: Instance;
   path: string;
   reason: string;
   createdAt: string;
@@ -555,7 +555,7 @@ export interface SnapshotRecord {
 
 export interface RuntimeStatus {
   ok: boolean;
-  lane: Lane;
+  instance: Instance;
   port: number;
   stateRoot: string;
   pid?: number;

@@ -3,7 +3,7 @@ import { readState } from "../state";
 import { hermesParityChecks } from "./parity";
 
 export function v1Readiness(config: RuntimeConfig) {
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   const parity = hermesParityChecks(config);
   const checks = [
     readiness("runtime_contracts", "Stable API contracts", true, ["/api/tasks", "/api/chat", "/api/events", "/api/parity/hermes"]),
@@ -11,7 +11,7 @@ export function v1Readiness(config: RuntimeConfig) {
     readiness("event_stream", "Event stream", true, [`${state.events.length} recorded events`, "/api/events/stream"]),
     readiness("trace_audit", "Trace/audit substrate", true, [`${state.audit.length} audit events`, "per-task trace files"]),
     readiness("permission_boundary", "Permission enforcement boundary", true, ["file.write", "file.patch", "terminal.exec approvals"]),
-    readiness("lane_state", "Lane-aware state", true, [config.lane, config.stateRoot]),
+    readiness("instance_state", "Instance-aware state", true, [config.instance, config.stateRoot]),
     readiness("providers", "Provider abstraction", true, parity.checks.find((check) => check.id === "providers")?.evidence ?? []),
     readiness("jobs", "Job scheduler and history", true, [`${state.jobs.length} jobs`, `${state.jobRuns.length} job runs`]),
     readiness("memory_skills", "Memory and skill governance", true, [`${state.memories.length} memories`, `${state.skills.length} skills`]),
@@ -22,7 +22,7 @@ export function v1Readiness(config: RuntimeConfig) {
   ];
   return {
     ok: parity.ok && checks.every((check) => check.status === "pass"),
-    lane: config.lane,
+    instance: config.instance,
     parity,
     checks
   };

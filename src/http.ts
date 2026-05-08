@@ -40,24 +40,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/chat\/([^/]+)$/, (_request, params) => json(getChatSession(config, params[0]))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
-    ["GET", /^\/api\/tasks$/, () => json(readState(config.lane).tasks)],
+    ["GET", /^\/api\/tasks$/, () => json(readState(config.instance).tasks)],
     ["POST", /^\/api\/tasks$/, async (request) => json(await submitTask(config, String((await body(request)).input ?? "")), 201)],
     ["GET", /^\/api\/search$/, (_request) => json(searchSessions(config, new URL(_request.url).searchParams.get("q") ?? "", Number(new URL(_request.url).searchParams.get("limit") ?? 20)))],
     ["GET", /^\/api\/tasks\/([^/]+)$/, (_request, params) => {
-      const state = readState(config.lane);
+      const state = readState(config.instance);
       const task = state.tasks.find((item) => item.id === params[0]);
       if (!task) return json({ error: "Task not found" }, 404);
-      return json({ task, trace: readTrace(config.lane, task.id) });
+      return json({ task, trace: readTrace(config.instance, task.id) });
     }],
     ["POST", /^\/api\/tasks\/([^/]+)\/retry$/, async (_request, params) => json(await retryTask(config, params[0]))],
     ["POST", /^\/api\/tasks\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelTask(config, params[0]))],
-    ["GET", /^\/api\/approvals$/, () => json(readState(config.lane).approvals)],
+    ["GET", /^\/api\/approvals$/, () => json(readState(config.instance).approvals)],
     ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
-    ["GET", /^\/api\/audit$/, () => json(readState(config.lane).audit)],
-    ["GET", /^\/api\/events$/, () => json(readState(config.lane).events)],
+    ["GET", /^\/api\/audit$/, () => json(readState(config.instance).audit)],
+    ["GET", /^\/api\/events$/, () => json(readState(config.instance).events)],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
-    ["GET", /^\/api\/memory$/, () => json(readState(config.lane).memories)],
+    ["GET", /^\/api\/memory$/, () => json(readState(config.instance).memories)],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(await createMemoryFromInput(config, await body(request)), 201);
     }],
@@ -116,14 +116,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const url = new URL(request.url);
       const networkParam = url.searchParams.get("network");
       const bankId = url.searchParams.get("bank") ?? DEFAULT_BANK_ID;
-      ensureDefaultBank(config.lane);
+      ensureDefaultBank(config.instance);
       const networks = networkParam
         ? networkParam.split(",").filter((value): value is Network =>
             value === "world" || value === "experience" || value === "opinion" || value === "observation"
           )
         : undefined;
       const limit = Number(url.searchParams.get("limit") ?? 200);
-      const units = listMemoryUnits(config.lane, bankId, {
+      const units = listMemoryUnits(config.instance, bankId, {
         network: networks && networks.length > 0 ? networks : undefined,
         limit
       });
@@ -140,19 +140,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["GET", /^\/api\/reranker\/status$/, () => json(rerankerStatus(config))],
     ["GET", /^\/api\/memory\/banks$/, () => {
-      ensureDefaultBank(config.lane);
-      return json(listBanks(config.lane));
+      ensureDefaultBank(config.instance);
+      return json(listBanks(config.instance));
     }],
     ["GET", /^\/api\/memory\/banks\/([^/]+)$/, (_request, params) => {
-      ensureDefaultBank(config.lane);
-      const bank = getBank(config.lane, params[0]);
+      ensureDefaultBank(config.instance);
+      const bank = getBank(config.instance, params[0]);
       if (!bank) return json({ error: "bank not found" }, 404);
       return json(bank);
     }],
     ["PATCH", /^\/api\/memory\/banks\/([^/]+)$/, async (request, params) => {
-      ensureDefaultBank(config.lane);
+      ensureDefaultBank(config.instance);
       const payload = await body(request);
-      const updated = updateBank(config.lane, params[0], {
+      const updated = updateBank(config.instance, params[0], {
         name: typeof payload.name === "string" ? payload.name : undefined,
         agentName: typeof payload.agentName === "string" ? payload.agentName : undefined,
         background: typeof payload.background === "string" ? payload.background : undefined,
@@ -180,7 +180,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/skills\/([^/]+)\/trust$/, async (_request, params) => json(await setSkillStatus(config, params[0], "trusted"))],
     ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],
     ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, async (_request, params) => json(await rollbackSkill(config, params[0]))],
-    ["GET", /^\/api\/jobs$/, () => json(readState(config.lane).jobs)],
+    ["GET", /^\/api\/jobs$/, () => json(readState(config.instance).jobs)],
     ["POST", /^\/api\/jobs$/, async (request) => {
       return json(await createScheduledJob(config, await body(request)), 201);
     }],
@@ -192,16 +192,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
-    ["GET", /^\/api\/connectors$/, () => json(readState(config.lane).connectors)],
+    ["GET", /^\/api\/connectors$/, () => json(readState(config.instance).connectors)],
     ["POST", /^\/api\/connectors\/([^/]+)\/health$/, async (_request, params) => json(await checkConnector(config, params[0]))],
-    ["GET", /^\/api\/improvements$/, () => json(readState(config.lane).improvements)],
+    ["GET", /^\/api\/improvements$/, () => json(readState(config.instance).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],
     ["POST", /^\/api\/improvements\/([^/]+)\/reject$/, async (_request, params) => json(await reviewImprovement(config, params[0], "reject"))],
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
     ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],
-    ["GET", /^\/api\/promotions$/, () => json(readState(config.lane).promotions)],
+    ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
     ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
@@ -210,7 +210,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
     ["GET", /^\/api\/subagents$/, async () => json(await listSubagents(config))],
     ["POST", /^\/api\/subagents$/, async (request) => json(await spawnSubagent(config, await body(request)), 201)],
-    ["GET", /^\/api\/mcp$/, () => json(readState(config.lane).mcpServers)],
+    ["GET", /^\/api\/mcp$/, () => json(readState(config.instance).mcpServers)],
     ["POST", /^\/api\/mcp$/, async (request) => json(await addMcpServer(config, await body(request)), 201)],
     ["POST", /^\/api\/mcp\/([^/]+)\/health$/, async (_request, params) => json(await checkMcpServer(config, params[0]))],
     ["POST", /^\/api\/mcp\/([^/]+)\/invoke$/, async (request, params) => {
@@ -218,7 +218,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await invokeMcpTool(config, params[0], String(input.toolName ?? ""), input.input && typeof input.input === "object" ? input.input as Record<string, unknown> : {}));
     }],
     ["POST", /^\/api\/mcp\/([^/]+)\/disable$/, async (_request, params) => json(await removeMcpServer(config, params[0]))],
-    ["GET", /^\/api\/messaging$/, () => json(readState(config.lane).messagingBridges)],
+    ["GET", /^\/api\/messaging$/, () => json(readState(config.instance).messagingBridges)],
     ["POST", /^\/api\/messaging$/, async (request) => json(await addMessagingBridge(config, await body(request)), 201)],
     ["GET", /^\/api\/messaging\/messages$/, () => json(listMessagingMessages(config))],
     ["GET", /^\/api\/messaging\/([^/]+)\/messages$/, (_request, params) => json(listMessagingMessages(config, params[0]))],
@@ -235,11 +235,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
     ["POST", /^\/api\/relays$/, async (request) => json(await configureRelay(config, await body(request)), 201)],
     ["POST", /^\/api\/relays\/([^/]+)\/health$/, async (_request, params) => json(await checkRelay(config, params[0]))],
-    ["GET", /^\/api\/notifications$/, () => json(readState(config.lane).notifications)],
+    ["GET", /^\/api\/notifications$/, () => json(readState(config.instance).notifications)],
     ["POST", /^\/api\/notifications$/, async (request) => json(await queueNotification(config, await body(request)), 201)],
     ["POST", /^\/api\/notifications\/send$/, async () => json(await sendQueuedNotifications(config))],
     ["POST", /^\/api\/notifications\/([^/]+)\/ack$/, async (_request, params) => json(await acknowledgeNotification(config, params[0]))],
-    ["GET", /^\/api\/imports$/, () => json(readState(config.lane).importReports)],
+    ["GET", /^\/api\/imports$/, () => json(readState(config.instance).importReports)],
     ["POST", /^\/api\/imports\/inspect$/, async (request) => {
       const input = await body(request);
       const source = input.source === "openclaw" ? "openclaw" : "hermes";
@@ -273,7 +273,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
       return json({
         name: "gini-runtime",
-        lane: config.lane,
+        instance: config.instance,
         port: config.port,
         message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
         ui_url_hint: process.env.GINI_WEB_URL ?? null
@@ -326,7 +326,7 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
       // retained window. When the cutoff isn't found, behave as if no
       // Last-Event-ID was supplied — send everything currently retained.
       if (lastEventId) {
-        const ordered = readState(config.lane).events.slice().reverse();
+        const ordered = readState(config.instance).events.slice().reverse();
         const cutoff = ordered.findIndex((event) => event.id === lastEventId);
         if (cutoff >= 0) {
           for (let index = 0; index <= cutoff; index += 1) {
@@ -338,7 +338,7 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
       }
       const send = () => {
         if (closed) return;
-        const events = readState(config.lane).events.slice().reverse();
+        const events = readState(config.instance).events.slice().reverse();
         for (const event of events) {
           if (seen.has(event.id)) continue;
           controller.enqueue(encoder.encode(`id: ${event.id}\nevent: ${event.kind}\ndata: ${JSON.stringify(event)}\n\n`));
@@ -363,5 +363,5 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
 }
 
 export function writePid(config: RuntimeConfig): void {
-  writeFileSync(pidPath(config.lane), String(process.pid));
+  writeFileSync(pidPath(config.instance), String(process.pid));
 }

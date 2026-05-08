@@ -1,7 +1,7 @@
-// CLI entry point. Parses global flags, resolves the lane and runtime
+// CLI entry point. Parses global flags, resolves the instance and runtime
 // config, builds a CliContext, and dispatches to the right command module.
 
-import { defaultWebPort, loadConfig, parseLane } from "../paths";
+import { defaultWebPort, loadConfig, parseInstance } from "../paths";
 import { applyGlobalEnvOverrides, flagValue, hasFlag, stripGlobalArgs } from "./args";
 import type { CliContext } from "./context";
 import { help } from "./output";
@@ -42,9 +42,9 @@ export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
   const cliArgs = stripGlobalArgs(args);
   const command = cliArgs[0] ?? "help";
-  const ephemeralSmoke = command === "smoke" && !hasFlag(args, "--lane") && !process.env.GINI_LANE;
+  const ephemeralSmoke = command === "smoke" && !hasFlag(args, "--instance") && !process.env.GINI_INSTANCE;
   // Smoke always runs headless unless the user explicitly opts in with --web.
-  // Decoupled from the ephemeral-lane decision so `gini smoke --lane <x>` stays headless.
+  // Decoupled from the ephemeral-instance decision so `gini smoke --instance <x>` stays headless.
   const smokeImpliesNoWeb = command === "smoke" && !hasFlag(args, "--web");
   const noWeb = hasFlag(args, "--no-web") || smokeImpliesNoWeb;
   // Snapshot whether the user pinned ports BEFORE applyGlobalEnvOverrides
@@ -53,11 +53,11 @@ export async function run(): Promise<void> {
   const userPinnedRuntimePort = Boolean(flagValue(args, "--port")) || Boolean(process.env.GINI_PORT);
   const userPinnedWebPort = Boolean(flagValue(args, "--web-port")) || Boolean(process.env.GINI_WEB_PORT);
   applyGlobalEnvOverrides(args, ephemeralSmoke);
-  const lane = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseLane(args);
-  const config = loadConfig(lane);
+  const instance = ephemeralSmoke ? `smoke-${process.pid}-${crypto.randomUUID().slice(0, 6)}` : parseInstance(args);
+  const config = loadConfig(instance);
   const webPortFlag = flagValue(args, "--web-port");
   const webPortPinned = userPinnedWebPort;
-  const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? defaultWebPort(lane));
+  const webPort = Number(process.env.GINI_WEB_PORT ?? webPortFlag ?? defaultWebPort(instance));
   const runtimePortPinned = userPinnedRuntimePort;
 
   const ctx: CliContext = {

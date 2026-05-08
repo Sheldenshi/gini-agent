@@ -1,12 +1,12 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
-import type { Lane, RuntimeConfig } from "./types";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
+import type { Instance, RuntimeConfig } from "./types";
 
-// Per-lane default ports. Two installs on the same machine (different lanes,
+// Per-instance default ports. Two installs on the same machine (different instances,
 // same defaults) used to fight over 7337/3000 and the second start would
-// fail. Hashing the lane name picks deterministic per-lane defaults so
-// parallel lanes coexist without manual `--port` wrangling. The dev lane
+// fail. Hashing the instance name picks deterministic per-instance defaults so
+// parallel instances coexist without manual `--port` wrangling. The dev instance
 // stays pinned to the historic 7337/3000 so existing muscle memory and any
 // external tooling pointing at those ports keeps working.
 const DEFAULT_RUNTIME_PORT_DEV = 7337;
@@ -15,7 +15,7 @@ const RUNTIME_PORT_RANGE = 100;
 const WEB_PORT_RANGE = 100;
 
 // FNV-1a 32-bit. Cheap, dependency-free, deterministic. We don't need
-// cryptographic strength — just something that scatters lane names evenly
+// cryptographic strength — just something that scatters instance names evenly
 // across a 100-port window.
 function fnv1a(input: string): number {
   let hash = 0x811c9dc5;
@@ -26,20 +26,20 @@ function fnv1a(input: string): number {
   return hash >>> 0;
 }
 
-export function defaultRuntimePort(lane: Lane): number {
-  if (lane === "dev") return DEFAULT_RUNTIME_PORT_DEV;
-  return DEFAULT_RUNTIME_PORT_DEV + (fnv1a(`runtime:${lane}`) % RUNTIME_PORT_RANGE);
+export function defaultRuntimePort(instance: Instance): number {
+  if (instance === "dev") return DEFAULT_RUNTIME_PORT_DEV;
+  return DEFAULT_RUNTIME_PORT_DEV + (fnv1a(`runtime:${instance}`) % RUNTIME_PORT_RANGE);
 }
 
-export function defaultWebPort(lane: Lane): number {
-  if (lane === "dev") return DEFAULT_WEB_PORT_DEV;
-  return DEFAULT_WEB_PORT_DEV + (fnv1a(`web:${lane}`) % WEB_PORT_RANGE);
+export function defaultWebPort(instance: Instance): number {
+  if (instance === "dev") return DEFAULT_WEB_PORT_DEV;
+  return DEFAULT_WEB_PORT_DEV + (fnv1a(`web:${instance}`) % WEB_PORT_RANGE);
 }
 
-export function parseLane(args = Bun.argv.slice(2)): Lane {
-  const flagIndex = args.indexOf("--lane");
+export function parseInstance(args = Bun.argv.slice(2)): Instance {
+  const flagIndex = args.indexOf("--instance");
   if (flagIndex >= 0 && args[flagIndex + 1]) return args[flagIndex + 1];
-  return process.env.GINI_LANE ?? "dev";
+  return process.env.GINI_INSTANCE ?? "dev";
 }
 
 export function projectRoot(): string {
@@ -58,38 +58,77 @@ export function baseLogRoot(): string {
     : join(homedir(), ".gini", "logs");
 }
 
-// All lane state lives under <baseStateRoot>/lanes/<lane>/ so wiping every
-// lane is a single rm -rf without touching the shared model cache or logs.
-export function lanesRoot(): string {
-  return join(baseStateRoot(), "lanes");
+// All instance state lives under <baseStateRoot>/instances/<instance>/ so wiping every
+// instance is a single rm -rf without touching the shared model cache or logs.
+export function instancesRoot(): string {
+  return join(baseStateRoot(), "instances");
 }
 
-export function laneRoot(lane: Lane): string {
-  return join(lanesRoot(), lane);
+export function instanceRoot(instance: Instance): string {
+  return join(instancesRoot(), instance);
 }
 
-// One-time migration of pre-`lanes/`-prefix lane directories. Old layout was
-// ~/.gini/<lane>/; new layout is ~/.gini/lanes/<lane>/. We detect a lane by
-// the presence of config.json so reserved children (logs, models, lanes
-// itself) are left alone. Idempotent: skips lanes that already moved.
-export function migrateLegacyLanePaths(): void {
+// One-time migration of legacy on-disk layouts to ~/.gini/instances/<name>/.
+// We support two predecessor layouts in a single pass so users coming from
+// either era end up in the same place:
+//
+//   1. ~/.gini/<name>/         (very old, pre-`lanes/`-prefix)
+//   2. ~/.gini/lanes/<name>/   (recent, before the lane→instance rename)
+//
+// Detection: layout (1) directories sit directly under baseStateRoot and
+// carry a config.json (which lets us skip reserved children logs/models/
+// lanes/instances). Layout (2) is a literal `lanes/` directory next to the
+// new `instances/`. Idempotent: skips entries that already moved.
+export function migrateLegacyInstancePaths(): void {
   const root = baseStateRoot();
   if (!existsSync(root)) return;
-  const newLanesDir = lanesRoot();
-  let migrated = 0;
+  const newInstancesDir = instancesRoot();
+  let migratedFromBare = 0;
+  let migratedFromLanes = 0;
+
+  // Layout (1): ~/.gini/<name>/  → ~/.gini/instances/<name>/
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
-    if (entry.name === "lanes" || entry.name === "logs" || entry.name === "models") continue;
+    if (entry.name === "instances" || entry.name === "lanes" || entry.name === "logs" || entry.name === "models") continue;
     const oldDir = join(root, entry.name);
     if (!existsSync(join(oldDir, "config.json"))) continue;
-    const newDir = join(newLanesDir, entry.name);
+    const newDir = join(newInstancesDir, entry.name);
     if (existsSync(newDir)) continue;
-    mkdirSync(newLanesDir, { recursive: true });
+    mkdirSync(newInstancesDir, { recursive: true });
     renameSync(oldDir, newDir);
-    migrated += 1;
+    migratedFromBare += 1;
   }
-  if (migrated > 0) {
-    process.stderr.write(`Migrated ${migrated} lane(s) from ~/.gini/<lane>/ to ~/.gini/lanes/<lane>/\n`);
+
+  // Layout (2): ~/.gini/lanes/<name>/  → ~/.gini/instances/<name>/
+  const oldLanesDir = join(root, "lanes");
+  if (existsSync(oldLanesDir)) {
+    for (const entry of readdirSync(oldLanesDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const oldDir = join(oldLanesDir, entry.name);
+      const newDir = join(newInstancesDir, entry.name);
+      if (existsSync(newDir)) continue;
+      mkdirSync(newInstancesDir, { recursive: true });
+      renameSync(oldDir, newDir);
+      migratedFromLanes += 1;
+    }
+    // Drop the now-empty lanes/ shell. If the directory still has unexpected
+    // residue (e.g. a partially migrated install) we leave it alone so the
+    // user can investigate.
+    try {
+      const remaining = readdirSync(oldLanesDir);
+      if (remaining.length === 0) {
+        rmdirSync(oldLanesDir);
+      }
+    } catch {
+      // Best-effort cleanup; ignore if we can't remove the empty shell.
+    }
+  }
+
+  if (migratedFromBare > 0) {
+    process.stderr.write(`Migrated ${migratedFromBare} instance(s) from ~/.gini/<name>/ to ~/.gini/instances/<name>/\n`);
+  }
+  if (migratedFromLanes > 0) {
+    process.stderr.write(`Migrated ${migratedFromLanes} instance(s) from ~/.gini/lanes/<name>/ to ~/.gini/instances/<name>/\n`);
   }
 }
 
@@ -97,84 +136,84 @@ export function ensureDir(path: string): void {
   mkdirSync(path, { recursive: true });
 }
 
-export function configPath(lane: Lane): string {
-  return join(laneRoot(lane), "config.json");
+export function configPath(instance: Instance): string {
+  return join(instanceRoot(instance), "config.json");
 }
 
-export function statePath(lane: Lane): string {
-  return join(laneRoot(lane), "state.json");
+export function statePath(instance: Instance): string {
+  return join(instanceRoot(instance), "state.json");
 }
 
-export function pidPath(lane: Lane): string {
-  return join(laneRoot(lane), "runtime.pid");
+export function pidPath(instance: Instance): string {
+  return join(instanceRoot(instance), "runtime.pid");
 }
 
 // Recorded port files. Written once `gini start` claims a port (which may
-// differ from the lane default if the default was busy and the walk rolled
+// differ from the instance default if the default was busy and the walk rolled
 // forward). `gini status` / `stop` / `doctor` / `existingWebUrl` read these
 // to know the actual live port without re-probing every default. Cleaned up
 // on stop so a stale value doesn't bleed into the next start.
-export function runtimePortPath(lane: Lane): string {
-  return join(laneRoot(lane), "runtime.port");
+export function runtimePortPath(instance: Instance): string {
+  return join(instanceRoot(instance), "runtime.port");
 }
 
-export function webPortPath(lane: Lane): string {
-  return join(laneRoot(lane), "web.port");
+export function webPortPath(instance: Instance): string {
+  return join(instanceRoot(instance), "web.port");
 }
 
-export function traceDir(lane: Lane): string {
-  return join(laneRoot(lane), "traces");
+export function traceDir(instance: Instance): string {
+  return join(instanceRoot(instance), "traces");
 }
 
-export function logDir(lane: Lane): string {
-  return join(baseLogRoot(), lane);
+export function logDir(instance: Instance): string {
+  return join(baseLogRoot(), instance);
 }
 
-export function skillsDir(lane: Lane): string {
-  return join(laneRoot(lane), "skills");
+export function skillsDir(instance: Instance): string {
+  return join(instanceRoot(instance), "skills");
 }
 
-export function snapshotsDir(lane: Lane): string {
-  return join(laneRoot(lane), "snapshots");
+export function snapshotsDir(instance: Instance): string {
+  return join(instanceRoot(instance), "snapshots");
 }
 
-export function workspaceDir(lane: Lane): string {
+export function workspaceDir(instance: Instance): string {
   return process.env.GINI_WORKSPACE
     ? resolve(process.env.GINI_WORKSPACE)
-    : join(laneRoot(lane), "workspace");
+    : join(instanceRoot(instance), "workspace");
 }
 
-export function defaultConfig(lane: Lane): RuntimeConfig {
+export function defaultConfig(instance: Instance): RuntimeConfig {
   const providerName = process.env.GINI_PROVIDER === "openai" || process.env.GINI_PROVIDER === "codex"
     ? process.env.GINI_PROVIDER
     : "echo";
   return {
-    lane,
-    port: Number(process.env.GINI_PORT ?? defaultRuntimePort(lane)),
+    instance,
+    port: Number(process.env.GINI_PORT ?? defaultRuntimePort(instance)),
     token: crypto.randomUUID(),
     provider: {
       name: providerName,
       model: process.env.GINI_MODEL ?? (providerName === "echo" ? "gini-echo-v0" : providerName === "codex" ? "gpt-5.4" : "gpt-5.4-mini"),
       apiKeyEnv: providerName === "openai" ? "OPENAI_API_KEY" : undefined
     },
-    workspaceRoot: workspaceDir(lane),
-    stateRoot: laneRoot(lane),
-    logRoot: logDir(lane)
+    workspaceRoot: workspaceDir(instance),
+    stateRoot: instanceRoot(instance),
+    logRoot: logDir(instance)
   };
 }
 
-export function loadConfig(lane: Lane): RuntimeConfig {
-  migrateLegacyLanePaths();
-  ensureDir(laneRoot(lane));
-  ensureDir(traceDir(lane));
-  ensureDir(logDir(lane));
-  ensureDir(skillsDir(lane));
-  ensureDir(snapshotsDir(lane));
-  ensureDir(workspaceDir(lane));
+export function loadConfig(instance: Instance): RuntimeConfig {
+  migrateLegacyInstancePaths();
+  ensureDir(instanceRoot(instance));
+  ensureDir(traceDir(instance));
+  ensureDir(logDir(instance));
+  ensureDir(skillsDir(instance));
+  ensureDir(snapshotsDir(instance));
+  ensureDir(workspaceDir(instance));
 
-  const path = configPath(lane);
+  const path = configPath(instance);
   if (!existsSync(path)) {
-    const config = defaultConfig(lane);
+    const config = defaultConfig(instance);
     writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
     return config;
   }
@@ -182,22 +221,27 @@ export function loadConfig(lane: Lane): RuntimeConfig {
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
   const persistedRoot = parsed.workspaceRoot ? resolve(parsed.workspaceRoot) : "";
   const repoRoot = projectRoot();
-  // Detect persisted paths from the pre-`lanes/` layout (anything that lives
-  // directly under baseStateRoot but NOT under lanes/). Re-derive to the new
-  // location instead of keeping the stale absolute path. Also rewrites the
-  // old repo-root default from earlier migrations.
-  const oldStyleLanePrefix = join(baseStateRoot(), lane) + "/";
-  const persistedIsOldStyle = persistedRoot.startsWith(oldStyleLanePrefix) || persistedRoot === join(baseStateRoot(), lane);
+  // Detect persisted paths from any pre-`instances/` layout. Three predecessor
+  // shapes can show up here:
+  //   - ~/.gini/<instance>/...     (very old, pre-`lanes/`-prefix)
+  //   - ~/.gini/lanes/<instance>/  (recent, pre lane→instance rename)
+  //   - <repoRoot>                 (an even older default that pointed at the
+  //                                 checkout itself)
+  // Re-derive to the new location instead of keeping the stale absolute path.
+  const oldBareInstancePrefix = join(baseStateRoot(), instance) + "/";
+  const oldLanesInstancePrefix = join(baseStateRoot(), "lanes", instance) + "/";
+  const persistedIsOldBare = persistedRoot.startsWith(oldBareInstancePrefix) || persistedRoot === join(baseStateRoot(), instance);
+  const persistedIsOldLanes = persistedRoot.startsWith(oldLanesInstancePrefix) || persistedRoot === join(baseStateRoot(), "lanes", instance);
   const persistedIsRepoRoot = persistedRoot === repoRoot;
-  const needsRewrite = persistedIsOldStyle || persistedIsRepoRoot || !persistedRoot;
-  const migratedWorkspaceRoot = needsRewrite ? workspaceDir(lane) : persistedRoot;
+  const needsRewrite = persistedIsOldBare || persistedIsOldLanes || persistedIsRepoRoot || !persistedRoot;
+  const migratedWorkspaceRoot = needsRewrite ? workspaceDir(instance) : persistedRoot;
   const merged: RuntimeConfig = {
-    ...defaultConfig(lane),
+    ...defaultConfig(instance),
     ...parsed,
-    lane,
+    instance,
     workspaceRoot: migratedWorkspaceRoot,
-    stateRoot: laneRoot(lane),
-    logRoot: logDir(lane)
+    stateRoot: instanceRoot(instance),
+    logRoot: logDir(instance)
   };
   if (needsRewrite) writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`);
   return merged;

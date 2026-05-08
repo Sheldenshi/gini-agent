@@ -18,7 +18,7 @@ The smoke output must include:
 - `readinessOk: true`
 - an `evidencePath`
 
-For an installed lane, use:
+For an installed instance, use:
 
 ```sh
 bun run gini parity hermes
@@ -45,7 +45,7 @@ bun run gini evidence
 | Delegation/subagents | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin surface | `gini mcp list/add/health/invoke/disable`, selected exposed tools |
 | Messaging bridge | `gini messaging list/add/health/receive/send/messages/disable`, inbound messages create tasks |
-| Profiles/config equivalent | `gini profiles list/create/use`, lane-aware config |
+| Profiles/config equivalent | `gini profiles list/create/use`, instance-aware config |
 | Import/migration basics | `gini import inspect hermes|openclaw <path>`, read-only by default |
 | Runtime self-improvement | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
@@ -97,19 +97,19 @@ Top-N defaults to 25 (override via `GINI_RERANKER_TOP_N`). The tail of the RRF l
 
 `gini reranker status` and `gini doctor` surface the active provider/model/top-N. `gini smoke` pins `GINI_RERANKER_PROVIDER=echo` so CI never triggers a cross-encoder download.
 
-## Next.js Control Plane
+## Next.js Control Pinstance
 
 The local web app at `web/` is a separate Next.js 16 process that the CLI launches with the runtime. It uses TanStack Query for data, `next-themes` for dark/light, shadcn/ui for primitives, and a server-side catch-all proxy (`web/src/app/api/runtime/[...path]/route.ts`) that forwards `GET/POST/PATCH/DELETE/PUT` to `${GINI_RUNTIME_URL}/api/<path>` with the bearer token attached. Real-time updates use the runtime's `/api/events/stream` SSE endpoint (also proxied). Pages render against live runtime state with empty states where no data exists; no fixture data is shipped.
 
-`bun run gini start` launches the runtime and the Next.js app, prints both URLs, and uses dev mode unless `web/.next-<lane>/BUILD_ID` is present. `bun run gini stop` kills both. `bun run gini smoke` runs with `--no-web` automatically so smoke remains a runtime-only verification path.
+`bun run gini start` launches the runtime and the Next.js app, prints both URLs, and uses dev mode unless `web/.next-<instance>/BUILD_ID` is present. `bun run gini stop` kills both. `bun run gini smoke` runs with `--no-web` automatically so smoke remains a runtime-only verification path.
 
 ## Process lifecycle: `start` vs `run`
 
-There are two ways to launch a lane:
+There are two ways to launch a instance:
 
 - **`gini start`** — daemon mode. The CLI spawns the runtime (and Next.js, unless `--no-web`) detached and `unref`s, so the children survive the launching shell. Use this for a persistent personal agent that should keep working after you close the terminal. Stop it explicitly with `gini stop`.
-- **`gini run`** — foreground mode. The CLI stays attached: child stdio is inherited so logs stream live, no `detached`/`unref`, and `SIGINT`/`SIGTERM`/`SIGHUP` to the CLI tear the children down (5s SIGTERM grace, then SIGKILL). When the launching terminal closes (HUP) or Ctrl-C is pressed, the lane dies with it.
+- **`gini run`** — foreground mode. The CLI stays attached: child stdio is inherited so logs stream live, no `detached`/`unref`, and `SIGINT`/`SIGTERM`/`SIGHUP` to the CLI tear the children down (5s SIGTERM grace, then SIGKILL). When the launching terminal closes (HUP) or Ctrl-C is pressed, the instance dies with it.
 
-Use `gini run` for parallel coding-agent worktrees and CI: each worktree runs its lane in the foreground so the lane is bound to the agent's session — when the agent exits, no orphan runtime is left behind. Both modes share the same port-walking, healthz probing, lane state, and pid/port files; the only differences are stdio + detach + signal handling. `gini stop --lane <X>` still works against a `run`-launched lane if invoked from another terminal.
+Use `gini run` for parallel coding-agent worktrees and CI: each worktree runs its instance in the foreground so the instance is bound to the agent's session — when the agent exits, no orphan runtime is left behind. Both modes share the same port-walking, healthz probing, instance state, and pid/port files; the only differences are stdio + detach + signal handling. `gini stop --instance <X>` still works against a `run`-launched instance if invoked from another terminal.
 
-Ports are auto-allocated per lane so multiple lanes coexist on one machine without manual `--port` wrangling. The default runtime port is `7337 + fnv1a(lane) % 100` and the default web port is `3000 + fnv1a(lane) % 100`; the `dev` lane stays pinned to `7337`/`3000` so existing muscle memory keeps working. If a default is busy (e.g. an unrelated process squats 3000) the CLI walks to the next free port and prints the actual URL it claimed. The chosen ports are persisted in `~/.gini/<lane>/runtime.port` / `web.port` so `gini status`, `gini stop`, and `gini doctor` read them directly without re-probing. Each lane also gets its own `web/.next-<lane>` build dir so two `next dev` instances do not contend on the same Next.js lockfile. Explicit `--port` / `--web-port` (and `GINI_PORT` / `GINI_WEB_PORT`) keep their strict-fail behaviour: a busy pinned port is reported, never silently rolled forward.
+Ports are auto-allocated per instance so multiple instances coexist on one machine without manual `--port` wrangling. The default runtime port is `7337 + fnv1a(instance) % 100` and the default web port is `3000 + fnv1a(instance) % 100`; the `dev` instance stays pinned to `7337`/`3000` so existing muscle memory keeps working. If a default is busy (e.g. an unrelated process squats 3000) the CLI walks to the next free port and prints the actual URL it claimed. The chosen ports are persisted in `~/.gini/<instance>/runtime.port` / `web.port` so `gini status`, `gini stop`, and `gini doctor` read them directly without re-probing. Each instance also gets its own `web/.next-<instance>` build dir so two `next dev` instances do not contend on the same Next.js lockfile. Explicit `--port` / `--web-port` (and `GINI_PORT` / `GINI_WEB_PORT`) keep their strict-fail behaviour: a busy pinned port is reported, never silently rolled forward.

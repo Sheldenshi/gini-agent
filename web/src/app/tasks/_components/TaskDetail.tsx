@@ -62,7 +62,7 @@ export function TaskDetail({
               <div className="space-y-4 pb-6">
                 <div className="grid gap-2 text-xs sm:grid-cols-2">
                   <Field label="Status" value={task.status} mono />
-                  <Field label="Lane" value={task.lane} mono />
+                  <Field label="Instance" value={task.instance} mono />
                   <Field label="Created" value={new Date(task.createdAt).toLocaleString()} />
                   <Field label="Updated" value={new Date(task.updatedAt).toLocaleString()} />
                   {task.currentStep ? <Field label="Current step" value={task.currentStep} mono /> : null}

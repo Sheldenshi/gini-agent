@@ -3,11 +3,11 @@ import { id, now } from "./ids";
 
 export function appendEvent(
   state: RuntimeState,
-  event: Omit<RuntimeEvent, "id" | "lane" | "at">
+  event: Omit<RuntimeEvent, "id" | "instance" | "at">
 ): RuntimeEvent {
   const item: RuntimeEvent = {
     id: id("event"),
-    lane: state.lane,
+    instance: state.instance,
     at: now(),
     ...event
   };
@@ -18,11 +18,11 @@ export function appendEvent(
 
 export function addAudit(
   state: RuntimeState,
-  event: Omit<AuditEvent, "id" | "lane" | "at">
+  event: Omit<AuditEvent, "id" | "instance" | "at">
 ): AuditEvent {
   const audit: AuditEvent = {
     id: id("audit"),
-    lane: state.lane,
+    instance: state.instance,
     at: now(),
     ...event
   };

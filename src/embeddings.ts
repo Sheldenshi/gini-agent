@@ -125,7 +125,7 @@ export function getEmbeddingProvider(config: RuntimeConfig): EmbeddingProvider {
 // Local provider — in-process Transformers.js feature-extraction pipeline.
 // --------------------------------------------------------------------------
 
-// Pipeline factories cached per-model so multiple lanes share a single
+// Pipeline factories cached per-model so multiple instances share a single
 // loaded model. Keyed by model id; value is a promise so concurrent callers
 // during cold start don't double-load.
 type FeatureExtractor = (text: string | string[], options: { pooling: "mean"; normalize: boolean }) => Promise<{ data: Float32Array; dims: number[] }>;

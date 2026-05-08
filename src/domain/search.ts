@@ -4,13 +4,13 @@ import { readState, readTrace } from "../state";
 export function searchSessions(config: RuntimeConfig, query: string, limit = 20): SessionSearchResult[] {
   const needle = query.trim().toLowerCase();
   if (!needle) return [];
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   const results: SessionSearchResult[] = [];
 
   for (const task of state.tasks) {
     addMatch(results, {
       id: task.id,
-      lane: task.lane,
+      instance: task.instance,
       kind: "task",
       title: task.title,
       excerpt: [task.input, task.summary, task.error].filter(Boolean).join("\n"),
@@ -19,10 +19,10 @@ export function searchSessions(config: RuntimeConfig, query: string, limit = 20)
       at: task.updatedAt
     }, needle);
 
-    for (const trace of readTrace(config.lane, task.id)) {
+    for (const trace of readTrace(config.instance, task.id)) {
       addMatch(results, {
         id: trace.id,
-        lane: trace.lane,
+        instance: trace.instance,
         kind: "trace",
         title: trace.message,
         excerpt: `${trace.message}\n${JSON.stringify(trace.data ?? {})}`,
@@ -37,7 +37,7 @@ export function searchSessions(config: RuntimeConfig, query: string, limit = 20)
   for (const memory of state.memories) {
     addMatch(results, {
       id: memory.id,
-      lane: memory.lane,
+      instance: memory.instance,
       kind: "memory",
       title: memory.content.slice(0, 80),
       excerpt: `${memory.content}\n${memory.provenance}`,
@@ -50,7 +50,7 @@ export function searchSessions(config: RuntimeConfig, query: string, limit = 20)
   for (const skill of state.skills) {
     addMatch(results, {
       id: skill.id,
-      lane: skill.lane,
+      instance: skill.instance,
       kind: "skill",
       title: skill.name,
       excerpt: `${skill.description}\n${skill.trigger}\n${skill.steps.join("\n")}`,
@@ -62,7 +62,7 @@ export function searchSessions(config: RuntimeConfig, query: string, limit = 20)
   for (const audit of state.audit) {
     addMatch(results, {
       id: audit.id,
-      lane: audit.lane,
+      instance: audit.instance,
       kind: "audit",
       title: audit.action,
       excerpt: `${audit.action} ${audit.target} ${JSON.stringify(audit.evidence ?? {})}`,

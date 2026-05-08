@@ -1,10 +1,10 @@
-import type { Lane, ProfileRecord, ToolRecord, ToolsetRecord } from "../types";
+import type { Instance, ProfileRecord, ToolRecord, ToolsetRecord } from "../types";
 
-export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
+export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[] {
   return [
     {
       id: "toolset_file",
-      lane,
+      instance,
       name: "file",
       description: "Workspace file read, search, list, and approval-gated write operations.",
       status: "enabled",
@@ -15,7 +15,7 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
     },
     {
       id: "toolset_terminal",
-      lane,
+      instance,
       name: "terminal",
       description: "Approval-gated shell execution with timeout and trace evidence.",
       status: "enabled",
@@ -26,7 +26,7 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
     },
     {
       id: "toolset_memory",
-      lane,
+      instance,
       name: "memory",
       description: "Inspectable memory proposal, activation, retrieval, and rejection flows.",
       status: "enabled",
@@ -37,7 +37,7 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
     },
     {
       id: "toolset_session_search",
-      lane,
+      instance,
       name: "session_search",
       description: "Search prior tasks, traces, memories, skills, and audit events with source links.",
       status: "enabled",
@@ -48,7 +48,7 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
     },
     {
       id: "toolset_delegation",
-      lane,
+      instance,
       name: "delegation",
       description: "Spawn isolated subagent tasks with toolset limits and trace linkage.",
       status: "enabled",
@@ -59,7 +59,7 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
     },
     {
       id: "toolset_mcp",
-      lane,
+      instance,
       name: "mcp",
       description: "Expose selected external MCP tools through configured server records.",
       status: "disabled",
@@ -70,7 +70,7 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
     },
     {
       id: "toolset_messaging",
-      lane,
+      instance,
       name: "messaging",
       description: "Bridge task input and notifications to configured messaging channels.",
       status: "disabled",
@@ -82,10 +82,10 @@ export function defaultToolsets(lane: Lane, at: string): ToolsetRecord[] {
   ];
 }
 
-export function defaultTools(lane: Lane, at: string): ToolRecord[] {
-  return defaultToolsets(lane, at).flatMap((toolset) => toolset.toolNames.map((name) => ({
+export function defaultTools(instance: Instance, at: string): ToolRecord[] {
+  return defaultToolsets(instance, at).flatMap((toolset) => toolset.toolNames.map((name) => ({
     id: `tool_${name.replaceAll(".", "_")}`,
-    lane,
+    instance,
     name,
     description: `${name} from ${toolset.name} toolset`,
     toolset: toolset.name,
@@ -97,10 +97,10 @@ export function defaultTools(lane: Lane, at: string): ToolRecord[] {
   } satisfies ToolRecord)));
 }
 
-export function defaultProfile(lane: Lane, at: string): ProfileRecord {
+export function defaultProfile(instance: Instance, at: string): ProfileRecord {
   return {
     id: "profile_default",
-    lane,
+    instance,
     name: "default",
     status: "active",
     providerName: "echo",

@@ -2,11 +2,11 @@ import type { RuntimeConfig, SkillRecord } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now, readState } from "../state";
 
 export function listSkills(config: RuntimeConfig) {
-  return readState(config.lane).skills;
+  return readState(config.instance).skills;
 }
 
 export async function createSkillFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => createSkill(state, {
+  return mutateState(config.instance, (state) => createSkill(state, {
     name: String(input.name ?? "Untitled skill"),
     description: String(input.description ?? ""),
     trigger: String(input.trigger ?? ""),
@@ -20,21 +20,21 @@ export async function createSkillFromInput(config: RuntimeConfig, input: Record<
 }
 
 export function getSkill(config: RuntimeConfig, idOrName: string): SkillRecord {
-  const skill = readState(config.lane).skills.find((item) => item.id === idOrName || item.name === idOrName);
+  const skill = readState(config.instance).skills.find((item) => item.id === idOrName || item.name === idOrName);
   if (!skill) throw new Error(`Skill not found: ${idOrName}`);
   return skill;
 }
 
 export function searchSkills(config: RuntimeConfig, query: string) {
   const normalized = query.trim().toLowerCase();
-  return readState(config.lane).skills.filter((skill) => {
+  return readState(config.instance).skills.filter((skill) => {
     if (!normalized) return true;
     return [skill.name, skill.description, skill.trigger, skill.steps.join("\n")].some((value) => value.toLowerCase().includes(normalized));
   });
 }
 
 export async function updateSkill(config: RuntimeConfig, idOrName: string, input: Record<string, unknown>) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     skill.previousVersions.unshift({
@@ -67,7 +67,7 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
 }
 
 export async function setSkillStatus(config: RuntimeConfig, idOrName: string, status: "trusted" | "disabled" | "archived") {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     skill.status = status;
@@ -83,7 +83,7 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
 }
 
 export async function rollbackSkill(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     const prior = skill.previousVersions.shift();
@@ -110,7 +110,7 @@ export async function rollbackSkill(config: RuntimeConfig, idOrName: string) {
 }
 
 export async function testSkill(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     const failures = validateSkillRecord(skill);
@@ -130,7 +130,7 @@ export async function testSkill(config: RuntimeConfig, idOrName: string) {
 }
 
 export function validateSkills(config: RuntimeConfig) {
-  return readState(config.lane).skills.map((skill) => ({ id: skill.id, name: skill.name, ok: validateSkillRecord(skill).length === 0, failures: validateSkillRecord(skill) }));
+  return readState(config.instance).skills.map((skill) => ({ id: skill.id, name: skill.name, ok: validateSkillRecord(skill).length === 0, failures: validateSkillRecord(skill) }));
 }
 
 function validateSkillRecord(skill: SkillRecord): string[] {

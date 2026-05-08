@@ -8,7 +8,7 @@ import type {
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
-  Lane,
+  Instance,
   McpServerRecord,
   MemoryRecord,
   MessagingBridgeRecord,
@@ -50,7 +50,7 @@ export function upsertTask(state: RuntimeState, task: Task): Task {
 }
 
 export function createTask(
-  lane: Lane,
+  instance: Instance,
   input: string,
   jobId?: string,
   parentTaskId?: string,
@@ -63,10 +63,10 @@ export function createTask(
     title: input.slice(0, 80) || "Untitled task",
     input,
     status: "queued",
-    lane,
+    instance,
     createdAt: at,
     updatedAt: at,
-    tracePath: tracePath(lane, taskId),
+    tracePath: tracePath(instance, taskId),
     auditIds: [],
     approvalIds: [],
     memoryIds: [],
@@ -81,7 +81,7 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
   const at = now();
   const session: ChatSessionRecord = {
     id: id("chat"),
-    lane: state.lane,
+    instance: state.instance,
     title: title.slice(0, 80) || "Untitled chat",
     createdAt: at,
     updatedAt: at,
@@ -101,11 +101,11 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
 
 export function createChatMessage(
   state: RuntimeState,
-  message: Omit<ChatMessageRecord, "id" | "lane" | "createdAt">
+  message: Omit<ChatMessageRecord, "id" | "instance" | "createdAt">
 ): ChatMessageRecord {
   const item: ChatMessageRecord = {
     id: id("msg"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: now(),
     ...message
   };
@@ -122,12 +122,12 @@ export function createChatMessage(
 
 export function createApproval(
   state: RuntimeState,
-  approval: Omit<Approval, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+  approval: Omit<Approval, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): Approval {
   const at = now();
   const item: Approval = {
     id: id("approval"),
-    lane: state.lane,
+    instance: state.instance,
     status: "pending",
     createdAt: at,
     updatedAt: at,
@@ -148,12 +148,12 @@ export function createApproval(
 
 export function createMemory(
   state: RuntimeState,
-  memory: Omit<MemoryRecord, "id" | "lane" | "createdAt" | "updatedAt">
+  memory: Omit<MemoryRecord, "id" | "instance" | "createdAt" | "updatedAt">
 ): MemoryRecord {
   const at = now();
   const item: MemoryRecord = {
     id: id("mem"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: at,
     updatedAt: at,
     ...memory
@@ -164,12 +164,12 @@ export function createMemory(
 
 export function createSkill(
   state: RuntimeState,
-  skill: Omit<SkillRecord, "id" | "lane" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions">>
+  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions">>
 ): SkillRecord {
   const at = now();
   const item: SkillRecord = {
     id: id("skill"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: at,
     updatedAt: at,
     version: 1,
@@ -185,12 +185,12 @@ export function createSkill(
 
 export function createJob(
   state: RuntimeState,
-  job: Omit<JobRecord, "id" | "lane" | "createdAt" | "updatedAt" | "status" | "lastRunAt" | "lastSuccessAt" | "lastFailureAt" | "lastError" | "runCount" | "missedRuns" | "taskIds" | "runIds" | "deliveryTargets" | "context" | "retryLimit" | "timeoutSeconds"> & Partial<Pick<JobRecord, "runIds" | "deliveryTargets" | "context" | "retryLimit" | "timeoutSeconds">>
+  job: Omit<JobRecord, "id" | "instance" | "createdAt" | "updatedAt" | "status" | "lastRunAt" | "lastSuccessAt" | "lastFailureAt" | "lastError" | "runCount" | "missedRuns" | "taskIds" | "runIds" | "deliveryTargets" | "context" | "retryLimit" | "timeoutSeconds"> & Partial<Pick<JobRecord, "runIds" | "deliveryTargets" | "context" | "retryLimit" | "timeoutSeconds">>
 ): JobRecord {
   const at = now();
   const item: JobRecord = {
     id: id("job"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: at,
     updatedAt: at,
     status: "active",
@@ -210,12 +210,12 @@ export function createJob(
 
 export function createJobRun(
   state: RuntimeState,
-  run: Omit<JobRunRecord, "id" | "lane" | "createdAt" | "updatedAt" | "status" | "attempt">
+  run: Omit<JobRunRecord, "id" | "instance" | "createdAt" | "updatedAt" | "status" | "attempt">
 ): JobRunRecord {
   const at = now();
   const item: JobRunRecord = {
     id: id("jobrun"),
-    lane: state.lane,
+    instance: state.instance,
     status: "running",
     attempt: state.jobRuns.filter((candidate) => candidate.jobId === run.jobId).length + 1,
     createdAt: at,
@@ -237,12 +237,12 @@ export function createJobRun(
 
 export function createImprovementProposal(
   state: RuntimeState,
-  proposal: Omit<ImprovementProposal, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+  proposal: Omit<ImprovementProposal, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): ImprovementProposal {
   const at = now();
   const item: ImprovementProposal = {
     id: id("impr"),
-    lane: state.lane,
+    instance: state.instance,
     status: "proposed",
     createdAt: at,
     updatedAt: at,
@@ -268,7 +268,7 @@ export function createPairingCode(
   const code = randomPairingCode();
   const pairing: PairingCode = {
     id: id("pair"),
-    lane: state.lane,
+    instance: state.instance,
     codeHash: hashSecret(code),
     status: "pending",
     createdAt: at,
@@ -299,7 +299,7 @@ export function claimPairingCode(
   const token = `gini_device_${crypto.randomUUID().replaceAll("-", "")}`;
   const device: PairedDevice = {
     id: id("device"),
-    lane: state.lane,
+    instance: state.instance,
     name: deviceName.trim() || "Unnamed device",
     tokenHash: hashSecret(token),
     status: "active",
@@ -349,12 +349,12 @@ export function findActiveDeviceByToken(state: RuntimeState, token: string): Pai
 
 export function createPromotionProposal(
   state: RuntimeState,
-  proposal: Omit<PromotionProposal, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+  proposal: Omit<PromotionProposal, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): PromotionProposal {
   const at = now();
   const item: PromotionProposal = {
     id: id("promo"),
-    lane: state.lane,
+    instance: state.instance,
     status: "proposed",
     createdAt: at,
     updatedAt: at,
@@ -394,11 +394,11 @@ export function decidePromotion(
 
 export function createSnapshotRecord(
   state: RuntimeState,
-  snapshot: Omit<SnapshotRecord, "id" | "lane" | "createdAt" | "taskCount" | "auditCount">
+  snapshot: Omit<SnapshotRecord, "id" | "instance" | "createdAt" | "taskCount" | "auditCount">
 ): SnapshotRecord {
   const item: SnapshotRecord = {
     id: id("snap"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: now(),
     taskCount: state.tasks.length,
     auditCount: state.audit.length,
@@ -417,12 +417,12 @@ export function createSnapshotRecord(
 
 export function createSubagentRecord(
   state: RuntimeState,
-  subagent: Omit<SubagentRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+  subagent: Omit<SubagentRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): SubagentRecord {
   const at = now();
   const item: SubagentRecord = {
     id: id("subagent"),
-    lane: state.lane,
+    instance: state.instance,
     status: "queued",
     createdAt: at,
     updatedAt: at,
@@ -442,12 +442,12 @@ export function createSubagentRecord(
 
 export function createMcpServerRecord(
   state: RuntimeState,
-  server: Omit<McpServerRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  server: Omit<McpServerRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
 ): McpServerRecord {
   const at = now();
   const item: McpServerRecord = {
     id: id("mcp"),
-    lane: state.lane,
+    instance: state.instance,
     status: "configured",
     createdAt: at,
     updatedAt: at,
@@ -466,12 +466,12 @@ export function createMcpServerRecord(
 
 export function createMessagingBridgeRecord(
   state: RuntimeState,
-  bridge: Omit<MessagingBridgeRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  bridge: Omit<MessagingBridgeRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
 ): MessagingBridgeRecord {
   const at = now();
   const item: MessagingBridgeRecord = {
     id: id("bridge"),
-    lane: state.lane,
+    instance: state.instance,
     status: "configured",
     createdAt: at,
     updatedAt: at,
@@ -490,12 +490,12 @@ export function createMessagingBridgeRecord(
 
 export function createMessagingMessageRecord(
   state: RuntimeState,
-  message: Omit<MessagingMessageRecord, "id" | "lane" | "createdAt" | "updatedAt">
+  message: Omit<MessagingMessageRecord, "id" | "instance" | "createdAt" | "updatedAt">
 ): MessagingMessageRecord {
   const at = now();
   const item: MessagingMessageRecord = {
     id: id("message"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: at,
     updatedAt: at,
     ...message
@@ -515,11 +515,11 @@ export function createMessagingMessageRecord(
 
 export function createImportReport(
   state: RuntimeState,
-  report: Omit<ImportReport, "id" | "lane" | "createdAt">
+  report: Omit<ImportReport, "id" | "instance" | "createdAt">
 ): ImportReport {
   const item: ImportReport = {
     id: id("import"),
-    lane: state.lane,
+    instance: state.instance,
     createdAt: now(),
     ...report
   };
@@ -536,12 +536,12 @@ export function createImportReport(
 
 export function createProfileRecord(
   state: RuntimeState,
-  profile: Omit<ProfileRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+  profile: Omit<ProfileRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): ProfileRecord {
   const at = now();
   const item: ProfileRecord = {
     id: id("profile"),
-    lane: state.lane,
+    instance: state.instance,
     status: "inactive",
     createdAt: at,
     updatedAt: at,
@@ -560,12 +560,12 @@ export function createProfileRecord(
 
 export function createRelayRecord(
   state: RuntimeState,
-  relay: Omit<RelayRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  relay: Omit<RelayRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
 ): RelayRecord {
   const at = now();
   const item: RelayRecord = {
     id: id("relay"),
-    lane: state.lane,
+    instance: state.instance,
     status: "configured",
     createdAt: at,
     updatedAt: at,
@@ -584,12 +584,12 @@ export function createRelayRecord(
 
 export function createNotificationRecord(
   state: RuntimeState,
-  notification: Omit<NotificationRecord, "id" | "lane" | "status" | "createdAt" | "updatedAt">
+  notification: Omit<NotificationRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt">
 ): NotificationRecord {
   const at = now();
   const item: NotificationRecord = {
     id: id("notify"),
-    lane: state.lane,
+    instance: state.instance,
     status: "queued",
     createdAt: at,
     updatedAt: at,

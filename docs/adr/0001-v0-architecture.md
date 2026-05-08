@@ -2,7 +2,7 @@
 
 ## Decision
 
-Gini v0 is a Bun TypeScript local runtime with a lane-aware JSON state store, authenticated localhost HTTP API, CLI, and local web control plane served by the runtime.
+Gini v0 is a Bun TypeScript local runtime with a instance-aware JSON state store, authenticated localhost HTTP API, CLI, and local web control plane served by the runtime.
 
 ## Context
 
@@ -11,9 +11,9 @@ The master plan asks v0 to prove the installable local runtime, CLI, and local c
 ## Required Now
 
 - `gini` CLI commands for install, start, stop, status, doctor, reset, task, approval, memory, skill, job, connector, trace, audit, and smoke.
-- Runtime state is scoped by lane under `~/.gini/lanes/<lane>` by default.
-- Runtime logs are scoped by lane under `~/.gini/logs/<lane>` by default.
-- Local API requires a bearer token stored in the lane config.
+- Runtime state is scoped by instance under `~/.gini/instances/<instance>` by default.
+- Runtime logs are scoped by instance under `~/.gini/logs/<instance>` by default.
+- Local API requires a bearer token stored in the instance config.
 - Tasks, traces, audit events, approvals, jobs, memories, skills, and demo connector records are persisted.
 - Risky file and terminal actions create approval records before side effects.
 - The provider layer supports deterministic `echo` for tests, `codex` via Codex CLI OAuth credentials, and `openai` via `OPENAI_API_KEY`.
@@ -28,7 +28,7 @@ The master plan asks v0 to prove the installable local runtime, CLI, and local c
 ## Consequences For Coding Agents
 
 - Use the API/CLI contracts instead of treating the web UI as a separate product brain.
-- Add new behavior through lane-aware state, audit events, and trace records.
+- Add new behavior through instance-aware state, audit events, and trace records.
 - Do not add dangerous tools that bypass approval and audit.
 - Keep future mobile clients as consumers of the same runtime semantics.
 
@@ -37,6 +37,6 @@ The master plan asks v0 to prove the installable local runtime, CLI, and local c
 - `bun run gini smoke` exercises task, memory, job, connector, trace, audit, and runtime health.
 - `bun run gini provider set codex <model>` configures Codex OAuth without copying token values into Gini config.
 - `bun run gini provider set openai <model>` configures a real model provider without persisting API keys.
-- Reset affects only the selected lane.
+- Reset affects only the selected instance.
 - CLI and web observe the same state.
 - Every side effect-oriented path has an audit record and, when tied to a task, trace evidence.

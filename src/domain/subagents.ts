@@ -9,16 +9,16 @@ export async function spawnSubagent(config: RuntimeConfig, input: Record<string,
   const parentTaskId = typeof input.parentTaskId === "string" ? input.parentTaskId : undefined;
   const name = String(input.name ?? "Subagent");
 
-  const subagent = await mutateState(config.lane, (state) => createSubagentRecord(state, { name, prompt, parentTaskId, toolsets }));
+  const subagent = await mutateState(config.instance, (state) => createSubagentRecord(state, { name, prompt, parentTaskId, toolsets }));
   const task = await submitTask(config, prompt, undefined, parentTaskId, subagent.id);
-  await mutateState(config.lane, (state) => {
+  await mutateState(config.instance, (state) => {
     const item = state.subagents.find((candidate) => candidate.id === subagent.id);
     if (!item) return;
     item.taskId = task.id;
     item.status = "running";
     item.updatedAt = now();
   });
-  appendTrace(config.lane, task.id, {
+  appendTrace(config.instance, task.id, {
     type: "tool",
     message: "Subagent spawned",
     data: { subagentId: subagent.id, parentTaskId, toolsets }
@@ -27,7 +27,7 @@ export async function spawnSubagent(config: RuntimeConfig, input: Record<string,
 }
 
 export async function refreshSubagents(config: RuntimeConfig) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     for (const subagent of state.subagents) {
       if (!subagent.taskId || subagent.status === "completed" || subagent.status === "failed") continue;
       const task = state.tasks.find((item) => item.id === subagent.taskId);
@@ -51,5 +51,5 @@ export async function refreshSubagents(config: RuntimeConfig) {
 
 export async function listSubagents(config: RuntimeConfig) {
   await refreshSubagents(config);
-  return readState(config.lane).subagents;
+  return readState(config.instance).subagents;
 }

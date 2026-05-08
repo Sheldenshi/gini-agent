@@ -78,8 +78,8 @@ export interface RetainOutput {
 }
 
 export async function retain(config: RuntimeConfig, input: RetainInput): Promise<RetainOutput> {
-  const lane = config.lane;
-  ensureDefaultBank(lane);
+  const instance = config.instance;
+  ensureDefaultBank(instance);
   const bankId = input.bankId ?? DEFAULT_BANK_ID;
   const mentionedAt = input.mentionedAt ?? now();
 
@@ -106,7 +106,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   const insertedUnits: MemoryUnit[] = [];
   for (let i = 0; i < normalized.length; i++) {
     const fact = normalized[i]!;
-    const unit = insertMemoryUnit(lane, {
+    const unit = insertMemoryUnit(instance, {
       bankId,
       text: narratives[i]!,
       embedding: embeddings[i] ?? null,
@@ -133,7 +133,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   }
 
   // 5. Entity resolution. Each fact may bring a few entities; map per-unit.
-  const recentPool = listMemoryUnits(lane, bankId, { limit: SEMANTIC_CANDIDATE_POOL });
+  const recentPool = listMemoryUnits(instance, bankId, { limit: SEMANTIC_CANDIDATE_POOL });
   const recentIds = recentPool.map((unit) => unit.id);
   const allEntities: Entity[] = [];
   // unitId -> [entityId...] for entity-link construction below.
@@ -146,11 +146,11 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
       const surface = entry.text.trim();
       if (!surface) continue;
       const type = entry.entity_type ?? "OTHER";
-      const resolution = resolveOrCreateEntity(lane, bankId, surface, type, {
+      const resolution = resolveOrCreateEntity(instance, bankId, surface, type, {
         recentUnitIds: recentIds,
         mentionedAt: unit.mentionedAt
       });
-      linkUnitToEntity(lane, unit.id, resolution.entity.id, surface);
+      linkUnitToEntity(instance, unit.id, resolution.entity.id, surface);
       if (resolution.created) allEntities.push(resolution.entity);
       ids.push(resolution.entity.id);
     }
@@ -169,8 +169,8 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
       const bEnts = entitiesByUnit.get(b.id) ?? [];
       const shared = aEnts.find((id) => bEnts.includes(id));
       if (!shared) continue;
-      links.push(insertLink(lane, { fromUnit: a.id, toUnit: b.id, linkType: "entity", weight: 1.0, entityId: shared }));
-      links.push(insertLink(lane, { fromUnit: b.id, toUnit: a.id, linkType: "entity", weight: 1.0, entityId: shared }));
+      links.push(insertLink(instance, { fromUnit: a.id, toUnit: b.id, linkType: "entity", weight: 1.0, entityId: shared }));
+      links.push(insertLink(instance, { fromUnit: b.id, toUnit: a.id, linkType: "entity", weight: 1.0, entityId: shared }));
     }
   }
 
@@ -189,7 +189,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
       if (delta > TEMPORAL_DECAY_SECONDS * 4) continue; // skip far-apart pairs
       const weight = Math.exp(-delta / TEMPORAL_DECAY_SECONDS);
       if (weight < 0.05) continue;
-      links.push(insertLink(lane, { fromUnit: a.id, toUnit: b.id, linkType: "temporal", weight }));
+      links.push(insertLink(instance, { fromUnit: a.id, toUnit: b.id, linkType: "temporal", weight }));
     }
   }
 
@@ -208,8 +208,8 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
       if (a.embedding.length !== b.embedding.length) continue;
       const sim = cosineSimilarity(a.embedding, b.embedding);
       if (sim < SEMANTIC_LINK_THRESHOLD) continue;
-      links.push(insertLink(lane, { fromUnit: a.id, toUnit: b.id, linkType: "semantic", weight: sim }));
-      links.push(insertLink(lane, { fromUnit: b.id, toUnit: a.id, linkType: "semantic", weight: sim }));
+      links.push(insertLink(instance, { fromUnit: a.id, toUnit: b.id, linkType: "semantic", weight: sim }));
+      links.push(insertLink(instance, { fromUnit: b.id, toUnit: a.id, linkType: "semantic", weight: sim }));
     }
     for (let j = i + 1; j < newUnitsWithEmbedding.length; j++) {
       const b = newUnitsWithEmbedding[j]!;
@@ -217,8 +217,8 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
       if (a.embedding.length !== b.embedding.length) continue;
       const sim = cosineSimilarity(a.embedding, b.embedding);
       if (sim < SEMANTIC_LINK_THRESHOLD) continue;
-      links.push(insertLink(lane, { fromUnit: a.id, toUnit: b.id, linkType: "semantic", weight: sim }));
-      links.push(insertLink(lane, { fromUnit: b.id, toUnit: a.id, linkType: "semantic", weight: sim }));
+      links.push(insertLink(instance, { fromUnit: a.id, toUnit: b.id, linkType: "semantic", weight: sim }));
+      links.push(insertLink(instance, { fromUnit: b.id, toUnit: a.id, linkType: "semantic", weight: sim }));
     }
   }
 
@@ -230,7 +230,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     for (const relation of fact.causal_relations ?? []) {
       const target = insertedUnits[relation.target_fact_index];
       if (!target || target.id === sourceUnit.id) continue;
-      links.push(insertLink(lane, {
+      links.push(insertLink(instance, {
         fromUnit: sourceUnit.id,
         toUnit: target.id,
         linkType: "causal",
@@ -252,7 +252,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     } catch (error) {
       // Observation failures are non-fatal — emit a trace and continue.
       if (input.sourceTaskId) {
-        appendTrace(lane, input.sourceTaskId, {
+        appendTrace(instance, input.sourceTaskId, {
           type: "memory",
           message: "observation regeneration failed",
           data: { entityId, error: error instanceof Error ? error.message : String(error) }
@@ -267,7 +267,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   await maybeReinforceOpinions(config, bankId, insertedUnits);
 
   // 9. Audit + trace.
-  await mutateState(lane, (state) => {
+  await mutateState(instance, (state) => {
     addAudit(state, {
       actor: "runtime",
       action: "memory.retain",
@@ -283,7 +283,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     });
   });
   if (input.sourceTaskId) {
-    appendTrace(lane, input.sourceTaskId, {
+    appendTrace(instance, input.sourceTaskId, {
       type: "memory",
       message: "retain completed",
       data: {
@@ -335,13 +335,13 @@ async function maybeReinforceOpinions(config: RuntimeConfig, bankId: string, uni
 }
 
 async function regenerateObservation(config: RuntimeConfig, bankId: string, entityId: string): Promise<void> {
-  const lane = config.lane;
-  const facts = unitsForEntity(lane, entityId, OBSERVATION_FACT_LIMIT)
+  const instance = config.instance;
+  const facts = unitsForEntity(instance, entityId, OBSERVATION_FACT_LIMIT)
     .filter((unit) => unit.network === "world" || unit.network === "experience");
   if (facts.length === 0) return;
 
   // Pick a display name for the prompt — first canonical entity match.
-  const db = getMemoryDb(lane);
+  const db = getMemoryDb(instance);
   const entityRow = db
     .query<{ canonical_name: string }, [string]>("SELECT canonical_name FROM entities WHERE id = ?")
     .get(entityId);
@@ -365,7 +365,7 @@ async function regenerateObservation(config: RuntimeConfig, bankId: string, enti
   // can reach it.
   const embedProvider = getEmbeddingProvider(config);
   const [vector] = await embedProvider.embed([summary]);
-  upsertObservationUnit(lane, bankId, entityId, summary, vector ?? null, embedProvider.model);
+  upsertObservationUnit(instance, bankId, entityId, summary, vector ?? null, embedProvider.model);
 }
 
 // --------------------------------------------------------------------------

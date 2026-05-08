@@ -4,7 +4,7 @@
 // Heuristic mapping:
 //   - scope    -> stays in record metadata as `legacyScope`. Future work may
 //                 namespace banks per project/user; v1 lumps everything into
-//                 the lane's default bank.
+//                 the instance's default bank.
 //   - content  -> embedded with the current provider, inserted as a
 //                 MemoryUnit. Network classified by a tiny rule:
 //                   first-person language ("I ", "did ", "recommended ",
@@ -25,7 +25,7 @@
 // abort the migration. Startup auto-trigger calls this and surfaces the
 // failure in `gini doctor` rather than blocking.
 
-import type { Lane, MemoryRecord, RuntimeConfig } from "../../types";
+import type { Instance, MemoryRecord, RuntimeConfig } from "../../types";
 import {
   DEFAULT_BANK_ID,
   ensureDefaultBank,
@@ -60,12 +60,12 @@ function classifyNetwork(content: string): "world" | "experience" {
 }
 
 export async function migrateLegacyMemories(config: RuntimeConfig): Promise<MigrationReport> {
-  const lane = config.lane;
-  ensureDefaultBank(lane);
+  const instance = config.instance;
+  ensureDefaultBank(instance);
 
   // Snapshot the records to migrate. We do not run retain on each one —
   // that would burn LLM tokens at scale — just embed and insert.
-  const snapshot = await mutateState(lane, (state) => state.memories.slice());
+  const snapshot = await mutateState(instance, (state) => state.memories.slice());
   const provider = getEmbeddingProvider(config);
 
   const report: MigrationReport = {
@@ -88,7 +88,7 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
     }
     try {
       const [vector] = await provider.embed([record.content]);
-      const unit = insertMemoryUnit(lane, {
+      const unit = insertMemoryUnit(instance, {
         bankId: DEFAULT_BANK_ID,
         text: record.content,
         embedding: vector ?? null,
@@ -110,7 +110,7 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
       // Mark the legacy record as migrated so re-running this migration is
       // a no-op. We keep the legacy row in JSON state so a rollback is
       // possible if the SQLite layer needs to be torn down.
-      await mutateState(lane, (state) => {
+      await mutateState(instance, (state) => {
         const target = state.memories.find((entry) => entry.id === record.id);
         if (!target) return;
         target.metadata = {
@@ -132,7 +132,7 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
 // Used by `gini start` to opportunistically migrate. Returns null if there
 // is nothing to migrate (so callers can stay quiet on first run).
 export async function migrateIfNeeded(config: RuntimeConfig): Promise<MigrationReport | null> {
-  const memories = await mutateState(config.lane, (state) => state.memories.slice());
+  const memories = await mutateState(config.instance, (state) => state.memories.slice());
   const candidates = memories.filter((record) => {
     if (record.status === "proposed" || record.status === "rejected") return false;
     return !record.metadata?.migratedToUnitId;

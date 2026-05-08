@@ -20,9 +20,9 @@ export function help(): void {
   console.log(`Gini CLI
 
 Usage:
-  bun run gini install [--lane dev]
-  bun run gini start|stop|status|doctor|reset [--lane dev] [--port 7337]
-  bun run gini run [--lane dev] [--no-web]
+  bun run gini install [--instance dev]
+  bun run gini start|stop|status|doctor|reset [--instance dev] [--port 7337]
+  bun run gini run [--instance dev] [--no-web]
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>
@@ -58,13 +58,13 @@ Usage:
   bun run gini smoke
 
 Process lifecycle:
-  gini start  - daemon mode; lane keeps running after the terminal closes.
+  gini start  - daemon mode; instance keeps running after the terminal closes.
                 Use this for a persistent personal agent on your machine.
-  gini run    - foreground mode; lane dies when this terminal exits or
+  gini run    - foreground mode; instance dies when this terminal exits or
                 you Ctrl-C. Use this for coding-agent worktrees and CI.
 
 Global options:
-  --lane <name>        Select a persistent lane. Smoke uses an ephemeral lane when omitted.
+  --instance <name>        Select a persistent instance. Smoke uses an ephemeral instance when omitted.
   --state-root <path>  Override state root for tests or parallel agents.
   --log-root <path>    Override log root for tests or parallel agents.
   --port <number>      Preferred runtime localhost port. Start scans upward if busy.

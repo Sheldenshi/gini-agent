@@ -1,8 +1,8 @@
-// Subprocess tests for `gini run` (foreground lane execution).
+// Subprocess tests for `gini run` (foreground instance execution).
 //
 // These tests spawn the real CLI as a child process so we can exercise the
 // signal-handling and child-teardown contract end-to-end. Each test gets a
-// unique lane + state/log roots under /tmp so they do not collide with
+// unique instance + state/log roots under /tmp so they do not collide with
 // developer state or with each other when bun test runs them in parallel.
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
@@ -12,23 +12,23 @@ import { join, resolve } from "node:path";
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 const CLI_PATH = join(PROJECT_ROOT, "src", "cli.ts");
 
-function uniqueLane(tag: string): string {
+function uniqueInstance(tag: string): string {
   return `run-test-${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
 }
 
 interface RunHarness {
-  lane: string;
+  instance: string;
   stateRoot: string;
   logRoot: string;
 }
 
 function makeHarness(tag: string): RunHarness {
-  const lane = uniqueLane(tag);
-  const stateRoot = `/tmp/gini-run-tests/${lane}`;
-  const logRoot = `/tmp/gini-run-tests-logs/${lane}`;
+  const instance = uniqueInstance(tag);
+  const stateRoot = `/tmp/gini-run-tests/${instance}`;
+  const logRoot = `/tmp/gini-run-tests-logs/${instance}`;
   rmSync(stateRoot, { recursive: true, force: true });
   rmSync(logRoot, { recursive: true, force: true });
-  return { lane, stateRoot, logRoot };
+  return { instance, stateRoot, logRoot };
 }
 
 async function spawnRun(h: RunHarness): Promise<{
@@ -40,8 +40,8 @@ async function spawnRun(h: RunHarness): Promise<{
     "run",
     CLI_PATH,
     "run",
-    "--lane",
-    h.lane,
+    "--instance",
+    h.instance,
     "--no-web",
     "--state-root",
     h.stateRoot,
@@ -55,13 +55,13 @@ async function spawnRun(h: RunHarness): Promise<{
   child.stdout?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
   child.stderr?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
   // Wait for the start banner to appear so callers know the runtime is live.
-  // The banner JSON includes "lane": "<our lane>" — that's the most specific
-  // marker and avoids matching incidental output from a different lane.
+  // The banner JSON includes "instance": "<our instance>" — that's the most specific
+  // marker and avoids matching incidental output from a different instance.
   const stdout = new Promise<string>((resolveOut) => {
     let combined = "";
     const onData = (chunk: Buffer) => {
       combined += chunk.toString("utf8");
-      if (combined.includes(`"lane": "${h.lane}"`)) {
+      if (combined.includes(`"instance": "${h.instance}"`)) {
         child.stdout?.off("data", onData);
         resolveOut(combined);
       }
@@ -84,7 +84,7 @@ describe("gini run", () => {
     const h = makeHarness("sigterm");
     const { child, stdout, exit } = await spawnRun(h);
     const banner = await stdout;
-    expect(banner).toContain(`"lane": "${h.lane}"`);
+    expect(banner).toContain(`"instance": "${h.instance}"`);
     expect(banner).toContain(`"foreground": true`);
     expect(child.pid).toBeDefined();
 
@@ -119,19 +119,19 @@ describe("gini run", () => {
     expect(await pidAlive(directChildPid)).toBe(false);
   }, 30_000);
 
-  test("refuses to run when the lane is already up", async () => {
+  test("refuses to run when the instance is already up", async () => {
     const h = makeHarness("conflict");
     const first = await spawnRun(h);
     await first.stdout;
     try {
-      // Second `gini run` against the same lane must fail loudly because we
+      // Second `gini run` against the same instance must fail loudly because we
       // can't bind a runtime we did not spawn into our signal handlers.
       const blocked = spawn("bun", [
         "run",
         CLI_PATH,
         "run",
-        "--lane",
-        h.lane,
+        "--instance",
+        h.instance,
         "--no-web",
         "--state-root",
         h.stateRoot,

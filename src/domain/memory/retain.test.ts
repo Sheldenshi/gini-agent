@@ -36,9 +36,9 @@ afterEach(() => {
   clearEchoStructuredResponses();
 });
 
-function makeConfig(lane: string): RuntimeConfig {
+function makeConfig(instance: string): RuntimeConfig {
   return {
-    lane,
+    instance,
     port: 0,
     token: "test",
     provider: { name: "echo", model: "gini-echo-v0" },
@@ -107,7 +107,7 @@ describe("openai embedding provider (mocked HTTP)", () => {
       const { openaiProvider } = await import("../../embeddings");
       process.env.OPENAI_API_KEY = "test-key";
       const provider = openaiProvider({
-        lane: "openai-test",
+        instance: "openai-test",
         port: 0,
         token: "t",
         provider: { name: "openai", model: "gpt-4o-mini", apiKeyEnv: "OPENAI_API_KEY" },
@@ -154,8 +154,8 @@ describe("echo embedding provider", () => {
 
 describe("retain pipeline", () => {
   test("happy path: structured stub yields units, entities, and links", async () => {
-    const lane = "retain-happy";
-    ensureDefaultBank(lane);
+    const instance = "retain-happy";
+    ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         {
@@ -195,7 +195,7 @@ describe("retain pipeline", () => {
     // empty observations[] and the regeneration silently no-ops. Phase 2.4
     // tests below cover the regeneration path explicitly.
 
-    const config = makeConfig(lane);
+    const config = makeConfig(instance);
     const result = await retain(config, { text: "Alice joined Acme Corp as CTO. She gave the keynote.", mentionedAt: "2025-04-02T08:00:00Z" });
 
     expect(result.units).toHaveLength(2);
@@ -212,13 +212,13 @@ describe("retain pipeline", () => {
     expect(causalLinks[0]!.causalSubtype).toBe("caused_by");
 
     // Two facts -> 2 world units. Observations regenerated for both entities.
-    const worldUnits = listMemoryUnits(lane, DEFAULT_BANK_ID, { network: "world" });
+    const worldUnits = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "world" });
     expect(worldUnits.length).toBe(2);
   });
 
   test("entity resolution: same surface twice merges to one canonical", async () => {
-    const lane = "retain-merge";
-    ensureDefaultBank(lane);
+    const instance = "retain-merge";
+    ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         {
@@ -232,7 +232,7 @@ describe("retain pipeline", () => {
         }
       ]
     });
-    const config = makeConfig(lane);
+    const config = makeConfig(instance);
     const first = await retain(config, { text: "Bob joined.", mentionedAt: "2025-04-01T00:00:00Z" });
     expect(first.entities).toHaveLength(1);
 
@@ -255,15 +255,15 @@ describe("retain pipeline", () => {
   });
 
   test("entity resolution: near-miss spelling still merges", async () => {
-    const lane = "retain-nearmiss";
-    ensureDefaultBank(lane);
+    const instance = "retain-nearmiss";
+    ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "x", when: "", where: "", who: "Alice Johnson", why: "", fact_type: "world",
           entities: [{ text: "Alice Johnson", entity_type: "PERSON" }] }
       ]
     });
-    await retain(makeConfig(lane), { text: "Alice Johnson is here.", mentionedAt: "2025-04-01T00:00:00Z" });
+    await retain(makeConfig(instance), { text: "Alice Johnson is here.", mentionedAt: "2025-04-01T00:00:00Z" });
 
     setEchoStructuredResponse("fact-extraction", {
       facts: [
@@ -271,15 +271,15 @@ describe("retain pipeline", () => {
           entities: [{ text: "Alice Johnsen", entity_type: "PERSON" }] }
       ]
     });
-    const second = await retain(makeConfig(lane), { text: "Alice Johnsen stopped by.", mentionedAt: "2025-04-01T00:00:00Z" });
+    const second = await retain(makeConfig(instance), { text: "Alice Johnsen stopped by.", mentionedAt: "2025-04-01T00:00:00Z" });
     // Single-character substitution on a 13-char surface -> Levenshtein 1 ->
     // lexical sim ≈ 0.92, well above the LEXICAL_EXACT_FAST_PATH=0.85.
     expect(second.entities).toHaveLength(0);
   });
 
   test("temporal links: distant pairs do not link", async () => {
-    const lane = "retain-temporal-distant";
-    ensureDefaultBank(lane);
+    const instance = "retain-temporal-distant";
+    ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "fact one", when: "2025-04-01", where: "", who: "", why: "", fact_type: "world",
@@ -288,14 +288,14 @@ describe("retain pipeline", () => {
           occurred_start: "2025-05-15T00:00:00Z", occurred_end: "2025-05-15T23:59:59Z" }
       ]
     });
-    const result = await retain(makeConfig(lane), { text: "two distant facts", mentionedAt: "2025-05-15T00:00:00Z" });
+    const result = await retain(makeConfig(instance), { text: "two distant facts", mentionedAt: "2025-05-15T00:00:00Z" });
     const temporalLinks = result.links.filter((l) => l.linkType === "temporal");
     expect(temporalLinks.length).toBe(0);
   });
 
   test("semantic links: identical embeddings get linked", async () => {
-    const lane = "retain-semantic";
-    ensureDefaultBank(lane);
+    const instance = "retain-semantic";
+    ensureDefaultBank(instance);
     // Two facts with literally the same `what` text — narrative will be similar
     // enough to clear θ_s = 0.7 with the echo embedding.
     setEchoStructuredResponse("fact-extraction", {
@@ -306,14 +306,14 @@ describe("retain pipeline", () => {
           where: "office", who: "team", why: "milestone", fact_type: "world" }
       ]
     });
-    const result = await retain(makeConfig(lane), { text: "near-duplicate facts", mentionedAt: "2025-04-02T00:00:00Z" });
+    const result = await retain(makeConfig(instance), { text: "near-duplicate facts", mentionedAt: "2025-04-02T00:00:00Z" });
     const semanticLinks = result.links.filter((l) => l.linkType === "semantic");
     expect(semanticLinks.length).toBeGreaterThanOrEqual(2);
   });
 
   test("observation regeneration: an observation unit is created per touched entity", async () => {
-    const lane = "retain-observation";
-    ensureDefaultBank(lane);
+    const instance = "retain-observation";
+    ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "Eve coded all night", when: "", where: "", who: "Eve", why: "", fact_type: "world",
@@ -323,23 +323,23 @@ describe("retain pipeline", () => {
     setEchoStructuredResponse("observation:", {
       observations: [{ observation: "Eve frequently codes through the night." }]
     });
-    await retain(makeConfig(lane), { text: "Eve coded all night.", mentionedAt: "2025-04-02T00:00:00Z" });
-    const observations = listMemoryUnits(lane, DEFAULT_BANK_ID, { network: "observation" });
+    await retain(makeConfig(instance), { text: "Eve coded all night.", mentionedAt: "2025-04-02T00:00:00Z" });
+    const observations = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "observation" });
     expect(observations.length).toBe(1);
     expect(observations[0]!.text).toContain("Eve");
   });
 
   test("audit + trace: retain emits an audit event", async () => {
-    const lane = "retain-audit";
-    ensureDefaultBank(lane);
+    const instance = "retain-audit";
+    ensureDefaultBank(instance);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "x", when: "", where: "", who: "", why: "", fact_type: "world" }
       ]
     });
-    await retain(makeConfig(lane), { text: "audited" });
+    await retain(makeConfig(instance), { text: "audited" });
     const { readState } = await import("../../state");
-    const state = readState(lane);
+    const state = readState(instance);
     const audit = state.audit.find((event) => event.action === "memory.retain");
     expect(audit).toBeDefined();
     expect(audit!.evidence).toMatchObject({ units: 1 });

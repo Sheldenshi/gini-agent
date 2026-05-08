@@ -32,8 +32,8 @@ import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./domain/memory";
 
 export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string): Promise<Task> {
-  const created = createTask(config.lane, input, jobId, parentTaskId, subagentId);
-  await mutateState(config.lane, (state) => {
+  const created = createTask(config.instance, input, jobId, parentTaskId, subagentId);
+  await mutateState(config.instance, (state) => {
     upsertTask(state, created);
     const audit = addAudit(state, {
       actor: jobId ? "runtime" : "user",
@@ -50,9 +50,9 @@ export async function submitTask(config: RuntimeConfig, input: string, jobId?: s
 }
 
 export async function retryTask(config: RuntimeConfig, taskId: string): Promise<Task> {
-  const task = await mutateState(config.lane, (state) => {
+  const task = await mutateState(config.instance, (state) => {
     const existing = findTask(state, taskId);
-    const retry = createTask(config.lane, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId);
+    const retry = createTask(config.instance, existing.input, existing.jobId, existing.parentTaskId, existing.subagentId);
     upsertTask(state, retry);
     addAudit(state, {
       actor: "user",
@@ -69,7 +69,7 @@ export async function retryTask(config: RuntimeConfig, taskId: string): Promise<
 }
 
 export async function cancelTask(config: RuntimeConfig, taskId: string): Promise<Task> {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") return task;
     task.status = "cancelled";
@@ -88,7 +88,7 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
 }
 
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
-  let task = await mutateState(config.lane, (state) => {
+  let task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     item.status = "running";
     item.currentStep = "Thinking";
@@ -97,8 +97,8 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     return item;
   });
 
-  appendTrace(config.lane, taskId, { type: "task", message: "Task started", data: { input: task.input } });
-  appendLog(config.lane, "task.started", { taskId });
+  appendTrace(config.instance, taskId, { type: "task", message: "Task started", data: { input: task.input } });
+  appendLog(config.instance, "task.started", { taskId });
 
   await Bun.sleep(10);
   const lower = task.input.toLowerCase();
@@ -115,7 +115,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   if (lower.startsWith("shell ")) return requestShell(config, task);
 
   // No tool matched: fall through to provider summarization.
-  const activeMemory = await mutateState(config.lane, (state) => state.memories.filter((memory) => memory.status === "active"));
+  const activeMemory = await mutateState(config.instance, (state) => state.memories.filter((memory) => memory.status === "active"));
 
   // Hindsight phase 5: auto-recall. Pull relevant facts/opinions from the
   // four-network store and inject as additional context. Best-effort — if
@@ -133,7 +133,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       augmentedInput = `${task.input}\n\nRecalled memory:\n${block}`;
     }
   } catch (error) {
-    appendTrace(config.lane, taskId, {
+    appendTrace(config.instance, taskId, {
       type: "memory",
       message: "auto-recall failed",
       data: { error: error instanceof Error ? error.message : String(error) }
@@ -141,7 +141,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   }
 
   const providerResult = await generateTaskSummary(config, augmentedInput, activeMemory);
-  appendTrace(config.lane, taskId, {
+  appendTrace(config.instance, taskId, {
     type: "model",
     message: `${providerResult.provider.name} provider generated response`,
     data: {
@@ -153,7 +153,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     }
   });
 
-  task = await mutateState(config.lane, (state) => {
+  task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     if (lower.includes("remember ")) {
       const content = item.input.split(/remember\s+/i).at(-1)?.trim() || item.input;
@@ -175,7 +175,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
         taskId: item.id,
         evidence: { content }
       });
-      appendTrace(config.lane, taskId, { type: "memory", message: "Memory proposed", data: { memoryId: memory.id } });
+      appendTrace(config.instance, taskId, { type: "memory", message: "Memory proposed", data: { memoryId: memory.id } });
     }
     item.status = "completed";
     item.currentStep = "Completed";
@@ -186,7 +186,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     return item;
   });
 
-  appendTrace(config.lane, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
+  appendTrace(config.instance, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
 
   // Hindsight phase 5: auto-retain. Run async and don't block task
   // completion. Skip trivial inputs (low information content) to keep cost
@@ -213,14 +213,14 @@ function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
     : `Task input: ${task.input}`;
   retain(config, { text, sourceTaskId: task.id })
     .then((result) => {
-      appendTrace(config.lane, task.id, {
+      appendTrace(config.instance, task.id, {
         type: "memory",
         message: "auto-retain completed",
         data: { units: result.units.length, links: result.links.length }
       });
     })
     .catch((error) => {
-      appendTrace(config.lane, task.id, {
+      appendTrace(config.instance, task.id, {
         type: "memory",
         message: "auto-retain failed",
         data: { error: error instanceof Error ? error.message : String(error) }
@@ -230,7 +230,7 @@ function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
-  await mutateState(config.lane, (state) => {
+  await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     task.status = "failed";
     task.error = message;
@@ -245,7 +245,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
       evidence: { error: message }
     });
   });
-  appendTrace(config.lane, taskId, { type: "error", message, data: {} });
+  appendTrace(config.instance, taskId, { type: "error", message, data: {} });
 }
 
 // Shared between agent and tool modules. Tools that complete immediately
@@ -259,7 +259,7 @@ export async function completeLowRiskToolTask(
   target: string,
   evidence: Record<string, unknown>
 ): Promise<Task> {
-  const completed = await mutateState(config.lane, (state) => {
+  const completed = await mutateState(config.instance, (state) => {
     const task = findTask(state, taskId);
     addAudit(state, {
       actor: "runtime",
@@ -282,7 +282,7 @@ export async function completeLowRiskToolTask(
 }
 
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
-  const approval = await mutateState(config.lane, (state) => {
+  const approval = await mutateState(config.instance, (state) => {
     const item = state.approvals.find((candidate) => candidate.id === approvalId);
     if (!item) throw new Error(`Approval not found: ${approvalId}`);
     if (item.status !== "pending") throw new Error(`Approval is already ${item.status}`);
@@ -300,7 +300,7 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
   });
 
   if (approval.taskId) {
-    appendTrace(config.lane, approval.taskId, { type: "approval", message: `Approval ${approval.status}`, data: { approvalId } });
+    appendTrace(config.instance, approval.taskId, { type: "approval", message: `Approval ${approval.status}`, data: { approvalId } });
   }
 
   if (decision === "deny") {
@@ -317,7 +317,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
     writeFileSync(target, String(approval.payload.content));
-    await mutateState(config.lane, (state) => {
+    await mutateState(config.instance, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "file.write",
@@ -329,7 +329,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       });
       if (approval.taskId) completeApprovedTask(state, approval.taskId, "File write completed.");
     });
-    if (approval.taskId) appendTrace(config.lane, approval.taskId, { type: "tool", message: "File written", data: { path: approval.payload.path } });
+    if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File written", data: { path: approval.payload.path } });
     return;
   }
 
@@ -341,7 +341,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     if (!before.includes(oldText)) throw new Error(`Patch target text no longer exists: ${approval.payload.path}`);
     const after = before.replace(oldText, newText);
     writeFileSync(target, after);
-    await mutateState(config.lane, (state) => {
+    await mutateState(config.instance, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "file.patch",
@@ -353,7 +353,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       });
       if (approval.taskId) completeApprovedTask(state, approval.taskId, "File patch completed.");
     });
-    if (approval.taskId) appendTrace(config.lane, approval.taskId, { type: "tool", message: "File patched", data: { path: approval.payload.path, diff: approval.payload.diff } });
+    if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File patched", data: { path: approval.payload.path, diff: approval.payload.diff } });
     return;
   }
 
@@ -374,9 +374,9 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
     // written to a sibling artifact under the task's trace directory and the
     // audit + trace point at it so the UI can render "View full output".
     const artifact = approval.taskId
-      ? writeTerminalArtifact(config.lane, approval.taskId, approval.id, { stdout, stderr })
+      ? writeTerminalArtifact(config.instance, approval.taskId, approval.id, { stdout, stderr })
       : undefined;
-    await mutateState(config.lane, (state) => {
+    await mutateState(config.instance, (state) => {
       addAudit(state, {
         actor: "runtime",
         action: "terminal.exec",
@@ -399,7 +399,7 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       if (approval.taskId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
     });
     if (approval.taskId) {
-      appendTrace(config.lane, approval.taskId, {
+      appendTrace(config.instance, approval.taskId, {
         type: "tool",
         message: "Command executed",
         data: {
@@ -425,12 +425,12 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
 // relative path; callers store both so URLs can resolve regardless of which
 // surface is displaying the trace.
 function writeTerminalArtifact(
-  lane: string,
+  instance: string,
   taskId: string,
   approvalId: string,
   output: { stdout: string; stderr: string }
 ): { path: string; relPath: string } {
-  const dir = join(traceDir(lane), taskId);
+  const dir = join(traceDir(instance), taskId);
   mkdirSync(dir, { recursive: true });
   const filename = `terminal-${approvalId}.log`;
   const path = join(dir, filename);

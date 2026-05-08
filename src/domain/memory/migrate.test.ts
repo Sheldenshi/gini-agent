@@ -30,9 +30,9 @@ afterAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
 });
 
-function makeConfig(lane: string): RuntimeConfig {
+function makeConfig(instance: string): RuntimeConfig {
   return {
-    lane,
+    instance,
     port: 0,
     token: "test",
     provider: { name: "echo", model: "gini-echo-v0" },
@@ -42,8 +42,8 @@ function makeConfig(lane: string): RuntimeConfig {
   };
 }
 
-async function seedLegacy(lane: string, count: number, network: "world" | "experience" = "world") {
-  await mutateState(lane, (state) => {
+async function seedLegacy(instance: string, count: number, network: "world" | "experience" = "world") {
+  await mutateState(instance, (state) => {
     for (let i = 0; i < count; i++) {
       // Mix in an experience-shaped one to exercise the network classifier.
       const content = network === "experience"
@@ -64,60 +64,60 @@ async function seedLegacy(lane: string, count: number, network: "world" | "exper
 
 describe("phase 6 migration", () => {
   test("migrates active legacy records into the SQLite store and marks them migrated", async () => {
-    const lane = "phase6-migrate-basic";
-    ensureDefaultBank(lane);
-    await seedLegacy(lane, 3);
-    expect(countMemoryUnits(lane)).toBe(0);
+    const instance = "phase6-migrate-basic";
+    ensureDefaultBank(instance);
+    await seedLegacy(instance, 3);
+    expect(countMemoryUnits(instance)).toBe(0);
 
-    const report = await migrateLegacyMemories(makeConfig(lane));
+    const report = await migrateLegacyMemories(makeConfig(instance));
     expect(report.total).toBe(3);
     expect(report.migrated).toBe(3);
     expect(report.failed).toBe(0);
-    expect(countMemoryUnits(lane)).toBe(3);
+    expect(countMemoryUnits(instance)).toBe(3);
 
-    const legacy = readState(lane).memories;
+    const legacy = readState(instance).memories;
     expect(legacy.every((entry) => Boolean(entry.metadata?.migratedToUnitId))).toBe(true);
   });
 
   test("re-running the migration is idempotent", async () => {
-    const lane = "phase6-migrate-idem";
-    ensureDefaultBank(lane);
-    await seedLegacy(lane, 2);
-    await migrateLegacyMemories(makeConfig(lane));
-    const before = countMemoryUnits(lane);
-    const report = await migrateLegacyMemories(makeConfig(lane));
+    const instance = "phase6-migrate-idem";
+    ensureDefaultBank(instance);
+    await seedLegacy(instance, 2);
+    await migrateLegacyMemories(makeConfig(instance));
+    const before = countMemoryUnits(instance);
+    const report = await migrateLegacyMemories(makeConfig(instance));
     expect(report.migrated).toBe(0);
     expect(report.skipped).toBe(2);
-    expect(countMemoryUnits(lane)).toBe(before);
+    expect(countMemoryUnits(instance)).toBe(before);
   });
 
   test("classifies first-person content as experience", async () => {
-    const lane = "phase6-migrate-classify";
-    ensureDefaultBank(lane);
-    await seedLegacy(lane, 2, "experience");
-    await migrateLegacyMemories(makeConfig(lane));
-    const experiences = listMemoryUnits(lane, DEFAULT_BANK_ID, { network: "experience" });
+    const instance = "phase6-migrate-classify";
+    ensureDefaultBank(instance);
+    await seedLegacy(instance, 2, "experience");
+    await migrateLegacyMemories(makeConfig(instance));
+    const experiences = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "experience" });
     expect(experiences.length).toBe(2);
   });
 
   test("legacyMigrationStatus reports pending vs migrated", async () => {
-    const lane = "phase6-migrate-status";
-    ensureDefaultBank(lane);
-    await seedLegacy(lane, 4);
-    let status = legacyMigrationStatus(readState(lane).memories);
+    const instance = "phase6-migrate-status";
+    ensureDefaultBank(instance);
+    await seedLegacy(instance, 4);
+    let status = legacyMigrationStatus(readState(instance).memories);
     expect(status.pending).toBe(4);
     expect(status.migrated).toBe(0);
-    await migrateLegacyMemories(makeConfig(lane));
-    status = legacyMigrationStatus(readState(lane).memories);
+    await migrateLegacyMemories(makeConfig(instance));
+    status = legacyMigrationStatus(readState(instance).memories);
     expect(status.pending).toBe(0);
     expect(status.migrated).toBe(4);
     expect(status.fullyMigrated).toBe(true);
   });
 
   test("proposed and rejected records are not migrated", async () => {
-    const lane = "phase6-migrate-skip-status";
-    ensureDefaultBank(lane);
-    await mutateState(lane, (state) => {
+    const instance = "phase6-migrate-skip-status";
+    ensureDefaultBank(instance);
+    await mutateState(instance, (state) => {
       createMemory(state, {
         content: "this is proposed",
         scope: "project",
@@ -135,9 +135,9 @@ describe("phase 6 migration", () => {
         provenance: "y"
       });
     });
-    const report = await migrateLegacyMemories(makeConfig(lane));
+    const report = await migrateLegacyMemories(makeConfig(instance));
     expect(report.skipped).toBe(2);
     expect(report.migrated).toBe(0);
-    expect(countMemoryUnits(lane)).toBe(0);
+    expect(countMemoryUnits(instance)).toBe(0);
   });
 });

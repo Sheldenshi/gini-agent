@@ -1,14 +1,14 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Lane, PairingStatus, RuntimeState } from "../types";
-import { ensureDir, laneRoot, statePath } from "../paths";
+import type { Instance, PairingStatus, RuntimeState } from "../types";
+import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultProfile, defaultTools, defaultToolsets } from "./defaults";
 
-export function createEmptyState(lane: Lane): RuntimeState {
+export function createEmptyState(instance: Instance): RuntimeState {
   const at = now();
   return {
     version: 1,
-    lane,
+    instance,
     createdAt: at,
     updatedAt: at,
     tasks: [],
@@ -20,7 +20,7 @@ export function createEmptyState(lane: Lane): RuntimeState {
     connectors: [
       {
         id: "conn_demo",
-        lane,
+        instance,
         name: "Demo Connector",
         kind: "demo",
         status: "configured",
@@ -35,13 +35,13 @@ export function createEmptyState(lane: Lane): RuntimeState {
     devices: [],
     promotions: [],
     snapshots: [],
-    tools: defaultTools(lane, at),
-    toolsets: defaultToolsets(lane, at),
+    tools: defaultTools(instance, at),
+    toolsets: defaultToolsets(instance, at),
     subagents: [],
     mcpServers: [],
     messagingBridges: [],
     importReports: [],
-    profiles: [defaultProfile(lane, at)],
+    profiles: [defaultProfile(instance, at)],
     activeProfileId: "profile_default",
     relays: [],
     notifications: [],
@@ -53,50 +53,50 @@ export function createEmptyState(lane: Lane): RuntimeState {
   };
 }
 
-export function readState(lane: Lane): RuntimeState {
-  ensureDir(laneRoot(lane));
-  const path = statePath(lane);
+export function readState(instance: Instance): RuntimeState {
+  ensureDir(instanceRoot(instance));
+  const path = statePath(instance);
   if (!existsSync(path)) {
-    const state = createEmptyState(lane);
-    writeState(lane, state);
+    const state = createEmptyState(instance);
+    writeState(instance, state);
     return state;
   }
   const state = JSON.parse(readFileSync(path, "utf8")) as RuntimeState;
-  return normalizeState(lane, state);
+  return normalizeState(instance, state);
 }
 
-export function writeState(lane: Lane, state: RuntimeState): void {
-  ensureDir(laneRoot(lane));
+export function writeState(instance: Instance, state: RuntimeState): void {
+  ensureDir(instanceRoot(instance));
   state.updatedAt = now();
-  const path = statePath(lane);
+  const path = statePath(instance);
   const tempPath = `${path}.tmp`;
   writeFileSync(tempPath, `${JSON.stringify(state, null, 2)}\n`);
   renameSync(tempPath, path);
 }
 
-// Per-lane serialization queue. mutateState is async so concurrent callers
+// Per-instance serialization queue. mutateState is async so concurrent callers
 // from independent async tasks (HTTP handlers, scheduler ticks, subagents,
 // messaging bridges) never interleave their read-modify-write windows on the
-// same lane. Single-process per-lane is the deployment model, so an
+// same instance. Single-process per-instance is the deployment model, so an
 // in-process promise chain is sufficient — no file lock or semaphore needed.
 //
 // Reads (readState) stay lock-free because the file is written atomically
 // (writeFileSync to .tmp + renameSync) so a reader either sees the prior
 // state or the next state, never a torn write.
-const laneLocks = new Map<Lane, Promise<unknown>>();
+const instanceLocks = new Map<Instance, Promise<unknown>>();
 
-export async function mutateState<T>(lane: Lane, fn: (state: RuntimeState) => T): Promise<T> {
-  const previous = laneLocks.get(lane) ?? Promise.resolve();
+export async function mutateState<T>(instance: Instance, fn: (state: RuntimeState) => T): Promise<T> {
+  const previous = instanceLocks.get(instance) ?? Promise.resolve();
   const next = previous.then(() => {
-    const state = readState(lane);
+    const state = readState(instance);
     const result = fn(state);
-    writeState(lane, state);
+    writeState(instance, state);
     return result;
   });
   // Store a chained promise that swallows errors so a failed mutation does
   // not poison the queue for subsequent callers; the original error still
   // propagates to the caller via the returned `next`.
-  laneLocks.set(lane, next.catch(() => undefined));
+  instanceLocks.set(instance, next.catch(() => undefined));
   return next;
 }
 
@@ -109,8 +109,64 @@ export function expirePairingCodes(state: RuntimeState): void {
   }
 }
 
-export function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
-  state.lane = lane;
+// Pre-rename state files persisted a `lane` field on every record (top-level
+// state.lane plus a lane field on every Task/Audit/Memory/Skill/etc.). After
+// the lane→instance rename these files still exist on disk; we rewrite them
+// in-place when first read. mutateState's read-modify-write cycle persists
+// the cleaned shape on the next mutation. Idempotent: records that already
+// carry an `instance` field are left alone.
+function migrateLaneFieldToInstance(state: RuntimeState): void {
+  const stateAny = state as unknown as { lane?: unknown; instance?: unknown };
+  if (stateAny.lane !== undefined && stateAny.instance === undefined) {
+    stateAny.instance = stateAny.lane;
+  }
+  delete stateAny.lane;
+
+  const collectionKeys: Array<keyof RuntimeState> = [
+    "tasks",
+    "approvals",
+    "audit",
+    "memories",
+    "skills",
+    "jobs",
+    "connectors",
+    "improvements",
+    "pairingCodes",
+    "devices",
+    "promotions",
+    "snapshots",
+    "tools",
+    "toolsets",
+    "subagents",
+    "mcpServers",
+    "messagingBridges",
+    "importReports",
+    "profiles",
+    "relays",
+    "notifications",
+    "events",
+    "jobRuns",
+    "chatSessions",
+    "chatMessages",
+    "messagingMessages"
+  ];
+  for (const key of collectionKeys) {
+    const records = state[key] as unknown;
+    if (!Array.isArray(records)) continue;
+    for (const record of records) {
+      if (!record || typeof record !== "object") continue;
+      const rec = record as { lane?: unknown; instance?: unknown };
+      if (rec.lane !== undefined && rec.instance === undefined) {
+        rec.instance = rec.lane;
+      }
+      delete rec.lane;
+    }
+  }
+}
+
+export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
+  migrateLaneFieldToInstance(state);
+  state.instance = instance;
   state.improvements ??= [];
   state.connectors ??= [];
   state.tasks ??= [];
@@ -123,14 +179,14 @@ export function normalizeState(lane: Lane, state: RuntimeState): RuntimeState {
   state.devices ??= [];
   state.promotions ??= [];
   state.snapshots ??= [];
-  state.tools ??= defaultTools(lane, now());
-  state.toolsets ??= defaultToolsets(lane, now());
+  state.tools ??= defaultTools(instance, now());
+  state.toolsets ??= defaultToolsets(instance, now());
   state.subagents ??= [];
   state.mcpServers ??= [];
   state.messagingBridges ??= [];
   state.messagingMessages ??= [];
   state.importReports ??= [];
-  state.profiles ??= [defaultProfile(lane, now())];
+  state.profiles ??= [defaultProfile(instance, now())];
   state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;
   state.relays ??= [];
   state.notifications ??= [];

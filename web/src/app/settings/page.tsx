@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { useInvalidate, useParity, useReadiness, useState_ } from "@/lib/queries";
-import { LaneCard } from "./_components/LaneCard";
+import { InstanceCard } from "./_components/InstanceCard";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
 import { ProfileCard, type ProfileRow } from "./_components/ProfileCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
@@ -105,10 +105,10 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="Settings" description="Lane, providers, profiles, integrations, devices, parity & readiness" />
+      <PageHeader title="Settings" description="Instance, providers, profiles, integrations, devices, parity & readiness" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
         <div className="grid gap-3 lg:grid-cols-2">
-          <LaneCard lane={state.data?.lane} activeProfileId={activeProfileId} />
+          <InstanceCard instance={state.data?.instance} activeProfileId={activeProfileId} />
           <ProviderCard catalog={catalog.data} />
         </div>
 

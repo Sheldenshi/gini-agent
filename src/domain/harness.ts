@@ -7,12 +7,12 @@ import { addAudit, createSnapshotRecord, mutateState, readState, readTrace, writ
 import { status } from "./runtime";
 
 export function createEvidenceBundle(config: RuntimeConfig) {
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   const taskIds = state.tasks.map((task) => task.id);
-  const traces = Object.fromEntries(taskIds.map((taskId) => [taskId, readTrace(config.lane, taskId)]));
+  const traces = Object.fromEntries(taskIds.map((taskId) => [taskId, readTrace(config.instance, taskId)]));
   const bundle = {
     createdAt: new Date().toISOString(),
-    lane: config.lane,
+    instance: config.instance,
     config: {
       port: config.port,
       stateRoot: config.stateRoot,
@@ -32,28 +32,28 @@ export function createEvidenceBundle(config: RuntimeConfig) {
 }
 
 export async function createSnapshot(config: RuntimeConfig, reason: string) {
-  mkdirSync(snapshotsDir(config.lane), { recursive: true });
+  mkdirSync(snapshotsDir(config.instance), { recursive: true });
   let snapshotPath = "";
-  const record = await mutateState(config.lane, (state) => {
-    snapshotPath = join(snapshotsDir(config.lane), `snapshot-${Date.now()}.json`);
+  const record = await mutateState(config.instance, (state) => {
+    snapshotPath = join(snapshotsDir(config.instance), `snapshot-${Date.now()}.json`);
     return createSnapshotRecord(state, { path: snapshotPath, reason });
   });
-  const state = readState(config.lane);
-  writeFileSync(snapshotPath, `${JSON.stringify({ createdAt: new Date().toISOString(), lane: config.lane, reason, state }, null, 2)}\n`);
+  const state = readState(config.instance);
+  writeFileSync(snapshotPath, `${JSON.stringify({ createdAt: new Date().toISOString(), instance: config.instance, reason, state }, null, 2)}\n`);
   return { ok: true, snapshotId: record.id, path: snapshotPath, reason };
 }
 
 export async function restoreSnapshot(config: RuntimeConfig, snapshotId: string) {
-  const current = readState(config.lane);
+  const current = readState(config.instance);
   const record = current.snapshots.find((item) => item.id === snapshotId);
   if (!record) throw new Error(`Snapshot not found: ${snapshotId}`);
   if (!existsSync(record.path)) throw new Error(`Snapshot file missing: ${record.path}`);
-  const parsed = JSON.parse(readFileSync(record.path, "utf8")) as { lane: string; state: ReturnType<typeof readState> };
-  if (parsed.lane !== config.lane || parsed.state.lane !== config.lane) {
-    throw new Error(`Snapshot lane mismatch: expected ${config.lane}`);
+  const parsed = JSON.parse(readFileSync(record.path, "utf8")) as { instance: string; state: ReturnType<typeof readState> };
+  if (parsed.instance !== config.instance || parsed.state.instance !== config.instance) {
+    throw new Error(`Snapshot instance mismatch: expected ${config.instance}`);
   }
-  writeState(config.lane, parsed.state);
-  await mutateState(config.lane, (state) => {
+  writeState(config.instance, parsed.state);
+  await mutateState(config.instance, (state) => {
     addAudit(state, {
       actor: "user",
       action: "snapshot.restored",
@@ -62,5 +62,5 @@ export async function restoreSnapshot(config: RuntimeConfig, snapshotId: string)
       evidence: { path: record.path }
     });
   });
-  return { ok: true, restored: snapshotId, lane: config.lane };
+  return { ok: true, restored: snapshotId, instance: config.instance };
 }

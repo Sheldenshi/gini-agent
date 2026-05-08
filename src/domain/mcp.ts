@@ -6,7 +6,7 @@ export async function addMcpServer(config: RuntimeConfig, input: Record<string, 
   const name = String(input.name ?? "");
   const command = String(input.command ?? "");
   if (!name || !command) throw new Error("MCP server name and command are required.");
-  return mutateState(config.lane, (state) => createMcpServerRecord(state, {
+  return mutateState(config.instance, (state) => createMcpServerRecord(state, {
     name,
     command,
     args: Array.isArray(input.args) ? input.args.map(String) : [],
@@ -16,10 +16,10 @@ export async function addMcpServer(config: RuntimeConfig, input: Record<string, 
 }
 
 export async function checkMcpServer(config: RuntimeConfig, idOrName: string) {
-  const server = readState(config.lane).mcpServers.find((item) => item.id === idOrName || item.name === idOrName);
+  const server = readState(config.instance).mcpServers.find((item) => item.id === idOrName || item.name === idOrName);
   if (!server) throw new Error(`MCP server not found: ${idOrName}`);
   const probe = server.status === "configured" ? await runMcpProbe(config, server.command, server.args) : { ok: false, message: "MCP server is disabled." };
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const server = state.mcpServers.find((item) => item.id === idOrName || item.name === idOrName);
     if (!server) throw new Error(`MCP server not found: ${idOrName}`);
     server.lastHealthAt = now();
@@ -38,12 +38,12 @@ export async function checkMcpServer(config: RuntimeConfig, idOrName: string) {
 }
 
 export async function invokeMcpTool(config: RuntimeConfig, idOrName: string, toolName: string, input: Record<string, unknown> = {}) {
-  const server = readState(config.lane).mcpServers.find((item) => item.id === idOrName || item.name === idOrName);
+  const server = readState(config.instance).mcpServers.find((item) => item.id === idOrName || item.name === idOrName);
   if (!server) throw new Error(`MCP server not found: ${idOrName}`);
   if (server.status !== "configured") throw new Error(`MCP server is not configured: ${idOrName}`);
   if (server.exposedTools.length > 0 && !server.exposedTools.includes(toolName)) throw new Error(`MCP tool is not exposed: ${toolName}`);
   const result = await runMcpProbe(config, server.command, [...server.args, JSON.stringify(input)]);
-  await mutateState(config.lane, (state) => {
+  await mutateState(config.instance, (state) => {
     addAudit(state, {
       actor: "runtime",
       action: "mcp.tool.invoked",
@@ -64,7 +64,7 @@ export async function invokeMcpTool(config: RuntimeConfig, idOrName: string, too
 }
 
 export async function removeMcpServer(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const server = state.mcpServers.find((item) => item.id === idOrName || item.name === idOrName);
     if (!server) throw new Error(`MCP server not found: ${idOrName}`);
     server.status = "disabled";

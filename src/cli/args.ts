@@ -1,9 +1,27 @@
 // Argument parsing helpers shared by the CLI entry and command modules.
 
+// Flags removed in the lane→instance rename. We reject them explicitly so
+// users on older muscle memory get a clear diagnostic instead of having the
+// flag silently ignored (which would let them think they were targeting one
+// instance while actually hitting the default).
+const REMOVED_FLAGS: Record<string, string> = {
+  "--lane": "--instance"
+};
+
+export function rejectRemovedFlags(values: string[]): void {
+  for (const value of values) {
+    const replacement = REMOVED_FLAGS[value];
+    if (replacement) {
+      throw new Error(`Unknown flag '${value}'. It was renamed to '${replacement}'.`);
+    }
+  }
+}
+
 export function stripGlobalArgs(values: string[]): string[] {
+  rejectRemovedFlags(values);
   const stripped: string[] = [];
   for (let index = 0; index < values.length; index += 1) {
-    if (["--lane", "--state-root", "--log-root", "--port", "--web-port"].includes(values[index] ?? "")) {
+    if (["--instance", "--state-root", "--log-root", "--port", "--web-port"].includes(values[index] ?? "")) {
       index += 1;
       continue;
     }

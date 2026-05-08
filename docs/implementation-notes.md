@@ -7,7 +7,7 @@ This repo is organized around runtime boundaries rather than feature chronology.
 ## Source Layout
 
 - `src/types.ts` defines stable domain contracts and serialized state shapes.
-- `src/paths.ts` owns macOS/user-level path selection and lane directory layout.
+- `src/paths.ts` owns macOS/user-level path selection and instance directory layout.
 - `src/state.ts` is the file-backed repository layer for state, trace, audit, and record constructors.
 - `src/domain/` contains behavior that mutates or evaluates runtime state.
 - `src/api/` contains API-facing view models and redaction rules.

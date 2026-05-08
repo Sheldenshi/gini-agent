@@ -48,7 +48,7 @@ describe("provider", () => {
 
 function config(provider: RuntimeConfig["provider"]): RuntimeConfig {
   return {
-    lane: "test",
+    instance: "test",
     port: 7337,
     token: "test",
     provider,

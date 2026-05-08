@@ -3,12 +3,12 @@ import { addAudit, createImprovementProposal, createJob, createMemory, createSki
 
 export async function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
   const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
-  const trace = taskId ? readTrace(config.lane, taskId) : [];
+  const trace = taskId ? readTrace(config.instance, taskId) : [];
   const kind = input.kind === "skill" || input.kind === "job" ? input.kind : "memory";
   const title = String(input.title ?? `${kind} improvement`);
   const payload = normalizeImprovementPayload(kind, input.payload);
 
-  return mutateState(config.lane, (state) => createImprovementProposal(state, {
+  return mutateState(config.instance, (state) => createImprovementProposal(state, {
     kind,
     title,
     rationale: String(input.rationale ?? "Proposed from runtime evidence."),
@@ -21,7 +21,7 @@ export async function proposeImprovement(config: RuntimeConfig, input: Record<st
 }
 
 export async function reviewImprovement(config: RuntimeConfig, proposalId: string, decision: "approve" | "reject") {
-  return mutateState(config.lane, (state) => {
+  return mutateState(config.instance, (state) => {
     const proposal = state.improvements.find((candidate) => candidate.id === proposalId);
     if (!proposal) throw new Error(`Improvement proposal not found: ${proposalId}`);
     if (proposal.status !== "proposed" && proposal.status !== "approved") {

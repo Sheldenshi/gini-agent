@@ -5,7 +5,7 @@ import { createImportReport, mutateState } from "../state";
 
 export async function inspectImportSource(config: RuntimeConfig, source: ImportSource, path: string) {
   const report = inspectPath(source, path);
-  return mutateState(config.lane, (state) => createImportReport(state, report));
+  return mutateState(config.instance, (state) => createImportReport(state, report));
 }
 
 function inspectPath(source: ImportSource, path: string) {

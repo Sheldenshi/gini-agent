@@ -51,12 +51,12 @@ export async function reinforceOpinionsForUnits(
   units: MemoryUnit[]
 ): Promise<void> {
   if (units.length === 0) return;
-  const lane = config.lane;
+  const instance = config.instance;
   for (const unit of units) {
     // Only facts (world/experience) trigger reinforcement; skip opinions
     // and observations to avoid feedback loops.
     if (unit.network !== "world" && unit.network !== "experience") continue;
-    const candidates = collectCandidates(lane, bankId, unit);
+    const candidates = collectCandidates(instance, bankId, unit);
     if (candidates.length === 0) continue;
     for (const opinion of candidates) {
       try {
@@ -70,8 +70,8 @@ export async function reinforceOpinionsForUnits(
         const before = opinion.confidence ?? 0.5;
         const after = applyVerdict(before, result.data.verdict);
         if (after !== before) {
-          updateMemoryUnitConfidence(lane, opinion.id, after);
-          appendTrace(lane, unit.sourceTaskId ?? bankId, {
+          updateMemoryUnitConfidence(instance, opinion.id, after);
+          appendTrace(instance, unit.sourceTaskId ?? bankId, {
             type: "memory",
             message: "opinion confidence updated",
             data: {
@@ -112,16 +112,16 @@ function clamp01(value: number): number {
 
 // Eq. 25: opinions that share an entity OR have semantic-similar text.
 function collectCandidates(
-  lane: string,
+  instance: string,
   bankId: string,
   newUnit: MemoryUnit
 ): MemoryUnit[] {
   const seen = new Map<string, MemoryUnit>();
 
   // Entity-shared candidates.
-  const mentions = entityMentionsForUnit(lane, newUnit.id);
+  const mentions = entityMentionsForUnit(instance, newUnit.id);
   for (const mention of mentions) {
-    for (const candidate of unitsForEntity(lane, mention.entityId, MAX_CANDIDATES_PER_FACT)) {
+    for (const candidate of unitsForEntity(instance, mention.entityId, MAX_CANDIDATES_PER_FACT)) {
       if (candidate.network !== "opinion") continue;
       seen.set(candidate.id, candidate);
     }
@@ -129,7 +129,7 @@ function collectCandidates(
 
   // Semantic-similar candidates over the active opinion pool.
   if (newUnit.embedding) {
-    const opinionPool = listMemoryUnits(lane, bankId, { network: "opinion", limit: 50 });
+    const opinionPool = listMemoryUnits(instance, bankId, { network: "opinion", limit: 50 });
     for (const candidate of opinionPool) {
       if (seen.has(candidate.id)) continue;
       if (!candidate.embedding) continue;

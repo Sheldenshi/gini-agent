@@ -21,11 +21,11 @@ import {
   DEFAULT_BANK_ID,
   MEMORY_SCHEMA_VERSION
 } from "./memory-db";
-import { resetLane } from "../domain/runtime";
-import { defaultConfig, laneRoot } from "../paths";
+import { resetInstance } from "../domain/runtime";
+import { defaultConfig, instanceRoot } from "../paths";
 
 // All tests share an isolated state root so they don't touch ~/.gini.
-// Each test uses a unique lane name to avoid cross-test interference.
+// Each test uses a unique instance name to avoid cross-test interference.
 const ROOT = "/tmp/gini-memory-db-test";
 
 beforeAll(() => {
@@ -41,11 +41,11 @@ afterAll(() => {
 
 describe("memory-db schema and storage", () => {
   test("opens idempotently and records schema version", () => {
-    const lane = "mem-init";
+    const instance = "mem-init";
     // First open creates the file + schema; second open is a no-op.
-    const a = getMemoryDb(lane);
-    const b = getMemoryDb(lane);
-    expect(a).toBe(b); // same handle, cached per lane
+    const a = getMemoryDb(instance);
+    const b = getMemoryDb(instance);
+    expect(a).toBe(b); // same handle, cached per instance
     const versionRow = a
       .query<{ value: string }, [string]>("SELECT value FROM schema_meta WHERE key = ?")
       .get("version");
@@ -55,7 +55,7 @@ describe("memory-db schema and storage", () => {
     // calling getMemoryDb again) must NOT throw and must preserve the
     // schema version row.
     closeAllMemoryDbs();
-    const reopened = getMemoryDb(lane);
+    const reopened = getMemoryDb(instance);
     const versionAfter = reopened
       .query<{ value: string }, [string]>("SELECT value FROM schema_meta WHERE key = ?")
       .get("version");
@@ -63,17 +63,17 @@ describe("memory-db schema and storage", () => {
   });
 
   test("ensureDefaultBank creates the default bank exactly once", () => {
-    const lane = "mem-bank";
-    const first = ensureDefaultBank(lane);
+    const instance = "mem-bank";
+    const first = ensureDefaultBank(instance);
     expect(first.id).toBe(DEFAULT_BANK_ID);
     expect(first.skepticism).toBe(3);
     expect(first.literalism).toBe(3);
     expect(first.empathy).toBe(3);
 
-    const second = ensureDefaultBank(lane);
+    const second = ensureDefaultBank(instance);
     expect(second.id).toBe(first.id);
 
-    const db = getMemoryDb(lane);
+    const db = getMemoryDb(instance);
     const count = db
       .query<{ c: number }, []>("SELECT COUNT(*) AS c FROM memory_banks")
       .get()?.c;
@@ -81,11 +81,11 @@ describe("memory-db schema and storage", () => {
   });
 
   test("inserts a memory unit with embedding and round-trips Float32Array", () => {
-    const lane = "mem-units";
-    ensureDefaultBank(lane);
+    const instance = "mem-units";
+    ensureDefaultBank(instance);
 
     const embedding = new Float32Array([0.1, -0.5, 1.25, 3.14159, -2.71828, 0.0]);
-    const unit = insertMemoryUnit(lane, {
+    const unit = insertMemoryUnit(instance, {
       text: "Gini ate the receipts.",
       embedding,
       embeddingModel: "test-embed-v0",
@@ -98,7 +98,7 @@ describe("memory-db schema and storage", () => {
     expect(unit.embeddingDim).toBe(6);
     expect(unit.metadata.topic).toBe("receipts");
 
-    const fetched = getMemoryUnit(lane, unit.id);
+    const fetched = getMemoryUnit(instance, unit.id);
     expect(fetched).not.toBeNull();
     expect(fetched?.text).toBe("Gini ate the receipts.");
     expect(fetched?.network).toBe("world");
@@ -110,7 +110,7 @@ describe("memory-db schema and storage", () => {
       expect(fetched!.embedding![i]).toBe(embedding[i]);
     }
 
-    expect(countMemoryUnits(lane)).toBe(1);
+    expect(countMemoryUnits(instance)).toBe(1);
   });
 
   test("serializeEmbedding/deserializeEmbedding survive a fresh ArrayBuffer", () => {
@@ -129,18 +129,18 @@ describe("memory-db schema and storage", () => {
   });
 
   test("FTS5 mirror returns inserted text via MATCH queries", () => {
-    const lane = "mem-fts";
-    ensureDefaultBank(lane);
-    const a = insertMemoryUnit(lane, {
+    const instance = "mem-fts";
+    ensureDefaultBank(instance);
+    const a = insertMemoryUnit(instance, {
       text: "The quick brown fox jumps over the lazy dog",
       network: "world"
     });
-    insertMemoryUnit(lane, {
+    insertMemoryUnit(instance, {
       text: "Pythagoras proved that the square of the hypotenuse",
       network: "world"
     });
 
-    const db = getMemoryDb(lane);
+    const db = getMemoryDb(instance);
     // FTS5 MATCH lookups return rowids that point back to memory_units. The
     // contentless FTS table approach means we have to JOIN to recover the row.
     const rows = db
@@ -154,14 +154,14 @@ describe("memory-db schema and storage", () => {
   });
 
   test("FTS index reflects deletions via the AFTER DELETE trigger", () => {
-    const lane = "mem-fts-delete";
-    ensureDefaultBank(lane);
-    const unit = insertMemoryUnit(lane, {
+    const instance = "mem-fts-delete";
+    ensureDefaultBank(instance);
+    const unit = insertMemoryUnit(instance, {
       text: "Deletable observation about lemurs",
       network: "observation"
     });
 
-    const db = getMemoryDb(lane);
+    const db = getMemoryDb(instance);
     db.run("DELETE FROM memory_units WHERE id = ?", [unit.id]);
     const remaining = db
       .query<{ c: number }, [string]>(
@@ -172,33 +172,33 @@ describe("memory-db schema and storage", () => {
   });
 
   test("entities and links round-trip and respect indexes", () => {
-    const lane = "mem-entities";
-    ensureDefaultBank(lane);
-    const fromUnit = insertMemoryUnit(lane, { text: "Alice met Bob in Paris.", network: "world" });
-    const toUnit = insertMemoryUnit(lane, { text: "Bob later moved to Berlin.", network: "world" });
+    const instance = "mem-entities";
+    ensureDefaultBank(instance);
+    const fromUnit = insertMemoryUnit(instance, { text: "Alice met Bob in Paris.", network: "world" });
+    const toUnit = insertMemoryUnit(instance, { text: "Bob later moved to Berlin.", network: "world" });
 
-    const alice = insertEntity(lane, { canonicalName: "Alice", entityType: "PERSON" });
-    const bob = insertEntity(lane, { canonicalName: "Bob", entityType: "PERSON" });
+    const alice = insertEntity(instance, { canonicalName: "Alice", entityType: "PERSON" });
+    const bob = insertEntity(instance, { canonicalName: "Bob", entityType: "PERSON" });
 
-    linkUnitToEntity(lane, fromUnit.id, alice.id, "Alice");
-    linkUnitToEntity(lane, fromUnit.id, bob.id, "Bob");
-    linkUnitToEntity(lane, toUnit.id, bob.id, "Bob");
+    linkUnitToEntity(instance, fromUnit.id, alice.id, "Alice");
+    linkUnitToEntity(instance, fromUnit.id, bob.id, "Bob");
+    linkUnitToEntity(instance, toUnit.id, bob.id, "Bob");
     // Duplicate insert is a no-op (PK + INSERT OR IGNORE).
-    linkUnitToEntity(lane, toUnit.id, bob.id, "Bob");
+    linkUnitToEntity(instance, toUnit.id, bob.id, "Bob");
 
-    const db = getMemoryDb(lane);
+    const db = getMemoryDb(instance);
     const mentionsForBob = db
       .query<{ unit_id: string }, [string]>("SELECT unit_id FROM entity_mentions WHERE entity_id = ?")
       .all(bob.id);
     expect(mentionsForBob.length).toBe(2);
 
-    insertLink(lane, {
+    insertLink(instance, {
       fromUnit: fromUnit.id,
       toUnit: toUnit.id,
       linkType: "temporal",
       weight: 0.75
     });
-    insertLink(lane, {
+    insertLink(instance, {
       fromUnit: fromUnit.id,
       toUnit: toUnit.id,
       linkType: "causal",
@@ -207,7 +207,7 @@ describe("memory-db schema and storage", () => {
     });
     // Same pair + same link_type but DIFFERENT causal_subtype is a separate
     // row (subtype is part of the PK), so this should not collide.
-    insertLink(lane, {
+    insertLink(instance, {
       fromUnit: fromUnit.id,
       toUnit: toUnit.id,
       linkType: "causal",
@@ -215,33 +215,33 @@ describe("memory-db schema and storage", () => {
       weight: 0.2
     });
 
-    const allFrom = linksFrom(lane, fromUnit.id);
+    const allFrom = linksFrom(instance, fromUnit.id);
     expect(allFrom.length).toBe(3);
-    const causalOnly = linksFrom(lane, fromUnit.id, "causal");
+    const causalOnly = linksFrom(instance, fromUnit.id, "causal");
     expect(causalOnly.length).toBe(2);
     expect(causalOnly.map((link) => link.causalSubtype).sort()).toEqual(["causes", "enables"]);
   });
 
   test("link weight outside [0,1] is rejected before hitting SQL", () => {
-    const lane = "mem-link-weight";
-    ensureDefaultBank(lane);
-    const a = insertMemoryUnit(lane, { text: "a", network: "world" });
-    const b = insertMemoryUnit(lane, { text: "b", network: "world" });
+    const instance = "mem-link-weight";
+    ensureDefaultBank(instance);
+    const a = insertMemoryUnit(instance, { text: "a", network: "world" });
+    const b = insertMemoryUnit(instance, { text: "b", network: "world" });
     expect(() =>
-      insertLink(lane, { fromUnit: a.id, toUnit: b.id, linkType: "semantic", weight: 1.5 })
+      insertLink(instance, { fromUnit: a.id, toUnit: b.id, linkType: "semantic", weight: 1.5 })
     ).toThrow();
   });
 
   test("countByNetwork groups by the four-network vocabulary", () => {
-    const lane = "mem-counts";
-    ensureDefaultBank(lane);
-    insertMemoryUnit(lane, { text: "world fact", network: "world" });
-    insertMemoryUnit(lane, { text: "experience", network: "experience" });
-    insertMemoryUnit(lane, { text: "experience 2", network: "experience" });
-    insertMemoryUnit(lane, { text: "opinion", network: "opinion" });
-    insertMemoryUnit(lane, { text: "observation", network: "observation" });
+    const instance = "mem-counts";
+    ensureDefaultBank(instance);
+    insertMemoryUnit(instance, { text: "world fact", network: "world" });
+    insertMemoryUnit(instance, { text: "experience", network: "experience" });
+    insertMemoryUnit(instance, { text: "experience 2", network: "experience" });
+    insertMemoryUnit(instance, { text: "opinion", network: "opinion" });
+    insertMemoryUnit(instance, { text: "observation", network: "observation" });
 
-    const counts = countByNetwork(lane);
+    const counts = countByNetwork(instance);
     expect(counts.world).toBe(1);
     expect(counts.experience).toBe(2);
     expect(counts.opinion).toBe(1);
@@ -249,36 +249,36 @@ describe("memory-db schema and storage", () => {
   });
 
   test("removeMemoryDb deletes the file and clears the cache", () => {
-    const lane = "mem-remove";
-    ensureDefaultBank(lane);
-    insertMemoryUnit(lane, { text: "doomed", network: "world" });
-    const path = memoryDbPath(lane);
+    const instance = "mem-remove";
+    ensureDefaultBank(instance);
+    insertMemoryUnit(instance, { text: "doomed", network: "world" });
+    const path = memoryDbPath(instance);
     expect(existsSync(path)).toBe(true);
 
-    removeMemoryDb(lane);
+    removeMemoryDb(instance);
     expect(existsSync(path)).toBe(false);
     // WAL/SHM siblings must be gone too so a re-open starts truly fresh.
     expect(existsSync(`${path}-wal`)).toBe(false);
     expect(existsSync(`${path}-shm`)).toBe(false);
 
     // Reopening after removal recreates the schema and the row count is 0.
-    const fresh = getMemoryDb(lane);
+    const fresh = getMemoryDb(instance);
     const c = fresh.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM memory_units").get()?.c;
     expect(c).toBe(0);
   });
 
-  test("resetLane clears the memory DB and probe reports zero units", () => {
-    const lane = "mem-reset";
-    const config = { ...defaultConfig(lane), stateRoot: laneRoot(lane) };
-    ensureDefaultBank(lane);
-    insertMemoryUnit(lane, { text: "to be wiped", network: "world" });
-    expect(countMemoryUnits(lane)).toBe(1);
+  test("resetInstance clears the memory DB and probe reports zero units", () => {
+    const instance = "mem-reset";
+    const config = { ...defaultConfig(instance), stateRoot: instanceRoot(instance) };
+    ensureDefaultBank(instance);
+    insertMemoryUnit(instance, { text: "to be wiped", network: "world" });
+    expect(countMemoryUnits(instance)).toBe(1);
 
-    resetLane(config);
+    resetInstance(config);
 
-    // After reset, the lane root has been recreated by install(); the memory
+    // After reset, the instance root has been recreated by install(); the memory
     // DB is gone until the next ensureDefaultBank() / insert / probe call.
-    const probe = probeMemoryDb(lane);
+    const probe = probeMemoryDb(instance);
     expect(probe.ok).toBe(true);
     expect(probe.memoryUnits).toBe(0);
     expect(probe.banks).toBe(0);

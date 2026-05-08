@@ -1,20 +1,20 @@
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import type { RuntimeConfig } from "../types";
-import { configPath, ensureDir, laneRoot } from "../paths";
+import { configPath, ensureDir, instanceRoot } from "../paths";
 import { readState, taskCounts } from "../state";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
 
 export function status(config: RuntimeConfig) {
-  const state = readState(config.lane);
+  const state = readState(config.instance);
   const missedJobs = state.jobs.filter((job) => job.status === "active" && new Date(job.nextRunAt).getTime() + job.intervalSeconds * 1000 < Date.now()).length;
-  // Memory DB probe is best-effort: a fresh lane will have 0 units. We don't
+  // Memory DB probe is best-effort: a fresh instance will have 0 units. We don't
   // open the DB here unless one already exists on disk to avoid creating an
   // empty memory.db side-effect from a read-only status call.
   const memoryUnits = countMemoryUnitsIfPresent(config);
   return {
     ok: true,
-    lane: config.lane,
+    instance: config.instance,
     port: config.port,
     stateRoot: config.stateRoot,
     workspaceRoot: config.workspaceRoot,
@@ -30,13 +30,13 @@ export function status(config: RuntimeConfig) {
 }
 
 function countMemoryUnitsIfPresent(config: RuntimeConfig): number {
-  // Skip the open if no DB exists yet — a fresh lane reports 0 units without
+  // Skip the open if no DB exists yet — a fresh instance reports 0 units without
   // creating an empty memory.db as a side effect of a read-only status call.
   // Returning 0 on any error keeps `gini status` resilient; doctor surfaces
   // deeper diagnostics via probeMemoryDb.
   try {
-    if (!existsSync(memoryDbPath(config.lane))) return 0;
-    const db = getMemoryDb(config.lane);
+    if (!existsSync(memoryDbPath(config.instance))) return 0;
+    const db = getMemoryDb(config.instance);
     const row = db
       .query<{ c: number }, []>("SELECT COUNT(*) AS c FROM memory_units")
       .get();
@@ -47,19 +47,19 @@ function countMemoryUnitsIfPresent(config: RuntimeConfig): number {
 }
 
 export function install(config: RuntimeConfig): void {
-  // After resetLane removes the lane root, the directory is gone. Ensure it
+  // After resetInstance removes the instance root, the directory is gone. Ensure it
   // before writing the config so reinstall is a clean idempotent operation.
-  ensureDir(laneRoot(config.lane));
-  writeFileSync(configPath(config.lane), `${JSON.stringify(config, null, 2)}\n`);
-  readState(config.lane);
+  ensureDir(instanceRoot(config.instance));
+  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  readState(config.instance);
 }
 
-export function resetLane(config: RuntimeConfig): void {
+export function resetInstance(config: RuntimeConfig): void {
   // Close the cached memory DB handle (if any) before removing the state
   // root so we release the WAL/SHM file descriptors. Without this, the
   // physical files would still be unlinked but a subsequent getMemoryDb()
   // could hand back the closed handle from the cache.
-  closeMemoryDb(config.lane);
+  closeMemoryDb(config.instance);
   rmSync(config.stateRoot, { recursive: true, force: true });
   install(config);
 }

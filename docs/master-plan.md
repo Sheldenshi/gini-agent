@@ -64,7 +64,7 @@ The ideal product promise:
 **Install an open source agent on your own computer. Control it from an app. Every action has a receipt.**
 
 Release interpretation:
-- v0 proves the durable local runtime trunk: CLI, local Next.js control surface, tasks, traces, audit, permissions, tools, jobs, memory/skills basics, lanes, connectors, and governed self-improvement primitives.
+- v0 proves the durable local runtime trunk: CLI, local Next.js control surface, tasks, traces, audit, permissions, tools, jobs, memory/skills basics, instances, connectors, and governed self-improvement primitives.
 - v1 completes the end-state system structure and reaches feature parity with the current Hermes Agent runtime feature set: CLI depth, persistent memory, skills, session search, cron/jobs, provider flexibility, toolsets/tool gating, delegation/subagents, MCP, messaging bridges, config/profile equivalents, migration/import basics, and the stable architecture/contracts needed for the future app and end-state product.
 - v2 is not a catch-up phase. v2 improves beyond Hermes in reliability, security, governance, mobile UX, connector/auth depth, production/sandbox promotion, rollback, evals, harness optimization, and long-running operational maturity.
 - Gini Computer, if pursued, is a separate product and is not part of this open source Gini Agent roadmap.
@@ -148,13 +148,13 @@ Build order:
 
 The Mac remains the source of truth. The relay should route encrypted control/event traffic and should not become the authority, the brain, or the place where sensitive runtime state lives.
 
-### Lanes
+### Instances
 
-Be lane-aware from the beginning, but do not require full production/sandbox machinery in the first milestone.
+Be instance-aware from the beginning, but do not require full production/sandbox machinery in the first milestone.
 
-Early implementation may run only one dev lane, but config, paths, events, traces, and runtime identity should avoid hardcoding “there is only one Gini forever.”
+Early implementation may run only one dev instance, but config, paths, events, traces, and runtime identity should avoid hardcoding “there is only one Gini forever.”
 
-Later milestones should add dev/sandbox/production lanes, separate state paths, separate ports/sockets, separate logs/traces, separate credential namespaces, isolation tests, promotion artifacts, and rollback workflows.
+Later milestones should add dev/sandbox/production instances, separate state paths, separate ports/sockets, separate logs/traces, separate credential namespaces, isolation tests, promotion artifacts, and rollback workflows.
 
 ### v0 and v1 milestone ladder
 
@@ -165,7 +165,7 @@ Split v0 into smaller milestones that build the durable runtime trunk:
 - v0.3 Tools with safety
 - v0.4 Jobs
 - v0.5 Memory, skills, and basic session search
-- v0.6 Lanes and closed-loop development harness
+- v0.6 Instances and closed-loop development harness
 - v0.7 Connector foundation
 - v0.8 Runtime self-improvement primitives
 
@@ -190,7 +190,7 @@ Required Phase 0 ADR topics:
 - trace privacy
 - audit integrity
 - permission defaults
-- lane identity
+- instance identity
 - pairing/approval model
 - relay threat model
 
@@ -210,17 +210,17 @@ Default names:
 - product: Gini
 - CLI: `gini`
 - runtime: `gini-runtime` or `gini-daemon`
-- state root: `~/.gini/lanes/<lane>` (overridable via `GINI_STATE_ROOT`)
-- logs: `~/.gini/logs/<lane>` (overridable via `GINI_LOG_ROOT`)
+- state root: `~/.gini/instances/<instance>` (overridable via `GINI_STATE_ROOT`)
+- logs: `~/.gini/logs/<instance>` (overridable via `GINI_LOG_ROOT`)
 
 Development builds may use simpler local paths, but old placeholder product names should be removed.
 
 ### Connectors
 
-Do not let real connectors block the core runtime. Start with demo connectors and add one practical real connector only after tasks, approvals, traces, jobs, memory/skills, and lane-aware development flows are stable enough to observe connector behavior.
+Do not let real connectors block the core runtime. Start with demo connectors and add one practical real connector only after tasks, approvals, traces, jobs, memory/skills, and instance-aware development flows are stable enough to observe connector behavior.
 
 Default sequencing:
-- v0.7 Connector foundation after v0.6 lanes/development harness
+- v0.7 Connector foundation after v0.6 instances/development harness
 - one demo connector with no secrets first
 - one real connector later, likely GitHub, before serious mobile polish if useful
 - broad connector catalog much later
@@ -492,7 +492,7 @@ Examples:
 
 These smoke tests should run locally and be runnable by coding agents. Some can run in CI; others may require a Mac host or a local simulator.
 
-Smoke tests must also be safe for concurrent coding-agent work. The default smoke path should allocate an isolated non-production lane, state root, log root, and localhost port when no lane is explicitly supplied. Named lanes are allowed for persistent harness work, but concurrent agents must not install, reset, or smoke-test against the same lane unless the test is intentionally exercising shared-lane contention.
+Smoke tests must also be safe for concurrent coding-agent work. The default smoke path should allocate an isolated non-production instance, state root, log root, and localhost port when no instance is explicitly supplied. Named instances are allowed for persistent harness work, but concurrent agents must not install, reset, or smoke-test against the same instance unless the test is intentionally exercising shared-instance contention.
 
 ### Orchestration model for coding agents
 
@@ -554,7 +554,7 @@ The development process itself should become a product testbed. If agents repeat
 
 ### Production vs sandbox isolation
 
-These sections describe the v0.6+ and later target. v0.1 may run a single dev lane. The early requirement is to avoid hardcoding assumptions that would prevent future lane separation, not to implement full production/sandbox promotion machinery immediately.
+These sections describe the v0.6+ and later target. v0.1 may run a single dev instance. The early requirement is to avoid hardcoding assumptions that would prevent future instance separation, not to implement full production/sandbox promotion machinery immediately.
 
 Gini should assume the user may eventually run a stable production installation while coding agents are simultaneously building the next version. The self-iteration loop must not corrupt, replace, or destabilize the user's main agent.
 
@@ -562,16 +562,16 @@ Core rule:
 
 **Production Gini is sacred. Experimental Gini runs in a sandbox until promoted.**
 
-The product should support at least two installation lanes:
+The product should support at least two installation instances:
 
-1. Production lane
+1. Production instance
    - the user's trusted daily-driver Gini
    - stable config, memory, skills, jobs, connectors, credentials, and audit history
    - conservative auto-updates
    - explicit user approval for upgrades
    - easy rollback to the prior known-good version
 
-2. Sandbox lane
+2. Sandbox instance
    - isolated development/test Gini instance
    - separate binary/build output
    - separate config directory
@@ -582,7 +582,7 @@ The product should support at least two installation lanes:
    - separate test credentials and demo connectors
    - no access to production secrets unless explicitly granted through a scoped test permission
 
-A coding agent should iterate against the sandbox lane by default. It can install, uninstall, reset, crash, migrate, and mutate the sandbox without touching production.
+A coding agent should iterate against the sandbox instance by default. It can install, uninstall, reset, crash, migrate, and mutate the sandbox without touching production.
 
 ### Promotion model
 
@@ -598,7 +598,7 @@ New versions should move through a promotion path:
 
 3. Sandbox smoke tests
    - run required product flows
-   - use a unique lane/state root/port per concurrent coding agent
+   - use a unique instance/state root/port per concurrent coding agent
    - collect logs, traces, audit events, screenshots/snapshots where relevant
 
 4. Staged migration test
@@ -685,7 +685,7 @@ A failed sandbox run is normal. A failed production upgrade without rollback is 
 
 ### Dogfooding model
 
-Once Gini has v0.6 lane isolation and later promotion/rollback support, the ideal workflow is:
+Once Gini has v0.6 instance isolation and later promotion/rollback support, the ideal workflow is:
 
 1. User runs stable Gini as daily driver.
 2. User asks production Gini to improve itself or build a feature.
@@ -1169,7 +1169,7 @@ The v1 target experience is that people can install Gini Agent on their own Mac 
 
 ## 5. Core Product Surfaces
 
-### 5.1 Control Plane Surfaces
+### 5.1 Control Pinstance Surfaces
 
 In v0 and v1, these product surfaces should be exposed through the local Next.js control plane so coding agents can test them with browser automation and users can operate Gini without a mobile app. The Expo/mobile app is post-v1 and should consume the same runtime contracts once the v1 architecture is stable.
 
@@ -1806,7 +1806,7 @@ The first diagnostic task should verify:
 - notifications configured where available
 - scheduler running
 - trace/audit logging working
-- lane identity clear
+- instance identity clear
 
 ### 7.1.3 Recovery and re-pairing
 
@@ -1814,7 +1814,7 @@ A headless product needs obvious recovery paths:
 - re-pair phone
 - revoke old phone
 - reset app pairing only
-- reset sandbox lane only
+- reset sandbox instance only
 - preserve production data unless user explicitly chooses destructive reset
 
 Recovery must be understandable to non-technical users and safe for technical users running production workloads.
@@ -2035,7 +2035,7 @@ Database stores:
 Filesystem trace store stores full artifacts:
 
 ```
-~/.gini/lanes/<lane>/
+~/.gini/instances/<instance>/
   config.yaml
   auth/                 # references only; secrets in Keychain
   db.sqlite
@@ -2151,7 +2151,7 @@ A paired device record should represent:
 - revocation status
 - production vs sandbox target
 
-The exact cryptographic implementation is an implementation choice, but the product semantics are not: paired devices must be authenticated, revocable, auditable, and clearly associated with the correct runtime lane.
+The exact cryptographic implementation is an implementation choice, but the product semantics are not: paired devices must be authenticated, revocable, auditable, and clearly associated with the correct runtime instance.
 
 ### 8.7 Real-time event model
 
@@ -2525,9 +2525,9 @@ Build Gini in layers.
 
 The first implementation target is an installable Mac runtime with CLI and a local Next.js control plane. The future app should consume the same runtime/control contracts, but it should not block the first runtime milestones.
 
-**v0 target:** A local macOS agent runtime that can be installed/run on a user-controlled Mac, inspected through CLI and local Next.js, execute tasks safely, show traces/audit, run jobs, expose memory/skills/session-search basics, support lane-aware development, and expose contracts that future mobile can consume.
+**v0 target:** A local macOS agent runtime that can be installed/run on a user-controlled Mac, inspected through CLI and local Next.js, execute tasks safely, show traces/audit, run jobs, expose memory/skills/session-search basics, support instance-aware development, and expose contracts that future mobile can consume.
 
-**v1 target:** Finish the full v1 plan as a complete product foundation, not a partial preview. By the end of v1, Gini should have everything Hermes Agent currently has at the runtime-capability level, plus Gini's end-state architecture skeleton: local runtime, CLI, stable API/contracts, local web control plane, future app/control-plane contracts, task/event model, tasks, approvals, jobs, memory, skills, session search, traces, audit, permissions, connectors, toolsets, provider abstraction, delegation, MCP, messaging bridge, lanes, import/migration basics, and parity smoke/eval coverage. Gini may present these capabilities through different UX primitives than Hermes, but a Hermes user should not lose a major runtime capability by switching to Gini v1. The iOS/Expo app is not part of v1.
+**v1 target:** Finish the full v1 plan as a complete product foundation, not a partial preview. By the end of v1, Gini should have everything Hermes Agent currently has at the runtime-capability level, plus Gini's end-state architecture skeleton: local runtime, CLI, stable API/contracts, local web control plane, future app/control-plane contracts, task/event model, tasks, approvals, jobs, memory, skills, session search, traces, audit, permissions, connectors, toolsets, provider abstraction, delegation, MCP, messaging bridge, instances, import/migration basics, and parity smoke/eval coverage. Gini may present these capabilities through different UX primitives than Hermes, but a Hermes user should not lose a major runtime capability by switching to Gini v1. The iOS/Expo app is not part of v1.
 
 **v2 target:** Start from completed v1 parity and improve beyond Hermes rather than catching up: iOS/Expo app, paired-device auth, remote/push path, hardened production/sandbox promotion, rollback, stronger adversarial security, richer connector/auth UX, mature runtime self-improvement, eval/harness optimization, long-running reliability, and operational polish.
 
@@ -2549,7 +2549,7 @@ Minimum v1 Hermes-parity capabilities:
 - Delegation/subagents: isolated subagent tasks, concurrency/depth limits, tool-scope restrictions, trace linkage, cost attribution, cancellation, and parent verification of side-effect claims.
 - MCP/plugin integration: add/list/remove/test MCP servers, selected exposed tools, plugin health, permission mediation, and failure isolation.
 - Messaging gateway/bridge: at least the most important Hermes-style messaging paths for remote input/notifications, with channel health and links back to Gini's source-of-truth task/control plane.
-- Config/profile equivalent: lane-aware config/profile management that covers the same practical use cases as Hermes profiles while preserving Gini's production/sandbox/dev isolation model.
+- Config/profile equivalent: instance-aware config/profile management that covers the same practical use cases as Hermes profiles while preserving Gini's production/sandbox/dev isolation model.
 - Migration/import basics: at minimum, read-only inspection or guided import for useful Hermes/OpenClaw state such as memories, skills, jobs, profiles, and connector references, without mutating existing installs by default.
 - Runtime self-improvement: memory, skill, job, prompt, or workflow improvement proposals sourced from traces and user feedback, reviewable before application.
 
@@ -2668,23 +2668,23 @@ Success criteria:
 - skill can be loaded for a toy task
 - skill/memory changes are inspectable and reversible where possible
 
-#### v0.6 Lanes and closed-loop development harness
+#### v0.6 Instances and closed-loop development harness
 
 Goal:
 Coding agents can safely iterate on Gini without destabilizing a real daily-driver install.
 
 Includes:
-- lane-aware config/state
-- dev/sandbox lane support
+- instance-aware config/state
+- dev/sandbox instance support
 - reset/uninstall paths
 - smoke test runner
 - evidence bundle
 - basic isolation checks
 
 Success criteria:
-- coding agent can run smoke tests against a non-production lane
-- lane identity appears in traces/audit/config
-- reset affects only the selected lane
+- coding agent can run smoke tests against a non-production instance
+- instance identity appears in traces/audit/config
+- reset affects only the selected instance
 - evidence bundle includes task, logs, trace, audit, and test results
 
 #### v0.7 Connector foundation
@@ -2759,7 +2759,7 @@ By the end of v1, a user can:
 8. Review trace/audit summaries in a readable form.
 9. Use Hermes-equivalent runtime capabilities inside Gini: CLI workflow, memory, skills, session search, jobs, file/terminal/web/code tools, toolsets/tool gating, provider abstraction, delegation/subagents, MCP, messaging bridge, config/profile equivalent, and import/migration basics.
 10. Confirm through a Hermes-parity smoke/eval suite that switching from Hermes to Gini does not remove a major runtime capability, even if Gini's UX and integration breadth differ.
-11. Confirm that the v1 architecture skeleton is in place for future v2 expansion: stable runtime contracts, future app/control-plane contracts, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and documented extension points.
+11. Confirm that the v1 architecture skeleton is in place for future v2 expansion: stable runtime contracts, future app/control-plane contracts, event stream, trace/audit substrate, permission enforcement boundary, instance-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and documented extension points.
 12. Treat any missing Hermes runtime capability as a v1 blocker unless explicitly documented as an intentional non-goal with an approved expansion path.
 
 Explicit v1 non-goal:
@@ -2772,7 +2772,7 @@ v2 starts from v1 Hermes parity. It is not a catch-up milestone. A user can:
 2. Chat or speak to Gini from the phone.
 3. See task progress and approve/deny risky actions from structured mobile cards.
 4. Use Gini remotely through paired-device auth, relay/push, and clear degraded/offline behavior.
-5. Run production Gini as a daily-driver lane while coding agents test sandbox lanes.
+5. Run production Gini as a daily-driver instance while coding agents test sandbox instances.
 6. Promote a tested candidate with an evidence-backed proposal and rollback plan.
 7. Recover from a failed upgrade without losing state, traces, or audit history.
 8. Use multiple real connectors with scoped credential storage, visible health, revocation, and operational recovery.
@@ -2796,7 +2796,7 @@ Deliverables:
 - local API/IPC direction
 - event vocabulary
 - minimal permission/audit/trace substrate design
-- lane identity design
+- instance identity design
 - Next.js control-plane direction
 - future app/control-plane contract direction
 
@@ -2808,7 +2808,7 @@ Required ADRs:
 - trace privacy
 - audit integrity
 - permission defaults
-- lane identity
+- instance identity
 - pairing/approval model
 - relay threat model
 
@@ -2912,24 +2912,24 @@ Verification:
 - skill can be loaded and used in a toy task
 - memory/skill mutations are audited
 
-### Phase 6: v0.6 lanes and closed-loop development harness
+### Phase 6: v0.6 instances and closed-loop development harness
 
 Deliverables:
-- lane-aware config/state paths
-- dev/sandbox lane support
-- reset/uninstall for selected lane
+- instance-aware config/state paths
+- dev/sandbox instance support
+- reset/uninstall for selected instance
 - smoke test runner
-- ephemeral smoke lanes for concurrent coding agents
+- ephemeral smoke instances for concurrent coding agents
 - support/evidence bundle
 - isolation checks
 - harness run records
 
 Verification:
-- coding agent can run smoke tests against non-production lane
+- coding agent can run smoke tests against non-production instance
 - multiple coding agents can run smoke tests at the same time without sharing state, logs, or ports by default
-- reset affects only selected lane
+- reset affects only selected instance
 - evidence bundle links tests, logs, traces, audit, and runtime health
-- lane confusion is visible in doctor/status
+- instance confusion is visible in doctor/status
 
 ### Phase 7: v0.7 connector foundation
 
@@ -2990,7 +2990,7 @@ Deliverables:
 - delegation/subagent runtime with isolated contexts, trace linkage, cost attribution, limits, cancellation, and parent verification rules
 - MCP server add/list/remove/test and selected tool exposure
 - session search depth: prior sessions, task traces, summaries, source links, and transcript/trace citations
-- config/profile equivalent through lane-aware profiles and importable/exportable config
+- config/profile equivalent through instance-aware profiles and importable/exportable config
 - Hermes/OpenClaw import basics for memories, skills, jobs, profiles, and connector references, read-only or guided by default
 - parity smoke/eval suite that maps Hermes capabilities to Gini workflows
 
@@ -3024,7 +3024,7 @@ Deliverables:
 - full v1 Hermes-parity smoke/eval coverage
 - install/upgrade/reset/uninstall tests for v1 surfaces
 - provider, MCP, delegation, messaging, job, memory, skill, session-search, local web, API, event-stream, trace, audit, and permission regression tests
-- architecture-readiness review for v2 expansion points: runtime API/contracts, future app/control-plane contracts, event stream, trace/audit substrate, permission enforcement boundary, lane-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and extension documentation
+- architecture-readiness review for v2 expansion points: runtime API/contracts, future app/control-plane contracts, event stream, trace/audit substrate, permission enforcement boundary, instance-aware state, connector/plugin abstraction, provider abstraction, job scheduler, memory/skill governance, support/evidence bundles, and extension documentation
 - support/evidence bundle for v1 failures
 - documentation for Hermes-equivalent workflows, v1 local control surfaces, future app contracts, and where Gini intentionally differs
 
@@ -3075,7 +3075,7 @@ Deliverables:
 - long-running reliability tests for jobs, connectors, approvals, messaging, subagents, MCP, and mobile/relay operation
 
 Verification:
-- production lane is not mutated without explicit approval
+- production instance is not mutated without explicit approval
 - failed promotion can be rolled back with preserved evidence
 - connector failures are visible and recoverable
 - remote outage does not break local control
@@ -3252,7 +3252,7 @@ Deferred technical questions:
 
 Resolved default:
 - Do not let real connectors block the core runtime.
-- Add connector foundation around v0.7, after the runtime, control plane, tools, jobs, memory/skills, and lane-aware harness are stable.
+- Add connector foundation around v0.7, after the runtime, control plane, tools, jobs, memory/skills, and instance-aware harness are stable.
 - Start with a demo connector and at most one practical real connector, likely GitHub.
 - Broad connector catalog is later.
 
@@ -3306,7 +3306,7 @@ Still required before implementation of affected subsystems:
 - trace privacy and large trace storage
 - audit integrity
 - permission defaults
-- lane identity
+- instance identity
 - pairing/approval cryptography
 - relay threat model
 

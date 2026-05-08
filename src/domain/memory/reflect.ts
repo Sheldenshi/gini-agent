@@ -50,10 +50,10 @@ export interface ReflectOutput {
 }
 
 export async function reflect(config: RuntimeConfig, input: ReflectInput): Promise<ReflectOutput> {
-  const lane = config.lane;
-  ensureDefaultBank(lane);
+  const instance = config.instance;
+  ensureDefaultBank(instance);
   const bankId = input.bankId ?? DEFAULT_BANK_ID;
-  const bank = getBank(lane, bankId);
+  const bank = getBank(instance, bankId);
   if (!bank) throw new Error(`Bank not found: ${bankId}`);
 
   // 1. Recall.
@@ -86,7 +86,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
   const insertedOpinions = await persistOpinions(config, bankId, extracted, input.sourceTaskId);
 
   // 5. Audit + trace.
-  await mutateState(lane, (state) => {
+  await mutateState(instance, (state) => {
     addAudit(state, {
       actor: "runtime",
       action: "memory.reflect",
@@ -97,7 +97,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
     });
   });
   if (input.sourceTaskId) {
-    appendTrace(lane, input.sourceTaskId, {
+    appendTrace(instance, input.sourceTaskId, {
       type: "memory",
       message: "reflect completed",
       data: { opinions: insertedOpinions.length, recalled: recalled.units.length }
@@ -124,7 +124,7 @@ async function persistOpinions(
   const inserted: MemoryUnit[] = [];
   for (let i = 0; i < extracted.length; i++) {
     const opinion = extracted[i]!;
-    const unit = insertMemoryUnit(config.lane, {
+    const unit = insertMemoryUnit(config.instance, {
       bankId,
       text: opinion.opinion,
       embedding: vectors[i] ?? null,

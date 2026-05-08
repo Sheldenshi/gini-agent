@@ -41,11 +41,11 @@ export interface EmbeddingStatus {
 }
 
 export function embeddingStatus(config: RuntimeConfig): EmbeddingStatus {
-  ensureDefaultBank(config.lane);
+  ensureDefaultBank(config.instance);
   const provider = resolveEmbeddingChoice(config);
   const dir = provider.cacheDir ?? localCacheDir();
   const cache = { dir, exists: existsSync(dir), sizeBytes: existsSync(dir) ? dirSize(dir) : 0 };
-  const byBank = countUnitsByEmbeddingModel(config.lane);
+  const byBank = countUnitsByEmbeddingModel(config.instance);
   const modelMismatch = byBank.some(
     (row) => row.embeddingModel !== null && row.embeddingModel !== provider.model
   );
@@ -92,10 +92,10 @@ export interface ReembedReport {
 }
 
 export async function reembedBank(config: RuntimeConfig, input: ReembedInput): Promise<ReembedReport> {
-  ensureDefaultBank(config.lane);
+  ensureDefaultBank(config.instance);
   const bankId = input.bankId ?? DEFAULT_BANK_ID;
   const provider = getEmbeddingProvider(config);
-  const units = listMemoryUnits(config.lane, bankId, { limit: 100000 });
+  const units = listMemoryUnits(config.instance, bankId, { limit: 100000 });
   const dryRun = input.dryRun === true;
   let migrated = 0;
   let alreadyOnModel = 0;
@@ -123,7 +123,7 @@ export async function reembedBank(config: RuntimeConfig, input: ReembedInput): P
       if (!dryRun) {
         const vector = vectors[i] ?? null;
         if (!vector) { failed += 1; continue; }
-        updateMemoryUnitEmbedding(config.lane, unit.id, vector, provider.model);
+        updateMemoryUnitEmbedding(config.instance, unit.id, vector, provider.model);
       }
       migrated += 1;
     }
@@ -131,7 +131,7 @@ export async function reembedBank(config: RuntimeConfig, input: ReembedInput): P
 
   // Audit (mutate state so the event hits the audit log + the runtime event
   // stream, matching the master-plan invariant for embedding mutations).
-  await mutateState(config.lane, (state) => {
+  await mutateState(config.instance, (state) => {
     addAudit(state, {
       actor: "runtime",
       action: dryRun ? "embedding.reembed.dry-run" : "embedding.reembed",
@@ -163,9 +163,9 @@ export async function reembedBank(config: RuntimeConfig, input: ReembedInput): P
 // isn't the currently-active provider's model.
 export function listBanksWithModelMismatch(config: RuntimeConfig): EmbeddingModelCount[] {
   const provider = resolveEmbeddingChoice(config);
-  const banks = listBanks(config.lane).map((bank) => bank.id);
+  const banks = listBanks(config.instance).map((bank) => bank.id);
   if (banks.length === 0) return [];
-  const all = countUnitsByEmbeddingModel(config.lane);
+  const all = countUnitsByEmbeddingModel(config.instance);
   return all.filter(
     (row) => row.embeddingModel !== null && row.embeddingModel !== provider.model && row.count > 0
   );

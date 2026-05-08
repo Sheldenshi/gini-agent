@@ -2,11 +2,11 @@ import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./domain/jobs";
 import { install } from "./domain/runtime";
 import { migrateIfNeeded } from "./domain/memory";
-import { loadConfig, parseLane } from "./paths";
+import { loadConfig, parseInstance } from "./paths";
 import { appendLog } from "./state";
 
-const lane = parseLane();
-const config = loadConfig(lane);
+const instance = parseInstance();
+const config = loadConfig(instance);
 install(config);
 writePid(config);
 
@@ -17,7 +17,7 @@ writePid(config);
 migrateIfNeeded(config)
   .then((report) => {
     if (!report) return;
-    appendLog(config.lane, "memory.migrated", {
+    appendLog(config.instance, "memory.migrated", {
       total: report.total,
       migrated: report.migrated,
       skipped: report.skipped,
@@ -25,7 +25,7 @@ migrateIfNeeded(config)
     });
   })
   .catch((error) => {
-    appendLog(config.lane, "memory.migrate.error", {
+    appendLog(config.instance, "memory.migrate.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });
@@ -36,17 +36,17 @@ const server = Bun.serve({
   fetch: createHandler(config)
 });
 
-appendLog(config.lane, "runtime.started", { port: server.port, pid: process.pid });
-console.log(`Gini runtime listening on http://127.0.0.1:${server.port} lane=${config.lane}`);
+appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
+console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
 
 setInterval(() => {
   runDueJobs(config).catch((error) => {
-    appendLog(config.lane, "scheduler.error", { error: error instanceof Error ? error.message : String(error) });
+    appendLog(config.instance, "scheduler.error", { error: error instanceof Error ? error.message : String(error) });
   });
 }, 1000);
 
 process.on("SIGTERM", () => {
-  appendLog(config.lane, "runtime.stopped", { signal: "SIGTERM" });
+  appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   server.stop(true);
   process.exit(0);
 });

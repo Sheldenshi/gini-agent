@@ -8,7 +8,7 @@ export async function requestCodeExecution(config: RuntimeConfig, task: Task): P
   const match = task.input.match(/^code\s+(\w+)\s*::\s*([\s\S]+)$/i);
   if (!match) throw new Error("Use: code js|python :: <code>");
   const [, language, code] = match;
-  return mutateState(config.lane, (state: RuntimeState) => {
+  return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
     const approval = createApproval(state, {
       taskId: item.id,
@@ -22,7 +22,7 @@ export async function requestCodeExecution(config: RuntimeConfig, task: Task): P
     item.currentStep = "Waiting for approval";
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
-    appendTrace(config.lane, item.id, { type: "approval", message: "Approval requested for code execution", data: { approvalId: approval.id, language } });
+    appendTrace(config.instance, item.id, { type: "approval", message: "Approval requested for code execution", data: { approvalId: approval.id, language } });
     return item;
   });
 }

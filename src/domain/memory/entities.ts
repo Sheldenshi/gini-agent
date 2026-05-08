@@ -12,7 +12,7 @@
 // Adapted from vectorize-io/hindsight (MIT) — same weights, same merge-on-
 // strong-match policy, same fallback-to-create-new for low-confidence cases.
 
-import type { Lane } from "../../types";
+import type { Instance } from "../../types";
 import type { Database } from "bun:sqlite";
 import type { HindsightEntity as Entity, EntityType } from "../../state";
 import { getMemoryDb, insertEntity } from "../../state";
@@ -42,13 +42,13 @@ interface CandidateEntity {
 }
 
 export function resolveOrCreateEntity(
-  lane: Lane,
+  instance: Instance,
   bankId: string,
   surface: string,
   type: EntityType,
   context?: { recentUnitIds?: string[]; mentionedAt?: string }
 ): { entity: Entity; created: boolean; score: number } {
-  const db = getMemoryDb(lane);
+  const db = getMemoryDb(instance);
   const candidates = db
     .query<CandidateEntity, [string]>("SELECT * FROM entities WHERE bank_id = ?")
     .all(bankId);
@@ -68,7 +68,7 @@ export function resolveOrCreateEntity(
     };
   }
 
-  const created = insertEntity(lane, {
+  const created = insertEntity(instance, {
     bankId,
     canonicalName: surface,
     entityType: type
