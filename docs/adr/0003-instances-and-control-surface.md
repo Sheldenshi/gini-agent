@@ -2,33 +2,34 @@
 
 ## Decision
 
-v0 is instance-aware from the first implementation. The default instance is `dev`, and `--instance <name>` or `GINI_INSTANCE` selects another instance. The CLI, runtime API, web control surface, traces, logs, state, and config all use the selected instance.
+Gini is instance-aware. The default instance is `dev`, and `--instance <name>` or `GINI_INSTANCE` selects another instance. The CLI, runtime API, web control plane, traces, logs, state, config, workspace, and memory database all use the selected instance.
 
 ## Context
 
-The master plan requires future dev/sandbox/production separation. v0 does not need full promotion and rollback, but it must avoid hardcoding a single global Gini install.
+Multiple coding agents, worktrees, smoke tests, and personal runtimes need to coexist on one machine. Gini must avoid hardcoding a single global install.
 
 ## Required Now
 
 - State paths are `~/.gini/instances/<instance>/...`.
-- Log paths are `~/.gini/logs/<instance>/...`.
+- Logs live under the selected instance directory.
 - `GINI_STATE_ROOT` and `GINI_LOG_ROOT` can override paths for disposable tests.
 - `smoke` uses an ephemeral instance/root/port by default when no instance is supplied.
 - `status` and `doctor` report instance identity.
-- `reset` removes only the selected instance state.
+- `reset` and `uninstall` affect only the selected instance.
 - Runtime API and web UI expose the instance.
+- Per-instance runtime and web ports are deterministic and collision-aware.
 
 ## Deferred
 
-- Separate sockets and LaunchAgents per instance.
-- Promotion artifacts and rollback workflows.
-- Evidence bundle export.
+- Separate LaunchAgents per instance.
+- Fully automated production/sandbox promotion and rollback.
+- Remote multi-device relay and push paths.
 
 ## Consequences For Coding Agents
 
-- New files written by the runtime should live under instance-specific roots unless they are deliberate workspace artifacts approved by the user.
+- New runtime-owned files should live under instance-specific roots unless they are deliberate workspace artifacts approved by the user.
 - Tests and smoke flows should use non-production instances.
-- Do not run concurrent install/reset/smoke work against the same instance unless the test is intentionally checking shared-instance behavior.
+- Do not run concurrent install/reset work against the same instance unless the test is intentionally checking shared-instance behavior.
 - Status output should make instance confusion visible.
 
 ## Acceptance Checks
