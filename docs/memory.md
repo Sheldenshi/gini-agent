@@ -4,6 +4,24 @@ Gini memory is visible, governable, and local by default.
 
 Memory records live in `~/.gini/instances/<instance>/memory.db` using SQLite. The model cache for local embeddings and reranking lives in `~/.gini/models/`.
 
+## Mental Model
+
+```mermaid
+flowchart LR
+  User[User / agent event] --> Retain[Retain]
+  Retain --> Unit[Memory unit]
+  Unit --> SQLite[(memory.db)]
+  SQLite --> Recall[Recall]
+  Recall --> Context[Context for future work]
+  Context --> Agent[Agent response or action]
+  SQLite --> Reflect[Reflect]
+  Reflect --> Proposal[Memory proposal]
+  Proposal --> Review[Human review]
+  Review --> SQLite
+```
+
+Memory is not hidden prompt stuffing. Gini records memory units with provenance, retrieves them through multiple signals, and keeps review surfaces available for proposed or generated changes.
+
 ## Memory Operations
 
 - **Retain:** write a memory unit with source/provenance metadata.
@@ -11,6 +29,22 @@ Memory records live in `~/.gini/instances/<instance>/memory.db` using SQLite. Th
 - **Reflect:** propose higher-level memory from existing evidence.
 - **Reinforce:** update strength and relationships as memories are used.
 - **Review:** edit, approve, reject, or archive memory records.
+
+## Retain Flow
+
+```mermaid
+flowchart TD
+  Input[Task, chat, job, or manual memory] --> Extract[Extract candidate facts]
+  Extract --> Classify[Classify network/type]
+  Classify --> Entities[Resolve entities and links]
+  Entities --> Embed[Embed text if semantic provider is enabled]
+  Embed --> Store[(SQLite memory.db)]
+  Store --> Audit[Audit event]
+  Store --> Trace[Trace evidence when tied to execution]
+  Store --> Review[Review/edit/archive surfaces]
+```
+
+Retain keeps enough metadata to answer: where did this memory come from, what entities does it touch, what model embedded it, and what runtime action created it.
 
 ## Recall Pipeline
 
@@ -22,6 +56,45 @@ Recall fuses four channels:
 - temporal recency and cadence
 
 Results are combined with reciprocal rank fusion, reranked over the top candidates, and packed into a token budget.
+
+```mermaid
+flowchart TD
+  Query[Current user request] --> Semantic[Semantic vector search]
+  Query --> Lexical[BM25 / lexical search]
+  Query --> Graph[Entity graph activation]
+  Query --> Temporal[Temporal matching]
+
+  Semantic --> RRF[Reciprocal rank fusion]
+  Lexical --> RRF
+  Graph --> RRF
+  Temporal --> RRF
+
+  RRF --> Rerank[Cross-encoder reranker]
+  Rerank --> Pack[Token-budget pack]
+  Pack --> Context[Memory context sent to agent]
+```
+
+The four channels cover different failure modes:
+
+- semantic catches meaning even when words differ
+- lexical catches exact names, commands, and phrases
+- graph catches related entities and relationships
+- temporal catches time-sensitive facts and recent context
+
+## Review And Governance
+
+```mermaid
+stateDiagram-v2
+  [*] --> Proposed
+  Proposed --> Active: approve
+  Proposed --> Rejected: reject
+  Active --> Active: edit
+  Active --> Archived: archive
+  Rejected --> [*]
+  Archived --> [*]
+```
+
+Agent-created memory should stay inspectable. Review states make it possible to accept useful memories, reject bad ones, and archive outdated facts without deleting provenance.
 
 ## Embeddings
 
