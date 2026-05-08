@@ -11,6 +11,7 @@ import type {
   RuntimeEvent,
   RuntimeStatus,
   SkillRecord,
+  SubagentRecord,
   Task,
   TraceRecord,
   AuditEvent
@@ -93,6 +94,14 @@ export function useHindsightBanks() {
     queryKey: ["memory", "banks"],
     queryFn: () => api<HindsightBankView[]>("/memory/banks"),
     refetchInterval: 10_000
+  });
+}
+
+export function useSubagents() {
+  return useQuery<SubagentRecord[]>({
+    queryKey: ["subagents"],
+    queryFn: () => api<SubagentRecord[]>("/subagents"),
+    refetchInterval: 3000
   });
 }
 
