@@ -138,7 +138,16 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       const block = recalled.units
         .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
         .join("\n");
-      augmentedInput = `${task.input}\n\nRecalled memory:\n${block}`;
+      // Frame the recalled block as authoritative context, not as data the
+      // user is showing the model. Without this framing the model treats the
+      // appended block as ambient text and answers "I don't know" even when
+      // the answer is right there.
+      augmentedInput = [
+        "[Context from your long-term memory of prior conversations with this user — treat as authoritative facts unless the current message contradicts them. Do NOT say you don't know if the answer is here.]",
+        block,
+        "",
+        `User: ${task.input}`
+      ].join("\n");
     }
   } catch (error) {
     appendTrace(config.instance, taskId, {

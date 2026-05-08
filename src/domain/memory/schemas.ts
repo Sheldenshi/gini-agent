@@ -127,14 +127,20 @@ function parseFact(value: unknown, index: number): ExtractedFact {
       });
   }
   if (Array.isArray(obj.causal_relations)) {
+    // Drop entries whose relation_type is outside the causal enum instead of
+    // failing the whole extraction. Models occasionally invent values like
+    // "related" or "describes"; rejecting those used to throw and lose every
+    // fact in the response.
     out.causal_relations = obj.causal_relations
       .filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
       .map((entry, ci) => {
         const target_fact_index = asNumber(entry.target_fact_index, `fact ${index} causal_relations[${ci}].target_fact_index`);
-        const relation_type = asEnum(entry.relation_type, CAUSAL_TYPES, `fact ${index} causal_relations[${ci}].relation_type`);
+        const relationRaw = typeof entry.relation_type === "string" ? entry.relation_type : "";
+        if (!(CAUSAL_TYPES as readonly string[]).includes(relationRaw)) return null;
         const strength = typeof entry.strength === "number" ? Math.max(0, Math.min(1, entry.strength)) : 0.7;
-        return { target_fact_index, relation_type, strength };
-      });
+        return { target_fact_index, relation_type: relationRaw as typeof CAUSAL_TYPES[number], strength };
+      })
+      .filter((entry): entry is { target_fact_index: number; relation_type: typeof CAUSAL_TYPES[number]; strength: number } => entry !== null);
   }
   return out;
 }
