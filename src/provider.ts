@@ -11,9 +11,25 @@ const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 const INSTRUCTIONS = [
   "You are Gini, a local-first personal agent.",
   "Reply directly and concisely.",
-  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals.",
-  "When the user message includes a [Context from your long-term memory ...] block, treat the facts in that block as ground truth from prior conversations with this user. Use them to answer. Do not say you don't know something if the answer is in that block."
+  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals."
 ].join("\n");
+
+// Build the authoritative system-area context: base instructions + pinned
+// memories + long-term recalled memory. By placing memory in the system
+// channel rather than appending to the user message, it inherits the model's
+// default trust for system instructions — we don't have to talk the model
+// into believing it.
+function buildSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
+  const parts = [INSTRUCTIONS];
+  if (memories.length > 0) {
+    const pinned = memories.map((memory) => `- (${memory.scope}) ${memory.content}`).join("\n");
+    parts.push(`Pinned memories about this user (curated, always relevant):\n${pinned}`);
+  }
+  if (recalledContext && recalledContext.trim().length > 0) {
+    parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);
+  }
+  return parts.join("\n\n");
+}
 
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
@@ -104,7 +120,12 @@ export function providerCatalog(): ProviderCatalogItem[] {
   ];
 }
 
-export async function generateTaskSummary(config: RuntimeConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
+export async function generateTaskSummary(
+  config: RuntimeConfig,
+  input: string,
+  memories: MemoryRecord[],
+  recalledContext?: string
+): Promise<ProviderResult> {
   const provider = normalizeProvider(config.provider);
   if (provider.name === "echo") {
     const memoryText = memories.length > 0 ? ` Active memory: ${memories.map((memory) => memory.content).join(" | ")}` : "";
@@ -114,10 +135,11 @@ export async function generateTaskSummary(config: RuntimeConfig, input: string, 
     };
   }
 
+  const systemContext = buildSystemContext(memories, recalledContext);
   if (provider.name === "openrouter" || provider.name === "local") {
-    return callChatCompletions(provider, input, memories);
+    return callChatCompletions(provider, input, systemContext);
   }
-  return callOpenAIResponses(provider, input, memories);
+  return callOpenAIResponses(provider, input, systemContext);
 }
 
 // Hindsight phase 2 — structured-output helper.
@@ -355,13 +377,9 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   };
 }
 
-async function callOpenAIResponses(provider: ProviderConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
+async function callOpenAIResponses(provider: ProviderConfig, input: string, systemContext: string): Promise<ProviderResult> {
   const bearer = provider.name === "codex" ? readCodexBearer(provider) : readOpenAIBearer(provider);
   const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
-
-  const memoryBlock = memories.length > 0
-    ? memories.map((memory) => `- (${memory.scope}) ${memory.content}`).join("\n")
-    : "No active memories.";
 
   const isCodex = provider.name === "codex";
   const response = await fetch(`${provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL}/responses`, {
@@ -376,15 +394,12 @@ async function callOpenAIResponses(provider: ProviderConfig, input: string, memo
       model: provider.model,
       store: false,
       stream: isCodex,
-      instructions: INSTRUCTIONS,
+      instructions: systemContext,
       input: [
         {
           role: "user",
           content: [
-            {
-              type: "input_text",
-              text: `Active memories:\n${memoryBlock}\n\nTask:\n${input}`
-            }
+            { type: "input_text", text: input }
           ]
         }
       ]
@@ -412,12 +427,9 @@ async function callOpenAIResponses(provider: ProviderConfig, input: string, memo
   };
 }
 
-async function callChatCompletions(provider: ProviderConfig, input: string, memories: MemoryRecord[]): Promise<ProviderResult> {
+async function callChatCompletions(provider: ProviderConfig, input: string, systemContext: string): Promise<ProviderResult> {
   const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
   const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
-  const memoryBlock = memories.length > 0
-    ? memories.map((memory) => `- (${memory.scope}) ${memory.content}`).join("\n")
-    : "No active memories.";
   const headers: Record<string, string> = {
     "content-type": "application/json",
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
@@ -429,11 +441,8 @@ async function callChatCompletions(provider: ProviderConfig, input: string, memo
     body: JSON.stringify({
       model: provider.model,
       messages: [
-        {
-          role: "system",
-          content: INSTRUCTIONS
-        },
-        { role: "user", content: `Active memories:\n${memoryBlock}\n\nTask:\n${input}` }
+        { role: "system", content: systemContext },
+        { role: "user", content: input }
       ]
     })
   });

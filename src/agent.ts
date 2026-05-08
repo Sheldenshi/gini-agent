@@ -129,25 +129,18 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   // four-network store and inject as additional context. Best-effort — if
   // recall fails (e.g. embedding provider unavailable), continue with the
   // legacy MemoryRecord injection only.
-  let augmentedInput = task.input;
+  let recalledContext: string | undefined;
   let hindsightUnitsRecalled = 0;
   try {
     const recalled = await recall(config, { query: task.input, tokenBudget: 1500, sourceTaskId: taskId });
     if (recalled.units.length > 0) {
       hindsightUnitsRecalled = recalled.units.length;
-      const block = recalled.units
+      // Pass the formatted block to the provider as system-area context;
+      // generateTaskSummary places it in `instructions` (system role) so it
+      // inherits the model's default trust without verbal pleading.
+      recalledContext = recalled.units
         .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
         .join("\n");
-      // Frame the recalled block as authoritative context, not as data the
-      // user is showing the model. Without this framing the model treats the
-      // appended block as ambient text and answers "I don't know" even when
-      // the answer is right there.
-      augmentedInput = [
-        "[Context from your long-term memory of prior conversations with this user — treat as authoritative facts unless the current message contradicts them. Do NOT say you don't know if the answer is here.]",
-        block,
-        "",
-        `User: ${task.input}`
-      ].join("\n");
     }
   } catch (error) {
     appendTrace(config.instance, taskId, {
@@ -157,7 +150,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     });
   }
 
-  const providerResult = await generateTaskSummary(config, augmentedInput, activeMemory);
+  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext);
   appendTrace(config.instance, taskId, {
     type: "model",
     message: `${providerResult.provider.name} provider generated response`,
