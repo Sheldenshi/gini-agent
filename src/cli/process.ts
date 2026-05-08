@@ -6,7 +6,7 @@
 // than read from module scope, which keeps each helper testable in
 // isolation.
 
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, openSync, readFileSync, rmSync, writeFileSync, type WriteStream } from "node:fs";
 import { createServer } from "node:net";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { join } from "node:path";
@@ -18,7 +18,7 @@ import { probeMemoryDb } from "../state/memory-db";
 import { legacyMigrationStatus } from "../domain/memory";
 import { embeddingStatus, listBanksWithModelMismatch } from "../domain/embedding";
 import { rerankerStatus } from "../domain/reranker";
-import { defaultRuntimePort, defaultWebPort, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
+import { defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
 import { api, auth, url } from "./api";
 
 export interface WebOptions {
@@ -39,6 +39,56 @@ export interface WebOptions {
 export interface ForegroundChildren {
   runtime: ChildProcess | null;
   web: ChildProcess | null;
+}
+
+// Capture stdout/stderr from a spawned child to <logPath>, tee'ing also to the
+// caller's terminal in foreground mode. Daemon mode opens the file once and
+// hands the FD to spawn() as stdio so writes survive the parent unref. We keep
+// the helpers separate because the call sites have different setup (FD-based
+// stdio must be configured BEFORE spawn; pipes are wired up AFTER spawn).
+//
+// Returns { stdio, onSpawned } so callers can drop the result straight into
+// their spawn options object and run a one-line post-spawn hook for foreground
+// pipe wiring (no-op in daemon mode).
+interface ChildLogPlumbing {
+  stdio: ["ignore" | "inherit", number | "pipe", number | "pipe"];
+  onSpawned: (child: ChildProcess) => void;
+}
+
+function setupChildLog(instance: string, fileName: string, foreground: boolean): ChildLogPlumbing {
+  const dir = logDir(instance);
+  ensureDir(dir);
+  const logPath = join(dir, fileName);
+  if (foreground) {
+    // Foreground: open a write stream and tee child.stdout/stderr to both the
+    // user's terminal and the log file. Stream is closed when the child exits
+    // so the tail is flushed and we don't leak FDs across instance restarts.
+    const stream: WriteStream = createWriteStream(logPath, { flags: "a" });
+    return {
+      stdio: ["inherit", "pipe", "pipe"],
+      onSpawned: (child) => {
+        child.stdout?.on("data", (chunk: Buffer | string) => {
+          process.stdout.write(chunk);
+          stream.write(chunk);
+        });
+        child.stderr?.on("data", (chunk: Buffer | string) => {
+          process.stderr.write(chunk);
+          stream.write(chunk);
+        });
+        const close = () => { try { stream.end(); } catch { /* ignore */ } };
+        child.once("exit", close);
+        child.once("error", close);
+      }
+    };
+  }
+  // Daemon: hand the FD directly to the child so writes go straight to the
+  // file from the kernel's perspective. This survives child.unref() and the
+  // parent CLI exiting (a JS-level pipe would not — the parent owns it).
+  const fd = openSync(logPath, "a");
+  return {
+    stdio: ["ignore", fd, fd],
+    onSpawned: () => { /* nothing to wire; FDs go to the kernel */ }
+  };
 }
 
 function readRecordedPort(path: string): number | null {
@@ -72,14 +122,18 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     install(config);
     writeFileSync(runtimePortPath(config.instance), String(config.port));
     // Foreground mode keeps the child attached to the CLI: no detached process
-    // group, no unref, and stdio inherits so the user sees runtime logs live.
-    // Daemon mode (gini start) preserves the original detach + ignore stdio.
+    // group, and stdio is tee'd to both the user's terminal and runtime-stdout.log.
+    // Daemon mode (gini start) preserves detach + unref but hands a log-file FD
+    // to the child so its stdio survives parent exit (kept separate from the
+    // structured runtime.jsonl event stream).
+    const runtimeLog = setupChildLog(config.instance, "runtime-stdout.log", foreground);
     const child = spawn(process.execPath, ["run", "src/server.ts", "--instance", config.instance], {
       cwd: process.cwd(),
       detached: !foreground,
-      stdio: foreground ? "inherit" : "ignore",
+      stdio: runtimeLog.stdio,
       env: { ...process.env, GINI_INSTANCE: config.instance, GINI_PORT: String(config.port) }
     });
+    runtimeLog.onSpawned(child);
     if (!foreground) child.unref();
     if (foreground) children.runtime = child;
     let healthy = false;
@@ -226,13 +280,15 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // `.next` because that env var is unset.
   const instanceSlug = config.instance.replace(/[^a-zA-Z0-9_-]/g, "_");
   const foreground = options.foreground === true;
-  // Foreground: keep the web child attached and inherit stdio so dev-server
-  // logs stream to the user. Daemon (gini start) keeps the historic detached
-  // group + ignored stdio so the runtime survives terminal close.
+  // Foreground: keep the web child attached and tee dev-server stdio to both
+  // the user's terminal and web.log. Daemon (gini start) keeps the historic
+  // detached group but writes stdio into web.log via an FD so the dev-server
+  // output is recoverable after the CLI exits.
+  const webLog = setupChildLog(config.instance, "web.log", foreground);
   const child = spawn("bun", command, {
     cwd: webRoot,
     detached: !foreground,
-    stdio: foreground ? "inherit" : "ignore",
+    stdio: webLog.stdio,
     env: {
       ...process.env,
       GINI_RUNTIME_URL: url(config),
@@ -242,6 +298,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       PORT: String(port)
     }
   });
+  webLog.onSpawned(child);
   if (!foreground) child.unref();
   if (typeof child.pid === "number") {
     writeFileSync(join(config.stateRoot, "web.pid"), String(child.pid));

@@ -1,0 +1,8 @@
+{
+    "scripts": {
+        "setup": "bun i && bun run gini install --instance $(basename $(pwd))",
+        "remoteSetup": "bun i && bun run gini install --instance $(basename $(pwd))",
+        "run": "bun run gini run --instance $(basename $(pwd))",
+        "archive": "bun run gini uninstall --instance $(basename $(pwd)) && rm -rf node_modules && ~/.claude/projects/-Users-shelden-conductor-workspaces-gini-agent-$(basename $(pwd))"
+    }
+}

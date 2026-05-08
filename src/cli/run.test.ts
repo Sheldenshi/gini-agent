@@ -6,7 +6,7 @@
 // developer state or with each other when bun test runs them in parallel.
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
@@ -117,6 +117,26 @@ describe("gini run", () => {
     expect(result.code === 129 || result.signal === "SIGHUP").toBe(true);
     expect(elapsed).toBeLessThan(8_000);
     expect(await pidAlive(directChildPid)).toBe(false);
+  }, 30_000);
+
+  test("captures runtime child stdout to runtime-stdout.log", async () => {
+    const h = makeHarness("logfile");
+    const { child, stdout, exit } = await spawnRun(h);
+    await stdout;
+    // Give the runtime a beat to print its startup banner before we tear down
+    // the parent — the tee stream is closed on child exit.
+    await Bun.sleep(500);
+    child.kill("SIGTERM");
+    await exit;
+    // With GINI_LOG_ROOT set (via --log-root), logDir(instance) resolves to
+    // <override>/<instance> (no extra /logs/ segment). See src/paths.ts:logDir.
+    const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
+    expect(existsSync(logPath)).toBe(true);
+    const contents = readFileSync(logPath, "utf8");
+    // src/server.ts logs "Gini runtime listening on ..." at boot, so this is
+    // the most reliable marker that stdio actually flowed into the log file.
+    expect(contents).toContain("Gini runtime listening");
+    expect(contents).toContain(`instance=${h.instance}`);
   }, 30_000);
 
   test("refuses to run when the instance is already up", async () => {
