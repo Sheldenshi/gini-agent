@@ -13,6 +13,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import {
+  addAudit,
   appendTrace,
   assertInsideWorkspace,
   createApproval,
@@ -23,6 +24,7 @@ import {
 import { findTask } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
+import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -56,6 +58,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await webFetchTool(config, taskId, args) };
     case "read_skill":
       return { kind: "sync", result: await readSkillTool(config, taskId, args) };
+    case "spawn_subagent":
+      return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -203,6 +207,142 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     bytes: skill.body.length
   });
   return skill.body || "(skill body is empty)";
+}
+
+// Spawn a constrained subagent and wait for its terminal state. The model
+// gets the child's summary back as the tool result. We deliberately resolve
+// synchronously (from the model's perspective) so the agent loop sees a
+// straightforward request/response pattern and doesn't need a separate
+// resume flow for delegation. Approval-gated tool calls inside the
+// subagent block the subagent task, not the parent — the parent just
+// polls for the final state.
+//
+// Depth is capped via MAX_SUBAGENT_DEPTH to prevent runaway nesting; the
+// cap is enforced both here (before submitting) and inside spawnSubagent
+// itself for defense-in-depth.
+async function spawnSubagentTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = requireString(args, "name");
+  const prompt = requireString(args, "prompt");
+  const systemPrompt = typeof args.system_prompt === "string" ? args.system_prompt : undefined;
+  const toolsets = Array.isArray(args.toolsets) ? args.toolsets.map(String) : undefined;
+  const skills = Array.isArray(args.skills) ? args.skills.map(String) : undefined;
+  const timeoutMs = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 5 * 60 * 1000;
+
+  // Pre-flight depth check so we can return a clean error to the model
+  // instead of throwing an exception that becomes a generic tool error.
+  const stateNow = readState(config.instance);
+  const depth = subagentDepth(stateNow, taskId);
+  if (depth >= MAX_SUBAGENT_DEPTH) {
+    appendTrace(config.instance, taskId, {
+      type: "error",
+      message: "spawn_subagent rejected: depth cap reached",
+      data: { depth, cap: MAX_SUBAGENT_DEPTH, name }
+    });
+    return `Error: max_subagent_depth_exceeded (current depth ${depth}, cap ${MAX_SUBAGENT_DEPTH}). Refusing to spawn '${name}'.`;
+  }
+
+  // Audit + trace the delegation call before launching the child. Medium
+  // risk because it doesn't directly mutate the world, but it commits
+  // model time / spend on a tangent.
+  await mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    addAudit(state, {
+      actor: "agent",
+      action: "subagent.spawn",
+      target: name,
+      risk: "medium",
+      taskId: item.id,
+      runId: item.runId,
+      evidence: { name, promptBytes: prompt.length, toolsets, skills, depth }
+    });
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: `Spawning subagent '${name}'`,
+    data: { name, toolsets, skills, depth }
+  });
+
+  let subagentId: string | undefined;
+  try {
+    const created = await spawnSubagent(config, {
+      name,
+      prompt,
+      systemPrompt,
+      toolsets,
+      skills,
+      parentTaskId: taskId
+    });
+    subagentId = created.id;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    appendTrace(config.instance, taskId, {
+      type: "error",
+      message: `spawn_subagent failed: ${message}`,
+      data: { name }
+    });
+    return `Error: ${message}`;
+  }
+
+  // Reflect the parent's currentStep so the UI shows what we're waiting on.
+  await mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    item.currentStep = `Waiting on subagent ${name}`;
+    item.updatedAt = now();
+  });
+
+  const final = await waitForSubagentTerminal(config, subagentId, timeoutMs);
+
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: `Subagent '${name}' finished`,
+    data: { subagentId, status: final.status, hasSummary: Boolean(final.summary), hasError: Boolean(final.error) }
+  });
+
+  // Format the result. We return a compact JSON-shaped string so the model
+  // can parse if it wants, but the strings inside are human-readable.
+  const payload = {
+    subagentId,
+    status: final.status,
+    summary: final.summary ?? null,
+    error: final.error ?? null
+  };
+  return JSON.stringify(payload);
+}
+
+// Poll the subagent record until its child task reaches a terminal state,
+// or `timeoutMs` elapses. We poll instead of using events because the
+// runtime state mutation queue is the canonical cross-call sync point and
+// the chat-task loop's terminal transitions already call syncSubagentFromTask.
+//
+// On timeout we return a synthetic record with status "timeout" so the
+// caller can recover (the underlying task continues running and may still
+// complete later — its eventual completion will sync into the record).
+async function waitForSubagentTerminal(
+  config: RuntimeConfig,
+  subagentId: string,
+  timeoutMs: number
+): Promise<{ status: string; summary?: string; error?: string }> {
+  const deadline = Date.now() + Math.max(1000, timeoutMs);
+  const pollMs = 100;
+  while (Date.now() < deadline) {
+    const state = readState(config.instance);
+    const sub = state.subagents.find((item) => item.id === subagentId);
+    if (!sub) return { status: "missing", error: `Subagent ${subagentId} disappeared.` };
+    if (sub.status === "completed" || sub.status === "failed" || sub.status === "cancelled") {
+      return {
+        status: sub.status,
+        summary: sub.resultSummary ?? sub.summary,
+        error: sub.resultError ?? sub.error
+      };
+    }
+    await Bun.sleep(pollMs);
+  }
+  return { status: "timeout", error: `Subagent ${subagentId} did not finish within ${timeoutMs}ms.` };
 }
 
 function isTextLike(path: string): boolean {

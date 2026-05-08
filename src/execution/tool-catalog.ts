@@ -159,6 +159,32 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["name"]
       }
     }
+  },
+  {
+    // Subagent delegation. Spawns a constrained child task running the
+    // chat-task agent loop with its own system prompt and toolset/skill
+    // subsets. The dispatch waits for the child to reach a terminal state
+    // (completed/failed/timeout) and feeds the summary back as the tool
+    // result. Medium-risk: no approval, but every call is audited and
+    // traced; depth-capped at 3 levels.
+    toolset: "subagents",
+    type: "function",
+    function: {
+      name: "spawn_subagent",
+      description: "Delegate a focused sub-task to a constrained child agent. Returns the child's summary (or error) once it finishes. Use sparingly — one delegation per logical sub-goal — and prefer direct tool use for simple queries.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Short label for the subagent (e.g. 'research', 'patch-author')." },
+          prompt: { type: "string", description: "The user-facing instruction for the subagent." },
+          system_prompt: { type: "string", description: "Optional override for the subagent's system instructions. Defaults to a generic 'focused subagent' preamble." },
+          toolsets: { type: "array", items: { type: "string" }, description: "Optional list of toolset names to expose. Subset of the parent's enabled toolsets." },
+          skills: { type: "array", items: { type: "string" }, description: "Optional list of trusted skill names to advertise. Subset of the parent's trusted skills." },
+          timeout_ms: { type: "number", description: "How long to wait for the subagent before timing out. Defaults to 300000 (5 minutes)." }
+        },
+        required: ["name", "prompt"]
+      }
+    }
   }
 ];
 
@@ -184,6 +210,11 @@ export function buildToolCatalog(state: RuntimeState): ToolCatalogTool[] {
     // legacy default toolsets; gating it on enable would mean a fresh
     // instance can't follow its own skill prompt without a toolset toggle.
     if (tool.function.name === "read_skill") return true;
+    // Always expose spawn_subagent. Like read_skill it's a runtime
+    // capability not tied to a legacy default toolset row, and gating it
+    // on enable would silently disable delegation on freshly cloned
+    // instances. Subagent path itself is depth-capped and audited.
+    if (tool.function.name === "spawn_subagent") return true;
     return enabled.has(tool.toolset);
   });
 }
