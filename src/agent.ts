@@ -34,6 +34,7 @@ import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
 import { approvalToolCallId } from "./execution/tool-dispatch";
+import { syncSubagentFromTask } from "./capabilities/subagents";
 
 export interface SubmitTaskOptions {
   jobId?: string;
@@ -118,7 +119,30 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
     return task;
   });
   await updateRunFromTask(config, task);
+  await syncSubagentFromTask(config, task);
+  // Cascade cancellation to descendant subagent tasks. If the cancelled
+  // task spawned subagents (whose taskIds are children), cancel each one
+  // recursively. Walk the runtime state for any task whose parentTaskId is
+  // this task and is not already terminal, then cancel them.
+  await cancelDescendantTasks(config, taskId);
   return task;
+}
+
+async function cancelDescendantTasks(config: RuntimeConfig, parentTaskId: string): Promise<void> {
+  // Snapshot the children synchronously so we don't recurse while mutating.
+  const state = await mutateState(config.instance, (s) => s);
+  const children = state.tasks
+    .filter((t) => t.parentTaskId === parentTaskId)
+    .filter((t) => t.status !== "completed" && t.status !== "failed" && t.status !== "cancelled")
+    .map((t) => t.id);
+  for (const childId of children) {
+    try {
+      await cancelTask(config, childId);
+    } catch {
+      // Best-effort: a race between the cancel and the natural completion
+      // is fine. The next refreshSubagents tick will reconcile state.
+    }
+  }
 }
 
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
@@ -343,6 +367,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   });
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
   await updateRunFromTask(config, task);
+  await syncSubagentFromTask(config, task);
 }
 
 // Shared between agent and tool modules. Tools that complete immediately

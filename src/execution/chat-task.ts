@@ -27,10 +27,19 @@ import {
   type ToolCallingMessage,
   type ToolCall
 } from "../provider";
-import type { PendingToolCall, RuntimeConfig, SkillRecord, Task, TaskToolCallState } from "../types";
+import type {
+  PendingToolCall,
+  RuntimeConfig,
+  RuntimeState,
+  SkillRecord,
+  SubagentRecord,
+  Task,
+  TaskToolCallState
+} from "../types";
 import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
+import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 
 const MAX_LOOP_ITERATIONS = 8;
 
@@ -77,8 +86,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
 
   const state = readState(config.instance);
   const activeMemory = state.memories.filter((memory) => memory.status === "active");
-  const baseSystem = buildAgentSystemContext(activeMemory, recalledContext);
-  const skillsBlock = buildTrustedSkillsBlock(state.skills);
+  // Subagent path: child tasks override the default Gini preamble with the
+  // subagent's own system prompt and filter the trusted-skills block by the
+  // subagent's skill whitelist (when set).
+  const subagent = getSubagentForTask(state, task);
+  const baseSystem = subagent && subagent.systemPrompt
+    ? subagent.systemPrompt
+    : buildAgentSystemContext(activeMemory, recalledContext);
+  const visibleSkills = filterSkillsForSubagent(state.skills, subagent);
+  const skillsBlock = buildTrustedSkillsBlock(visibleSkills);
   const systemContext = skillsBlock ? `${baseSystem}\n\n${skillsBlock}` : baseSystem;
 
   // Conversation history: include prior turns from the same chat session so
@@ -116,6 +132,35 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
   return stored
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+}
+
+// Restrict the parent-built tool catalog to the subagent's toolset
+// whitelist. Skill-catalog tools (read_skill) and web_fetch are always
+// allowed (mirrors buildToolCatalog's permissive defaults). When the
+// subagent has no whitelist (undefined/empty), the parent catalog passes
+// through unchanged.
+function filterToolsForSubagent<T extends { toolset: string; function: { name: string } }>(
+  tools: T[],
+  subagent: SubagentRecord | undefined
+): T[] {
+  if (!subagent || !subagent.toolsetIds || subagent.toolsetIds.length === 0) return tools;
+  const allowed = new Set(subagent.toolsetIds);
+  return tools.filter((tool) => {
+    if (tool.function.name === "read_skill") return true;
+    if (tool.function.name === "web_fetch") return true;
+    return allowed.has(tool.toolset);
+  });
+}
+
+// Filter the trusted-skill list down to a subagent's whitelist. When the
+// subagent has no whitelist (toolset-or-skill-undefined / inherit), the full
+// list is returned. When the whitelist is set, only matching skill names
+// are advertised — the read_skill tool itself still gates on `status ===
+// "trusted"` so a non-trusted skill can't slip through.
+function filterSkillsForSubagent(skills: SkillRecord[], subagent: SubagentRecord | undefined): SkillRecord[] {
+  if (!subagent || !subagent.skillNames || subagent.skillNames.length === 0) return skills;
+  const allowed = new Set(subagent.skillNames);
+  return skills.filter((s) => allowed.has(s.name));
 }
 
 // Build the "Available skills:" block that gets prepended to the system
@@ -157,7 +202,9 @@ async function runLoop(
   // feature, not a bug, and the toolsHash check protects against weird
   // schema drift.
   const state0 = readState(config.instance);
-  const tools = buildToolCatalog(state0);
+  const taskRow = state0.tasks.find((t) => t.id === taskId);
+  const subagent0 = taskRow ? getSubagentForTask(state0, taskRow) : undefined;
+  const tools = filterToolsForSubagent(buildToolCatalog(state0), subagent0);
   const providerTools = toProviderTools(tools);
   const toolsHash = hashCatalog(tools);
 
@@ -231,6 +278,7 @@ async function runLoop(
         data: { summary: finished.summary, iterations }
       });
       await updateRunFromTask(config, finished);
+      await syncSubagentFromTask(config, finished);
       return finished;
     }
 
@@ -338,6 +386,7 @@ async function runLoop(
     data: { iterations: MAX_LOOP_ITERATIONS }
   });
   await updateRunFromTask(config, exhausted);
+  await syncSubagentFromTask(config, exhausted);
   return exhausted;
 }
 
