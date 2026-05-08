@@ -1,5 +1,10 @@
 import type { RuntimeConfig, SkillRecord } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now, readState } from "../state";
+import { loadSkillsFromDisk, type SkillLoadResult } from "./skill-loader";
+
+export async function reloadSkills(config: RuntimeConfig): Promise<SkillLoadResult> {
+  return loadSkillsFromDisk(config);
+}
 
 export function listSkills(config: RuntimeConfig) {
   return readState(config.instance).skills;

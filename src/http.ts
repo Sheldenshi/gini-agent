@@ -24,7 +24,7 @@ import { providerCatalog } from "./provider";
 import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
@@ -179,6 +179,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["POST", /^\/api\/skills$/, async (request) => json(await createSkillFromInput(config, await body(request)), 201)],
     ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
+    // Manual filesystem skill reload — re-runs loadSkillsFromDisk so a user
+    // can drop a new SKILL.md under <instance>/skills/ without restarting.
+    ["POST", /^\/api\/skills\/reload$/, async () => json(await reloadSkills(config))],
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],

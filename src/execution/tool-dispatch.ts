@@ -17,7 +17,8 @@ import {
   assertInsideWorkspace,
   createApproval,
   mutateState,
-  now
+  now,
+  readState
 } from "../state";
 import { findTask } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
@@ -53,6 +54,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await fileSearch(config, taskId, args) };
     case "web_fetch":
       return { kind: "sync", result: await webFetchTool(config, taskId, args) };
+    case "read_skill":
+      return { kind: "sync", result: await readSkillTool(config, taskId, args) };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -173,6 +176,33 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
   });
   await recordLowRiskAudit(config, taskId, "web.fetch", parsed.toString(), { status: response.status, bytes: text.length });
   return text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`;
+}
+
+// Skill catalog access. Returns the full markdown body of a trusted skill
+// so the model can follow its instructions. We deliberately gate on the
+// "trusted" status — draft / disabled / archived skills are invisible
+// to the agent loop. The system prompt only advertises trusted skills, so
+// the model shouldn't request anything else; if it does, surface the
+// reason to the model as a tool error rather than silently returning empty.
+async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const name = requireString(args, "name");
+  const state = readState(config.instance);
+  const skill = state.skills.find((s) => s.name === name);
+  if (!skill) throw new Error(`No skill named ${name} is registered.`);
+  if (skill.status !== "trusted") {
+    throw new Error(`Skill ${name} is not trusted (current status: ${skill.status}). Ask the user to trust it via /skills before using.`);
+  }
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Skill body read (chat-task)",
+    data: { name: skill.name, version: skill.version, bytes: skill.body.length }
+  });
+  await recordLowRiskAudit(config, taskId, "skill.read", skill.id, {
+    name: skill.name,
+    version: skill.version,
+    bytes: skill.body.length
+  });
+  return skill.body || "(skill body is empty)";
 }
 
 function isTextLike(path: string): boolean {

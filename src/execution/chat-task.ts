@@ -27,7 +27,7 @@ import {
   type ToolCallingMessage,
   type ToolCall
 } from "../provider";
-import type { PendingToolCall, RuntimeConfig, Task, TaskToolCallState } from "../types";
+import type { PendingToolCall, RuntimeConfig, SkillRecord, Task, TaskToolCallState } from "../types";
 import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
@@ -77,7 +77,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
 
   const state = readState(config.instance);
   const activeMemory = state.memories.filter((memory) => memory.status === "active");
-  const systemContext = buildAgentSystemContext(activeMemory, recalledContext);
+  const baseSystem = buildAgentSystemContext(activeMemory, recalledContext);
+  const skillsBlock = buildTrustedSkillsBlock(state.skills);
+  const systemContext = skillsBlock ? `${baseSystem}\n\n${skillsBlock}` : baseSystem;
 
   // Conversation history: include prior turns from the same chat session so
   // the model has multi-turn context (the legacy single-shot path didn't).
@@ -114,6 +116,28 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
   return stored
     .filter((m) => m.role === "user" || m.role === "assistant")
     .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+}
+
+// Build the "Available skills:" block that gets prepended to the system
+// prompt for the agent loop. We only advertise *trusted* skills (draft /
+// disabled / archived stay invisible). The block lists each name +
+// frontmatter description; the model uses the read_skill tool to fetch
+// the full body when it actually needs the instructions. This keeps the
+// resident system prompt small even when many skills are registered.
+function buildTrustedSkillsBlock(skills: SkillRecord[]): string {
+  const trusted = skills.filter((s) => s.status === "trusted");
+  if (trusted.length === 0) return "";
+  const lines = trusted
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const desc = s.description.trim() || "(no description)";
+      return `- ${s.name}: ${desc}`;
+    });
+  return [
+    "Available skills (call read_skill with the skill name to load full instructions):",
+    ...lines
+  ].join("\n");
 }
 
 // Inner loop. Calls the model, dispatches tool calls, and either completes

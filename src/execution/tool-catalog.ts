@@ -140,6 +140,25 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["language", "code"]
       }
     }
+  },
+  {
+    // Skill catalog access. Always available so the model can opportunistically
+    // load any trusted skill listed in the system prompt without waiting for
+    // the user to enable a toolset. Sync, low-risk, no approval needed: the
+    // body is just text content that already lives in state.
+    toolset: "skills",
+    type: "function",
+    function: {
+      name: "read_skill",
+      description: "Read the full markdown body of a trusted skill by name. Use this when the system prompt advertises a skill and you need its instructions to follow.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Skill name (e.g. 'apple-notes')." }
+        },
+        required: ["name"]
+      }
+    }
   }
 ];
 
@@ -160,6 +179,11 @@ export function buildToolCatalog(state: RuntimeState): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
+    // Always expose read_skill so the model can load any trusted skill the
+    // system prompt advertises. The "skills" toolset isn't part of the
+    // legacy default toolsets; gating it on enable would mean a fresh
+    // instance can't follow its own skill prompt without a toolset toggle.
+    if (tool.function.name === "read_skill") return true;
     return enabled.has(tool.toolset);
   });
 }

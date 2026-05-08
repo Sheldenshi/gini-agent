@@ -16,8 +16,9 @@ import {
   normalizeProvider
 } from "../provider";
 import { submitTask, decideApproval } from "../agent";
-import { readState } from "../state";
+import { mutateState, readState } from "../state";
 import type { RuntimeConfig, Task } from "../types";
+import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 
 function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
   return {
@@ -165,6 +166,92 @@ describe("chat-task loop", () => {
     const finished = await waitForTerminal(config, task.id);
     expect(finished.status).toBe("completed");
     expect(finished.summary).toBe("Sure, here's a direct answer.");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("read_skill returns the full body of a trusted skill", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-readskill");
+    const provider = normalizeProvider(config.provider);
+
+    // Pre-create a trusted skill with a non-empty body — simulates a
+    // post-loadSkillsFromDisk state without exercising the loader here.
+    const skill = await createSkillFromInput(config, {
+      name: "apple-notes",
+      description: "Apple Notes via memo CLI."
+    });
+    await mutateState(config.instance, (state) => {
+      const item = state.skills.find((s) => s.id === skill.id)!;
+      item.body = "# Apple Notes\n\nUse `memo notes -a` to add a note.";
+    });
+    await setSkillStatus(config, skill.id, "trusted");
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_skill", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "apple-notes" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I now know how to use Apple Notes.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "how do I add an apple note?", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("I now know how to use Apple Notes.");
+    // Audit trail captures the skill read.
+    const state = readState(config.instance);
+    const reads = state.audit.filter((a) => a.action === "skill.read" && a.taskId === task.id);
+    expect(reads).toHaveLength(1);
+    expect(reads[0]?.evidence?.name).toBe("apple-notes");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("read_skill rejects non-trusted skills with a recoverable error", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-readskill-untrusted");
+    const provider = normalizeProvider(config.provider);
+
+    // Create a draft skill (default status). The agent loop should see an
+    // error tool result and recover.
+    const skill = await createSkillFromInput(config, {
+      name: "draft-skill",
+      description: "Not yet trusted."
+    });
+    await mutateState(config.instance, (state) => {
+      const item = state.skills.find((s) => s.id === skill.id)!;
+      item.body = "Some draft content.";
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_draft", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "draft-skill" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Got it — that skill isn't trusted.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "use the draft skill", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Got it — that skill isn't trusted.");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
