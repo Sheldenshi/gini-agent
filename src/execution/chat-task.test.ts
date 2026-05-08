@@ -7,18 +7,16 @@
 //   - resume after approval → task completes
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtempSync } from "node:fs";
 import {
   clearEchoToolCallingResponses,
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
 import { submitTask, decideApproval } from "../agent";
-import { runChatTask, resumeChatTask } from "./chat-task";
-import { createTask, mutateState, readState, upsertTask } from "../state";
+import { readState } from "../state";
 import type { RuntimeConfig, Task } from "../types";
 
 function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
