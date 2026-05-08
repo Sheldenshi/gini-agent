@@ -139,6 +139,27 @@ describe("gini run", () => {
     expect(contents).toContain(`instance=${h.instance}`);
   }, 30_000);
 
+  test("captures runtime shutdown output to runtime-stdout.log on SIGTERM", async () => {
+    // End-to-end guard for the shutdown contract that
+    // `awaitForegroundLogFlush()` in admin.ts:runForeground exists to support:
+    // output emitted by the runtime as it tears down (server.ts SIGTERM
+    // handler) must reach the log file before the CLI exits. On a slow OS or
+    // a future Bun where WriteStream draining isn't already done by the time
+    // `await done` resolves, dropping the await would lose the tail bytes.
+    const h = makeHarness("shutdown-flush");
+    const { child, stdout, exit } = await spawnRun(h);
+    await stdout;
+    child.kill("SIGTERM");
+    await exit;
+    const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
+    expect(existsSync(logPath)).toBe(true);
+    const contents = readFileSync(logPath, "utf8");
+    // Marker comes from src/server.ts SIGTERM handler. The instance suffix
+    // makes sure we're seeing OUR runtime's shutdown, not stray output.
+    expect(contents).toContain("Gini runtime shutting down (SIGTERM)");
+    expect(contents).toContain(`instance=${h.instance}`);
+  }, 30_000);
+
   test("refuses to run when the instance is already up", async () => {
     const h = makeHarness("conflict");
     const first = await spawnRun(h);

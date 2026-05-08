@@ -64,10 +64,13 @@ const foregroundLogStreams: Set<WriteStream> = new Set();
 export async function awaitForegroundLogFlush(): Promise<void> {
   // `'finish'` fires after `.end()` has flushed all queued writes. Streams that
   // are already finished are skipped so we don't hang waiting for an event
-  // that's never coming.
+  // that's never coming. Per-stream errors (ENOSPC/EACCES/NFS hiccups) are
+  // swallowed: a logging failure must never override the child's exit code.
   await Promise.all(
     [...foregroundLogStreams].map((stream) =>
-      stream.writableFinished ? Promise.resolve() : once(stream, "finish")
+      stream.writableFinished
+        ? Promise.resolve()
+        : once(stream, "finish").then(() => undefined).catch(() => undefined)
     )
   );
 }
@@ -85,6 +88,11 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
     const stream: WriteStream = createWriteStream(logPath, { flags: "a" });
     foregroundLogStreams.add(stream);
     stream.once("finish", () => { foregroundLogStreams.delete(stream); });
+    // Without an `'error'` listener the stream stays registered after a
+    // failure (ENOSPC/EACCES/NFS), so a later `awaitForegroundLogFlush()`
+    // would hang waiting for a `'finish'` that never fires. Cleaning up here
+    // also prevents an unhandled-error abort.
+    stream.once("error", () => { foregroundLogStreams.delete(stream); });
     return {
       stdio: ["inherit", "pipe", "pipe"],
       onSpawned: (child) => {

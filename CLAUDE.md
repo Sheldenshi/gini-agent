@@ -19,7 +19,3 @@ tail -n 200 ~/.gini/instances/$INSTANCE/logs/web.log
 tail -n 200 ~/.gini/instances/$INSTANCE/logs/runtime-stdout.log
 tail -n 200 ~/.gini/instances/$INSTANCE/logs/runtime.jsonl
 ```
-
-In daemon mode (`gini start`) writes go directly from the child's FDs to
-the file, so logs keep flowing after the CLI exits. In foreground mode
-(`gini run`) child output is tee'd to both the terminal and the log file.
