@@ -41,6 +41,10 @@ The master plan lives at:
 
 `docs/master-plan.md`
 
+A short architecture overview with diagram lives at:
+
+`docs/architecture-overview.md`
+
 The current module boundaries are documented at:
 
 `docs/implementation-notes.md`
@@ -49,13 +53,29 @@ The V1 local runtime readiness map is documented at:
 
 `docs/v1-readiness.md`
 
+## Architecture in one sentence
+
+Gini's **runtime is the gateway** — a single Bun process per lane that owns all state and does all real work. The Next.js web app, the CLI, and the future mobile app are all clients of the same `/api/*` contract.
+
+```
+                 GATEWAY (server, one per lane)
+                 Bun runtime — state, agent loop, tools
+                            ↑
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+    Next.js BFF      Phone app (post-v1)    CLI / MCP /
+    + browser UI     direct, paired         your scripts
+```
+
+See `docs/architecture-overview.md` for the full picture.
+
 ## v0 Developer Slice
 
 This repo now includes a Bun TypeScript v0 implementation of the local runtime trunk:
 
 - lane-aware CLI and runtime
-- authenticated localhost API
-- browser control plane served by the runtime
+- authenticated localhost API (the gateway)
+- Next.js + Tailwind + shadcn/ui control plane (BFF for the browser; holds the bearer token server-side)
 - persistent tasks, traces, audit events, approvals, jobs, memories, skills, and demo connectors
 - approval-gated file writes and terminal commands
 - provider support with deterministic `echo`, Codex OAuth, and OpenAI API key modes
@@ -70,15 +90,24 @@ Run it locally:
 
 ```bash
 bun run gini install
-bun run gini start
+bun run gini start         # daemon — lane keeps running after the terminal closes
 bun run gini smoke
 ```
 
-Open the control plane at the URL printed by `start`, usually:
+Or run a lane in the foreground (lane dies when this terminal exits — use this for coding-agent worktrees):
+
+```bash
+bun run gini run --lane feature-x
+```
+
+`start` and `run` both print two URLs:
 
 ```text
-http://127.0.0.1:7337
+url     → runtime (gateway) — the API server
+webUrl  → Next.js control plane — open this in a browser
 ```
+
+For the `dev` lane those default to `http://127.0.0.1:7337` (runtime) and `http://127.0.0.1:3000` (web). Other lanes get their own deterministic ports automatically; both walk forward if the default is busy.
 
 Common commands:
 
@@ -149,11 +178,12 @@ For a named persistent test lane, pass explicit roots and a port:
 bun run gini smoke --lane codex-a --state-root /tmp/gini-codex-a --log-root /tmp/gini-codex-a-logs --port 7601
 ```
 
-By default, Gini follows macOS user-level install conventions:
+By default, Gini stores per-lane state and logs under `~/.gini/`:
 
 ```text
-~/Library/Application Support/Gini/<lane>/
-~/Library/Logs/Gini/<lane>/
+~/.gini/<lane>/             # config, state.json, memory.db, traces, snapshots, workspace
+~/.gini/logs/<lane>/         # rotated runtime logs
+~/.gini/models/              # Transformers.js embedding/reranker model cache (shared across lanes)
 ```
 
 For disposable development or tests, override those roots:
