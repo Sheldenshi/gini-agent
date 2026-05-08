@@ -8,6 +8,12 @@ const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CODEX_MODEL = "gpt-5.4";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 
+const INSTRUCTIONS = [
+  "You are Gini, a local-first personal agent.",
+  "Reply directly and concisely.",
+  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals."
+].join("\n");
+
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
   if (provider.name === "echo") {
@@ -310,11 +316,7 @@ async function callOpenAIResponses(provider: ProviderConfig, input: string, memo
       model: provider.model,
       store: false,
       stream: isCodex,
-      instructions: [
-        "You are Gini, a local-first personal agent runtime.",
-        "Return a concise task summary for the control plane.",
-        "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals."
-      ].join("\n"),
+      instructions: INSTRUCTIONS,
       input: [
         {
           role: "user",
@@ -369,7 +371,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, memo
       messages: [
         {
           role: "system",
-          content: "You are Gini, a local-first personal agent runtime. Return a concise task summary and do not claim side effects."
+          content: INSTRUCTIONS
         },
         { role: "user", content: `Active memories:\n${memoryBlock}\n\nTask:\n${input}` }
       ]

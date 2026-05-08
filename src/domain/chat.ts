@@ -31,13 +31,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) throw new Error(`Chat session not found: ${sessionId}`);
-  const recentContext = state.chatMessages
-    .filter((message) => message.sessionId === sessionId)
-    .slice(-8)
-    .map((message) => `${message.role}: ${message.content}`)
-    .join("\n");
-  const taskInput = recentContext ? `Chat context:\n${recentContext}\n\nUser: ${content}` : content;
-  const task = await submitTask(config, taskInput);
+  const task = await submitTask(config, content);
   await mutateState(config.instance, (current) => {
     createChatMessage(current, { sessionId, role: "user", content, taskId: task.id });
   });
