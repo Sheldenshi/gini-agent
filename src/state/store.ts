@@ -218,6 +218,14 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     // safe defaults so consumers can rely on `body` being a string.
     skill.body ??= "";
   }
+  for (const subagent of state.subagents) {
+    // Slice 4 introduced `systemPrompt` (always present) and optional
+    // toolsetIds/skillNames/resultSummary/resultError. Records persisted
+    // before Slice 4 landed don't carry these — backfill `systemPrompt`
+    // with an empty string so callers can rely on the field being a
+    // string. The optional fields stay undefined for legacy rows.
+    subagent.systemPrompt ??= "";
+  }
   for (const job of state.jobs) {
     job.deliveryTargets ??= [];
     job.context ??= [];

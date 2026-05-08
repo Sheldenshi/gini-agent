@@ -316,6 +316,24 @@ export interface SubagentRecord {
   completedAt?: string;
   error?: string;
   summary?: string;
+  // Slice 4 extensions: subagents now run a real constrained agent loop.
+  // The system prompt overrides the parent's default Gini preamble for the
+  // child task so the subagent has its own narrower instructions.
+  systemPrompt: string;
+  // Restricted toolset whitelist (names matching state.toolsets[].name). When
+  // omitted/empty, the child inherits the parent's toolset world. When set,
+  // only tools belonging to one of these toolsets are exposed (skill catalog
+  // tools like read_skill stay always-on).
+  toolsetIds?: string[];
+  // Trusted skill name whitelist. When omitted/empty, the child sees every
+  // trusted skill the parent could see. When set, the "Available skills:"
+  // block in the system prompt is filtered down to this subset.
+  skillNames?: string[];
+  // Convenience mirror of the populated child task's summary/error so the
+  // parent (or UI) can read terminal results off the subagent record without
+  // joining against the task table.
+  resultSummary?: string;
+  resultError?: string;
 }
 
 export interface McpServerRecord {
