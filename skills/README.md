@@ -1,7 +1,6 @@
 # Bundled Skills
 
-This directory ships with the runtime. Each subdirectory follows the
-Hermes-compatible shape:
+This directory ships with the runtime. Each subdirectory uses the layout:
 
 ```
 skills/<category>/<skill-name>/SKILL.md
@@ -17,9 +16,12 @@ actually needs the skill.
 ## Auto-load
 
 `loadSkillsFromDisk` runs at runtime boot and on `POST /api/skills/reload`.
-It walks this directory plus `~/.gini/instances/<instance>/skills/` and
-upserts each `SKILL.md` into runtime state. Skills are matched by `name`;
-re-running the loader bumps the numeric `version` when content changes
+It walks this directory (each loaded record is tagged `source: "bundled"`)
+plus `~/.gini/instances/<instance>/skills/` (tagged `source: "user"`) and
+upserts each `SKILL.md` into runtime state. Skills are matched by
+`(name, source)` so a user-instance `SKILL.md` named the same as a bundled
+skill lands as its own row instead of overwriting the vendored one.
+Re-running the loader bumps the numeric `version` when content changes
 without resetting user-set fields like `status`.
 
 ## Auto-trust allowlist
