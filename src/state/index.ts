@@ -73,10 +73,13 @@ export type {
 export {
   taskCounts,
   upsertTask,
+  appendTaskPartial,
   createTask,
   createRun,
   createPlanStep,
   createChatSession,
+  deleteChatSession,
+  renameChatSession,
   createChatMessage,
   createApproval,
   createMemory,

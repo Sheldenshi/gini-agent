@@ -1,6 +1,7 @@
 .gini/
 node_modules/
 .DS_Store
+.playwright-cli/
 web/.next/
 web/.turbo/
 web/next-env.d.ts

@@ -82,6 +82,13 @@ export interface RuntimeConfig {
   workspaceRoot: string;
   stateRoot: string;
   logRoot: string;
+  // User-curated allowlist of shell-glob patterns that bypass the approval
+  // gate for terminal_exec. Patterns match the full command string (e.g.
+  // `memo *` matches any command starting with "memo "). Auto-approved
+  // executions still write a `terminal.exec` audit row with
+  // evidence.autoApproved=true plus the matched pattern, so the activity
+  // trail stays intact. Empty / undefined means no auto-approval.
+  autoApproveCommands?: string[];
 }
 
 export interface RuntimeState {
@@ -120,6 +127,38 @@ export interface RuntimeState {
   planSteps: PlanStepRecord[];
 }
 
+export type TaskMode = "chat" | "imperative";
+
+// A pending tool call captured by the chat-task loop while waiting for an
+// approval to resolve. Stored on the task so the loop can resume after the
+// approval completes without re-running the model. `result` is filled in by
+// the approval execution path (e.g. file write succeeded, command output).
+export interface PendingToolCall {
+  toolCallId: string;
+  toolName: string;
+  approvalId: string;
+  result?: string;
+}
+
+// Snapshot of the tool-calling conversation needed to resume the loop after
+// an approval gates a tool. We persist enough context that the runtime can
+// pick up where it left off when the user approves/denies.
+export interface TaskToolCallState {
+  // OpenAI-shaped messages array (system, user, assistant w/ tool_calls,
+  // tool result messages). We keep `unknown[]` to avoid pulling provider
+  // shape into the central type module.
+  messages: unknown[];
+  // Stable identifier for the tool catalog used during this loop. If it
+  // changes between iterations (toolset toggled, skill loaded), we don't
+  // assume the prior catalog still applies.
+  toolsHash: string;
+  // Tool calls awaiting approval. When all of these have results filled in,
+  // the loop resumes.
+  pending: PendingToolCall[];
+  // Iteration counter (capped to prevent runaway loops).
+  iterations: number;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -130,6 +169,11 @@ export interface Task {
   updatedAt: string;
   currentStep?: string;
   summary?: string;
+  // Live partial assistant text streamed from the provider while the task is
+  // running. Cleared/ignored once `summary` is set on completion. Surfaced to
+  // the chat UI as a synthesized streaming assistant message so the user sees
+  // text mid-flight instead of waiting for the buffered final response.
+  partialSummary?: string;
   error?: string;
   tracePath: string;
   auditIds: string[];
@@ -141,6 +185,14 @@ export interface Task {
   subagentId?: string;
   runId?: string;
   cost?: CostRecord;
+  // Execution mode. "chat" routes through the tool-calling agent loop in
+  // src/execution/chat-task.ts. "imperative" preserves the legacy CLI
+  // prefix-dispatch behavior. Defaults to "imperative" for back-compat.
+  mode?: TaskMode;
+  // Resume state for the chat-task loop while waiting on an approval. Cleared
+  // once the loop finishes (completed/failed) so completed tasks don't retain
+  // long-lived conversation snapshots in state.
+  toolCallState?: TaskToolCallState;
 }
 
 export interface RuntimeEvent {
@@ -271,6 +323,24 @@ export interface SubagentRecord {
   completedAt?: string;
   error?: string;
   summary?: string;
+  // Slice 4 extensions: subagents now run a real constrained agent loop.
+  // The system prompt overrides the parent's default Gini preamble for the
+  // child task so the subagent has its own narrower instructions.
+  systemPrompt: string;
+  // Restricted toolset whitelist (names matching state.toolsets[].name). When
+  // omitted/empty, the child inherits the parent's toolset world. When set,
+  // only tools belonging to one of these toolsets are exposed (skill catalog
+  // tools like read_skill stay always-on).
+  toolsetIds?: string[];
+  // Trusted skill name whitelist. When omitted/empty, the child sees every
+  // trusted skill the parent could see. When set, the "Available skills:"
+  // block in the system prompt is filtered down to this subset.
+  skillNames?: string[];
+  // Convenience mirror of the populated child task's summary/error so the
+  // parent (or UI) can read terminal results off the subagent record without
+  // joining against the task table.
+  resultSummary?: string;
+  resultError?: string;
 }
 
 export interface McpServerRecord {
@@ -469,6 +539,33 @@ export interface SkillRecord {
   successCount: number;
   failureCount: number;
   previousVersions: SkillVersion[];
+  // Filesystem-loaded skills carry their full markdown body (the part of the
+  // SKILL.md file after the YAML frontmatter). Legacy CRUD-created skills
+  // default to "" — present-but-empty so callers can rely on the field being
+  // a string. The body is what gets fed back to the model when it asks to
+  // "read" the skill via the read_skill tool.
+  body: string;
+  // Origin file path (absolute) for skills loaded from disk. Useful for
+  // traceability and re-load detection. Optional because legacy
+  // user-CRUD-authored skills don't have a source file.
+  manifestPath?: string;
+  // Parent directory name for filesystem-loaded skills (e.g. "apple" for
+  // skills/apple/apple-notes/SKILL.md). Used as a UI grouping hint.
+  category?: string;
+  // Frontmatter `platforms` list (e.g. ["macos"]). Skills are skipped at
+  // load time when the host platform isn't in this list.
+  platforms?: string[];
+  // Frontmatter `prerequisites`. We keep `commands` and `env` as strings —
+  // strings the LLM can later inspect or check via terminal_exec.
+  prerequisites?: { commands?: string[]; env?: string[] };
+  // Origin of the loaded skill: "bundled" for vendored repo skills (under
+  // <repo>/skills/), "user" for skills under ~/.gini/instances/<inst>/skills/.
+  // Used by the loader to keep bundled and user records separate (so a
+  // user-instance SKILL.md named "apple-notes" can't hijack the vendored
+  // trust grant) and by the auto-trust allowlist (only bundled records may
+  // be auto-trusted). Defaults to "user" for legacy records via
+  // normalizeState so older state files keep loading.
+  source?: "bundled" | "user";
 }
 
 export interface SkillVersion {

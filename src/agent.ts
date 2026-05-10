@@ -16,6 +16,7 @@ import { traceDir } from "./paths";
 import {
   addAudit,
   appendLog,
+  appendTaskPartial,
   appendTrace,
   assertInsideWorkspace,
   createMemory,
@@ -29,21 +30,48 @@ import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } 
 import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
 import { requestCodeExecution } from "./tools/code";
-import { recall, retain } from "./domain/memory";
-import { updateRunFromTask } from "./domain/runs";
+import { recall, retain } from "./memory";
+import { updateRunFromTask } from "./execution/runs";
+import { runChatTask, resumeChatTask } from "./execution/chat-task";
+import { approvalToolCallId } from "./execution/tool-dispatch";
+import { syncSubagentFromTask } from "./capabilities/subagents";
 
-export async function submitTask(config: RuntimeConfig, input: string, jobId?: string, parentTaskId?: string, subagentId?: string, runId?: string): Promise<Task> {
-  const created = createTask(config.instance, input, jobId, parentTaskId, subagentId, runId);
+export interface SubmitTaskOptions {
+  jobId?: string;
+  parentTaskId?: string;
+  subagentId?: string;
+  runId?: string;
+  // Execution mode. "chat" routes through the tool-calling agent loop.
+  // "imperative" preserves the legacy CLI prefix-dispatch behavior. Defaults
+  // to "imperative" for back-compat with the CLI; chat callers pass "chat".
+  mode?: "chat" | "imperative";
+}
+
+export async function submitTask(
+  config: RuntimeConfig,
+  input: string,
+  jobIdOrOptions?: string | SubmitTaskOptions,
+  parentTaskId?: string,
+  subagentId?: string,
+  runId?: string
+): Promise<Task> {
+  // Back-compat shim: callers pass either positional args (legacy) or an
+  // options bag. New chat callers use the bag so they can set mode.
+  const options: SubmitTaskOptions = typeof jobIdOrOptions === "object" && jobIdOrOptions !== null
+    ? jobIdOrOptions
+    : { jobId: jobIdOrOptions, parentTaskId, subagentId, runId };
+  const created = createTask(config.instance, input, options.jobId, options.parentTaskId, options.subagentId, options.runId);
+  if (options.mode) created.mode = options.mode;
   await mutateState(config.instance, (state) => {
     upsertTask(state, created);
     const audit = addAudit(state, {
-      actor: jobId ? "runtime" : "user",
+      actor: options.jobId ? "runtime" : "user",
       action: "task.submitted",
       target: created.id,
       risk: "low",
       taskId: created.id,
-      runId,
-      evidence: { input, jobId, parentTaskId, subagentId, runId }
+      runId: options.runId,
+      evidence: { input, jobId: options.jobId, parentTaskId: options.parentTaskId, subagentId: options.subagentId, runId: options.runId, mode: options.mode }
     });
     created.auditIds.push(audit.id);
   });
@@ -87,14 +115,84 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
       taskId,
       runId: task.runId
     });
+    // Halt-siblings fix: cancelling a task that's waiting on multiple
+    // pending approvals must also tear down those approvals so a later
+    // approve doesn't run a tool against a cancelled task. Clear the
+    // captured tool-call snapshot in the same write.
+    cancelPendingTaskApprovals(state, taskId, "task.cancelled");
+    task.toolCallState = undefined;
     upsertTask(state, task);
     return task;
   });
   await updateRunFromTask(config, task);
+  await syncSubagentFromTask(config, task);
+  // Cascade cancellation to descendant subagent tasks. If the cancelled
+  // task spawned subagents (whose taskIds are children), cancel each one
+  // recursively. Walk the runtime state for any task whose parentTaskId is
+  // this task and is not already terminal, then cancel them.
+  await cancelDescendantTasks(config, taskId);
   return task;
 }
 
+// Mark every other pending approval that targets the given task as denied,
+// audited as cancelled-by-sibling-decision. Called from the deny path of
+// decideApproval and from cancelTask. Excludes `excludeApprovalId` (the
+// approval that triggered the cancellation) so we don't double-audit it.
+// Runs inside an existing mutateState call (not its own) so it shares the
+// same write.
+function cancelPendingTaskApprovals(
+  state: RuntimeState,
+  taskId: string,
+  reason: "task.cancelled" | "sibling.denied",
+  excludeApprovalId?: string
+): void {
+  for (const sibling of state.approvals) {
+    if (sibling.taskId !== taskId) continue;
+    if (sibling.status !== "pending") continue;
+    if (excludeApprovalId && sibling.id === excludeApprovalId) continue;
+    sibling.status = "denied";
+    sibling.updatedAt = now();
+    addAudit(state, {
+      actor: "runtime",
+      action: reason === "sibling.denied"
+        ? "approval.cancelled_sibling_denial"
+        : "approval.cancelled_task_cancelled",
+      target: sibling.target,
+      risk: sibling.risk,
+      taskId: sibling.taskId,
+      runId: state.tasks.find((task) => task.id === sibling.taskId)?.runId,
+      approvalId: sibling.id,
+      evidence: { reason, originatingApprovalId: excludeApprovalId }
+    });
+  }
+}
+
+async function cancelDescendantTasks(config: RuntimeConfig, parentTaskId: string): Promise<void> {
+  // Snapshot the children synchronously so we don't recurse while mutating.
+  const state = await mutateState(config.instance, (s) => s);
+  const children = state.tasks
+    .filter((t) => t.parentTaskId === parentTaskId)
+    .filter((t) => t.status !== "completed" && t.status !== "failed" && t.status !== "cancelled")
+    .map((t) => t.id);
+  for (const childId of children) {
+    try {
+      await cancelTask(config, childId);
+    } catch {
+      // Best-effort: a race between the cancel and the natural completion
+      // is fine. The next refreshSubagents tick will reconcile state.
+    }
+  }
+}
+
 export async function runTask(config: RuntimeConfig, taskId: string): Promise<Task> {
+  // Chat-mode tasks route through the tool-calling agent loop in
+  // src/execution/chat-task.ts. The legacy prefix-dispatch path below is
+  // preserved for imperative CLI commands (`gini task "write foo.txt :: hi"`).
+  const initialTask = await mutateState(config.instance, (state) => findTask(state, taskId));
+  if (initialTask.mode === "chat") {
+    return runChatTask(config, taskId);
+  }
+
   let task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     item.status = "running";
@@ -112,15 +210,20 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   const lower = task.input.toLowerCase();
 
   // Dispatch by input prefix. Each tool returns the resulting Task; high-risk
-  // tools may have transitioned the task into waiting_approval.
-  if (lower.startsWith("write ")) return finishTaskTransition(config, await requestFileWrite(config, task));
-  if (lower.startsWith("patch ")) return finishTaskTransition(config, await requestFilePatch(config, task));
-  if (lower.startsWith("read ")) return finishTaskTransition(config, await readFile(config, task));
-  if (lower.startsWith("list ")) return finishTaskTransition(config, await listFiles(config, task));
-  if (lower.startsWith("find ")) return finishTaskTransition(config, await searchFiles(config, task));
-  if (lower.startsWith("web ")) return finishTaskTransition(config, await fetchWeb(config, task));
-  if (lower.startsWith("code ")) return finishTaskTransition(config, await requestCodeExecution(config, task));
-  if (lower.startsWith("shell ")) return finishTaskTransition(config, await requestShell(config, task));
+  // tools may have transitioned the task into waiting_approval. We flip
+  // currentStep to "Working" *before* dispatching so the chat UI can
+  // distinguish text-generation ("Thinking") from tool execution ("Working").
+  // Approval-gated tools will overwrite to "Waiting for approval" inside the
+  // tool itself; synchronous tools (read/list/find/web) keep "Working" until
+  // completion.
+  if (lower.startsWith("write ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestFileWrite(config, task)); }
+  if (lower.startsWith("patch ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestFilePatch(config, task)); }
+  if (lower.startsWith("read ")) { await markWorking(config, taskId); return finishTaskTransition(config, await readFile(config, task)); }
+  if (lower.startsWith("list ")) { await markWorking(config, taskId); return finishTaskTransition(config, await listFiles(config, task)); }
+  if (lower.startsWith("find ")) { await markWorking(config, taskId); return finishTaskTransition(config, await searchFiles(config, task)); }
+  if (lower.startsWith("web ")) { await markWorking(config, taskId); return finishTaskTransition(config, await fetchWeb(config, task)); }
+  if (lower.startsWith("code ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestCodeExecution(config, task)); }
+  if (lower.startsWith("shell ")) { await markWorking(config, taskId); return finishTaskTransition(config, await requestShell(config, task)); }
 
   // No tool matched: fall through to provider summarization.
   const activeMemory = await mutateState(config.instance, (state) => state.memories.filter((memory) => memory.status === "active"));
@@ -150,7 +253,30 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     });
   }
 
-  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext);
+  // Debounced streaming: codex emits many small SSE deltas. Buffer them and
+  // flush to state at most every ~150ms so we get smooth updates without
+  // thrashing mutateState (each call serializes the full RuntimeState to
+  // disk). A final flush after the stream completes drains any tail.
+  let pending = "";
+  let lastFlush = 0;
+  const flush = async (): Promise<void> => {
+    if (!pending) return;
+    const delta = pending;
+    pending = "";
+    lastFlush = Date.now();
+    await mutateState(config.instance, (state) => {
+      appendTaskPartial(state, taskId, delta);
+    });
+  };
+  const onDelta = (text: string): void => {
+    pending += text;
+    if (Date.now() - lastFlush >= 150) {
+      void flush();
+    }
+  };
+
+  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext, onDelta);
+  await flush();
   appendTrace(config.instance, taskId, {
     type: "model",
     message: `${providerResult.provider.name} provider generated response`,
@@ -213,6 +339,19 @@ async function finishTaskTransition(config: RuntimeConfig, task: Task): Promise<
   return task;
 }
 
+// Sets currentStep to "Working" for a running task. Called immediately
+// before dispatching to a tool so the chat UI's phase indicator can show
+// "Working" (tool execution) instead of "Thinking" (LLM text generation).
+// Tool implementations may later overwrite to "Waiting for approval".
+async function markWorking(config: RuntimeConfig, taskId: string): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    item.currentStep = "Working";
+    item.updatedAt = now();
+    upsertTask(state, item);
+  });
+}
+
 function shouldAutoRetain(task: Task): boolean {
   // Read-only / low-risk tool calls don't carry retainable facts. Everything
   // else goes through the extractor — which returns an empty fact list for
@@ -267,6 +406,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   });
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
   await updateRunFromTask(config, task);
+  await syncSubagentFromTask(config, task);
 }
 
 // Shared between agent and tool modules. Tools that complete immediately
@@ -319,6 +459,18 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
       approvalId: item.id
     });
+    // Halt-siblings fix (Review P1 #2): when a single LLM turn emits
+    // multiple approval-gated tool calls, denying one must immediately
+    // tear down the other pending approvals on the same task and clear
+    // the captured tool-call snapshot. Otherwise a sibling approved
+    // *after* the denial would still execute (executeApprovedAction
+    // didn't check task status) and `resumeChatTask` would re-enter the
+    // loop on a failed task.
+    if (decision === "deny" && item.taskId) {
+      cancelPendingTaskApprovals(state, item.taskId, "sibling.denied", item.id);
+      const task = state.tasks.find((t) => t.id === item.taskId);
+      if (task) task.toolCallState = undefined;
+    }
     return item;
   });
 
@@ -336,6 +488,51 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
 }
 
 async function executeApprovedAction(config: RuntimeConfig, approval: Approval): Promise<void> {
+  // Chat-task approvals carry a `toolCallId` on payload — when present, we
+  // run the side effect, skip task completion (the loop owns the task),
+  // and feed the result back via resumeChatTask.
+  const chatToolCallId = approvalToolCallId(approval.payload);
+
+  // Halt-siblings fix (Review P1 #2): re-read the owning task and refuse
+  // to execute the side effect if the task has already reached a terminal
+  // state (failed via sibling denial, cancelled, completed). Without this
+  // guard, two approval-gated tool calls in a single LLM turn could both
+  // execute even though the first denial already failed the task.
+  if (approval.taskId) {
+    const taskNow = await mutateState(config.instance, (state) => {
+      return state.tasks.find((t) => t.id === approval.taskId);
+    });
+    if (taskNow && (taskNow.status === "failed" || taskNow.status === "cancelled" || taskNow.status === "completed")) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "approval",
+        message: "Skipping approved action: task already terminal",
+        data: { approvalId: approval.id, taskStatus: taskNow.status }
+      });
+      // Mark the approval as cancelled-after-approval so audit trail and
+      // UI both surface the no-op. Approval status enum only has the
+      // three values; we use "denied" plus a distinct audit action to
+      // record that the cancellation was post-approval.
+      await mutateState(config.instance, (state) => {
+        const item = state.approvals.find((a) => a.id === approval.id);
+        if (item && item.status === "approved") {
+          item.status = "denied";
+          item.updatedAt = now();
+          addAudit(state, {
+            actor: "runtime",
+            action: "approval.cancelled_task_terminal",
+            target: item.target,
+            risk: item.risk,
+            taskId: item.taskId,
+            runId: state.tasks.find((task) => task.id === item.taskId)?.runId,
+            approvalId: item.id,
+            evidence: { taskStatus: taskNow.status }
+          });
+        }
+      });
+      return;
+    }
+  }
+
   if (approval.action === "file.write") {
     const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
@@ -351,11 +548,14 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         approvalId: approval.id,
         evidence: { beforeBytes: before.length, afterBytes: String(approval.payload.content).length }
       });
-      if (approval.taskId) completeApprovedTask(state, approval.taskId, "File write completed.");
+      if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File write completed.");
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File written", data: { path: approval.payload.path } });
     if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, `File write completed: ${approval.payload.path}`);
+    }
     return;
   }
 
@@ -378,17 +578,33 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
         approvalId: approval.id,
         evidence: { diff: approval.payload.diff, beforeBytes: before.length, afterBytes: after.length }
       });
-      if (approval.taskId) completeApprovedTask(state, approval.taskId, "File patch completed.");
+      if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, "File patch completed.");
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) appendTrace(config.instance, approval.taskId, { type: "tool", message: "File patched", data: { path: approval.payload.path, diff: approval.payload.diff } });
     if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, `File patch completed: ${approval.payload.path}`);
+    }
     return;
   }
 
   if (approval.action === "terminal.exec") {
     const command = String(approval.payload.command);
-    const proc = spawn(["zsh", "-lc", command], {
+    const usePty = approval.payload.pty === true;
+    // PTY-capable spawn: when the model asks for a TTY (interactive CLIs
+    // like vim, memo, claude-code), we wrap with `script` so the child sees
+    // stdin as a real terminal. macOS and Linux disagree on the script
+    // invocation: macOS expects `script -q <typescript> <cmd...>`, Linux
+    // expects `script -q -c '<cmd>' <typescript>`. We discard the
+    // typescript file by pointing it at /dev/null on either platform.
+    // Without the wrapper, vim immediately exits with
+    // "Vim: Error reading input, exiting..." and any caller (memo notes -a,
+    // git rebase -i, etc.) sees a cancelled session.
+    const spawnArgs = usePty
+      ? buildPtySpawnArgs(command)
+      : ["zsh", "-lc", command];
+    const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
       stderr: "pipe"
@@ -423,10 +639,11 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
           stdoutTruncated: stdout.length > 4000,
           stderrTruncated: stderr.length > 4000,
           artifactPath: artifact?.path,
-          artifactRelPath: artifact?.relPath
+          artifactRelPath: artifact?.relPath,
+          pty: usePty
         }
       });
-      if (approval.taskId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
+      if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
       return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
     });
     if (approval.taskId) {
@@ -446,7 +663,126 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       });
     }
     if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      // Feed the captured stdout/stderr back to the chat-task loop. Truncate
+      // similarly to the audit trail so we don't blow the model's context.
+      const summary = [
+        `exit ${exitCode}`,
+        stdout.length > 0 ? `stdout:\n${stdout.slice(0, 4000)}${stdout.length > 4000 ? "\n…(truncated)" : ""}` : "",
+        stderr.length > 0 ? `stderr:\n${stderr.slice(0, 4000)}${stderr.length > 4000 ? "\n…(truncated)" : ""}` : ""
+      ].filter(Boolean).join("\n\n");
+      await resumeChatTask(config, approval.taskId, chatToolCallId, summary || `Command finished with exit ${exitCode}.`);
+    }
   }
+}
+
+// Picks the right `script` invocation to wrap a shell command in a pseudo-
+// terminal. macOS BSD `script` puts the typescript file first then the
+// command; util-linux `script` requires `-c '<cmd>'` plus the typescript
+// file. Both support `-q` to suppress the "Script started/done" banner.
+// Output stays plain because we point the typescript file at /dev/null
+// (we capture stdout/stderr off the spawned proc directly).
+//
+// The wrapped command itself is re-routed through `zsh -lc` so the model's
+// command line is parsed by the same shell as a non-PTY invocation. Without
+// this, the model would have to know it's running in a different shell when
+// pty=true.
+export function buildPtySpawnArgs(command: string): string[] {
+  if (process.platform === "linux") {
+    return ["script", "-q", "-c", `zsh -lc ${shellQuote(command)}`, "/dev/null"];
+  }
+  // macOS / BSD layout (also the default for Bun's dev env). `script -q
+  // /dev/null <cmd...>` runs <cmd...> under a PTY and discards the
+  // typescript file; the remaining args are the command + its argv.
+  return ["script", "-q", "/dev/null", "zsh", "-lc", command];
+}
+
+// Public helper for the auto-approve path. Spawns the command, captures
+// stdout/stderr, writes the artifact + audit + trace, returns the
+// formatted result string the chat-task loop feeds back to the model.
+// Mirrors the executeApprovedAction terminal.exec branch, minus the
+// approval-row handling. `evidenceExtra` lets the caller inject
+// `autoApproved` flags so the audit trail records why the approval gate
+// was skipped.
+export async function runTerminalCommand(
+  config: RuntimeConfig,
+  taskId: string,
+  command: string,
+  options: { timeoutMs?: number; pty?: boolean; evidenceExtra?: Record<string, unknown> } = {}
+): Promise<{ exitCode: number; stdout: string; stderr: string; summary: string }> {
+  const usePty = options.pty === true;
+  const timeoutMs = options.timeoutMs ?? 60_000;
+  const spawnArgs = usePty ? buildPtySpawnArgs(command) : ["zsh", "-lc", command];
+  const proc = spawn(spawnArgs, {
+    cwd: config.workspaceRoot,
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const timeout = setTimeout(() => proc.kill(), timeoutMs);
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited
+  ]);
+  clearTimeout(timeout);
+  // Synthetic id so the artifact filename collides with neither real
+  // approval ids nor sibling auto-approved runs in the same task.
+  const syntheticId = `auto_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+  const artifact = writeTerminalArtifact(config.instance, taskId, syntheticId, { stdout, stderr });
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(state, {
+      actor: "runtime",
+      action: "terminal.exec",
+      target: command,
+      risk: "high",
+      taskId,
+      runId: item.runId,
+      evidence: {
+        exitCode,
+        stdout: stdout.slice(0, 4000),
+        stderr: stderr.slice(0, 4000),
+        stdoutBytes: stdout.length,
+        stderrBytes: stderr.length,
+        stdoutTruncated: stdout.length > 4000,
+        stderrTruncated: stderr.length > 4000,
+        artifactPath: artifact.path,
+        artifactRelPath: artifact.relPath,
+        pty: usePty,
+        ...options.evidenceExtra
+      }
+    });
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Command executed",
+    data: {
+      command,
+      exitCode,
+      stdoutBytes: stdout.length,
+      stderrBytes: stderr.length,
+      stdoutTruncated: stdout.length > 4000,
+      stderrTruncated: stderr.length > 4000,
+      artifactPath: artifact.path,
+      artifactRelPath: artifact.relPath,
+      pty: usePty,
+      ...options.evidenceExtra
+    }
+  });
+  const summary = [
+    `exit ${exitCode}`,
+    stdout.length > 0 ? `stdout:\n${stdout.slice(0, 4000)}${stdout.length > 4000 ? "\n…(truncated)" : ""}` : "",
+    stderr.length > 0 ? `stderr:\n${stderr.slice(0, 4000)}${stderr.length > 4000 ? "\n…(truncated)" : ""}` : ""
+  ].filter(Boolean).join("\n\n") || `Command finished with exit ${exitCode}.`;
+  return { exitCode, stdout, stderr, summary };
+}
+
+// POSIX-safe single-quoting for embedding a command as one shell-word
+// argument (Linux script -c expects a single string). Wraps in '...' and
+// escapes embedded single quotes the standard way.
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 // Writes the full stdout/stderr for an approved terminal/code execution to a

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import type { MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -120,11 +120,697 @@ export function providerCatalog(): ProviderCatalogItem[] {
   ];
 }
 
+// Public so chat-task.ts can build the same authoritative system prompt
+// (instructions + pinned memories + recalled context) the legacy
+// generateTaskSummary path uses.
+export function buildAgentSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
+  return buildSystemContext(memories, recalledContext);
+}
+
+// OpenAI tool-calling shapes. We mirror the chat-completions API surface
+// directly so tool specs can be authored once and shipped to any compat
+// provider (OpenAI, OpenRouter, local) without an intermediate adapter.
+export interface ToolFunctionSpec {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>; // JSON schema
+  };
+}
+
+export interface ToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string; // JSON-encoded args; callers parse
+  };
+}
+
+export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
+
+export interface ToolCallingMessage {
+  role: ChatMessageRole;
+  content: string | null;
+  // tool result messages carry the originating call id; assistant messages
+  // that triggered tool calls carry `tool_calls`.
+  name?: string;
+  tool_call_id?: string;
+  tool_calls?: ToolCall[];
+}
+
+export interface ToolCallingResult {
+  provider: ProviderConfig;
+  text: string;
+  toolCalls: ToolCall[];
+  finishReason: "stop" | "tool_calls" | "length" | "content_filter" | "unknown";
+  responseId?: string;
+  usage?: Record<string, unknown>;
+  cost?: CostRecord;
+}
+
+// Echo provider stub registry for tool-calling. Tests register a sequence
+// of canned responses (each is the next ToolCallingResult to return) keyed
+// by an optional tag — useful for end-to-end chat-task tests where the
+// loop calls the provider multiple times.
+const echoToolCallingStubs: Array<{ tag?: string; result: ToolCallingResult }> = [];
+
+export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: string): void {
+  echoToolCallingStubs.push({ tag, result });
+}
+
+export function clearEchoToolCallingResponses(): void {
+  echoToolCallingStubs.length = 0;
+}
+
+function nextEchoToolCallingResult(provider: ProviderConfig, lastUserText: string): ToolCallingResult {
+  const stub = echoToolCallingStubs.shift();
+  if (stub) return stub.result;
+  // Default: behave like generateTaskSummary's echo branch — finish with a
+  // canned text response so callers that don't pre-register stubs still see
+  // a deterministic shape.
+  return {
+    provider,
+    text: `Gini handled: ${lastUserText}`,
+    toolCalls: [],
+    finishReason: "stop"
+  };
+}
+
+// Native tool-calling entry point. Calls the provider's chat-completions
+// endpoint (or codex `/responses`) with a `tools` array. Used by the chat-task
+// agent loop.
+//
+// For codex with no tools (legacy callers), we fall back to the text-only
+// `/responses` path via `callOpenAIResponses` so older code paths still work.
+// With tools present, codex now uses the native function-call surface of the
+// responses API (see `callToolCallingResponses`). The echo provider keeps its
+// stub-driven behavior so unit tests stay deterministic.
+export async function generateToolCallingResponse(
+  config: RuntimeConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  const provider = normalizeProvider(config.provider);
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
+  const lastUserText = typeof lastUser?.content === "string" ? lastUser.content : "";
+
+  if (provider.name === "echo") {
+    const result = nextEchoToolCallingResult(provider, lastUserText);
+    if (result.text && onDelta) {
+      // Synthesize a single streamed delta so callers exercise their
+      // streaming pipelines in echo-backed tests.
+      try {
+        onDelta(result.text);
+      } catch {
+        // never let onDelta crash the test path.
+      }
+    }
+    return result;
+  }
+
+  // Codex/responses API. With tools present, route to the native
+  // function-calling responses path. Without tools, fall back to a plain
+  // text completion (preserves legacy callers like `generateTaskSummary`
+  // pathways that still pass through this function).
+  if (provider.name === "codex") {
+    if (tools.length > 0) {
+      return callToolCallingResponses(provider, messages, tools, onDelta);
+    }
+    const systemContext = stitchSystemFromMessages(messages);
+    const userInput = lastUserText || "";
+    const text = await callOpenAIResponses(provider, userInput, systemContext, onDelta);
+    return {
+      provider: text.provider,
+      text: text.text,
+      toolCalls: [],
+      finishReason: "stop",
+      responseId: text.responseId,
+      usage: text.usage,
+      cost: text.cost
+    };
+  }
+
+  return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+}
+
+// When falling back to the responses API for codex, collapse all `system`
+// messages into one instructions block. tool/assistant messages are dropped
+// since the responses path doesn't model them.
+function stitchSystemFromMessages(messages: ToolCallingMessage[]): string {
+  return messages
+    .filter((m) => m.role === "system" && typeof m.content === "string")
+    .map((m) => m.content as string)
+    .join("\n\n");
+}
+
+async function callToolCallingChatCompletions(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
+  };
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const wantStream = Boolean(onDelta);
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    messages: messages.map(serializeChatMessage),
+    stream: wantStream
+  };
+  if (tools.length > 0) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
+    body: JSON.stringify(body)
+  });
+
+  if (wantStream) {
+    return readToolCallingStream(response, provider, onDelta);
+  }
+
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Tool-calling request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  return extractToolCallingResult(payload, provider);
+}
+
+function serializeChatMessage(message: ToolCallingMessage): Record<string, unknown> {
+  // OpenAI chat-completions accepts the wire shape directly. Strip
+  // undefined fields so they don't leak into the JSON body.
+  const out: Record<string, unknown> = { role: message.role, content: message.content };
+  if (message.name !== undefined) out.name = message.name;
+  if (message.tool_call_id !== undefined) out.tool_call_id = message.tool_call_id;
+  if (message.tool_calls !== undefined) out.tool_calls = message.tool_calls;
+  return out;
+}
+
+function extractToolCallingResult(
+  payload: Record<string, unknown>,
+  provider: ProviderConfig
+): ToolCallingResult {
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const first = choices.find(isRecord);
+  const message = first && isRecord(first.message) ? first.message : undefined;
+  const text = typeof message?.content === "string" ? message.content : "";
+  const toolCalls = extractToolCalls(message);
+  const finishReason = normalizeFinishReason(typeof first?.finish_reason === "string" ? first.finish_reason : undefined);
+  return {
+    provider,
+    text,
+    toolCalls,
+    finishReason,
+    responseId: typeof payload.id === "string" ? payload.id : undefined,
+    usage: isRecord(payload.usage) ? payload.usage : undefined,
+    cost: estimateCost(provider, isRecord(payload.usage) ? payload.usage : undefined)
+  };
+}
+
+function extractToolCalls(message: Record<string, unknown> | undefined): ToolCall[] {
+  if (!message) return [];
+  const raw = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const out: ToolCall[] = [];
+  for (const call of raw) {
+    if (!isRecord(call)) continue;
+    const id = typeof call.id === "string" ? call.id : "";
+    const fn = isRecord(call.function) ? call.function : undefined;
+    const name = fn && typeof fn.name === "string" ? fn.name : "";
+    const args = fn && typeof fn.arguments === "string" ? fn.arguments : "";
+    if (!id || !name) continue;
+    out.push({ id, type: "function", function: { name, arguments: args } });
+  }
+  return out;
+}
+
+function normalizeFinishReason(value: string | undefined): ToolCallingResult["finishReason"] {
+  if (value === "stop" || value === "tool_calls" || value === "length" || value === "content_filter") return value;
+  return "unknown";
+}
+
+// Streaming tool-calling: many compat providers send tool_call argument
+// chunks across multiple SSE events. We accumulate per-index buffers and
+// emit completed tool calls only when the stream finishes.
+async function readToolCallingStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Tool-calling stream failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const body = response.body;
+  if (!body) throw new Error("Tool-calling stream returned no response body.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const textParts: string[] = [];
+  // Index → in-progress tool call. The chat-completions stream sends
+  // tool_calls as deltas indexed by position. Final id/name arrive in the
+  // first delta for that index; arguments stream in subsequent deltas.
+  const callsByIndex = new Map<number, ToolCall>();
+  let finishReason: ToolCallingResult["finishReason"] = "unknown";
+  let responseId: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+
+  const handleEvent = (block: string): void => {
+    const lines = block.split(/\r?\n/);
+    const dataLines = lines.filter((line) => line.startsWith("data:"));
+    if (dataLines.length === 0) return;
+    const data = dataLines.map((line) => line.slice("data:".length).trim()).join("\n");
+    if (!data || data === "[DONE]") return;
+    const payload = parseJsonObject(data);
+    if (!responseId && typeof payload.id === "string") responseId = payload.id;
+    if (isRecord(payload.usage)) usage = payload.usage;
+    const choices = Array.isArray(payload.choices) ? payload.choices : [];
+    for (const choice of choices) {
+      if (!isRecord(choice)) continue;
+      if (typeof choice.finish_reason === "string") {
+        finishReason = normalizeFinishReason(choice.finish_reason);
+      }
+      const delta = isRecord(choice.delta) ? choice.delta : undefined;
+      if (!delta) continue;
+      if (typeof delta.content === "string" && delta.content.length > 0) {
+        textParts.push(delta.content);
+        if (onDelta) {
+          try {
+            onDelta(delta.content);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      }
+      const tcs = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+      for (const tc of tcs) {
+        if (!isRecord(tc)) continue;
+        const idx = typeof tc.index === "number" ? tc.index : 0;
+        const existing = callsByIndex.get(idx) ?? { id: "", type: "function" as const, function: { name: "", arguments: "" } };
+        if (typeof tc.id === "string" && tc.id.length > 0) existing.id = tc.id;
+        const fn = isRecord(tc.function) ? tc.function : undefined;
+        if (fn) {
+          if (typeof fn.name === "string" && fn.name.length > 0) existing.function.name = fn.name;
+          if (typeof fn.arguments === "string") existing.function.arguments += fn.arguments;
+        }
+        callsByIndex.set(idx, existing);
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block.trim().length > 0) handleEvent(block);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) handleEvent(buffer);
+
+  const toolCalls: ToolCall[] = [];
+  // Preserve original index ordering.
+  const sortedIndices = [...callsByIndex.keys()].sort((a, b) => a - b);
+  for (const idx of sortedIndices) {
+    const call = callsByIndex.get(idx)!;
+    if (call.id && call.function.name) toolCalls.push(call);
+  }
+
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason,
+    responseId,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+// Codex/Responses-API tool-calling. Translates the chat-completions message
+// shape used by the rest of the loop into the Responses API input shape:
+//   - All `system` messages → concatenated `instructions` field
+//   - `user` messages → { role: "user", content: [{ type: "input_text", text }] }
+//   - `assistant` text → { role: "assistant", content: [{ type: "output_text", text }] }
+//   - `assistant` tool_calls → { type: "function_call", call_id, name, arguments }
+//   - `tool` results → { type: "function_call_output", call_id, output }
+// Tools are flattened from the chat-completions `{ type, function: {...} }`
+// shape into the Responses API `{ type: "function", name, description,
+// parameters, strict: false }` shape.
+async function callToolCallingResponses(
+  provider: ProviderConfig,
+  messages: ToolCallingMessage[],
+  tools: ToolFunctionSpec[],
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  const bearer = readCodexBearer(provider);
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const { instructions, input } = translateMessagesToResponsesInput(messages);
+  const responsesTools = tools.map((tool) => ({
+    type: "function" as const,
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters,
+    strict: false
+  }));
+  const body: Record<string, unknown> = {
+    model: provider.model,
+    store: false,
+    stream: true,
+    instructions,
+    input
+  };
+  if (responsesTools.length > 0) body.tools = responsesTools;
+
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      accept: "text/event-stream",
+      ...codexHeaders(bearer)
+    },
+    body: JSON.stringify(body)
+  });
+
+  return readResponsesToolCallingStream(response, provider, onDelta);
+}
+
+interface ResponsesInputShape {
+  instructions: string;
+  input: Array<Record<string, unknown>>;
+}
+
+function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): ResponsesInputShape {
+  const systemParts: string[] = [];
+  const input: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    if (message.role === "system") {
+      if (typeof message.content === "string" && message.content.length > 0) {
+        systemParts.push(message.content);
+      }
+      continue;
+    }
+    if (message.role === "user") {
+      const text = typeof message.content === "string" ? message.content : "";
+      input.push({
+        role: "user",
+        content: [{ type: "input_text", text }]
+      });
+      continue;
+    }
+    if (message.role === "assistant") {
+      // Emit any tool calls first as discrete function_call items so the
+      // model sees the same item ordering it produced.
+      const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+      if (toolCalls.length === 0) {
+        const text = typeof message.content === "string" ? message.content : "";
+        if (text.length > 0) {
+          input.push({
+            role: "assistant",
+            content: [{ type: "output_text", text }]
+          });
+        }
+        continue;
+      }
+      // Some assistants emit text + tool_calls in the same message. Preserve
+      // the text first if present, then the function_call entries.
+      const text = typeof message.content === "string" ? message.content : "";
+      if (text.length > 0) {
+        input.push({
+          role: "assistant",
+          content: [{ type: "output_text", text }]
+        });
+      }
+      for (const call of toolCalls) {
+        input.push({
+          type: "function_call",
+          call_id: call.id,
+          name: call.function.name,
+          arguments: call.function.arguments ?? ""
+        });
+      }
+      continue;
+    }
+    if (message.role === "tool") {
+      const callId = message.tool_call_id ?? "";
+      const output = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+      input.push({
+        type: "function_call_output",
+        call_id: callId,
+        output
+      });
+      continue;
+    }
+  }
+  return { instructions: systemParts.join("\n\n"), input };
+}
+
+// Consume the Responses API SSE stream. Tracks both text deltas
+// (`response.output_text.delta`) and function-call lifecycle events
+// (`response.output_item.added` / `response.function_call_arguments.delta` /
+// `response.output_item.done`). Falls back to the final
+// `response.completed` event's `response.output` array if any tool calls
+// were missed during streaming.
+async function readResponsesToolCallingStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ToolCallingResult> {
+  if (!response.ok) {
+    const raw = await response.text();
+    const payload = parseJsonObject(raw);
+    const fallback = raw.slice(0, 500) || `Codex tool-calling stream failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const body = response.body;
+  if (!body) throw new Error("Codex tool-calling stream returned no response body.");
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
+  const textParts: string[] = [];
+  // item_id → in-progress function call. The Responses API streams
+  // function-call argument deltas keyed by item_id; we accumulate into
+  // these entries and surface the final list when the stream completes.
+  const callsById = new Map<string, { id: string; name: string; arguments: string; order: number }>();
+  let nextOrder = 0;
+  let responseId: string | undefined;
+  let usage: Record<string, unknown> | undefined;
+  let finalOutput: unknown[] | undefined;
+
+  const handleEvent = (block: string): void => {
+    const lines = block.split(/\r?\n/);
+    let eventType: string | undefined;
+    const dataLines: string[] = [];
+    for (const line of lines) {
+      if (line.startsWith("event:")) {
+        eventType = line.slice("event:".length).trim();
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trim());
+      }
+    }
+    if (dataLines.length === 0) return;
+    const data = dataLines.join("\n");
+    if (!data || data === "[DONE]") return;
+    const payload = parseJsonObject(data);
+    const type = typeof payload.type === "string" ? payload.type : eventType;
+    if (!type) return;
+
+    // Capture top-level metadata when present.
+    if (typeof payload.response_id === "string") responseId = payload.response_id;
+    if (isRecord(payload.response)) {
+      const resp = payload.response;
+      if (!responseId && typeof resp.id === "string") responseId = resp.id;
+      if (isRecord(resp.usage)) usage = resp.usage;
+      if (Array.isArray(resp.output)) finalOutput = resp.output;
+    }
+
+    if (type === "response.output_text.delta") {
+      const delta = typeof payload.delta === "string" ? payload.delta : "";
+      if (delta.length > 0) {
+        textParts.push(delta);
+        if (onDelta) {
+          try {
+            onDelta(delta);
+          } catch {
+            // never abort the stream consumer on a UI-side error
+          }
+        }
+      }
+      return;
+    }
+
+    if (type === "response.output_item.added") {
+      const item = isRecord(payload.item) ? payload.item : undefined;
+      if (item && item.type === "function_call") {
+        const itemId = typeof item.id === "string" ? item.id : (typeof payload.item_id === "string" ? payload.item_id : "");
+        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        const key = itemId || callId;
+        if (key && !callsById.has(key)) {
+          callsById.set(key, { id: callId, name, arguments: args, order: nextOrder++ });
+        }
+      }
+      return;
+    }
+
+    if (type === "response.function_call_arguments.delta") {
+      const delta = typeof payload.delta === "string" ? payload.delta : "";
+      const itemId = typeof payload.item_id === "string" ? payload.item_id : "";
+      if (itemId) {
+        const existing = callsById.get(itemId) ?? { id: itemId, name: "", arguments: "", order: nextOrder++ };
+        existing.arguments += delta;
+        callsById.set(itemId, existing);
+      }
+      return;
+    }
+
+    if (type === "response.function_call_arguments.done") {
+      const itemId = typeof payload.item_id === "string" ? payload.item_id : "";
+      const finalArgs = typeof payload.arguments === "string" ? payload.arguments : undefined;
+      if (itemId && finalArgs !== undefined) {
+        const existing = callsById.get(itemId);
+        if (existing) {
+          existing.arguments = finalArgs;
+          callsById.set(itemId, existing);
+        } else {
+          callsById.set(itemId, { id: itemId, name: "", arguments: finalArgs, order: nextOrder++ });
+        }
+      }
+      return;
+    }
+
+    if (type === "response.output_item.done") {
+      const item = isRecord(payload.item) ? payload.item : undefined;
+      if (item && item.type === "function_call") {
+        const itemId = typeof item.id === "string" ? item.id : (typeof payload.item_id === "string" ? payload.item_id : "");
+        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        const key = itemId || callId;
+        if (key) {
+          const existing = callsById.get(key) ?? { id: callId, name, arguments: args, order: nextOrder++ };
+          if (callId) existing.id = callId;
+          if (name) existing.name = name;
+          if (args.length > 0) existing.arguments = args;
+          callsById.set(key, existing);
+        }
+      }
+      return;
+    }
+
+    if (type === "response.completed") {
+      // Backstop: the final completed event carries the full `response.output`
+      // array. Capture it for fallback reconstruction below.
+      if (isRecord(payload.response) && Array.isArray(payload.response.output)) {
+        finalOutput = payload.response.output;
+      }
+      return;
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block.trim().length > 0) handleEvent(block);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) handleEvent(buffer);
+
+  // Backstop: if SSE delivery missed function_call items but the final
+  // `response.completed` event carries them, reconstruct from there.
+  if (finalOutput) {
+    let backstopText = "";
+    for (const item of finalOutput) {
+      if (!isRecord(item)) continue;
+      if (item.type === "function_call") {
+        const itemId = typeof item.id === "string" ? item.id : "";
+        const callId = typeof item.call_id === "string" ? item.call_id : itemId;
+        const name = typeof item.name === "string" ? item.name : "";
+        const args = typeof item.arguments === "string" ? item.arguments : "";
+        const key = itemId || callId;
+        if (!key) continue;
+        const existing = callsById.get(key);
+        if (!existing) {
+          callsById.set(key, { id: callId, name, arguments: args, order: nextOrder++ });
+        } else {
+          if (!existing.id && callId) existing.id = callId;
+          if (!existing.name && name) existing.name = name;
+          if (existing.arguments.length === 0 && args.length > 0) existing.arguments = args;
+        }
+      }
+      // Some responses also embed assistant text in output items as
+      // { type: "message", content: [{ type: "output_text", text }] }
+      if (item.type === "message" && Array.isArray(item.content)) {
+        for (const c of item.content) {
+          if (isRecord(c) && c.type === "output_text" && typeof c.text === "string") {
+            backstopText += c.text;
+          }
+        }
+      }
+    }
+    // Only use backstop text if streaming missed all of it.
+    if (textParts.length === 0 && backstopText.length > 0) {
+      textParts.push(backstopText);
+    }
+  }
+
+  const ordered = [...callsById.values()].sort((a, b) => a.order - b.order);
+  const toolCalls: ToolCall[] = [];
+  for (const call of ordered) {
+    if (!call.id || !call.name) continue;
+    toolCalls.push({
+      id: call.id,
+      type: "function",
+      function: { name: call.name, arguments: call.arguments }
+    });
+  }
+
+  const finishReason: ToolCallingResult["finishReason"] = toolCalls.length > 0 ? "tool_calls" : "stop";
+  return {
+    provider,
+    text: textParts.join("").trim(),
+    toolCalls,
+    finishReason,
+    responseId,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
 export async function generateTaskSummary(
   config: RuntimeConfig,
   input: string,
   memories: MemoryRecord[],
-  recalledContext?: string
+  recalledContext?: string,
+  onDelta?: (text: string) => void
 ): Promise<ProviderResult> {
   const provider = normalizeProvider(config.provider);
   if (provider.name === "echo") {
@@ -139,7 +825,7 @@ export async function generateTaskSummary(
   if (provider.name === "openrouter" || provider.name === "local") {
     return callChatCompletions(provider, input, systemContext);
   }
-  return callOpenAIResponses(provider, input, systemContext);
+  return callOpenAIResponses(provider, input, systemContext, onDelta);
 }
 
 // Hindsight phase 2 — structured-output helper.
@@ -377,7 +1063,12 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   };
 }
 
-async function callOpenAIResponses(provider: ProviderConfig, input: string, systemContext: string): Promise<ProviderResult> {
+async function callOpenAIResponses(
+  provider: ProviderConfig,
+  input: string,
+  systemContext: string,
+  onDelta?: (text: string) => void
+): Promise<ProviderResult> {
   const bearer = provider.name === "codex" ? readCodexBearer(provider) : readOpenAIBearer(provider);
   const headers = provider.name === "codex" ? codexHeaders(bearer) : {};
 
@@ -407,7 +1098,7 @@ async function callOpenAIResponses(provider: ProviderConfig, input: string, syst
   });
 
   if (isCodex) {
-    return readCodexStream(response, provider);
+    return readCodexStream(response, provider, onDelta);
   }
 
   const rawPayload = await response.text();
@@ -461,32 +1152,82 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
   };
 }
 
-async function readCodexStream(response: Response, provider: ProviderConfig): Promise<ProviderResult> {
-  const raw = await response.text();
+async function readCodexStream(
+  response: Response,
+  provider: ProviderConfig,
+  onDelta?: (text: string) => void
+): Promise<ProviderResult> {
   if (!response.ok) {
+    // Error path: drain the body fully so we can surface the API's error
+    // message. Streaming codex endpoints sometimes return JSON for errors.
+    const raw = await response.text();
     const payload = parseJsonObject(raw);
     const fallback = raw.slice(0, 500) || `Codex API request failed with HTTP ${response.status}`;
     const error = readOpenAIError(payload) ?? fallback;
     throw new Error(error);
   }
 
-  const events = parseSseEvents(raw);
+  const body = response.body;
+  if (!body) {
+    throw new Error("Codex stream returned no response body.");
+  }
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buffer = "";
   const deltaTextParts: string[] = [];
   const finalTextParts: string[] = [];
   let responseId: string | undefined;
   let usage: Record<string, unknown> | undefined;
-  for (const event of events) {
-    const payload = parseJsonObject(event.data);
+
+  // Consume the SSE stream incrementally. Each event is delimited by `\n\n`;
+  // we split off complete events from the rolling buffer and push the rest
+  // back. `delta` events fire `onDelta` so callers can surface partial text
+  // to UI. The full response text is still returned at the end so the
+  // existing ProviderResult contract holds.
+  const handleEvent = (block: string): void => {
+    const lines = block.split(/\r?\n/);
+    const dataLines = lines.filter((line) => line.startsWith("data:"));
+    if (dataLines.length === 0) return;
+    const data = dataLines.map((line) => line.slice("data:".length).trim()).join("\n");
+    if (!data || data === "[DONE]") return;
+    const payload = parseJsonObject(data);
     if (!responseId && typeof payload.response_id === "string") responseId = payload.response_id;
     if (!responseId && isRecord(payload.response) && typeof payload.response.id === "string") responseId = payload.response.id;
     if (isRecord(payload.response) && isRecord(payload.response.usage)) usage = payload.response.usage;
-    if (typeof payload.delta === "string") deltaTextParts.push(payload.delta);
+    if (typeof payload.delta === "string") {
+      deltaTextParts.push(payload.delta);
+      if (onDelta) {
+        try {
+          onDelta(payload.delta);
+        } catch {
+          // onDelta is fire-and-forget for UI updates; never let it abort
+          // the stream consumer.
+        }
+      }
+    }
     if (isRecord(payload.item) && Array.isArray(payload.item.content)) {
       for (const content of payload.item.content) {
         if (isRecord(content) && typeof content.text === "string") finalTextParts.push(content.text);
       }
     }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      if (block.trim().length > 0) handleEvent(block);
+      boundary = buffer.indexOf("\n\n");
+    }
+    if (done) break;
   }
+  // Flush any trailing event that wasn't followed by a blank-line terminator.
+  buffer += decoder.decode();
+  if (buffer.trim().length > 0) handleEvent(buffer);
 
   const text = (deltaTextParts.length > 0 ? deltaTextParts.join("") : finalTextParts.join("")).trim();
   if (!text) {
@@ -500,21 +1241,6 @@ async function readCodexStream(response: Response, provider: ProviderConfig): Pr
     usage,
     cost: estimateCost(provider, usage)
   };
-}
-
-function parseSseEvents(raw: string): Array<{ event?: string; data: string }> {
-  return raw
-    .split(/\n\n+/)
-    .map((block) => {
-      const lines = block.split(/\r?\n/);
-      const eventLine = lines.find((line) => line.startsWith("event:"));
-      const dataLines = lines.filter((line) => line.startsWith("data:"));
-      return {
-        event: eventLine?.slice("event:".length).trim(),
-        data: dataLines.map((line) => line.slice("data:".length).trim()).join("\n")
-      };
-    })
-    .filter((event) => event.data && event.data !== "[DONE]");
 }
 
 function codexHeaders(accessToken: string): Record<string, string> {

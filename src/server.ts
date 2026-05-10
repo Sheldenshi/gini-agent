@@ -1,9 +1,10 @@
 import { createHandler, writePid } from "./http";
-import { runDueJobs } from "./domain/jobs";
-import { install } from "./domain/runtime";
-import { migrateIfNeeded } from "./domain/memory";
+import { runDueJobs } from "./jobs";
+import { install } from "./runtime";
+import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance } from "./paths";
 import { appendLog } from "./state";
+import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 
 const instance = parseInstance();
 const config = loadConfig(instance);
@@ -26,6 +27,23 @@ migrateIfNeeded(config)
   })
   .catch((error) => {
     appendLog(config.instance, "memory.migrate.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+// Slice 2: load filesystem-backed skills (bundled + user) at boot. Errors
+// are absorbed into the audit/log so a malformed SKILL.md can never block
+// startup; doctor/reload surface follow-up diagnostics.
+loadSkillsFromDisk(config)
+  .then((report) => {
+    appendLog(config.instance, "skills.loaded", {
+      added: report.added.length,
+      updated: report.updated.length,
+      skipped: report.skipped.length
+    });
+  })
+  .catch((error) => {
+    appendLog(config.instance, "skills.load.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });

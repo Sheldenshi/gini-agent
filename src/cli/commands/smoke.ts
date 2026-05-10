@@ -4,7 +4,7 @@
 // contract. Output keys feed parity/readiness reports.
 import type { CliContext } from "../context";
 import type { RuntimeConfig } from "../../types";
-import { createEvidenceBundle, createSnapshot } from "../../domain/harness";
+import { createEvidenceBundle, createSnapshot } from "../../runtime/harness";
 import { api, apiWithToken, publicApi } from "../api";
 import { start as startLifecycle, stopRuntime, waitForTask } from "../process";
 import { print } from "../output";

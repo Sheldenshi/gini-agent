@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
   Approval,
@@ -11,6 +11,7 @@ import type {
   RuntimeEvent,
   RuntimeStatus,
   SkillRecord,
+  SubagentRecord,
   Task,
   TraceRecord,
   AuditEvent
@@ -96,6 +97,14 @@ export function useHindsightBanks() {
   });
 }
 
+export function useSubagents() {
+  return useQuery<SubagentRecord[]>({
+    queryKey: ["subagents"],
+    queryFn: () => api<SubagentRecord[]>("/subagents"),
+    refetchInterval: 3000
+  });
+}
+
 export function useSkills(query?: string) {
   const trimmed = query?.trim() ?? "";
   return useQuery<SkillRecord[]>({
@@ -163,12 +172,61 @@ export function useChatSessions() {
 
 export type ChatSessionDetail = ChatSession & { messages: ChatMessage[]; tasks: Task[] };
 
+// Statuses where a chat task is no longer producing partial text — used to
+// decide polling cadence below.
+const CHAT_TERMINAL_TASK_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "waiting_approval"
+]);
+
 export function useChatSession(id: string | null) {
   return useQuery<ChatSessionDetail>({
     queryKey: ["chat", id],
     queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
     enabled: Boolean(id),
-    refetchInterval: 3000
+    // While a task is in flight we want the streaming partialSummary to feel
+    // live, so we drop to ~800ms. Once everything is terminal we relax back
+    // to 3s to avoid unnecessary network chatter.
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      if (!data) return 3000;
+      const hasInflight = data.tasks?.some((t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status));
+      return hasInflight ? 800 : 3000;
+    }
+  });
+}
+
+export function useDeleteChatSession() {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true }, Error, string>({
+    mutationFn: (id: string) => api<{ ok: true }>(`/chat/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+    }
+  });
+}
+
+export function useCancelTask() {
+  const qc = useQueryClient();
+  return useMutation<Task, Error, string>({
+    mutationFn: (taskId: string) => api<Task>(`/tasks/${taskId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+      qc.invalidateQueries({ queryKey: ["tasks"] });
+    }
+  });
+}
+
+export function useRenameChatSession() {
+  const qc = useQueryClient();
+  return useMutation<ChatSession, Error, { id: string; title: string }>({
+    mutationFn: ({ id, title }) =>
+      api<ChatSession>(`/chat/${id}`, { method: "PATCH", body: JSON.stringify({ title }) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
+    }
   });
 }
 

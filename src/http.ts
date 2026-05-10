@@ -3,31 +3,31 @@ import type { RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
-import { mobileBootstrap, publicState } from "./domain/views";
-import { checkConnector } from "./domain/connectors";
-import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./domain/jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./domain/memory";
-import { embeddingStatus, reembedBank } from "./domain/embedding";
-import { rerankerStatus } from "./domain/reranker";
+import { mobileBootstrap, publicState } from "./runtime/views";
+import { checkConnector } from "./integrations/connectors";
+import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
+import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
+import { embeddingStatus, reembedBank } from "./memory/embedding";
+import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
-import { proposeImprovement, reviewImprovement } from "./domain/improvements";
-import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./domain/pairing";
-import { proposePromotion, reviewPromotion } from "./domain/promotions";
-import { status } from "./domain/runtime";
-import { searchSessions } from "./domain/search";
-import { listToolsets, setToolsetStatus } from "./domain/toolsets";
-import { listSubagents, spawnSubagent } from "./domain/subagents";
-import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./domain/mcp";
-import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./domain/messaging";
-import { inspectImportSource } from "./domain/importers";
+import { proposeImprovement, reviewImprovement } from "./governance/improvements";
+import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
+import { proposePromotion, reviewPromotion } from "./governance/promotions";
+import { status, updateAutoApproveCommands } from "./runtime";
+import { searchSessions } from "./execution/search";
+import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
+import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
+import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
+import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
+import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
-import { createProfile, listProfiles, useProfile } from "./domain/profiles";
-import { hermesParityChecks } from "./domain/parity";
-import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./domain/relay";
-import { createSkillFromInput, getSkill, listSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./domain/skills";
-import { createChat, getChatSession, listChatSessions, submitChatMessage, syncChatTaskResult } from "./domain/chat";
-import { v1Readiness } from "./domain/readiness";
-import { getRun, listRuns } from "./domain/runs";
+import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
+import { hermesParityChecks } from "./runtime/parity";
+import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
+import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { v1Readiness } from "./runtime/readiness";
+import { getRun, listRuns } from "./execution/runs";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
@@ -35,10 +35,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
+    // Settings: auto-approve allowlist for terminal_exec.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => json({ patterns: config.autoApproveCommands ?? [] })],
+    ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
+      const payload = await body(request);
+      const raw = Array.isArray(payload.patterns) ? payload.patterns : [];
+      const cleaned = updateAutoApproveCommands(config, raw.map(String));
+      return json({ patterns: cleaned });
+    }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
     ["POST", /^\/api\/chat$/, async (request) => json(await createChat(config, await body(request)), 201)],
     ["GET", /^\/api\/chat\/([^/]+)$/, (_request, params) => json(getChatSession(config, params[0]))],
+    ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
+    ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
@@ -177,6 +187,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["POST", /^\/api\/skills$/, async (request) => json(await createSkillFromInput(config, await body(request)), 201)],
     ["GET", /^\/api\/skills\/validate$/, () => json(validateSkills(config))],
+    // Manual filesystem skill reload — re-runs loadSkillsFromDisk so a user
+    // can drop a new SKILL.md under <instance>/skills/ without restarting.
+    ["POST", /^\/api\/skills\/reload$/, async () => json(await reloadSkills(config))],
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
@@ -213,6 +226,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
     ["GET", /^\/api\/subagents$/, async () => json(await listSubagents(config))],
     ["POST", /^\/api\/subagents$/, async (request) => json(await spawnSubagent(config, await body(request)), 201)],
+    ["POST", /^\/api\/subagents\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelSubagent(config, params[0]))],
     ["GET", /^\/api\/mcp$/, () => json(readState(config.instance).mcpServers)],
     ["POST", /^\/api\/mcp$/, async (request) => json(await addMcpServer(config, await body(request)), 201)],
     ["POST", /^\/api\/mcp\/([^/]+)\/health$/, async (_request, params) => json(await checkMcpServer(config, params[0]))],

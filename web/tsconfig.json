@@ -41,7 +41,11 @@
     ".next-dev/types/**/*.ts",
     ".next-dev/dev/types/**/*.ts",
     ".next-minsk/types/**/*.ts",
-    ".next-minsk/dev/types/**/*.ts"
+    ".next-minsk/dev/types/**/*.ts",
+    ".next-cebu/types/**/*.ts",
+    ".next-cebu/dev/types/**/*.ts",
+    ".next-tehran/types/**/*.ts",
+    ".next-tehran/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

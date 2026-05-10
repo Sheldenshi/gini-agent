@@ -17,6 +17,7 @@ import {
   Sparkles,
   Sun,
   Timer,
+  Users,
   Wrench
 } from "lucide-react";
 import { useTheme } from "next-themes";
@@ -30,6 +31,7 @@ const NAV = [
   { href: "/tasks", label: "Tasks", icon: ListTodo },
   { href: "/memory", label: "Memory", icon: Sparkles },
   { href: "/skills", label: "Skills", icon: Wrench },
+  { href: "/subagents", label: "Subagents", icon: Users },
   { href: "/jobs", label: "Jobs", icon: Timer },
   { href: "/connections", label: "Connections", icon: Cable },
   { href: "/permissions", label: "Permissions", icon: AlertTriangle },

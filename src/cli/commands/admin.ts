@@ -1,7 +1,7 @@
 // Lifecycle and instance-admin commands: install, start, stop, status, doctor, reset, run.
 import type { ChildProcess } from "node:child_process";
 import type { CliContext } from "../context";
-import { install, resetInstance, uninstallInstance } from "../../domain/runtime";
+import { install, resetInstance, uninstallInstance } from "../../runtime";
 import {
   awaitForegroundLogFlush,
   doctor,

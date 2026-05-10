@@ -213,6 +213,23 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     skill.successCount ??= 0;
     skill.failureCount ??= 0;
     skill.previousVersions ??= [];
+    // Filesystem skill loader (Slice 2) introduced these fields. Records
+    // persisted before the loader landed don't carry them — backfill with
+    // safe defaults so consumers can rely on `body` being a string.
+    skill.body ??= "";
+    // Trust-hijack fix: skill records now carry an explicit `source` so
+    // bundled and user-instance skills with the same name coexist as
+    // separate rows. Legacy records (pre-fix) default to "user" — bundled
+    // records get re-tagged on the next loadSkillsFromDisk pass.
+    skill.source ??= "user";
+  }
+  for (const subagent of state.subagents) {
+    // Slice 4 introduced `systemPrompt` (always present) and optional
+    // toolsetIds/skillNames/resultSummary/resultError. Records persisted
+    // before Slice 4 landed don't carry these — backfill `systemPrompt`
+    // with an empty string so callers can rely on the field being a
+    // string. The optional fields stay undefined for legacy rows.
+    subagent.systemPrompt ??= "";
   }
   for (const job of state.jobs) {
     job.deliveryTargets ??= [];

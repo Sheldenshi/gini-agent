@@ -1,7 +1,7 @@
 import type { CliContext } from "../context";
 import { restAfter } from "../args";
 import { readState } from "../../state";
-import { createSnapshot, restoreSnapshot } from "../../domain/harness";
+import { createSnapshot, restoreSnapshot } from "../../runtime/harness";
 import { print } from "../output";
 
 export async function snapshot(ctx: CliContext): Promise<void> {

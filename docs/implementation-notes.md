@@ -1,36 +1,44 @@
 # Gini Runtime Implementation Notes
 
-**Status:** Implementation notes. The canonical product spec is [master-plan.md](./master-plan.md).
-
-This repo is organized around runtime boundaries rather than feature chronology.
+These notes describe the current source layout and boundaries. Product direction lives in [Master Plan](./master-plan.md). Runtime behavior is documented in [Gateway And Control Plane](./gateway.md), [Conversation And Runs](./conversation-runs.md), and [Memory](./memory.md).
 
 ## Source Layout
 
-- `src/types.ts` defines stable domain contracts and serialized state shapes.
-- `src/paths.ts` owns macOS/user-level path selection and instance directory layout.
-- `src/state.ts` is the file-backed repository layer for state, trace, audit, and record constructors.
-- `src/domain/` contains behavior that mutates or evaluates runtime state.
-- `src/api/` contains API-facing view models and redaction rules.
-- `src/http.ts` is the authenticated local API router and web app adapter.
+- `src/types.ts` defines serialized domain contracts and runtime record shapes.
+- `src/paths.ts` owns path selection, instance directory layout, ports, and local filesystem conventions.
+- `src/server.ts` is the Bun process entrypoint and scheduler loop.
+- `src/http.ts` is the authenticated local API router.
 - `src/agent.ts` owns task execution and approval-gated tool actions.
-- `src/provider.ts` owns model provider normalization, health, and calls.
-- `src/cli.ts` is the command-line adapter over runtime APIs and domain utilities.
-- `src/server.ts` is the process entrypoint and scheduler loop.
+- `src/provider.ts` owns provider normalization, health checks, and model calls.
+- `src/state/` contains persistence, JSON state store helpers, audit/trace records, IDs, security helpers, and SQLite memory storage.
+- `src/runtime/` contains install/status, public runtime views, parity/readiness checks, and local harness helpers.
+- `src/execution/` contains chat, runs, and search behavior.
+- `src/memory/` contains retain, recall, reflect, reinforce, embeddings/reranker status, entity, temporal, migration, and schema logic.
+- `src/jobs/` contains scheduler job creation, execution, replay, and run history behavior.
+- `src/governance/` contains approvals-adjacent runtime workflows such as pairing, improvements, and promotions.
+- `src/capabilities/` contains skills, toolsets, profiles, and subagent records.
+- `src/integrations/` contains connectors, MCP, messaging, import inspection, relay, and notification behavior.
+- `src/tools/` contains file, terminal, code, and web tool implementations.
+- `src/cli.ts` is the CLI shim.
+- `src/cli/` contains CLI routing, API helpers, process management, output helpers, and command modules.
+- `web/` is the Next.js control plane and BFF proxy.
 
 ## Boundary Rules
 
-- API handlers should delegate behavior to `src/domain/*` instead of embedding state mutation logic.
-- Domain services may use `state.ts`, `types.ts`, `paths.ts`, and other domain services when needed.
-- `state.ts` should remain storage-oriented: constructors, persistence, trace/log writes, and low-level state helpers.
-- `api/` modules must not expose secret hashes or bearer tokens.
-- CLI commands should prefer public runtime APIs when exercising product behavior; direct domain calls are reserved for local harness operations such as snapshots and evidence bundles.
-- New connectors, tools, providers, and mobile surfaces should land in their own modules before adding router or CLI commands.
+- API handlers should delegate behavior to bounded runtime modules instead of embedding state mutation logic.
+- Runtime behavior modules may use `src/state/*`, `src/types.ts`, `src/paths.ts`, and neighboring behavior modules when needed.
+- Storage modules should remain persistence-oriented: load/save, record constructors, migrations, traces, logs, security helpers, and low-level state utilities.
+- API responses must not expose bearer tokens, secret hashes, or credential material.
+- CLI commands should prefer public runtime APIs when exercising product behavior.
+- Direct module calls from CLI are reserved for local harness/process operations such as install, smoke setup, snapshots, and evidence bundles.
+- New connectors, tools, providers, and client surfaces should land in focused modules before adding router or CLI commands.
 - Hermes-parity features should first add durable runtime records and safe inspection flows before adding live external transports.
 - MCP, messaging, and import integrations must fail visibly and must not mutate external installs or credentials by default.
 
 ## Current Intentional Compromises
 
-- The state store is still a JSON file to keep v0 install/debug simple.
-- The web control plane is a single HTML file served by the runtime until a real Next.js/Expo shell is added.
-- Provider clients still share one module; split them when provider routing/fallback grows beyond the current Codex/OpenAI/echo set.
-- `cli.ts` remains a larger adapter because it mirrors the full command map, but durable business logic has been moved out of it.
+- Most non-memory runtime records still live in a JSON state file for easy local debugging.
+- Memory uses SQLite because recall needs structured indexes and durable local query behavior.
+- Provider clients still share `src/provider.ts`; split them when provider routing/fallback becomes more complex.
+- Some integration surfaces are durable records and health flows before they are full live transports.
+- The CLI command set is broad, but command modules now keep behavior out of the top-level shim.

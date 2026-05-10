@@ -1,18 +1,20 @@
 # Gini Architecture Overview
 
-A short visual + plain-language map of how Gini's runtime, control plane, and clients fit together. For the full product spec see [`master-plan.md`](./master-plan.md). For implementation-level notes see [`implementation-notes.md`](./implementation-notes.md).
+Gini is organized around one stateful runtime gateway and many replaceable clients.
 
-## One sentence
+For deeper topic docs, see [Gateway And Control Plane](./gateway.md), [Conversation And Runs](./conversation-runs.md), [Memory](./memory.md), and [Runtime Capabilities](./runtime-capabilities.md).
 
-Gini's **runtime is the gateway** — a single Bun process per instance that owns all state and does all real work. Every other surface (web app, mobile app, CLI, MCP integrations) is a client that consumes the same `/api/*` contract.
+## One Sentence
+
+Gini's **runtime is the gateway**: a single Bun process per instance owns all durable state and performs all real work. Every other surface consumes the same authenticated `/api/*` contract.
 
 ## Picture
 
-```
+```text
                            ┌─────────────────────────────────┐
                            │         GATEWAY (server)        │
                            │                                 │
-                           │  Bun runtime — one per instance     │
+                           │  Bun runtime, one per instance  │
                            │                                 │
                            │  • agent loop                   │
                            │  • tool execution               │
@@ -26,138 +28,102 @@ Gini's **runtime is the gateway** — a single Bun process per instance that own
                                             │
         ┌───────────────────────────────────┼───────────────────────────────────┐
         │                                   │                                   │
-        │ token (server-side only)          │ paired-device token               │ bearer token
+        │ token server-side only            │ paired-device token               │ bearer token
         │                                   │                                   │
 ┌───────┴───────┐                  ┌────────┴────────┐                  ┌───────┴────────┐
-│   Next.js     │                  │  Phone app      │                  │   CLI          │
-│   (BFF + UI)  │                  │  (Expo, v2)     │                  │   gini task /  │
-│               │                  │                 │                  │   memory / etc │
+│   Next.js     │                  │  Future mobile  │                  │   CLI          │
+│   BFF + UI    │                  │  app            │                  │   scripts      │
+│               │                  │                 │                  │   MCP clients  │
 │   one per     │                  │  pairs once,    │                  │                │
-│   instance        │                  │  holds own      │                  │  spawns from   │
-│   localhost   │                  │  token in       │                  │  any shell     │
-│   port        │                  │  Keychain       │                  │                │
+│   instance    │                  │  stores token   │                  │  direct API    │
+│   localhost   │                  │  securely       │                  │  client        │
 └───────┬───────┘                  └─────────────────┘                  └────────────────┘
         │
-        │ HTML / JS / SSE (no token)
+        │ HTML / JS / SSE
         │
    ┌────┴────┐
    │ browser │
-   │         │
    │ never   │
    │ sees    │
    │ token   │
    └─────────┘
-
-                          Other clients (post-v1):
-                          MCP integrations, scheduled jobs that call out,
-                          your own scripts — all use bearer tokens
-                          and talk directly to the gateway.
 ```
 
-## What each piece does
+## Components
 
-### Gateway (the runtime)
+### Gateway
 
-- **Single source of truth.** Every byte of agent state lives here: tasks, jobs, memory units, skills, audit events, traces.
-- **One process per instance.** `--instance dev`, `--instance feature-x`, `--instance vienna` are independent gateways with isolated state, ports, and lifecycles. Each writes to `~/.gini/instances/<instance>/`.
-- **Token-authenticated.** Bearer tokens (per-instance and per-paired-device) gate every request. Tokens are minted at install time and stored in the instance's `config.json`.
-- **HTTP + SSE.** Standard REST surface plus an event stream (`/api/events/stream`) for real-time updates.
-- **Self-contained.** No Postgres, no Docker, no Python service. SQLite via `bun:sqlite` for the four-network memory, JSON for everything else.
+- Single source of truth for tasks, conversations, runs, jobs, memory, skills, approvals, audit, traces, and events.
+- One process per instance.
+- Authenticated HTTP API plus SSE event stream.
+- JSON state for broad runtime records and SQLite for memory.
+- Starts from `src/server.ts`.
 
-Process: `src/server.ts`. Started by `gini start` (daemon) or `gini run` (foreground).
+### Next.js Control Plane
 
-### Next.js (Backend-for-Frontend + browser UI)
-
-- **A client of the gateway, plus a server for the browser.** Two-faced.
-- **Holds the bearer token server-side.** Browser HTTP requests come into Next.js as `/api/runtime/*`, Next.js attaches `Authorization: Bearer <token>` and forwards to the gateway. The browser never sees the token — that's the entire reason Next.js exists in the picture.
-- **One per instance.** Spawned by the same `gini start` / `gini run` that spawned the gateway. Picks its own deterministic port (3000 for `dev`, hash-derived for everything else).
-- **Stateless.** Restarting Next.js doesn't lose anything; all state lives on the gateway.
-
-Process: `web/`. Spawned by `src/cli/process.ts:startWeb`.
-
-### Phone app (Expo, post-v1)
-
-- **Direct client of the gateway.** No proxy in between. Talks the same `/api/*` the CLI talks.
-- **Pairs once.** `POST /api/pairing` (already exists) issues a paired-device token. The phone stores it in iOS Keychain.
-- **On LAN:** direct HTTP to the gateway (Bonjour discovery or manual code).
-- **Off LAN (post-v1):** through a relay that routes encrypted traffic but cannot decrypt it.
-
-Doesn't exist yet. The endpoints it would consume already do (`/api/mobile/bootstrap`, pairing/devices APIs, the rest of the runtime contract).
+- Lives in `web/`.
+- Browser talks to `/api/runtime/*`.
+- Server-side BFF attaches the gateway bearer token.
+- Uses the same API that CLI and future clients use.
+- Can be disabled with `--no-web` for smoke and runtime-only testing.
 
 ### CLI
 
-- **Direct client of the gateway.** `gini task submit ...`, `gini memory list`, etc. Reads the instance's `config.json` to find the runtime URL and bearer token.
-- **Subset of the same `/api/*` contract.** Anything the CLI does, a future client could do via HTTP.
+- Entry shim: `src/cli.ts`.
+- Command implementation: `src/cli/`.
+- Reads instance config and calls the gateway API.
+- Also owns local process management for install/start/run/stop/smoke workflows.
 
-## Why this shape
+### Future Clients
 
-1. **Single source of truth.** Reload the web, open the phone, run a CLI command — they all see the same state because there's only one place state actually lives. No sync, no eventual consistency, no client-side caching that drifts.
-2. **New clients = no gateway changes.** A future Slack bot, MCP integration, or whatever — they speak the existing API. Master plan §0.1 calls this out as the v1→v2 enabler.
-3. **Trust boundary is clear.** Anything that can hold a token safely (CLI, mobile, MCP) talks direct. Anything that can't (browser) goes through Next.js. That's the only reason the BFF exists.
-4. **Per-instance isolation.** Instances are independent gateways. Run `--instance feature-x` and `--instance feature-y` side-by-side; they share nothing. Coding agents working on different worktrees can't step on each other.
+Mobile, MCP, messaging bridges, and scripts should connect through the gateway contract. Clients that can safely hold a token may call the gateway directly. Browser clients should go through a BFF.
 
-## Lifecycle
+## Why This Shape
 
-| Command | Instance fate |
-|---|---|
-| `gini start --instance X` | Daemon. Instance survives terminal close, machine sleep, etc. Stops only on `gini stop --instance X` or reboot. |
-| `gini run --instance X` | Foreground. Instance lives as long as this terminal. Ctrl-C, `kill`, or terminal close kills the gateway + Next.js + cleans pid/port files. |
-| `gini stop --instance X` | Stops both gateway + Next.js, removes pid/port files. Works on instances started either way. |
+1. **Single source of truth.** Reloading the web app, running a CLI command, and opening a future mobile app all observe the same runtime state.
+2. **Clear trust boundary.** The browser never receives a bearer token. Trusted clients can hold their own tokens.
+3. **Replaceable clients.** New surfaces do not require a second backend or a duplicated state model.
+4. **Parallel agent support.** Instances isolate ports, state, logs, workspaces, and runtime processes.
 
-For coding agents in worktrees: use `gini run`. For the personal-agent-on-your-Mac case: use `gini start`.
+## Storage
 
-## Where things live on disk
-
-```
+```text
 ~/.gini/
 ├── instances/
 │   └── <instance>/
-│       ├── config.json         # instance config (port, token, provider, paths)
-│       ├── state.json          # tasks, jobs, skills, approvals, audit, events, ...
-│       ├── memory.db           # SQLite — four-network memory units, entities, links
-│       ├── runtime.pid         # gateway PID (recorded on start)
-│       ├── runtime.port        # gateway port (recorded after walk)
-│       ├── web.pid             # Next.js PID
-│       ├── web.port            # Next.js port
-│       ├── traces/             # per-task trace files (one dir per task)
-│       ├── snapshots/          # instance snapshots for promotion/rollback
-│       ├── skills/             # skill definitions
-│       ├── workspace/          # default workspace for file/terminal tools
-│       └── logs/               # rotated runtime logs
-└── models/                     # Transformers.js model cache (shared across instances)
+│       ├── config.json
+│       ├── state.json
+│       ├── memory.db
+│       ├── runtime.pid
+│       ├── runtime.port
+│       ├── web.pid
+│       ├── web.port
+│       ├── traces/
+│       ├── snapshots/
+│       ├── skills/
+│       ├── workspace/
+│       └── logs/
+└── models/
 ```
 
-Cleanup is simple: `gini uninstall --instance <instance>` (or `rm -rf ~/.gini/instances/<instance>`) removes one instance; `rm -rf ~/.gini/instances` removes every instance while keeping the (potentially large) shared model cache.
+## API Surface
 
-## Ports
-
-| Instance | Default runtime port | Default web port |
-|---|---|---|
-| `dev` (special-cased) | 7337 | 3000 |
-| any other | `7337 + (FNV1a("runtime:<instance>") % 100)` | `3000 + (FNV1a("web:<instance>") % 100)` |
-
-Both walk forward on collision (without rolling silently if the user pinned a specific port via `--port` / `--web-port`). The actual claimed port gets persisted in `runtime.port` / `web.port`.
-
-## API surface (high-level)
-
-The full list lives in [`v1-readiness.md`](./v1-readiness.md). At a glance:
+The current capability map is in [Runtime Capabilities](./runtime-capabilities.md). Common surfaces include:
 
 - `/api/status`, `/api/healthz`, `/api/state`
-- `/api/tasks`, `/api/chat/*`, `/api/approvals/*`
-- `/api/memory/*`, `/api/banks/*`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/migrate`
-- `/api/skills/*`, `/api/jobs/*`, `/api/connectors/*`
-- `/api/embedding/*`, `/api/reranker/status`
-- `/api/pairing/*`, `/api/devices/*`, `/api/mobile/bootstrap`
-- `/api/audit`, `/api/events`, `/api/events/stream` (SSE)
+- `/api/tasks`, `/api/chat`, `/api/runs`, `/api/approvals`
+- `/api/memory`, `/api/banks`, `/api/embedding/*`, `/api/reranker/status`
+- `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
+- `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
+- `/api/messaging`, `/api/mcp`, `/api/subagents`
+- `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
-All routes accept `Authorization: Bearer <token>` (or `?token=` for SSE compatibility). Tokens are issued per instance and per paired device.
+## Not Yet Built
 
-## What's not here yet
+- Native/mobile app UI.
+- Production relay for off-LAN access.
+- Push notification delivery.
+- LaunchAgent-style auto-start.
 
-- iOS/Expo mobile app (post-v1).
-- Remote relay for off-LAN access (post-v1).
-- Push notifications (post-v1).
-- LaunchAgent / system-service auto-start (master plan §0.1 envisions this; not wired).
-
-The runtime contracts are stable enough that adding any of these is client-side work, not gateway work.
+Those should build on the existing gateway contract rather than changing the runtime/source-of-truth model.

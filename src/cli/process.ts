@@ -12,13 +12,13 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
-import { install, status } from "../domain/runtime";
+import { install, status } from "../runtime";
 import { providerHealth } from "../provider";
 import { readState } from "../state";
 import { probeMemoryDb } from "../state/memory-db";
-import { legacyMigrationStatus } from "../domain/memory";
-import { embeddingStatus, listBanksWithModelMismatch } from "../domain/embedding";
-import { rerankerStatus } from "../domain/reranker";
+import { legacyMigrationStatus } from "../memory";
+import { embeddingStatus, listBanksWithModelMismatch } from "../memory/embedding";
+import { rerankerStatus } from "../memory/reranker";
 import { defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
 import { api, auth, url } from "./api";
 

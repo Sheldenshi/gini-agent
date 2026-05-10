@@ -51,6 +51,18 @@ export function upsertTask(state: RuntimeState, task: Task): Task {
   return task;
 }
 
+// Appends streamed delta text to a task's `partialSummary`, bumping
+// updatedAt. Used by runTask to expose mid-flight provider output to the
+// chat UI without waiting for the buffered final response. Silently no-ops
+// if the task no longer exists (cancellation race).
+export function appendTaskPartial(state: RuntimeState, taskId: string, delta: string): void {
+  if (!delta) return;
+  const task = state.tasks.find((existing) => existing.id === taskId);
+  if (!task) return;
+  task.partialSummary = (task.partialSummary ?? "") + delta;
+  task.updatedAt = now();
+}
+
 export function createTask(
   instance: Instance,
   input: string,
@@ -172,6 +184,38 @@ export function createChatSession(state: RuntimeState, title: string): ChatSessi
   return session;
 }
 
+export function deleteChatSession(state: RuntimeState, id: string): ChatSessionRecord {
+  const index = state.chatSessions.findIndex((item) => item.id === id);
+  if (index < 0) throw new Error(`Chat session not found: ${id}`);
+  const session = state.chatSessions[index]!;
+  state.chatSessions.splice(index, 1);
+  state.chatMessages = state.chatMessages.filter((message) => message.sessionId !== id);
+  appendEvent(state, {
+    kind: "task",
+    action: "chat.session.deleted",
+    target: id,
+    risk: "low",
+    summary: `Chat session deleted: ${session.title}`
+  });
+  return session;
+}
+
+export function renameChatSession(state: RuntimeState, id: string, title: string): ChatSessionRecord {
+  const session = state.chatSessions.find((item) => item.id === id);
+  if (!session) throw new Error(`Chat session not found: ${id}`);
+  const trimmed = title.trim();
+  session.title = (trimmed ? trimmed.slice(0, 80) : "") || "Untitled chat";
+  session.updatedAt = now();
+  appendEvent(state, {
+    kind: "task",
+    action: "chat.session.renamed",
+    target: session.id,
+    risk: "low",
+    summary: `Chat session renamed: ${session.title}`
+  });
+  return session;
+}
+
 export function createChatMessage(
   state: RuntimeState,
   message: Omit<ChatMessageRecord, "id" | "instance" | "createdAt">
@@ -238,7 +282,7 @@ export function createMemory(
 
 export function createSkill(
   state: RuntimeState,
-  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions">>
+  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions" | "body"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions" | "body" | "manifestPath" | "category" | "platforms" | "prerequisites" | "source">>
 ): SkillRecord {
   const at = now();
   const item: SkillRecord = {
@@ -251,6 +295,7 @@ export function createSkill(
     successCount: 0,
     failureCount: 0,
     previousVersions: [],
+    body: "",
     ...skill
   };
   state.skills.unshift(item);

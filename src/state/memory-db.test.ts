@@ -21,7 +21,7 @@ import {
   DEFAULT_BANK_ID,
   MEMORY_SCHEMA_VERSION
 } from "./memory-db";
-import { resetInstance } from "../domain/runtime";
+import { resetInstance } from "../runtime";
 import { defaultConfig, instanceRoot } from "../paths";
 
 // All tests share an isolated state root so they don't touch ~/.gini.
