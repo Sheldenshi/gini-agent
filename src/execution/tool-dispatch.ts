@@ -477,6 +477,7 @@ async function requestTerminalExec(
 ): Promise<string> {
   const command = requireString(args, "command");
   const timeoutMs = optionalNumber(args, "timeoutMs", 60_000);
+  const pty = args.pty === true;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     const approval = createApproval(state, {
@@ -485,14 +486,14 @@ async function requestTerminalExec(
       target: command,
       risk: "high",
       reason: "Terminal execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs, toolCallId }
+      payload: { command, timeoutMs, pty, toolCallId }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for terminal command (chat-task)",
-      data: { approvalId: approval.id, command, toolCallId }
+      data: { approvalId: approval.id, command, pty, toolCallId }
     });
     return approval.id;
   });

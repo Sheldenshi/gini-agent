@@ -591,7 +591,20 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
 
   if (approval.action === "terminal.exec") {
     const command = String(approval.payload.command);
-    const proc = spawn(["zsh", "-lc", command], {
+    const usePty = approval.payload.pty === true;
+    // PTY-capable spawn: when the model asks for a TTY (interactive CLIs
+    // like vim, memo, claude-code), we wrap with `script` so the child sees
+    // stdin as a real terminal. macOS and Linux disagree on the script
+    // invocation: macOS expects `script -q <typescript> <cmd...>`, Linux
+    // expects `script -q -c '<cmd>' <typescript>`. We discard the
+    // typescript file by pointing it at /dev/null on either platform.
+    // Without the wrapper, vim immediately exits with
+    // "Vim: Error reading input, exiting..." and any caller (memo notes -a,
+    // git rebase -i, etc.) sees a cancelled session.
+    const spawnArgs = usePty
+      ? buildPtySpawnArgs(command)
+      : ["zsh", "-lc", command];
+    const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
       stderr: "pipe"
@@ -626,7 +639,8 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
           stdoutTruncated: stdout.length > 4000,
           stderrTruncated: stderr.length > 4000,
           artifactPath: artifact?.path,
-          artifactRelPath: artifact?.relPath
+          artifactRelPath: artifact?.relPath,
+          pty: usePty
         }
       });
       if (approval.taskId && !chatToolCallId) completeApprovedTask(state, approval.taskId, exitCode === 0 ? "Command completed." : "Command failed.", exitCode === 0 ? undefined : stderr);
@@ -660,6 +674,34 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       await resumeChatTask(config, approval.taskId, chatToolCallId, summary || `Command finished with exit ${exitCode}.`);
     }
   }
+}
+
+// Picks the right `script` invocation to wrap a shell command in a pseudo-
+// terminal. macOS BSD `script` puts the typescript file first then the
+// command; util-linux `script` requires `-c '<cmd>'` plus the typescript
+// file. Both support `-q` to suppress the "Script started/done" banner.
+// Output stays plain because we point the typescript file at /dev/null
+// (we capture stdout/stderr off the spawned proc directly).
+//
+// The wrapped command itself is re-routed through `zsh -lc` so the model's
+// command line is parsed by the same shell as a non-PTY invocation. Without
+// this, the model would have to know it's running in a different shell when
+// pty=true.
+function buildPtySpawnArgs(command: string): string[] {
+  if (process.platform === "linux") {
+    return ["script", "-q", "-c", `zsh -lc ${shellQuote(command)}`, "/dev/null"];
+  }
+  // macOS / BSD layout (also the default for Bun's dev env). `script -q
+  // /dev/null <cmd...>` runs <cmd...> under a PTY and discards the
+  // typescript file; the remaining args are the command + its argv.
+  return ["script", "-q", "/dev/null", "zsh", "-lc", command];
+}
+
+// POSIX-safe single-quoting for embedding a command as one shell-word
+// argument (Linux script -c expects a single string). Wraps in '...' and
+// escapes embedded single quotes the standard way.
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 // Writes the full stdout/stderr for an approved terminal/code execution to a

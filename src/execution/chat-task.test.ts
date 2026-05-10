@@ -363,6 +363,105 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // PTY support: terminal_exec accepts an opt-in `pty: true` arg that wraps
+  // the command under a pseudo-terminal so interactive CLIs (vim, memo,
+  // claude-code) don't see "stdin is not a tty" and exit immediately. We
+  // verify the round-trip end-to-end:
+  //   - the model emits terminal_exec with pty=true
+  //   - the approval payload captures pty=true
+  //   - executeApprovedAction spawns under a TTY (verified by `tty -s`)
+  //   - the audit evidence carries pty=true so the user can see it
+  test("terminal_exec with pty=true runs the command under a real TTY", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-pty");
+    const provider = normalizeProvider(config.provider);
+
+    // `tty -s` exits 0 when stdin is a terminal, 1 otherwise. Print the
+    // result so we can verify both the exit code and the side channel.
+    const command = "tty -s && echo PTY-OK || echo NO-PTY";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_pty", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command, pty: true }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Ran the command under a TTY.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "run with pty", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+    expect(paused.approvalIds.length).toBe(1);
+
+    // Approval payload should carry pty=true so the executor knows to wrap.
+    const stateBefore = readState(config.instance);
+    const approval = stateBefore.approvals.find((a) => a.id === paused.approvalIds[0]!)!;
+    expect(approval.payload.pty).toBe(true);
+
+    await decideApproval(config, approval.id, "approve");
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const stateAfter = readState(config.instance);
+    const auditEntry = stateAfter.audit.find((a) => a.action === "terminal.exec" && a.taskId === task.id)!;
+    expect(auditEntry).toBeDefined();
+    const evidence = auditEntry.evidence as Record<string, unknown>;
+    expect(evidence.pty).toBe(true);
+    expect(evidence.exitCode).toBe(0);
+    // The wrapped command saw a TTY, so the `tty -s` branch ran.
+    expect(String(evidence.stdout)).toContain("PTY-OK");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("terminal_exec without pty sees no TTY and stays on the legacy spawn path", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-pty");
+    const provider = normalizeProvider(config.provider);
+
+    const command = "tty -s && echo PTY-OK || echo NO-PTY";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_nopty", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Ran without TTY.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "run without pty", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+
+    const stateBefore = readState(config.instance);
+    const approval = stateBefore.approvals.find((a) => a.id === paused.approvalIds[0]!)!;
+    expect(approval.payload.pty).toBe(false);
+
+    await decideApproval(config, approval.id, "approve");
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const stateAfter = readState(config.instance);
+    const auditEntry = stateAfter.audit.find((a) => a.action === "terminal.exec" && a.taskId === task.id)!;
+    const evidence = auditEntry.evidence as Record<string, unknown>;
+    expect(evidence.pty).toBe(false);
+    expect(String(evidence.stdout)).toContain("NO-PTY");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("invalid tool args are reported back as tool errors so the model can recover", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-baddargs");
