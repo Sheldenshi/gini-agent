@@ -45,8 +45,15 @@ memo notes -s "query"             # Search notes (fuzzy)
 ### Create Notes
 
 ```bash
-memo notes -a                     # Interactive editor
-memo notes -a "Note Title"        # Quick add with title
+memo notes -a                     # Interactive editor (optionally with -f "Folder Name")
+```
+
+`memo notes -a "Note Title"` is not supported by current memo versions. For a non-interactive quick note, use AppleScript instead:
+
+```bash
+osascript -e 'tell application "Notes"' \
+  -e 'make new note with properties {name:"Test note", body:"Test note<br><br>Created by Gini as a test."}' \
+  -e 'end tell'
 ```
 
 ### Edit Notes
