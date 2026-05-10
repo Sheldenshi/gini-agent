@@ -6,6 +6,7 @@ import { useMutation } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { ApprovalActions } from "@/components/chat/ApprovalActions";
 import { Avatar } from "@/components/chat/Avatar";
 import { Composer } from "@/components/chat/Composer";
 import { MessageBubble } from "@/components/chat/MessageBubble";
@@ -280,14 +281,31 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {messages.map((message) => (
-                      <li key={message.id}>
-                        <MessageBubble
-                          message={message}
-                          isStreaming={message.id === streamingAssistantMessageId}
-                        />
-                      </li>
-                    ))}
+                    {messages.map((message) => {
+                      // Render inline Approve / Deny on the synthetic
+                      // "Waiting for approval..." placeholder — when the
+                      // message's task is in waiting_approval state, the user
+                      // can resolve the approval without leaving the chat.
+                      const messageTask = message.taskId
+                        ? tasksById.get(message.taskId)
+                        : undefined;
+                      const showApprovalActions =
+                        message.role === "assistant" &&
+                        messageTask?.status === "waiting_approval";
+                      return (
+                        <li key={message.id}>
+                          <MessageBubble
+                            message={message}
+                            isStreaming={message.id === streamingAssistantMessageId}
+                          />
+                          {showApprovalActions && message.taskId ? (
+                            <div className="ml-[46px] mt-1 max-w-[90%]">
+                              <ApprovalActions taskId={message.taskId} />
+                            </div>
+                          ) : null}
+                        </li>
+                      );
+                    })}
                     {pendingPhase && !streamingAssistantMessageId ? (
                       <li>
                         <div className="flex items-start gap-2.5">
