@@ -186,6 +186,31 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["name", "prompt"]
       }
     }
+  },
+  {
+    // Schedule a real cron/job. The job's output is delivered as an
+    // assistant message back into the originating chat session when it
+    // fires. Low-risk: no approval gate — the user can pause/delete the
+    // job at any time, and gating reminders behind an approval dialog
+    // would defeat the UX (`remind me in 2 minutes` should not pop a
+    // modal). Always exposed (like read_skill / spawn_subagent) so a
+    // fresh instance can schedule reminders without toolset toggling.
+    toolset: "jobs",
+    type: "function",
+    function: {
+      name: "create_job",
+      description: "Schedule a recurring or one-shot job that runs a prompt on a fixed interval. The job's response is delivered as an assistant message back to this chat session when it fires. Use for reminders ('in 2 minutes', 'every hour'), periodic checks, or any user request mentioning 'remind me', 'every N minutes/hours', or 'cron job'. Set oneShot=true for single-fire reminders.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Short human-readable label (e.g. 'cake-reminder')." },
+          intervalSeconds: { type: "number", description: "Seconds between runs. For a one-shot reminder, this is the delay until the single fire (e.g. 120 for 'in 2 minutes')." },
+          prompt: { type: "string", description: "The instruction the agent will receive when the job fires. Phrase it from the user's perspective (e.g. 'Remind me to take the cake out of the oven.')." },
+          oneShot: { type: "boolean", description: "If true, the job is paused after its first successful run. Defaults to false (recurring)." }
+        },
+        required: ["name", "intervalSeconds", "prompt"]
+      }
+    }
   }
 ];
 
@@ -216,6 +241,11 @@ export function buildToolCatalog(state: RuntimeState): ToolCatalogTool[] {
     // on enable would silently disable delegation on freshly cloned
     // instances. Subagent path itself is depth-capped and audited.
     if (tool.function.name === "spawn_subagent") return true;
+    // Always expose create_job. The "jobs" toolset isn't part of the
+    // legacy defaults; gating on enable would silently hide scheduling
+    // (and chat-reminder delivery) on fresh instances. Low-risk by
+    // design — the user can pause/delete any job from /jobs.
+    if (tool.function.name === "create_job") return true;
     return enabled.has(tool.toolset);
   });
 }

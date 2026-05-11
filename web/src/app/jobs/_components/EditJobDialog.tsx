@@ -55,7 +55,11 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
     const timeout = Number(timeoutSeconds);
     if (Number.isFinite(timeout) && timeout > 0) patch.timeoutSeconds = timeout;
     if (costBudget.trim() === "") {
-      // empty string means "leave unset"; runtime updateJob ignores undefined
+      // Empty input means "clear the budget". The runtime's updateJob
+      // explicitly handles `costBudget: null` as the clearing path; sending
+      // `undefined` (or omitting the field) would leave the prior value
+      // in place.
+      patch.costBudget = null;
     } else {
       const budget = Number(costBudget);
       if (Number.isFinite(budget) && budget >= 0) patch.costBudget = budget;

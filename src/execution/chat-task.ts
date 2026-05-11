@@ -40,6 +40,7 @@ import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
+import { finalizeJobRunFromTask } from "../jobs/finalize";
 
 const MAX_LOOP_ITERATIONS = 8;
 
@@ -313,6 +314,11 @@ async function runLoop(
       });
       await updateRunFromTask(config, finished);
       await syncSubagentFromTask(config, finished);
+      // Chat-mode tasks spawned by a scheduled job (create_job tool path)
+      // need the same finalize hook the imperative path uses, otherwise
+      // the JobRunRecord stays stuck in `running` and the chat-session
+      // delivery never fires. Idempotent — no-op for tasks without jobId.
+      if (finished.jobId) await finalizeJobRunFromTask(config, finished);
       return finished;
     }
 
@@ -421,6 +427,7 @@ async function runLoop(
   });
   await updateRunFromTask(config, exhausted);
   await syncSubagentFromTask(config, exhausted);
+  if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
   return exhausted;
 }
 

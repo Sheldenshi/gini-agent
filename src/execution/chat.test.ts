@@ -196,7 +196,8 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     expect(failed.status).toBe("failed");
 
     const message = await syncChatTaskResult(config, session.id, submission.taskId);
-    expect(message.role).toBe("assistant");
-    expect(message.content).toContain("Approval denied");
+    expect(message).not.toBeNull();
+    expect(message?.role).toBe("assistant");
+    expect(message?.content).toContain("Approval denied");
   });
 });

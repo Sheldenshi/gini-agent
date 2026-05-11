@@ -281,7 +281,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           try {
             return await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value])));
           } catch (error) {
-            return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+            const message = error instanceof Error ? error.message : String(error);
+            return json({ error: message }, statusFromErrorMessage(message));
           }
         }
       }
@@ -314,6 +315,16 @@ async function authorized(request: Request, config: RuntimeConfig): Promise<bool
 
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
+}
+
+// Maps a thrown Error.message to an HTTP status code. Job-layer code throws
+// typed errors with stable prefixes ("Job not found:", "Job run not found:",
+// "Invalid input: ...") so the gateway can return 404/400 instead of the
+// previous catch-all 500. Anything else stays 500.
+function statusFromErrorMessage(message: string): number {
+  if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
+  if (message.startsWith("Invalid input")) return 400;
+  return 500;
 }
 
 function eventStream(config: RuntimeConfig, request: Request): Response {

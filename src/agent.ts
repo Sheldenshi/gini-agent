@@ -35,6 +35,12 @@ import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
 import { approvalToolCallId } from "./execution/tool-dispatch";
 import { syncSubagentFromTask } from "./capabilities/subagents";
+// Imported from a leaf module (not src/jobs/index.ts) so we don't close
+// the cycle that runs through submitTask. The finalizer flips the linked
+// JobRunRecord from "running" to a terminal status when a Task with a
+// jobId settles. Idempotent — safe to call from runTask, failTask, and
+// cancelTask without de-duping.
+import { finalizeJobRunFromTask } from "./jobs/finalize";
 
 export interface SubmitTaskOptions {
   jobId?: string;
@@ -125,6 +131,7 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
     return task;
   });
   await updateRunFromTask(config, task);
+  if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
   // Cascade cancellation to descendant subagent tasks. If the cancelled
   // task spawned subagents (whose taskIds are children), cancel each one
@@ -324,6 +331,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 
   appendTrace(config.instance, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
   await updateRunFromTask(config, task);
+  if (task.jobId) await finalizeJobRunFromTask(config, task);
 
   // Hindsight phase 5: auto-retain. Run async and don't block task completion.
   // The extractor decides whether anything factual is in the input — we only
@@ -336,6 +344,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 
 async function finishTaskTransition(config: RuntimeConfig, task: Task): Promise<Task> {
   await updateRunFromTask(config, task);
+  if (task.jobId) await finalizeJobRunFromTask(config, task);
   return task;
 }
 
@@ -406,6 +415,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   });
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
   await updateRunFromTask(config, task);
+  if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
 }
 
@@ -440,6 +450,7 @@ export async function completeLowRiskToolTask(
   // Hindsight phase 5: auto-retain. Skip read/list/find — they're noise.
   void scheduleAutoRetain(config, completed);
   await updateRunFromTask(config, completed);
+  if (completed.jobId) await finalizeJobRunFromTask(config, completed);
   return completed;
 }
 

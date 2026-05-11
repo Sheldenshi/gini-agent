@@ -45,7 +45,9 @@
     ".next-cebu/types/**/*.ts",
     ".next-cebu/dev/types/**/*.ts",
     ".next-tehran/types/**/*.ts",
-    ".next-tehran/dev/types/**/*.ts"
+    ".next-tehran/dev/types/**/*.ts",
+    ".next-lima/types/**/*.ts",
+    ".next-lima/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

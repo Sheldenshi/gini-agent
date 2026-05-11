@@ -591,6 +591,16 @@ export interface JobRecord {
   retryLimit: number;
   timeoutSeconds: number;
   costBudget?: number;
+  // Optional originating chat session for jobs scheduled by the agent via
+  // the `create_job` tool. When set, each scheduled task is linked back to
+  // this session (session.taskIds/runIds) and its final summary is synced
+  // as an assistant chat message. Backwards-compatible: legacy jobs without
+  // this field keep their existing imperative delivery semantics.
+  chatSessionId?: string;
+  // One-shot reminder semantics: when true the job is auto-paused after its
+  // first terminal run (success or fail). The user can resume manually
+  // through /jobs. Defaults to undefined/false (recurring behavior).
+  oneShot?: boolean;
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;

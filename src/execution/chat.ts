@@ -1,5 +1,6 @@
 import { submitTask } from "../agent";
 import {
+  addAudit,
   createChatMessage,
   createChatSession,
   deleteChatSession,
@@ -146,6 +147,28 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     // approval grants and the task finishes.
     if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
       throw new Error(`Task is not ready for chat sync: ${task.status}`);
+    }
+    // [SILENT] sentinel — emitted by scheduled jobs that have nothing
+    // new to report (e.g. a watcher run that found no change). The
+    // cron-execution hint instructs the LLM to respond with exactly
+    // "[SILENT]" to suppress delivery. We only honor the literal token
+    // (trim trailing whitespace tolerantly but reject any other content,
+    // including lowercase variants), and only for successfully completed
+    // tasks — a failure should still surface in chat.
+    if (
+      task.status === "completed" &&
+      typeof task.summary === "string" &&
+      task.summary.trim() === "[SILENT]"
+    ) {
+      addAudit(state, {
+        actor: "runtime",
+        action: "chat.message.suppressed_silent",
+        target: sessionId,
+        taskId,
+        risk: "low",
+        evidence: { runId: task.runId }
+      });
+      return null;
     }
     const content = task.status === "completed"
       ? task.summary ?? "Task completed."

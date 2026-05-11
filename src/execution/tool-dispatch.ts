@@ -26,6 +26,7 @@ import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
+import { createScheduledJob } from "../jobs";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -61,6 +62,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await readSkillTool(config, taskId, args) };
     case "spawn_subagent":
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
+    case "create_job":
+      return { kind: "sync", result: await createJobTool(config, taskId, args) };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -318,6 +321,75 @@ async function spawnSubagentTool(
     error: final.error ?? null
   };
   return JSON.stringify(payload);
+}
+
+// Schedule a real job (cron-style) and link it to the originating chat
+// session so the job's output is delivered back as an assistant message
+// when it fires. Low-risk: no approval gate, since reminders should not
+// pop a modal — the user can pause/delete the job at any time via /jobs.
+// We discover the originating session by walking task → run → conversation.
+async function createJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = requireString(args, "name");
+  const prompt = requireString(args, "prompt");
+  if (typeof args.intervalSeconds !== "number" || !Number.isFinite(args.intervalSeconds) || args.intervalSeconds <= 0 || !Number.isInteger(args.intervalSeconds)) {
+    throw new Error("Invalid input: intervalSeconds must be a positive integer.");
+  }
+  const intervalSeconds = args.intervalSeconds;
+  // Coerce oneShot to a strict boolean. Treat `undefined`/`null` as false
+  // (recurring), and anything else (string "true", number 1) is rejected
+  // so the agent has a clean contract.
+  let oneShot = false;
+  if (args.oneShot !== undefined && args.oneShot !== null) {
+    if (typeof args.oneShot !== "boolean") {
+      throw new Error("Invalid input: oneShot must be a boolean.");
+    }
+    oneShot = args.oneShot;
+  }
+
+  // Walk task -> run -> conversation to find the originating chat session.
+  // If the caller is imperative (CLI, no run, or run without conversation),
+  // we leave chatSessionId undefined and the job runs without delivery
+  // back into a session.
+  const state = readState(config.instance);
+  const task = state.tasks.find((item) => item.id === taskId);
+  let chatSessionId: string | undefined;
+  if (task?.runId) {
+    const run = state.runs.find((item) => item.id === task.runId);
+    if (run?.conversationId) {
+      // Confirm the session still exists; otherwise leave undefined so the
+      // dispatcher doesn't try to push the new task onto a missing record.
+      const session = state.chatSessions.find((item) => item.id === run.conversationId);
+      if (session) chatSessionId = session.id;
+    }
+  }
+
+  const job = await createScheduledJob(config, { name, intervalSeconds, prompt, chatSessionId, oneShot });
+
+  await mutateState(config.instance, (current) => {
+    const item = findTask(current, taskId);
+    addAudit(current, {
+      actor: "agent",
+      action: "job.created",
+      target: job.id,
+      risk: "low",
+      taskId: item.id,
+      runId: item.runId,
+      evidence: { name, intervalSeconds, oneShot, chatSessionId, jobId: job.id }
+    });
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: "Created scheduled job",
+    data: { jobId: job.id, name, intervalSeconds, oneShot, chatSessionId }
+  });
+
+  const cadence = oneShot ? "one-shot" : `every ${intervalSeconds}s`;
+  return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}.`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,

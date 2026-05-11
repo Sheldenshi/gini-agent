@@ -57,15 +57,51 @@ const server = Bun.serve({
 appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
 
-setInterval(() => {
-  runDueJobs(config).catch((error) => {
-    appendLog(config.instance, "scheduler.error", { error: error instanceof Error ? error.message : String(error) });
-  });
-}, 1000);
+// Self-rescheduling scheduler loop. We await runDueJobs(config) before
+// scheduling the next tick so a slow tick (e.g. spawning N script jobs
+// inline) can never overlap with itself. Cadence is the 1000ms gap
+// *between completions*, which means a fast tick still polls roughly
+// once a second; a slow tick just slides the next tick later. Bun.sleep
+// is used in lieu of setTimeout to keep the loop awaitable and to match
+// the project's preference (CLAUDE.md).
+//
+// We retain the loop's promise (`schedulerDone`) so SIGTERM can await
+// the in-flight tick before exiting — without that, a SIGTERM landing
+// mid-tick would kill an in-progress dispatch and leave its
+// JobRunRecord stuck "running" forever.
+let schedulerStopped = false;
+const schedulerDone: Promise<void> = (async function schedulerLoop(): Promise<void> {
+  while (!schedulerStopped) {
+    try {
+      await runDueJobs(config);
+    } catch (error) {
+      appendLog(config.instance, "scheduler.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (schedulerStopped) break;
+    await Bun.sleep(1000);
+  }
+})();
 
 process.on("SIGTERM", () => {
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
+  schedulerStopped = true;
   server.stop(true);
+  // Wait for the in-flight tick before exiting so we don't kill a job
+  // mid-execution and leave its JobRunRecord stuck "running". The tick
+  // catches its own errors, so schedulerDone shouldn't reject — but we
+  // attach a no-op .catch() defensively (any error already landed in
+  // appendLog from the loop itself).
+  //
+  // Bound the wait at 5 seconds: a hung tick (e.g. a script job that
+  // spawned a child blocking on stdio) shouldn't block shutdown
+  // forever. After 5s we proceed even if the tick hasn't unwound — the
+  // OS will reap the child process tree on exit.
+  const drained = Promise.race([
+    schedulerDone.catch(() => {}),
+    Bun.sleep(5000)
+  ]);
   // Print a stable shutdown marker so the foreground log capture (and any
   // human tailing the file) can see that the runtime is going down. Without
   // this, the SIGTERM path emits no stdio at all and observability of clean
@@ -78,7 +114,9 @@ process.on("SIGTERM", () => {
   // tee-ing), the write completes before we exit. console.log is async on
   // pipes and process.exit doesn't wait for pending writes — that race would
   // drop the shutdown marker.
-  process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
-    process.exit(0);
+  drained.finally(() => {
+    process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
+      process.exit(0);
+    });
   });
 });
