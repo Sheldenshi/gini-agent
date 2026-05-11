@@ -34,6 +34,23 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
   const retryLimit = input.retryLimit === undefined
     ? 0
     : assertNonNegativeInt("retryLimit", input.retryLimit);
+  // Optional session linkage + one-shot semantics. We validate types
+  // up-front so a bogus payload returns a typed `Invalid input: …` (which
+  // the HTTP layer turns into 400) instead of silently coercing.
+  let chatSessionId: string | undefined;
+  if (input.chatSessionId !== undefined && input.chatSessionId !== null) {
+    if (typeof input.chatSessionId !== "string" || input.chatSessionId.length === 0) {
+      throw new Error(`Invalid input: chatSessionId must be a non-empty string (got ${String(input.chatSessionId)})`);
+    }
+    chatSessionId = input.chatSessionId;
+  }
+  let oneShot: boolean | undefined;
+  if (input.oneShot !== undefined && input.oneShot !== null) {
+    if (typeof input.oneShot !== "boolean") {
+      throw new Error(`Invalid input: oneShot must be a boolean (got ${String(input.oneShot)})`);
+    }
+    oneShot = input.oneShot;
+  }
   return mutateState(config.instance, (state) => createJob(state, {
     name: String(input.name ?? "Untitled job"),
     prompt: String(input.prompt ?? ""),
@@ -44,7 +61,9 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     context: Array.isArray(input.context) ? input.context.map(String) : [],
     retryLimit,
     timeoutSeconds,
-    costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined
+    costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
+    chatSessionId,
+    oneShot
   }));
 }
 
