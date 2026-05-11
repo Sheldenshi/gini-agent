@@ -12,11 +12,15 @@
 // Idempotent: if the run is already terminal, this is a no-op.
 
 import type { RuntimeConfig, Task } from "../types";
-import { appendEvent, mutateState, now } from "../state";
+import { addAudit, appendEvent, appendLog, mutateState, now } from "../state";
+import { syncChatTaskResult } from "../execution/chat";
 
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
   if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") return;
+  // Capture session/oneShot context inside the mutateState write so the
+  // post-write chat sync uses the same view we used to flip the run.
+  let chatSessionIdToSync: string | undefined;
   await mutateState(config.instance, (state) => {
     // Match the run by taskId first (most reliable), fall back to the
     // most recent running run for the job (covers older runs whose
@@ -52,6 +56,27 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
         job.lastFailureAt = completedAt;
         job.lastError = run.error;
       }
+      // One-shot reminders auto-pause after the FIRST terminal run (success
+      // or failure). The user can resume manually through /jobs. Audit the
+      // transition so the deactivation is traceable.
+      if (job.oneShot === true && job.status === "active") {
+        job.status = "paused";
+        job.updatedAt = completedAt;
+        addAudit(state, {
+          actor: "runtime",
+          action: "job.oneshot.completed",
+          target: job.id,
+          risk: "low",
+          taskId: task.id,
+          evidence: { runId: run.id, runStatus: run.status }
+        });
+      }
+      // Stage the chat sync for after the write closes — calling another
+      // mutateState (which syncChatTaskResult does) inside this one would
+      // deadlock the state queue.
+      if (job.chatSessionId) {
+        chatSessionIdToSync = job.chatSessionId;
+      }
     }
     appendEvent(state, {
       kind: "job",
@@ -64,4 +89,22 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
       data: { runId: run.id, taskStatus: task.status }
     });
   });
+
+  // Materialize the assistant chat message for jobs created via the agent
+  // tool with a chat session. syncChatTaskResult is idempotent (no-ops if
+  // the message already exists) and only writes for terminal task states,
+  // both of which match our gating. Wrap in try/catch so a vanished
+  // session can't break the finalize hook for everyone else.
+  if (chatSessionIdToSync) {
+    try {
+      await syncChatTaskResult(config, chatSessionIdToSync, task.id);
+    } catch (error) {
+      appendLog(config.instance, "job.chat.sync.error", {
+        jobId: task.jobId,
+        taskId: task.id,
+        sessionId: chatSessionIdToSync,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 }
