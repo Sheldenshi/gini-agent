@@ -5,6 +5,27 @@ import { spawn } from "bun";
 
 export { finalizeJobRunFromTask } from "./finalize";
 
+// Prepended to every scheduled-job prompt so the LLM produces output the
+// runtime can deliver. Without this, a scheduled task run inside a chat
+// session inherits the prior conversation context and the LLM tends to
+// respond conversationally ("Scheduled: feed-cat will fire in 45 seconds.")
+// instead of actually delivering the reminder ("Feed the cat now.").
+//
+// The hint also defines a `[SILENT]` sentinel the LLM can emit when there
+// is genuinely nothing to report — see syncChatTaskResult for the
+// suppression path.
+const CRON_EXECUTION_HINT = [
+  "[IMPORTANT: You are running as a scheduled job, not as part of a live conversation.",
+  "DELIVERY: Your final response IS the deliverable. The runtime ships it back to the originating chat (or other configured target) automatically — do NOT try to schedule another job, do NOT acknowledge the schedule, do NOT say 'I will remind you'. Just produce the reminder/report/output the user wanted.",
+  "SILENT: If there is genuinely nothing new to report (e.g. a watcher job with no change), respond with exactly \"[SILENT]\" and nothing else to suppress delivery. Never combine [SILENT] with content.]",
+  ""
+].join("\n");
+
+function withCronHint(jobPrompt: string, context: string[]): string {
+  const contextBlock = context.length > 0 ? `Context:\n${context.join("\n")}\n\n` : "";
+  return `${CRON_EXECUTION_HINT}\n${contextBlock}${jobPrompt}`;
+}
+
 function assertPositiveInt(label: string, value: unknown): number {
   const num = Number(value);
   if (!Number.isFinite(num) || num <= 0 || !Number.isInteger(num)) {
@@ -167,7 +188,7 @@ async function dispatchPromptRun(
   run: JobRunRecord,
   trigger: "schedule" | "manual" | "replay"
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
-  const prompt = [job.context.length > 0 ? `Context:\n${job.context.join("\n")}` : "", job.prompt].filter(Boolean).join("\n\n");
+  const prompt = withCronHint(job.prompt, job.context);
 
   // Resolve session linkage up-front. If the job points at a session that
   // no longer exists (deleted by the user), audit the gap and fall through
