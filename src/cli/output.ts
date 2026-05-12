@@ -43,9 +43,11 @@ export function printStartBanner(value: unknown): void {
   lines.push(`${dot} ${paint("bold", "Gini")} ${verb}${mode}`);
   if (banner.instance) lines.push(`  ${paint("dim", "Instance")}  ${banner.instance}`);
   if (banner.webUrl) lines.push(`  ${paint("dim", "Web     ")}  ${banner.webUrl}`);
-  if (banner.url) lines.push(`  ${paint("dim", "Runtime ")}  ${banner.url}`);
   if (banner.webError) {
+    // The runtime is still up if only the web failed — surface it here so the
+    // user can recover (e.g. retry, look at logs) without re-running status.
     lines.push(`  ${paint("yellow", "⚠ Web failed:")} ${banner.webError}`);
+    if (banner.url) lines.push(`  ${paint("dim", "Runtime ")}  ${banner.url}`);
   }
   console.log(lines.join("\n"));
 }
