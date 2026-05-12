@@ -180,15 +180,22 @@ function isYes(input: string, defaultYes: boolean): boolean {
 }
 
 const RC_MARKER = "# Added by gini-agent installer";
+const EXPECTED_PATH_LINES = new Set([
+  'export PATH="$HOME/.local/bin:$PATH"',
+  'fish_add_path "$HOME/.local/bin"'
+]);
 
 function removePathBlockFromRc(): string[] {
   const home = homedir();
-  const candidates = [
+  const candidates: string[] = [];
+  const zdotdir = process.env.ZDOTDIR;
+  if (zdotdir) candidates.push(join(zdotdir, ".zshrc"));
+  candidates.push(
     join(home, ".zshrc"),
     join(home, ".bashrc"),
     join(home, ".bash_profile"),
     join(home, ".config", "fish", "config.fish")
-  ];
+  );
   const edited: string[] = [];
   for (const file of candidates) {
     if (!existsSync(file)) continue;
@@ -197,14 +204,21 @@ function removePathBlockFromRc(): string[] {
     const lines = contents.split("\n");
     const next: string[] = [];
     let removed = false;
+    let skippedMismatched = false;
     for (let i = 0; i < lines.length; i += 1) {
       if (lines[i]?.trim() === RC_MARKER) {
-        // Skip the marker AND the following PATH line that the installer wrote.
-        i += 1;
-        removed = true;
-        continue;
+        const followup = lines[i + 1]?.trim() ?? "";
+        if (EXPECTED_PATH_LINES.has(followup)) {
+          i += 1;
+          removed = true;
+          continue;
+        }
+        skippedMismatched = true;
       }
       next.push(lines[i] ?? "");
+    }
+    if (skippedMismatched) {
+      console.error(`Warning: found installer marker in ${file} but the following line didn't match the expected PATH update. Skipping rc cleanup for ${file}.`);
     }
     if (!removed) continue;
     try {
@@ -226,7 +240,9 @@ function describeWrapper(path: string): WrapperOutcome {
   if (!existsSync(path)) return { message: "absent", shouldRemove: false };
   let contents = "";
   try { contents = readFileSync(path, "utf8"); } catch { return { message: `unreadable at ${path}`, shouldRemove: false }; }
-  if (!contents.includes("gini-agent-installer-managed")) {
+  const lines = contents.split("\n");
+  const hasMarker = lines.some((line) => line.trim() === "# gini-agent-installer-managed");
+  if (!hasMarker) {
     return { message: `kept (not installer-managed at ${path})`, shouldRemove: false };
   }
   return { message: `will remove ${path}`, shouldRemove: true };
