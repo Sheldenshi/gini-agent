@@ -265,15 +265,15 @@ print_done() {
 
   if [ "$PATH_MANUAL" = "1" ]; then
     info "Add \$HOME/.local/bin to your PATH (see the message above), then run:"
-    printf '    gini\n\n'
+    printf '    gini start\n\n'
   elif [ "$path_ready" = "0" ]; then
     info "Open a new terminal, then run:"
-    printf '    gini\n\n'
+    printf '    gini start\n\n'
   else
     if [ "$LOCAL_MODE" = "1" ]; then
-      printf 'Run %sgini%s to start. After committing changes in %s, run %sgini update%s to re-sync.\n\n' "$C_BOLD" "$C_RESET" "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+      printf 'Run %sgini start%s to start. After committing changes in %s, run %sgini update%s to re-sync.\n\n' "$C_BOLD" "$C_RESET" "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
     else
-      printf 'Run %sgini%s to start.\n\n' "$C_BOLD" "$C_RESET"
+      printf 'Run %sgini start%s to start.\n\n' "$C_BOLD" "$C_RESET"
     fi
   fi
 }
