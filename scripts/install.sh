@@ -6,6 +6,7 @@ RUNTIME_DIR="$HOME/.gini/runtime"
 BIN_DIR="$HOME/.local/bin"
 WRAPPER_PATH="$BIN_DIR/gini"
 DEFAULT_INSTANCE="home"
+PATH_MANUAL=0
 
 log() {
   printf '[gini-install] %s\n' "$*"
@@ -16,6 +17,11 @@ err() {
 }
 
 detect_os() {
+  if [ "$(uname -o 2>/dev/null || true)" = "Android" ]; then
+    err "Android / Termux is not supported by gini-agent"
+    err "Bun has limited support on Termux and the runtime is not tested there"
+    exit 1
+  fi
   local uname_s
   uname_s="$(uname -s)"
   case "$uname_s" in
@@ -49,7 +55,13 @@ detect_shell_rc() {
     shell_name="$(basename "$SHELL")"
   fi
   case "$shell_name" in
-    zsh) printf '%s/.zshrc' "$HOME" ;;
+    zsh)
+      if [ -n "${ZDOTDIR:-}" ] && [ -d "$ZDOTDIR" ] && [ -w "$ZDOTDIR" ]; then
+        printf '%s/.zshrc' "$ZDOTDIR"
+      else
+        printf '%s/.zshrc' "$HOME"
+      fi
+      ;;
     bash)
       if [ "$OS" = "darwin" ]; then
         printf '%s/.bash_profile' "$HOME"
@@ -57,6 +69,7 @@ detect_shell_rc() {
         printf '%s/.bashrc' "$HOME"
       fi
       ;;
+    fish) printf '%s/.config/fish/config.fish' "$HOME" ;;
     *)
       if [ "$OS" = "darwin" ]; then
         printf '%s/.zshrc' "$HOME"
@@ -67,6 +80,14 @@ detect_shell_rc() {
   esac
 }
 
+detect_shell_name() {
+  local shell_name=""
+  if [ -n "${SHELL:-}" ]; then
+    shell_name="$(basename "$SHELL")"
+  fi
+  printf '%s' "$shell_name"
+}
+
 ensure_bun() {
   if command -v bun >/dev/null 2>&1; then
     log "bun already installed: $(bun --version)"
@@ -75,19 +96,12 @@ ensure_bun() {
 
   log "bun not found; installing via https://bun.sh/install"
   curl -fsSL https://bun.sh/install | bash
-
-  if [ -s "$HOME/.bun/_bun" ]; then
-    # shellcheck disable=SC1091
-    . "$HOME/.bun/_bun"
-  fi
-  if [ -s "$HOME/.bun/env" ]; then
-    # shellcheck disable=SC1091
-    . "$HOME/.bun/env"
-  fi
+  export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
 
   if ! command -v bun >/dev/null 2>&1; then
-    if [ -x "$HOME/.bun/bin/bun" ]; then
-      export PATH="$HOME/.bun/bin:$PATH"
+    local bun_install_dir="${BUN_INSTALL:-$HOME/.bun}"
+    if [ -x "$bun_install_dir/bin/bun" ]; then
+      export PATH="$bun_install_dir/bin:$PATH"
     fi
   fi
 
@@ -103,9 +117,22 @@ ensure_bun() {
 fetch_runtime() {
   mkdir -p "$HOME/.gini"
   if [ -d "$RUNTIME_DIR/.git" ]; then
+    local existing_origin existing_normalized expected_normalized
+    existing_origin="$(git -C "$RUNTIME_DIR" remote get-url origin 2>/dev/null || true)"
+    existing_normalized="${existing_origin%.git}"
+    expected_normalized="${REPO_URL%.git}"
+    if [ -z "$existing_origin" ] || [ "$existing_normalized" != "$expected_normalized" ]; then
+      err "directory $RUNTIME_DIR has a different origin ($existing_origin); refusing to overwrite."
+      err "Move or remove it and re-run the installer."
+      exit 1
+    fi
     log "updating existing runtime at $RUNTIME_DIR"
     git -C "$RUNTIME_DIR" fetch origin
     git -C "$RUNTIME_DIR" reset --hard origin/main
+  elif [ -d "$RUNTIME_DIR" ] && [ -n "$(ls -A "$RUNTIME_DIR" 2>/dev/null || true)" ]; then
+    err "$RUNTIME_DIR exists but is not a git checkout."
+    err "Remove it (or move it aside) and re-run the installer."
+    exit 1
   else
     log "cloning $REPO_URL into $RUNTIME_DIR"
     git clone "$REPO_URL" "$RUNTIME_DIR"
@@ -119,9 +146,15 @@ install_deps() {
 
 write_wrapper() {
   mkdir -p "$BIN_DIR"
+  if [ -e "$WRAPPER_PATH" ] && ! grep -Fq 'gini-agent-installer-managed' "$WRAPPER_PATH" 2>/dev/null; then
+    err "$WRAPPER_PATH already exists and is not managed by this installer."
+    err "Remove or move it (e.g. mv \"$WRAPPER_PATH\" \"$WRAPPER_PATH.bak\") and re-run the installer."
+    exit 1
+  fi
   log "writing wrapper $WRAPPER_PATH"
   cat >"$WRAPPER_PATH" <<'WRAPPER'
 #!/usr/bin/env bash
+# gini-agent-installer-managed
 set -euo pipefail
 export GINI_INSTANCE="${GINI_INSTANCE:-home}"
 cd "$HOME/.gini/runtime"
@@ -131,20 +164,49 @@ WRAPPER
 }
 
 update_path() {
-  local rc_file
+  local rc_file shell_name path_line
   rc_file="$(detect_shell_rc)"
-  local path_line='export PATH="$HOME/.local/bin:$PATH"'
+  shell_name="$(detect_shell_name)"
 
-  if [ -f "$rc_file" ] && grep -Fq "$path_line" "$rc_file"; then
+  if [ "$shell_name" = "fish" ]; then
+    path_line='fish_add_path "$HOME/.local/bin"'
+    mkdir -p "$(dirname "$rc_file")" 2>/dev/null || true
+  else
+    path_line='export PATH="$HOME/.local/bin:$PATH"'
+  fi
+
+  if [ -f "$rc_file" ] && grep -Eq '^[[:space:]]*[^#].*\.local/bin' "$rc_file"; then
     log "PATH entry already present in $rc_file"
-    return
+    return 0
+  fi
+
+  if [ -e "$rc_file" ] && [ ! -w "$rc_file" ]; then
+    err "$rc_file is not writable; add this line manually to enable the gini command:"
+    err "  $path_line"
+    PATH_MANUAL=1
+    return 0
+  fi
+  if [ ! -e "$rc_file" ]; then
+    local rc_dir
+    rc_dir="$(dirname "$rc_file")"
+    if [ ! -w "$rc_dir" ] && [ ! -d "$rc_dir" ]; then
+      err "$rc_dir does not exist and cannot be created; add this line manually:"
+      err "  $path_line"
+      PATH_MANUAL=1
+      return 0
+    fi
   fi
 
   log "appending PATH update to $rc_file"
   {
     printf '\n# Added by gini-agent installer\n'
     printf '%s\n' "$path_line"
-  } >>"$rc_file"
+  } >>"$rc_file" 2>/dev/null || {
+    err "could not write to $rc_file; add this line manually:"
+    err "  $path_line"
+    PATH_MANUAL=1
+    return 0
+  }
 }
 
 initialize_instance() {
@@ -173,6 +235,14 @@ Next steps:
        gini smoke
 
 DONE
+  if [ "$PATH_MANUAL" = "1" ]; then
+    cat <<'MANUAL'
+Note: the installer could not update your shell rc automatically.
+Add $HOME/.local/bin to your PATH manually (see message above) so the
+`gini` command is found.
+
+MANUAL
+  fi
 }
 
 main() {
