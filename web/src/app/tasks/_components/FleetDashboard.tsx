@@ -62,19 +62,33 @@ export function FleetDashboard({
   // Query's structural sharing keeps the `tasks` array reference stable
   // across polls — without this, `Date.now()` would freeze at first render.
   const nowTick = useNow(true, 60_000);
+  // The 60s ticker drives natural left-edge progression (old tasks aging out
+  // of the 24h window), but it's too coarse for the right edge: a task whose
+  // createdAt is newer than the last tick would fall outside the
+  // (windowStart, now] half-open window and silently disappear from the
+  // sparkline until the next tick. Extend `now` to include the newest data
+  // we currently see so freshly-submitted tasks land in the rightmost bucket
+  // immediately. This is cheaper and more correct than tightening the
+  // ticker cadence.
+  const latestTaskAt = tasks.reduce((acc, t) => {
+    const created = new Date(t.createdAt).getTime();
+    const updated = new Date(t.updatedAt).getTime();
+    return Math.max(acc, created, updated);
+  }, 0);
+  const effectiveNow = Math.max(nowTick, latestTaskAt);
   // Recompute the 24-hour buckets when the task list changes or the minute
   // ticker advances. Hour-bucket math is cheap (O(n)) but we don't want to
   // thrash on every parent rerender either.
   const buckets = useMemo(() => {
-    const taskCounts = bucketByHour(tasks, 24, () => 1, nowTick);
+    const taskCounts = bucketByHour(tasks, 24, () => 1, effectiveNow);
     const costCounts = bucketByHour(
       tasks,
       24,
       (t) => (typeof t.cost?.estimatedUsd === "number" ? t.cost.estimatedUsd : 0),
-      nowTick
+      effectiveNow
     );
     return { taskCounts, costCounts };
-  }, [tasks, nowTick]);
+  }, [tasks, effectiveNow]);
   const tasksLast24h = buckets.taskCounts.reduce((a, b) => a + b, 0);
   const costLast24h = buckets.costCounts.reduce((a, b) => a + b, 0);
   const showCost = hasAnyCost(tasks);
