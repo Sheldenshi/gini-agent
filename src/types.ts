@@ -38,6 +38,34 @@ export type ImportSource = "hermes" | "openclaw";
 
 export type ProfileStatus = "active" | "inactive";
 
+// Headed-browser connection mode. `managed` means the runtime spawned the
+// Chrome process and owns its lifecycle (PID + dedicated user-data-dir).
+// `cdp` means the user pointed us at an existing CDP endpoint (e.g. their
+// own already-running Chrome) and we never touch the process. The two modes
+// share most of the same record so the API stays uniform.
+export type BrowserConnectionMode = "managed" | "cdp";
+
+export interface BrowserConnectionRecord {
+  mode: BrowserConnectionMode;
+  // ws:// CDP debugger URL. For `managed` we discover it by polling the
+  // launched Chrome's /json/version endpoint; for `cdp` it's the value the
+  // user supplied. Stored normalized (no credentials in the path).
+  cdpUrl: string;
+  // PID of the Chrome we spawned. Null when mode === "cdp" because we
+  // don't own that process and must not signal it on disconnect.
+  pid: number | null;
+  // Profile directory passed to Chrome via --user-data-dir. Null for
+  // mode: "cdp". Survives disconnect so the user's signed-in state stays
+  // intact across reconnects.
+  dataDir: string | null;
+  // Absolute path of the Chrome binary the runtime launched. Null for cdp
+  // mode (we never resolved a binary). Useful for surfacing in the UI so
+  // users can confirm which install is being driven.
+  chromePath: string | null;
+  // ISO timestamp of when the connection record was created/updated.
+  startedAt: string;
+}
+
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
 export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
@@ -125,6 +153,12 @@ export interface RuntimeState {
   messagingMessages: MessagingMessageRecord[];
   runs: RunRecord[];
   planSteps: PlanStepRecord[];
+  // Optional headed-browser connection. Populated by the browser-connect
+  // capability and consumed by the session manager in src/tools/browser.ts
+  // to switch from headless `chromium.launch()` to `chromium.connectOverCDP()`
+  // so authenticated state lives in the user's Chrome profile, not the
+  // ephemeral test context. Purely opt-in; legacy state files omit it.
+  browser?: BrowserConnectionRecord | null;
 }
 
 export type TaskMode = "chat" | "imperative";

@@ -1,0 +1,83 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { findChromePath, platformCandidates } from "./chrome-discovery";
+
+// Save / restore the env var so tests don't leak state into each other.
+const ORIGINAL_ENV = process.env["GINI_CHROME_PATH"];
+
+afterEach(() => {
+  if (ORIGINAL_ENV === undefined) {
+    delete process.env["GINI_CHROME_PATH"];
+  } else {
+    process.env["GINI_CHROME_PATH"] = ORIGINAL_ENV;
+  }
+});
+
+function withFakeBinary<T>(fn: (path: string) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "gini-chrome-"));
+  const binary = join(dir, "fake-chrome");
+  writeFileSync(binary, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  try {
+    return fn(binary);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe("findChromePath", () => {
+  test("env override wins when the pointed-at file exists", () => {
+    withFakeBinary((path) => {
+      process.env["GINI_CHROME_PATH"] = path;
+      expect(findChromePath()).toBe(path);
+    });
+  });
+
+  test("env override returns null when the file does not exist", () => {
+    const missing = join(tmpdir(), `gini-missing-${Date.now()}-${Math.random()}`);
+    process.env["GINI_CHROME_PATH"] = missing;
+    expect(findChromePath()).toBeNull();
+  });
+
+  test("empty env override falls back to candidate scan", () => {
+    process.env["GINI_CHROME_PATH"] = "";
+    // We can't assert the absolute return value (depends on the host
+    // machine) but we can verify that it didn't blow up and produced
+    // either a string or null — never undefined.
+    const result = findChromePath();
+    expect(result === null || typeof result === "string").toBe(true);
+  });
+
+  test("platformCandidates returns macOS paths on darwin", () => {
+    const list = platformCandidates("darwin");
+    expect(list.some((path) => path.endsWith("Google Chrome"))).toBe(true);
+  });
+
+  test("platformCandidates returns Linux paths on linux", () => {
+    const list = platformCandidates("linux");
+    expect(list.some((path) => path.includes("google-chrome"))).toBe(true);
+    expect(list.some((path) => path.includes("chromium"))).toBe(true);
+  });
+
+  test("platformCandidates returns Windows .exe paths on win32", () => {
+    const list = platformCandidates("win32");
+    expect(list.some((path) => path.toLowerCase().endsWith("chrome.exe"))).toBe(true);
+  });
+
+  test("returns null when no candidates exist (mocked via empty-dir override)", () => {
+    // The override branch is what's actually directly testable without
+    // monkey-patching fs.existsSync. We've already covered the
+    // candidate-scan fall-through via the "empty env override" test above.
+    // Use a fresh directory with no Chrome binaries inside to point the
+    // override at a path that definitely doesn't exist.
+    const dir = mkdtempSync(join(tmpdir(), "gini-chrome-empty-"));
+    try {
+      mkdirSync(join(dir, "subdir"), { recursive: true });
+      process.env["GINI_CHROME_PATH"] = join(dir, "subdir", "nope");
+      expect(findChromePath()).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

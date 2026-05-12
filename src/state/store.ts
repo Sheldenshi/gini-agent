@@ -256,6 +256,20 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     job.timeoutSeconds ??= 30;
     job.runIds ??= [];
   }
+  // Browser connection record is purely opt-in — feature added after the
+  // initial state shape. Normalize obviously bad shapes to null so a
+  // hand-edited state file can't crash downstream consumers; valid records
+  // pass through untouched.
+  if (state.browser !== undefined && state.browser !== null) {
+    const candidate = state.browser as Partial<typeof state.browser> & { cdpUrl?: unknown; mode?: unknown };
+    if (
+      typeof candidate !== "object" ||
+      typeof candidate.cdpUrl !== "string" ||
+      (candidate.mode !== "managed" && candidate.mode !== "cdp")
+    ) {
+      state.browser = null;
+    }
+  }
   expirePairingCodes(state);
   return state;
 }
