@@ -436,12 +436,13 @@ function probe(port: number, host: string): Promise<boolean> {
 
 export function stopRuntime(config: RuntimeConfig) {
   const webResult = stopWeb(config);
+  const tmuxResult = killTmuxSession(config.instance);
   const path = pidPath(config.instance);
   if (!existsSync(path)) {
     // Clean up any orphaned port file even when there's no pidfile — keeps
     // the instance root tidy across upgrades and aborted starts.
     rmSync(runtimePortPath(config.instance), { force: true });
-    return { stopped: false, reason: "No pid file", instance: config.instance, web: webResult };
+    return { stopped: false, reason: "No pid file", instance: config.instance, web: webResult, tmux: tmuxResult };
   }
   const pid = Number(readFileSync(path, "utf8"));
   // Process already dead → stale pidfile, treat as a successful stop. The
@@ -450,16 +451,32 @@ export function stopRuntime(config: RuntimeConfig) {
   if (!processAlive(pid)) {
     rmSync(path, { force: true });
     rmSync(runtimePortPath(config.instance), { force: true });
-    return { stopped: true, pid, reason: "process already dead", instance: config.instance, web: webResult };
+    return { stopped: true, pid, reason: "process already dead", instance: config.instance, web: webResult, tmux: tmuxResult };
   }
   try {
     process.kill(pid, "SIGTERM");
     rmSync(path, { force: true });
     rmSync(runtimePortPath(config.instance), { force: true });
-    return { stopped: true, pid, instance: config.instance, web: webResult };
+    return { stopped: true, pid, instance: config.instance, web: webResult, tmux: tmuxResult };
   } catch (error) {
-    return { stopped: false, pid, error: error instanceof Error ? error.message : String(error), web: webResult };
+    return { stopped: false, pid, error: error instanceof Error ? error.message : String(error), web: webResult, tmux: tmuxResult };
   }
+}
+
+// Kill the Conductor tmux session that wraps `gini run` for this instance.
+// Conductor's `run` script creates `tmux new-session -A -s gini-<instance> ...`,
+// and although the session usually dies on its own when `gini run` exits, an
+// explicit kill keeps `gini stop`/`gini uninstall` from leaving an orphaned
+// session behind (which then blocks the next `bun run run` from re-creating it).
+// Best-effort: silently no-ops when tmux isn't installed or the session is gone.
+function killTmuxSession(instance: string): { killed: boolean; reason?: string } {
+  const session = `gini-${instance}`;
+  const has = spawnSync("tmux", ["has-session", "-t", session], { stdio: "ignore" });
+  if (has.error) return { killed: false, reason: "tmux not available" };
+  if (has.status !== 0) return { killed: false, reason: "no session" };
+  const result = spawnSync("tmux", ["kill-session", "-t", session], { stdio: "ignore" });
+  if (result.status === 0) return { killed: true };
+  return { killed: false, reason: `kill-session exited ${result.status ?? "null"}` };
 }
 
 function stopWeb(config: RuntimeConfig): { stopped: boolean; pid?: number; reason?: string } {
