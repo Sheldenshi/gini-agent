@@ -63,6 +63,32 @@ gini smoke
 
 `gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL.
 
+### Update
+
+Re-run the same install one-liner to update. The script is idempotent — it pulls the latest source, reinstalls deps, and keeps your state under `~/.gini/instances/`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+```
+
+### Uninstall
+
+Full uninstall (asks two questions):
+
+```bash
+gini uninstall
+```
+
+The first prompt confirms the uninstall. The second asks whether to keep instance state under `~/.gini/instances/` (default yes). The downloaded model cache at `~/.gini/models/` is always preserved with a note showing its size and the manual `rm -rf` to remove it.
+
+Other variants:
+
+```bash
+gini uninstall --instance <name>     # remove a single instance, no prompts
+gini uninstall --yes                 # full uninstall, no prompts, keep instances
+gini uninstall --purge               # full uninstall + delete instances (implies --yes)
+```
+
 ### From source (for developers)
 
 ```bash
@@ -168,11 +194,13 @@ Remove one instance:
 bun run gini uninstall --instance <instance>
 ```
 
-Remove every instance while keeping the model cache:
+Full uninstall with two prompts (asks before deleting instance state):
 
 ```bash
-rm -rf ~/.gini/instances
+bun run gini uninstall
 ```
+
+See the Uninstall subsection under Quick Start for the `--yes` and `--purge` variants.
 
 For disposable development or tests:
 

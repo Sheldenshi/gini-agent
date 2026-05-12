@@ -95,24 +95,35 @@ bun run gini readiness v1
 bun run gini evidence
 ```
 
+## Update
+
+To update an existing install, re-run the install one-liner. The script is idempotent — it pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and leaves your state under `~/.gini/instances/` and the model cache at `~/.gini/models/` untouched.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
+```
+
 ## Cleanup
 
-Remove one instance:
+Remove a single instance:
 
 ```sh
-bun run gini uninstall --instance <instance>
+gini uninstall --instance <instance>
 ```
 
-Remove all instances while keeping model cache:
+Full uninstall (interactive, two prompts):
 
 ```sh
-rm -rf ~/.gini/instances
+gini uninstall
 ```
 
-Remove all local Gini data, including downloaded models:
+The first prompt asks "are you sure" (default no). The second asks whether to keep instance state at `~/.gini/instances/` (default yes). The full uninstall stops every running instance, removes the installer-managed wrapper at `~/.local/bin/gini`, removes the runtime checkout at `~/.gini/runtime/`, and strips the PATH block (marker `# Added by gini-agent installer`) from your shell rc. The model cache at `~/.gini/models/` is never auto-removed — the summary prints its size and the `rm -rf` command to remove it manually.
+
+Non-interactive variants:
 
 ```sh
-rm -rf ~/.gini
+gini uninstall --yes      # full uninstall, no prompts, keep instances
+gini uninstall --purge    # full uninstall + delete instances (implies --yes)
 ```
 
 For disposable development and tests, override roots:
