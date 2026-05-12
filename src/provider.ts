@@ -6,7 +6,7 @@ import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, Pro
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const DEFAULT_CODEX_MODEL = "gpt-5.4";
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 
 export function providerHealth(config: RuntimeConfig) {

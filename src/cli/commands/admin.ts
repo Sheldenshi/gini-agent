@@ -8,7 +8,7 @@ import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { loadConfig } from "../../paths";
+import { configPath, loadConfig, parseInstance } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -21,6 +21,21 @@ import { print } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 
 export async function install_(ctx: CliContext): Promise<void> {
+  // A fresh install must pick a real LLM provider. We refuse to silently
+  // materialize the `echo` stub config — that bites users who then have to
+  // remember to switch providers on every new worktree. Re-installing an
+  // existing instance is still fine without env vars.
+  const instance = parseInstance(ctx.rawArgs);
+  if (!existsSync(configPath(instance))) {
+    const envProvider = process.env.GINI_PROVIDER;
+    if (envProvider !== "openai" && envProvider !== "codex") {
+      throw new Error(
+        `No LLM provider configured for instance '${instance}'. ` +
+        `Set GINI_PROVIDER=codex|openai (and optionally GINI_MODEL) in the environment, ` +
+        `or run \`gini provider set <name> [model]\` after install.`
+      );
+    }
+  }
   const { config } = ctx;
   install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
