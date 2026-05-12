@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/
 
 The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `main` instance under `~/.gini/instances/main/`. The wrapper defaults `GINI_INSTANCE=main` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `main` while repo-clone developers stay on `dev`.
 
-When run in an interactive terminal the installer also walks through `gini setup` at the end (provider configuration; currently OpenAI only). Piped curl|bash installs skip it and ask you to run `gini setup` yourself before `gini start`. Setup writes your API key to `~/.gini/secrets.env` with mode 0600; the wrapper sources that file on every invocation. The key is never written to `config.json` and never leaves your machine except in API calls to the configured provider.
+When run in an interactive terminal the installer also walks through `gini setup` at the end. Setup picks between OpenAI Codex (uses existing `codex --login` credentials at `CODEX_AUTH_JSON` or `~/.codex/auth.json`) and OpenAI (API key). Piped curl|bash installs skip the prompt and ask you to run `gini setup` yourself before `gini start`. For OpenAI, setup writes your API key to `~/.gini/secrets.env` with mode 0600; the wrapper sources that file on every invocation. The key is never written to `config.json` and never leaves your machine except in API calls to the configured provider. For Codex, no token values are stored by gini — the runtime reads `~/.codex/auth.json` on demand.
 
 From source (for developers):
 

@@ -3,6 +3,7 @@
 // load-bearing part: each step has isComplete() so users (and scripted
 // installs) can re-run `gini setup` idempotently, and run(io) so steps can
 // drive their own prompts via a shared SetupIO surface.
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -29,9 +30,6 @@ export interface SetupStep {
   isComplete(config: RuntimeConfig): Promise<boolean>;
   run(config: RuntimeConfig, io: SetupIO): Promise<void>;
 }
-
-const SUGGESTED_OPENAI_MODELS = ["gpt-5.4-mini", "gpt-5.4", "gpt-4o"] as const;
-const DEFAULT_OPENAI_MODEL = SUGGESTED_OPENAI_MODELS[0];
 
 const COLOR_ENABLED = Boolean(process.stdout.isTTY) && process.env.TERM !== "dumb";
 const COLOR = COLOR_ENABLED
@@ -131,29 +129,175 @@ export function checkOpenAIKeyStatus(): OpenAIKeyStatus {
   return { source: "missing" };
 }
 
-function providerDisplayName(name: string): string {
-  if (name === "openai") return "OpenAI";
-  if (name === "codex") return "Codex OAuth";
-  if (name === "openrouter") return "OpenRouter";
-  if (name === "local") return "Local";
-  return name;
+export interface CredentialStatus {
+  available: boolean;
+  source: "env" | "file" | "missing";
+  display: string;
 }
 
-function keyStatusLine(status: OpenAIKeyStatus): string {
-  if (status.source === "env") return "✓ in env";
-  if (status.source === "file") return "✓ saved";
-  return "✗ missing";
+export interface ProviderModule {
+  id: "openai" | "codex";
+  label: string;
+  description: string;
+  defaultModel: string;
+  suggestedModels: string[];
+  checkCredentials(): CredentialStatus;
+  ensureCredentials(io: SetupIO): Promise<boolean>;
+}
+
+function codexAuthFilePath(): string {
+  const home = process.env.HOME || homedir();
+  return join(home, ".codex", "auth.json");
+}
+
+// Parse-only: we never read or copy token values out of auth.json — only
+// confirm the file (or env var) holds well-formed JSON.
+function checkCodexCredentialsStatus(): CredentialStatus {
+  const envRaw = process.env.CODEX_AUTH_JSON;
+  if (envRaw && envRaw.length > 0) {
+    try {
+      JSON.parse(envRaw);
+      return { available: true, source: "env", display: "✓ in CODEX_AUTH_JSON env" };
+    } catch {
+      // fall through; treat unparseable env as missing
+    }
+  }
+  const path = codexAuthFilePath();
+  if (existsSync(path)) {
+    try {
+      JSON.parse(readFileSync(path, "utf8"));
+      return { available: true, source: "file", display: "✓ ~/.codex/auth.json" };
+    } catch {
+      // unparseable → treat as missing
+    }
+  }
+  return { available: false, source: "missing", display: "✗ missing — run codex --login" };
+}
+
+const openaiProvider: ProviderModule = {
+  id: "openai",
+  label: "OpenAI",
+  description: "API key — sk-...",
+  defaultModel: "gpt-5.4-mini",
+  suggestedModels: ["gpt-5.4-mini", "gpt-5.4", "gpt-4o"],
+  checkCredentials(): CredentialStatus {
+    const status = checkOpenAIKeyStatus();
+    if (status.source === "env") return { available: true, source: "env", display: "✓ in env" };
+    if (status.source === "file") return { available: true, source: "file", display: "✓ saved" };
+    return { available: false, source: "missing", display: "✗ missing" };
+  },
+  async ensureCredentials(io: SetupIO): Promise<boolean> {
+    const status = checkOpenAIKeyStatus();
+    if (status.source === "missing") {
+      return promptAndSaveApiKey(io);
+    }
+    if (status.source === "env") {
+      io.info("Using OPENAI_API_KEY from your environment.");
+      if (status.value) writeKeyToSecretsFile("OPENAI_API_KEY", status.value);
+      return true;
+    }
+    io.info("Found existing OpenAI key in ~/.gini/secrets.env.");
+    return true;
+  }
+};
+
+const codexProvider: ProviderModule = {
+  id: "codex",
+  label: "OpenAI Codex",
+  description: "Use existing codex --login auth (~/.codex/auth.json)",
+  defaultModel: "gpt-5.4",
+  suggestedModels: ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
+  checkCredentials(): CredentialStatus {
+    return checkCodexCredentialsStatus();
+  },
+  async ensureCredentials(io: SetupIO): Promise<boolean> {
+    while (true) {
+      const status = checkCodexCredentialsStatus();
+      if (status.available) {
+        io.info(`OpenAI Codex credentials: ${status.display}`);
+        const action = await io.select(
+          "What would you like to do?",
+          [
+            { label: "Use existing credentials", value: "use" as const },
+            { label: "Reauthenticate (run codex --login)", value: "reauth" as const },
+            { label: "Cancel", value: "cancel" as const }
+          ],
+          0
+        );
+        if (action === "use") return true;
+        if (action === "cancel") return false;
+        const ok = runCodexLogin(io);
+        if (!ok) return false;
+        const recheck = checkCodexCredentialsStatus();
+        if (recheck.available) return true;
+        io.error("Codex credentials still missing after login. Aborting.");
+        return false;
+      }
+
+      io.info(`OpenAI Codex credentials: ${status.display}`);
+      const action = await io.select(
+        "What would you like to do?",
+        [
+          { label: "Run codex --login now", value: "login" as const },
+          { label: "I've already logged in elsewhere — re-check", value: "recheck" as const },
+          { label: "Cancel", value: "cancel" as const }
+        ],
+        0
+      );
+      if (action === "cancel") return false;
+      if (action === "login") {
+        const ok = runCodexLogin(io);
+        if (!ok) return false;
+        const recheck = checkCodexCredentialsStatus();
+        if (recheck.available) return true;
+        io.error("Codex credentials still missing after login. Aborting.");
+        return false;
+      }
+      // action === "recheck" → loop again
+    }
+  }
+};
+
+function runCodexLogin(io: SetupIO): boolean {
+  const result = spawnSync("codex", ["--login"], { stdio: "inherit" });
+  if (result.error) {
+    const err = result.error as NodeJS.ErrnoException;
+    if (err.code === "ENOENT") {
+      io.error("codex CLI not found — install it from https://github.com/openai/codex then run codex --login");
+    } else {
+      io.error(`Failed to run codex --login: ${err.message}`);
+    }
+    return false;
+  }
+  if (typeof result.status === "number" && result.status !== 0) {
+    io.error(`codex --login exited with status ${result.status}.`);
+    return false;
+  }
+  return true;
+}
+
+const PROVIDERS: ProviderModule[] = [openaiProvider, codexProvider];
+
+function providerById(id: string | undefined): ProviderModule | undefined {
+  if (!id) return undefined;
+  return PROVIDERS.find((p) => p.id === id);
 }
 
 function renderCurrentState(config: RuntimeConfig): void {
   const provider = config.provider;
-  const configuredOpenAI = provider?.name === "openai";
-  const providerLabel = configuredOpenAI ? "OpenAI" : "(not set)";
-  const modelLabel = configuredOpenAI && provider?.model ? provider.model : "(not set)";
-  const keyStatus = configuredOpenAI ? keyStatusLine(checkOpenAIKeyStatus()) : "(not set)";
-  console.log(`  Provider:    ${providerLabel}`);
+  const module = providerById(provider?.name);
+  if (!module) {
+    console.log(`  Provider:    (not set)`);
+    console.log(`  Model:       (not set)`);
+    console.log(`  Credentials: (not set)`);
+    console.log("");
+    return;
+  }
+  const cred = module.checkCredentials();
+  const modelLabel = provider?.model ? provider.model : "(not set)";
+  console.log(`  Provider:    ${module.label}`);
   console.log(`  Model:       ${modelLabel}`);
-  console.log(`  API key:     ${keyStatus}`);
+  console.log(`  Credentials: ${cred.display}`);
   console.log("");
 }
 
@@ -161,28 +305,25 @@ export const providerStep: SetupStep = {
   id: "provider",
   title: "LLM provider",
   async isComplete(config) {
-    // Only the openai provider has a real configuration. The `echo` default
-    // is a placeholder — we want setup to run for it. Other providers
-    // (codex/openrouter/local) aren't reachable through this flow yet, so
-    // we treat them as needing setup too.
-    if (config.provider?.name !== "openai") return false;
-    return checkOpenAIKeyStatus().source !== "missing";
+    const module = providerById(config.provider?.name);
+    if (!module) return false;
+    return module.checkCredentials().available;
   },
   async run(config, io) {
     console.log("◆ LLM provider");
     console.log("  Configure how gini connects to your chat model.\n");
     renderCurrentState(config);
 
-    const provider = config.provider;
-    const isConfigured = provider?.name === "openai" && checkOpenAIKeyStatus().source !== "missing";
-
     if (io.isNonInteractive) {
       await runNonInteractive(config, io);
       return;
     }
 
-    if (isConfigured) {
-      await runConfiguredFlow(config, io);
+    const currentModule = providerById(config.provider?.name);
+    const isConfigured = currentModule ? currentModule.checkCredentials().available : false;
+
+    if (isConfigured && currentModule) {
+      await runConfiguredFlow(config, io, currentModule);
       return;
     }
 
@@ -191,32 +332,48 @@ export const providerStep: SetupStep = {
 };
 
 async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<void> {
-  const status = checkOpenAIKeyStatus();
-  if (status.source === "missing") {
-    throw new Error(
-      "No OpenAI API key found. Set OPENAI_API_KEY in your environment or write it to ~/.gini/secrets.env, then re-run `gini setup --yes`."
-    );
+  // Precedence: codex > openai. Codex uses existing OAuth/API key files and
+  // needs no prompt, so we prefer it when both are available in a --yes run.
+  const codexStatus = codexProvider.checkCredentials();
+  const openaiStatus = openaiProvider.checkCredentials();
+
+  if (codexStatus.available) {
+    const model = config.provider?.name === "codex" && config.provider.model
+      ? config.provider.model
+      : codexProvider.defaultModel;
+    config.provider = normalizeProvider({ name: "codex", model });
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    io.success(`Auto-configured: codex (${model}), credentials from ${codexStatus.source === "env" ? "CODEX_AUTH_JSON env" : "~/.codex/auth.json"}`);
+    return;
   }
-  // If the key only lives in env, persist it to secrets.env so the wrapper
-  // can pick it up on future shells.
-  if (status.source === "env" && status.value) {
-    writeKeyToSecretsFile("OPENAI_API_KEY", status.value);
+
+  if (openaiStatus.available) {
+    const status = checkOpenAIKeyStatus();
+    if (status.source === "env" && status.value) {
+      writeKeyToSecretsFile("OPENAI_API_KEY", status.value);
+    }
+    const model = config.provider?.name === "openai" && config.provider.model
+      ? config.provider.model
+      : openaiProvider.defaultModel;
+    config.provider = normalizeProvider({ name: "openai", model });
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    io.success(`Auto-configured: openai (${model}), key from ${status.source === "env" ? "env" : "secrets.env"}`);
+    return;
   }
-  const model = config.provider?.name === "openai" && config.provider.model
-    ? config.provider.model
-    : DEFAULT_OPENAI_MODEL;
-  config.provider = normalizeProvider({ name: "openai", model });
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  io.success(`Auto-configured: openai (${model}), key from ${status.source === "env" ? "env" : "secrets.env"}`);
+
+  throw new Error(
+    "No provider credentials found. Set OPENAI_API_KEY in your environment, write it to ~/.gini/secrets.env, set CODEX_AUTH_JSON, or run codex --login (~/.codex/auth.json), then re-run `gini setup --yes`."
+  );
 }
 
-async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
+async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO, current: ProviderModule): Promise<void> {
   const action = await io.select(
     "What would you like to do?",
     [
       { label: "Keep current configuration", value: "keep" as const },
-      { label: "Re-enter API key", value: "rekey" as const },
+      { label: "Update credentials", value: "credentials" as const },
       { label: "Change model", value: "model" as const },
+      { label: "Switch provider", value: "switch" as const },
       { label: "Cancel", value: "cancel" as const }
     ],
     0
@@ -230,66 +387,82 @@ async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO): Promise<vo
     io.info("Aborted.");
     return;
   }
-  if (action === "rekey") {
-    await promptAndSaveApiKey(io);
+  if (action === "credentials") {
+    const ok = await current.ensureCredentials(io);
+    if (!ok) {
+      io.info("Aborted.");
+    }
+    return;
+  }
+  if (action === "switch") {
+    await runFreshFlow(config, io);
     return;
   }
   // action === "model"
   const currentModel = config.provider?.model;
-  const newModel = await selectModel(io, currentModel ?? null, true);
+  const newModel = await selectModelForProvider(io, current, currentModel ?? null, true);
   if (newModel === null) return;
-  config.provider = normalizeProvider({ name: "openai", model: newModel });
+  config.provider = normalizeProvider({ name: current.id, model: newModel });
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  io.success(`Provider set to openai (${newModel}).`);
+  io.success(`Provider set to ${current.id} (${newModel}).`);
 }
 
 async function runFreshFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
   const chosen = await io.select(
     "Select provider:",
-    [{ label: "OpenAI", value: "openai" as const }],
+    PROVIDERS.map((p) => ({
+      label: `${p.label}  ${COLOR.dim}— ${p.description}${COLOR.reset}`,
+      value: p.id
+    })),
     0
   );
-  if (chosen !== "openai") return;
-  io.info("\n→ OpenAI selected.\n");
+  const provider = PROVIDERS.find((p) => p.id === chosen);
+  if (!provider) {
+    io.info("Aborted.");
+    return;
+  }
+  io.info(`\n→ ${provider.label} selected.\n`);
 
-  const status = checkOpenAIKeyStatus();
-  if (status.source === "missing") {
-    await promptAndSaveApiKey(io);
-  } else if (status.source === "env") {
-    io.info("Using OPENAI_API_KEY from your environment.");
-    if (status.value) writeKeyToSecretsFile("OPENAI_API_KEY", status.value);
-  } else {
-    io.info("Found existing OpenAI key in ~/.gini/secrets.env.");
+  const ok = await provider.ensureCredentials(io);
+  if (!ok) {
+    io.info("Aborted.");
+    return;
   }
 
-  const model = await selectModel(io, null, false);
-  const chosenModel = model ?? DEFAULT_OPENAI_MODEL;
-  config.provider = normalizeProvider({ name: "openai", model: chosenModel });
+  const model = await selectModelForProvider(io, provider, null, false);
+  const chosenModel = model ?? provider.defaultModel;
+  config.provider = normalizeProvider({ name: provider.id, model: chosenModel });
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  io.success(`Provider set to openai (${chosenModel}).`);
+  io.success(`Provider set to ${provider.id} (${chosenModel}).`);
 }
 
-async function promptAndSaveApiKey(io: SetupIO): Promise<void> {
+async function promptAndSaveApiKey(io: SetupIO): Promise<boolean> {
   const apiKey = await io.secret("Enter your OpenAI API key (sk-...):");
   if (!apiKey) {
     io.error("No API key entered. Skipping.");
-    return;
+    return false;
   }
   if (!apiKey.startsWith("sk-")) {
     io.error("API key doesn't look like an OpenAI key (expected to start with sk-). Continuing anyway.");
   }
   writeKeyToSecretsFile("OPENAI_API_KEY", apiKey);
   io.success("Saved API key to ~/.gini/secrets.env (mode 0600).");
+  return true;
 }
 
 // Returns null when the user picks "skip" (model unchanged). Returns the
 // model name otherwise.
-async function selectModel(io: SetupIO, currentModel: string | null, allowSkip: boolean): Promise<string | null> {
+async function selectModelForProvider(
+  io: SetupIO,
+  module: ProviderModule,
+  currentModel: string | null,
+  allowSkip: boolean
+): Promise<string | null> {
   const choices: { label: string; value: string }[] = [];
-  for (const model of SUGGESTED_OPENAI_MODELS) {
+  for (const model of module.suggestedModels) {
     let label: string = model;
     if (model === currentModel) label += "  ← currently in use";
-    else if (model === DEFAULT_OPENAI_MODEL && !currentModel) label += "  ← recommended";
+    else if (model === module.defaultModel && !currentModel) label += "  ← recommended";
     choices.push({ label, value: model });
   }
   choices.push({ label: "Enter custom model name", value: "__custom__" });
@@ -309,14 +482,17 @@ async function selectModel(io: SetupIO, currentModel: string | null, allowSkip: 
       io.info(`Keeping model ${currentModel}.`);
       return null;
     }
-    return DEFAULT_OPENAI_MODEL;
+    return module.defaultModel;
   }
   if (chosen === "__custom__") {
-    const custom = await io.prompt("Enter model name", currentModel ?? DEFAULT_OPENAI_MODEL);
-    return custom.trim() || (currentModel ?? DEFAULT_OPENAI_MODEL);
+    const custom = await io.prompt("Enter model name", currentModel ?? module.defaultModel);
+    return custom.trim() || (currentModel ?? module.defaultModel);
   }
   return chosen;
 }
+
+// Exported for tests.
+export const __testing = { openaiProvider, codexProvider, PROVIDERS };
 
 const STEPS: SetupStep[] = [providerStep];
 

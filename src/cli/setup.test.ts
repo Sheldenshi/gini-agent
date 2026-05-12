@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
+  __testing,
   checkOpenAIKeyStatus,
   hasKeyInSecretsFile,
   readKeyFromSecretsFile,
@@ -56,7 +57,7 @@ function scratch(tag: string): string {
 }
 
 describe("gini setup", () => {
-  test("--non-interactive without provider configured and no OPENAI_API_KEY exits 1", async () => {
+  test("--non-interactive without provider configured and no credentials exits 1", async () => {
     const stateRoot = scratch("no-key");
     const home = scratch("no-key-home");
     const instance = "dev";
@@ -67,6 +68,7 @@ describe("gini setup", () => {
       HOME: home
     };
     delete env.OPENAI_API_KEY;
+    delete env.CODEX_AUTH_JSON;
     const result = await runCli({
       args: ["setup", "--non-interactive", "--state-root", stateRoot, "--instance", instance],
       env
@@ -103,6 +105,7 @@ describe("gini setup", () => {
       HOME: home,
       OPENAI_API_KEY: "sk-test"
     };
+    delete env.CODEX_AUTH_JSON;
     const result = await runCli({
       args: ["setup", "--non-interactive", "--state-root", stateRoot, "--instance", instance],
       env
@@ -123,6 +126,7 @@ describe("gini setup", () => {
       HOME: home,
       OPENAI_API_KEY: "sk-test-fresh-123"
     };
+    delete env.CODEX_AUTH_JSON;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -154,6 +158,7 @@ describe("gini setup", () => {
       HOME: home
     };
     delete env.OPENAI_API_KEY;
+    delete env.CODEX_AUTH_JSON;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -186,6 +191,7 @@ describe("gini setup", () => {
       HOME: home,
       OPENAI_API_KEY: "sk-chmod-test"
     };
+    delete env.CODEX_AUTH_JSON;
     const result = await runCli({
       args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
       env
@@ -204,6 +210,7 @@ describe("gini setup", () => {
       HOME: home
     };
     delete env.OPENAI_API_KEY;
+    delete env.CODEX_AUTH_JSON;
     const result = await runCli({
       args: ["setup", "--state-root", stateRoot],
       env,
@@ -307,4 +314,142 @@ describe("secrets.env helpers (direct)", () => {
       expect(mode).toBe(0o600);
     });
   });
+});
+
+describe("codexProvider.checkCredentials (direct)", () => {
+  function withCodexEnv<T>(home: string, env: { CODEX_AUTH_JSON?: string }, fn: () => T): T {
+    const oldHome = process.env.HOME;
+    const oldEnv = process.env.CODEX_AUTH_JSON;
+    process.env.HOME = home;
+    if (env.CODEX_AUTH_JSON === undefined) {
+      delete process.env.CODEX_AUTH_JSON;
+    } else {
+      process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
+    }
+    try {
+      return fn();
+    } finally {
+      if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+      if (oldEnv === undefined) delete process.env.CODEX_AUTH_JSON; else process.env.CODEX_AUTH_JSON = oldEnv;
+    }
+  }
+
+  test("no env and no file → returns missing", () => {
+    const home = scratch("codex-direct-missing");
+    withCodexEnv(home, {}, () => {
+      const status = __testing.codexProvider.checkCredentials();
+      expect(status.available).toBe(false);
+      expect(status.source).toBe("missing");
+    });
+  });
+
+  test("CODEX_AUTH_JSON parseable → returns env", () => {
+    const home = scratch("codex-direct-env");
+    withCodexEnv(home, { CODEX_AUTH_JSON: "{}" }, () => {
+      const status = __testing.codexProvider.checkCredentials();
+      expect(status.available).toBe(true);
+      expect(status.source).toBe("env");
+    });
+  });
+
+  test("~/.codex/auth.json parseable → returns file", () => {
+    const home = scratch("codex-direct-file");
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "{}");
+    withCodexEnv(home, {}, () => {
+      const status = __testing.codexProvider.checkCredentials();
+      expect(status.available).toBe(true);
+      expect(status.source).toBe("file");
+    });
+  });
+
+  test("~/.codex/auth.json invalid JSON → returns missing", () => {
+    const home = scratch("codex-direct-invalid");
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "auth.json"), "not json {");
+    withCodexEnv(home, {}, () => {
+      const status = __testing.codexProvider.checkCredentials();
+      expect(status.available).toBe(false);
+      expect(status.source).toBe("missing");
+    });
+  });
+
+  test("CODEX_AUTH_JSON invalid JSON → returns missing (when no file)", () => {
+    const home = scratch("codex-direct-invalid-env");
+    withCodexEnv(home, { CODEX_AUTH_JSON: "not json {" }, () => {
+      const status = __testing.codexProvider.checkCredentials();
+      expect(status.available).toBe(false);
+      expect(status.source).toBe("missing");
+    });
+  });
+});
+
+describe("gini setup --yes codex precedence", () => {
+  test("CODEX_AUTH_JSON set and fresh echo config → picks codex with default model", async () => {
+    const stateRoot = scratch("codex-yes");
+    const home = scratch("codex-yes-home");
+    const instance = "dev";
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home,
+      CODEX_AUTH_JSON: "{}"
+    };
+    delete env.OPENAI_API_KEY;
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain("codex");
+    const cfgPath = join(stateRoot, "instances", instance, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { provider?: { name?: string; model?: string } };
+    expect(cfg.provider?.name).toBe("codex");
+    expect(cfg.provider?.model).toBe("gpt-5.4");
+  }, 30_000);
+
+  test("CODEX_AUTH_JSON and OPENAI_API_KEY both set → picks codex (precedence)", async () => {
+    const stateRoot = scratch("codex-precedence");
+    const home = scratch("codex-precedence-home");
+    const instance = "dev";
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home,
+      CODEX_AUTH_JSON: "{}",
+      OPENAI_API_KEY: "sk-also-set"
+    };
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).toBe(0);
+    const cfgPath = join(stateRoot, "instances", instance, "config.json");
+    const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { provider?: { name?: string } };
+    expect(cfg.provider?.name).toBe("codex");
+  }, 30_000);
+
+  test("neither CODEX_AUTH_JSON nor OPENAI_API_KEY set → exits 1 naming all three sources", async () => {
+    const stateRoot = scratch("codex-none");
+    const home = scratch("codex-none-home");
+    const instance = "dev";
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      GINI_STATE_ROOT: stateRoot,
+      GINI_INSTANCE: instance,
+      HOME: home
+    };
+    delete env.OPENAI_API_KEY;
+    delete env.CODEX_AUTH_JSON;
+    const result = await runCli({
+      args: ["setup", "--yes", "--state-root", stateRoot, "--instance", instance],
+      env
+    });
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("OPENAI_API_KEY");
+    expect(result.stderr).toContain("CODEX_AUTH_JSON");
+    expect(result.stderr).toContain("~/.codex/auth.json");
+  }, 30_000);
 });

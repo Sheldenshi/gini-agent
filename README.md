@@ -149,6 +149,8 @@ bun run gini readiness v1
 
 ## Providers
 
+`gini setup` walks an interactive picker for both supported providers (OpenAI Codex and OpenAI API key). On `--yes`/`--non-interactive` runs it auto-picks: it prefers Codex when `CODEX_AUTH_JSON` is set or `~/.codex/auth.json` exists, falls back to OpenAI when `OPENAI_API_KEY` is set, and otherwise fails with a clear message naming all three sources.
+
 Use Codex OAuth:
 
 ```bash
