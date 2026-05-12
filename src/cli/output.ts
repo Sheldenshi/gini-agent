@@ -24,6 +24,7 @@ Usage:
   bun run gini start|stop|status|doctor|reset [--instance dev] [--port 7337]
   bun run gini run [--instance dev] [--no-web]
   bun run gini uninstall [--instance <name>] [--yes] [--purge]
+  bun run gini update
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>

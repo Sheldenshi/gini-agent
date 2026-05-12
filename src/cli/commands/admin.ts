@@ -48,6 +48,102 @@ export function reset(ctx: CliContext): void {
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 
+export async function update(_ctx: CliContext): Promise<void> {
+  // GINI_STATE_ROOT is the test-mode signal — same convention as `uninstall`.
+  // Skip every step that would touch the real $HOME so the command stays
+  // exercisable from subprocess tests without clobbering the developer's
+  // installed runtime.
+  if (process.env.GINI_STATE_ROOT) {
+    console.log("gini update: skipped (GINI_STATE_ROOT set; not touching ~/.gini/runtime)");
+    return;
+  }
+
+  const home = homedir();
+  const runtimeDir = join(home, ".gini", "runtime");
+
+  if (!existsSync(runtimeDir) || !existsSync(join(runtimeDir, ".git"))) {
+    console.error("gini update operates on the installed runtime at ~/.gini/runtime, which is not present. Reinstall with: curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash");
+    process.exit(1);
+  }
+
+  const expectedOrigin = "https://github.com/Lilac-Labs/gini-agent";
+  const originRes = spawnSync("git", ["-C", runtimeDir, "remote", "get-url", "origin"], { encoding: "utf8" });
+  if (originRes.status !== 0) {
+    const stderr = (originRes.stderr ?? "").trim();
+    console.error(`gini update could not read git origin in ${runtimeDir}${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+  const actualOrigin = (originRes.stdout ?? "").trim();
+  const normalize = (url: string): string => url.replace(/\.git$/, "");
+  if (normalize(actualOrigin) !== normalize(expectedOrigin)) {
+    console.error(`gini update refuses to touch ~/.gini/runtime because its git origin is ${actualOrigin} (expected ${expectedOrigin}). Move that directory aside and reinstall.`);
+    process.exit(1);
+  }
+
+  const beforeRes = spawnSync("git", ["-C", runtimeDir, "rev-parse", "HEAD"], { encoding: "utf8" });
+  if (beforeRes.status !== 0) {
+    const stderr = (beforeRes.stderr ?? "").trim();
+    console.error(`gini update could not read current HEAD${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+  const beforeSha = (beforeRes.stdout ?? "").trim();
+
+  const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
+  if (fetchRes.status !== 0) {
+    const stderr = (fetchRes.stderr ?? "").trim();
+    console.error(`gini update: git fetch origin failed${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+
+  const resetRes = spawnSync("git", ["-C", runtimeDir, "reset", "--hard", "origin/main"], { encoding: "utf8" });
+  if (resetRes.status !== 0) {
+    const stderr = (resetRes.stderr ?? "").trim();
+    console.error(`gini update: git reset --hard origin/main failed${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+
+  const afterRes = spawnSync("git", ["-C", runtimeDir, "rev-parse", "HEAD"], { encoding: "utf8" });
+  if (afterRes.status !== 0) {
+    const stderr = (afterRes.stderr ?? "").trim();
+    console.error(`gini update could not read new HEAD${stderr ? `: ${stderr}` : "."}`);
+    process.exit(1);
+  }
+  const afterSha = (afterRes.stdout ?? "").trim();
+
+  if (beforeSha === afterSha) {
+    console.log(`Already up to date (at ${afterSha.slice(0, 7)}).`);
+    return;
+  }
+
+  const installRes = spawnSync("bun", ["install"], { cwd: runtimeDir, stdio: "inherit" });
+  if (installRes.status !== 0) {
+    console.error(`gini update: bun install failed (exit ${installRes.status ?? "null"}).`);
+    process.exit(1);
+  }
+
+  const countRes = spawnSync("git", ["-C", runtimeDir, "rev-list", "--count", `${beforeSha}..${afterSha}`], { encoding: "utf8" });
+  const commitCount = countRes.status === 0 ? (countRes.stdout ?? "").trim() : "?";
+
+  let restartNeeded = false;
+  try {
+    restartNeeded = await isRunning(loadConfig("main"));
+  } catch {
+    // best-effort — if we can't read the main config (e.g. before first install),
+    // treat as not-running. The user can always restart manually.
+  }
+
+  const summary = [
+    "gini update summary:",
+    `  before:        ${beforeSha.slice(0, 7)}`,
+    `  after:         ${afterSha.slice(0, 7)}`,
+    `  commits:       ${commitCount}`
+  ];
+  if (restartNeeded) {
+    summary.push("  runtime:       running — restart with `gini stop && gini start` to pick up the new code");
+  }
+  console.log(summary.join("\n"));
+}
+
 export async function uninstall(ctx: CliContext): Promise<void> {
   const yes = hasFlag(ctx.rawArgs, "--yes");
   const purge = hasFlag(ctx.rawArgs, "--purge");
