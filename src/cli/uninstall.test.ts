@@ -39,7 +39,7 @@ async function runCli(opts: RunOptions): Promise<RunResult> {
       child.stdin?.write(opts.stdinData);
       child.stdin?.end();
     }
-    child.on("exit", (code) => resolveRun({ code, stdout, stderr }));
+    child.on("close", (code) => resolveRun({ code, stdout, stderr }));
   });
 }
 
@@ -93,6 +93,7 @@ describe("gini uninstall", () => {
     });
     expect(result.code).toBe(1);
     expect(result.stderr).toContain("Refusing to run interactively without a TTY");
+    expect(existsSync(join(stateRoot, "instances"))).toBe(false);
   }, 30_000);
 
   test("--yes (full, no --purge) keeps instances", async () => {
