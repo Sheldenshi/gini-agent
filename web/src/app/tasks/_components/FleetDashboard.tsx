@@ -5,7 +5,7 @@ import { ChevronDown, ChevronUp } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import type { RuntimeStatus, Task, TaskStatus } from "@runtime/types";
-import { bucketByHour, hasAnyCost, totalCostUsd } from "./observability";
+import { bucketByHour, hasAnyCost, totalCostUsd, useNow } from "./observability";
 
 // Fleet dashboard strip — three small charts that summarize the whole task
 // list / runtime status without making any extra network calls. The status
@@ -48,30 +48,57 @@ const STATUS_LABEL: Record<TaskStatus, string> = {
 
 export function FleetDashboard({
   tasks,
-  status
+  status,
+  isPending = false,
+  isError = false
 }: {
   tasks: Task[];
   status: RuntimeStatus | undefined;
+  isPending?: boolean;
+  isError?: boolean;
 }) {
   const [open, setOpen] = useState<boolean>(true);
-  // Recompute the 24-hour buckets only when the task list or its length
-  // changes. Hour-bucket math is cheap (O(n)) but we don't want to thrash
-  // on every parent rerender either.
+  // Re-tick once a minute so the 24h window rolls forward even when React
+  // Query's structural sharing keeps the `tasks` array reference stable
+  // across polls — without this, `Date.now()` would freeze at first render.
+  const nowTick = useNow(true, 60_000);
+  // Recompute the 24-hour buckets when the task list changes or the minute
+  // ticker advances. Hour-bucket math is cheap (O(n)) but we don't want to
+  // thrash on every parent rerender either.
   const buckets = useMemo(() => {
-    const now = Date.now();
-    const taskCounts = bucketByHour(tasks, 24, () => 1, now);
+    const taskCounts = bucketByHour(tasks, 24, () => 1, nowTick);
     const costCounts = bucketByHour(
       tasks,
       24,
       (t) => (typeof t.cost?.estimatedUsd === "number" ? t.cost.estimatedUsd : 0),
-      now
+      nowTick
     );
     return { taskCounts, costCounts };
-  }, [tasks]);
+  }, [tasks, nowTick]);
   const tasksLast24h = buckets.taskCounts.reduce((a, b) => a + b, 0);
   const costLast24h = buckets.costCounts.reduce((a, b) => a + b, 0);
   const showCost = hasAnyCost(tasks);
   const allTimeCost = totalCostUsd(tasks);
+
+  if (isPending || isError) {
+    // Match Card chrome so the page doesn't reflow when data arrives. Use
+    // muted placeholders for the three columns — no fake numbers.
+    const message = isError ? "Failed to load tasks" : "Loading…";
+    return (
+      <Card size="sm">
+        <CardHeader className="flex flex-row items-center justify-between">
+          <CardTitle className="text-sm">Fleet overview</CardTitle>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <LoadingColumn label="Status mix" message={message} />
+            <LoadingColumn label="Tasks per hour" message={message} />
+            <LoadingColumn label="Cost per hour" message={message} />
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
 
   if (tasks.length === 0) {
     // Honest empty state — no fake bars, no fake dot. The whole point of
@@ -308,6 +335,21 @@ function Sparkline({
         ))}
       </svg>
       <p className="text-[10px] text-muted-foreground">Past 24 hours, hourly buckets</p>
+    </div>
+  );
+}
+
+function LoadingColumn({ label, message }: { label: string; message: string }) {
+  // Mirrors the layout of a real column (title row + chart-height block) so
+  // the page doesn't jump when data finishes loading. Center cell uses an
+  // em dash rather than a fake number.
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="text-xs font-medium text-muted-foreground">{label}</p>
+      <div className="flex h-16 items-center justify-center rounded-md border border-dashed border-border bg-muted/30">
+        <p className="text-[11px] text-muted-foreground">{message}</p>
+      </div>
+      <p className="font-mono text-[10px] text-muted-foreground">—</p>
     </div>
   );
 }

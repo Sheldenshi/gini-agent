@@ -33,8 +33,9 @@ export function TaskList({
   const activeLabel = filters.find((f) => f.key === filter)?.label ?? filter;
   // Tick once per second so any visible "running" task row updates its
   // elapsed timer in lockstep. We pay one render/sec for the whole list,
-  // not one per row — and only when at least one filtered row is live.
-  const hasLiveRow = filtered.some((t) => isLive(t.status));
+  // not one per row — and only when at least one row actually renders a
+  // timer (running rows only; queued/waiting rows have no visible timer).
+  const hasLiveRow = filtered.some((t) => t.status === "running");
   const now = useNow(hasLiveRow, 1000);
   return (
     <Tabs value={filter} onValueChange={onFilterChange}>

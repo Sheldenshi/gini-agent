@@ -1,9 +1,5 @@
 // Shared helpers for the tasks page observability surfaces (TaskList row
 // animations, TaskDetail duration/cost viz, FleetDashboard sparklines).
-//
-// These are intentionally pure functions plus one tiny ticking hook — no
-// new dependencies. Tested separately for the hour-bucketing math because
-// timezone edge-cases are easy to get wrong silently.
 
 import { useEffect, useState } from "react";
 import type { Task, TaskStatus } from "@runtime/types";
@@ -84,7 +80,10 @@ export function bucketByHour(
   const windowStart = now - hours * hourMs;
   for (const task of tasks) {
     const at = new Date(task.createdAt).getTime();
-    if (!Number.isFinite(at) || at < windowStart || at > now) continue;
+    // Half-open window `(windowStart, now]`: a task whose createdAt lands
+    // exactly on the windowStart boundary is excluded, matching the bounds
+    // check below which already drops it (idx would equal `hours`).
+    if (!Number.isFinite(at) || at <= windowStart || at > now) continue;
     const offsetHours = Math.floor((now - at) / hourMs);
     // offsetHours=0 → most recent bucket (last index). offsetHours=hours-1
     // → oldest bucket (index 0). Clamp just in case of float boundary.
