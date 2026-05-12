@@ -38,9 +38,12 @@ import {
 // signed-in state for the next connect.
 
 export default function BrowserPage() {
-  const status = useBrowserConnection();
   const connect = useConnectBrowser();
   const disconnect = useDisconnectBrowser();
+  // Tighten the polling cadence while a mutation is in flight so the user
+  // sees the new connection status snap into place; idle pages can fall
+  // back to the slower 5s cadence to avoid hammering the runtime.
+  const status = useBrowserConnection({ isActive: connect.isPending || disconnect.isPending });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [cdpUrl, setCdpUrl] = useState("");
   const [port, setPort] = useState("");
@@ -151,7 +154,7 @@ export default function BrowserPage() {
                     variant="ghost"
                     onClick={() => setShowAdvanced((value) => !value)}
                   >
-                    {showAdvanced ? "Hide advanced" : "Advanced"}
+                    {showAdvanced ? "Hide Advanced" : "Advanced"}
                   </Button>
                 </>
               )}
@@ -275,7 +278,7 @@ export default function BrowserPage() {
               onClick={handleDisconnect}
               disabled={disconnect.isPending}
             >
-              {disconnect.isPending ? "Disconnecting..." : "Disconnect"}
+              {disconnect.isPending ? "Disconnecting..." : "Disconnect Chrome"}
             </Button>
           </DialogFooter>
         </DialogContent>
