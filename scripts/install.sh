@@ -194,7 +194,13 @@ write_wrapper() {
 #!/usr/bin/env bash
 # gini-agent-installer-managed
 set -euo pipefail
-[ -f "$HOME/.gini/secrets.env" ] && set -a && . "$HOME/.gini/secrets.env" && set +a
+if [ -f "$HOME/.gini/secrets.env" ]; then
+  set +e
+  set -a
+  . "$HOME/.gini/secrets.env" || printf 'gini: warning — failed to source ~/.gini/secrets.env, continuing without it\n' >&2
+  set +a
+  set -e
+fi
 export GINI_INSTANCE="${GINI_INSTANCE:-main}"
 cd "$HOME/.gini/runtime"
 exec bun run gini "$@"
@@ -280,27 +286,36 @@ print_done() {
     printf '\n%sgini-agent installed.%s\n\n' "$C_BOLD" "$C_RESET"
   fi
 
-  # If setup ran during install, the user is done — just point at start.
-  # Otherwise tell them to run setup first.
-  local next_cmd
-  if [ "$SETUP_RAN" = "1" ]; then
-    next_cmd='gini start'
-  else
-    next_cmd='gini setup, then gini start'
-  fi
+  # If setup ran during install, point at `gini start` directly. Otherwise
+  # list the two commands the user needs to run, each on its own line so
+  # they read as commands, not prose.
+  print_next_commands() {
+    if [ "$SETUP_RAN" = "1" ]; then
+      printf '    gini start\n'
+    else
+      printf '    gini setup\n'
+      printf '    gini start\n'
+    fi
+  }
 
   if [ "$PATH_MANUAL" = "1" ]; then
     info "Add \$HOME/.local/bin to your PATH (see the message above), then run:"
-    printf '    %s\n\n' "$next_cmd"
+    print_next_commands
+    printf '\n'
   elif [ "$path_ready" = "0" ]; then
     info "Open a new terminal, then run:"
-    printf '    %s\n\n' "$next_cmd"
+    print_next_commands
+    printf '\n'
   else
-    if [ "$LOCAL_MODE" = "1" ]; then
-      printf 'Run %s%s%s. After committing changes in %s, run %sgini update%s to re-sync.\n\n' "$C_BOLD" "$next_cmd" "$C_RESET" "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+    if [ "$SETUP_RAN" = "1" ]; then
+      printf 'Run %sgini start%s.' "$C_BOLD" "$C_RESET"
     else
-      printf 'Run %s%s%s.\n\n' "$C_BOLD" "$next_cmd" "$C_RESET"
+      printf 'Run %sgini setup%s, then %sgini start%s.' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
     fi
+    if [ "$LOCAL_MODE" = "1" ]; then
+      printf ' After committing changes in %s, run %sgini update%s to re-sync.' "$LOCAL_REPO" "$C_BOLD" "$C_RESET"
+    fi
+    printf '\n\n'
   fi
 }
 
