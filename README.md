@@ -48,21 +48,12 @@ This repo includes a Bun TypeScript local runtime with:
 
 ## Quick Start
 
-Install with one command:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
-```
-
-The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `main` instance by default. State lives under `~/.gini/instances/main/`. If the installer is run in an interactive terminal it walks you through `gini setup` immediately; the curl|bash piped form skips that and asks you to run it yourself. After install, reload your shell PATH if needed, then:
-
-```bash
-gini setup    # configures your LLM provider (asks for an OpenAI API key)
 gini start
-gini smoke
 ```
 
-`gini setup` writes your API key to `~/.gini/secrets.env` (mode 0600). The installed wrapper sources that file on every invocation so the key is never written to `config.json` and never leaves your machine except in API calls to the configured provider. `gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL.
+The installer walks you through provider setup (OpenAI API key or existing `codex --login` auth). `gini start` prints the runtime and web URLs.
 
 ### Update
 
@@ -74,31 +65,12 @@ Pulls the latest source into `~/.gini/runtime`, reinstalls dependencies, and lea
 
 If you are working from a repo clone, use `git pull && bun install` instead — `gini update` only operates on the installer-managed runtime at `~/.gini/runtime`.
 
-### Uninstall
-
-Full uninstall (asks two questions):
-
-```bash
-gini uninstall
-```
-
-The first prompt confirms the uninstall. The second asks whether to keep instance state under `~/.gini/instances/` (default yes). The downloaded model cache at `~/.gini/models/` is always preserved with a note showing its size and the manual `rm -rf` to remove it.
-
-Other variants:
-
-```bash
-gini uninstall --instance <name>     # remove a single instance, no prompts
-gini uninstall --yes                 # full uninstall, no prompts, keep instances
-gini uninstall --purge               # full uninstall + delete instances (implies --yes)
-```
-
 ### From source (for developers)
 
 ```bash
 bun install
 bun run gini install
 bun run gini start
-bun run gini smoke
 ```
 
 When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
