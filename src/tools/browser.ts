@@ -44,15 +44,25 @@ let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefin
 // In-flight launch promise so concurrent ensureBrowser callers share one
 // chromium.launch() instead of orphaning the loser's Browser.
 let pendingBrowser: Promise<Browser> | null = null;
-// Set to true while disconnectSharedBrowser is tearing down the shared
-// browser handle. withSession rejects new admissions during that window
-// so a concurrent tool call doesn't re-enter ensureBrowser() and either
-// reattach to the about-to-die remote or race the close-and-launch path.
-// Cleared in the finally of disconnectSharedBrowser.
-let disconnecting = false;
-// Counts admissions that have passed the `disconnecting` check but have
-// not yet bumped their session's `inFlight`. Without this, a tool call
-// could pass the initial check, suspend inside getOrCreate / ensureBrowser
+// Monotonically-increasing disconnect counter. Bumped at the start of
+// every disconnectSharedBrowser call. Replaces an earlier boolean
+// `disconnecting` flag whose two-state design lost information across
+// re-entrant disconnects and exceeded-drain-deadline races: a slow
+// getOrCreate / connectOverCDP that breached the 5s cap would resume
+// after teardown, observe `disconnecting === false`, and proceed against
+// a torn-down browser. With a generation counter the resuming caller
+// compares its captured epoch to the current one and bails on any
+// change. Callers that need "is teardown in progress right now?" can
+// read the wider `inFlightDisconnects` boolean below.
+let disconnectGeneration = 0;
+// True while one or more disconnectSharedBrowser calls are mid-flight.
+// withSession uses this to short-circuit new admissions cheaply without
+// racing the generation counter on every entry. Cleared back to false
+// when the last in-flight disconnect's finally block runs.
+let inFlightDisconnects = 0;
+// Counts admissions that have captured a generation but have not yet
+// bumped their session's `inFlight`. Without this, a tool call could
+// pass the initial check, suspend inside getOrCreate / ensureBrowser
 // (e.g. on the dynamic playwright-core import or a slow CDP attach),
 // disconnectSharedBrowser could observe an empty drain and tear down,
 // and the suspended call would resume against a closed browser. The
@@ -117,18 +127,69 @@ async function ensureBrowser(): Promise<Browser> {
   // path — we don't try to atomically lock state across the dynamic import.
   const record = activeBrowserRecord();
   const useCdp = Boolean(record?.cdpUrl);
+  // Capture the current disconnect generation at the START of the launch.
+  // If a disconnect bumps the counter while chromium.launch / connectOverCDP
+  // is in flight, we don't want to install the resulting Browser on the
+  // shared slot — disconnect already cleared `sharedBrowser`, so installing
+  // the freshly-launched handle would silently re-attach the agent to the
+  // soon-to-be-dead remote (or a stale headless Chromium). Throwing inside
+  // the IIFE lets the natural pendingBrowser rejection carry up to the
+  // caller, and the resulting Browser is closed/disconnected so we don't
+  // leak the process.
+  const launchGeneration = disconnectGeneration;
   pendingBrowser = (async () => {
     const chromium = await loadChromium();
+    let browser: Browser;
     if (useCdp && record?.cdpUrl) {
       // connectOverCDP returns a Browser handle scoped to the remote
       // process. The remote Chrome's default BrowserContext (the one the
       // user has been clicking around in) shows up under browser.contexts()
       // — we'll reuse it in getOrCreate() so signed-in cookies are visible.
-      return chromium.connectOverCDP(record.cdpUrl);
+      browser = await chromium.connectOverCDP(record.cdpUrl);
+    } else {
+      browser = await chromium.launch({ headless: true });
     }
-    return chromium.launch({ headless: true });
+    if (disconnectGeneration !== launchGeneration) {
+      // Disconnect bumped the generation while we were launching. Clean
+      // up the freshly-built handle and surface a clear error to the
+      // caller. Use disconnect() for CDP handles (close() would kill the
+      // user's Chrome); use close() for the headless launch.
+      try {
+        if (useCdp) {
+          const candidate = browser as unknown as { disconnect?: () => Promise<void> };
+          if (typeof candidate.disconnect === "function") {
+            await candidate.disconnect();
+          }
+        } else {
+          await browser.close();
+        }
+      } catch {
+        // ignore — caller is already getting an error
+      }
+      throw new Error("Browser disconnecting, retry shortly.");
+    }
+    return browser;
   })()
     .then((browser) => {
+      // Re-check inside the .then so we never install a stale browser on
+      // the shared slot. The IIFE above already throws in this case, but
+      // the belt-and-braces check covers a future refactor where the
+      // generation could change between the IIFE return and this handler.
+      if (disconnectGeneration !== launchGeneration) {
+        try {
+          if (useCdp) {
+            const candidate = browser as unknown as { disconnect?: () => Promise<void> };
+            if (typeof candidate.disconnect === "function") {
+              void candidate.disconnect().catch(() => undefined);
+            }
+          } else {
+            void browser.close().catch(() => undefined);
+          }
+        } catch {
+          // ignore
+        }
+        throw new Error("Browser disconnecting, retry shortly.");
+      }
       sharedBrowser = browser;
       sharedBrowserIsCdp = useCdp;
       registerExitHook();
@@ -137,6 +198,12 @@ async function ensureBrowser(): Promise<Browser> {
     })
     .catch((error) => {
       const message = error instanceof Error ? error.message : String(error);
+      // Don't wrap the "Browser disconnecting" sentinel — withSession
+      // matches on its prefix and we want callers to see the same
+      // message regardless of where the bail happened.
+      if (message.startsWith("Browser disconnecting")) {
+        throw error instanceof Error ? error : new Error(message);
+      }
       if (useCdp) {
         throw new Error(
           `Failed to attach over CDP: ${message}. ` +
@@ -248,22 +315,26 @@ async function getOrCreate(taskId: string): Promise<Session> {
 // Per-tool wrapper that bumps inFlight while the work is in progress so
 // the idle sweeper never closes a session mid-call.
 async function withSession<T>(taskId: string, fn: (session: Session) => Promise<T>): Promise<T> {
-  if (disconnecting) {
+  if (inFlightDisconnects > 0) {
     // The caller is the tool layer; throwing here surfaces as a `success:
     // false` envelope from each browser_* entry point via their existing
     // catch blocks.
     throw new Error("Browser disconnecting, retry shortly.");
   }
-  // Increment the admission counter so disconnectSharedBrowser can wait
-  // for materializing sessions to either finish bumping inFlight or bail
-  // out. Decremented in the outer finally regardless of which path wins.
+  // Capture the disconnect generation BEFORE bumping pendingAdmissions so
+  // we can detect any disconnect that completes (and possibly re-completes)
+  // while getOrCreate is materializing. A boolean wouldn't be enough: by
+  // the time getOrCreate resumes the boolean may have flipped back to
+  // false, but the browser we were going to use is gone.
+  const enteredAt = disconnectGeneration;
   pendingAdmissions++;
   let session: Session;
   try {
     session = await getOrCreate(taskId);
-    if (disconnecting) {
-      // Disconnect started while we were materializing. Bail out without
-      // using the session — the browser is about to be torn down.
+    if (disconnectGeneration !== enteredAt) {
+      // Disconnect started — and possibly finished — while we were
+      // materializing. Bail out without using the session; the browser
+      // is either being torn down or already gone.
       throw new Error("Browser disconnecting, retry shortly.");
     }
     session.inFlight++;
@@ -320,29 +391,39 @@ async function closeSession(taskId: string): Promise<void> {
 // fall back to the headless launch path. Safe no-op when no shared
 // browser is held.
 export async function disconnectSharedBrowser(): Promise<void> {
-  if (disconnecting) {
-    // Another caller already kicked off teardown; piggyback rather than
-    // racing it (re-entry would double-close pages / contexts).
-    return;
-  }
-  disconnecting = true;
+  // Bump the generation FIRST so any in-flight admissions and any
+  // pendingBrowser launch capture-and-compare can detect the disconnect
+  // even if their resume runs after this function returns. Re-entrant
+  // disconnects each get their own generation; the drain loop below
+  // bails early if a NEWER generation appears, letting that newer call
+  // handle the actual teardown.
+  const myGeneration = ++disconnectGeneration;
+  inFlightDisconnects++;
   try {
     // Wait for in-flight calls AND materializing admissions to drain. We
     // can't safely close pages / contexts while tools are mid-await on
     // them — the half-completed browser call would throw a confusing
     // "Target closed" up the stack. We also have to wait for any
-    // withSession callers that have passed the disconnecting check but
+    // withSession callers that have passed the admission check but
     // haven't yet bumped inFlight: closing under them would leave a
     // suspended call holding a soon-to-be-dead session reference. Bound
     // the wait so a hung page.goto can't wedge disconnect forever; after
     // the deadline, proceed with teardown anyway.
     const drainDeadline = Date.now() + DISCONNECT_DRAIN_DEADLINE_MS;
     while (Date.now() < drainDeadline) {
+      // If a newer disconnect call has bumped the generation past ours,
+      // bail early: the newer call will run its own drain and teardown,
+      // and our continued work would just double-close pages.
+      if (disconnectGeneration !== myGeneration) return;
       let pending = 0;
       for (const session of sessions.values()) pending += session.inFlight;
       if (pending === 0 && pendingAdmissions === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
+    // Same early-exit re-check after the drain loop: a newer disconnect
+    // may have arrived while we slept the last 50ms tick. Let it own the
+    // teardown.
+    if (disconnectGeneration !== myGeneration) return;
 
     const ids = Array.from(sessions.keys());
     for (const id of ids) {
@@ -394,7 +475,7 @@ export async function disconnectSharedBrowser(): Promise<void> {
       sweepTimer = undefined;
     }
   } finally {
-    disconnecting = false;
+    inFlightDisconnects--;
   }
 }
 
@@ -1011,13 +1092,28 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
 // Internal hooks exported for unit tests. The session manager keeps its
 // state module-local so production callers don't accidentally poke at the
 // shared browser; tests need controlled access to verify the
-// disconnecting flag, inFlight draining, and the CDP-safe close fallback.
+// disconnect generation, inFlight draining, and the CDP-safe close fallback.
 export const __test = {
-  setDisconnectingForTest(value: boolean): void {
-    disconnecting = value;
+  // Bump the disconnect generation as if a disconnect ran. Tests that
+  // need to simulate "disconnect mid-admission" call this between
+  // capturing the current generation and resuming the admission.
+  bumpDisconnectGenerationForTest(): number {
+    return ++disconnectGeneration;
   },
-  isDisconnectingForTest(): boolean {
-    return disconnecting;
+  currentDisconnectGenerationForTest(): number {
+    return disconnectGeneration;
+  },
+  setInFlightDisconnectsForTest(value: number): void {
+    inFlightDisconnects = value;
+  },
+  inFlightDisconnectsForTest(): number {
+    return inFlightDisconnects;
+  },
+  installPendingBrowserForTest(promise: Promise<Browser>): void {
+    pendingBrowser = promise;
+  },
+  clearPendingBrowserForTest(): void {
+    pendingBrowser = null;
   },
   // Install a fake shared browser so the close-path tests can assert
   // disconnect()-vs-close() behavior without launching Chromium.

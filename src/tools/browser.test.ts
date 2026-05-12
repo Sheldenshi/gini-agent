@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
+import type { Browser } from "playwright-core";
 import {
   __test as browserTest,
   browserNavigate,
@@ -121,11 +122,12 @@ describe("browser disconnect lifecycle", () => {
     // subsequent tests start from zero.
     browserTest.uninstallFakeBrowserForTest();
     browserTest.clearFakeSessionsForTest();
-    browserTest.setDisconnectingForTest(false);
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.clearPendingBrowserForTest();
   });
 
-  test("disconnecting flag rejects new browser_navigate admissions", async () => {
-    browserTest.setDisconnectingForTest(true);
+  test("in-flight disconnect rejects new browser_navigate admissions", async () => {
+    browserTest.setInFlightDisconnectsForTest(1);
     const result = await browserNavigate("disconnect-test-task", { url: "https://example.com/" });
     const parsed = JSON.parse(result) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
@@ -224,31 +226,65 @@ describe("browser disconnect lifecycle", () => {
     expect(elapsed).toBeLessThan(2_000);
   });
 
-  // Round-2 review fix: withSession must re-check `disconnecting` after
-  // the async getOrCreate suspension point. Otherwise a tool call can
-  // pass the initial check, suspend in ensureBrowser, then resume against
-  // a browser that's already torn down.
-  test("withSession bails out when disconnect flips during getOrCreate suspension", async () => {
-    // Flip disconnecting from "false" to "true" between the initial check
-    // and the actual session materialization. browserNavigate routes
-    // through withSession, which awaits getOrCreate -> ensureBrowser.
-    // We can't easily inject a delay into the real ensureBrowser, but we
-    // can simulate the race by flipping the flag synchronously and then
-    // calling browserNavigate: with no real Chrome, getOrCreate either
-    // resolves (and re-check catches it) or rejects (and the throw
-    // surfaces as success: false either way). What we assert is that the
-    // call returns success: false with the disconnecting error message,
-    // not a successful navigation.
-    browserTest.setDisconnectingForTest(false);
+  // Round-3 review fix: epoch counter. withSession captures the current
+  // disconnect generation before awaiting getOrCreate; after the await
+  // resumes it compares the current generation to the captured one and
+  // bails out cleanly if a disconnect ran (or completed) in the gap.
+  // This is deterministic — we control the pendingBrowser promise so
+  // getOrCreate's await suspends until we resolve it AFTER bumping the
+  // generation.
+  test("withSession bails when disconnect generation advances during admission", async () => {
+    // Install a pendingBrowser that we control so ensureBrowser's await
+    // suspends at our latch instead of hitting playwright-core's real
+    // launch (which would fail with "Chromium not found" and obscure
+    // the assertion). The fake browser has the minimal Browser surface
+    // getOrCreate needs after the await resolves — but the test bumps
+    // the generation BEFORE we resolve, so the post-await re-check
+    // bails before getOrCreate ever touches the fake.
+    let resolveBrowser: (browser: unknown) => void = () => undefined;
+    const fakeBrowser = {
+      isConnected: () => true,
+      contexts: () => [],
+      newContext: async () => ({
+        newPage: async () => ({
+          on: () => undefined,
+          close: () => Promise.resolve(),
+          goto: () => Promise.resolve(null),
+          url: () => "about:blank",
+          title: () => Promise.resolve(""),
+          evaluate: () => Promise.resolve([])
+        }),
+        close: () => Promise.resolve()
+      }),
+      close: () => Promise.resolve()
+    };
+    const pending = new Promise<unknown>((resolve) => {
+      resolveBrowser = resolve;
+    });
+    browserTest.installPendingBrowserForTest(pending as unknown as Promise<Browser>);
+
+    // Kick off the navigation. withSession captures the generation,
+    // bumps pendingAdmissions, awaits getOrCreate -> ensureBrowser ->
+    // pendingBrowser, and suspends.
     const navigatePromise = browserNavigate("admission-race", { url: "https://example.com/" });
-    // Flip during the same microtask so the disconnecting flag is true
-    // by the time the post-getOrCreate re-check runs (or before
-    // ensureBrowser starts, in which case the launch fails — also fine,
-    // since the test asserts the call doesn't succeed against a closed
-    // browser).
-    browserTest.setDisconnectingForTest(true);
+
+    // Yield a microtask so withSession has actually entered the await
+    // chain before we bump the generation.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    // Simulate a disconnect completing while our admission was
+    // suspended. Bump the generation; this is exactly what the real
+    // disconnectSharedBrowser does at its top.
+    browserTest.bumpDisconnectGenerationForTest();
+
+    // Now resolve the pendingBrowser so the suspended admission resumes
+    // and runs the post-await re-check. It should observe the
+    // generation mismatch and bail.
+    resolveBrowser(fakeBrowser);
+
     const result = await navigatePromise;
     const parsed = JSON.parse(result) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/disconnecting/i);
   });
 });

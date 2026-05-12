@@ -391,3 +391,193 @@ describe("browser-connect round-2 hardening", () => {
     }
   });
 });
+
+describe("browser-connect round-3 hardening", () => {
+  test("blocked replacement cdpUrl does NOT tear down existing managed record", async () => {
+    const config = testConfig("blocked-keeps-existing");
+    const { mutateState } = await import("../state");
+    // Seed a managed record. A bad-input connect must not kill the user's
+    // Chrome before validation fires — the round-3 fix lifts validation
+    // to the top of connectBrowserInner so the SSRF/safety check happens
+    // BEFORE we even read `existing`.
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/KEEP",
+        pid: 555555,
+        dataDir: "/tmp/keep-me",
+        chromePath: "/never/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+    let killCalled = false;
+    __test.setKillManagedChromeForTest(async () => {
+      killCalled = true;
+    });
+    try {
+      // IPv4-mapped IPv6 metadata bypass — safetyCheck rejects with a
+      // "Blocked: ..." message wrapped in "Invalid cdpUrl: ...".
+      await expect(
+        connectBrowser(config, { cdpUrl: "ws://[::ffff:169.254.169.254]:9222/" })
+      ).rejects.toThrow(/Invalid cdpUrl/);
+      expect(killCalled).toBe(false);
+      // Old record is still there — we did not tear anything down.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.cdpUrl).toContain("KEEP");
+      expect(persisted?.pid).toBe(555555);
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  });
+
+  test("malformed replacement cdpUrl does NOT tear down existing managed record", async () => {
+    const config = testConfig("malformed-keeps-existing");
+    const { mutateState } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/KEEP",
+        pid: 555556,
+        dataDir: "/tmp/keep-me-malformed",
+        chromePath: "/never/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+    let killCalled = false;
+    __test.setKillManagedChromeForTest(async () => {
+      killCalled = true;
+    });
+    try {
+      await expect(connectBrowser(config, { cdpUrl: "not a url" })).rejects.toThrow(/Invalid cdpUrl/);
+      expect(killCalled).toBe(false);
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.cdpUrl).toContain("KEEP");
+      expect(persisted?.pid).toBe(555556);
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  });
+
+  test("mismatch teardown of a cdp-mode record skips managed kill", async () => {
+    const config = testConfig("cdp-mismatch-no-kill");
+    const { mutateState } = await import("../state");
+    // Seed a cdp-mode record (the user attached to an external Chrome).
+    // The caller then passes a *different* cdpUrl — the mismatch path
+    // must run teardown (clear state + disconnectSharedBrowser) but must
+    // NOT call killManagedChrome since we don't own the process.
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "cdp",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/EXTERNAL",
+        pid: null,
+        dataDir: null,
+        chromePath: null,
+        startedAt: new Date().toISOString()
+      };
+    });
+    let killCalled = false;
+    __test.setKillManagedChromeForTest(async () => {
+      killCalled = true;
+    });
+    try {
+      // A different valid cdpUrl. The fresh attach will fail (unreachable
+      // port 1) but the assertion is purely about the teardown order /
+      // selectivity.
+      await expect(
+        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/OTHER" })
+      ).rejects.toThrow();
+      expect(killCalled).toBe(false);
+      // State cleared by the teardown (so the user is in a clean
+      // disconnected state after the failed fresh connect).
+      const persisted = readState(config.instance).browser;
+      expect(persisted ?? null).toBeNull();
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  }, 30_000);
+
+  test("mismatch teardown writes a browser.disconnect audit row", async () => {
+    const config = testConfig("mismatch-audit");
+    const { mutateState } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/AUDIT-OLD",
+        pid: 777777,
+        dataDir: "/tmp/audit-old-dir",
+        chromePath: "/never/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+    __test.setKillManagedChromeForTest(async () => undefined);
+    try {
+      await expect(
+        connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
+      ).rejects.toThrow();
+      const state = readState(config.instance);
+      const disconnects = state.audit.filter((row) => row.action === "browser.disconnect");
+      expect(disconnects.length).toBeGreaterThanOrEqual(1);
+      // The latest audit row should reference the old record's data dir
+      // as its target (managed-mode target convention).
+      expect(disconnects[0]!.target).toBe("/tmp/audit-old-dir");
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  }, 30_000);
+
+  test("pendingDisconnect rejection propagates and clears", async () => {
+    const config = testConfig("pending-disconnect-rejection");
+    const { mutateState } = await import("../state");
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/REJ",
+        pid: 888888,
+        dataDir: "/tmp/rejection-test",
+        chromePath: "/never/real/chrome",
+        startedAt: new Date().toISOString()
+      };
+    });
+    const boom = new Error("kill failed");
+    __test.setKillManagedChromeForTest(async () => {
+      // Give both concurrent disconnects time to coalesce onto the same
+      // pendingDisconnect promise before we reject.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      throw boom;
+    });
+    try {
+      const results = await Promise.allSettled([
+        disconnectBrowser(config),
+        disconnectBrowser(config)
+      ]);
+      expect(results[0]!.status).toBe("rejected");
+      expect(results[1]!.status).toBe("rejected");
+      if (results[0]!.status === "rejected") {
+        expect((results[0]!.reason as Error).message).toBe("kill failed");
+      }
+      if (results[1]!.status === "rejected") {
+        expect((results[1]!.reason as Error).message).toBe("kill failed");
+      }
+      // The pendingDisconnect slot must have cleared so the next call
+      // is independent (we can't see the slot directly, but we can call
+      // again and expect a fresh attempt). Restore the mock to a
+      // success-returning impl, restate the record, and verify the next
+      // disconnect succeeds rather than re-rejecting the stale promise.
+      __test.setKillManagedChromeForTest(async () => undefined);
+      await mutateState(config.instance, (state) => {
+        state.browser = {
+          mode: "managed",
+          cdpUrl: "ws://127.0.0.1:9222/devtools/browser/REJ2",
+          pid: 999999,
+          dataDir: "/tmp/rejection-test-2",
+          chromePath: "/never/real/chrome",
+          startedAt: new Date().toISOString()
+        };
+      });
+      const followup = await disconnectBrowser(config);
+      expect(followup.connected).toBe(false);
+    } finally {
+      __test.restoreKillManagedChromeForTest();
+    }
+  });
+});

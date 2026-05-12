@@ -256,17 +256,33 @@ export function connectBrowser(config: RuntimeConfig, input: ConnectInput): Prom
 }
 
 async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): Promise<Status> {
+  // Validate caller input BEFORE we touch any existing state. A bad cdpUrl
+  // (malformed, blocked SSRF target, unsupported protocol) or out-of-range
+  // port must surface as a 400 to the caller without tearing down the
+  // user's already-managed Chrome. Previously the mismatch check used the
+  // raw input string, triggered tearDownExistingConnection (killing the
+  // user's Chrome), and only THEN ran validation — see round-3 review.
+  let validatedCallerCdp: string | undefined;
+  if (typeof input.cdpUrl === "string" && input.cdpUrl.length > 0) {
+    const validated = validateCdpUrl(input.cdpUrl);
+    if (!validated.ok) throw new Error(validated.error);
+    const httpForm = cdpHttpForm(validated.url);
+    const blocked = safetyCheck(httpForm);
+    if (blocked) throw new Error(`Invalid cdpUrl: ${blocked}`);
+    validatedCallerCdp = validated.url;
+  }
+  const validatedCallerPort =
+    input.port !== undefined && input.port !== null && input.port !== ""
+      ? validatePort(input.port, DEFAULT_CDP_PORT)
+      : undefined;
+
   const existing = readState(config.instance).browser ?? null;
   if (existing) {
     // If the caller explicitly asked for a *different* endpoint than what's
     // stored, don't short-circuit on the old record — fall through to the
     // teardown + fresh attach path.
-    const callerCdp = typeof input.cdpUrl === "string" && input.cdpUrl.length > 0
-      ? input.cdpUrl
-      : undefined;
-    const callerPort = input.port !== undefined && input.port !== null && input.port !== ""
-      ? validatePort(input.port, DEFAULT_CDP_PORT)
-      : undefined;
+    const callerCdp = validatedCallerCdp;
+    const callerPort = validatedCallerPort;
     const targetsSameEndpoint = targetsExistingRecord(existing, callerCdp, callerPort);
 
     if (targetsSameEndpoint) {
@@ -311,10 +327,9 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
   // left in a clean disconnected state rather than half-leaked. The
   // thrown error propagates up to the HTTP handler, which maps it to the
   // appropriate status code.
-  const result =
-    typeof input.cdpUrl === "string" && input.cdpUrl.length > 0
-      ? await connectExisting(config, input.cdpUrl)
-      : await launchManaged(config, validatePort(input.port, DEFAULT_CDP_PORT));
+  const result = validatedCallerCdp
+    ? await connectExisting(config, validatedCallerCdp)
+    : await launchManaged(config, validatedCallerPort ?? DEFAULT_CDP_PORT);
 
   // If a tool ran headless before this connect, the session manager's
   // cached `sharedBrowser` is still the headless Browser — and
@@ -338,9 +353,18 @@ async function tearDownExistingConnection(
 ): Promise<void> {
   // Clear state FIRST so any concurrent ensureBrowser() callers that
   // re-enter during teardown see fresh state and don't reattach to the
-  // soon-to-be-dead endpoint.
+  // soon-to-be-dead endpoint. Emit the same browser.disconnect audit row
+  // disconnectBrowserInner writes so a mismatch-reconnect leaves the
+  // activity log indistinguishable from a user-initiated disconnect.
   await mutateState(config.instance, (state) => {
     state.browser = null;
+    addAudit(state, {
+      actor: "user",
+      action: "browser.disconnect",
+      target: existing.mode === "managed" ? existing.dataDir ?? "managed" : redactUrlCredentials(existing.cdpUrl),
+      risk: "medium",
+      evidence: { mode: existing.mode, pid: existing.pid }
+    });
   });
   await disconnectSharedBrowser();
   if (existing.mode === "managed" && existing.pid !== null) {
@@ -380,23 +404,17 @@ function targetsExistingRecord(
   return true;
 }
 
-async function connectExisting(config: RuntimeConfig, rawUrl: string): Promise<Status> {
-  const validated = validateCdpUrl(rawUrl);
-  if (!validated.ok) throw new Error(validated.error);
-  const httpForm = cdpHttpForm(validated.url);
-  // SSRF guard. The user could otherwise tell us to attach to
-  // `ws://[::ffff:169.254.169.254]:9222/...` and we'd happily probe cloud
-  // metadata. safetyCheck only speaks http(s), so we hand it the http
-  // form derived from the ws:// URL — same host, just a different scheme.
-  const blocked = safetyCheck(httpForm);
-  if (blocked) {
-    throw new Error(`Invalid cdpUrl: ${blocked}`);
-  }
+// `validatedUrl` is the WHATWG-normalized form already vetted by
+// connectBrowserInner (validateCdpUrl + safetyCheck against the http
+// form). We re-derive the http form here for the probe rather than
+// threading both representations through the call site.
+async function connectExisting(config: RuntimeConfig, validatedUrl: string): Promise<Status> {
+  const httpForm = cdpHttpForm(validatedUrl);
   const probe = await probeCdp(httpForm, PROBE_TIMEOUT_MS);
   if (!probe) {
-    throw new Error(`Could not reach CDP endpoint at ${redactUrlCredentials(validated.url)}`);
+    throw new Error(`Could not reach CDP endpoint at ${redactUrlCredentials(validatedUrl)}`);
   }
-  const probeUrl = probe.webSocketDebuggerUrl ?? validated.url;
+  const probeUrl = probe.webSocketDebuggerUrl ?? validatedUrl;
   const record: BrowserConnectionRecord = {
     mode: "cdp",
     // Strip embedded credentials before persisting. The audit row used
