@@ -33,6 +33,11 @@ export interface SetupStep {
 const SUGGESTED_OPENAI_MODELS = ["gpt-5.4-mini", "gpt-5.4", "gpt-4o"] as const;
 const DEFAULT_OPENAI_MODEL = SUGGESTED_OPENAI_MODELS[0];
 
+const COLOR_ENABLED = Boolean(process.stdout.isTTY) && process.env.TERM !== "dumb";
+const COLOR = COLOR_ENABLED
+  ? { cyan: "\x1b[36m", bold: "\x1b[1m", reset: "\x1b[0m", dim: "\x1b[2m" }
+  : { cyan: "", bold: "", reset: "", dim: "" };
+
 function secretsPath(): string {
   // Prefer $HOME so tests that override the env var see the override.
   // os.homedir() caches the platform's getpwuid result on macOS and won't
@@ -325,6 +330,13 @@ function makeReadlineIO(): DisposableIO {
   return {
     isNonInteractive: false,
     async select<T>(prompt: string, choices: { label: string; value: T }[], defaultIndex = 0): Promise<T> {
+      if (process.stdin.isTTY && typeof process.stdin.setRawMode === "function") {
+        try {
+          return await tuiSelect(prompt, choices, defaultIndex, rl);
+        } catch {
+          // Fall through to numbered fallback on unexpected TUI failure.
+        }
+      }
       while (true) {
         console.log(prompt);
         for (let i = 0; i < choices.length; i += 1) {
@@ -362,6 +374,172 @@ function makeReadlineIO(): DisposableIO {
     error(msg: string) { console.error(msg); },
     close() { rl.close(); }
   };
+}
+
+// Arrow-key TUI menu. TTY-only — caller falls back to numbered selection on
+// throw. Like readSecret, we pause readline so it doesn't race us for stdin
+// bytes.
+async function tuiSelect<T>(
+  prompt: string,
+  choices: { label: string; value: T }[],
+  defaultIndex: number,
+  rl: readline.Interface
+): Promise<T> {
+  if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+    throw new Error("tuiSelect requires a TTY");
+  }
+  if (choices.length === 0) {
+    throw new Error("tuiSelect requires at least one choice");
+  }
+  const startIndex = defaultIndex >= 0 && defaultIndex < choices.length ? defaultIndex : 0;
+  let cursor = startIndex;
+
+  rl.pause();
+  process.stdout.write("\x1b[?25l");
+
+  const trimmedPrompt = prompt.replace(/^\n+/, "");
+  const leadingNewlines = prompt.slice(0, prompt.length - trimmedPrompt.length);
+  if (leadingNewlines) process.stdout.write(leadingNewlines);
+
+  let renderedLines = 0;
+
+  const render = (firstPass: boolean): void => {
+    if (!firstPass && renderedLines > 0) {
+      for (let i = 0; i < renderedLines; i += 1) {
+        process.stdout.write("\x1b[1A\x1b[2K");
+      }
+    }
+    const lines: string[] = [];
+    lines.push(trimmedPrompt);
+    lines.push("");
+    for (let i = 0; i < choices.length; i += 1) {
+      const isSelected = i === cursor;
+      if (isSelected) {
+        lines.push(`${COLOR.cyan}  → ●${COLOR.reset} ${COLOR.bold}${choices[i]!.label}${COLOR.reset}`);
+      } else {
+        lines.push(`    ○ ${choices[i]!.label}`);
+      }
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+    renderedLines = lines.length;
+  };
+
+  render(true);
+
+  return new Promise<T>((resolveChoice, rejectChoice) => {
+    // The Escape key is `\x1b`, but arrow keys also begin with `\x1b` and
+    // arrive as a multi-byte sequence (`\x1b[A`, `\x1bOA`, etc.). When a
+    // chunk is exactly `\x1b` we can't immediately tell which it is, so we
+    // wait 50ms for the rest of the sequence; if nothing arrives, treat it
+    // as a standalone Escape press.
+    let escTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (): void => {
+      if (escTimer) { clearTimeout(escTimer); escTimer = null; }
+      process.stdin.removeListener("data", onData);
+      try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+      process.stdin.pause();
+      process.stdout.write("\x1b[?25h");
+      rl.resume();
+    };
+
+    const selectAt = (idx: number): void => {
+      cursor = idx;
+      render(false);
+      finish();
+      resolveChoice(choices[cursor]!.value);
+    };
+
+    const handleSequence = (seq: string): void => {
+      if (seq === "\x1b[A" || seq === "\x1bOA") {
+        cursor = (cursor - 1 + choices.length) % choices.length;
+        render(false);
+        return;
+      }
+      if (seq === "\x1b[B" || seq === "\x1bOB") {
+        cursor = (cursor + 1) % choices.length;
+        render(false);
+        return;
+      }
+    };
+
+    const onData = (chunk: Buffer): void => {
+      const str = chunk.toString("utf8");
+
+      if (escTimer && str.length > 0) {
+        clearTimeout(escTimer);
+        escTimer = null;
+        if (str.startsWith("[") || str.startsWith("O")) {
+          handleSequence("\x1b" + str);
+          return;
+        }
+        cursor = startIndex;
+        render(false);
+        finish();
+        resolveChoice(choices[cursor]!.value);
+        return;
+      }
+
+      if (str === "\x1b") {
+        escTimer = setTimeout(() => {
+          escTimer = null;
+          cursor = startIndex;
+          render(false);
+          finish();
+          resolveChoice(choices[cursor]!.value);
+        }, 50);
+        return;
+      }
+
+      if (str.startsWith("\x1b[") || str.startsWith("\x1bO")) {
+        handleSequence(str);
+        return;
+      }
+
+      for (const ch of str) {
+        const code = ch.charCodeAt(0);
+        if (code === 13 || code === 10) {
+          selectAt(cursor);
+          return;
+        }
+        if (code === 3) {
+          finish();
+          process.stdout.write("\n");
+          process.exit(130);
+          return;
+        }
+        if (ch === "k") {
+          cursor = (cursor - 1 + choices.length) % choices.length;
+          render(false);
+          continue;
+        }
+        if (ch === "j") {
+          cursor = (cursor + 1) % choices.length;
+          render(false);
+          continue;
+        }
+        if (code >= 49 && code <= 57) {
+          const idx = code - 49;
+          if (idx < choices.length) {
+            selectAt(idx);
+            return;
+          }
+        }
+      }
+    };
+
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("data", onData);
+
+    // Defensive: surface unexpected stream errors so the caller can fall back.
+    const onError = (err: Error): void => {
+      process.stdin.removeListener("error", onError);
+      finish();
+      rejectChoice(err);
+    };
+    process.stdin.once("error", onError);
+  });
 }
 
 // Read a line without echoing it. Falls back to plain readline (with a
