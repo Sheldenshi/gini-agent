@@ -44,6 +44,16 @@ let chromiumImport: Promise<typeof import("playwright-core").chromium> | undefin
 // In-flight launch promise so concurrent ensureBrowser callers share one
 // chromium.launch() instead of orphaning the loser's Browser.
 let pendingBrowser: Promise<Browser> | null = null;
+// Set to true while disconnectSharedBrowser is tearing down the shared
+// browser handle. withSession rejects new admissions during that window
+// so a concurrent tool call doesn't re-enter ensureBrowser() and either
+// reattach to the about-to-die remote or race the close-and-launch path.
+// Cleared in the finally of disconnectSharedBrowser.
+let disconnecting = false;
+// How long disconnectSharedBrowser waits for inFlight sessions to drain
+// before forcing teardown. Better to risk tearing down a slow in-flight
+// call than to wedge disconnect forever waiting on a hung page.goto.
+const DISCONNECT_DRAIN_DEADLINE_MS = 5_000;
 const sessions = new Map<string, Session>();
 // Set at runtime startup via setBrowserInstance(). Lets ensureBrowser()
 // look up state.browser to decide between connectOverCDP() and launch().
@@ -229,6 +239,12 @@ async function getOrCreate(taskId: string): Promise<Session> {
 // Per-tool wrapper that bumps inFlight while the work is in progress so
 // the idle sweeper never closes a session mid-call.
 async function withSession<T>(taskId: string, fn: (session: Session) => Promise<T>): Promise<T> {
+  if (disconnecting) {
+    // The caller is the tool layer; throwing here surfaces as a `success:
+    // false` envelope from each browser_* entry point via their existing
+    // catch blocks.
+    throw new Error("Browser disconnecting, retry shortly.");
+  }
   const session = await getOrCreate(taskId);
   session.inFlight++;
   try {
@@ -281,47 +297,77 @@ async function closeSession(taskId: string): Promise<void> {
 // fall back to the headless launch path. Safe no-op when no shared
 // browser is held.
 export async function disconnectSharedBrowser(): Promise<void> {
-  const ids = Array.from(sessions.keys());
-  for (const id of ids) {
-    const session = sessions.get(id);
-    sessions.delete(id);
-    if (!session) continue;
-    try {
-      // For sessions reusing the user's default context, close just the
-      // page so we don't close the user's tabs. For sessions that own
-      // their context, close the context as usual.
-      if (session.ownsContext) {
-        await session.context.close().catch(() => undefined);
-      } else {
-        await session.page.close().catch(() => undefined);
-      }
-    } catch {
-      // ignore
-    }
+  if (disconnecting) {
+    // Another caller already kicked off teardown; piggyback rather than
+    // racing it (re-entry would double-close pages / contexts).
+    return;
   }
-  consoleLogs.clear();
-  if (sharedBrowser) {
-    try {
-      // Use disconnect() rather than close() over CDP — close() over CDP
-      // also terminates the remote browser, which the user owns. The
-      // Browser type from playwright-core only exposes disconnect on
-      // CDP-attached instances, so we probe at runtime and fall back to
-      // close() for local launches.
-      const candidate = sharedBrowser as unknown as { disconnect?: () => Promise<void> };
-      if (sharedBrowserIsCdp && typeof candidate.disconnect === "function") {
-        await candidate.disconnect();
-      } else {
-        await sharedBrowser.close();
-      }
-    } catch {
-      // ignore
+  disconnecting = true;
+  try {
+    // Wait for in-flight calls to drain. We can't safely close pages /
+    // contexts while tools are mid-await on them — the half-completed
+    // browser call would throw a confusing "Target closed" up the stack.
+    // Bound the wait so a hung page.goto can't wedge disconnect forever;
+    // after the deadline, proceed with teardown anyway.
+    const drainDeadline = Date.now() + DISCONNECT_DRAIN_DEADLINE_MS;
+    while (Date.now() < drainDeadline) {
+      let pending = 0;
+      for (const session of sessions.values()) pending += session.inFlight;
+      if (pending === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
-    sharedBrowser = undefined;
-    sharedBrowserIsCdp = false;
-  }
-  if (sweepTimer) {
-    clearInterval(sweepTimer);
-    sweepTimer = undefined;
+
+    const ids = Array.from(sessions.keys());
+    for (const id of ids) {
+      const session = sessions.get(id);
+      sessions.delete(id);
+      if (!session) continue;
+      try {
+        // For sessions reusing the user's default context, close just the
+        // page so we don't close the user's tabs. For sessions that own
+        // their context, close the context as usual.
+        if (session.ownsContext) {
+          await session.context.close().catch(() => undefined);
+        } else {
+          await session.page.close().catch(() => undefined);
+        }
+      } catch {
+        // ignore
+      }
+    }
+    consoleLogs.clear();
+    if (sharedBrowser) {
+      try {
+        // Use disconnect() rather than close() over CDP — close() over CDP
+        // also terminates the remote browser, which the user owns. The
+        // Browser type from playwright-core only exposes disconnect on
+        // CDP-attached instances, so we probe at runtime.
+        const candidate = sharedBrowser as unknown as { disconnect?: () => Promise<void> };
+        if (sharedBrowserIsCdp) {
+          if (typeof candidate.disconnect === "function") {
+            await candidate.disconnect();
+          }
+          // No disconnect() available on this CDP-attached Browser handle.
+          // We deliberately do NOT fall back to close() — close() over CDP
+          // also terminates the user's Chrome. Leaking the in-process
+          // Playwright handle is strictly better than killing the user's
+          // browser; the handle will be garbage-collected once nothing
+          // references it.
+        } else {
+          await sharedBrowser.close();
+        }
+      } catch {
+        // ignore
+      }
+      sharedBrowser = undefined;
+      sharedBrowserIsCdp = false;
+    }
+    if (sweepTimer) {
+      clearInterval(sweepTimer);
+      sweepTimer = undefined;
+    }
+  } finally {
+    disconnecting = false;
   }
 }
 
@@ -346,10 +392,17 @@ export async function closeAll(): Promise<void> {
     try {
       // Mirror disconnectSharedBrowser's CDP-aware teardown: over CDP we
       // disconnect the Playwright handle without killing the user's
-      // Chrome; for the headless-launch path we close() as before.
+      // Chrome; for the headless-launch path we close() as before. We
+      // deliberately do NOT fall back to close() when disconnect() is
+      // unavailable on a CDP-attached handle — close() would terminate
+      // the user's Chrome.
       const candidate = sharedBrowser as unknown as { disconnect?: () => Promise<void> };
-      if (sharedBrowserIsCdp && typeof candidate.disconnect === "function") {
-        await candidate.disconnect();
+      if (sharedBrowserIsCdp) {
+        if (typeof candidate.disconnect === "function") {
+          await candidate.disconnect();
+        }
+        // Otherwise: leak the in-process handle on purpose (see comment
+        // above in disconnectSharedBrowser).
       } else {
         await sharedBrowser.close();
       }
@@ -927,3 +980,50 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
     return fail(error instanceof Error ? error.message : String(error));
   }
 }
+
+// Internal hooks exported for unit tests. The session manager keeps its
+// state module-local so production callers don't accidentally poke at the
+// shared browser; tests need controlled access to verify the
+// disconnecting flag, inFlight draining, and the CDP-safe close fallback.
+export const __test = {
+  setDisconnectingForTest(value: boolean): void {
+    disconnecting = value;
+  },
+  isDisconnectingForTest(): boolean {
+    return disconnecting;
+  },
+  // Install a fake shared browser so the close-path tests can assert
+  // disconnect()-vs-close() behavior without launching Chromium.
+  installFakeBrowserForTest(
+    browser: Pick<Browser, "close"> & Partial<{ disconnect: () => Promise<void> }>,
+    isCdp: boolean
+  ): void {
+    sharedBrowser = browser as Browser;
+    sharedBrowserIsCdp = isCdp;
+  },
+  uninstallFakeBrowserForTest(): { sharedBrowser: Browser | undefined; sharedBrowserIsCdp: boolean } {
+    const captured = { sharedBrowser, sharedBrowserIsCdp };
+    sharedBrowser = undefined;
+    sharedBrowserIsCdp = false;
+    return captured;
+  },
+  // Synchronously poke inFlight on a synthetic session so the drain
+  // test can verify disconnect waits without spinning up Playwright.
+  installFakeSessionForTest(taskId: string, inFlight: number): void {
+    sessions.set(taskId, {
+      context: {} as BrowserContext,
+      page: { close: () => Promise.resolve() } as unknown as Page,
+      refs: new Map(),
+      lastActivity: Date.now(),
+      inFlight,
+      ownsContext: false
+    });
+  },
+  setFakeSessionInFlight(taskId: string, inFlight: number): void {
+    const session = sessions.get(taskId);
+    if (session) session.inFlight = inFlight;
+  },
+  clearFakeSessionsForTest(): void {
+    sessions.clear();
+  }
+};

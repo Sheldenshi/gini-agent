@@ -291,11 +291,19 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
     });
   }
 
-  if (typeof input.cdpUrl === "string" && input.cdpUrl.length > 0) {
-    return connectExisting(config, input.cdpUrl);
-  }
-  const port = validatePort(input.port, DEFAULT_CDP_PORT);
-  return launchManaged(config, port);
+  const result =
+    typeof input.cdpUrl === "string" && input.cdpUrl.length > 0
+      ? await connectExisting(config, input.cdpUrl)
+      : await launchManaged(config, validatePort(input.port, DEFAULT_CDP_PORT));
+
+  // If a tool ran headless before this connect, the session manager's
+  // cached `sharedBrowser` is still the headless Browser — and
+  // ensureBrowser() would short-circuit to it on the next call, silently
+  // ignoring the fresh CDP record we just wrote. Drop the cached handle
+  // here so the next browser_* call rebuilds via the CDP branch.
+  await disconnectSharedBrowser();
+
+  return result;
 }
 
 // Compare the caller's requested endpoint against the existing record.
