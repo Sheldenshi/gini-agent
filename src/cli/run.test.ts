@@ -55,13 +55,13 @@ async function spawnRun(h: RunHarness): Promise<{
   child.stdout?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
   child.stderr?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
   // Wait for the start banner to appear so callers know the runtime is live.
-  // The banner JSON includes "instance": "<our instance>" — that's the most specific
+  // The banner prints `Instance  <our instance>` — that's the most specific
   // marker and avoids matching incidental output from a different instance.
   const stdout = new Promise<string>((resolveOut) => {
     let combined = "";
     const onData = (chunk: Buffer) => {
       combined += chunk.toString("utf8");
-      if (combined.includes(`"instance": "${h.instance}"`)) {
+      if (combined.includes(`Instance  ${h.instance}`)) {
         child.stdout?.off("data", onData);
         resolveOut(combined);
       }
@@ -84,8 +84,8 @@ describe("gini run", () => {
     const h = makeHarness("sigterm");
     const { child, stdout, exit } = await spawnRun(h);
     const banner = await stdout;
-    expect(banner).toContain(`"instance": "${h.instance}"`);
-    expect(banner).toContain(`"foreground": true`);
+    expect(banner).toContain(`Instance  ${h.instance}`);
+    expect(banner).toContain(`foreground`);
     expect(child.pid).toBeDefined();
 
     // Capture all child PIDs we spawned so we can confirm none survive teardown.

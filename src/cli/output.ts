@@ -2,6 +2,54 @@ export function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
+const ANSI = {
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  dim: "\x1b[2m",
+  bold: "\x1b[1m",
+  reset: "\x1b[0m"
+} as const;
+
+function paint(color: keyof typeof ANSI, text: string): string {
+  // Skip colors when stdout isn't a TTY (piped/redirected) so callers parsing
+  // output don't have to strip escape codes.
+  if (!process.stdout.isTTY) return text;
+  return `${ANSI[color]}${text}${ANSI.reset}`;
+}
+
+interface StartBanner {
+  started?: boolean;
+  running?: boolean;
+  url?: string;
+  webUrl?: string;
+  webError?: string;
+  instance?: string;
+  foreground?: boolean;
+}
+
+// Friendly multi-line banner for `gini start` / `gini run`. Replaces the raw
+// JSON dump so users see a clear status indicator and clickable web URL.
+// Keeps each field on its own line — terminals make URLs clickable when they
+// stand alone with no surrounding punctuation.
+export function printStartBanner(value: unknown): void {
+  const banner = value as StartBanner;
+  const justStarted = banner.started === true;
+  const wasRunning = !justStarted && banner.running === true;
+  const dot = paint("green", "●");
+  const verb = justStarted ? "started" : wasRunning ? "running" : "running";
+  const mode = banner.foreground ? paint("dim", " (foreground — Ctrl-C to stop)") : "";
+  const lines: string[] = [];
+  lines.push(`${dot} ${paint("bold", "Gini")} ${verb}${mode}`);
+  if (banner.instance) lines.push(`  ${paint("dim", "Instance")}  ${banner.instance}`);
+  if (banner.webUrl) lines.push(`  ${paint("dim", "Web     ")}  ${banner.webUrl}`);
+  if (banner.url) lines.push(`  ${paint("dim", "Runtime ")}  ${banner.url}`);
+  if (banner.webError) {
+    lines.push(`  ${paint("yellow", "⚠ Web failed:")} ${banner.webError}`);
+  }
+  console.log(lines.join("\n"));
+}
+
 export function compactTask(task: { id: string; status: string; title: string; updatedAt: string }) {
   return { id: task.id, status: task.status, title: task.title, updatedAt: task.updatedAt };
 }
