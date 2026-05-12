@@ -54,14 +54,13 @@ Install with one command:
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
 ```
 
-The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `main` instance by default. State lives under `~/.gini/instances/main/`. If the installer is run in an interactive terminal it walks you through `gini setup` immediately; the curl|bash piped form skips that and asks you to run it yourself. After install, reload your shell PATH if needed, then:
+The installer drops a `gini` wrapper at `~/.local/bin/gini` that runs against the `main` instance by default. State lives under `~/.gini/instances/main/`. The installer walks you through provider configuration interactively (OpenAI API key or existing `codex --login` auth). After install, reload your shell PATH if needed, then:
 
 ```bash
-gini setup    # configures your LLM provider (asks for an OpenAI API key)
 gini start
 ```
 
-`gini setup` writes your API key to `~/.gini/secrets.env` (mode 0600). The installed wrapper sources that file on every invocation so the key is never written to `config.json` and never leaves your machine except in API calls to the configured provider. `gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL.
+`gini start` launches the runtime gateway and the Next.js web control plane and prints the runtime gateway URL and the web URL. API keys are stored at `~/.gini/secrets.env` (mode 0600) and sourced by the wrapper — never written to `config.json`.
 
 ### Update
 
