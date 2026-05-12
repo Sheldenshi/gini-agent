@@ -39,6 +39,7 @@ import { events } from "./commands/events";
 import { evidence } from "./commands/evidence";
 import { smoke } from "./commands/smoke";
 import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, uninstall, update } from "./commands/admin";
+import { setup } from "./commands/setup";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -96,6 +97,7 @@ export async function run(): Promise<void> {
     case "status": await statusCmd(ctx); break;
     case "doctor": await doctorCmd(ctx); break;
     case "reset": reset(ctx); break;
+    case "setup": await setup(ctx); break;
     case "task": await task(ctx); break;
     case "chat": await chat(ctx); break;
     case "run-record":

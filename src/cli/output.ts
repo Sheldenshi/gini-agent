@@ -25,6 +25,7 @@ Usage:
   bun run gini run [--instance dev] [--no-web]
   bun run gini uninstall [--instance <name>] [--yes] [--purge]
   bun run gini update
+  bun run gini setup [--force] [--yes]
   bun run gini task submit <prompt>
   bun run gini task list
   bun run gini task show <task-id>
