@@ -331,6 +331,16 @@ function json(value: unknown, statusCode = 200): Response {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Invalid input")) return 400;
+  // Browser-connect surfaces user-input failures with these prefixes;
+  // forward them to 400 so the webapp can surface the original error text
+  // rather than a generic "internal error". Connectivity failures
+  // (unreachable CDP) and discovery failures (no Chrome on PATH) are also
+  // user-correctable, not internal errors.
+  if (message.startsWith("Invalid cdpUrl")) return 400;
+  if (message.startsWith("Unsupported cdpUrl protocol")) return 400;
+  if (message.startsWith("Invalid port")) return 400;
+  if (message.startsWith("Could not reach CDP endpoint")) return 400;
+  if (message.startsWith("Could not locate")) return 400;
   return 500;
 }
 

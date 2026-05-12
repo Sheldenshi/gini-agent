@@ -1,5 +1,6 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
+import * as net from "node:net";
 import { __test, connectBrowser, disconnectBrowser, getBrowserConnection } from "./browser-connect";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -168,4 +169,141 @@ describe("browser-connect API surface", () => {
     const state = readState(config.instance);
     expect(state.browser ?? null).toBeNull();
   }, 60_000);
+});
+
+describe("browser-connect round-1 hardening", () => {
+  test("safetyCheck blocks IPv4-mapped IPv6 metadata via ws://", async () => {
+    const config = testConfig("safety-mapped-metadata");
+    // The SSRF guard converts the ws:// URL to its http:// sibling and
+    // hands that off to safetyCheck. The IPv4-mapped IPv6 form of
+    // 169.254.169.254 is one of the cloud metadata bypasses we
+    // specifically must reject.
+    await expect(
+      connectBrowser(config, { cdpUrl: "ws://[::ffff:169.254.169.254]:9222/devtools/browser/abc" })
+    ).rejects.toThrow(/Invalid cdpUrl/);
+  });
+
+  test("safetyCheck blocks link-local IPv6 over wss://", async () => {
+    const config = testConfig("safety-linklocal-ipv6");
+    await expect(
+      connectBrowser(config, { cdpUrl: "wss://[fe80::1]:9222/devtools/browser/abc" })
+    ).rejects.toThrow(/Invalid cdpUrl/);
+  });
+
+  test("stripUrlCredentials drops user:pass@ for storage", () => {
+    const stripped = __test.stripUrlCredentials("ws://alice:secret@127.0.0.1:9222/devtools/browser/abc");
+    expect(stripped).not.toContain("alice");
+    expect(stripped).not.toContain("secret");
+    expect(stripped).toContain("127.0.0.1");
+  });
+
+  test("stripUrlCredentials leaves clean URLs untouched", () => {
+    const clean = "ws://127.0.0.1:9222/devtools/browser/abc";
+    expect(__test.stripUrlCredentials(clean)).toBe(clean);
+  });
+
+  test("ensurePortAvailable rejects when port is bound", async () => {
+    // Bind a listener so the helper sees EADDRINUSE. Picking 0 lets the
+    // OS assign a free ephemeral port; we then ask the helper about that
+    // same port and expect rejection.
+    await new Promise<void>(async (resolve, reject) => {
+      const server = net.createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", async () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") {
+          server.close();
+          reject(new Error("no port assigned"));
+          return;
+        }
+        const port = addr.port;
+        try {
+          await expect(__test.ensurePortAvailable(port)).rejects.toThrow(/already in use/);
+          resolve();
+        } catch (error) {
+          reject(error);
+        } finally {
+          server.close();
+        }
+      });
+    });
+  });
+
+  test("ensurePortAvailable succeeds when port is free", async () => {
+    // Take an ephemeral port, close it, then probe — the kernel will
+    // typically hand it back to us. (TIME_WAIT means this can flake, but
+    // SO_REUSEADDR-default net.createServer should be fine on Bun.)
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = net.createServer();
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address();
+        if (!addr || typeof addr === "string") {
+          server.close();
+          reject(new Error("no port assigned"));
+          return;
+        }
+        const p = addr.port;
+        server.close(() => resolve(p));
+      });
+    });
+    await expect(__test.ensurePortAvailable(port)).resolves.toBeUndefined();
+  });
+
+  test("isPidStillChrome returns false when ps cmdline doesn't match", () => {
+    // pid 1 (the init process) is guaranteed to exist on macOS/Linux but
+    // its cmdline will never include the magical /Applications/Google
+    // Chrome.app path nor a --user-data-dir flag. The identity check must
+    // refuse to accept it.
+    const matches = __test.isPidStillChrome(
+      1,
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/tmp/never-was-a-real-data-dir"
+    );
+    expect(matches).toBe(false);
+  });
+
+  test("idempotent connect refreshes cdpUrl from the probe response", async () => {
+    const config = testConfig("idempotent-refresh");
+    // Stand up a tiny HTTP server that pretends to be /json/version. We
+    // record a stale URL, then watch the connect flow refresh it to the
+    // new UUID the server reports.
+    let server: ReturnType<typeof Bun.serve> | undefined;
+    try {
+      server = Bun.serve({
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/json/version") {
+            return Response.json({
+              Browser: "TestChrome/0.0",
+              webSocketDebuggerUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/FRESH-UUID`
+            });
+          }
+          return new Response("nope", { status: 404 });
+        }
+      });
+      const { mutateState } = await import("../state");
+      await mutateState(config.instance, (state) => {
+        state.browser = {
+          mode: "cdp",
+          cdpUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/OLD-STALE-UUID`,
+          pid: null,
+          dataDir: null,
+          chromePath: null,
+          startedAt: new Date().toISOString()
+        };
+      });
+
+      const result = await connectBrowser(config, {});
+      expect(result.connected).toBe(true);
+      expect(result.record?.cdpUrl).toContain("FRESH-UUID");
+      expect(result.record?.cdpUrl).not.toContain("OLD-STALE-UUID");
+      // State should also reflect the refresh.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.cdpUrl).toContain("FRESH-UUID");
+    } finally {
+      server?.stop(true);
+    }
+  });
 });

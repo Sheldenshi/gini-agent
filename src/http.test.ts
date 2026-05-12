@@ -598,6 +598,84 @@ describe("runtime api", () => {
     expect(chat.messages.some((message: { role: string; runId?: string }) => message.role === "assistant" && message.runId === submitted.runId)).toBe(true);
     expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
   });
+
+  // Round-1 review fix: browser-connect throws with prefixes that the
+  // gateway's catch-all previously mapped to 500. The webapp needs them as
+  // 4xx so it can render the original message instead of "internal error".
+  test("browser connect returns 400 for unsupported cdpUrl protocol", async () => {
+    const config = testConfig("browser-bad-proto");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ cdpUrl: "file:///etc/passwd" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Unsupported/);
+  });
+
+  test("browser connect returns 400 for garbage cdpUrl", async () => {
+    const config = testConfig("browser-bad-url");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ cdpUrl: "not-a-url" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Invalid cdpUrl/);
+  });
+
+  test("browser connect returns 400 for invalid port", async () => {
+    const config = testConfig("browser-bad-port");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ port: 999999 })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Invalid port/);
+  });
+
+  test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
+    const config = testConfig("browser-unreachable");
+    const handler = createHandler(config);
+    // Port 1 is reserved; probe will time out. The point of this test is
+    // the status mapping, so use a short-lived test by aborting once we
+    // see the response.
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ cdpUrl: "http://127.0.0.1:1/" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Could not reach CDP endpoint/);
+  }, 30_000);
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
