@@ -43,9 +43,15 @@ function loadChromium(): Promise<typeof import("playwright-core").chromium> {
 async function ensureBrowser(): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) return sharedBrowser;
   if (pendingBrowser) return pendingBrowser;
-  const chromium = await loadChromium();
-  pendingBrowser = chromium
-    .launch({ headless: true })
+  // Assign pendingBrowser synchronously (before any await) so two concurrent
+  // cold-start callers share one launch promise. If we awaited loadChromium()
+  // first, both callers would pass the null check, both would suspend on the
+  // dynamic import, and each would then call chromium.launch() — orphaning
+  // the loser. Mirrors the IIFE pattern already correct in getOrCreate.
+  pendingBrowser = (async () => {
+    const chromium = await loadChromium();
+    return chromium.launch({ headless: true });
+  })()
     .then((browser) => {
       sharedBrowser = browser;
       registerExitHook();
@@ -229,18 +235,18 @@ function isLinkLocal(host: string): boolean {
 // Not a full SSRF sandbox — proportional to the design's "lightweight
 // guard" intent.
 function isBlockedIpv6(host: string): string | undefined {
-  // fe80::/10 — first 10 bits are 1111 1110 10, so the second hex nibble
-  // is in 8..b. Match fe80, fe90, fea0, feb0 prefixes followed by a colon
-  // (so we don't catch e.g. fe8a:: that's outside the range — but the
-  // bypass we care about is the obvious [fe80::1] style).
-  if (/^fe[89ab][0-9a-f]?:/i.test(host)) {
+  // fe80::/10 — first 10 bits are 1111 1110 10, so the first 16 bits fall
+  // in fe80..febf. Require all four hex digits in the leading group so
+  // shorter forms like `fe8::` (which expand to 0fe8::, outside the range)
+  // don't false-positive. fe8a:: is inside the range and correctly matches.
+  if (/^fe[89ab][0-9a-f]:/i.test(host)) {
     return `Blocked: ${host} is an IPv6 link-local address.`;
   }
   if (host === "::1") {
     return `Blocked: ${host} is the IPv6 loopback address.`;
   }
-  // ::ffff:a.b.c.d — IPv4-mapped IPv6. Re-run the IPv4 link-local /
-  // metadata check against the trailing dotted quad.
+  // ::ffff:a.b.c.d — IPv4-mapped IPv6 in dotted-quad form. Re-run the
+  // IPv4 link-local / metadata check against the trailing dotted quad.
   const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(host);
   if (mapped) {
     const ipv4 = mapped[1]!;
@@ -251,10 +257,49 @@ function isBlockedIpv6(host: string): string | undefined {
       return `Blocked: ${host} maps to ${ipv4}, a link-local address.`;
     }
   }
+  // ::ffff:HHHH:HHHH — same IPv4-mapped address but in canonical hex form.
+  // Bun normalizes `[::ffff:169.254.169.254]` to `[::ffff:a9fe:a9fe]`, so
+  // the dotted-quad regex above never matches. Decode the two trailing
+  // 16-bit groups back into a dotted quad and re-run the IPv4 checks.
+  const mappedHex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  if (mappedHex) {
+    const high = parseInt(mappedHex[1]!, 16);
+    const low = parseInt(mappedHex[2]!, 16);
+    const a = (high >> 8) & 0xff;
+    const b = high & 0xff;
+    const c = (low >> 8) & 0xff;
+    const d = low & 0xff;
+    const ipv4 = `${a}.${b}.${c}.${d}`;
+    if (BLOCKED_HOSTNAMES.has(ipv4)) {
+      return `Blocked: ${host} maps to ${ipv4}, a cloud metadata endpoint.`;
+    }
+    if (isLinkLocal(ipv4)) {
+      return `Blocked: ${host} maps to ${ipv4}, a link-local address.`;
+    }
+  }
   return undefined;
 }
 
-function safetyCheck(rawUrl: string): string | undefined {
+// Exported for direct unit testing in src/tools/browser.test.ts.
+// Returns undefined when the URL is allowed; otherwise a human-readable
+// reason starting with "Blocked:" or "Invalid URL:".
+export function safetyCheck(rawUrl: string): string | undefined {
+  // Run the secret-pattern scan against the raw input *before* attempting
+  // to parse the URL. A malformed-but-secret-bearing input would otherwise
+  // fall through to the `Invalid URL: ${rawUrl}` branch and leak the token
+  // into the trace + audit row. Short-circuiting here keeps the error
+  // surface free of the original string.
+  let decoded = rawUrl;
+  try {
+    decoded = decodeURIComponent(rawUrl);
+  } catch {
+    // Malformed escape — fall back to the raw form.
+  }
+  for (const pattern of SECRET_PATTERNS) {
+    if (pattern.test(rawUrl) || pattern.test(decoded)) {
+      return "Blocked: URL appears to contain an API key or token.";
+    }
+  }
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -274,17 +319,6 @@ function safetyCheck(rawUrl: string): string | undefined {
   }
   const ipv6Block = isBlockedIpv6(host);
   if (ipv6Block) return ipv6Block;
-  let decoded = rawUrl;
-  try {
-    decoded = decodeURIComponent(rawUrl);
-  } catch {
-    // Malformed escape — fall back to the raw form.
-  }
-  for (const pattern of SECRET_PATTERNS) {
-    if (pattern.test(rawUrl) || pattern.test(decoded)) {
-      return "Blocked: URL appears to contain an API key or token.";
-    }
-  }
   return undefined;
 }
 

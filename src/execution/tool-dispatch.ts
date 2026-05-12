@@ -223,8 +223,14 @@ async function browserDispatch(
   // UI and on disk. Redact the URL and target in that case so secrets
   // don't leak through the audit trail. Other failures (network, timeout,
   // unknown ref) keep the URL since it's needed for debugging.
+  //
+  // Match both "Blocked:" (active safety rejection) and "Invalid URL:"
+  // (URL parse failure) — defense in depth so any safety-rejection prefix
+  // routed through this dispatcher won't leak the input string.
   const safetyBlocked =
-    parsed.success === false && typeof parsed.error === "string" && parsed.error.startsWith("Blocked:");
+    parsed.success === false &&
+    typeof parsed.error === "string" &&
+    (parsed.error.startsWith("Blocked:") || parsed.error.startsWith("Invalid URL:"));
   const safeArgs = safetyBlocked && typeof args.url === "string"
     ? { ...args, url: "[redacted]" }
     : args;
