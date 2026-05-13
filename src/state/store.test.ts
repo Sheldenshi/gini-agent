@@ -60,4 +60,90 @@ describe("normalizeState toolset/tool backfill", () => {
     expect(normalized.toolsets.length).toBeGreaterThan(0);
     expect(normalized.toolsets.some((ts) => ts.name === "browser")).toBe(true);
   });
+
+  test("unions new tool names into an existing toolset row and synthesizes matching tool rows", () => {
+    // Simulate an older instance whose browser toolset row was written
+    // when only the original 9 browser tools existed. The toolset row
+    // exists; the new tool entries (vision, hover, drag, select_option,
+    // wait_for, tabs, upload_file) are missing from both toolNames and
+    // the tool rows. Mark the existing toolset as "enabled" so we can
+    // verify the new tool rows come up "available" matching the
+    // toolset's status.
+    const state = createEmptyState("test-instance-5");
+    const browser = state.toolsets.find((ts) => ts.name === "browser");
+    expect(browser).toBeDefined();
+    browser!.toolNames = [
+      "browser.navigate",
+      "browser.snapshot",
+      "browser.click",
+      "browser.type",
+      "browser.press",
+      "browser.scroll",
+      "browser.back",
+      "browser.console",
+      "browser.close"
+    ];
+    browser!.status = "enabled";
+    // Drop the newer tool rows so the backfill has something to do.
+    const newerNames = new Set([
+      "browser.vision",
+      "browser.hover",
+      "browser.drag",
+      "browser.select_option",
+      "browser.wait_for",
+      "browser.tabs",
+      "browser.upload_file"
+    ]);
+    state.tools = state.tools.filter(
+      (tool) => tool.toolset !== "browser" || !newerNames.has(tool.name)
+    );
+
+    const normalized = normalizeState("test-instance-5", state);
+    const after = normalized.toolsets.find((ts) => ts.name === "browser")!;
+    // toolNames is now the full default set, in stable order (old names
+    // first, new names appended).
+    expect(after.toolNames.length).toBe(16);
+    for (const name of newerNames) {
+      expect(after.toolNames.includes(name)).toBe(true);
+    }
+    // Tool rows for each new name exist and inherit the toolset's
+    // enabled→available status.
+    for (const name of newerNames) {
+      const row = normalized.tools.find((tool) => tool.name === name);
+      expect(row).toBeDefined();
+      expect(row!.toolset).toBe("browser");
+      expect(row!.status).toBe("available");
+    }
+  });
+
+  test("backfilled tool rows for a DISABLED toolset stay disabled", () => {
+    const state = createEmptyState("test-instance-6");
+    const browser = state.toolsets.find((ts) => ts.name === "browser");
+    expect(browser).toBeDefined();
+    // Reduce to the old 9-tool roster and leave the toolset disabled
+    // (the on-disk default for the browser toolset).
+    browser!.toolNames = [
+      "browser.navigate",
+      "browser.snapshot",
+      "browser.click",
+      "browser.type",
+      "browser.press",
+      "browser.scroll",
+      "browser.back",
+      "browser.console",
+      "browser.close"
+    ];
+    expect(browser!.status).toBe("disabled");
+    const newerNames = ["browser.vision", "browser.hover"];
+    state.tools = state.tools.filter(
+      (tool) => tool.toolset !== "browser" || !newerNames.includes(tool.name)
+    );
+
+    const normalized = normalizeState("test-instance-6", state);
+    for (const name of newerNames) {
+      const row = normalized.tools.find((tool) => tool.name === name);
+      expect(row).toBeDefined();
+      expect(row!.status).toBe("disabled");
+    }
+  });
 });

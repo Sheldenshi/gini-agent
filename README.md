@@ -127,7 +127,7 @@ Use Codex OAuth:
 
 ```bash
 codex --login
-bun run gini provider set codex gpt-5.4
+bun run gini provider set codex gpt-5.5
 bun run gini doctor
 ```
 

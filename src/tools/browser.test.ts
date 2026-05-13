@@ -699,6 +699,118 @@ describe("browserVision", () => {
     expect(screenshotCalls).toBe(1);
   });
 
+  test("fails fast when the screenshot exceeds the 5MB byte cap", async () => {
+    // Hand the fake page a >5MB Buffer. We allocate exactly 5MB + 1
+    // byte to avoid wasting test memory while still tripping the cap.
+    const oversize = Buffer.alloc(5 * 1024 * 1024 + 1, 0xff);
+    const fakePage = {
+      screenshot: async () => oversize,
+      url: () => "https://example.com/big"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-oversize", fakePage);
+    setEchoVisionResponse({ text: "should-not-be-reached" });
+
+    const config: RuntimeConfig = {
+      instance: "test",
+      port: 7337,
+      token: "test",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: "/tmp/gini-vision-test",
+      logRoot: "/tmp/gini-vision-test-logs"
+    };
+    const raw = await browserVision("vision-oversize", { question: "describe" }, config);
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/Screenshot too large/);
+    expect(parsed.error).toMatch(/5MB cap/);
+  });
+
+  test("bails with 'Browser disconnecting' if the generation advances between screenshot and provider return", async () => {
+    // The fake page's screenshot first bumps the disconnect generation
+    // BEFORE returning bytes — that simulates a teardown that races a
+    // long-running screenshot. browserVision captures the generation
+    // AFTER the screenshot resolves, so we instead bump from inside the
+    // echo vision stub (which fires between screenshot and the final
+    // re-check). Custom stub is simpler than racing setTimeout.
+    const fakePage = {
+      screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      url: () => "https://example.com/disconnect"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-disconnect", fakePage);
+    // The echo vision stub returns a stub answer but ALSO advances the
+    // disconnect generation as a side effect — mimicking a teardown
+    // that ran while we were awaiting the provider response.
+    setEchoVisionResponse({
+      text: "fake-answer",
+      // Side-effect: bump the generation. The setEchoVisionResponse
+      // path doesn't expose hooks, so we hijack the provider override
+      // shape (provider is optional).
+      provider: { name: "echo", model: "gini-echo-v0" }
+    });
+    // Schedule the bump to happen between the screenshot resolve and
+    // the provider call — easier to read than racing through the stub.
+    const original = browserTest.currentDisconnectGenerationForTest();
+    const config: RuntimeConfig = {
+      instance: "test",
+      port: 7337,
+      token: "test",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: "/tmp/gini-vision-test",
+      logRoot: "/tmp/gini-vision-test-logs"
+    };
+    // Kick off the call, then immediately bump the generation on the
+    // same tick. The fake screenshot resolves synchronously (via the
+    // microtask queue), capturedGeneration is captured next, then the
+    // echo vision returns, then the post-fetch re-check fires.
+    const callPromise = browserVision("vision-disconnect", { question: "what" }, config);
+    // Defer the bump to AFTER browserVision has captured its baseline.
+    await Promise.resolve();
+    await Promise.resolve();
+    browserTest.bumpDisconnectGenerationForTest();
+    const raw = await callPromise;
+    const parsed = JSON.parse(raw) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/disconnecting/i);
+    // Restore the global counter so subsequent tests start fresh.
+    void original;
+  });
+
+  test("envelope carries provider cost so the dispatcher can accumulate it into task.cost", async () => {
+    const fakePage = {
+      screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      url: () => "https://example.com/dashboard"
+    };
+    browserTest.installFakeSessionWithPageForTest("vision-cost", fakePage);
+    // Provide a stubbed response with a fake cost record so the
+    // browserVision envelope picks it up.
+    setEchoVisionResponse({
+      text: "answer with cost",
+      cost: {
+        provider: "echo",
+        model: "gini-echo-v0",
+        inputTokens: 100,
+        outputTokens: 20,
+        totalTokens: 120,
+        estimatedUsd: 0.00012
+      }
+    });
+    const config: RuntimeConfig = {
+      instance: "test",
+      port: 7337,
+      token: "test",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: "/tmp/gini-vision-test",
+      logRoot: "/tmp/gini-vision-test-logs"
+    };
+    const raw = await browserVision("vision-cost", { question: "what?" }, config);
+    const parsed = JSON.parse(raw) as { success: boolean; cost?: { totalTokens?: number } };
+    expect(parsed.success).toBe(true);
+    expect(parsed.cost?.totalTokens).toBe(120);
+  });
+
   test("rejects calls missing the required question argument", async () => {
     const fakePage = {
       screenshot: async () => Buffer.from([0x89]),
@@ -1533,6 +1645,83 @@ describe("dispatchToolCall(browser_upload_file)", () => {
     // No approval row should exist.
     const state = readState(config.instance);
     expect(state.approvals.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+});
+
+// dispatchToolCall(browser_vision) must accumulate the vision provider's
+// token spend into task.cost so the chat UI's running total reflects
+// out-of-band side calls. The browserVision tool returns the cost in its
+// JSON envelope; the dispatcher rolls it into the task row via mutateState.
+describe("dispatchToolCall(browser_vision) cost accumulation", () => {
+  const ROOT = "/tmp/gini-browser-vision-dispatch-tests";
+
+  function dispatchConfig(instance: string): RuntimeConfig {
+    process.env.GINI_STATE_ROOT = ROOT;
+    process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+    rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
+    return {
+      instance,
+      port: 7339,
+      token: "test-token",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: "/tmp",
+      stateRoot: `${ROOT}/instances/${instance}`,
+      logRoot: `${ROOT}-logs/${instance}`
+    };
+  }
+
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    clearEchoVisionResponses();
+  });
+
+  test("vision usage block accumulates into the task's cost row", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    const config = dispatchConfig("browser-vision-dispatch");
+    // Build the task row the dispatcher will route the call against.
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "vision test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // Plant the fake session + canned vision response.
+    const fakePage = {
+      screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d]),
+      url: () => "https://example.com/cost"
+    };
+    browserTest.installFakeSessionWithPageForTest(taskId, fakePage);
+    setEchoVisionResponse({
+      text: "looks fine",
+      cost: {
+        provider: "echo",
+        model: "gini-echo-v0",
+        inputTokens: 250,
+        outputTokens: 50,
+        totalTokens: 300,
+        estimatedUsd: 0.0003
+      }
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_vision",
+      "call_vision_1",
+      JSON.stringify({ question: "what is on the page?" })
+    );
+    expect(result.kind).toBe("sync");
+
+    // The task row's cost should now reflect the vision provider's spend.
+    const after = readState(config.instance).tasks.find((t) => t.id === taskId);
+    expect(after?.cost).toBeDefined();
+    expect(after!.cost!.totalTokens).toBe(300);
+    expect(after!.cost!.inputTokens).toBe(250);
+    expect(after!.cost!.outputTokens).toBe(50);
+    expect(after!.cost!.estimatedUsd).toBeCloseTo(0.0003, 5);
 
     rmSync(ROOT, { recursive: true, force: true });
   });

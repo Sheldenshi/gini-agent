@@ -223,7 +223,7 @@ export function defaultConfig(instance: Instance): RuntimeConfig {
     token: crypto.randomUUID(),
     provider: {
       name: providerName,
-      model: process.env.GINI_MODEL ?? (providerName === "echo" ? "gini-echo-v0" : providerName === "codex" ? "gpt-5.4" : "gpt-5.4-mini"),
+      model: process.env.GINI_MODEL ?? (providerName === "echo" ? "gini-echo-v0" : providerName === "codex" ? "gpt-5.5" : "gpt-5.4-mini"),
       apiKeyEnv: providerName === "openai" ? "OPENAI_API_KEY" : undefined
     },
     workspaceRoot: workspaceDir(instance),

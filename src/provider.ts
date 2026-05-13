@@ -5,7 +5,7 @@ import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, Pro
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const DEFAULT_CODEX_MODEL = "gpt-5.4";
+const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
 
 const INSTRUCTIONS = [
@@ -1552,6 +1552,15 @@ async function callVisionChatCompletions(
   };
   const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
   const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+  // OpenAI's newer o-series chat models reject `max_tokens` outright and
+  // require `max_completion_tokens`. Older OpenAI models still accept the
+  // legacy field. OpenRouter / local OpenAI-compatible gateways may not
+  // recognize the newer name yet, so we keep `max_tokens` for them. Send
+  // only the field each backend expects to avoid double-counting or
+  // 400-level errors.
+  const tokenBudgetField = provider.name === "openai"
+    ? { max_completion_tokens: maxTokens }
+    : { max_tokens: maxTokens };
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -1566,7 +1575,7 @@ async function callVisionChatCompletions(
           ]
         }
       ],
-      max_tokens: maxTokens
+      ...tokenBudgetField
     })
   });
   const rawPayload = await response.text();

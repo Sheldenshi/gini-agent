@@ -638,7 +638,11 @@ describe("provider", () => {
       expect(captured?.url).toContain("/chat/completions");
       const sent = JSON.parse(String(captured!.init!.body));
       expect(sent.model).toBe("gpt-test");
-      expect(sent.max_tokens).toBe(32);
+      // OpenAI now uses max_completion_tokens (some o-series models reject
+      // max_tokens entirely). We send only the newer field for the openai
+      // provider; openrouter/local keep the legacy max_tokens.
+      expect(sent.max_completion_tokens).toBe(32);
+      expect(sent.max_tokens).toBeUndefined();
       expect(Array.isArray(sent.messages)).toBe(true);
       expect(sent.messages[0].role).toBe("user");
       expect(Array.isArray(sent.messages[0].content)).toBe(true);
@@ -652,6 +656,48 @@ describe("provider", () => {
       globalThis.fetch = originalFetch;
       if (original === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("openrouter vision keeps legacy max_tokens for compat with older OpenAI-style gateways", async () => {
+    const original = process.env.OPENROUTER_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_or_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "OR reply." }
+        }],
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openrouter", model: "or-model" });
+      await generateVisionAnalysis(config(provider), {
+        prompt: "describe",
+        imageBase64: "AAAA",
+        mimeType: "image/png",
+        maxTokens: 16
+      });
+      const sent = JSON.parse(String(captured!.init!.body));
+      // OpenRouter / local / older OpenAI-compat gateways still expect
+      // max_tokens; max_completion_tokens isn't sent.
+      expect(sent.max_tokens).toBe(16);
+      expect(sent.max_completion_tokens).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original;
     }
   });
 });

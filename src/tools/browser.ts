@@ -1569,12 +1569,22 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
   }
 }
 
+// Cap on screenshot byte size we'll forward to the vision provider. A
+// 5MB PNG is already absurdly large for vision input — anything bigger
+// is almost certainly a huge full-page scroll capture that will either
+// blow the provider's request limit or produce a useless answer. Failing
+// fast here is cheaper (no provider round-trip) and gives the model a
+// clear retry instruction.
+const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
+
 // Screenshot the current page and ask the configured vision model a question
 // about it. Returns the model's text answer. The agent never sees the
 // screenshot bytes — vision is a side call mediated by the provider layer so
 // pixels stay out of the agent loop's transcript. One image per invocation;
 // `full` toggles fullPage vs viewport. Cost is bounded by the provider's
-// default 512-token response budget.
+// default 512-token response budget, the 5MB screenshot cap above, and a
+// disconnect-generation re-check that bails before returning if the browser
+// was torn down mid-call.
 export async function browserVision(
   taskId: string,
   args: Record<string, unknown>,
@@ -1586,6 +1596,16 @@ export async function browserVision(
   try {
     return await withSession(taskId, async (session) => {
       const buf = await session.page.screenshot({ type: "png", fullPage: full });
+      if (buf.length > MAX_SCREENSHOT_BYTES) {
+        return fail(
+          `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
+        );
+      }
+      // Capture the disconnect generation BEFORE the provider fetch. A
+      // disconnect that runs while we're awaiting the model would otherwise
+      // let us return an "answer" based on a screenshot from a torn-down
+      // browser — confusing at best, misleading at worst.
+      const capturedGeneration = currentDisconnectGeneration();
       const imageBase64 = Buffer.from(buf).toString("base64");
       const result = await generateVisionAnalysis(config, {
         prompt: question,
@@ -1593,11 +1613,16 @@ export async function browserVision(
         mimeType: "image/png",
         maxTokens: 512
       });
+      if (currentDisconnectGeneration() !== capturedGeneration) {
+        return fail("Browser disconnecting, retry shortly.");
+      }
       return ok({
         url: session.page.url(),
         answer: result.text,
         bytes: buf.length,
-        full
+        full,
+        cost: result.cost ?? null,
+        usage: result.usage ?? null
       });
     });
   } catch (error) {

@@ -120,8 +120,17 @@ export async function dispatchToolCall(
           : "browser.tabs.list";
       return { kind: "sync", result: await browserDispatch(config, taskId, label, browserTabs, args) };
     }
-    case "browser_vision":
-      return { kind: "sync", result: await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args) };
+    case "browser_vision": {
+      const result = await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args);
+      // Roll the vision provider's spend into the owning task's cost row
+      // so the chat UI's running token / USD total reflects the
+      // out-of-band vision call. The envelope carries `cost` as a
+      // CostRecord (or null) — parse it once and accumulate via
+      // addCostToTask. Failures here are best-effort; the tool result
+      // already flows back to the model.
+      await accumulateBrowserVisionCost(config, taskId, result);
+      return { kind: "sync", result };
+    }
     case "browser_upload_file":
       // Uploading a workspace file egresses bytes to a remote site —
       // explicit, side-effecting, irreversible from the user's
@@ -339,6 +348,61 @@ async function runBrowserDispatch(
     item.updatedAt = now();
   });
   return result;
+}
+
+// Sum a per-call CostRecord into the owning task's running cost row.
+// Mirrors addCost in src/execution/chat-task.ts: token totals add; USD
+// estimates add when present; provider/model track the most recent call.
+// This keeps task.cost honest when out-of-band side calls (like
+// browser_vision's provider request) consume tokens the main agent loop
+// doesn't see directly.
+async function accumulateBrowserVisionCost(
+  config: RuntimeConfig,
+  taskId: string,
+  rawResult: string
+): Promise<void> {
+  let parsed: { cost?: Record<string, unknown> | null } = {};
+  try {
+    parsed = JSON.parse(rawResult) as typeof parsed;
+  } catch {
+    return;
+  }
+  if (!parsed.cost || typeof parsed.cost !== "object") return;
+  const increment = parsed.cost as {
+    provider?: string;
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    estimatedUsd?: number;
+  };
+  // Skip entirely if there's nothing numeric to add (e.g. the provider
+  // didn't return usage). Avoids pointless mutateState round-trips.
+  if (
+    increment.inputTokens === undefined &&
+    increment.outputTokens === undefined &&
+    increment.totalTokens === undefined &&
+    increment.estimatedUsd === undefined
+  ) {
+    return;
+  }
+  await mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    const sum = (a: number | undefined, b: number | undefined): number | undefined => {
+      if (a === undefined && b === undefined) return undefined;
+      return (a ?? 0) + (b ?? 0);
+    };
+    const prev = item.cost;
+    item.cost = {
+      provider: increment.provider ?? prev?.provider ?? "",
+      model: increment.model ?? prev?.model ?? "",
+      inputTokens: sum(prev?.inputTokens, increment.inputTokens),
+      outputTokens: sum(prev?.outputTokens, increment.outputTokens),
+      totalTokens: sum(prev?.totalTokens, increment.totalTokens),
+      estimatedUsd: sum(prev?.estimatedUsd, increment.estimatedUsd)
+    };
+    item.updatedAt = now();
+  });
 }
 
 async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {

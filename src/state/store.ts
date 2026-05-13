@@ -192,12 +192,47 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // not found". Match by name so user-renamed entries are left alone.
   const at = now();
   const desiredToolsets = defaultToolsets(instance, at);
+  const desiredTools = defaultTools(instance, at);
   for (const ts of desiredToolsets) {
     if (!state.toolsets!.some((existing) => existing.name === ts.name)) {
       state.toolsets!.push(ts);
     }
   }
-  const desiredTools = defaultTools(instance, at);
+  // For each defaults-known toolset, union its desired tool names into
+  // the (possibly pre-existing) state row, and synthesize matching tool
+  // rows whose status reflects the EXISTING toolset's status. This runs
+  // before the catch-all "add missing tools" pass below so a tool that
+  // belongs to an already-enabled toolset comes up "available" rather
+  // than inheriting the defaults' "disabled" status. Without this an
+  // older instance whose `browser` row is enabled but whose tool rows
+  // pre-date browser.vision et al. would render the new entries as
+  // disabled even though the toolset itself is on.
+  for (const desired of desiredToolsets) {
+    const existing = state.toolsets!.find((t) => t.name === desired.name);
+    if (!existing) continue;
+    // Union toolNames preserving the existing row's order; append any
+    // names that aren't already present.
+    const known = new Set(existing.toolNames);
+    for (const name of desired.toolNames) {
+      if (!known.has(name)) {
+        existing.toolNames.push(name);
+        known.add(name);
+      }
+    }
+    const existingStatus = existing.status;
+    for (const desiredTool of desiredTools) {
+      if (desiredTool.toolset !== desired.name) continue;
+      if (state.tools!.some((t) => t.name === desiredTool.name)) continue;
+      state.tools!.push({
+        ...desiredTool,
+        status: existingStatus === "enabled" ? "available" : "disabled"
+      });
+    }
+  }
+  // Catch-all final pass: tools whose toolset wasn't in the defaults
+  // (or matched by name above) but that ship in defaultTools. We use
+  // the desired tool's own status here since there's no existing
+  // toolset row to consult.
   for (const tool of desiredTools) {
     if (!state.tools!.some((existing) => existing.name === tool.name)) {
       state.tools!.push(tool);
