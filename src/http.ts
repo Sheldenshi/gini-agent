@@ -21,7 +21,7 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
-import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
+import { createAgent, listAgents, useAgent } from "./capabilities/agents";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -244,9 +244,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
-    ["GET", /^\/api\/profiles$/, () => json(listProfiles(config))],
-    ["POST", /^\/api\/profiles$/, async (request) => json(await createProfile(config, await body(request)), 201)],
-    ["POST", /^\/api\/profiles\/([^/]+)\/use$/, async (_request, params) => json(await useProfile(config, params[0]))],
+    ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
+    ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
+    ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],

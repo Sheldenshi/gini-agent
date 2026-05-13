@@ -1,15 +1,15 @@
 import type { RuntimeConfig } from "../types";
-import { activateProfile, createProfileRecord, mutateState, readState } from "../state";
+import { activateAgent, createAgentRecord, mutateState, readState } from "../state";
 
-export function listProfiles(config: RuntimeConfig) {
+export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
-  return { activeProfileId: state.activeProfileId, profiles: state.profiles };
+  return { activeAgentId: state.activeAgentId, agents: state.agents };
 }
 
-export async function createProfile(config: RuntimeConfig, input: Record<string, unknown>) {
+export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "");
-  if (!name) throw new Error("Profile name is required.");
-  return mutateState(config.instance, (state) => createProfileRecord(state, {
+  if (!name) throw new Error("Agent name is required.");
+  return mutateState(config.instance, (state) => createAgentRecord(state, {
     name,
     providerName: typeof input.providerName === "string" ? input.providerName as never : undefined,
     model: typeof input.model === "string" ? input.model : undefined,
@@ -19,8 +19,8 @@ export async function createProfile(config: RuntimeConfig, input: Record<string,
   }));
 }
 
-export async function useProfile(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.instance, (state) => activateProfile(state, idOrName));
+export async function useAgent(config: RuntimeConfig, idOrName: string) {
+  return mutateState(config.instance, (state) => activateAgent(state, idOrName));
 }
 
 function isMemoryScope(value: unknown): value is "user" | "project" | "device" | "temporary" {

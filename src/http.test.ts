@@ -174,22 +174,22 @@ describe("runtime api", () => {
     expect(state.audit.some((event) => event.action === "file.search")).toBe(true);
   });
 
-  test("supports profile config equivalents and Hermes parity reporting", async () => {
-    const config = testConfig("profiles-parity");
+  test("supports agent config equivalents and Hermes parity reporting", async () => {
+    const config = testConfig("agents-parity");
     const handler = createHandler(config);
 
-    const created = await call(handler, config, "/api/profiles", {
+    const created = await call(handler, config, "/api/agents", {
       method: "POST",
       body: JSON.stringify({ name: "research", toolsets: ["file", "web", "session_search"], memoryScopes: ["user", "project"] })
     });
-    const active = await call(handler, config, `/api/profiles/${created.id}/use`, { method: "POST" });
-    const profiles = await call(handler, config, "/api/profiles");
+    const active = await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+    const agents = await call(handler, config, "/api/agents");
     const parity = await call(handler, config, "/api/parity/hermes");
 
     expect(active.status).toBe("active");
-    expect(profiles.activeProfileId).toBe(created.id);
+    expect(agents.activeAgentId).toBe(created.id);
     expect(parity.ok).toBe(true);
-    expect(parity.checks.some((item: { id: string; status: string }) => item.id === "profiles" && item.status === "pass")).toBe(true);
+    expect(parity.checks.some((item: { id: string; status: string }) => item.id === "agents" && item.status === "pass")).toBe(true);
   });
 
   test("supports relay degraded health and notification delivery records", async () => {

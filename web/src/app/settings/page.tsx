@@ -6,7 +6,7 @@ import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus } from "@/lib/queries";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
-import { ProfileCard, type ProfileRow } from "./_components/ProfileCard";
+import { AgentCard, type AgentRow } from "./_components/AgentCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
 import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
@@ -19,9 +19,9 @@ export default function SettingsPage() {
     queryFn: () => api<ProviderCatalogItem[]>("/providers/catalog"),
     refetchInterval: 60_000
   });
-  const profiles = useQuery({
-    queryKey: ["profiles"],
-    queryFn: () => api<{ profiles: ProfileRow[]; activeProfileId?: string }>("/profiles")
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
   });
   const toolsets = useQuery({
     queryKey: ["toolsets"],
@@ -40,9 +40,9 @@ export default function SettingsPage() {
     queryFn: () => api<DeviceRow[]>("/devices")
   });
 
-  const useProfile = useMutation({
-    mutationFn: (id: string) => api(`/profiles/${encodeURIComponent(id)}/use`, { method: "POST" }),
-    onSuccess: () => { toast.success("Profile activated"); invalidate(["profiles", "state"]); },
+  const useAgent = useMutation({
+    mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
+    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state"]); },
     onError: (error: Error) => toast.error(error.message)
   });
 
@@ -89,7 +89,7 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const activeProfileId = profiles.data?.activeProfileId;
+  const activeAgentId = agents.data?.activeAgentId;
   const effectiveProviderName = status.data?.provider?.provider?.name;
   const effectiveProviderModel = status.data?.provider?.provider?.model;
   const catalogEntry = catalog.data?.find((c) => c.name === effectiveProviderName);
@@ -97,15 +97,15 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader title="Settings" description="Providers, profiles, toolsets, integrations, devices" />
+      <PageHeader title="Settings" description="Providers, agents, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
         <ProviderCard displayName={displayName} model={effectiveProviderModel} />
 
-        <ProfileCard
-          profiles={profiles.data?.profiles ?? []}
-          activeProfileId={activeProfileId}
-          pending={useProfile.isPending}
-          onUse={(id) => useProfile.mutate(id)}
+        <AgentCard
+          agents={agents.data?.agents ?? []}
+          activeAgentId={activeAgentId}
+          pending={useAgent.isPending}
+          onUse={(id) => useAgent.mutate(id)}
         />
 
         <ToolsetsCard

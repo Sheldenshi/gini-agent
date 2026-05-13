@@ -17,7 +17,7 @@ export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks
     check("delegation", "Delegation/subagents", true, [`${state.subagents.length} subagents`, "spawn/list APIs with trace linkage and toolset limits"], "pass"),
     check("mcp", "MCP integration", true, [`${state.mcpServers.length} MCP server records`, "add/health/invoke/disable APIs"], "pass"),
     check("messaging", "Messaging bridge", true, [`${state.messagingBridges.length} bridge records`, "add/health/disable APIs and notification routing"], "pass"),
-    check("profiles", "Config/profile equivalent", true, state.profiles.map((item) => `${item.name}:${item.status}`), state.profiles.length > 0 ? "pass" : "missing"),
+    check("agents", "Config/agent equivalent", true, state.agents.map((item) => `${item.name}:${item.status}`), state.agents.length > 0 ? "pass" : "missing"),
     check("migration", "Hermes/OpenClaw import basics", true, [`${state.importReports.length} import inspection reports`, "read-only guided inspection by default"], "pass"),
     check("mobile", "Mobile/remote control structure", true, [`${state.devices.length} paired devices`, "mobile bootstrap and revocation contracts"], "pass"),
     check("relay", "Remote relay and notifications", true, [`${state.relays.length} relay records`, `${state.notifications.length} notifications`, "local/lan/hosted relay records with queued notifications"], "pass")

@@ -54,8 +54,8 @@ export interface RuntimeStateSnapshot {
   messagingBridges: unknown[];
   messagingMessages: unknown[];
   importReports: unknown[];
-  profiles: unknown[];
-  activeProfileId?: string;
+  agents: unknown[];
+  activeAgentId?: string;
   relays: unknown[];
   notifications: unknown[];
   events: RuntimeEvent[];

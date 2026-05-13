@@ -97,7 +97,7 @@ Usage:
   bun run gini mcp list|add|health|invoke|disable
   bun run gini messaging list|add|health|disable
   bun run gini import inspect hermes|openclaw <path>
-  bun run gini profiles list|create|use
+  bun run gini agents list|create|use
   bun run gini parity hermes
   bun run gini readiness v1
   bun run gini relays list|add|health

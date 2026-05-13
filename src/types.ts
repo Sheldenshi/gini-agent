@@ -36,7 +36,7 @@ export type MessagingBridgeStatus = "configured" | "disabled" | "error";
 
 export type ImportSource = "hermes" | "openclaw";
 
-export type ProfileStatus = "active" | "inactive";
+export type AgentStatus = "active" | "inactive";
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
@@ -114,8 +114,8 @@ export interface RuntimeState {
   mcpServers: McpServerRecord[];
   messagingBridges: MessagingBridgeRecord[];
   importReports: ImportReport[];
-  profiles: ProfileRecord[];
-  activeProfileId?: string;
+  agents: AgentRecord[];
+  activeAgentId?: string;
   relays: RelayRecord[];
   notifications: NotificationRecord[];
   events: RuntimeEvent[];
@@ -423,11 +423,11 @@ export interface ProviderCatalogItem {
   costHint: "free" | "external" | "unknown";
 }
 
-export interface ProfileRecord {
+export interface AgentRecord {
   id: string;
   instance: Instance;
   name: string;
-  status: ProfileStatus;
+  status: AgentStatus;
   providerName?: ProviderName | "openrouter" | "local";
   model?: string;
   toolsets: string[];

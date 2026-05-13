@@ -99,9 +99,9 @@ export {
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
   createImportReport,
-  createProfileRecord,
+  createAgentRecord,
   createRelayRecord,
   createNotificationRecord,
-  activateProfile,
+  activateAgent,
   updateConnectorHealth
 } from "./records";

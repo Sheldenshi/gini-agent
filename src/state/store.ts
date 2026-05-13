@@ -2,7 +2,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import type { Instance, PairingStatus, RuntimeState } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
-import { defaultProfile, defaultTools, defaultToolsets } from "./defaults";
+import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
 
 export function createEmptyState(instance: Instance): RuntimeState {
   const at = now();
@@ -41,8 +41,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
     mcpServers: [],
     messagingBridges: [],
     importReports: [],
-    profiles: [defaultProfile(instance, at)],
-    activeProfileId: "profile_default",
+    agents: [defaultAgent(instance, at)],
+    activeAgentId: "agent_default",
     relays: [],
     notifications: [],
     events: [],
@@ -143,7 +143,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "mcpServers",
     "messagingBridges",
     "importReports",
-    "profiles",
+    "agents",
     "relays",
     "notifications",
     "events",
@@ -168,7 +168,30 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
 }
 
+// Pre-rename state files persisted `state.profiles` / `state.activeProfileId`.
+// After the profile→agent rename these fields still exist on disk; we rewrite
+// them in-place when first read. mutateState's read-modify-write cycle persists
+// the cleaned shape on the next mutation. Idempotent: when `agents` already
+// exists, the legacy `profiles` field is just dropped.
+function migrateProfileFieldsToAgent(state: RuntimeState): void {
+  const stateAny = state as unknown as {
+    profiles?: unknown;
+    agents?: unknown;
+    activeProfileId?: unknown;
+    activeAgentId?: unknown;
+  };
+  if (stateAny.profiles !== undefined && stateAny.agents === undefined) {
+    stateAny.agents = stateAny.profiles;
+  }
+  delete stateAny.profiles;
+  if (stateAny.activeProfileId !== undefined && stateAny.activeAgentId === undefined) {
+    stateAny.activeAgentId = stateAny.activeProfileId;
+  }
+  delete stateAny.activeProfileId;
+}
+
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
+  migrateProfileFieldsToAgent(state);
   migrateLaneFieldToInstance(state);
   state.instance = instance;
   state.improvements ??= [];
@@ -190,8 +213,8 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.messagingBridges ??= [];
   state.messagingMessages ??= [];
   state.importReports ??= [];
-  state.profiles ??= [defaultProfile(instance, now())];
-  state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;
+  state.agents ??= [defaultAgent(instance, now())];
+  state.activeAgentId ??= state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];

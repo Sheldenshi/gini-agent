@@ -1,4 +1,4 @@
-import type { Instance, ProfileRecord, ToolRecord, ToolsetRecord } from "../types";
+import type { AgentRecord, Instance, ToolRecord, ToolsetRecord } from "../types";
 
 export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[] {
   return [
@@ -97,9 +97,9 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
   } satisfies ToolRecord)));
 }
 
-export function defaultProfile(instance: Instance, at: string): ProfileRecord {
+export function defaultAgent(instance: Instance, at: string): AgentRecord {
   return {
-    id: "profile_default",
+    id: "agent_default",
     instance,
     name: "default",
     status: "active",
