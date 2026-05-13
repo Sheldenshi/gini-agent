@@ -363,6 +363,12 @@ function json(value: unknown, statusCode = 200): Response {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Invalid input")) return 400;
+  // Memory write paths (createMemoryFromInput, the "remember "-prefix
+  // path in agent.ts) throw this when no agent is active. Sibling routes
+  // (/memory/retain, /memory/recall, /memory/reflect) already return 400
+  // for the same condition — map this here so legacy POST /api/memory
+  // matches.
+  if (message.includes("no active agent")) return 400;
   return 500;
 }
 

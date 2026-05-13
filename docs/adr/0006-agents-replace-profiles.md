@@ -106,9 +106,11 @@ partial override.
 - `normalizeState` runs idempotent migrations:
   - Rename `state.profiles` → `state.agents` and
     `state.activeProfileId` → `state.activeAgentId`.
-  - Overwrite the default agent's provider with `config.provider` when
-    the default agent still carries the legacy `echo / gini-echo-v0`
-    pair and `config.provider` differs.
+  - Backfill `agentId` on legacy `MemoryRecord` rows so they belong to
+    the active agent's pool (Phase C concern, but the rename migration
+    runs first so the agent id is available).
+  - `normalizeState` does not consult `config` — the provider seed lives
+    entirely in `seedDefaultAgentFromRuntimeConfig` above.
 - Tests that construct a config without calling `install()` retain
   `providerName: undefined` on the default agent, which is the
   "fall through to `config.provider`" case — the agent is not

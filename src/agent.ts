@@ -339,6 +339,13 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     if (lower.includes("remember ")) {
+      // Phase C — reject loud when no active agent so we don't silently
+      // leak into a default pool. Message matches createMemoryFromInput
+      // so the gateway's statusFromErrorMessage mapping to 400 applies
+      // uniformly across the legacy + remember-prefix create paths.
+      if (!activeAgentId) {
+        throw new Error("Cannot create memory: no active agent.");
+      }
       const content = item.input.split(/remember\s+/i).at(-1)?.trim() || item.input;
       const memory = createMemory(state, {
         agentId: activeAgentId,

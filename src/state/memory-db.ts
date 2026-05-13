@@ -169,6 +169,19 @@ export function removeMemoryDb(instance: Instance): void {
 // always safe. The schema_meta row records the current version for future
 // rounds — phase 2+ may need data migrations rather than just additive DDL.
 function applyMigrations(db: Database): void {
+  // Step 1: create tables and indexes that do NOT reference agent_id.
+  //
+  // We MUST NOT issue CREATE INDEX ... ON memory_units(agent_id) yet:
+  // on a pre-Phase-C database the agent_id column doesn't exist on the
+  // existing tables, and `CREATE TABLE IF NOT EXISTS` is a no-op against
+  // the existing schema (so it won't add the column either). SQLite
+  // parse-validates column references in CREATE INDEX even with
+  // IF NOT EXISTS, so emitting the agent_id indexes here would throw
+  // "no such column: agent_id" on every v1 upgrade.
+  //
+  // Step 2 (ensureColumn) backfills agent_id on existing tables.
+  // Step 3 emits the agent_id-referencing indexes once the column is
+  // guaranteed to exist.
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_meta (
       key TEXT PRIMARY KEY,
@@ -188,7 +201,6 @@ function applyMigrations(db: Database): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_memory_banks_agent ON memory_banks(agent_id);
 
     -- Eq. 1 (paper §3.1): a memory unit is text + provenance + temporal scope
     -- + a network label drawn from {world, experience, opinion, observation}.
@@ -219,8 +231,6 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_memory_units_network ON memory_units(bank_id, network);
     CREATE INDEX IF NOT EXISTS idx_memory_units_temporal ON memory_units(bank_id, occurred_start, occurred_end);
     CREATE INDEX IF NOT EXISTS idx_memory_units_status ON memory_units(bank_id, status);
-    CREATE INDEX IF NOT EXISTS idx_memory_units_agent ON memory_units(agent_id);
-    CREATE INDEX IF NOT EXISTS idx_memory_units_agent_network ON memory_units(agent_id, network);
 
     -- BM25 (paper Eq. 11) — FTS5 mirror of memory_units.text, kept in sync via
     -- triggers so retain/recall (phases 2-3) can run lexical queries without
@@ -277,14 +287,22 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_links_entity ON memory_links(entity_id) WHERE entity_id IS NOT NULL;
   `);
 
-  // Phase C additive migration: pre-Phase-C databases were created without
-  // the agent_id columns on memory_banks / memory_units. Add them in-place
-  // with a runtime check — SQLite has no IF NOT EXISTS on ALTER TABLE ADD
-  // COLUMN, so we probe PRAGMA table_info and ALTER only when the column is
-  // missing. Idempotent: a fresh DB created from the CREATE TABLE above
-  // already has the column and falls through.
+  // Step 2 — Phase C additive migration: pre-Phase-C databases were created
+  // without the agent_id columns on memory_banks / memory_units. Add them
+  // in-place with a runtime check — SQLite has no IF NOT EXISTS on ALTER
+  // TABLE ADD COLUMN, so we probe PRAGMA table_info and ALTER only when the
+  // column is missing. Idempotent: a fresh DB created from the CREATE TABLE
+  // above already has the column and falls through.
   ensureColumn(db, "memory_banks", "agent_id", "TEXT");
   ensureColumn(db, "memory_units", "agent_id", "TEXT");
+
+  // Step 3 — agent_id-referencing indexes. Safe to issue now that the
+  // column is guaranteed to exist on both fresh and upgraded DBs.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_memory_banks_agent ON memory_banks(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_units_agent ON memory_units(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_units_agent_network ON memory_units(agent_id, network);
+  `);
 
   db.run(
     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",

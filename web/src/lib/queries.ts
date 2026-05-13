@@ -80,7 +80,7 @@ export function useHindsightUnits(network: string = "all") {
   return useQuery<HindsightUnitView[]>({
     queryKey: ["memory", "hindsight", network],
     queryFn: () => {
-      const params = new URLSearchParams({ bank: "bank_default", limit: "200" });
+      const params = new URLSearchParams({ limit: "200" });
       if (network !== "all") params.set("network", network);
       return api<HindsightUnitView[]>(`/memory/units?${params.toString()}`);
     },
