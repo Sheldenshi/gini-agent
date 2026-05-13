@@ -94,7 +94,18 @@ const schedulerDone: Promise<void> = (async function schedulerLoop(): Promise<vo
   }
 })();
 
+// Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
+// own self-signal from src/runtime/autostart-refresh.ts can all arrive
+// in quick succession; we only want to drain + consume the refresh
+// marker once. Without this flag, two SIGTERMs racing the same drain
+// would call `server.stop(false)` twice and then run the marker-consume
+// twice — best case a wasted spawn, worst case a double-bootstrap that
+// confuses launchd.
+let shutdownStarted = false;
+
 process.on("SIGTERM", async () => {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
   // Drain in-flight HTTP responses BEFORE we start tearing the process

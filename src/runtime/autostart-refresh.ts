@@ -58,6 +58,28 @@ export function refreshMarkerPath(instance: Instance): string {
   return join(stateRoot, "instances", instance, ".autostart-refresh-pending");
 }
 
+// In-memory flag: did THIS process call requestAutostartRefresh? If not,
+// `consumeAutostartRefresh` MUST NOT spawn the bootstrap subprocess even
+// when it finds a marker on disk.
+//
+// Why this matters: the marker file persists across the SIGTERM → exit
+// → next-launchd-spawn boundary. Without an in-process flag, ANY SIGTERM
+// — including `gini stop` issued by the user from another terminal — would
+// trigger an unwanted respawn. With the flag, only the SIGTERM dispatched
+// from inside requestAutostartRefresh leads to a refresh; an unrelated
+// SIGTERM cleans up the (stale) marker but does NOT spawn the bootstrap.
+//
+// This is module-level (process-local) state; it is intentionally NOT
+// persisted to disk.
+let refreshRequestedInProcess = false;
+
+// Test seam: reset the in-memory flag so unit tests can exercise the
+// "marker exists but flag not set" path. Not exported from the public
+// API surface — only via __testing below.
+function resetRefreshFlag(): void {
+  refreshRequestedInProcess = false;
+}
+
 // Called from the response handler (POST /api/setup/provider) after the
 // new key has been persisted. Writes the marker so the SIGTERM handler
 // will pick it up after Bun drains in-flight responses, then signals
@@ -87,6 +109,11 @@ export function requestAutostartRefresh(instance: Instance): boolean {
     return false;
   }
 
+  // Flip the in-process flag BEFORE dispatching SIGTERM so the consume
+  // path (which runs in the same process) sees the intent regardless of
+  // signal-handler ordering.
+  refreshRequestedInProcess = true;
+
   // GINI_SKIP_PLIST_REFRESH=1: tests assert the marker is written without
   // the SIGTERM actually firing (which would kill the test runner). The
   // contract remains observable.
@@ -115,17 +142,26 @@ export function requestAutostartRefresh(instance: Instance): boolean {
   return true;
 }
 
-// Called from the SIGTERM handler in src/server.ts AFTER `server.stop(true)`
+// Called from the SIGTERM handler in src/server.ts AFTER `server.stop(false)`
 // has drained in-flight responses. If a refresh marker exists for this
-// instance, remove it and exec the autostart-refresh child as detached.
+// instance AND this process is the one that requested the refresh
+// (refreshRequestedInProcess === true), remove the marker and exec the
+// autostart-refresh child as detached.
 //
-// Returns true when a refresh was kicked off; false when there's nothing
-// to do (no marker, or non-darwin). The caller exits the process either
-// way — the refresh child runs independently of our exit.
+// If the marker exists but the in-process flag is FALSE, this SIGTERM
+// did NOT originate from our /api/setup/provider flow — it came from
+// somewhere else (e.g. user ran `gini stop`). In that case we still
+// clean up the stale marker (so it doesn't accumulate on disk and fire
+// at the next setup POST) but we do NOT spawn the bootstrap. This is
+// the round-4 HIGH-2 fix: a `gini stop` issued while a marker was
+// sitting around from a prior crash must not respawn the gateway.
 //
-// Test seam: `spawnImpl` lets tests inject a recorder instead of the real
-// child_process.spawn. Production callers pass nothing and get the real
-// spawn.
+// Returns true when a refresh was kicked off; false otherwise (no
+// marker, non-darwin, or marker present without the in-process flag).
+//
+// Test seam: `spawnImpl` lets tests inject a recorder instead of the
+// real child_process.spawn. Production callers pass nothing and get the
+// real spawn.
 export interface ConsumeOptions {
   spawnImpl?: typeof spawn;
 }
@@ -149,12 +185,22 @@ export function consumeAutostartRefresh(instance: Instance, options: ConsumeOpti
     // correct instance handles it.
     return false;
   }
+
+  // Marker is for us. ALWAYS clean it up, regardless of whether we go
+  // on to spawn — a stale marker on disk should not survive any
+  // shutdown.
   try {
     rmSync(marker, { force: true });
   } catch {
     // Best-effort: if we can't remove, the next startup will redo the
     // refresh. Not the end of the world.
   }
+
+  // Gate: only spawn when THIS process initiated the refresh. An
+  // unrelated SIGTERM (`gini stop`, `launchctl bootout`, kill from
+  // ops) must NOT trigger a respawn — that would defeat the whole
+  // point of stop.
+  if (!refreshRequestedInProcess) return false;
 
   const spawnFn = options.spawnImpl ?? spawn;
   try {
@@ -177,5 +223,6 @@ export function consumeAutostartRefresh(instance: Instance, options: ConsumeOpti
   return true;
 }
 
-// Exposed for tests that want to manipulate the marker directly.
-export const __testing = { refreshMarkerPath };
+// Exposed for tests that want to manipulate the marker directly + reset
+// the in-process flag between cases.
+export const __testing = { refreshMarkerPath, resetRefreshFlag };

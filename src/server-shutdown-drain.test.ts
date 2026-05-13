@@ -65,8 +65,31 @@ const server = Bun.serve({
 // Tell the parent test which port we bound on.
 console.log("PORT=" + server.port);
 
+// Mirror src/server.ts:97-102 idempotency guard. Two concurrent SIGTERMs
+// must not run the handler body twice. To make the second SIGTERM
+// reliably observable (POSIX may coalesce signals delivered back-to-back
+// at the same moment), the handler does an artificial Bun.sleep(150ms)
+// AFTER setting shutdownStarted but BEFORE running server.stop. That
+// window is long enough for a "second SIGTERM" sent ~80ms later to
+// land in a distinct signal event — proving the idempotency guard is
+// what suppresses the duplicate, not the OS coalescer.
+let shutdownStarted = false;
+let handlerInvocations = 0;
+let stopCalls = 0;
 process.on("SIGTERM", async () => {
+  handlerInvocations += 1;
+  if (shutdownStarted) {
+    // Surface a count of suppressed invocations on stdout so the test
+    // can confirm the guard fired.
+    process.stdout.write("SUPPRESSED=" + (handlerInvocations - 1) + "\\n");
+    return;
+  }
+  shutdownStarted = true;
+  // Give the test time to issue a second SIGTERM that lands while
+  // we're holding the flag but haven't yet exited.
+  await Bun.sleep(150);
   try {
+    stopCalls += 1;
     await Promise.race([
       server.stop(false),
       Bun.sleep(5000)
@@ -74,6 +97,7 @@ process.on("SIGTERM", async () => {
   } catch {
     /* swallow */
   }
+  process.stdout.write("STOP_CALLS=" + stopCalls + "\\n");
   process.exit(0);
 });
 `;
@@ -169,6 +193,74 @@ describe("server SIGTERM drain", () => {
         // Clean exit (0), not killed by an external signal.
         expect(exitState.code).toBe(0);
         expect(exitState.signal).toBeNull();
+      } finally {
+        if (child && !exitState.exited) {
+          try { child.kill("SIGKILL"); } catch { /* best-effort */ }
+        }
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    15000
+  );
+
+  // Round-4 HIGH-2: SIGTERM idempotency. Two concurrent SIGTERMs to the
+  // same gateway must not run the shutdown handler body twice. With the
+  // shutdownStarted flag, the second invocation returns early. We
+  // assert via stdout that STOP_CALLS=1 (server.stop called once) and
+  // that at least one SUPPRESSED= line appeared.
+  test.skipIf(!E2E)(
+    "shutdownStarted flag prevents double-execution under concurrent SIGTERM",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "gini-shutdown-idemp-"));
+      const scriptPath = join(dir, "drain-server.ts");
+      writeFileSync(scriptPath, SERVER_SOURCE);
+
+      let child: ReturnType<typeof spawn> | null = null;
+      const exitState: { code: number | null; exited: boolean } = { code: null, exited: false };
+      try {
+        child = spawn("bun", ["run", scriptPath], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+        const proc = child;
+        let stdoutBuf = "";
+        proc.stdout!.on("data", (chunk: Buffer) => { stdoutBuf += chunk.toString("utf8"); });
+        const exited = new Promise<void>((resolve) => {
+          proc.on("exit", (code) => {
+            exitState.code = code;
+            exitState.exited = true;
+            resolve();
+          });
+        });
+
+        // Wait for PORT= so we know SIGTERM handler is wired.
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("server did not start within 5s")), 5000);
+          const check = () => {
+            if (stdoutBuf.includes("PORT=")) {
+              clearTimeout(timer);
+              resolve();
+            } else {
+              setTimeout(check, 20);
+            }
+          };
+          check();
+        });
+
+        // Fire one SIGTERM, wait ~80ms for the handler to flip the
+        // shutdownStarted flag and enter its artificial 150ms sleep,
+        // then fire a second SIGTERM. The second signal lands as a
+        // distinct event (the OS doesn't coalesce when there's a clear
+        // dispatch boundary between deliveries) and the handler's
+        // re-entry must hit the guard.
+        proc.kill("SIGTERM");
+        await new Promise((r) => setTimeout(r, 80));
+        proc.kill("SIGTERM");
+
+        await exited;
+        expect(exitState.code).toBe(0);
+
+        // Side-effect assertions: stop was called once, the second
+        // invocation was suppressed.
+        expect(stdoutBuf).toContain("STOP_CALLS=1");
+        expect(stdoutBuf).toMatch(/SUPPRESSED=\d+/);
       } finally {
         if (child && !exitState.exited) {
           try { child.kill("SIGKILL"); } catch { /* best-effort */ }

@@ -19,7 +19,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { consumeAutostartRefresh, refreshMarkerPath, requestAutostartRefresh } from "./autostart-refresh";
+import { __testing, consumeAutostartRefresh, refreshMarkerPath, requestAutostartRefresh } from "./autostart-refresh";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -59,6 +59,9 @@ describe("autostart-refresh", () => {
     // to exercise the signaling path explicitly (we don't, since killing
     // the test runner has no point).
     process.env.GINI_SKIP_PLIST_REFRESH = "1";
+    // Reset the in-process refresh-requested flag between tests so the
+    // "marker without flag" path can be exercised explicitly per case.
+    __testing.resetRefreshFlag();
   });
 
   afterEach(() => {
@@ -111,10 +114,15 @@ describe("autostart-refresh", () => {
 
   test("consumeAutostartRefresh removes marker and execs the refresh subprocess", () => {
     if (process.platform !== "darwin") return;
-    // Write the marker directly (same shape requestAutostartRefresh writes).
+    // Drive the flag via the public API so we exercise the full
+    // request → consume contract. requestAutostartRefresh writes the
+    // marker AND sets the in-process refreshRequestedInProcess flag.
+    const plistDir = join(s.home, "Library", "LaunchAgents");
+    mkdirSync(plistDir, { recursive: true });
+    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    expect(requestAutostartRefresh(instance)).toBe(true);
     const marker = refreshMarkerPath(instance);
-    mkdirSync(join(s.stateRoot, "instances", instance), { recursive: true });
-    writeFileSync(marker, instance);
+    expect(existsSync(marker)).toBe(true);
 
     let capturedArgs: string[] | null = null;
     let unrefCalled = false;
@@ -164,7 +172,9 @@ describe("autostart-refresh", () => {
     // Simulate Bun.serve flushing a multi-chunk JSON response body. The
     // bytes go through a ReadableStream, we await each chunk, and when
     // the controller closes we mark `respondedAt`. This stands in for
-    // `server.stop(true)` waiting for in-flight responses to drain.
+    // `server.stop(false)` waiting for in-flight responses to drain
+    // (the round-4 HIGH-1 fix replaced the force-close stop(true) call
+    // with the polite stop(false) variant in src/server.ts).
     const body = new ReadableStream<Uint8Array>({
       async start(controller) {
         const enc = new TextEncoder();
@@ -197,6 +207,56 @@ describe("autostart-refresh", () => {
     // the order was reversed for any response body that took >200ms to
     // stream — which is what HIGH-A flagged.
     expect(spawnedAt).toBeGreaterThan(respondedAt);
+  });
+
+  // Round-4 HIGH-2 fix: marker present from a prior crash, but THIS
+  // process never called requestAutostartRefresh. An external SIGTERM
+  // (e.g. user ran `gini stop`) must NOT trigger a respawn. The stale
+  // marker IS cleaned up so it doesn't fire on the next setup POST.
+  test("does NOT spawn when marker exists but in-process flag not set (external SIGTERM)", () => {
+    if (process.platform !== "darwin") return;
+    // Drop a marker as if a previous run had crashed mid-refresh, or
+    // as if some other process had written it. Crucially: do NOT call
+    // requestAutostartRefresh in this process — the flag stays false.
+    const marker = refreshMarkerPath(instance);
+    mkdirSync(join(s.stateRoot, "instances", instance), { recursive: true });
+    writeFileSync(marker, instance);
+
+    let spawnCalls = 0;
+    const fakeSpawn = ((..._args: unknown[]) => {
+      spawnCalls += 1;
+      return { unref() { /* no-op */ } } as unknown as ReturnType<typeof import("node:child_process").spawn>;
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const result = consumeAutostartRefresh(instance, { spawnImpl: fakeSpawn });
+    // No spawn happened — the flag gates the bootstrap.
+    expect(result).toBe(false);
+    expect(spawnCalls).toBe(0);
+    // BUT the marker is cleaned up so it doesn't accumulate on disk
+    // and fire on the next setup POST. (If we left it, the next
+    // request → consume cycle would respect the flag but the file
+    // would never disappear.)
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("DOES spawn when refreshRequestedInProcess is set (internal SIGTERM from setup POST)", () => {
+    if (process.platform !== "darwin") return;
+    // Plist on disk + requestAutostartRefresh call: both the marker AND
+    // the in-process flag should be set after this.
+    const plistDir = join(s.home, "Library", "LaunchAgents");
+    mkdirSync(plistDir, { recursive: true });
+    writeFileSync(join(plistDir, `ai.lilac.gini.${instance}.gateway.plist`), "<plist/>\n");
+    expect(requestAutostartRefresh(instance)).toBe(true);
+
+    let spawnCalls = 0;
+    const fakeSpawn = ((..._args: unknown[]) => {
+      spawnCalls += 1;
+      return { unref() { /* no-op */ } } as unknown as ReturnType<typeof import("node:child_process").spawn>;
+    }) as unknown as typeof import("node:child_process").spawn;
+
+    const result = consumeAutostartRefresh(instance, { spawnImpl: fakeSpawn });
+    expect(result).toBe(true);
+    expect(spawnCalls).toBe(1);
   });
 
   test("marker tagged for a different instance is left alone (no spawn)", () => {
