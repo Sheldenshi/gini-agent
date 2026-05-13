@@ -6,7 +6,6 @@ import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
@@ -14,13 +13,10 @@ import { useInvalidate, useMemories, useStatus } from "@/lib/queries";
 import type { MemoryRecord } from "@runtime/types";
 import { HindsightPanel } from "./_components/HindsightPanel";
 
-const SCOPES = ["all", "user", "project", "device", "temporary"] as const;
-
 export default function MemoryPage() {
   const memories = useMemories();
   const status = useStatus();
   const activeAgentName = status.data?.activeAgent?.name;
-  const [scope, setScope] = useState<typeof SCOPES[number]>("all");
   const [content, setContent] = useState("");
   const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null);
   const invalidate = useInvalidate();
@@ -58,12 +54,12 @@ export default function MemoryPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const filtered = (memories.data ?? []).filter((m) => scope === "all" || m.scope === scope);
+  const allMemories = memories.data ?? [];
+  const filtered = allMemories;
 
   // Phase 6: hide the legacy panel once every migratable record carries the
   // `migratedToUnitId` breadcrumb. Proposed/rejected rows still bring the
   // legacy panel back so users can curate them in place.
-  const allMemories = memories.data ?? [];
   const eligibleForMigration = allMemories.filter((m) => m.status === "active" || m.status === "archived");
   const allMigrated = eligibleForMigration.length > 0 && eligibleForMigration.every((m) => Boolean((m as { metadata?: { migratedToUnitId?: string } }).metadata?.migratedToUnitId));
   const showLegacy = !allMigrated || allMemories.some((m) => m.status === "proposed" || m.status === "rejected");
@@ -101,84 +97,72 @@ export default function MemoryPage() {
           </CardContent>
         </Card>
 
-        <Tabs value={scope} onValueChange={(value) => setScope(value as typeof scope)}>
-          <TabsList>
-            {SCOPES.map((value) => (
-              <TabsTrigger key={value} value={value} className="capitalize text-xs">
-                {value}
-              </TabsTrigger>
-            ))}
-          </TabsList>
-          {SCOPES.map((value) => (
-            <TabsContent key={value} value={value} className="mt-4">
-              {filtered.length === 0 ? (
-                <EmptyState title="No memories" />
-              ) : (
-                <div className="grid gap-3 lg:grid-cols-2">
-                  {filtered.map((memory) => (
-                    <Card key={memory.id}>
-                      <CardHeader>
-                        <div className="flex items-start justify-between gap-2">
-                          <CardTitle className="text-sm font-medium">{memory.scope}</CardTitle>
-                          <StatusPill value={memory.status} />
+        <div className="mt-4">
+          {filtered.length === 0 ? (
+            <EmptyState title="No memories" />
+          ) : (
+            <div className="grid gap-3 lg:grid-cols-2">
+              {filtered.map((memory) => (
+                <Card key={memory.id}>
+                  <CardHeader>
+                    <div className="flex items-start justify-between gap-2">
+                      <CardTitle className="font-mono text-[11px] text-muted-foreground">{memory.id}</CardTitle>
+                      <StatusPill value={memory.status} />
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {editing?.id === memory.id ? (
+                      <div className="space-y-2">
+                        <Textarea
+                          value={editing.draft}
+                          onChange={(event) => setEditing({ id: memory.id, draft: event.target.value })}
+                          className="min-h-20"
+                        />
+                        <div className="flex gap-2">
+                          <Button
+                            size="sm"
+                            disabled={!editing.draft.trim() || edit.isPending}
+                            onClick={() => edit.mutate({ id: memory.id, content: editing.draft.trim() })}
+                          >
+                            {edit.isPending ? "Saving…" : "Save"}
+                          </Button>
+                          <Button size="sm" variant="outline" disabled={edit.isPending} onClick={() => setEditing(null)}>
+                            Cancel
+                          </Button>
                         </div>
-                        <CardDescription className="font-mono text-[11px]">{memory.id}</CardDescription>
-                      </CardHeader>
-                      <CardContent className="space-y-2">
-                        {editing?.id === memory.id ? (
-                          <div className="space-y-2">
-                            <Textarea
-                              value={editing.draft}
-                              onChange={(event) => setEditing({ id: memory.id, draft: event.target.value })}
-                              className="min-h-20"
-                            />
-                            <div className="flex gap-2">
-                              <Button
-                                size="sm"
-                                disabled={!editing.draft.trim() || edit.isPending}
-                                onClick={() => edit.mutate({ id: memory.id, content: editing.draft.trim() })}
-                              >
-                                {edit.isPending ? "Saving…" : "Save"}
-                              </Button>
-                              <Button size="sm" variant="outline" disabled={edit.isPending} onClick={() => setEditing(null)}>
-                                Cancel
-                              </Button>
-                            </div>
-                          </div>
-                        ) : (
-                          <p className="text-sm">{memory.content}</p>
-                        )}
-                        <p className="font-mono text-[10px] text-muted-foreground">
-                          conf {memory.confidence.toFixed(2)} · {memory.provenance}
-                          {memory.lastUsedAt ? ` · last used ${new Date(memory.lastUsedAt).toLocaleString()}` : ""}
-                          {memory.sourceTaskId ? ` · task ${memory.sourceTaskId}` : ""}
-                        </p>
-                        {editing?.id !== memory.id ? (
-                          <div className="flex flex-wrap gap-2">
-                            {memory.status === "proposed" ? (
-                              <>
-                                <Button size="sm" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "approve" })}>Approve</Button>
-                                <Button size="sm" variant="outline" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "reject" })}>Reject</Button>
-                              </>
-                            ) : null}
-                            {memory.status !== "archived" && memory.status !== "rejected" ? (
-                              <Button size="sm" variant="outline" onClick={() => setEditing({ id: memory.id, draft: memory.content })}>
-                                Edit
-                              </Button>
-                            ) : null}
-                            {memory.status === "active" ? (
-                              <Button size="sm" variant="outline" disabled={archive.isPending} onClick={() => archive.mutate(memory.id)}>Archive</Button>
-                            ) : null}
-                          </div>
+                      </div>
+                    ) : (
+                      <p className="text-sm">{memory.content}</p>
+                    )}
+                    <p className="font-mono text-[10px] text-muted-foreground">
+                      conf {memory.confidence.toFixed(2)} · {memory.provenance}
+                      {memory.lastUsedAt ? ` · last used ${new Date(memory.lastUsedAt).toLocaleString()}` : ""}
+                      {memory.sourceTaskId ? ` · task ${memory.sourceTaskId}` : ""}
+                    </p>
+                    {editing?.id !== memory.id ? (
+                      <div className="flex flex-wrap gap-2">
+                        {memory.status === "proposed" ? (
+                          <>
+                            <Button size="sm" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "approve" })}>Approve</Button>
+                            <Button size="sm" variant="outline" disabled={decide.isPending} onClick={() => decide.mutate({ id: memory.id, op: "reject" })}>Reject</Button>
+                          </>
                         ) : null}
-                      </CardContent>
-                    </Card>
-                  ))}
-                </div>
-              )}
-            </TabsContent>
-          ))}
-        </Tabs>
+                        {memory.status !== "archived" && memory.status !== "rejected" ? (
+                          <Button size="sm" variant="outline" onClick={() => setEditing({ id: memory.id, draft: memory.content })}>
+                            Edit
+                          </Button>
+                        ) : null}
+                        {memory.status === "active" ? (
+                          <Button size="sm" variant="outline" disabled={archive.isPending} onClick={() => archive.mutate(memory.id)}>Archive</Button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
           </>
         ) : null}
       </div>

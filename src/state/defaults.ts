@@ -113,7 +113,6 @@ export function defaultAgent(instance: Instance, at: string): AgentRecord {
     providerName: undefined,
     model: undefined,
     toolsets: ["file", "terminal", "memory", "session_search", "delegation"],
-    memoryScopes: ["user", "project", "device", "temporary"],
     messagingTargets: [],
     createdAt: at,
     updatedAt: at

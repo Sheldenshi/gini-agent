@@ -230,6 +230,53 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
   delete stateAny.activeProfileId;
 }
 
+// Drop the dead `MemoryRecord.scope` and `AgentRecord.memoryScopes` fields
+// from persisted state. Neither was consulted at runtime after Phase C —
+// `agentId` is the only memory isolation boundary. Idempotent: a second
+// pass over an already-cleaned state file matches no rows. Emits one
+// summary audit event per collection when something was stripped so the
+// cleanup shows up in `gini doctor` / /api/audit.
+function migrateDropDeadMemoryFields(state: RuntimeState): void {
+  let scopesStripped = 0;
+  if (Array.isArray(state.memories)) {
+    for (const memory of state.memories) {
+      const rec = memory as unknown as { scope?: unknown };
+      if (rec.scope !== undefined) {
+        delete rec.scope;
+        scopesStripped += 1;
+      }
+    }
+  }
+  let memoryScopesStripped = 0;
+  if (Array.isArray(state.agents)) {
+    for (const agent of state.agents) {
+      const rec = agent as unknown as { memoryScopes?: unknown };
+      if (rec.memoryScopes !== undefined) {
+        delete rec.memoryScopes;
+        memoryScopesStripped += 1;
+      }
+    }
+  }
+  if (scopesStripped > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "memory.scope.dropped",
+      target: "state.memories",
+      risk: "low",
+      evidence: { stripped: scopesStripped }
+    });
+  }
+  if (memoryScopesStripped > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "agent.memoryscopes.dropped",
+      target: "state.agents",
+      risk: "low",
+      evidence: { stripped: memoryScopesStripped }
+    });
+  }
+}
+
 // Phase C — per-agent memory isolation backfill for the legacy
 // MemoryRecord store. Walks state.memories and stamps `agentId` on rows
 // that pre-date Phase C, bundling all of them under whichever agent was
@@ -347,6 +394,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // idempotent so a re-read of an already-migrated state file is a no-op.
   migrateMemoryAgentId(state);
   migrateHindsightAgentIdColumns(instance, state);
+  // Drop dead MemoryRecord.scope / AgentRecord.memoryScopes fields from
+  // legacy state files. Runs after agents are populated so the audit
+  // event can land on a valid state.
+  migrateDropDeadMemoryFields(state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];

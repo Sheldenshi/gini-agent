@@ -63,7 +63,6 @@ function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited
   if (proposal.kind === "memory") {
     const memory = createMemory(state, {
       content: String(proposal.payload.content ?? proposal.title),
-      scope: proposal.payload.scope === "user" || proposal.payload.scope === "device" || proposal.payload.scope === "temporary" ? proposal.payload.scope : "project",
       sourceTaskId: proposal.sourceTaskId,
       confidence: Number(proposal.payload.confidence ?? 0.75),
       status: "active",

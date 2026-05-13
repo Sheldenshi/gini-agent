@@ -63,7 +63,6 @@ describe("createAgent", () => {
       defaultAgent.providerName = "codex";
       defaultAgent.model = "gpt-5.5";
       defaultAgent.toolsets = ["file", "terminal"];
-      defaultAgent.memoryScopes = ["user"];
       defaultAgent.messagingTargets = ["local"];
       return defaultAgent;
     });
@@ -72,7 +71,6 @@ describe("createAgent", () => {
     expect(created.providerName).toBe("codex");
     expect(created.model).toBe("gpt-5.5");
     expect(created.toolsets).toEqual(["file", "terminal"]);
-    expect(created.memoryScopes).toEqual(["user"]);
     expect(created.messagingTargets).toEqual(["local"]);
   });
 
@@ -111,7 +109,6 @@ describe("createAgent", () => {
         instance: config.instance,
         agentId: defaultAgent.id,
         content: "should not leak",
-        scope: "project",
         status: "active",
         sensitivity: "normal",
         confidence: 1,

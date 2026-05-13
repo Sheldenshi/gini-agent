@@ -13,7 +13,6 @@ export async function createMemoryFromInput(config: RuntimeConfig, input: Record
     return createMemory(state, {
       agentId: effective.agentId,
       content: String(input.content ?? ""),
-      scope: normalizeScope(input.scope),
       confidence: Math.max(0, Math.min(1, Number(input.confidence ?? 1))),
       status: String(input.status ?? "active") === "proposed" ? "proposed" : "active",
       sensitivity: input.sensitivity === "sensitive" ? "sensitive" : "normal",
@@ -44,7 +43,6 @@ export async function editMemory(config: RuntimeConfig, memoryId: string, input:
     const memory = state.memories.find((candidate) => candidate.id === memoryId);
     if (!memory) throw new Error(`Memory not found: ${memoryId}`);
     if (typeof input.content === "string") memory.content = input.content;
-    if (typeof input.scope === "string") memory.scope = normalizeScope(input.scope);
     if (typeof input.confidence === "number") memory.confidence = Math.max(0, Math.min(1, input.confidence));
     if (input.sensitivity === "normal" || input.sensitivity === "sensitive") memory.sensitivity = input.sensitivity;
     memory.updatedAt = now();
@@ -54,7 +52,7 @@ export async function editMemory(config: RuntimeConfig, memoryId: string, input:
       target: memoryId,
       risk: "medium",
       taskId: memory.sourceTaskId,
-      evidence: { scope: memory.scope, sensitivity: memory.sensitivity }
+      evidence: { sensitivity: memory.sensitivity }
     });
     return memory;
   });
@@ -75,8 +73,4 @@ export async function archiveMemory(config: RuntimeConfig, memoryId: string) {
     });
     return memory;
   });
-}
-
-function normalizeScope(value: unknown): "user" | "project" | "device" | "temporary" {
-  return value === "user" || value === "device" || value === "temporary" ? value : "project";
 }

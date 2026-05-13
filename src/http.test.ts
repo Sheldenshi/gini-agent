@@ -180,7 +180,7 @@ describe("runtime api", () => {
 
     const created = await call(handler, config, "/api/agents", {
       method: "POST",
-      body: JSON.stringify({ name: "research", toolsets: ["file", "web", "session_search"], memoryScopes: ["user", "project"] })
+      body: JSON.stringify({ name: "research", toolsets: ["file", "web", "session_search"] })
     });
     const active = await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
     const agents = await call(handler, config, "/api/agents");
@@ -432,11 +432,11 @@ describe("runtime api", () => {
 
     const memory = await call(handler, config, "/api/memory", {
       method: "POST",
-      body: JSON.stringify({ content: "original memory", scope: "user", status: "active" })
+      body: JSON.stringify({ content: "original memory", status: "active" })
     });
     const edited = await call(handler, config, `/api/memory/${memory.id}`, {
       method: "PATCH",
-      body: JSON.stringify({ content: "edited memory", scope: "temporary" })
+      body: JSON.stringify({ content: "edited memory" })
     });
     const archived = await call(handler, config, `/api/memory/${memory.id}`, { method: "DELETE" });
 
@@ -448,7 +448,6 @@ describe("runtime api", () => {
     const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
 
     expect(edited.content).toBe("edited memory");
-    expect(edited.scope).toBe("temporary");
     expect(archived.status).toBe("archived");
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");

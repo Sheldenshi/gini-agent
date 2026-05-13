@@ -69,11 +69,18 @@ agent changes which facts the agent knows.
 
 ## Boundary
 
-`agentId` is the isolation key. `MemoryRecord.scope` (`user`,
-`project`, `device`, `temporary`) is kept as an in-agent organizational
-tag for user-facing categorization — not a boundary. Future work may
-revisit `scope`, but tearing it out here would ripple too far for one
-phase.
+`agentId` is the isolation key.
+
+**Amendment (2026-05-13):** `MemoryRecord.scope` and
+`AgentRecord.memoryScopes` were removed in a follow-up after the audit
+confirmed neither was consulted at runtime. The fields had been kept as
+an "in-agent organizational tag" pending future use, but no read or
+write path ever branched on them — they were dead weight after Phase
+C. `normalizeState` gained an idempotent migration step that strips
+both fields from existing state files on first read. The Hindsight
+`metadata.legacyScope` breadcrumb on imported units is left intact as
+a historical record of pre-Phase-C data and is separate from the
+runtime field that was removed.
 
 ## Subagent Inheritance
 
@@ -122,9 +129,12 @@ in legacy code paths keeps working.
 - **Filter at query time only; no per-agent banks.** Rejected —
   slower queries, no bank-level cleanup story (e.g. deleting an
   agent's entire memory in one statement).
-- **Drop `MemoryRecord.scope` entirely.** Rejected for this ADR —
-  too much ripple for one phase. Kept as an in-agent organizational
-  tag.
+- **Drop `MemoryRecord.scope` entirely.** Initially rejected for this
+  ADR as "too much ripple for one phase" and kept as an in-agent
+  organizational tag. A follow-up audit on 2026-05-13 confirmed the
+  field had no runtime consumers and dropped it, along with
+  `AgentRecord.memoryScopes`. See the amendment in the Boundary
+  section above.
 - **Inherit memory from the parent agent on `createAgent`.**
   Rejected — the product choice is that new agents start clean. A
   newly-created "research" agent should not see "coding" agent

@@ -2,9 +2,9 @@
 // store into the four-network SQLite store.
 //
 // Heuristic mapping:
-//   - scope    -> stays in record metadata as `legacyScope`. Future work may
-//                 namespace banks per project/user; v1 lumps everything into
-//                 the instance's default bank.
+//   - scope    -> dropped from MemoryRecord but legacy state files on disk
+//                 may still carry it; preserved as `metadata.legacyScope` on
+//                 the imported Hindsight unit purely as a breadcrumb.
 //   - content  -> embedded with the current provider, inserted as a
 //                 MemoryUnit. Network classified by a tiny rule:
 //                   first-person language ("I ", "did ", "recommended ",
@@ -98,6 +98,11 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
       const [vector] = await provider.embed([record.content]);
       const agentId = record.agentId ?? fallbackAgentId;
       ensureAgentBank(instance, agentId);
+      // legacyScope breadcrumb: legacy state files persisted before scope
+      // was dropped from MemoryRecord may still carry the field on disk;
+      // preserve it as an opaque breadcrumb on the imported Hindsight unit
+      // for downstream debugging. The field is not consulted at runtime.
+      const legacyScope = (record as unknown as { scope?: unknown }).scope;
       const unit = insertMemoryUnit(instance, {
         bankId: bankIdForAgent(agentId),
         agentId,
@@ -107,7 +112,7 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
         network: classifyNetwork(record.content),
         confidence: typeof record.confidence === "number" ? record.confidence : null,
         metadata: {
-          legacyScope: record.scope,
+          legacyScope,
           legacyProvenance: record.provenance,
           legacyId: record.id
         },

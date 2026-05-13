@@ -63,7 +63,7 @@ export function improvementPayload(kind: string, title: string, content: string)
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
   }
-  return { content, scope: "project", confidence: 0.75 };
+  return { content, confidence: 0.75 };
 }
 
 export function help(): void {

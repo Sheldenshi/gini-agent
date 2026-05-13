@@ -431,7 +431,6 @@ export interface AgentRecord {
   providerName?: ProviderName | "openrouter" | "local";
   model?: string;
   toolsets: string[];
-  memoryScopes: Array<"user" | "project" | "device" | "temporary">;
   messagingTargets: string[];
   createdAt: string;
   updatedAt: string;
@@ -504,14 +503,11 @@ export interface Approval {
 export interface MemoryRecord {
   id: string;
   instance: Instance;
-  // Phase C — per-agent isolation key. Optional in the type because legacy
-  // state files persisted before Phase C don't carry it; normalizeState
+  // Per-agent isolation key. Optional in the type because legacy state
+  // files persisted before Phase C don't carry it; normalizeState
   // backfills these by stamping the active agent at migration time.
-  // `scope` is kept as an in-agent tag for the user's own organization;
-  // `agentId` is the isolation boundary.
   agentId?: string;
   content: string;
-  scope: "user" | "project" | "device" | "temporary";
   sourceTaskId?: string;
   createdAt: string;
   updatedAt: string;

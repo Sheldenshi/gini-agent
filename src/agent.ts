@@ -350,7 +350,6 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       const memory = createMemory(state, {
         agentId: activeAgentId,
         content,
-        scope: "project",
         sourceTaskId: item.id,
         confidence: 0.7,
         status: "proposed",

@@ -31,9 +31,6 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
       toolsets: Array.isArray(input.toolsets)
         ? input.toolsets.map(String)
         : (defaultAgent?.toolsets ?? ["file", "terminal", "memory", "session_search"]),
-      memoryScopes: Array.isArray(input.memoryScopes)
-        ? input.memoryScopes.filter(isMemoryScope)
-        : (defaultAgent?.memoryScopes ?? ["user", "project"]),
       messagingTargets: Array.isArray(input.messagingTargets)
         ? input.messagingTargets.map(String)
         : (defaultAgent?.messagingTargets ?? [])
@@ -49,8 +46,4 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
 
 export async function useAgent(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.instance, (state) => activateAgent(state, idOrName));
-}
-
-function isMemoryScope(value: unknown): value is "user" | "project" | "device" | "temporary" {
-  return value === "user" || value === "project" || value === "device" || value === "temporary";
 }

@@ -52,7 +52,6 @@ async function seedLegacy(instance: string, count: number, network: "world" | "e
         : `Fact ${i} about the project.`;
       createMemory(state, {
         content,
-        scope: "project",
         sourceTaskId: `task_${i}`,
         confidence: 0.7,
         status: "active",
@@ -124,7 +123,6 @@ describe("phase 6 migration", () => {
     await mutateState(instance, (state) => {
       createMemory(state, {
         content: "this is proposed",
-        scope: "project",
         confidence: 0.7,
         status: "proposed",
         sensitivity: "normal",
@@ -132,7 +130,6 @@ describe("phase 6 migration", () => {
       });
       createMemory(state, {
         content: "this is rejected",
-        scope: "project",
         confidence: 0.7,
         status: "rejected",
         sensitivity: "normal",

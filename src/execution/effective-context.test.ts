@@ -22,7 +22,6 @@ function buildAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
     providerName: undefined,
     model: undefined,
     toolsets: [],
-    memoryScopes: ["user", "project"],
     messagingTargets: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
