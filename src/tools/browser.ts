@@ -533,6 +533,18 @@ export async function disconnectSharedBrowser(): Promise<void> {
     // teardown.
     if (disconnectGeneration !== myGeneration) return;
 
+    // Wait for any in-flight launch to settle BEFORE tearing down the
+    // shared slot. The drain loop above only counts admissions that
+    // reached withSession — a slow launchPersistentContext / connectOverCDP
+    // started by an earlier admission that has since exited withSession
+    // can still finish here and install itself into `shared`, holding the
+    // profile lock against the Connect/Wipe that's running this teardown.
+    // Swallow rejections: a failed launch leaves `shared` null, which is
+    // what we want, and the original caller already saw the failure.
+    if (pendingShared) {
+      await pendingShared.catch(() => undefined);
+    }
+
     const ids = Array.from(sessions.keys());
     for (const id of ids) {
       const session = sessions.get(id);
@@ -548,6 +560,11 @@ export async function disconnectSharedBrowser(): Promise<void> {
     }
     consoleLogs.clear();
     if (shared) {
+      // Either the handle survived the entire drain, or pendingShared
+      // resolved between the generation check and now and installed itself
+      // into shared (the ensureShared post-await re-check usually catches
+      // this and throws, but a future refactor or a same-generation race
+      // could still land here). Tear it down regardless.
       await teardownHandle(shared).catch(() => undefined);
       shared = null;
     }
@@ -555,6 +572,35 @@ export async function disconnectSharedBrowser(): Promise<void> {
       clearInterval(sweepTimer);
       sweepTimer = undefined;
     }
+  } finally {
+    inFlightDisconnects--;
+  }
+}
+
+// Run `fn` with the disconnect admission gate held closed for the entire
+// duration. Used by browser-connect's launchManaged and wipeBrowserProfile
+// to guarantee that no new agent tool call can land between the
+// disconnect-then-launch (or disconnect-then-rm) steps in their critical
+// section.
+//
+// Without this lock, the disconnectSharedBrowser-internal generation bump
+// only blocks new admissions while disconnect itself is running. As soon
+// as disconnect returns control to the caller, the gate reopens, and any
+// admission that lands between `await disconnectSharedBrowser()` and the
+// next step (launchPersistentContext, or fs.rm) sneaks back in — racing the
+// caller for the profile dir lock.
+//
+// Mechanics: bump the generation at entry so any in-flight or
+// freshly-arriving admission sees a generation mismatch and bails with
+// the standard "Browser disconnecting" sentinel. Increment
+// `inFlightDisconnects` so withSession's cheap short-circuit also rejects.
+// Restore both in a `finally` so a thrown `fn` doesn't wedge the
+// admission gate closed forever.
+export async function withTeardownLock<T>(fn: () => Promise<T>): Promise<T> {
+  disconnectGeneration++;
+  inFlightDisconnects++;
+  try {
+    return await fn();
   } finally {
     inFlightDisconnects--;
   }
@@ -1171,6 +1217,12 @@ export const __test = {
   },
   clearPendingSharedForTest(): void {
     pendingShared = null;
+  },
+  // Reset the cached chromium import so a test that installed a fresh
+  // playwright-core mock via mock.module() forces ensureShared to re-import
+  // the module and pick up the mocked chromium.launchPersistentContext.
+  resetChromiumImportForTest(): void {
+    chromiumImport = undefined;
   },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag

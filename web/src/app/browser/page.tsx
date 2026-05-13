@@ -48,7 +48,6 @@ export default function BrowserPage() {
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [cdpUrl, setCdpUrl] = useState("");
-  const [port, setPort] = useState("");
   const [disconnectOpen, setDisconnectOpen] = useState(false);
   const [wipeOpen, setWipeOpen] = useState(false);
 
@@ -56,7 +55,7 @@ export default function BrowserPage() {
   const record = status.data?.record;
 
   const handleConnect = (mode: "managed" | "cdp") => {
-    const body: { cdpUrl?: string; port?: number } = {};
+    const body: { cdpUrl?: string } = {};
     if (mode === "cdp") {
       const trimmed = cdpUrl.trim();
       if (!trimmed) {
@@ -64,19 +63,11 @@ export default function BrowserPage() {
         return;
       }
       body.cdpUrl = trimmed;
-    } else if (port.trim().length > 0) {
-      const parsed = Number(port);
-      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
-        toast.error("Port must be an integer between 1 and 65535.");
-        return;
-      }
-      body.port = parsed;
     }
     connect.mutate(body, {
       onSuccess: () => {
         toast.success(mode === "cdp" ? "Attached to Chrome via CDP." : "Chrome connected.");
         setCdpUrl("");
-        setPort("");
       },
       onError: (error: Error) => toast.error(error.message)
     });
@@ -186,21 +177,6 @@ export default function BrowserPage() {
 
             {!connected && showAdvanced ? (
               <div className="grid gap-3 rounded-md border border-border bg-card/50 p-3 text-xs">
-                <div>
-                  <Label htmlFor="port" className="text-[11px] uppercase tracking-wide text-muted-foreground">
-                    Debugging port (managed mode)
-                  </Label>
-                  <Input
-                    id="port"
-                    value={port}
-                    onChange={(event) => setPort(event.target.value)}
-                    placeholder="9222"
-                    inputMode="numeric"
-                  />
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    Optional. Leave blank to use the runtime default.
-                  </p>
-                </div>
                 <div>
                   <Label htmlFor="cdp" className="text-[11px] uppercase tracking-wide text-muted-foreground">
                     Attach to existing Chrome (CDP URL)

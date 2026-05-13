@@ -72,15 +72,6 @@ describe("browser-connect helpers", () => {
     expect(result.ok).toBe(false);
   });
 
-  test("validatePort accepts 1..65535 and rejects everything else", () => {
-    expect(__test.validatePort(9222, 1234)).toBe(9222);
-    expect(__test.validatePort(undefined, 1234)).toBe(1234);
-    expect(() => __test.validatePort(-1, 9222)).toThrow();
-    expect(() => __test.validatePort(0, 9222)).toThrow();
-    expect(() => __test.validatePort(99999, 9222)).toThrow();
-    expect(() => __test.validatePort("nope", 9222)).toThrow();
-  });
-
   test("profileDirFor lives under the instance root", () => {
     const config = testConfig("profile-dir");
     const dir = __test.profileDirFor(config);
@@ -662,5 +653,226 @@ describe("wipeBrowserProfile", () => {
     expect(contextCloseCalled).toBe(true);
     expect(existsSync(dir)).toBe(false);
     browserMod.__test.uninstallFakeBrowserForTest();
+  });
+});
+
+// Round-1 fix 5: realistic coverage that the same per-instance profile
+// dir is used across a Connect → Disconnect → tool-call sequence. We
+// mock playwright-core so launchPersistentContext records the data dir
+// it was invoked with at every step; the assertion is that the dir is
+// identical across the two launches (sign-ins persist on the same dir).
+describe("persistent profile dir is stable across Connect → Disconnect → tool call", () => {
+  test("Connect launches headed against the same dir the default-tool path uses headless", async () => {
+    const config = testConfig("profile-stable");
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            pages: () => [],
+            newPage: async () => ({
+              on: () => undefined,
+              close: () => Promise.resolve(),
+              goto: () => Promise.resolve(null),
+              url: () => "about:blank",
+              title: () => Promise.resolve(""),
+              evaluate: () => Promise.resolve([])
+            }),
+            browser: () => ({ process: () => ({ pid: 9999 }) }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    const browserMod = await import("../tools/browser");
+    browserMod.__test.resetChromiumImportForTest();
+    browserMod.setBrowserInstance(config.instance);
+    try {
+      // Step 1: Connect — launches headed against the per-instance dir.
+      const connectResult = await connectBrowser(config, {});
+      expect(connectResult.connected).toBe(true);
+      // Step 2: Disconnect — closes the visible context.
+      const disconnectResult = await disconnectBrowser(config);
+      expect(disconnectResult.connected).toBe(false);
+      // Step 3: Default tool path — relaunches headless against the SAME dir.
+      try {
+        await browserMod.browserNavigate("profile-stable-task", { url: "https://example.com/" });
+      } catch {
+        // snapshot may fail with the fake page; assertion below is what matters.
+      }
+
+      expect(launchCalls.length).toBeGreaterThanOrEqual(2);
+      const first = launchCalls[0]!;
+      const second = launchCalls[launchCalls.length - 1]!;
+      expect(first.dataDir).toBe(second.dataDir);
+      expect(first.dataDir).toContain("chrome-profile");
+      expect(first.dataDir).toContain(config.instance);
+      // Connect is headed; default tool path is headless.
+      expect(first.options.headless).toBe(false);
+      expect(second.options.headless).toBe(true);
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+      browserMod.setBrowserInstance("dev");
+    }
+  });
+});
+
+// Round-1 fix 3: state.browser must be cleared on runtime startup so a
+// stale managed record from a previous run doesn't make GET /api/browser
+// report `connected: true` and trigger an unprompted headed Chrome launch
+// on the next agent tool call. This test exercises the same mutateState
+// shape that src/server.ts runs at startup; the on-disk profile dir is
+// independent and stays put.
+describe("startup clears stale browser connection record", () => {
+  test("mutateState(state.browser = null) leaves on-disk profile untouched", async () => {
+    const config = testConfig("startup-clear-stale");
+    const { mutateState } = await import("../state");
+    // Materialize a profile dir on disk to prove the wipe is independent
+    // of clearing the record.
+    const dir = __test.profileDirFor(config);
+    mkdirSync(dir, { recursive: true });
+    const sentinel = join(dir, "Cookies");
+    writeFileSync(sentinel, "fake-cookie-data");
+
+    // Seed a stale managed record (as if a previous runtime had a
+    // visible Chrome window before crashing/restarting).
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "managed",
+        cdpUrl: __test.MANAGED_CDP_SENTINEL,
+        pid: 424242,
+        dataDir: dir,
+        chromePath: "/fake/path",
+        startedAt: new Date().toISOString()
+      };
+    });
+    expect(readState(config.instance).browser).not.toBeNull();
+
+    // Same shape src/server.ts runs at startup.
+    const existing = readState(config.instance).browser ?? null;
+    if (existing) {
+      await mutateState(config.instance, (state) => {
+        state.browser = null;
+      });
+    }
+
+    // Record gone, profile dir + sentinel cookie file untouched.
+    expect(readState(config.instance).browser ?? null).toBeNull();
+    expect(existsSync(sentinel)).toBe(true);
+  });
+});
+
+// Round-1 fix 1: launchManaged wraps disconnect-then-launch in
+// withTeardownLock so a parallel agent admission can't sneak in between
+// the two awaits and re-acquire the profile lock. We verify the lock by
+// installing a fake launchPersistentContext that, mid-launch, kicks off a
+// browserNavigate admission and asserts it rejects with the standard
+// "Browser disconnecting" sentinel.
+describe("launchManaged holds the teardown lock across the disconnect-then-launch sequence", () => {
+  test("a browserNavigate admission landing during launch is rejected", async () => {
+    const config = testConfig("launch-lock-admission");
+    const browserMod = await import("../tools/browser");
+    browserMod.setBrowserInstance(config.instance);
+    let admissionResultJson: string | undefined;
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => {
+          // Mid-launch: simulate a browserNavigate landing while the lock
+          // is held. With the lock active, withSession should reject this
+          // immediately with the disconnecting sentinel — proving no agent
+          // tool call can sneak in between disconnectSharedBrowser and
+          // launchPersistentContext.
+          admissionResultJson = await browserMod.browserNavigate(
+            "launch-lock-admission-task",
+            { url: "https://example.com/" }
+          );
+          return {
+            pages: () => [],
+            newPage: async () => ({
+              on: () => undefined,
+              close: () => Promise.resolve(),
+              goto: () => Promise.resolve(null),
+              url: () => "about:blank",
+              title: () => Promise.resolve(""),
+              evaluate: () => Promise.resolve([])
+            }),
+            browser: () => ({ process: () => ({ pid: 7777 }) }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      await connectBrowser(config, {});
+      expect(admissionResultJson).toBeDefined();
+      const parsed = JSON.parse(admissionResultJson!) as { success: boolean; error?: string };
+      expect(parsed.success).toBe(false);
+      expect(parsed.error).toMatch(/disconnecting/i);
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.setInFlightDisconnectsForTest(0);
+      browserMod.__test.resetChromiumImportForTest();
+      browserMod.setBrowserInstance("dev");
+    }
+  });
+});
+
+// Round-1 fix 1 (wipe variant): wipeBrowserProfile must hold the
+// admission gate closed across disconnect-then-rm so an admission can't
+// land between the two awaits and recreate the profile dir mid-delete.
+describe("wipeBrowserProfile holds the teardown lock across disconnect-then-rm", () => {
+  test("a browserNavigate admission landing during wipe is rejected", async () => {
+    const config = testConfig("wipe-lock-admission");
+    const browserMod = await import("../tools/browser");
+    browserMod.setBrowserInstance(config.instance);
+    // Materialize a profile dir on disk.
+    const dir = __test.profileDirFor(config);
+    mkdirSync(dir, { recursive: true });
+    const sentinel = join(dir, "Cookies");
+    writeFileSync(sentinel, "fake-cookie-data");
+
+    // Install a fake headless persistent context whose .close() takes a
+    // moment so we can prove the admission landing during that close
+    // gets rejected.
+    let releaseClose: () => void = () => undefined;
+    const closeReleased = new Promise<void>((resolve) => {
+      releaseClose = resolve;
+    });
+    let admissionResultJson: string | undefined;
+    browserMod.__test.installFakeHeadlessPersistentContextForTest({
+      close: async () => {
+        // Schedule the admission attempt while we're inside close() —
+        // the lock must be held for the whole disconnect-then-rm
+        // sequence, so this admission should reject.
+        admissionResultJson = await browserMod.browserNavigate(
+          "wipe-lock-admission-task",
+          { url: "https://example.com/" }
+        );
+        await closeReleased;
+      }
+    });
+
+    setTimeout(() => releaseClose(), 50);
+    await wipeBrowserProfile(config);
+
+    expect(admissionResultJson).toBeDefined();
+    const parsed = JSON.parse(admissionResultJson!) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/disconnecting/i);
+    // Dir was rm'd as part of the wipe.
+    expect(existsSync(sentinel)).toBe(false);
+    browserMod.__test.uninstallFakeBrowserForTest();
+    browserMod.__test.clearFakeSessionsForTest();
+    browserMod.__test.setInFlightDisconnectsForTest(0);
+    browserMod.setBrowserInstance("dev");
   });
 });

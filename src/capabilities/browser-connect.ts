@@ -45,11 +45,11 @@ import {
   chromeProfileDirFor,
   disconnectSharedBrowser,
   materializeManagedForConnect,
-  safetyCheck
+  safetyCheck,
+  withTeardownLock
 } from "../tools/browser";
 import type { BrowserConnectionRecord, RuntimeConfig } from "../types";
 
-const DEFAULT_CDP_PORT = 9222;
 // We poll a user-supplied CDP /json/version endpoint every 500ms for up
 // to 15s before giving up. Used only by `cdp` mode now (managed mode no
 // longer probes — Playwright owns the lifecycle).
@@ -183,17 +183,7 @@ function validateCdpUrl(raw: string): { ok: true; url: string } | { ok: false; e
   return { ok: true, url: parsed.toString() };
 }
 
-function validatePort(value: unknown, fallback: number): number {
-  if (value === undefined || value === null || value === "") return fallback;
-  const port = typeof value === "number" ? value : Number(value);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`Invalid port: ${String(value)}`);
-  }
-  return port;
-}
-
 interface ConnectInput {
-  port?: unknown;
   cdpUrl?: unknown;
 }
 
@@ -227,11 +217,11 @@ export function connectBrowser(config: RuntimeConfig, input: ConnectInput): Prom
 
 async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): Promise<Status> {
   // Validate caller input BEFORE we touch any existing state. A bad cdpUrl
-  // (malformed, blocked SSRF target, unsupported protocol) or out-of-range
-  // port must surface as a 400 to the caller without tearing down the
-  // user's already-managed Chrome. Previously the mismatch check used the
-  // raw input string, triggered tearDownExistingConnection (killing the
-  // user's Chrome), and only THEN ran validation — see round-3 review.
+  // (malformed, blocked SSRF target, unsupported protocol) must surface as
+  // a 400 to the caller without tearing down the user's already-managed
+  // Chrome. Previously the mismatch check used the raw input string,
+  // triggered tearDownExistingConnection (killing the user's Chrome), and
+  // only THEN ran validation — see round-3 review.
   let validatedCallerCdp: string | undefined;
   if (typeof input.cdpUrl === "string" && input.cdpUrl.length > 0) {
     const validated = validateCdpUrl(input.cdpUrl);
@@ -241,10 +231,6 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
     if (blocked) throw new Error(`Invalid cdpUrl: ${blocked}`);
     validatedCallerCdp = validated.url;
   }
-  const validatedCallerPort =
-    input.port !== undefined && input.port !== null && input.port !== ""
-      ? validatePort(input.port, DEFAULT_CDP_PORT)
-      : undefined;
 
   const existing = readState(config.instance).browser ?? null;
   if (existing) {
@@ -252,8 +238,7 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
     // stored, don't short-circuit on the old record — fall through to the
     // teardown + fresh attach path.
     const callerCdp = validatedCallerCdp;
-    const callerPort = validatedCallerPort;
-    const targetsSameEndpoint = targetsExistingRecord(existing, callerCdp, callerPort);
+    const targetsSameEndpoint = targetsExistingRecord(existing, callerCdp);
 
     if (targetsSameEndpoint) {
       if (existing.mode === "managed") {
@@ -316,11 +301,6 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
     await disconnectSharedBrowser();
     return result;
   }
-  // Ignore validatedCallerPort: launchPersistentContext doesn't take a
-  // user-supplied debugging port. We accept the field for API back-compat
-  // (callers from older CLI versions may still send it) but it has no
-  // effect on the managed lifecycle.
-  void validatedCallerPort;
   return await launchManaged(config);
 }
 
@@ -359,39 +339,25 @@ async function tearDownExistingConnection(
 
 // Compare the caller's requested endpoint against the existing record.
 // Returns true when the caller didn't specify anything (a vanilla
-// "reconnect") or when their cdpUrl / port matches what we already have
-// stored. False means the caller explicitly wants somewhere else — we
-// should tear down and re-attach rather than handing back the stale record.
+// "reconnect") or when their cdpUrl matches what we already have stored.
+// False means the caller explicitly wants somewhere else — we should tear
+// down and re-attach rather than handing back the stale record.
 function targetsExistingRecord(
   existing: BrowserConnectionRecord,
-  callerCdp: string | undefined,
-  callerPort: number | undefined
+  callerCdp: string | undefined
 ): boolean {
   // No explicit endpoint requested → managed reconnect → matches anything.
-  if (callerCdp === undefined && callerPort === undefined) return true;
+  if (callerCdp === undefined) return true;
   // Caller asked for cdp mode but existing is managed (or vice versa) →
   // always a mismatch.
-  if (callerCdp !== undefined) {
-    if (existing.mode === "managed") return false;
-    try {
-      const wanted = new URL(callerCdp);
-      const have = new URL(existing.cdpUrl);
-      return wanted.host === have.host;
-    } catch {
-      return false;
-    }
+  if (existing.mode === "managed") return false;
+  try {
+    const wanted = new URL(callerCdp);
+    const have = new URL(existing.cdpUrl);
+    return wanted.host === have.host;
+  } catch {
+    return false;
   }
-  if (callerPort !== undefined) {
-    if (existing.mode === "managed") return false;
-    try {
-      const have = new URL(existing.cdpUrl);
-      const havePort = have.port ? Number(have.port) : have.protocol === "wss:" || have.protocol === "https:" ? 443 : 80;
-      return havePort === callerPort;
-    } catch {
-      return false;
-    }
-  }
-  return true;
 }
 
 // `validatedUrl` is the WHATWG-normalized form already vetted by
@@ -451,39 +417,48 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   // data directory is already in use". This is the pivot's central
   // ordering rule: only one Chromium process can have the profile open at
   // a time, so visibility transitions go teardown-then-launch.
-  await disconnectSharedBrowser();
-
+  //
   // Dynamically import playwright-core so tests can mock it via
   // mock.module without forcing every test that imports this module to
   // pull in the full browser SDK at module-init time.
   const playwright = (await import("playwright-core")) as typeof import("playwright-core");
   const chromium = playwright.chromium;
-  let context;
-  try {
-    context = await chromium.launchPersistentContext(dataDir, {
-      headless: false,
-      executablePath: chromePath ?? undefined,
-      args: [
-        "--no-first-run",
-        "--no-default-browser-check",
-        // Suppress the "restore previous session?" dialog that appears
-        // after a hard kill. We don't restore state because the user
-        // signs in fresh per connect anyway.
-        "--disable-features=ChromeWhatsNewUI,Translate"
-      ]
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Failed to launch managed Chrome: ${message}. ` +
-        "Confirm Chrome / Chromium is installed (or set GINI_CHROME_PATH), or run " +
-        "`bunx playwright install chromium` to install Playwright's bundled Chromium."
-    );
-  }
+
+  // withTeardownLock holds the admission gate CLOSED for the entire
+  // disconnect-then-launch sequence. Without it, a new agent tool call
+  // could land between disconnectSharedBrowser returning and the headed
+  // launchPersistentContext starting — re-acquiring the profile lock with
+  // a headless persistent context and forcing this launch to fail with
+  // "user data directory is already in use".
+  const context = await withTeardownLock(async () => {
+    await disconnectSharedBrowser();
+
+    try {
+      return await chromium.launchPersistentContext(dataDir, {
+        headless: false,
+        executablePath: chromePath ?? undefined,
+        args: [
+          "--no-first-run",
+          "--no-default-browser-check",
+          // Suppress the "restore previous session?" dialog that appears
+          // after a hard kill. We don't restore state because the user
+          // signs in fresh per connect anyway.
+          "--disable-features=ChromeWhatsNewUI,Translate"
+        ]
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Failed to launch managed Chrome: ${message}. ` +
+          "Confirm Chrome / Chromium is installed (or set GINI_CHROME_PATH), or run " +
+          "`bunx playwright install chromium` to install Playwright's bundled Chromium."
+      );
+    }
+  });
 
   // Hand the live BrowserContext to the session manager so the next
   // browser_* tool call can reuse it directly without re-launching.
-  materializeManagedForConnect(context);
+  await materializeManagedForConnect(context);
 
   // Best-effort PID extraction for UI display. Playwright exposes the
   // child via context.browser()?.process(); the .process() method is on
@@ -590,8 +565,16 @@ export async function wipeBrowserProfile(config: RuntimeConfig): Promise<WipeRes
   // macOS rm -rf still succeeds (unlink-while-open semantics) but Chromium
   // would then write to ghost inodes on its way out, which is messier than
   // necessary. Tearing down first is the clean order.
-  await disconnectSharedBrowser();
-  await rm(dataDir, { recursive: true, force: true });
+  //
+  // withTeardownLock holds the admission gate CLOSED across the whole
+  // disconnect-then-rm sequence so a new agent tool call can't sneak in
+  // between the two awaits, materialize a fresh headless persistent
+  // context against the same dir, and either lock the rm out or fight us
+  // for the inodes mid-delete.
+  await withTeardownLock(async () => {
+    await disconnectSharedBrowser();
+    await rm(dataDir, { recursive: true, force: true });
+  });
   await mutateState(config.instance, (state) => {
     addAudit(state, {
       actor: "user",
@@ -610,7 +593,6 @@ export const __test = {
   stripUrlCredentials,
   cdpHttpForm,
   validateCdpUrl,
-  validatePort,
   profileDirFor,
   MANAGED_CDP_SENTINEL,
   // Verifying the existsSync side effect of mkdirSync in tests would

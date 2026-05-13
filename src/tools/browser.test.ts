@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
   __test as browserTest,
@@ -6,7 +6,8 @@ import {
   closeAll,
   disconnectSharedBrowser,
   safetyCheck,
-  setBrowserInstance
+  setBrowserInstance,
+  withTeardownLock
 } from "./browser";
 import { mutateState, readState } from "../state";
 
@@ -302,5 +303,172 @@ describe("chromeProfileDirFor", () => {
     const dir = chromeProfileDirFor("dev");
     expect(dir.endsWith("chrome-profile")).toBe(true);
     expect(dir.includes("dev")).toBe(true);
+  });
+});
+
+// Round-1 fix: withTeardownLock holds the admission gate closed across
+// the disconnect-then-launch (Connect) and disconnect-then-rm (Wipe)
+// critical sections. Without it, an admission landing between the two
+// awaits could re-acquire the profile lock with a fresh headless
+// persistent context and fight the caller for the dir.
+describe("withTeardownLock", () => {
+  afterEach(() => {
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.clearPendingSharedForTest();
+  });
+
+  test("rejects parallel withSession admissions while the lock is held", async () => {
+    let release: () => void = () => undefined;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const lockPromise = withTeardownLock(async () => {
+      await released;
+    });
+    // Yield so withTeardownLock has actually entered (incremented the
+    // generation + inFlightDisconnects) before we attempt the admission.
+    await new Promise((resolve) => setImmediate(resolve));
+    const result = await browserNavigate("teardown-lock-task", { url: "https://example.com/" });
+    const parsed = JSON.parse(result) as { success: boolean; error?: string };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error).toMatch(/disconnecting/i);
+    release();
+    await lockPromise;
+  });
+
+  test("restores the gate when fn throws so future admissions can land", async () => {
+    await expect(
+      withTeardownLock(async () => {
+        throw new Error("boom");
+      })
+    ).rejects.toThrow(/boom/);
+    expect(browserTest.inFlightDisconnectsForTest()).toBe(0);
+  });
+});
+
+// Round-1 fix: disconnectSharedBrowser must await any in-flight launch
+// (pendingShared) before tearing down. A slow launchPersistentContext
+// started just before disconnect can otherwise complete after the drain
+// and install itself into `shared`, holding the profile lock against
+// the Connect/Wipe that's running this teardown.
+describe("disconnectSharedBrowser pending-launch handling", () => {
+  afterEach(() => {
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.clearPendingSharedForTest();
+  });
+
+  test("waits for an in-flight pendingShared launch and clears the resulting handle", async () => {
+    // Build a pendingShared that resolves to a fake persistent context
+    // AFTER disconnect has bumped the generation but before disconnect
+    // has finished its drain. The natural ensureShared post-await
+    // re-check would normally throw and tear down the freshly-built
+    // handle, but we install pendingShared directly without going
+    // through ensureShared so that re-check never runs. The disconnect
+    // path itself must observe the leftover `shared` and tear it down.
+    let contextCloseCalled = false;
+    const fakeContext = {
+      pages: () => [],
+      close: async () => {
+        contextCloseCalled = true;
+      }
+    };
+    let resolvePending: (handle: unknown) => void = () => undefined;
+    const pending = new Promise<unknown>((resolve) => {
+      resolvePending = resolve;
+    });
+    browserTest.installPendingSharedForTest(pending as Promise<never>);
+
+    // Kick off disconnect. It bumps the generation, increments
+    // inFlightDisconnects, then enters the drain loop. pendingAdmissions
+    // is 0, so the drain loop exits immediately. Then it should await
+    // pendingShared and observe whatever the launch installs.
+    const disconnectPromise = disconnectSharedBrowser();
+
+    // Give disconnect a tick to enter the drain loop and reach the
+    // pendingShared await.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // Simulate a slow launch finishing AND installing itself into
+    // shared. We have to do the install ourselves because the test
+    // bypassed ensureShared's installer.
+    browserTest.installFakeHeadlessPersistentContextForTest(fakeContext);
+    resolvePending(fakeContext);
+
+    await disconnectPromise;
+    // The disconnect path must have observed the freshly-installed
+    // shared handle and torn it down (closing the context).
+    expect(contextCloseCalled).toBe(true);
+  });
+});
+
+// Round-1 fix 5: realistic coverage that the no-record default tool
+// path launches launchPersistentContext against the per-instance profile
+// dir with headless: true. Mocks playwright-core at the module level so
+// ensureShared exercises its persistent arm without spawning Chrome.
+describe("ensureShared default headless persistent launch", () => {
+  afterEach(() => {
+    browserTest.uninstallFakeBrowserForTest();
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+    browserTest.clearPendingSharedForTest();
+  });
+
+  test("launches launchPersistentContext(profileDir, { headless: true }) when no state.browser exists", async () => {
+    const TEST_ROOT = "/tmp/gini-browser-default-headless";
+    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+    const instance = `default-headless-${process.pid}`;
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            pages: () => [],
+            newPage: async () => ({
+              on: () => undefined,
+              close: () => Promise.resolve(),
+              goto: () => Promise.resolve(null),
+              url: () => "about:blank",
+              title: () => Promise.resolve(""),
+              evaluate: () => Promise.resolve([])
+            }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      // Trigger the default tool path. We don't care about navigation
+      // semantics here — the snapshot may fail since our fake page
+      // isn't a real Playwright Page — but launchPersistentContext should
+      // have been invoked exactly once with the per-instance profile dir
+      // and headless: true before any of that.
+      await browserNavigate("default-headless-task", { url: "https://example.com/" });
+    } catch {
+      // Snapshot wiring may throw; the assertion below is what matters.
+    } finally {
+      mock.restore();
+      browserTest.uninstallFakeBrowserForTest();
+      browserTest.clearFakeSessionsForTest();
+      browserTest.resetChromiumImportForTest();
+      setBrowserInstance("dev");
+      rmSync(TEST_ROOT, { recursive: true, force: true });
+    }
+
+    expect(launchCalls.length).toBe(1);
+    const call = launchCalls[0]!;
+    expect(call.options.headless).toBe(true);
+    expect(call.dataDir).toContain("chrome-profile");
+    expect(call.dataDir).toContain(instance);
   });
 });

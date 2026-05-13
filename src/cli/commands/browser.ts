@@ -1,6 +1,6 @@
 // CLI surface for the browser-connect capability:
 //   gini browser status
-//   gini browser connect [--port N] [--url WSURL]
+//   gini browser connect [--url WSURL]
 //   gini browser disconnect
 //   gini browser wipe-profile [--yes]
 //
@@ -12,9 +12,15 @@
 // the agent always drives the same per-instance profile so sign-ins
 // persist across cycles. `wipe-profile` is the only path that destroys
 // saved logins / cookies.
+//
+// Note on --port: managed mode launches Chromium via
+// chromium.launchPersistentContext, which doesn't take a user-supplied
+// debugging port. CDP-attach mode never used a port either — the user
+// pastes a full ws:// URL. The flag is gone; older scripts that pass it
+// will get the usage error below.
 import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
-import { flagValue, hasFlag, restAfter } from "../args";
+import { flagValue, restAfter, hasFlag } from "../args";
 import { api } from "../api";
 import { print } from "../output";
 
@@ -30,16 +36,8 @@ export async function browser(ctx: CliContext): Promise<void> {
   if (sub === "connect") {
     const rest = restAfter(cliArgs, "connect");
     const url = flagValue(rest, "--url");
-    const portValue = flagValue(rest, "--port");
     const body: Record<string, unknown> = {};
     if (url) body.cdpUrl = url;
-    if (portValue !== undefined) {
-      const port = Number(portValue);
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        throw new Error(`Invalid --port: ${portValue}`);
-      }
-      body.port = port;
-    }
     print(
       await api(config, "/api/browser/connect", {
         method: "POST",
@@ -92,6 +90,6 @@ export async function browser(ctx: CliContext): Promise<void> {
   }
 
   throw new Error(
-    "Usage: gini browser status | connect [--port N] [--url WSURL] | disconnect | wipe-profile [--yes]"
+    "Usage: gini browser status | connect [--url WSURL] | disconnect | wipe-profile [--yes]"
   );
 }

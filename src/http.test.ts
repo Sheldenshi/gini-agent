@@ -638,24 +638,6 @@ describe("runtime api", () => {
     expect(body.error).toMatch(/Invalid cdpUrl/);
   });
 
-  test("browser connect returns 400 for invalid port", async () => {
-    const config = testConfig("browser-bad-port");
-    const handler = createHandler(config);
-    const response = await rawCall(
-      handler,
-      config,
-      "/api/browser/connect",
-      {
-        method: "POST",
-        body: JSON.stringify({ port: 999999 })
-      },
-      config.token
-    );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toMatch(/Invalid port/);
-  });
-
   test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
     const config = testConfig("browser-unreachable");
     const handler = createHandler(config);

@@ -43,7 +43,7 @@ Usage:
   bun run gini mobile bootstrap
   bun run gini search <query>
   bun run gini toolsets list|enable|disable
-  bun run gini browser status|connect [--port N] [--url WSURL]|disconnect|wipe-profile [--yes]
+  bun run gini browser status|connect [--url WSURL]|disconnect|wipe-profile [--yes]
   bun run gini subagents list|spawn
   bun run gini mcp list|add|health|invoke|disable
   bun run gini messaging list|add|health|disable
