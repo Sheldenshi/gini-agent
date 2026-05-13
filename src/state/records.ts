@@ -2,8 +2,8 @@ import type {
   Approval,
   ChatMessageRecord,
   ChatSessionRecord,
-  ConnectorRecord,
   DeviceStatus,
+  IdentityRecord,
   ImportReport,
   ImprovementProposal,
   JobRecord,
@@ -742,10 +742,10 @@ export function activateProfile(state: RuntimeState, idOrName: string): ProfileR
   return profile;
 }
 
-export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
-  connector.lastHealthAt = now();
-  connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
-  connector.message = connector.kind === "demo" ? "Demo connector is available without secrets." : connector.message;
-  connector.updatedAt = now();
-  return connector;
+export function updateIdentityHealth(identity: IdentityRecord): IdentityRecord {
+  identity.lastHealthAt = now();
+  identity.health = identity.status === "configured" ? "healthy" : "unhealthy";
+  identity.message = identity.kind === "demo" ? "Demo identity is available without secrets." : identity.message;
+  identity.updatedAt = now();
+  return identity;
 }

@@ -50,7 +50,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     })
   });
   await api(config, `/api/improvements/${proposal.id}/approve`, { method: "POST" });
-  const connectorHealth = await api(config, "/api/connectors/conn_demo/health", { method: "POST" });
+  const identityHealth = await api(config, "/api/identities/id_demo/health", { method: "POST" });
   const pairingResult = await api(config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 300 }) });
   const claimedDevice = await publicApi(config, "/api/pairing/claim", {
     method: "POST",
@@ -134,7 +134,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     notificationId: notificationResult.id,
     snapshotId: snapshotResult.snapshotId,
     promotionId: promotionResult.id,
-    connectorHealth: connectorHealth.health,
+    identityHealth: identityHealth.health,
     traces: finalState.tasks.length,
     auditEvents: finalState.audit.length,
     evidencePath: bundle.path

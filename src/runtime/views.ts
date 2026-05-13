@@ -13,7 +13,7 @@ export function mobileBootstrap(config: RuntimeConfig) {
     memories: state.memories,
     skills: state.skills,
     jobs: state.jobs,
-    connectors: state.connectors,
+    identities: state.identities,
     improvements: state.improvements,
     devices: state.devices,
     toolsets: state.toolsets,

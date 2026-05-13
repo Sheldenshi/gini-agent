@@ -17,14 +17,15 @@ export function createEmptyState(instance: Instance): RuntimeState {
     memories: [],
     skills: [],
     jobs: [],
-    connectors: [
+    identities: [
       {
-        id: "conn_demo",
+        id: "id_demo",
         instance,
-        name: "Demo Connector",
+        name: "Demo Identity",
         kind: "demo",
         status: "configured",
         scopes: ["demo:read"],
+        secretRefs: [],
         createdAt: at,
         updatedAt: at,
         health: "unknown"
@@ -131,7 +132,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "memories",
     "skills",
     "jobs",
-    "connectors",
+    "identities",
     "improvements",
     "pairingCodes",
     "devices",
@@ -168,11 +169,29 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
 }
 
+// Pre-ADR-0007 state files persist a `connectors` array. Rename to
+// `identities` in-place; mutateState rewrites the file on the next mutation.
+// Also backfill the new `secretRefs` field so callers can rely on it being
+// an array.
+function migrateConnectorsToIdentities(state: RuntimeState): void {
+  const stateAny = state as unknown as { connectors?: unknown; identities?: unknown };
+  if (stateAny.connectors !== undefined && stateAny.identities === undefined) {
+    stateAny.identities = stateAny.connectors;
+  }
+  delete stateAny.connectors;
+  if (Array.isArray(state.identities)) {
+    for (const identity of state.identities) {
+      identity.secretRefs ??= [];
+    }
+  }
+}
+
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
   migrateLaneFieldToInstance(state);
+  migrateConnectorsToIdentities(state);
   state.instance = instance;
   state.improvements ??= [];
-  state.connectors ??= [];
+  state.identities ??= [];
   state.tasks ??= [];
   state.approvals ??= [];
   state.audit ??= [];

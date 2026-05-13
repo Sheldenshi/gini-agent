@@ -15,7 +15,7 @@ import { embedding } from "./commands/embedding";
 import { reranker } from "./commands/reranker";
 import { skill } from "./commands/skills";
 import { job } from "./commands/jobs";
-import { connector } from "./commands/connectors";
+import { identity } from "./commands/identities";
 import { improvement } from "./commands/improvements";
 import { pairing, device } from "./commands/pairing";
 import { mobile } from "./commands/mobile";
@@ -114,8 +114,8 @@ export async function run(): Promise<void> {
     case "skills": await skill(ctx); break;
     case "job":
     case "jobs": await job(ctx); break;
-    case "connector":
-    case "connectors": await connector(ctx); break;
+    case "identity":
+    case "identities": await identity(ctx); break;
     case "improvement":
     case "improvements": await improvement(ctx); break;
     case "pairing":

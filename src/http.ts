@@ -4,7 +4,7 @@ import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkConnector } from "./integrations/connectors";
+import { checkIdentity } from "./integrations/identities";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
 import { embeddingStatus, reembedBank } from "./memory/embedding";
@@ -208,8 +208,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
-    ["GET", /^\/api\/connectors$/, () => json(readState(config.instance).connectors)],
-    ["POST", /^\/api\/connectors\/([^/]+)\/health$/, async (_request, params) => json(await checkConnector(config, params[0]))],
+    ["GET", /^\/api\/identities$/, () => json(readState(config.instance).identities)],
+    ["POST", /^\/api\/identities\/([^/]+)\/health$/, async (_request, params) => json(await checkIdentity(config, params[0]))],
     ["GET", /^\/api\/improvements$/, () => json(readState(config.instance).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],

@@ -103,5 +103,5 @@ export {
   createRelayRecord,
   createNotificationRecord,
   activateProfile,
-  updateConnectorHealth
+  updateIdentityHealth
 } from "./records";

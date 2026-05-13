@@ -86,7 +86,7 @@ Usage:
   bun run gini reranker status
   bun run gini skills list|add|show|search|validate|test|trust|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
-  bun run gini connectors list|health
+  bun run gini identities list|add|remove|rotate|health
   bun run gini improvements list|propose|approve|reject
   bun run gini pairing create|claim
   bun run gini devices list|revoke

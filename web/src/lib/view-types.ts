@@ -14,7 +14,7 @@ import type {
   MemoryRecord,
   SkillRecord,
   JobRecord,
-  ConnectorRecord,
+  IdentityRecord,
   ImprovementProposal,
   PairedDevice,
   RuntimeEvent,
@@ -36,7 +36,7 @@ export interface RuntimeStateSnapshot {
   memories: MemoryRecord[];
   skills: SkillRecord[];
   jobs: JobRecord[];
-  connectors: ConnectorRecord[];
+  identities: IdentityRecord[];
   improvements: ImprovementProposal[];
   devices: PairedDevice[];
   promotions: Array<{
