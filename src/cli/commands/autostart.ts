@@ -488,6 +488,30 @@ export interface UninstallAutostartResult {
   failures: Array<{ kind: PlistKind | "legacy"; error: string }>;
 }
 
+// Called from CLI paths that touch creds (gini provider set, gini setup
+// after writing secrets.env). If a gateway plist already exists for the
+// instance, re-run `enable` so the launchd registration picks up the
+// fresh secrets.env / config values. Bails on non-macOS or when no
+// plist is present — both are common, expected states.
+//
+// Returns the refresh outcome (or a "skipped" reason) so the caller can
+// surface it in their output. The refresh DOES bootout + bootstrap, so
+// it will briefly stop and respawn the running gateway/web. That's fine
+// in a CLI context because the user typed the command and expects it.
+// (Never call this from inside the gateway process — it would kill
+// itself mid-call. See setup-api.maybeRefreshAutostartPlist.)
+export async function maybeRefreshAutostart(instance: string): Promise<{ refreshed: boolean; reason?: string }> {
+  if (!platformIsSupported()) return { refreshed: false, reason: "not macOS" };
+  const gatewayPlist = plistPathFor(instance, "gateway");
+  if (!existsSync(gatewayPlist)) return { refreshed: false, reason: "no autostart plist on disk" };
+  try {
+    const result = await enable(instance);
+    return { refreshed: result.ok, ...(result.ok ? {} : { reason: result.error ?? "autostart enable failed" }) };
+  } catch (error) {
+    return { refreshed: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 export async function disableForUninstall(instance: string): Promise<UninstallAutostartResult> {
   if (!platformIsSupported()) {
     return { removed: false, alreadyDisabled: false, reason: "not macOS", failures: [] };

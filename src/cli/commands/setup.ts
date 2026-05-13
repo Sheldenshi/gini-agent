@@ -824,6 +824,17 @@ export async function setup(ctx: CliContext): Promise<void> {
       }
     }
 
+    // If autostart is enabled for this instance, refresh the plist so any
+    // secrets.env values just written land in EnvironmentVariables for
+    // the next launchd respawn. The running gateway (if any) already has
+    // the new env via process.env. No-op on non-macOS or when autostart
+    // isn't enabled.
+    const { maybeRefreshAutostart } = await import("./autostart");
+    const refreshed = await maybeRefreshAutostart(ctx.config.instance);
+    if (refreshed.refreshed) {
+      io.info("Autostart plist refreshed.");
+    }
+
     console.log("\nDone. Run `gini start` to start.\n");
   } finally {
     io.close();

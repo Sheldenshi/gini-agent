@@ -73,10 +73,13 @@ describe("setup-api", () => {
     expect(status.current).toBe("echo");
   });
 
-  test("POST openai with apiKey writes secrets.env, sets process.env, updates config, signals plist refresh", async () => {
+  test("POST openai with apiKey writes secrets.env, sets process.env, updates config", async () => {
     const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test-abcd1234" });
     expect(result.ok).toBe(true);
-    expect(result.plistRefreshNeeded).toBe(true);
+    // plistRefreshNeeded only flips true when a gateway plist exists for
+    // this instance — we don't write one in tests. The dedicated
+    // "plist already exists" test below covers that branch.
+    expect(result.plistRefreshNeeded).toBe(false);
     // secrets.env wrote the key (shell-escaped form).
     const secretsPath = join(s.home, ".gini", "secrets.env");
     expect(existsSync(secretsPath)).toBe(true);
@@ -124,6 +127,30 @@ describe("setup-api", () => {
     const result = await setSetupProvider(config, { kind: "anthropic" });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Unsupported provider kind");
+  });
+
+  test("plistRefreshNeeded:true when an autostart plist already exists (macOS only)", async () => {
+    if (process.platform !== "darwin") {
+      // Linux: function returns false regardless.
+      const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test" });
+      expect(result.plistRefreshNeeded).toBe(false);
+      return;
+    }
+    // Create a fake plist file at the path the function probes. It's in
+    // the real $HOME (not the scratch home) because setup-api reads
+    // process.env.HOME, which is overridden in beforeEach.
+    const home = s.home;
+    const launchAgents = join(home, "Library", "LaunchAgents");
+    mkdirSync(launchAgents, { recursive: true });
+    const gatewayPlist = join(launchAgents, `ai.lilac.gini.${config.instance}.gateway.plist`);
+    writeFileSync(gatewayPlist, "<?xml version=\"1.0\"?>\n");
+    try {
+      const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test" });
+      expect(result.ok).toBe(true);
+      expect(result.plistRefreshNeeded).toBe(true);
+    } finally {
+      rmSync(gatewayPlist, { force: true });
+    }
   });
 
   test("re-POSTing openai overwrites the previous key in secrets.env (no duplicate lines)", async () => {

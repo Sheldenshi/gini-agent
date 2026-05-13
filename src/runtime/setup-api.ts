@@ -107,10 +107,18 @@ export async function setSetupProvider(
       : (config.provider?.name === "openai" && config.provider.model ? config.provider.model : "gpt-5.4-mini");
     config.provider = normalizeProvider({ name: "openai", model });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+
+    // Best-effort plist refresh: if an autostart plist already exists
+    // for this instance, re-run `gini autostart enable` in the background
+    // so its EnvironmentVariables pick up the new key. The current
+    // gateway already has the new key in process.env, so this is purely
+    // about surviving the next launchd respawn cycle.
+    const refreshed = maybeRefreshAutostartPlist(config.instance);
+
     return {
       ok: true,
       provider: providerHealth(config),
-      plistRefreshNeeded: true
+      plistRefreshNeeded: refreshed
     };
   }
   // kind === "codex"
@@ -135,6 +143,25 @@ export async function setSetupProvider(
     // secrets.env entry), so no plist refresh is required.
     plistRefreshNeeded: false
   };
+}
+
+// If the gateway plist already exists on disk, return true so the
+// response signals the caller that a future launchd respawn would use
+// stale env. We deliberately do NOT bootout+bootstrap from here —
+// doing that would kill the running gateway mid-response (the same
+// process we're answering from).
+//
+// Instead, the user (or the CLI `gini autostart enable` flow they run
+// after using /setup) is responsible for refreshing the plist when
+// they want the new env to take effect across reboots. The running
+// gateway has the new key in process.env already, so the in-flight
+// session is fully functional.
+function maybeRefreshAutostartPlist(instance: string): boolean {
+  if (process.platform !== "darwin") return false;
+  const home = process.env.HOME || homedir();
+  const gatewayPlist = join(home, "Library", "LaunchAgents", `ai.lilac.gini.${instance}.gateway.plist`);
+  if (!existsSync(gatewayPlist)) return false;
+  return true;
 }
 
 function secretsPath(): string {
