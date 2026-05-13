@@ -33,7 +33,6 @@ import {
   writePlist,
   type PlistKind
 } from "../autostart";
-import { logDir } from "../../paths";
 
 const KINDS: PlistKind[] = ["gateway", "web"];
 
@@ -74,11 +73,21 @@ export async function autostart(ctx: CliContext): Promise<void> {
       : undefined;
 
   if (sub === "enable") {
-    print(await enable(instance, testRoot));
+    const kindFlag = flagValue(ctx.rawArgs, "--kind");
+    const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
+    const result = await enable(instance, testRoot, kinds);
+    print(result);
+    // HIGH-4: exit code reflects ok:false so install.sh's `if … then`
+    // sees the failure. Previously soft failures (e.g. partial bootstrap)
+    // returned exit 0 because the JSON had ok:false but the CLI didn't
+    // surface that to the shell.
+    if (!result.ok) process.exitCode = 1;
     return;
   }
   if (sub === "disable") {
-    print(await disable(instance));
+    const result = await disable(instance);
+    print(result);
+    if (!result.ok) process.exitCode = 1;
     return;
   }
   if (sub === "status") {
@@ -86,7 +95,9 @@ export async function autostart(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "kick") {
-    print(kick(instance, ctx.rawArgs));
+    const result = kick(instance, ctx.rawArgs);
+    print(result);
+    if (!result.ok) process.exitCode = 1;
     return;
   }
 
@@ -137,13 +148,72 @@ interface EnableResult {
   error?: string;
 }
 
-async function enable(instance: string, testRoot?: { stateRoot?: string; logRoot?: string }): Promise<EnableResult> {
+// Compute the plist's StandardOutPath/StandardErrorPath log root WITHOUT
+// honoring process.env.GINI_LOG_ROOT. MEDIUM-6: logDir() in paths.ts
+// returns join(GINI_LOG_ROOT, instance) when that env var is set, so a
+// developer who runs `autostart enable` from a shell with GINI_LOG_ROOT
+// set would bake scratch paths into the permanent plist. The fix: when
+// not in testRoot opt-in, compute the log root from instance state root
+// directly. When testRoot.logRoot is provided (E2E), embed that.
+function resolveLogRoot(instance: string, testRoot?: { stateRoot?: string; logRoot?: string }): string {
+  if (testRoot?.logRoot) return join(testRoot.logRoot, instance);
+  if (testRoot?.stateRoot) return join(testRoot.stateRoot, "instances", instance, "logs");
+  // Production path: derive from $HOME/.gini regardless of whether
+  // GINI_LOG_ROOT or GINI_STATE_ROOT are set in the invoking shell.
+  // We use HOME directly so a stray env-set GINI_STATE_ROOT also doesn't
+  // leak into the plist via instanceRoot() → baseStateRoot().
+  const home = process.env.HOME ?? "";
+  return join(home, ".gini", "instances", instance, "logs");
+}
+
+async function enable(
+  instance: string,
+  testRoot?: { stateRoot?: string; logRoot?: string },
+  kinds: PlistKind[] = KINDS
+): Promise<EnableResult> {
   const pair = resolveLaunchSpecPair({ instance, testRoot });
-  const logRoot = logDir(instance);
+  const logRoot = resolveLogRoot(instance, testRoot);
   const results: PerKindEnableResult[] = [];
   let allOk = true;
 
-  for (const kind of KINDS) {
+  // HIGH-5: clean up the round-1 legacy single-plist
+  // `ai.lilac.gini.<instance>` (no kind suffix) BEFORE bootstrapping the
+  // round-2 split pair. Otherwise an upgrade from round 1 → round 2
+  // leaves the legacy service running alongside the new pair, which
+  // either fights for the gateway port or wedges launchd. `bootout` on
+  // an unknown label is a no-op (we ignore "Could not find service"),
+  // so it's safe to always run.
+  if (isLoaded(instance) && kinds.includes("gateway")) {
+    const out = bootout(instance);
+    if (!out.ok && !out.stderr.includes("Could not find service")) {
+      // Surface as a top-level error and bail — running both legacy
+      // and new gateway simultaneously is worse than failing the
+      // enable.
+      return {
+        ok: false,
+        enabled: false,
+        instance,
+        resolution: pair.resolution,
+        results: [],
+        error: `legacy bootout failed: ${out.stderr.trim()}`
+      };
+    }
+  }
+  // Remove the legacy plist file too so a future `disable` doesn't
+  // bother re-cleaning it (and so `ls ~/Library/LaunchAgents/` shows
+  // only the round-2 split files).
+  const legacyPlist = plistPathFor(instance);
+  if (existsSync(legacyPlist) && kinds.includes("gateway")) {
+    try { rmSync(legacyPlist, { force: true }); } catch { /* best-effort */ }
+  }
+
+  // HIGH-4 (b): track which kinds we successfully bootstrapped so we
+  // can roll them back if a later kind fails. Leaving a half-loaded
+  // service set is worse than nothing loaded — `gini status` would
+  // report the gateway up but the user can't reach the webapp.
+  const bootstrapped: PlistKind[] = [];
+
+  for (const kind of kinds) {
     const spec = kind === "gateway" ? pair.gateway : pair.web;
     const stdoutPath = join(logRoot, kind === "gateway" ? "runtime-stdout.log" : "web.log");
     // launchd routes stderr to its own file by default — we keep that
@@ -198,8 +268,16 @@ async function enable(instance: string, testRoot?: { stateRoot?: string; logRoot
         stderr: res.stderr.trim()
       });
       allOk = false;
+      // HIGH-4 (b): roll back any kinds we already bootstrapped in this
+      // call so we don't leave a half-loaded service set behind. Skip
+      // kinds that were `wasLoaded:true` on entry — those are the
+      // user's prior state, not something this call created.
+      for (const earlier of bootstrapped) {
+        bootout(instance, earlier);
+      }
       continue;
     }
+    bootstrapped.push(kind);
     results.push({
       kind,
       label: labelForKind(instance, kind),
