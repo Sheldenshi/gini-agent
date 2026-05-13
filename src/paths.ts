@@ -1,16 +1,18 @@
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
 import type { Instance, RuntimeConfig } from "./types";
 
-// Per-instance default ports. Two installs on the same machine (different instances,
-// same defaults) used to fight over 7337/3000 and the second start would
-// fail. Hashing the instance name picks deterministic per-instance defaults so
-// parallel instances coexist without manual `--port` wrangling. The dev instance
-// stays pinned to the historic 7337/3000 so existing muscle memory and any
-// external tooling pointing at those ports keeps working.
-const DEFAULT_RUNTIME_PORT_DEV = 7337;
-const DEFAULT_WEB_PORT_DEV = 3000;
+// Per-instance default ports. The installed end-user instance (`default`,
+// set by the ~/.local/bin/gini wrapper) is pinned to fixed memorable ports so
+// users always know what URL to hit. All other instances — dev worktrees,
+// smoke runs, named test instances — get deterministic per-instance defaults
+// derived from a hash of the instance name so parallel instances coexist
+// without manual `--port` wrangling.
+const DEFAULT_WEB_PORT_PROD = 7777;
+const DEFAULT_RUNTIME_PORT_PROD = 7778;
+const RUNTIME_PORT_HASH_BASE = 7337;
+const WEB_PORT_HASH_BASE = 3000;
 const RUNTIME_PORT_RANGE = 100;
 const WEB_PORT_RANGE = 100;
 
@@ -27,19 +29,25 @@ function fnv1a(input: string): number {
 }
 
 export function defaultRuntimePort(instance: Instance): number {
-  if (instance === "dev") return DEFAULT_RUNTIME_PORT_DEV;
-  return DEFAULT_RUNTIME_PORT_DEV + (fnv1a(`runtime:${instance}`) % RUNTIME_PORT_RANGE);
+  if (instance === "default") return DEFAULT_RUNTIME_PORT_PROD;
+  return RUNTIME_PORT_HASH_BASE + (fnv1a(`runtime:${instance}`) % RUNTIME_PORT_RANGE);
 }
 
 export function defaultWebPort(instance: Instance): number {
-  if (instance === "dev") return DEFAULT_WEB_PORT_DEV;
-  return DEFAULT_WEB_PORT_DEV + (fnv1a(`web:${instance}`) % WEB_PORT_RANGE);
+  if (instance === "default") return DEFAULT_WEB_PORT_PROD;
+  return WEB_PORT_HASH_BASE + (fnv1a(`web:${instance}`) % WEB_PORT_RANGE);
 }
 
 export function parseInstance(args = Bun.argv.slice(2)): Instance {
   const flagIndex = args.indexOf("--instance");
   if (flagIndex >= 0 && args[flagIndex + 1]) return args[flagIndex + 1];
-  return process.env.GINI_INSTANCE ?? "dev";
+  if (process.env.GINI_INSTANCE) return process.env.GINI_INSTANCE;
+  // No flag and no env → we're running `bun run gini ...` from a repo
+  // checkout (the installed wrapper always sets GINI_INSTANCE=default). Derive
+  // the instance from the repo root basename so each worktree gets isolated
+  // state by default. Conductor parallel worktrees, casual clones, and CI all
+  // land on a name that matches their directory without explicit --instance.
+  return basename(projectRoot());
 }
 
 export function projectRoot(): string {
