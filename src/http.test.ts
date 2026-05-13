@@ -192,6 +192,53 @@ describe("runtime api", () => {
     expect(parity.checks.some((item: { id: string; status: string }) => item.id === "agents" && item.status === "pass")).toBe(true);
   });
 
+  test("DELETE /api/agents/:id removes the agent and cascades cleanup", async () => {
+    const config = testConfig("agents-delete");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scratch" })
+    });
+    const deleted = await call(handler, config, `/api/agents/${created.id}`, { method: "DELETE" });
+
+    expect(deleted.ok).toBe(true);
+    expect(deleted.id).toBe(created.id);
+    expect(deleted.bankDeleted).toBe(true);
+
+    const after = await call(handler, config, "/api/agents");
+    expect(after.agents.find((agent: { id: string }) => agent.id === created.id)).toBeUndefined();
+
+    // Idempotent: a second delete on the same id returns 404, not 500.
+    const followUp = await rawCall(handler, config, `/api/agents/${created.id}`, { method: "DELETE" }, config.token);
+    expect(followUp.status).toBe(404);
+  });
+
+  test("DELETE /api/agents/:id rejects the default agent with 400", async () => {
+    const config = testConfig("agents-delete-default");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/agents/agent_default", { method: "DELETE" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot delete the default agent");
+  });
+
+  test("DELETE /api/agents/:id rejects the active agent with 400", async () => {
+    const config = testConfig("agents-delete-active");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "active" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+
+    const response = await rawCall(handler, config, `/api/agents/${created.id}`, { method: "DELETE" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot delete the active agent");
+  });
+
   test("supports relay degraded health and notification delivery records", async () => {
     const config = testConfig("relay-notifications");
     const handler = createHandler(config);

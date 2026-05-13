@@ -186,6 +186,11 @@ silently bypassing the filter.
   active and omits it otherwise.
 - Default agent on a fresh instance with `gini run --provider codex`
   → `providerName: "codex"` after install.
+- Agents can be deleted via `DELETE /api/agents/:id`; cascade removes
+  legacy `MemoryRecord` rows owned by the agent and the per-agent
+  Hindsight bank plus all of its units. The default agent
+  (`agent_default`) and the currently active agent are protected and
+  return 400 with a typed error.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are
   green.
 

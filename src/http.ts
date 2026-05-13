@@ -21,7 +21,7 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
-import { createAgent, listAgents, useAgent } from "./capabilities/agents";
+import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
@@ -286,6 +286,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
     ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
     ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],
+    ["DELETE", /^\/api\/agents\/([^/]+)$/, async (_request, params) => json(await deleteAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
@@ -362,7 +363,11 @@ function json(value: unknown, statusCode = 200): Response {
 // previous catch-all 500. Anything else stays 500.
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
+  if (message.startsWith("Agent not found")) return 404;
   if (message.startsWith("Invalid input")) return 400;
+  // Agent delete guards (default agent, active agent) throw user-input
+  // errors that should surface as 400.
+  if (message.startsWith("Cannot delete")) return 400;
   // Memory write paths (createMemoryFromInput, the "remember "-prefix
   // path in agent.ts) throw this when no agent is active. Sibling routes
   // (/memory/retain, /memory/recall, /memory/reflect) already return 400

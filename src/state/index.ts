@@ -23,6 +23,7 @@ export {
   ensureDefaultBank,
   ensureAgentBank,
   bankIdForAgent,
+  deleteBankAndUnits,
   insertMemoryUnit,
   getMemoryUnit,
   countMemoryUnits,

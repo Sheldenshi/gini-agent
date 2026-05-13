@@ -1,5 +1,14 @@
 import type { RuntimeConfig } from "../types";
-import { activateAgent, createAgentRecord, ensureAgentBank, mutateState, readState } from "../state";
+import {
+  activateAgent,
+  bankIdForAgent,
+  createAgentRecord,
+  deleteBankAndUnits,
+  ensureAgentBank,
+  mutateState,
+  readState
+} from "../state";
+import { addAudit } from "../state/audit";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -46,4 +55,74 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
 
 export async function useAgent(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.instance, (state) => activateAgent(state, idOrName));
+}
+
+// Hard-deletes an agent and cascades cleanup across its memory pools.
+// Guards:
+//   - The default agent (`agent_default`) cannot be deleted.
+//   - The active agent cannot be deleted — the caller must switch first.
+//   - Unknown agent id/name throws (mapped to 404 by the HTTP layer).
+// Cascade:
+//   - Per-agent Hindsight bank (`bank_${agentId}`) + all units in it.
+//   - Legacy MemoryRecord rows where `agentId === <deletedAgentId>` are
+//     hard-deleted. The owning agent is going away, so archiving them
+//     serves no purpose.
+//   - The agent row is removed from `state.agents`.
+// Returns counts so callers/tests can verify the cascade scope. A single
+// audit event records the deletion + cleanup counts.
+export async function deleteAgent(
+  config: RuntimeConfig,
+  idOrName: string
+): Promise<{ ok: true; id: string; memoriesArchived: number; unitsDeleted: number; bankDeleted: boolean }> {
+  const result = await mutateState(config.instance, (state) => {
+    const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    if (agent.id === "agent_default") {
+      throw new Error("Cannot delete the default agent.");
+    }
+    if (state.activeAgentId === agent.id) {
+      throw new Error("Cannot delete the active agent; switch to another agent first.");
+    }
+    const memoriesBefore = state.memories.length;
+    state.memories = state.memories.filter((memory) => memory.agentId !== agent.id);
+    const memoriesArchived = memoriesBefore - state.memories.length;
+    state.agents = state.agents.filter((item) => item.id !== agent.id);
+    return { id: agent.id, name: agent.name, memoriesArchived };
+  });
+
+  // Drop the per-agent Hindsight bank + its units outside the JSON state
+  // transaction. SQLite is the source of truth for hindsight, so a single
+  // BEGIN/COMMIT block there is the only consistency boundary we need.
+  const { unitsDeleted, bankDeleted } = deleteBankAndUnits(
+    config.instance,
+    bankIdForAgent(result.id)
+  );
+
+  // Single audit event covering the whole cascade. Routed through a
+  // follow-up mutateState so the cleanup counts are visible alongside
+  // hindsight bookkeeping; the agent removal itself is already logged by
+  // the state mutation above via state.agents membership change.
+  await mutateState(config.instance, (state) => {
+    addAudit(state, {
+      actor: "user",
+      action: "agent.deleted",
+      target: result.id,
+      risk: "medium",
+      evidence: {
+        name: result.name,
+        memoriesArchived: result.memoriesArchived,
+        unitsDeleted,
+        bankDeleted
+      }
+    });
+    return result.id;
+  });
+
+  return {
+    ok: true,
+    id: result.id,
+    memoriesArchived: result.memoriesArchived,
+    unitsDeleted,
+    bankDeleted
+  };
 }

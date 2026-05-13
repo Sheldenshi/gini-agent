@@ -409,6 +409,34 @@ export function ensureAgentBank(instance: Instance, agentId: string): MemoryBank
   return bank;
 }
 
+// Hard-deletes a memory bank and all of its memory_units in a single
+// transaction. Returns counts so the caller can audit how much state was
+// removed. Idempotent: if the bank doesn't exist, returns
+// `{ unitsDeleted: 0, bankDeleted: false }`. Memory units are removed
+// explicitly first even though `ON DELETE CASCADE` would cover them, so
+// the returned count is exact. Triggers on memory_units also fan out to
+// the FTS mirror and entity_mentions.
+export function deleteBankAndUnits(
+  instance: Instance,
+  bankId: string
+): { unitsDeleted: number; bankDeleted: boolean } {
+  const db = getMemoryDb(instance);
+  db.exec("BEGIN");
+  try {
+    const unitsBefore = db
+      .query<{ c: number }, [string]>("SELECT COUNT(*) AS c FROM memory_units WHERE bank_id = ?")
+      .get(bankId)?.c ?? 0;
+    db.run("DELETE FROM memory_units WHERE bank_id = ?", [bankId]);
+    const bankResult = db.run("DELETE FROM memory_banks WHERE id = ?", [bankId]);
+    const bankDeleted = (bankResult.changes ?? 0) > 0;
+    db.exec("COMMIT");
+    return { unitsDeleted: unitsBefore, bankDeleted };
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
 export function listBanks(instance: Instance): MemoryBank[] {
   const db = getMemoryDb(instance);
   return db
