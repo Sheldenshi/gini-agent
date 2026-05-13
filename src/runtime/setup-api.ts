@@ -19,10 +19,19 @@
 //     env on each call). The runtime config is rewritten to `openai` so
 //     status calls reflect the new active provider.
 //
-// What this does NOT do: re-write the autostart plist's
-// EnvironmentVariables on key change. That's a CLI-layer responsibility
-// (admin path can detect a plist on disk and re-run `autostart enable`).
-// We keep this module API-thin so the gateway doesn't shell out.
+// What this DOES do for plist refresh: when an OpenAI key is written and
+// a gateway plist exists on disk, this module calls
+// requestAutostartRefresh (src/runtime/autostart-refresh.ts) which
+// writes a marker file and self-signals SIGTERM. The gateway's SIGTERM
+// handler then drains in-flight responses, consumes the marker, and
+// execs a detached `gini autostart enable --kind gateway` as the last
+// thing before process.exit(0). That child re-registers the plist with
+// fresh EnvironmentVariables read from secrets.env. Round-3 wired the
+// hand-off; round-4 hardened it (response drain ordering, SIGTERM
+// idempotency, in-process gate to block external-SIGTERM respawns).
+// We still keep the module API-thin: no shelling out from the request
+// handler itself; the actual launchctl interaction is the detached
+// child's responsibility.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
