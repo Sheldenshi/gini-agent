@@ -2,11 +2,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import {
   clearEchoToolCallingResponses,
+  clearEchoVisionResponses,
   generateTaskSummary,
   generateToolCallingResponse,
+  generateVisionAnalysis,
   normalizeProvider,
   providerHealth,
   setEchoToolCallingResponse,
+  setEchoVisionResponse,
   type ToolFunctionSpec
 } from "./provider";
 import type { RuntimeConfig } from "./types";
@@ -519,6 +522,136 @@ describe("provider", () => {
     } finally {
       globalThis.fetch = originalFetch;
       restore();
+    }
+  });
+
+  // ---------------- generateVisionAnalysis ----------------
+
+  test("echo vision returns the next stubbed result", async () => {
+    const provider = normalizeProvider({ name: "echo", model: "" });
+    setEchoVisionResponse({ text: "echo-vision" });
+    const result = await generateVisionAnalysis(config(provider), {
+      prompt: "what is on screen?",
+      imageBase64: "AAAA",
+      mimeType: "image/png"
+    });
+    expect(result.text).toBe("echo-vision");
+    expect(result.provider.name).toBe("echo");
+    clearEchoVisionResponses();
+  });
+
+  test("echo vision falls back to a deterministic stub when no response is registered", async () => {
+    const provider = normalizeProvider({ name: "echo", model: "" });
+    clearEchoVisionResponses();
+    const result = await generateVisionAnalysis(config(provider), {
+      prompt: "describe the image",
+      imageBase64: "AAAA",
+      mimeType: "image/png"
+    });
+    expect(result.text).toContain("describe the image");
+  });
+
+  test("codex vision posts an input_image to /responses with the data URL", async () => {
+    const { restore } = installCodexAuth("codex-vision-test");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_vision_1",
+        output: [
+          {
+            id: "msg_1",
+            type: "message",
+            content: [{ type: "output_text", text: "The page shows a login form." }]
+          }
+        ],
+        usage: { input_tokens: 100, output_tokens: 10, total_tokens: 110 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is on this page?",
+        imageBase64: "AAAA",
+        mimeType: "image/png",
+        maxTokens: 64
+      });
+      expect(result.text).toBe("The page shows a login form.");
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.model).toBe("gpt-test");
+      expect(sent.stream).toBe(false);
+      expect(sent.max_output_tokens).toBe(64);
+      expect(Array.isArray(sent.input)).toBe(true);
+      expect(sent.input[0].role).toBe("user");
+      expect(Array.isArray(sent.input[0].content)).toBe(true);
+      expect(sent.input[0].content[0].type).toBe("input_text");
+      expect(sent.input[0].content[0].text).toBe("what is on this page?");
+      expect(sent.input[0].content[1].type).toBe("input_image");
+      expect(typeof sent.input[0].content[1].image_url).toBe("string");
+      expect(sent.input[0].content[1].image_url.startsWith("data:image/png;base64,")).toBe(true);
+      expect(sent.input[0].content[1].detail).toBe("low");
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("openai vision posts an image_url content part to /chat/completions", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_chat_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "Looks like a banner." }
+        }],
+        usage: { prompt_tokens: 80, completion_tokens: 4, total_tokens: 84 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is shown?",
+        imageBase64: "BBBB",
+        mimeType: "image/jpeg",
+        maxTokens: 32
+      });
+      expect(result.text).toBe("Looks like a banner.");
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.model).toBe("gpt-test");
+      expect(sent.max_tokens).toBe(32);
+      expect(Array.isArray(sent.messages)).toBe(true);
+      expect(sent.messages[0].role).toBe("user");
+      expect(Array.isArray(sent.messages[0].content)).toBe(true);
+      expect(sent.messages[0].content[0].type).toBe("text");
+      expect(sent.messages[0].content[0].text).toBe("what is shown?");
+      expect(sent.messages[0].content[1].type).toBe("image_url");
+      expect(typeof sent.messages[0].content[1].image_url).toBe("object");
+      expect(sent.messages[0].content[1].image_url.url.startsWith("data:image/jpeg;base64,")).toBe(true);
+      expect(sent.messages[0].content[1].image_url.detail).toBe("low");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
     }
   });
 });

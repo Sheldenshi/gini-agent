@@ -1423,3 +1423,164 @@ function readOpenAIError(payload: Record<string, unknown>): string | undefined {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+// ---------------- Vision (image input) ----------------
+//
+// Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
+// the provider returns plain text. Used by browser_vision to ask the configured
+// vision model about a page screenshot without exposing pixels to the agent
+// loop itself. We intentionally keep the surface tiny — one image, low detail,
+// small max_tokens — so cost stays bounded.
+export interface VisionRequest {
+  prompt: string;
+  imageBase64: string;
+  mimeType: "image/png" | "image/jpeg";
+  // Caps the model's response length. Defaults to 512 (small budget keeps
+  // surprise costs predictable; callers that need more should raise the cap
+  // explicitly and document why).
+  maxTokens?: number;
+}
+
+export interface VisionResult {
+  text: string;
+  provider: ProviderConfig;
+  usage?: Record<string, unknown>;
+  cost?: CostRecord;
+}
+
+// Echo provider vision stubs — mirror of echoToolCallingStubs. Tests register
+// canned results; default fallback returns a deterministic "Vision stub: <prompt>"
+// so callers that forget to seed a stub still see a stable shape.
+const echoVisionStubs: Array<{ tag?: string; result: Omit<VisionResult, "provider"> & { provider?: ProviderConfig } }> = [];
+
+export function setEchoVisionResponse(
+  result: Omit<VisionResult, "provider"> & { provider?: ProviderConfig },
+  tag?: string
+): void {
+  echoVisionStubs.push({ tag, result });
+}
+
+export function clearEchoVisionResponses(): void {
+  echoVisionStubs.length = 0;
+}
+
+function nextEchoVisionResult(provider: ProviderConfig, prompt: string): VisionResult {
+  const stub = echoVisionStubs.shift();
+  if (stub) {
+    return { provider: stub.result.provider ?? provider, ...stub.result };
+  }
+  return { provider, text: `Vision stub: ${prompt}` };
+}
+
+export async function generateVisionAnalysis(
+  config: RuntimeConfig,
+  request: VisionRequest
+): Promise<VisionResult> {
+  const provider = normalizeProvider(config.provider);
+  const maxTokens = request.maxTokens ?? 512;
+  if (provider.name === "echo") {
+    return nextEchoVisionResult(provider, request.prompt);
+  }
+  if (provider.name === "codex") {
+    return callVisionCodex(provider, request, maxTokens);
+  }
+  // openai / openrouter / local — all expose chat-completions with the same
+  // multi-modal content array shape (`type: "image_url"`).
+  return callVisionChatCompletions(provider, request, maxTokens);
+}
+
+async function callVisionCodex(
+  provider: ProviderConfig,
+  request: VisionRequest,
+  maxTokens: number
+): Promise<VisionResult> {
+  const bearer = readCodexBearer(provider);
+  const baseUrl = provider.baseUrl ?? DEFAULT_CODEX_BASE_URL;
+  const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      accept: "application/json",
+      ...codexHeaders(bearer)
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      store: false,
+      stream: false,
+      instructions: "",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: request.prompt },
+            { type: "input_image", image_url: dataUrl, detail: "low" }
+          ]
+        }
+      ],
+      max_output_tokens: maxTokens
+    })
+  });
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Codex vision request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const text = extractOutputText(payload);
+  const usage = isRecord(payload.usage) ? payload.usage : undefined;
+  return {
+    provider,
+    text,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+async function callVisionChatCompletions(
+  provider: ProviderConfig,
+  request: VisionRequest,
+  maxTokens: number
+): Promise<VisionResult> {
+  const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
+  };
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: provider.model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: request.prompt },
+            { type: "image_url", image_url: { url: dataUrl, detail: "low" } }
+          ]
+        }
+      ],
+      max_tokens: maxTokens
+    })
+  });
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Vision request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const text = extractChatText(payload);
+  const usage = isRecord(payload.usage) ? payload.usage : undefined;
+  return {
+    provider,
+    text,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
