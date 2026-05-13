@@ -23,6 +23,12 @@ import { normalizeProvider } from "../provider";
 
 export interface EffectiveContext {
   agentId?: string;
+  // Phase C — per-agent memory isolation key. Defined whenever agentId is
+  // (so chat-task can pass it through to recall/retain without re-checking
+  // optionality). Currently identical to agentId; surfaced as a distinct
+  // field so future work can re-namespace memory (e.g. shared pools) without
+  // breaking the rest of the contract.
+  memoryNamespace?: string;
   provider: ProviderConfig;
   providerSource: "agent" | "instance";
   toolsetFilter?: Set<string>;
@@ -98,6 +104,7 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
 
   return {
     agentId: agent.id,
+    memoryNamespace: agent.id,
     provider,
     providerSource,
     toolsetFilter,

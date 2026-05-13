@@ -6,7 +6,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { closeAllMemoryDbs, getMemoryDb, listMemoryUnits, ensureDefaultBank, DEFAULT_BANK_ID } from "../state";
+import { bankIdForAgent, closeAllMemoryDbs, ensureAgentBank, getMemoryDb, listMemoryUnits, ensureDefaultBank, DEFAULT_BANK_ID } from "../state";
 import {
   clearEchoStructuredResponses,
   setEchoStructuredResponse
@@ -18,6 +18,8 @@ import { cosineSimilarity, echoEmbed, echoProvider } from "../embeddings";
 import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-retain-test";
+const TEST_AGENT = "agent_test";
+const TEST_BANK = bankIdForAgent(TEST_AGENT);
 
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
@@ -156,6 +158,7 @@ describe("retain pipeline", () => {
   test("happy path: structured stub yields units, entities, and links", async () => {
     const instance = "retain-happy";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         {
@@ -196,7 +199,7 @@ describe("retain pipeline", () => {
     // tests below cover the regeneration path explicitly.
 
     const config = makeConfig(instance);
-    const result = await retain(config, { text: "Alice joined Acme Corp as CTO. She gave the keynote.", mentionedAt: "2025-04-02T08:00:00Z" });
+    const result = await retain(config, { agentId: TEST_AGENT, text: "Alice joined Acme Corp as CTO. She gave the keynote.", mentionedAt: "2025-04-02T08:00:00Z" });
 
     expect(result.units).toHaveLength(2);
     // 2 entities created on first call.
@@ -212,13 +215,14 @@ describe("retain pipeline", () => {
     expect(causalLinks[0]!.causalSubtype).toBe("caused_by");
 
     // Two facts -> 2 world units. Observations regenerated for both entities.
-    const worldUnits = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "world" });
+    const worldUnits = listMemoryUnits(instance, TEST_BANK, { network: "world" });
     expect(worldUnits.length).toBe(2);
   });
 
   test("entity resolution: same surface twice merges to one canonical", async () => {
     const instance = "retain-merge";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         {
@@ -233,7 +237,7 @@ describe("retain pipeline", () => {
       ]
     });
     const config = makeConfig(instance);
-    const first = await retain(config, { text: "Bob joined.", mentionedAt: "2025-04-01T00:00:00Z" });
+    const first = await retain(config, { agentId: TEST_AGENT, text: "Bob joined.", mentionedAt: "2025-04-01T00:00:00Z" });
     expect(first.entities).toHaveLength(1);
 
     setEchoStructuredResponse("fact-extraction", {
@@ -249,7 +253,7 @@ describe("retain pipeline", () => {
         }
       ]
     });
-    const second = await retain(config, { text: "Bob shipped a release.", mentionedAt: "2025-04-02T00:00:00Z" });
+    const second = await retain(config, { agentId: TEST_AGENT, text: "Bob shipped a release.", mentionedAt: "2025-04-02T00:00:00Z" });
     // Second call should find the existing canonical and not create a new entity.
     expect(second.entities).toHaveLength(0);
   });
@@ -257,13 +261,14 @@ describe("retain pipeline", () => {
   test("entity resolution: near-miss spelling still merges", async () => {
     const instance = "retain-nearmiss";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "x", when: "", where: "", who: "Alice Johnson", why: "", fact_type: "world",
           entities: [{ text: "Alice Johnson", entity_type: "PERSON" }] }
       ]
     });
-    await retain(makeConfig(instance), { text: "Alice Johnson is here.", mentionedAt: "2025-04-01T00:00:00Z" });
+    await retain(makeConfig(instance), { agentId: TEST_AGENT, text:"Alice Johnson is here.", mentionedAt: "2025-04-01T00:00:00Z" });
 
     setEchoStructuredResponse("fact-extraction", {
       facts: [
@@ -271,7 +276,7 @@ describe("retain pipeline", () => {
           entities: [{ text: "Alice Johnsen", entity_type: "PERSON" }] }
       ]
     });
-    const second = await retain(makeConfig(instance), { text: "Alice Johnsen stopped by.", mentionedAt: "2025-04-01T00:00:00Z" });
+    const second = await retain(makeConfig(instance), { agentId: TEST_AGENT, text:"Alice Johnsen stopped by.", mentionedAt: "2025-04-01T00:00:00Z" });
     // Single-character substitution on a 13-char surface -> Levenshtein 1 ->
     // lexical sim ≈ 0.92, well above the LEXICAL_EXACT_FAST_PATH=0.85.
     expect(second.entities).toHaveLength(0);
@@ -280,6 +285,7 @@ describe("retain pipeline", () => {
   test("temporal links: distant pairs do not link", async () => {
     const instance = "retain-temporal-distant";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "fact one", when: "2025-04-01", where: "", who: "", why: "", fact_type: "world",
@@ -288,7 +294,7 @@ describe("retain pipeline", () => {
           occurred_start: "2025-05-15T00:00:00Z", occurred_end: "2025-05-15T23:59:59Z" }
       ]
     });
-    const result = await retain(makeConfig(instance), { text: "two distant facts", mentionedAt: "2025-05-15T00:00:00Z" });
+    const result = await retain(makeConfig(instance), { agentId: TEST_AGENT, text:"two distant facts", mentionedAt: "2025-05-15T00:00:00Z" });
     const temporalLinks = result.links.filter((l) => l.linkType === "temporal");
     expect(temporalLinks.length).toBe(0);
   });
@@ -306,7 +312,7 @@ describe("retain pipeline", () => {
           where: "office", who: "team", why: "milestone", fact_type: "world" }
       ]
     });
-    const result = await retain(makeConfig(instance), { text: "near-duplicate facts", mentionedAt: "2025-04-02T00:00:00Z" });
+    const result = await retain(makeConfig(instance), { agentId: TEST_AGENT, text:"near-duplicate facts", mentionedAt: "2025-04-02T00:00:00Z" });
     const semanticLinks = result.links.filter((l) => l.linkType === "semantic");
     expect(semanticLinks.length).toBeGreaterThanOrEqual(2);
   });
@@ -314,6 +320,7 @@ describe("retain pipeline", () => {
   test("observation regeneration: an observation unit is created per touched entity", async () => {
     const instance = "retain-observation";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "Eve coded all night", when: "", where: "", who: "Eve", why: "", fact_type: "world",
@@ -323,8 +330,8 @@ describe("retain pipeline", () => {
     setEchoStructuredResponse("observation:", {
       observations: [{ observation: "Eve frequently codes through the night." }]
     });
-    await retain(makeConfig(instance), { text: "Eve coded all night.", mentionedAt: "2025-04-02T00:00:00Z" });
-    const observations = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "observation" });
+    await retain(makeConfig(instance), { agentId: TEST_AGENT, text:"Eve coded all night.", mentionedAt: "2025-04-02T00:00:00Z" });
+    const observations = listMemoryUnits(instance, TEST_BANK, { network: "observation" });
     expect(observations.length).toBe(1);
     expect(observations[0]!.text).toContain("Eve");
   });
@@ -332,12 +339,13 @@ describe("retain pipeline", () => {
   test("audit + trace: retain emits an audit event", async () => {
     const instance = "retain-audit";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     setEchoStructuredResponse("fact-extraction", {
       facts: [
         { what: "x", when: "", where: "", who: "", why: "", fact_type: "world" }
       ]
     });
-    await retain(makeConfig(instance), { text: "audited" });
+    await retain(makeConfig(instance), { agentId: TEST_AGENT, text:"audited" });
     const { readState } = await import("../state");
     const state = readState(instance);
     const audit = state.audit.find((event) => event.action === "memory.retain");

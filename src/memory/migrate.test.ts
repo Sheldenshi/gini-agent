@@ -3,6 +3,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
+  bankIdForAgent,
   closeAllMemoryDbs,
   countMemoryUnits,
   ensureDefaultBank,
@@ -96,7 +97,10 @@ describe("phase 6 migration", () => {
     ensureDefaultBank(instance);
     await seedLegacy(instance, 2, "experience");
     await migrateLegacyMemories(makeConfig(instance));
-    const experiences = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "experience" });
+    // Phase C — migrated rows land in the active-agent's per-agent bank,
+    // not the legacy default bank.
+    const agentId = readState(instance).activeAgentId ?? "agent_default";
+    const experiences = listMemoryUnits(instance, bankIdForAgent(agentId), { network: "experience" });
     expect(experiences.length).toBe(2);
   });
 

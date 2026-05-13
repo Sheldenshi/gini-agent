@@ -1,15 +1,25 @@
 import type { RuntimeConfig } from "../types";
 import { addAudit, createMemory, mutateState, now } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 
 export async function createMemoryFromInput(config: RuntimeConfig, input: Record<string, unknown>) {
-  return mutateState(config.instance, (state) => createMemory(state, {
-    content: String(input.content ?? ""),
-    scope: normalizeScope(input.scope),
-    confidence: Math.max(0, Math.min(1, Number(input.confidence ?? 1))),
-    status: String(input.status ?? "active") === "proposed" ? "proposed" : "active",
-    sensitivity: input.sensitivity === "sensitive" ? "sensitive" : "normal",
-    provenance: String(input.provenance ?? "Created by user")
-  }));
+  return mutateState(config.instance, (state) => {
+    // Phase C — stamp the active agent on every new MemoryRecord so the
+    // pinned-memory block and /api/memory listings show the right agent's
+    // pool. Reject loud when no agent is active so we don't silently leak
+    // into a default pool.
+    const effective = resolveEffectiveContext(state, config);
+    if (!effective.agentId) throw new Error("Cannot create memory: no active agent.");
+    return createMemory(state, {
+      agentId: effective.agentId,
+      content: String(input.content ?? ""),
+      scope: normalizeScope(input.scope),
+      confidence: Math.max(0, Math.min(1, Number(input.confidence ?? 1))),
+      status: String(input.status ?? "active") === "proposed" ? "proposed" : "active",
+      sensitivity: input.sensitivity === "sensitive" ? "sensitive" : "normal",
+      provenance: String(input.provenance ?? "Created by user")
+    });
+  });
 }
 
 export async function updateMemory(config: RuntimeConfig, memoryId: string, statusValue: "active" | "rejected") {

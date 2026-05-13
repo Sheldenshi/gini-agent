@@ -25,6 +25,8 @@ import {
   DEFAULT_BANK_ID,
   addAudit,
   appendTrace,
+  bankIdForAgent,
+  ensureAgentBank,
   ensureDefaultBank,
   getBank,
   insertMemoryUnit,
@@ -36,6 +38,7 @@ import { recall } from "./recall";
 import { opinionExtractionValidator, type ExtractedOpinion } from "./schemas";
 
 export interface ReflectInput {
+  agentId: string;
   bankId?: string;
   query: string;
   tokenBudget?: number;
@@ -51,13 +54,16 @@ export interface ReflectOutput {
 
 export async function reflect(config: RuntimeConfig, input: ReflectInput): Promise<ReflectOutput> {
   const instance = config.instance;
+  if (!input.agentId) throw new Error("reflect: agentId is required (Phase C per-agent memory isolation)");
   ensureDefaultBank(instance);
-  const bankId = input.bankId ?? DEFAULT_BANK_ID;
+  ensureAgentBank(instance, input.agentId);
+  const bankId = input.bankId ?? bankIdForAgent(input.agentId);
   const bank = getBank(instance, bankId);
   if (!bank) throw new Error(`Bank not found: ${bankId}`);
 
   // 1. Recall.
   const recalled = await recall(config, {
+    agentId: input.agentId,
     bankId,
     query: input.query,
     tokenBudget: input.tokenBudget ?? 2000,
@@ -83,7 +89,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
     echoTag: "opinion-formation"
   });
   const extracted = opinionStub.data.opinions ?? [];
-  const insertedOpinions = await persistOpinions(config, bankId, extracted, input.sourceTaskId);
+  const insertedOpinions = await persistOpinions(config, bankId, input.agentId, extracted, input.sourceTaskId);
 
   // 5. Audit + trace.
   await mutateState(instance, (state) => {
@@ -115,6 +121,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
 async function persistOpinions(
   config: RuntimeConfig,
   bankId: string,
+  agentId: string,
   extracted: ExtractedOpinion[],
   sourceTaskId: string | undefined
 ): Promise<MemoryUnit[]> {
@@ -126,6 +133,7 @@ async function persistOpinions(
     const opinion = extracted[i]!;
     const unit = insertMemoryUnit(config.instance, {
       bankId,
+      agentId,
       text: opinion.opinion,
       embedding: vectors[i] ?? null,
       embeddingModel: provider.model,

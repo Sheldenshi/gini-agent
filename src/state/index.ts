@@ -21,6 +21,8 @@ export {
   closeAllMemoryDbs,
   removeMemoryDb,
   ensureDefaultBank,
+  ensureAgentBank,
+  bankIdForAgent,
   insertMemoryUnit,
   getMemoryUnit,
   countMemoryUnits,

@@ -66,28 +66,48 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   });
   appendLog(config.instance, "task.started", { taskId, mode: "chat" });
 
+  // Resolve the active agent up-front so memory recall and pinned-memory
+  // filtering both use the same isolation key (Phase C). Without an active
+  // agent we skip auto-recall — Hindsight requires a namespace.
+  const stateForAgent = readState(config.instance);
+  const effectiveForAgent = resolveEffectiveContext(stateForAgent, config);
+  const agentIdForMemory = effectiveForAgent.agentId;
+
   // Auto-recall: same as the legacy path. If recall fails we continue with
   // pinned memories only; the model can still answer.
   let recalledContext: string | undefined;
   let hindsightUnitsRecalled = 0;
-  try {
-    const recalled = await recall(config, { query: task.input, tokenBudget: 1500, sourceTaskId: taskId });
-    if (recalled.units.length > 0) {
-      hindsightUnitsRecalled = recalled.units.length;
-      recalledContext = recalled.units
-        .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
-        .join("\n");
+  if (agentIdForMemory) {
+    try {
+      const recalled = await recall(config, {
+        agentId: agentIdForMemory,
+        query: task.input,
+        tokenBudget: 1500,
+        sourceTaskId: taskId
+      });
+      if (recalled.units.length > 0) {
+        hindsightUnitsRecalled = recalled.units.length;
+        recalledContext = recalled.units
+          .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
+          .join("\n");
+      }
+    } catch (error) {
+      appendTrace(config.instance, taskId, {
+        type: "memory",
+        message: "auto-recall failed",
+        data: { error: error instanceof Error ? error.message : String(error) }
+      });
     }
-  } catch (error) {
-    appendTrace(config.instance, taskId, {
-      type: "memory",
-      message: "auto-recall failed",
-      data: { error: error instanceof Error ? error.message : String(error) }
-    });
   }
 
   const state = readState(config.instance);
-  const activeMemory = state.memories.filter((memory) => memory.status === "active");
+  // Phase C: pinned memories are also per-agent. Records without an
+  // agentId (pre-migration leftovers) are excluded — the migration in
+  // normalizeState backfills them on first read, so this filter should
+  // only drop content during the in-flight first-boot rewrite.
+  const activeMemory = state.memories.filter((memory) =>
+    memory.status === "active" && (!agentIdForMemory || memory.agentId === agentIdForMemory)
+  );
   // Subagent path: child tasks override the default Gini preamble with the
   // subagent's own system prompt and filter the trusted-skills block by the
   // subagent's skill whitelist (when set).

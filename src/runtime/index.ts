@@ -25,6 +25,7 @@ export function status(config: RuntimeConfig) {
         providerSource: effective.providerSource,
         toolsetFilter: effective.toolsetFilter ? Array.from(effective.toolsetFilter) : undefined,
         messagingTargetFilter: effective.messagingTargetFilter ? Array.from(effective.messagingTargetFilter) : undefined,
+        memoryNamespace: effective.memoryNamespace ?? effective.agentId,
         warnings: effective.warnings
       }
     : undefined;

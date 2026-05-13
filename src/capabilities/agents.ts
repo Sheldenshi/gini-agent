@@ -1,5 +1,5 @@
 import type { RuntimeConfig } from "../types";
-import { activateAgent, createAgentRecord, mutateState, readState } from "../state";
+import { activateAgent, createAgentRecord, ensureAgentBank, mutateState, readState } from "../state";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -9,7 +9,7 @@ export function listAgents(config: RuntimeConfig) {
 export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "");
   if (!name) throw new Error("Agent name is required.");
-  return mutateState(config.instance, (state) => createAgentRecord(state, {
+  const record = await mutateState(config.instance, (state) => createAgentRecord(state, {
     name,
     providerName: typeof input.providerName === "string" ? input.providerName as never : undefined,
     model: typeof input.model === "string" ? input.model : undefined,
@@ -17,6 +17,12 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
     memoryScopes: Array.isArray(input.memoryScopes) ? input.memoryScopes.filter(isMemoryScope) : ["user", "project"],
     messagingTargets: Array.isArray(input.messagingTargets) ? input.messagingTargets.map(String) : []
   }));
+  // Phase C — eagerly create the per-agent bank so the new agent starts
+  // with an *empty* memory pool. Config copied at creation, content NOT:
+  // there's no copying of memories or hindsight units from the default
+  // agent or any other agent.
+  ensureAgentBank(config.instance, record.id);
+  return record;
 }
 
 export async function useAgent(config: RuntimeConfig, idOrName: string) {

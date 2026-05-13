@@ -10,7 +10,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
-import { useInvalidate, useMemories } from "@/lib/queries";
+import { useInvalidate, useMemories, useStatus } from "@/lib/queries";
 import type { MemoryRecord } from "@runtime/types";
 import { HindsightPanel } from "./_components/HindsightPanel";
 
@@ -18,6 +18,8 @@ const SCOPES = ["all", "user", "project", "device", "temporary"] as const;
 
 export default function MemoryPage() {
   const memories = useMemories();
+  const status = useStatus();
+  const activeAgentName = status.data?.activeAgent?.name;
   const [scope, setScope] = useState<typeof SCOPES[number]>("all");
   const [content, setContent] = useState("");
   const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null);
@@ -68,7 +70,12 @@ export default function MemoryPage() {
 
   return (
     <>
-      <PageHeader title="Memory" description="Approve, reject, archive memories with provenance" />
+      <PageHeader
+        title="Memory"
+        description={activeAgentName
+          ? `Approve, reject, archive memories with provenance — agent: ${activeAgentName}`
+          : "Approve, reject, archive memories with provenance"}
+      />
       <div className="flex-1 space-y-6 overflow-auto p-6">
         <HindsightPanel />
 

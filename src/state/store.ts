@@ -3,6 +3,8 @@ import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeSta
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
+import { addAudit } from "./audit";
+import { getMemoryDb, memoryDbPath } from "./memory-db";
 
 export function createEmptyState(instance: Instance): RuntimeState {
   const at = now();
@@ -228,6 +230,93 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
   delete stateAny.activeProfileId;
 }
 
+// Phase C — per-agent memory isolation backfill for the legacy
+// MemoryRecord store. Walks state.memories and stamps `agentId` on rows
+// that pre-date Phase C, bundling all of them under whichever agent was
+// active at migration time (typically the default agent on davao-style
+// instances). Idempotent: rows already carrying `agentId` are skipped.
+// Audits the count so the rebucketing shows up in `gini doctor` /
+// /api/audit. Hindsight unit/bank backfill lives in
+// migrateHindsightAgentIdColumns (runs against SQLite, not JSON state).
+function migrateMemoryAgentId(state: RuntimeState): void {
+  if (!Array.isArray(state.memories) || state.memories.length === 0) return;
+  const defaultAgentId =
+    state.activeAgentId
+    ?? state.agents.find((agent) => agent.status === "active")?.id
+    ?? state.agents[0]?.id
+    ?? "agent_default";
+  let stamped = 0;
+  for (const memory of state.memories) {
+    if (memory.agentId) continue;
+    memory.agentId = defaultAgentId;
+    stamped += 1;
+  }
+  if (stamped > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "memory.agentid.backfill",
+      target: defaultAgentId,
+      risk: "low",
+      evidence: { stamped, agentId: defaultAgentId }
+    });
+  }
+}
+
+// Phase C — per-agent backfill on the SQLite hindsight store. Pre-Phase-C
+// rows have a NULL agent_id (default value from the ALTER TABLE). Walk the
+// DB once and stamp them with the migration-time active agent, mirroring
+// the JSON MemoryRecord backfill. Bank rows get the same treatment so
+// their `agentId` field is non-null going forward. Idempotent — only
+// touches NULL rows.
+function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState): void {
+  // Skip if no memory.db has been created yet — first-boot instances will
+  // pick up the column from CREATE TABLE and won't need the backfill.
+  if (!existsSync(memoryDbPath(instance))) return;
+  const defaultAgentId =
+    state.activeAgentId
+    ?? state.agents.find((agent) => agent.status === "active")?.id
+    ?? state.agents[0]?.id
+    ?? "agent_default";
+  try {
+    const db = getMemoryDb(instance);
+    const stampedUnits = db
+      .query<{ c: number }, []>(
+        "SELECT COUNT(*) AS c FROM memory_units WHERE agent_id IS NULL"
+      )
+      .get()?.c ?? 0;
+    if (stampedUnits > 0) {
+      db.run("UPDATE memory_units SET agent_id = ? WHERE agent_id IS NULL", [defaultAgentId]);
+    }
+    const stampedBanks = db
+      .query<{ c: number }, []>(
+        "SELECT COUNT(*) AS c FROM memory_banks WHERE agent_id IS NULL AND id != 'bank_default'"
+      )
+      .get()?.c ?? 0;
+    if (stampedBanks > 0) {
+      // The legacy `bank_default` row stays untagged so existing code that
+      // reads from it (ensureDefaultBank) keeps working; per-agent banks
+      // created by ensureAgentBank carry a non-null agent_id from inception.
+      db.run(
+        "UPDATE memory_banks SET agent_id = ? WHERE agent_id IS NULL AND id != 'bank_default'",
+        [defaultAgentId]
+      );
+    }
+    if (stampedUnits > 0 || stampedBanks > 0) {
+      addAudit(state, {
+        actor: "runtime",
+        action: "hindsight.agentid.backfill",
+        target: defaultAgentId,
+        risk: "low",
+        evidence: { units: stampedUnits, banks: stampedBanks, agentId: defaultAgentId }
+      });
+    }
+  } catch {
+    // SQLite open failures are surfaced through `gini doctor`'s probe; the
+    // normalizeState path stays best-effort so a corrupted DB doesn't block
+    // every read of state.json.
+  }
+}
+
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
   migrateProfileFieldsToAgent(state);
   migrateLaneFieldToInstance(state);
@@ -253,6 +342,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.importReports ??= [];
   state.agents ??= [defaultAgent(instance, now())];
   state.activeAgentId ??= state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
+  // Phase C — per-agent memory isolation backfill. Runs after agents are
+  // present so the migration can stamp the right id. Both helpers are
+  // idempotent so a re-read of an already-migrated state file is a no-op.
+  migrateMemoryAgentId(state);
+  migrateHindsightAgentIdColumns(instance, state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];

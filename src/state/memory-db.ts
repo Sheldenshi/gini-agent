@@ -18,8 +18,18 @@ import type { Instance } from "../types";
 import { instanceRoot } from "../paths";
 import { id, now } from "./ids";
 
-export const MEMORY_SCHEMA_VERSION = 1;
+// Bumped to 2 in Phase C: added agent_id columns to memory_banks and
+// memory_units for per-agent memory isolation. New SQLite installs add the
+// columns through CREATE TABLE; existing installs add them via the additive
+// migration in applyMigrations().
+export const MEMORY_SCHEMA_VERSION = 2;
 export const DEFAULT_BANK_ID = "bank_default";
+
+// Builds a deterministic per-agent bank id from an agent id. Used by
+// ensureAgentBank so each agent's hindsight data lives in its own bank.
+export function bankIdForAgent(agentId: string): string {
+  return `bank_${agentId}`;
+}
 
 export type Network = "world" | "experience" | "opinion" | "observation";
 export type LinkType = "temporal" | "semantic" | "entity" | "causal";
@@ -40,6 +50,11 @@ export type MemoryUnitStatus =
 
 export interface MemoryBank {
   id: string;
+  // agentId is the per-agent isolation key (Phase C). NULL on legacy banks
+  // that pre-date Phase C; the normalizeState migration backfills these by
+  // pointing them at whoever was the active agent at migration time. The
+  // ambient default bank stays untagged so legacy reads keep working.
+  agentId: string | null;
   name: string;
   agentName: string | null;
   background: string | null;
@@ -54,6 +69,10 @@ export interface MemoryBank {
 export interface MemoryUnit {
   id: string;
   bankId: string;
+  // agentId is denormalized on each unit row so recall queries can filter
+  // on a single indexed column without a JOIN through memory_banks. NULL
+  // only on legacy rows that the migration hasn't seen yet.
+  agentId: string | null;
   text: string;
   embedding: Float32Array | null;
   embeddingDim: number | null;
@@ -158,6 +177,7 @@ function applyMigrations(db: Database): void {
 
     CREATE TABLE IF NOT EXISTS memory_banks (
       id TEXT PRIMARY KEY,
+      agent_id TEXT,
       name TEXT NOT NULL,
       agent_name TEXT,
       background TEXT,
@@ -168,12 +188,14 @@ function applyMigrations(db: Database): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_memory_banks_agent ON memory_banks(agent_id);
 
     -- Eq. 1 (paper §3.1): a memory unit is text + provenance + temporal scope
     -- + a network label drawn from {world, experience, opinion, observation}.
     CREATE TABLE IF NOT EXISTS memory_units (
       id TEXT PRIMARY KEY,
       bank_id TEXT NOT NULL REFERENCES memory_banks(id) ON DELETE CASCADE,
+      agent_id TEXT,
       text TEXT NOT NULL,
       embedding BLOB,
       embedding_dim INTEGER,
@@ -197,6 +219,8 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_memory_units_network ON memory_units(bank_id, network);
     CREATE INDEX IF NOT EXISTS idx_memory_units_temporal ON memory_units(bank_id, occurred_start, occurred_end);
     CREATE INDEX IF NOT EXISTS idx_memory_units_status ON memory_units(bank_id, status);
+    CREATE INDEX IF NOT EXISTS idx_memory_units_agent ON memory_units(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_memory_units_agent_network ON memory_units(agent_id, network);
 
     -- BM25 (paper Eq. 11) — FTS5 mirror of memory_units.text, kept in sync via
     -- triggers so retain/recall (phases 2-3) can run lexical queries without
@@ -253,10 +277,27 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_links_entity ON memory_links(entity_id) WHERE entity_id IS NOT NULL;
   `);
 
+  // Phase C additive migration: pre-Phase-C databases were created without
+  // the agent_id columns on memory_banks / memory_units. Add them in-place
+  // with a runtime check — SQLite has no IF NOT EXISTS on ALTER TABLE ADD
+  // COLUMN, so we probe PRAGMA table_info and ALTER only when the column is
+  // missing. Idempotent: a fresh DB created from the CREATE TABLE above
+  // already has the column and falls through.
+  ensureColumn(db, "memory_banks", "agent_id", "TEXT");
+  ensureColumn(db, "memory_units", "agent_id", "TEXT");
+
   db.run(
     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
     [String(MEMORY_SCHEMA_VERSION)]
   );
+}
+
+function ensureColumn(db: Database, table: string, column: string, type: string): void {
+  const rows = db
+    .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+    .all();
+  if (rows.some((row) => row.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
 }
 
 // Float32Array <-> Buffer round-trip.
@@ -295,6 +336,7 @@ export function ensureDefaultBank(instance: Instance): MemoryBank {
   const at = now();
   const bank: MemoryBank = {
     id: DEFAULT_BANK_ID,
+    agentId: null,
     name: "default",
     agentName: null,
     background: null,
@@ -307,9 +349,44 @@ export function ensureDefaultBank(instance: Instance): MemoryBank {
   };
   db.run(
     `INSERT INTO memory_banks
-       (id, name, agent_name, background, skepticism, literalism, empathy, bias_strength, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [bank.id, bank.name, bank.agentName, bank.background, bank.skepticism, bank.literalism, bank.empathy, bank.biasStrength, bank.createdAt, bank.updatedAt]
+       (id, agent_id, name, agent_name, background, skepticism, literalism, empathy, bias_strength, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [bank.id, bank.agentId, bank.name, bank.agentName, bank.background, bank.skepticism, bank.literalism, bank.empathy, bank.biasStrength, bank.createdAt, bank.updatedAt]
+  );
+  return bank;
+}
+
+// Phase C — lazy per-agent bank. Each agent owns one hindsight bank so the
+// behavioural profile sliders + namespacing are agent-local. New agents get
+// an empty bank on first access: config copied, content NOT — there is no
+// inheritance from the default agent or any other bank.
+export function ensureAgentBank(instance: Instance, agentId: string): MemoryBank {
+  if (!agentId) throw new Error("ensureAgentBank: agentId is required");
+  const db = getMemoryDb(instance);
+  const bankId = bankIdForAgent(agentId);
+  const existing = db
+    .query<MemoryBankRow, [string]>("SELECT * FROM memory_banks WHERE id = ?")
+    .get(bankId);
+  if (existing) return rowToBank(existing);
+  const at = now();
+  const bank: MemoryBank = {
+    id: bankId,
+    agentId,
+    name: agentId,
+    agentName: null,
+    background: null,
+    skepticism: 3,
+    literalism: 3,
+    empathy: 3,
+    biasStrength: 0.5,
+    createdAt: at,
+    updatedAt: at
+  };
+  db.run(
+    `INSERT INTO memory_banks
+       (id, agent_id, name, agent_name, background, skepticism, literalism, empathy, bias_strength, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [bank.id, bank.agentId, bank.name, bank.agentName, bank.background, bank.skepticism, bank.literalism, bank.empathy, bank.biasStrength, bank.createdAt, bank.updatedAt]
   );
   return bank;
 }
@@ -328,6 +405,12 @@ export function listBanks(instance: Instance): MemoryBank[] {
 
 export interface InsertMemoryUnitInput {
   bankId?: string;
+  // Phase C: each unit is stamped with the active agent at write time so
+  // recall can filter to a single agent's pool without joining through
+  // memory_banks. Optional in the type so legacy callers / tests that don't
+  // route through resolveEffectiveContext can still insert; production paths
+  // (retain, reflect.persistOpinions, migrate) always supply it.
+  agentId?: string | null;
   text: string;
   embedding?: Float32Array | null;
   embeddingModel?: string | null;
@@ -348,6 +431,7 @@ export function insertMemoryUnit(instance: Instance, input: InsertMemoryUnitInpu
   const unit: MemoryUnit = {
     id: id("mu"),
     bankId: input.bankId ?? DEFAULT_BANK_ID,
+    agentId: input.agentId ?? null,
     text: input.text,
     embedding: input.embedding ?? null,
     embeddingDim: input.embedding ? input.embedding.length : null,
@@ -368,14 +452,15 @@ export function insertMemoryUnit(instance: Instance, input: InsertMemoryUnitInpu
   };
   db.run(
     `INSERT INTO memory_units
-       (id, bank_id, text, embedding, embedding_dim, embedding_model,
+       (id, bank_id, agent_id, text, embedding, embedding_dim, embedding_model,
         occurred_start, occurred_end, mentioned_at, network, confidence,
         metadata, source_task_id, source_session_id, status,
         created_at, updated_at, last_used_at, usage_count)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       unit.id,
       unit.bankId,
+      unit.agentId,
       unit.text,
       unit.embedding ? serializeEmbedding(unit.embedding) : null,
       unit.embeddingDim,
@@ -415,6 +500,10 @@ export interface ListUnitsOptions {
   status?: MemoryUnitStatus | MemoryUnitStatus[];
   limit?: number;
   excludeIds?: string[];
+  // Phase C agent isolation — when supplied, restricts results to units
+  // owned by the agent. Optional so legacy callers / tests that haven't
+  // moved to per-agent banks still work; production paths pass it through.
+  agentId?: string;
 }
 
 export function listMemoryUnits(instance: Instance, bankId: string, options: ListUnitsOptions = {}): MemoryUnit[] {
@@ -426,6 +515,10 @@ export function listMemoryUnits(instance: Instance, bankId: string, options: Lis
   if (statuses.length > 0) {
     where.push(`status IN (${statuses.map(() => "?").join(",")})`);
     params.push(...statuses);
+  }
+  if (options.agentId) {
+    where.push("agent_id = ?");
+    params.push(options.agentId);
   }
   if (options.network) {
     const networks = Array.isArray(options.network) ? options.network : [options.network];
@@ -476,7 +569,8 @@ export function upsertObservationUnit(
   entityId: string,
   text: string,
   embedding: Float32Array | null,
-  embeddingModel: string | null
+  embeddingModel: string | null,
+  agentId?: string | null
 ): MemoryUnit {
   const db = getMemoryDb(instance);
   // Archive any existing observation rows for this entity in this bank.
@@ -492,6 +586,7 @@ export function upsertObservationUnit(
   );
   const unit = insertMemoryUnit(instance, {
     bankId,
+    agentId: agentId ?? null,
     text,
     embedding,
     embeddingModel,
@@ -817,6 +912,7 @@ export function linksFrom(instance: Instance, unitId: string, linkType?: LinkTyp
 
 interface MemoryBankRow {
   id: string;
+  agent_id: string | null;
   name: string;
   agent_name: string | null;
   background: string | null;
@@ -831,6 +927,7 @@ interface MemoryBankRow {
 interface MemoryUnitRow {
   id: string;
   bank_id: string;
+  agent_id: string | null;
   text: string;
   embedding: Uint8Array | null;
   embedding_dim: number | null;
@@ -863,6 +960,7 @@ interface MemoryLinkRow {
 function rowToBank(row: MemoryBankRow): MemoryBank {
   return {
     id: row.id,
+    agentId: row.agent_id,
     name: row.name,
     agentName: row.agent_name,
     background: row.background,
@@ -884,6 +982,7 @@ function rowToUnit(row: MemoryUnitRow): MemoryUnit {
   return {
     id: row.id,
     bankId: row.bank_id,
+    agentId: row.agent_id,
     text: row.text,
     embedding: deserializeEmbedding(row.embedding, row.embedding_dim),
     embeddingDim: row.embedding_dim,
