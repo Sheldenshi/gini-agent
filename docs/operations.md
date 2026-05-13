@@ -148,7 +148,9 @@ To override the cap for a single instance, edit
 
 `maxIterations` must be a positive integer. Invalid values (zero, negative,
 non-numeric) fall back to the built-in default and emit a warning trace on
-the next task. The setting is read on every task; no restart is required.
+the next task. The runtime reads `config.json` once at server start and
+holds `RuntimeConfig` in memory, so edits don't take effect until you
+restart `gini run` (stop the tmux session and re-issue the command).
 
 ## Cleanup
 

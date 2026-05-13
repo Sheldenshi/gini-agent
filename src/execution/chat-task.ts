@@ -17,7 +17,8 @@ import {
   appendTrace,
   mutateState,
   now,
-  readState
+  readState,
+  readTrace
 } from "../state";
 import { findTask } from "../agent";
 import { recall } from "../memory";
@@ -28,6 +29,7 @@ import {
   type ToolCall
 } from "../provider";
 import type {
+  CostRecord,
   PendingToolCall,
   RuntimeConfig,
   RuntimeState,
@@ -63,6 +65,32 @@ function resolveIterationCap(config: RuntimeConfig): { cap: number; warnReason?:
     };
   }
   return { cap: raw };
+}
+
+// Add an incremental cost record (from a single model call) into a running
+// accumulator. Token totals sum across calls; USD estimates sum when
+// present. `provider`/`model` track the most recent call so the surfaced
+// cost row reflects whichever model spent the bulk of the budget — this
+// mirrors how upstream UIs display task.cost as the latest provider used
+// rather than a multi-provider rollup.
+function addCost(accumulator: CostRecord | undefined, increment: CostRecord | undefined): CostRecord | undefined {
+  if (!increment) return accumulator;
+  if (!accumulator) {
+    // Clone to avoid the caller mutating the original later.
+    return { ...increment };
+  }
+  const sum = (a: number | undefined, b: number | undefined): number | undefined => {
+    if (a === undefined && b === undefined) return undefined;
+    return (a ?? 0) + (b ?? 0);
+  };
+  return {
+    provider: increment.provider ?? accumulator.provider,
+    model: increment.model ?? accumulator.model,
+    inputTokens: sum(accumulator.inputTokens, increment.inputTokens),
+    outputTokens: sum(accumulator.outputTokens, increment.outputTokens),
+    totalTokens: sum(accumulator.totalTokens, increment.totalTokens),
+    estimatedUsd: sum(accumulator.estimatedUsd, increment.estimatedUsd)
+  };
 }
 
 // runChatTask: kicks off the chat-task loop for a freshly submitted task.
@@ -248,15 +276,34 @@ async function runLoop(
 
   const { cap, warnReason } = resolveIterationCap(config);
   if (warnReason) {
-    appendTrace(config.instance, taskId, {
-      type: "warning",
-      message: `Invalid agent.maxIterations config; using default.`,
-      data: { reason: warnReason, defaultCap: MAX_LOOP_ITERATIONS }
-    });
+    // Only emit the invalid-config warning once per task. resumeChatTask
+    // re-enters runLoop after every approval, so without this guard a task
+    // that bounces through several approvals would log the same warning
+    // for each resume — noisy and confusing in the trace.
+    const priorTraces = readTrace(config.instance, taskId);
+    const alreadyWarned = priorTraces.some(
+      (t) =>
+        t.type === "warning" &&
+        typeof (t.data as Record<string, unknown> | undefined)?.reason === "string" &&
+        (t.data as Record<string, unknown>).reason === warnReason
+    );
+    if (!alreadyWarned) {
+      appendTrace(config.instance, taskId, {
+        type: "warning",
+        message: `Invalid agent.maxIterations config; using default.`,
+        data: { reason: warnReason, defaultCap: MAX_LOOP_ITERATIONS }
+      });
+    }
   }
 
   let iterations = iterationsSoFar;
   let workingMessages = messages.slice();
+  // Carry the running cost across approval resumes by seeding from the
+  // task's existing cost row (set by a prior runLoop entry). Each model
+  // call adds into this accumulator and we write it back on every
+  // persistence point so partial work is never lost — including on pause,
+  // graceful exhaustion, and the failure fallback.
+  let accumulatedCost: CostRecord | undefined = taskRow?.cost ? { ...taskRow.cost } : undefined;
 
   while (iterations < cap) {
     iterations += 1;
@@ -307,6 +354,7 @@ async function runLoop(
 
     const result = await generateToolCallingResponse(config, workingMessages, providerTools, onDelta);
     await flush();
+    accumulatedCost = addCost(accumulatedCost, result.cost);
 
     appendTrace(config.instance, taskId, {
       type: "model",
@@ -329,7 +377,7 @@ async function runLoop(
         item.status = "completed";
         item.currentStep = "Completed";
         item.summary = finalText || "(no content)";
-        item.cost = result.cost;
+        item.cost = accumulatedCost;
         // partialSummary is no longer the source of truth — clear it so
         // the chat UI uses the synced summary instead.
         item.partialSummary = undefined;
@@ -425,6 +473,10 @@ async function runLoop(
         item.status = "waiting_approval";
         item.currentStep = "Waiting for approval";
         item.toolCallState = snapshot;
+        // Persist the partial cost up to this pause so it isn't lost if
+        // the approval is denied (failTask reads the row as-is) or the
+        // task waits a long time before resuming.
+        item.cost = accumulatedCost;
         item.updatedAt = now();
         return item;
       });
@@ -456,13 +508,14 @@ async function runLoop(
   ];
   try {
     const summaryResult = await generateToolCallingResponse(config, summaryMessages, []);
+    accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
       item.status = "completed";
       item.currentStep = `Completed (iteration cap reached: ${cap})`;
       item.summary = finalText;
-      item.cost = summaryResult.cost;
+      item.cost = accumulatedCost;
       item.partialSummary = undefined;
       item.toolCallState = undefined;
       item.updatedAt = now();
@@ -494,6 +547,9 @@ async function runLoop(
       item.status = "failed";
       item.currentStep = "Failed";
       item.error = `Chat task exceeded ${cap} model iterations.`;
+      // Preserve the accumulated cost from the loop so the audit row
+      // reflects all model calls leading up to the failed summary turn.
+      item.cost = accumulatedCost;
       item.toolCallState = undefined;
       item.updatedAt = now();
       return item;

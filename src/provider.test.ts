@@ -440,6 +440,87 @@ describe("provider", () => {
       restore();
     }
   });
+
+  // Fix 1 (graceful exhaustion): when the chat-task loop hits the iteration
+  // cap it asks for a final summary with `tools: []` but the message array
+  // still carries the prior tool transcript. The codex routing must keep
+  // that transcript intact (i.e. take the Responses-API tool-calling path
+  // and translate function_call / function_call_output items) instead of
+  // collapsing to the text-only legacy path which would strip everything
+  // but the system + user messages.
+  test("codex with empty tools but tool transcript preserves the full Responses-API input", async () => {
+    const { restore } = installCodexAuth("codex-empty-tools-transcript");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          const ev = { type: "response.completed", response: { id: "resp_summary", output: [
+            { id: "msg_1", type: "message", content: [{ type: "output_text", text: "Cap hit. I read /tmp." }] }
+          ] } };
+          controller.enqueue(enc.encode(`event: response.completed\ndata: ${JSON.stringify(ev)}\n\n`));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [
+          { role: "system", content: "you are gini" },
+          { role: "user", content: "list /tmp" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [{
+              id: "call_xyz",
+              type: "function",
+              function: { name: "file_list", arguments: '{"path":"/tmp"}' }
+            }]
+          },
+          {
+            role: "tool",
+            tool_call_id: "call_xyz",
+            content: '{"files":["a.txt","b.txt"]}'
+          },
+          { role: "user", content: "summarize what you learned" }
+        ],
+        // Empty tools — the cap-hit summary call passes []. The codex
+        // routing must still take the Responses-API path because the
+        // history contains tool traffic.
+        []
+      );
+
+      expect(result.text).toBe("Cap hit. I read /tmp.");
+      // Hit the /responses path, not the legacy text-only routing.
+      expect(captured?.url).toContain("/responses");
+      const sent = JSON.parse(String(captured!.init!.body));
+      // No `tools` field when caller passed an empty array — the request
+      // body must omit it so providers that reject empty `tools` are happy.
+      expect("tools" in sent).toBe(false);
+      // Full transcript translated into Responses-API input items.
+      expect(sent.instructions).toBe("you are gini");
+      expect(sent.input).toEqual([
+        { role: "user", content: [{ type: "input_text", text: "list /tmp" }] },
+        { type: "function_call", call_id: "call_xyz", name: "file_list", arguments: '{"path":"/tmp"}' },
+        { type: "function_call_output", call_id: "call_xyz", output: '{"files":["a.txt","b.txt"]}' },
+        { role: "user", content: [{ type: "input_text", text: "summarize what you learned" }] }
+      ]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
 });
 
 // Install a temporary CODEX_AUTH_JSON pointing at a fake auth.json. Tests

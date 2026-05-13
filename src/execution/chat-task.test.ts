@@ -657,6 +657,101 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  // Fix 2 (cost accumulation): each iteration's cost must add to the
+  // running total instead of overwriting. Tested across a 3-iteration
+  // run where the stub provider returns small but nonzero usage on
+  // every turn — including the final tool-less summary turn the cap
+  // exhaustion path emits.
+  test("accumulates cost across iterations including the cap-exhaustion summary turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const fixturePath = join(workspaceRoot, "hello.md");
+    writeFileSync(fixturePath, "Hello, world!");
+    const config = buildConfig(workspaceRoot, "chat-task-cost-accum");
+    config.agent = { maxIterations: 2 };
+    const provider = normalizeProvider(config.provider);
+
+    // Two tool-call iterations, each reporting 10 in / 5 out / 15 total.
+    for (let i = 0; i < 2; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_acc_${i}`,
+            type: "function",
+            function: { name: "file_read", arguments: JSON.stringify({ path: "hello.md" }) }
+          }
+        ],
+        finishReason: "tool_calls",
+        cost: { provider: "echo", model: "gini-echo-v0", inputTokens: 10, outputTokens: 5, totalTokens: 15 }
+      });
+    }
+    // Cap-exhaustion summary turn — adds another 4 in / 6 out / 10 total.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Cap reached.",
+      toolCalls: [],
+      finishReason: "stop",
+      cost: { provider: "echo", model: "gini-echo-v0", inputTokens: 4, outputTokens: 6, totalTokens: 10 }
+    });
+
+    const task = await submitTask(config, "loop a bit", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Cap reached.");
+    // 10 + 10 + 4 = 24 input tokens, 5 + 5 + 6 = 16 output tokens, 15 + 15 + 10 = 40 total.
+    expect(finished.cost?.inputTokens).toBe(24);
+    expect(finished.cost?.outputTokens).toBe(16);
+    expect(finished.cost?.totalTokens).toBe(40);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Fix 4 (warning de-duplication): the invalid-config warning should be
+  // emitted at most once per task even when runLoop is re-entered after
+  // approval pauses. We force a pause via a gated tool call, approve it,
+  // then assert the trace contains exactly one matching warning.
+  test("invalid agent.maxIterations warning is emitted at most once across approval resumes", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-warn-once");
+    (config as unknown as { agent: { maxIterations: number } }).agent = { maxIterations: 0 };
+    const provider = normalizeProvider(config.provider);
+
+    // First model turn: request a file write (gated → pauses the task).
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_wo", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "out.txt", content: "x" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Resume turn: final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "write and finish", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id);
+    expect(paused.status).toBe("waiting_approval");
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const warnings = traces.filter(
+      (t) => t.type === "warning" && /agent\.maxIterations/i.test(String(t.data?.reason ?? ""))
+    );
+    expect(warnings.length).toBe(1);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   // Also accept the same invalid-string case (e.g. "abc") to confirm the
   // resolver's typeof guard rejects non-numbers, not just non-positive
   // integers.

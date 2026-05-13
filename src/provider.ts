@@ -231,12 +231,15 @@ export async function generateToolCallingResponse(
     return result;
   }
 
-  // Codex/responses API. With tools present, route to the native
-  // function-calling responses path. Without tools, fall back to a plain
-  // text completion (preserves legacy callers like `generateTaskSummary`
-  // pathways that still pass through this function).
+  // Codex/responses API. Route to the native function-calling responses
+  // path whenever tools are present OR the message history already
+  // contains tool-calling traffic (assistant tool_calls / tool results).
+  // The latter matters for the graceful-exhaustion summary call: it
+  // passes `tools: []` but needs the prior tool transcript preserved so
+  // the model can summarize what it learned. Falling back to the text-
+  // only `/responses` path here would strip that transcript.
   if (provider.name === "codex") {
-    if (tools.length > 0) {
+    if (tools.length > 0 || messagesContainToolTraffic(messages)) {
       return callToolCallingResponses(provider, messages, tools, onDelta);
     }
     const systemContext = stitchSystemFromMessages(messages);
@@ -254,6 +257,20 @@ export async function generateToolCallingResponse(
   }
 
   return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+}
+
+// True when the message array carries assistant `tool_calls` entries or
+// `tool` result messages. Used to decide whether the codex routing must
+// preserve the full Responses-API tool transcript even when the caller
+// passes an empty tools list (e.g. the iteration-cap summary turn).
+function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
+  for (const message of messages) {
+    if (message.role === "tool") return true;
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // When falling back to the responses API for codex, collapse all `system`
