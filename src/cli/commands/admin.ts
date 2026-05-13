@@ -19,6 +19,7 @@ import {
 } from "../process";
 import { print } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
+import { disableForUninstall } from "./autostart";
 
 export async function install_(ctx: CliContext): Promise<void> {
   // A fresh install must pick a real LLM provider. We refuse to silently
@@ -173,12 +174,18 @@ export async function uninstall(ctx: CliContext): Promise<void> {
   const purge = hasFlag(ctx.rawArgs, "--purge");
 
   if (ctx.explicitInstance) {
+    // Disable autostart FIRST so launchd doesn't respawn the runtime
+    // mid-uninstall. Errors are swallowed — a broken plist must not block
+    // uninstall of the instance state. The `removed` field is captured in
+    // the response so the user can see whether we actually unloaded a
+    // service or whether autostart was already off.
+    const autostart = await disableForUninstall(ctx.config.instance);
     // Stop the runtime first if it's running — otherwise removing stateRoot
     // out from under a live process leaves the daemon writing to a deleted
     // directory until it crashes.
     if (await isRunning(ctx.config)) stopRuntime(ctx.config);
     uninstallInstance(ctx.config);
-    print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot });
+    print({ uninstalled: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot, logRoot: ctx.config.logRoot, autostart });
     return;
   }
 
@@ -220,6 +227,11 @@ async function fullUninstall(flags: FullUninstallFlags): Promise<void> {
   const result = await uninstallAll({
     deleteInstances,
     stopInstance: async (name) => {
+      // Disable autostart before stopping the runtime so launchd doesn't
+      // respawn it the instant we send SIGTERM. Errors are swallowed
+      // (best-effort) — a stale plist with no service is still better
+      // than a half-uninstalled instance.
+      await disableForUninstall(name);
       const cfg = loadConfig(name);
       if (!(await isRunning(cfg))) return;
       const outcome = stopRuntime(cfg);

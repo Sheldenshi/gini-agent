@@ -11,14 +11,22 @@ SETUP_RAN=0
 
 LOCAL_MODE=0
 LOCAL_REPO=""
+# Autostart (macOS LaunchAgent) is on by default — the target install UX is
+# "install completes → runtime is running and stays running across reboots".
+# --no-autostart opts out; useful on shared dev machines, CI, or for users
+# who explicitly don't want a per-user launchd job.
+AUTOSTART=1
+AUTOSTART_ENABLED=0
 
 usage() {
   cat <<USAGE
-Usage: install.sh [--local[=PATH]]
+Usage: install.sh [--local[=PATH]] [--no-autostart]
 
   (no flag)         Install from $REPO_URL (default).
   --local           Install from the local repo containing this script.
   --local=PATH      Install from PATH (must be a gini-agent git checkout).
+  --no-autostart    Skip macOS LaunchAgent registration. (Linux is a no-op
+                    in v1 either way.)
 
 USAGE
 }
@@ -27,6 +35,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --local) LOCAL_MODE=1; LOCAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"; LOCAL_REPO="${LOCAL_REPO%/}" ;;
     --local=*) LOCAL_MODE=1; LOCAL_REPO="${1#--local=}"; LOCAL_REPO="${LOCAL_REPO%/}" ;;
+    --no-autostart) AUTOSTART=0 ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
   esac
@@ -274,6 +283,33 @@ run_setup() {
   fi
 }
 
+enable_autostart() {
+  # Skip if the user opted out or if we're not on macOS — `gini autostart`
+  # prints a clear platform message on Linux, but we don't want a noisy
+  # "macOS-only" line on every Linux install.
+  if [ "$AUTOSTART" = "0" ]; then
+    info "Skipping autostart (--no-autostart)"
+    return
+  fi
+  if [ "$OS" != "darwin" ]; then
+    return
+  fi
+  # Provider must be configured before autostart starts the runtime —
+  # otherwise launchd will respawn a runtime that fails on every boot.
+  # The interactive flow gates on SETUP_RAN; the piped flow leaves
+  # autostart for the user to invoke after `gini setup`.
+  if [ "$SETUP_RAN" != "1" ]; then
+    info "Skipping autostart (provider not configured; run 'gini autostart enable' after 'gini setup')"
+    return
+  fi
+  if (cd "$RUNTIME_DIR" && GINI_INSTANCE="$DEFAULT_INSTANCE" bun run gini autostart enable >/dev/null 2>&1); then
+    step "Autostart enabled (~/Library/LaunchAgents)"
+    AUTOSTART_ENABLED=1
+  else
+    err "Autostart enable failed. Re-run 'gini autostart enable' to retry."
+  fi
+}
+
 print_done() {
   local path_ready=0
   case ":$PATH:" in
@@ -286,11 +322,14 @@ print_done() {
     printf '\n%sgini-agent installed.%s\n\n' "$C_BOLD" "$C_RESET"
   fi
 
-  # If setup ran during install, point at `gini start` directly. Otherwise
-  # list the two commands the user needs to run, each on its own line so
-  # they read as commands, not prose.
+  # If autostart took over, the runtime is already running and will respawn
+  # across reboots — point at `gini status` instead of `gini start`. If
+  # setup ran but autostart didn't, the user still needs to start it once.
+  # If neither ran, they need both setup and start.
   print_next_commands() {
-    if [ "$SETUP_RAN" = "1" ]; then
+    if [ "$AUTOSTART_ENABLED" = "1" ]; then
+      printf '    gini status\n'
+    elif [ "$SETUP_RAN" = "1" ]; then
       printf '    gini start\n'
     else
       printf '    gini setup\n'
@@ -307,7 +346,9 @@ print_done() {
     print_next_commands
     printf '\n'
   else
-    if [ "$SETUP_RAN" = "1" ]; then
+    if [ "$AUTOSTART_ENABLED" = "1" ]; then
+      printf 'Runtime is up (autostart enabled). Check it with %sgini status%s.' "$C_BOLD" "$C_RESET"
+    elif [ "$SETUP_RAN" = "1" ]; then
       printf 'Run %sgini start%s.' "$C_BOLD" "$C_RESET"
     else
       printf 'Run %sgini setup%s, then %sgini start%s.' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
@@ -338,6 +379,7 @@ main() {
   update_path
   initialize_instance
   run_setup
+  enable_autostart
   print_done
 }
 
