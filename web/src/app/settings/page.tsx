@@ -90,10 +90,16 @@ export default function SettingsPage() {
   });
 
   const activeAgentId = agents.data?.activeAgentId;
-  const effectiveProviderName = status.data?.provider?.provider?.name;
-  const effectiveProviderModel = status.data?.provider?.provider?.model;
+  // Prefer activeAgent.resolvedProvider (Phase B) and fall back to
+  // provider.provider for safety during rollout — older runtimes that
+  // pre-date the activeAgent block still surface the legacy field.
+  const effectiveProviderName = status.data?.activeAgent?.resolvedProvider?.name
+    ?? status.data?.provider?.provider?.name;
+  const effectiveProviderModel = status.data?.activeAgent?.resolvedProvider?.model
+    ?? status.data?.provider?.provider?.model;
   const catalogEntry = catalog.data?.find((c) => c.name === effectiveProviderName);
   const displayName = catalogEntry?.displayName ?? effectiveProviderName;
+  const agentWarnings = status.data?.activeAgent?.warnings ?? [];
 
   return (
     <>
@@ -104,6 +110,7 @@ export default function SettingsPage() {
         <AgentCard
           agents={agents.data?.agents ?? []}
           activeAgentId={activeAgentId}
+          warnings={agentWarnings}
           pending={useAgent.isPending}
           onUse={(id) => useAgent.mutate(id)}
         />

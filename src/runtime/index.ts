@@ -1,7 +1,8 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { Instance, RuntimeConfig } from "../types";
 import { configPath, ensureDir, instanceRoot, instancesRoot } from "../paths";
-import { readState, taskCounts } from "../state";
+import { readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
 
@@ -12,6 +13,21 @@ export function status(config: RuntimeConfig) {
   // open the DB here unless one already exists on disk to avoid creating an
   // empty memory.db side-effect from a read-only status call.
   const memoryUnits = countMemoryUnitsIfPresent(config);
+  // Surface the active-agent overrides so clients (Settings page, mobile
+  // app) can render the resolved provider and any warnings without
+  // re-deriving the intersection logic. Omitted when no active agent.
+  const effective = resolveEffectiveContext(state, config);
+  const activeAgent = effective.agentId
+    ? {
+        id: effective.agentId,
+        name: state.agents.find((a) => a.id === effective.agentId)?.name ?? effective.agentId,
+        resolvedProvider: { name: effective.provider.name, model: effective.provider.model },
+        providerSource: effective.providerSource,
+        toolsetFilter: effective.toolsetFilter ? Array.from(effective.toolsetFilter) : undefined,
+        messagingTargetFilter: effective.messagingTargetFilter ? Array.from(effective.messagingTargetFilter) : undefined,
+        warnings: effective.warnings
+      }
+    : undefined;
   return {
     ok: true,
     instance: config.instance,
@@ -25,7 +41,8 @@ export function status(config: RuntimeConfig) {
     missedJobs,
     connectors: state.connectors.length,
     memoryUnits,
-    provider: providerHealth(config)
+    provider: providerHealth(config),
+    activeAgent
   };
 }
 
@@ -52,6 +69,13 @@ export function install(config: RuntimeConfig): void {
   ensureDir(instanceRoot(config.instance));
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   readState(config.instance);
+  // Seed the default agent's provider fields from the freshly-written
+  // config so `gini run --provider X` (or any CLI install) propagates
+  // to the active agent. Fire-and-forget: the mutateState write either
+  // settles before any chat task picks it up (typical) or the next
+  // resolveEffectiveContext call sees the unseeded agent and falls
+  // back to config.provider — both are safe.
+  void seedDefaultAgentFromRuntimeConfig(config);
 }
 
 export function resetInstance(config: RuntimeConfig): void {

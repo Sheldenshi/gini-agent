@@ -724,6 +724,16 @@ export interface ProviderHealth {
   message?: string;
 }
 
+export interface ActiveAgentSnapshot {
+  id: string;
+  name: string;
+  resolvedProvider: { name: string; model: string };
+  providerSource: "agent" | "instance";
+  toolsetFilter?: string[];
+  messagingTargetFilter?: string[];
+  warnings: string[];
+}
+
 export interface RuntimeStatus {
   ok: boolean;
   instance: Instance;
@@ -738,6 +748,7 @@ export interface RuntimeStatus {
   connectors: number;
   memoryUnits?: number;
   provider?: ProviderHealth;
+  activeAgent?: ActiveAgentSnapshot;
 }
 
 export interface ProviderResult {

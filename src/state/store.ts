@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Instance, PairingStatus, RuntimeState } from "../types";
+import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
@@ -87,6 +87,17 @@ export function writeState(instance: Instance, state: RuntimeState): void {
 // state or the next state, never a torn write.
 const instanceLocks = new Map<Instance, Promise<unknown>>();
 
+// Public seed/migration entrypoint. Called at boot from `install()` so the
+// default agent picks up `gini run --provider X` on fresh instances and
+// migrates legacy davao-style instances away from the leaked echo
+// defaults. Idempotent — calling it twice with the same inputs is a no-op.
+// Writes back to disk only when something actually changed.
+export async function seedDefaultAgentFromRuntimeConfig(config: RuntimeConfig): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    seedDefaultAgentFromConfig(state, config.provider);
+  });
+}
+
 export async function mutateState<T>(instance: Instance, fn: (state: RuntimeState) => T): Promise<T> {
   const previous = instanceLocks.get(instance) ?? Promise.resolve();
   const next = previous.then(() => {
@@ -166,6 +177,33 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
       delete rec.lane;
     }
   }
+}
+
+// Seed the default agent's provider fields from RuntimeConfig.provider when:
+//   1. The agent has never been configured (providerName/model undefined), OR
+//   2. The agent still carries the legacy hardcoded echo defaults AND the
+//      instance config points at a different provider — this corrects
+//      pre-Phase-B instances where the default leaked echo regardless of
+//      the user's `gini run --provider X` choice.
+// Idempotent: a second pass with the same inputs is a no-op. Touches only
+// the default agent (id === "agent_default" or the legacy "profile_default")
+// because non-default agents are user-authored and we don't want to clobber
+// their explicit picks.
+function seedDefaultAgentFromConfig(state: RuntimeState, provider: ProviderConfig): boolean {
+  const defaults = state.agents.filter((agent) => agent.id === "agent_default" || agent.id === "profile_default");
+  let mutated = false;
+  for (const agent of defaults) {
+    const needsSeed = !agent.providerName || !agent.model;
+    const legacyEcho = agent.providerName === "echo"
+      && agent.model === "gini-echo-v0"
+      && (provider.name !== "echo" || provider.model !== "gini-echo-v0");
+    if (!needsSeed && !legacyEcho) continue;
+    agent.providerName = provider.name;
+    agent.model = provider.model;
+    agent.updatedAt = now();
+    mutated = true;
+  }
+  return mutated;
 }
 
 // Pre-rename state files persisted `state.profiles` / `state.activeProfileId`.

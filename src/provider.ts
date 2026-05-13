@@ -182,9 +182,15 @@ export async function generateToolCallingResponse(
   config: RuntimeConfig,
   messages: ToolCallingMessage[],
   tools: ToolFunctionSpec[],
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  // Optional per-call override. Resolved by the chat-task loop from the
+  // active agent's providerName/model via resolveEffectiveContext. We do
+  // NOT mutate config.provider — embeddings and the reranker still read
+  // from config and must not be retargeted by agent switches. When
+  // omitted, behavior matches the legacy single-provider path.
+  providerOverride?: ProviderConfig
 ): Promise<ToolCallingResult> {
-  const provider = normalizeProvider(config.provider);
+  const provider = normalizeProvider(providerOverride ?? config.provider);
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const lastUserText = typeof lastUser?.content === "string" ? lastUser.content : "";
 

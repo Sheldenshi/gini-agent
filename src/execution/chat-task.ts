@@ -41,6 +41,7 @@ import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { resolveEffectiveContext } from "./effective-context";
 
 const MAX_LOOP_ITERATIONS = 8;
 
@@ -221,7 +222,12 @@ async function runLoop(
   const state0 = readState(config.instance);
   const taskRow = state0.tasks.find((t) => t.id === taskId);
   const subagent0 = taskRow ? getSubagentForTask(state0, taskRow) : undefined;
-  const tools = filterToolsForSubagent(buildToolCatalog(state0), subagent0);
+  // Resolve the active-agent overrides (provider, toolset filter, etc.).
+  // Provider override flows into generateToolCallingResponse below; the
+  // toolset filter narrows buildToolCatalog before the subagent filter
+  // narrows further (state → agent → subagent composition).
+  const effective = resolveEffectiveContext(state0, config);
+  const tools = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
   const providerTools = toProviderTools(tools);
   const toolsHash = hashCatalog(tools);
 
@@ -275,7 +281,13 @@ async function runLoop(
       item.updatedAt = now();
     });
 
-    const result = await generateToolCallingResponse(config, workingMessages, providerTools, onDelta);
+    const result = await generateToolCallingResponse(
+      config,
+      workingMessages,
+      providerTools,
+      onDelta,
+      effective.providerSource === "agent" ? effective.provider : undefined
+    );
     await flush();
 
     appendTrace(config.instance, taskId, {

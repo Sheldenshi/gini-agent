@@ -480,6 +480,41 @@ describe("runtime api", () => {
     expect(messages).toHaveLength(2);
   });
 
+  test("rejects send to a target outside the active agent's messagingTargets filter", async () => {
+    const config = testConfig("messaging-agent-filter");
+    const handler = createHandler(config);
+
+    // Bridge advertises two targets so the per-call `target` selector has
+    // something to disagree with the agent filter about.
+    const bridge = await call(handler, config, "/api/messaging", {
+      method: "POST",
+      body: JSON.stringify({ name: "multi", kind: "demo", deliveryTargets: ["local", "slack"] })
+    });
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "local-only", toolsets: ["file"], messagingTargets: ["local"] })
+    });
+    await call(handler, config, `/api/agents/${agent.id}/use`, { method: "POST" });
+
+    // local target is permitted → succeeds.
+    const allowed = await call(handler, config, `/api/messaging/${bridge.id}/send`, {
+      method: "POST",
+      body: JSON.stringify({ text: "ok", target: "local" })
+    });
+    expect(allowed.status).toBe("sent");
+
+    // slack is outside the agent filter → server returns 400 with a typed
+    // error message that names both target and agent.
+    const rejected = await rawCall(handler, config, `/api/messaging/${bridge.id}/send`, {
+      method: "POST",
+      body: JSON.stringify({ text: "nope", target: "slack" })
+    }, config.token);
+    expect(rejected.ok).toBe(false);
+    const errorBody = await rejected.json();
+    expect(String(errorBody.error)).toContain("not permitted by active agent");
+    expect(String(errorBody.error)).toContain("slack");
+  });
+
   test("returns a JSON pointer at GET / instead of static HTML", async () => {
     const config = testConfig("root-pointer");
     const handler = createHandler(config);

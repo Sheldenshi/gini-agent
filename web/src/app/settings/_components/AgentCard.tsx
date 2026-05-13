@@ -10,11 +10,13 @@ export interface AgentRow { id: string; name: string; status: string }
 export function AgentCard({
   agents,
   activeAgentId,
+  warnings,
   pending,
   onUse
 }: {
   agents: AgentRow[];
   activeAgentId: string | undefined;
+  warnings?: string[];
   pending: boolean;
   onUse: (id: string) => void;
 }) {
@@ -50,6 +52,13 @@ export function AgentCard({
             ))}
           </ul>
         )}
+        {warnings && warnings.length > 0 ? (
+          <ul className="mt-3 space-y-1 border-t border-border pt-3 text-[11px] text-muted-foreground">
+            {warnings.map((warning, idx) => (
+              <li key={idx}>· {warning}</li>
+            ))}
+          </ul>
+        ) : null}
       </CardContent>
     </Card>
   );
