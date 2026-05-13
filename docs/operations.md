@@ -10,7 +10,7 @@ One-line install:
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
 ```
 
-The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `default` instance under `~/.gini/instances/default/`. The wrapper defaults `GINI_INSTANCE=default` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `default` while repo-clone developers stay on `dev`.
+The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `default` instance under `~/.gini/instances/default/`. The wrapper defaults `GINI_INSTANCE=default` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `default`. Repo-clone developers running `bun run gini` get an instance auto-derived from the repo directory basename so each worktree is isolated by default.
 
 When run in an interactive terminal the installer also walks through `gini setup` at the end. Setup picks between OpenAI Codex (uses existing `codex --login` credentials at `CODEX_AUTH_JSON` or `~/.codex/auth.json`) and OpenAI (API key). Piped curl|bash installs skip the prompt and ask you to run `gini setup` yourself before `gini start`. For OpenAI, setup writes your API key to `~/.gini/secrets.env` with mode 0600; the wrapper sources that file on every invocation. The key is never written to `config.json` and never leaves your machine except in API calls to the configured provider. For Codex, no token values are stored by gini — the runtime reads `~/.codex/auth.json` on demand.
 
@@ -57,12 +57,12 @@ bun run gini run --instance feature-x
 
 `start` and `run` print the runtime gateway URL and the Next.js web URL.
 
-For `dev`, defaults are:
+The production `default` instance (installed via `curl|bash`) is pinned to memorable ports:
 
-- runtime: `http://127.0.0.1:7337`
-- web: `http://127.0.0.1:3000`
+- web: `http://127.0.0.1:7777`
+- runtime: `http://127.0.0.1:7778`
 
-Other instances get deterministic ports and isolated state.
+Developer worktree instances (auto-derived from the repo directory basename when running `bun run gini`) get deterministic hash-derived ports within a 100-port window starting at 7337 (runtime) / 3000 (web), so parallel worktrees coexist without manual `--port` wrangling. `gini status` prints the live URLs.
 
 ## Parallel Smoke Tests
 

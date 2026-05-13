@@ -100,8 +100,8 @@ describe("browser session manager state lookup", () => {
   afterAll(() => {
     // Reset the module-level instance pointer so subsequent test files
     // in the same run don't accidentally read this test instance's state.
-    // Passing the literal "dev" matches the production default.
-    setBrowserInstance("dev");
+    // Passing "default" matches the production end-user instance.
+    setBrowserInstance("default");
     rmSync(TEST_ROOT, { recursive: true, force: true });
   });
 

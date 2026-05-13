@@ -1,4 +1,7 @@
-export type Instance = "dev" | "sandbox" | "production" | string;
+// `default` is the production end-user install (set by ~/.local/bin/gini).
+// Anything else is a developer worktree (auto-derived from the repo dir
+// basename) or a named test/smoke instance.
+export type Instance = "default" | string;
 
 export type TaskStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 

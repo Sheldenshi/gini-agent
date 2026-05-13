@@ -4,7 +4,10 @@
 const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
 
 export function runtimeUrl(): string {
-  return process.env.GINI_RUNTIME_URL ?? "http://127.0.0.1:7337";
+  // Fallback aligns with the production `default` instance runtime port.
+  // In practice `bun run gini run` always injects GINI_RUNTIME_URL, so this
+  // only fires for `next dev` invocations done outside the gini wrapper.
+  return process.env.GINI_RUNTIME_URL ?? "http://127.0.0.1:7778";
 }
 
 export function runtimeToken(): string {
@@ -12,7 +15,7 @@ export function runtimeToken(): string {
 }
 
 export function runtimeInstance(): string {
-  return process.env.GINI_INSTANCE ?? "dev";
+  return process.env.GINI_INSTANCE ?? "default";
 }
 
 export interface ProxyOptions {
