@@ -66,7 +66,7 @@ export async function run(): Promise<void> {
   // the user didn't explicitly target one instance. We must distinguish "user
   // typed --instance" from "we resolved a default instance" — stripGlobalArgs
   // erases the flag, so we sniff the raw args here. The installed wrapper sets
-  // GINI_INSTANCE=main on every invocation, so env presence cannot count as
+  // GINI_INSTANCE=default on every invocation, so env presence cannot count as
   // "explicit"; only an explicit --instance flag opts into single-instance mode.
   const explicitInstance = hasFlag(args, "--instance");
 

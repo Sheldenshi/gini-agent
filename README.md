@@ -73,7 +73,7 @@ bun run gini install
 bun run gini start
 ```
 
-When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
+When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `default` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
 
 - runtime: `http://127.0.0.1:7337`
 - web: `http://127.0.0.1:3000`
