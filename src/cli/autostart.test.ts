@@ -281,6 +281,42 @@ describe("resolveLaunchSpecPair", () => {
       cwdOverride: "/tmp/neutral"
     })).toThrow(/refusing to embed instance name/);
   });
+
+  // MEDIUM-C: per-instance Next.js dist dir. Two autostarted instances
+  // from the same checkout (e.g. `dev` and `main`) both `bun run dev`
+  // from web/, which writes build artifacts to `.next/` by default.
+  // Without GINI_DIST_DIR=.next-<instance> in the plist env, they race
+  // each other's compile caches. `gini start` already sets this in
+  // src/cli/process.ts; the autostart plist MUST mirror it.
+  test("web env includes GINI_DIST_DIR=.next-<instance> to avoid Next.js dist-dir races", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    expect(pair.web.environment.GINI_DIST_DIR).toBe(".next-main");
+  });
+
+  test("web env GINI_DIST_DIR sanitizes unsafe characters in the instance name", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    // Names like `feat.x` get punctuation other than [A-Za-z0-9_-]
+    // replaced with `_` because Next.js rejects non-relative paths.
+    // Match what process.ts does so behavior is consistent between
+    // `gini start` and autostart.
+    const pair = resolveLaunchSpecPair({
+      instance: "feat.x",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    expect(pair.web.environment.GINI_DIST_DIR).toBe(".next-feat_x");
+  });
 });
 
 describe("parseSecretsEnv", () => {

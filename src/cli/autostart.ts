@@ -229,7 +229,17 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     // For instances other than `main`/`dev`, that would collide with
     // whatever else is using 3000. Pin to the per-instance default that
     // `gini start` would have picked.
-    PORT: String(defaultWebPort(options.instance))
+    PORT: String(defaultWebPort(options.instance)),
+    // MEDIUM-C: per-instance Next.js dist dir. `gini start` already sets
+    // GINI_DIST_DIR=.next-<instance> in src/cli/process.ts so two
+    // instances from the same checkout don't race each other's build
+    // artifacts in `.next/`. The autostart web plist execs `bun run dev`
+    // from the same web/ subdir, so it MUST mirror that env or two
+    // autostarted instances (e.g. `dev` and `main`) corrupt each
+    // other's compile caches. Same slug rule as process.ts: only
+    // [A-Za-z0-9_-] in the dist-dir path; anything else gets replaced
+    // with `_` because Next.js rejects non-relative paths.
+    GINI_DIST_DIR: `.next-${options.instance.replace(/[^a-zA-Z0-9_-]/g, "_")}`
   };
   // sh -c arg vector. We exec `bun run dev` from the web/ subdir, after
   // polling the gateway runtime port file or 127.0.0.1:<port>/api/status.
