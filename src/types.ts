@@ -117,6 +117,17 @@ export interface RuntimeConfig {
   // evidence.autoApproved=true plus the matched pattern, so the activity
   // trail stays intact. Empty / undefined means no auto-approval.
   autoApproveCommands?: string[];
+  // Power-user agent budget knobs. Lives under a nested `agent` namespace so
+  // future budgets (token cap, wall-clock cap, etc.) can hang off the same
+  // object without further config-shape churn. Validated leniently at the
+  // call site — an invalid value falls back to the built-in default.
+  agent?: {
+    // Hard cap on chat-task loop iterations (model -> tool -> model cycles).
+    // When the cap is hit the loop gracefully produces a tool-less final
+    // summary instead of failing outright. Must be a positive integer; any
+    // non-conforming value falls back to the built-in default.
+    maxIterations?: number;
+  };
 }
 
 export interface RuntimeState {
@@ -313,7 +324,7 @@ export interface TraceRecord {
   taskId: string;
   instance: Instance;
   at: string;
-  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error";
+  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error" | "warning";
   message: string;
   data?: Record<string, unknown>;
 }

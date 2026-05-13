@@ -562,4 +562,129 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // Iteration cap (graceful exhaustion). When the chat-task loop hits the
+  // configurable iteration cap, it must NOT fail. Instead it makes one
+  // final tool-less model call asking for a summary and completes with
+  // that text. A warning trace should record the cap hit.
+  test("hits the configurable iteration cap and completes with a tool-less summary", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const fixturePath = join(workspaceRoot, "hello.md");
+    writeFileSync(fixturePath, "Hello, world!");
+    const config = buildConfig(workspaceRoot, "chat-task-cap-graceful");
+    config.agent = { maxIterations: 3 };
+    const provider = normalizeProvider(config.provider);
+
+    // Three iterations of tool calls — one per loop pass — that all just
+    // re-read the same file. The loop guard is `iterations < cap` so cap=3
+    // means three model turns are consumed before exhaustion.
+    for (let i = 0; i < 3; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_loop_${i}`,
+            type: "function",
+            function: { name: "file_read", arguments: JSON.stringify({ path: "hello.md" }) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn — what the exhaustion path should consume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Cap reached. I read the same file three times but never produced a final answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "loop forever", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(
+      "Cap reached. I read the same file three times but never produced a final answer."
+    );
+    expect(finished.currentStep).toBe("Completed (iteration cap reached: 3)");
+    expect(finished.error).toBeUndefined();
+
+    // Trace should contain a warning event flagging the cap hit.
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const warning = traces.find((t) => t.type === "warning" && /Iteration cap \(3\)/.test(t.message));
+    expect(warning).toBeDefined();
+    expect((warning?.data as Record<string, unknown> | undefined)?.iterations).toBe(3);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Invalid `agent.maxIterations` values must fall back to the built-in
+  // default and emit a warning trace. We only verify the warning trace
+  // here — proving the fallback value is actually 90 would require running
+  // a 90-iteration loop, which is wasteful; the resolver is small enough
+  // that the warning's presence is sufficient evidence.
+  test("invalid agent.maxIterations falls back to the default and emits a warning trace", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-cap-invalid");
+    // Invalid: 0 is non-positive. Loose-typed cast so the test can simulate
+    // a config.json that was hand-edited with a bad value.
+    (config as unknown as { agent: { maxIterations: number } }).agent = { maxIterations: 0 };
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Direct answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "say something", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Direct answer.");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const warning = traces.find(
+      (t) => t.type === "warning" && /agent\.maxIterations/i.test(String(t.data?.reason ?? ""))
+    );
+    expect(warning).toBeDefined();
+    expect((warning?.data as Record<string, unknown> | undefined)?.defaultCap).toBe(90);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Also accept the same invalid-string case (e.g. "abc") to confirm the
+  // resolver's typeof guard rejects non-numbers, not just non-positive
+  // integers.
+  test("non-numeric agent.maxIterations also falls back with a warning", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-cap-invalid-string");
+    (config as unknown as { agent: { maxIterations: string } }).agent = { maxIterations: "abc" };
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Hello.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "say hi again", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const warning = traces.find(
+      (t) => t.type === "warning" && /agent\.maxIterations/i.test(String(t.data?.reason ?? ""))
+    );
+    expect(warning).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });

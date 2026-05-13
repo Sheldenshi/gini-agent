@@ -42,7 +42,28 @@ import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 
-const MAX_LOOP_ITERATIONS = 40;
+// Default safety cap on chat-task loop iterations. Each iteration is one
+// model call (followed by zero or more tool dispatches). Most tasks finish
+// in well under 10 iterations; the cap exists to bound runaway loops, not
+// to be a meaningful budget for normal work. Power users can override this
+// per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
+const MAX_LOOP_ITERATIONS = 90;
+
+// Resolve the effective iteration cap from config, falling back to the
+// default when the user hasn't set one or set an invalid value. Validation
+// is intentionally minimal — positive integer or fall back. We log a single
+// warning trace from runLoop on fallback so the user can spot the typo.
+function resolveIterationCap(config: RuntimeConfig): { cap: number; warnReason?: string } {
+  const raw = config.agent?.maxIterations;
+  if (raw === undefined) return { cap: MAX_LOOP_ITERATIONS };
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+    return {
+      cap: MAX_LOOP_ITERATIONS,
+      warnReason: `agent.maxIterations must be a positive integer; got ${JSON.stringify(raw)}. Using default ${MAX_LOOP_ITERATIONS}.`
+    };
+  }
+  return { cap: raw };
+}
 
 // runChatTask: kicks off the chat-task loop for a freshly submitted task.
 // Sets the task to running, builds the initial system + user messages,
@@ -225,10 +246,19 @@ async function runLoop(
   const providerTools = toProviderTools(tools);
   const toolsHash = hashCatalog(tools);
 
+  const { cap, warnReason } = resolveIterationCap(config);
+  if (warnReason) {
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: `Invalid agent.maxIterations config; using default.`,
+      data: { reason: warnReason, defaultCap: MAX_LOOP_ITERATIONS }
+    });
+  }
+
   let iterations = iterationsSoFar;
   let workingMessages = messages.slice();
 
-  while (iterations < MAX_LOOP_ITERATIONS) {
+  while (iterations < cap) {
     iterations += 1;
 
     // Cancellation bail-out. If the task was cancelled externally (e.g.
@@ -410,25 +440,74 @@ async function runLoop(
     // All sync — keep looping.
   }
 
-  // Hit the iteration cap. Complete with whatever partialSummary we have.
-  const exhausted = await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    item.status = "failed";
-    item.currentStep = "Failed";
-    item.error = `Chat task exceeded ${MAX_LOOP_ITERATIONS} model iterations.`;
-    item.toolCallState = undefined;
-    item.updatedAt = now();
-    return item;
-  });
-  appendTrace(config.instance, taskId, {
-    type: "error",
-    message: "Chat task hit iteration cap",
-    data: { iterations: MAX_LOOP_ITERATIONS }
-  });
-  await updateRunFromTask(config, exhausted);
-  await syncSubagentFromTask(config, exhausted);
-  if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
-  return exhausted;
+  // Hit the iteration cap. Instead of failing outright, give the model one
+  // last turn with NO tools available and an explicit instruction to write
+  // a final answer summarizing what it learned and what it couldn't finish.
+  // The summary call's cost is recorded on the task just like any other
+  // model call. If the summary call itself fails (provider error, etc.),
+  // fall back to the legacy failure path so we don't lose the user's work.
+  const summaryInstruction =
+    `You have reached the maximum number of tool-calling iterations (${cap}). ` +
+    `No further tools are available. Please write a final answer summarizing ` +
+    `what you have learned so far and what you were unable to complete.`;
+  const summaryMessages: ToolCallingMessage[] = [
+    ...workingMessages,
+    { role: "user", content: summaryInstruction }
+  ];
+  try {
+    const summaryResult = await generateToolCallingResponse(config, summaryMessages, []);
+    const finalText = summaryResult.text || "(no content)";
+    const exhausted = await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      item.status = "completed";
+      item.currentStep = `Completed (iteration cap reached: ${cap})`;
+      item.summary = finalText;
+      item.cost = summaryResult.cost;
+      item.partialSummary = undefined;
+      item.toolCallState = undefined;
+      item.updatedAt = now();
+      return item;
+    });
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
+      data: { iterations: cap }
+    });
+    appendTrace(config.instance, taskId, {
+      type: "model",
+      message: `${summaryResult.provider.name} provider produced exhaustion summary`,
+      data: {
+        provider: summaryResult.provider,
+        responseId: summaryResult.responseId,
+        usage: summaryResult.usage,
+        finishReason: summaryResult.finishReason
+      }
+    });
+    await updateRunFromTask(config, exhausted);
+    await syncSubagentFromTask(config, exhausted);
+    if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    return exhausted;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const exhausted = await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      item.status = "failed";
+      item.currentStep = "Failed";
+      item.error = `Chat task exceeded ${cap} model iterations.`;
+      item.toolCallState = undefined;
+      item.updatedAt = now();
+      return item;
+    });
+    appendTrace(config.instance, taskId, {
+      type: "error",
+      message: "Chat task hit iteration cap and tool-less summary call failed",
+      data: { iterations: cap, summaryError: message }
+    });
+    await updateRunFromTask(config, exhausted);
+    await syncSubagentFromTask(config, exhausted);
+    if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    return exhausted;
+  }
 }
 
 // Resume a paused chat task after one of its tool approvals resolved.
