@@ -22,20 +22,30 @@ import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall } from "./autostart";
 
 export async function install_(ctx: CliContext): Promise<void> {
-  // A fresh install must pick a real LLM provider. We refuse to silently
-  // materialize the `echo` stub config — that bites users who then have to
-  // remember to switch providers on every new worktree. Re-installing an
-  // existing instance is still fine without env vars.
+  // Provider configuration is optional at install time. The piped-curl
+  // install path (`curl … | bash`) has no GINI_PROVIDER env, and the
+  // browser /setup flow is responsible for picking a provider. If no env
+  // is set and no config exists yet, materialize a placeholder ("echo")
+  // config; the runtime starts, /api/setup/status reports
+  // providerConfigured:false, and the browser /setup page replaces the
+  // placeholder. Existing configs are not overwritten.
+  //
+  // For users who want to skip the browser flow, GINI_PROVIDER=openai|codex
+  // is still honored — it short-circuits the placeholder and writes the
+  // real provider directly.
   const instance = parseInstance(ctx.rawArgs);
   if (!existsSync(configPath(instance))) {
     const envProvider = process.env.GINI_PROVIDER;
-    if (envProvider !== "openai" && envProvider !== "codex") {
+    if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
       throw new Error(
-        `No LLM provider configured for instance '${instance}'. ` +
-        `Set GINI_PROVIDER=codex|openai (and optionally GINI_MODEL) in the environment, ` +
+        `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
+        `Use 'openai' or 'codex', leave it unset for a placeholder config that the /setup page replaces, ` +
         `or run \`gini provider set <name> [model]\` after install.`
       );
     }
+    // envProvider is undefined → placeholder config will materialize via
+    // defaultConfig() inside install(); /api/setup/status will report
+    // providerConfigured:false; the browser /setup flow takes over.
   }
   const { config } = ctx;
   install(config);
