@@ -49,6 +49,17 @@ describe("gini autostart usage and platform gate", () => {
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
     expect(parsed.ok).toBe(false);
   });
+
+  // HIGH-4: `kick` on a non-existent service must return non-zero exit
+  // code so install.sh's `if … then` shell guard sees the failure. The
+  // JSON had ok:false before round 2 even when the exit code was 0.
+  test("kick on a not-loaded instance returns non-zero exit", () => {
+    if (process.platform !== "darwin") return; // platform gate prints macOS-only
+    const result = runCli(["autostart", "kick", "--instance", `kick-nonexistent-${tag()}`], {});
+    expect(result.status).not.toBe(0);
+    const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(parsed.ok).toBe(false);
+  });
 });
 
 // Run only on macOS — the platform gate kicks in elsewhere and the JSON
@@ -296,5 +307,121 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
       expect(svc.plistExists).toBe(false);
       expect(svc.loaded).toBe(false);
     }
+  }, 60_000);
+
+  // MEDIUM-9: idempotent enable at the CLI level (subprocess). The
+  // unit-level test in this file checks plist file bytes; this one
+  // confirms TWO real `autostart enable` invocations both succeed,
+  // status remains consistent, and bootout+bootstrap retried once still
+  // ends with a loaded service set.
+  test("enable → enable → status: both invocations ok, services stay loaded", () => {
+    const first = runCli(
+      ["autostart", "enable", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot, "--test-root", scratch.stateRoot],
+      { GINI_AUTOSTART_E2E: "1" }
+    );
+    expect(first.status).toBe(0);
+    const firstParsed = JSON.parse(first.stdout) as Record<string, unknown>;
+    expect(firstParsed.ok).toBe(true);
+
+    const second = runCli(
+      ["autostart", "enable", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot, "--test-root", scratch.stateRoot],
+      { GINI_AUTOSTART_E2E: "1" }
+    );
+    expect(second.status).toBe(0);
+    const secondParsed = JSON.parse(second.stdout) as Record<string, unknown>;
+    expect(secondParsed.ok).toBe(true);
+
+    const status = runCli(
+      ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
+      {}
+    );
+    const statusParsed = JSON.parse(status.stdout) as Record<string, unknown>;
+    const svcs = statusParsed.services as Array<Record<string, unknown>>;
+    for (const svc of svcs) {
+      expect(svc.loaded).toBe(true);
+    }
+  }, 60_000);
+
+  // HIGH-5: `enable` removes a leftover round-1 legacy single-plist
+  // file (ai.lilac.gini.<instance>.plist without a kind suffix) when
+  // bootstrapping the round-2 split pair. This protects users upgrading
+  // from round 1 → round 2 from ending up with the old plist still
+  // sitting in ~/Library/LaunchAgents/.
+  test("enable cleans up the legacy ai.lilac.gini.<instance>.plist file from disk", async () => {
+    const { mkdirSync: mk, writeFileSync, existsSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    const legacyPath = plistPathFor(uniqueInstance);
+    mk(dirname(legacyPath), { recursive: true });
+    writeFileSync(legacyPath, "<plist>fake legacy from round 1</plist>");
+    expect(existsSync(legacyPath)).toBe(true);
+
+    const result = runCli(
+      [
+        "autostart", "enable",
+        "--instance", uniqueInstance,
+        "--state-root", scratch.stateRoot,
+        "--log-root", scratch.logRoot,
+        "--test-root", scratch.stateRoot
+      ],
+      { GINI_AUTOSTART_E2E: "1" }
+    );
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(parsed.ok).toBe(true);
+    // The legacy plist file should be gone after enable.
+    expect(existsSync(legacyPath)).toBe(false);
+  }, 60_000);
+
+  // MEDIUM-9: `enable --kind gateway` only loads the gateway; the web
+  // service stays untouched. This is the path setup-api scheduleAutostartRefresh
+  // uses after POST /api/setup/provider to refresh the gateway plist
+  // without killing the web service the user's browser is currently
+  // talking to.
+  test("enable --kind gateway leaves web untouched", () => {
+    // First enable both, so the web is loaded.
+    const both = runCli(
+      ["autostart", "enable", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot, "--test-root", scratch.stateRoot],
+      { GINI_AUTOSTART_E2E: "1" }
+    );
+    expect(both.status).toBe(0);
+    const beforeStatus = runCli(
+      ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
+      {}
+    );
+    const beforeParsed = JSON.parse(beforeStatus.stdout) as Record<string, unknown>;
+    const beforeSvcs = beforeParsed.services as Array<Record<string, unknown>>;
+    expect(beforeSvcs[0]!.loaded).toBe(true);
+    expect(beforeSvcs[1]!.loaded).toBe(true);
+
+    // Now re-enable only the gateway. The web plist should remain loaded
+    // (untouched), and the refresh result should be ok.
+    const gatewayOnly = runCli(
+      [
+        "autostart", "enable",
+        "--instance", uniqueInstance,
+        "--state-root", scratch.stateRoot,
+        "--log-root", scratch.logRoot,
+        "--test-root", scratch.stateRoot,
+        "--kind", "gateway"
+      ],
+      { GINI_AUTOSTART_E2E: "1" }
+    );
+    expect(gatewayOnly.status).toBe(0);
+    const gatewayOnlyParsed = JSON.parse(gatewayOnly.stdout) as Record<string, unknown>;
+    expect(gatewayOnlyParsed.ok).toBe(true);
+    const results = gatewayOnlyParsed.results as Array<Record<string, unknown>>;
+    expect(results.length).toBe(1);
+    expect(results[0]!.kind).toBe("gateway");
+    expect(results[0]!.enabled).toBe(true);
+
+    // Web should still be loaded.
+    const afterStatus = runCli(
+      ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
+      {}
+    );
+    const afterParsed = JSON.parse(afterStatus.stdout) as Record<string, unknown>;
+    const afterSvcs = afterParsed.services as Array<Record<string, unknown>>;
+    expect(afterSvcs[0]!.loaded).toBe(true);
+    expect(afterSvcs[1]!.loaded).toBe(true);
   }, 60_000);
 });
