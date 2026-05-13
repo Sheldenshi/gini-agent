@@ -30,7 +30,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { Instance } from "../types";
-import { projectRoot } from "../paths";
+import { defaultWebPort, projectRoot } from "../paths";
 
 export const LABEL_PREFIX = "ai.lilac.gini";
 
@@ -224,7 +224,12 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   const webEnv: Record<string, string> = {
     ...baseEnv,
     ...secretsEnv,
-    GINI_INSTANCE: options.instance
+    GINI_INSTANCE: options.instance,
+    // The `bun run dev` invocation otherwise defaults to Next.js's 3000.
+    // For instances other than `main`/`dev`, that would collide with
+    // whatever else is using 3000. Pin to the per-instance default that
+    // `gini start` would have picked.
+    PORT: String(defaultWebPort(options.instance))
   };
   // sh -c arg vector. We exec `bun run dev` from the web/ subdir, after
   // polling the gateway runtime port file or 127.0.0.1:<port>/api/status.
@@ -336,6 +341,7 @@ function buildWebShim(instance: Instance): string {
     `cd web 2>/dev/null || true`,
     `state_root="\${GINI_STATE_ROOT:-$HOME/.gini}"`,
     `port_file="$state_root/instances/${instance}/runtime.port"`,
+    `instance_root="$state_root/instances/${instance}"`,
     // 1) Wait for the gateway port file to appear and have a value.
     `port=""`,
     `for i in $(seq 1 120); do`,
@@ -345,14 +351,24 @@ function buildWebShim(instance: Instance): string {
     `  fi`,
     `  sleep 0.5`,
     `done`,
-    // 2) If we have a port, poll /api/status until it responds.
+    // 2) If we have a port, poll the gateway until it responds at all.
+    // /api/status returns 401 without auth, but we don't need a 2xx —
+    // any HTTP response means the runtime is up. -sS without -f keeps
+    // curl from failing on the 401; -o /dev/null + --max-time 2 stops
+    // a hung gateway from blocking the loop forever.
     `if [ -n "$port" ]; then`,
     `  for i in $(seq 1 120); do`,
-    `    if curl -fsS "http://127.0.0.1:$port/api/status" >/dev/null 2>&1; then break; fi`,
+    `    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:$port/api/status" 2>/dev/null; then break; fi`,
     `    sleep 0.5`,
     `  done`,
     `fi`,
-    // 3) Hand off to Next.js. exec so launchd tracks dev server PID.
+    // 3) Record the *future* bun PID so `gini stop` can SIGTERM it.
+    // We use $$ — the current shell's PID — which `exec` will reuse for
+    // the bun process below (exec replaces the shell with bun, keeping
+    // the same PID).
+    `mkdir -p "$instance_root" 2>/dev/null || true`,
+    `echo $$ > "$instance_root/web.pid"`,
+    // 4) Hand off to Next.js. exec so launchd tracks dev server PID.
     `exec bun run dev`
   ].join("\n");
 }
