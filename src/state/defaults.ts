@@ -1,4 +1,5 @@
 import type { Instance, ProfileRecord, ToolRecord, ToolsetRecord } from "../types";
+import { riskForTool } from "../execution/tool-risk";
 
 export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[] {
   return [
@@ -110,22 +111,9 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
   ];
 }
 
-// Tool names whose risk/approval defaults don't fall out of the substring
-// heuristic below. Anything listed here is treated as high risk requiring
-// approval. Keep this in sync with the dispatch reality in
-// src/execution/tool-dispatch.ts and src/agent.ts.
-const HIGH_RISK_NAMED_TOOLS = new Set<string>([
-  "browser.upload_file"
-]);
-
 export function defaultTools(instance: Instance, at: string): ToolRecord[] {
   return defaultToolsets(instance, at).flatMap((toolset) => toolset.toolNames.map((name) => {
-    const heuristicHigh =
-      name.includes("write") ||
-      name.includes("exec") ||
-      name.includes("invoke") ||
-      name.includes("send");
-    const isHigh = heuristicHigh || HIGH_RISK_NAMED_TOOLS.has(name);
+    const risk = riskForTool(name);
     return {
       id: `tool_${name.replaceAll(".", "_")}`,
       instance,
@@ -133,8 +121,8 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
       description: `${name} from ${toolset.name} toolset`,
       toolset: toolset.name,
       status: toolset.status === "enabled" ? "available" : "disabled",
-      risk: isHigh ? "high" : "low",
-      requiresApproval: isHigh,
+      risk,
+      requiresApproval: risk === "high",
       createdAt: at,
       updatedAt: at
     } satisfies ToolRecord;

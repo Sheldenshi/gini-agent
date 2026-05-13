@@ -67,12 +67,6 @@ interface Session {
   // invocation so the idle sweeper can skip sessions that are mid-call
   // (e.g. a slow page.goto exceeding the 5-minute idle window).
   inFlight: number;
-  // We never own the BrowserContext anymore — the persistent and CDP modes
-  // both share a single BrowserContext across tasks. closeSession() closes
-  // just the page so we don't kill the user's tabs or the shared context.
-  // The field is retained to keep the test helpers stable; it's always
-  // false in production code paths.
-  ownsContext: boolean;
   // Tabs the agent itself opened during this task. Used by closeSession to
   // drain agent-opened tabs at task end without touching tabs the user
   // opened or another task owns. Populated by getOrCreate ONLY when it
@@ -461,7 +455,6 @@ async function getOrCreate(taskId: string): Promise<Session> {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: false,
       ownedPageIds
     };
     sessions.set(taskId, session);
@@ -1969,7 +1962,6 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight,
-      ownsContext: false,
       ownedPageIds: new Set<Page>([fakePage])
     });
   },
@@ -1984,7 +1976,6 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: false,
       ownedPageIds: new Set<Page>([realPage])
     });
   },
@@ -2003,7 +1994,6 @@ export const __test = {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: false,
       ownedPageIds: new Set<Page>([realPage])
     });
   },

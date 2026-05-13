@@ -27,6 +27,7 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { createScheduledJob } from "../jobs";
+import { riskForAction } from "./tool-risk";
 import {
   browserBack,
   browserClick,
@@ -84,45 +85,45 @@ export async function dispatchToolCall(
     case "create_job":
       return { kind: "sync", result: await createJobTool(config, taskId, args) };
     case "browser_navigate":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", browserNavigate, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", browserSnapshot, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args), args) };
     case "browser_click":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", browserClick, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", () => browserClick(taskId, args), args) };
     case "browser_type":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", browserType, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", () => browserType(taskId, args), args) };
     case "browser_press":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", browserPress, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", () => browserPress(taskId, args), args) };
     case "browser_scroll":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.scroll", browserScroll, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.scroll", () => browserScroll(taskId, args), args) };
     case "browser_back":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.back", browserBack, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.back", () => browserBack(taskId, args), args) };
     case "browser_console":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", browserConsole, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", () => browserConsole(taskId, args), args) };
     case "browser_close":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", browserClose, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", () => browserClose(taskId, args), args) };
     case "browser_hover":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.hover", browserHover, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.hover", () => browserHover(taskId, args), args) };
     case "browser_drag":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.drag", browserDrag, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.drag", () => browserDrag(taskId, args), args) };
     case "browser_select_option":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.select_option", browserSelectOption, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.select_option", () => browserSelectOption(taskId, args), args) };
     case "browser_wait_for":
-      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.wait_for", browserWaitFor, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.wait_for", () => browserWaitFor(taskId, args), args) };
     case "browser_tabs": {
       // tabs.list is read-only (low risk); tabs.new/switch/close mutate the
       // active page (medium). Encode that into the action label so the risk
-      // set in runBrowserDispatch picks the right bucket without re-parsing
+      // registry in tool-risk.ts picks the right bucket without re-parsing
       // args downstream.
       const tabsAction = typeof args.action === "string" ? args.action : "";
       const label =
         tabsAction === "new" || tabsAction === "switch" || tabsAction === "close"
           ? `browser.tabs.${tabsAction}`
           : "browser.tabs.list";
-      return { kind: "sync", result: await browserDispatch(config, taskId, label, browserTabs, args) };
+      return { kind: "sync", result: await browserDispatch(config, taskId, label, () => browserTabs(taskId, args), args) };
     }
     case "browser_vision": {
-      const result = await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args);
+      const result = await browserDispatch(config, taskId, "browser.vision", () => browserVision(taskId, args, config), args);
       // Roll the vision provider's spend into the owning task's cost row
       // so the chat UI's running token / USD total reflects the
       // out-of-band vision call. The envelope carries `cost` as a
@@ -238,66 +239,32 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
   return matches.join("\n") || "No matches.";
 }
 
-// Wraps a browser tool function with the trace+audit ceremony every other
+// Wraps a browser tool invocation with the trace+audit ceremony every other
 // chat-task tool emits. Browser tools return JSON strings on their own
 // (success or error), so we don't second-guess their result — we just log
-// the dispatch and pass it through. Audit risk is `low` for the read-only
-// surface (navigate/snapshot/hover/scroll/back/press/console/close/wait_for/
-// tabs:list/vision) and `medium` for the side-effecting calls
-// (click/type/drag/select_option/tabs:new/tabs:switch/tabs:close) so the
-// activity trail stays consistent with how file/terminal tools are
-// categorized. browser.upload_file does NOT pass through here — it's
-// approval-gated upstream (high risk) and executed via the approval
-// branch in agent.executeApprovedAction.
+// the dispatch and pass it through. Audit risk is derived from the single
+// source of truth in src/execution/tool-risk.ts:
+//   - read-only paths (navigate/snapshot/hover/scroll/back/press/console/
+//     close/wait_for/tabs.list/vision) are "low"
+//   - side-effecting calls (click/type/drag/select_option/tabs.{new,switch,
+//     close}) are "medium"
+// browser.upload_file is classified "high" in the registry but never
+// reaches this dispatcher: it's intercepted as an approval request in
+// requestBrowserUpload and executed via agent.executeApprovedAction after
+// explicit user consent.
+//
+// Callers pass a thunk so the legacy `(taskId, args)` tools and the
+// config-bearing browser_vision can share one wrapper without forcing a
+// uniform signature on the tool functions themselves.
 async function browserDispatch(
   config: RuntimeConfig,
   taskId: string,
   action: string,
-  fn: (taskId: string, args: Record<string, unknown>) => Promise<string>,
+  thunk: () => Promise<string>,
   args: Record<string, unknown>
 ): Promise<string> {
-  return runBrowserDispatch(config, taskId, action, () => fn(taskId, args), args);
-}
-
-// Variant for browser tools that need the runtime config (e.g. browser_vision,
-// which threads the configured provider through to generateVisionAnalysis).
-// Kept separate from browserDispatch so the 9 existing tools keep their
-// stable `(taskId, args)` signature.
-async function browserDispatchWithConfig(
-  config: RuntimeConfig,
-  taskId: string,
-  action: string,
-  fn: (taskId: string, args: Record<string, unknown>, config: RuntimeConfig) => Promise<string>,
-  args: Record<string, unknown>
-): Promise<string> {
-  return runBrowserDispatch(config, taskId, action, () => fn(taskId, args, config), args);
-}
-
-async function runBrowserDispatch(
-  config: RuntimeConfig,
-  taskId: string,
-  action: string,
-  exec: () => Promise<string>,
-  args: Record<string, unknown>
-): Promise<string> {
-  const result = await exec();
-  // Side-effecting actions get medium risk so the activity trail flags them
-  // alongside file/terminal actions; read-only paths (navigate, snapshot,
-  // hover, console, scroll, back, close, vision) stay low.
-  // browser.upload_file is intentionally absent: it never reaches
-  // runBrowserDispatch because it's intercepted as a high-risk approval
-  // request (see requestBrowserUpload) and executed via
-  // agent.executeApprovedAction after explicit user consent.
-  const MEDIUM_RISK_ACTIONS = new Set([
-    "browser.click",
-    "browser.type",
-    "browser.drag",
-    "browser.select_option",
-    "browser.tabs.new",
-    "browser.tabs.switch",
-    "browser.tabs.close"
-  ]);
-  const risk: "low" | "medium" = MEDIUM_RISK_ACTIONS.has(action) ? "medium" : "low";
+  const result = await thunk();
+  const risk = riskForAction(action);
   let parsed: { success?: boolean; error?: string } = {};
   try {
     parsed = JSON.parse(result) as { success?: boolean; error?: string };
