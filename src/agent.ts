@@ -19,10 +19,12 @@ import {
   appendTaskPartial,
   appendTrace,
   assertInsideWorkspace,
+  assertInsideWorkspaceNoSymlinkEscape,
   createMemory,
   createTask,
   mutateState,
   now,
+  readState,
   upsertTask
 } from "./state";
 import { generateTaskSummary } from "./provider";
@@ -253,7 +255,26 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   for (const { prefix, shape, tool } of dispatch) {
     if (matchesShape(task.input, prefix, shape)) {
       await markWorking(config, taskId);
-      return finishTaskTransition(config, await tool(config, task));
+      const next = await tool(config, task);
+      // dangerouslyAutoApprove also applies to the legacy imperative
+      // path: each `request*` helper above creates exactly one
+      // approval and leaves the task in `waiting_approval`. When the
+      // flag is on, immediately resolve that approval through the same
+      // resolveApproval pipeline the chat-task dispatcher uses, so
+      // `gini task submit "write foo :: bar"` and `POST /api/tasks`
+      // honor the bypass too. Errors here propagate up so submitTask's
+      // `.catch(failTask)` records the side-effect failure.
+      if (config.dangerouslyAutoApprove && next.status === "waiting_approval" && next.approvalIds.length > 0) {
+        const approvalId = next.approvalIds[next.approvalIds.length - 1]!;
+        await resolveApproval(config, approvalId, {
+          actor: "runtime",
+          resumeChatTask: false,
+          evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+        });
+        const refreshed = readState(config.instance).tasks.find((t) => t.id === taskId);
+        return finishTaskTransition(config, refreshed ?? next);
+      }
+      return finishTaskTransition(config, next);
     }
   }
 
@@ -484,6 +505,18 @@ export async function completeLowRiskToolTask(
   return completed;
 }
 
+// Human/API entry point for approve|deny decisions. Use this from the
+// approval REST handlers, the CLI `approval approve|deny` commands, and
+// anywhere else a user action settles a pending approval. The approve
+// branch delegates to `resolveApproval` with `actor: "user"` so the
+// approval.approved audit reflects the human decision; the deny branch
+// marks the row denied, auto-denies sibling approvals on the same task,
+// and fails the task.
+//
+// If you need to auto-resolve an approval from runtime code (e.g.
+// `dangerouslyAutoApprove`), call `resolveApproval` directly with
+// `actor: "runtime"` and the matching `evidenceExtra` marker — that
+// path is the right one to reach for, not this function.
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
   if (decision === "approve") {
     const { approval } = await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
@@ -512,19 +545,51 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
     // *after* the denial would still execute (executeApprovedAction
     // didn't check task status) and `resumeChatTask` would re-enter the
     // loop on a failed task.
+    //
+    // Race fix: also flip the task to `failed` inside this SAME
+    // mutateState. Previously failTask was a separate await, which gave
+    // a concurrent approve-sibling's executeApprovedAction guard a
+    // window between this write and the failure mutation where the
+    // task still looked `waiting_approval` and the side effect ran. By
+    // making the failure atomic with the denial we close that window;
+    // the run/job/subagent propagation still runs below as plain
+    // post-mutation work.
+    let taskRowForPostMutation: Task | undefined;
     if (item.taskId) {
       cancelPendingTaskApprovals(state, item.taskId, "sibling.denied", item.id);
       const task = state.tasks.find((t) => t.id === item.taskId);
-      if (task) task.toolCallState = undefined;
+      if (task) {
+        task.toolCallState = undefined;
+        const message = `Approval denied: ${item.target}`;
+        task.status = "failed";
+        task.currentStep = "Failed";
+        task.error = message;
+        task.updatedAt = item.updatedAt;
+        addAudit(state, {
+          actor: "runtime",
+          action: "task.failed",
+          target: task.id,
+          risk: "low",
+          taskId: task.id,
+          runId: task.runId,
+          evidence: { error: message, viaApprovalDenied: item.id }
+        });
+        taskRowForPostMutation = task;
+      }
     }
-    return item;
+    return { item, task: taskRowForPostMutation };
   });
 
-  if (approval.taskId) {
-    appendTrace(config.instance, approval.taskId, { type: "approval", message: `Approval ${approval.status}`, data: { approvalId } });
-    await failTask(config, approval.taskId, new Error(`Approval denied: ${approval.target}`));
+  if (approval.item.taskId) {
+    appendTrace(config.instance, approval.item.taskId, { type: "approval", message: `Approval ${approval.item.status}`, data: { approvalId } });
+    appendTrace(config.instance, approval.item.taskId, { type: "error", message: `Approval denied: ${approval.item.target}`, data: {} });
+    if (approval.task) {
+      await updateRunFromTask(config, approval.task);
+      if (approval.task.jobId) await finalizeJobRunFromTask(config, approval.task);
+      await syncSubagentFromTask(config, approval.task);
+    }
   }
-  return approval;
+  return approval.item;
 }
 
 // Mark a pending approval as approved and run its side effect through
@@ -535,10 +600,52 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
 // approval.approved audit row and forwarded to executeApprovedAction so
 // the same fields appear on the side-effect audit row — giving the
 // reviewer the full "why was this auto-approved" trail in one place.
+//
+// Caller responsibilities:
+//   - `actor`: "user" for human-driven approvals (default), "runtime"
+//     for automated approval paths like dangerouslyAutoApprove.
+//   - `resumeChatTask`: true when the caller wants the chat-task loop to
+//     resume after the side effect (e.g. user clicked Approve on a
+//     paused task). False when the caller is dispatching the approval
+//     inline and will hand the tool result back to the loop itself.
+//   - `evidenceExtra`: only `{ autoApproved, autoApprovedReason }` style
+//     markers belong here. The runtime owns the canonical evidence
+//     fields (beforeBytes/exitCode/etc.) and merges those after this
+//     bag so unrelated keys are dropped if they collide.
+// Audit-marker fields that auto-approve callers can stamp onto the
+// approval.approved and side-effect audit rows. Narrow on purpose — the
+// runtime owns the canonical evidence (beforeBytes/exitCode/diff/etc.)
+// and merges those AFTER this bag so caller markers can't overwrite
+// them. Add new keys here as new auto-approve reasons appear.
+export interface AutoApproveMarkers {
+  autoApproved?: boolean;
+  autoApprovedReason?: string;
+}
+
+// Thrown when an approved side effect itself fails (writeFileSync
+// EISDIR, terminal_exec timeout, etc.). Used by the chat-task dispatch
+// loop's generic try/catch as a signal to STOP — the loop's existing
+// catch turns dispatch validation errors into recoverable "Error: <msg>"
+// tool results, but a side-effect failure is post-decision and must
+// fail the owning task instead of letting the model carry on. The
+// approval row stays in `status: "approved"` and the approval.approved
+// audit row stays present (both happened before the throw); the missing
+// per-action audit row is the trail signal that execution failed.
+export class ApprovedActionFailedError extends Error {
+  public approvalId: string;
+  public cause: unknown;
+  constructor(approvalId: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "ApprovedActionFailedError";
+    this.approvalId = approvalId;
+    this.cause = cause;
+  }
+}
+
 export async function resolveApproval(
   config: RuntimeConfig,
   approvalId: string,
-  opts: { actor?: "user" | "runtime"; resumeChatTask?: boolean; evidenceExtra?: Record<string, unknown> } = {}
+  opts: { actor?: "user" | "runtime"; resumeChatTask?: boolean; evidenceExtra?: AutoApproveMarkers } = {}
 ): Promise<{ approval: Approval; toolResult: string | undefined }> {
   const actor = opts.actor ?? "user";
   const resumeChatTaskOpt = opts.resumeChatTask ?? true;
@@ -556,7 +663,7 @@ export async function resolveApproval(
       taskId: item.taskId,
       runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
       approvalId: item.id,
-      evidence: opts.evidenceExtra
+      evidence: opts.evidenceExtra ? { ...opts.evidenceExtra } : undefined
     });
     return item;
   });
@@ -572,10 +679,19 @@ export async function resolveApproval(
   return { approval, toolResult };
 }
 
+// Internal side-effect executor. Assumes the caller (resolveApproval) has
+// ALREADY marked the approval as approved and emitted the approval.approved
+// audit row. This function runs the per-action work, emits the
+// `<action>` audit row, optionally resumes the chat-task loop, and
+// returns the per-action result string (the same string the chat-task
+// loop will hand back to the model as the tool result).
+//
+// Do NOT call this directly from new code — go through `resolveApproval`
+// or `decideApproval` so the approval state machine stays consistent.
 async function executeApprovedAction(
   config: RuntimeConfig,
   approval: Approval,
-  opts: { resumeChatTask?: boolean; evidenceExtra?: Record<string, unknown> } = {}
+  opts: { resumeChatTask?: boolean; evidenceExtra?: AutoApproveMarkers } = {}
 ): Promise<string | undefined> {
   const shouldResumeChat = opts.resumeChatTask ?? true;
   const extraEvidence = opts.evidenceExtra ?? {};
@@ -625,7 +741,11 @@ async function executeApprovedAction(
   }
 
   if (approval.action === "file.write") {
-    const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
+    // Use the realpath-validating variant so a workspace-internal
+    // symlink to /tmp/outside can't redirect the write outside the
+    // workspace (relevant under dangerouslyAutoApprove where there's no
+    // human reviewing the target path).
+    const target = assertInsideWorkspaceNoSymlinkEscape(config.workspaceRoot, String(approval.payload.path));
     const before = existsSync(target) ? readFileSync(target, "utf8") : "";
     mkdirSync(dirname(target), { recursive: true });
     writeFileSync(target, String(approval.payload.content));
@@ -653,7 +773,10 @@ async function executeApprovedAction(
   }
 
   if (approval.action === "file.patch") {
-    const target = assertInsideWorkspace(config.workspaceRoot, String(approval.payload.path));
+    // Same symlink-escape concern as file.write — the patch can land
+    // its replacement bytes outside the workspace through an in-
+    // workspace symlink without this validator.
+    const target = assertInsideWorkspaceNoSymlinkEscape(config.workspaceRoot, String(approval.payload.path));
     const before = readFileSync(target, "utf8");
     const oldText = String(approval.payload.oldText);
     const newText = String(approval.payload.newText);

@@ -20,7 +20,7 @@ import {
   readState,
   readTrace
 } from "../state";
-import { findTask } from "../agent";
+import { ApprovedActionFailedError, findTask } from "../agent";
 import { recall } from "../memory";
 import {
   generateToolCallingResponse,
@@ -441,6 +441,15 @@ async function runLoop(
           });
         }
       } catch (error) {
+        // An approved side effect (file.write, terminal.exec, etc.) that
+        // failed AFTER the approval was marked approved is fundamentally
+        // different from a validation/dispatch error: the human gate (or
+        // its dangerouslyAutoApprove equivalent) was already burned, so
+        // letting the model retry as if nothing happened risks declaring
+        // the task complete despite an audit-row gap. Let those escape
+        // up to runChatTask's outer .catch so the task is failed.
+        if (error instanceof ApprovedActionFailedError) throw error;
+
         // Dispatch failed (bad args, unknown tool, validation error). Feed
         // the error back to the model as the tool result so it can recover.
         const message = error instanceof Error ? error.message : String(error);

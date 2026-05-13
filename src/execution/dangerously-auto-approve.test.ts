@@ -10,7 +10,7 @@
 // autoApprovedReason marker that downstream auditors rely on.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -283,6 +283,124 @@ describe("dangerouslyAutoApprove dispatch", () => {
     // autoApprovedReason marker (only the runtime path stamps it).
     expect(approveAudits[0]?.actor).toBe("user");
     expect(approveAudits[0]?.evidence?.autoApprovedReason).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("rejects writes that escape the workspace via an in-workspace symlink (S1)", async () => {
+    // S1: assertInsideWorkspace is purely lexical; a symlink inside the
+    // workspace pointing outside would let file_write land bytes
+    // outside workspaceRoot. With dangerouslyAutoApprove there's no
+    // human gate to catch the suspicious path, so the
+    // assertInsideWorkspaceNoSymlinkEscape variant has to reject the
+    // write outright.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-dangerously-ws-"));
+    const outside = mkdtempSync(join(tmpdir(), "gini-dangerously-outside-"));
+    symlinkSync(outside, join(workspaceRoot, "escape"));
+    const config = buildConfig(workspaceRoot, "dangerously-sym", { dangerouslyAutoApprove: true });
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "escape/pwned.txt", content: "should-not-land" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "write through symlink", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("failed");
+    // No file should have been written at the symlink target.
+    expect(existsSync(join(outside, "pwned.txt"))).toBe(false);
+    // The error message surfaces the escape detection.
+    expect(finished.error ?? "").toContain("escapes workspace");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  test("approved side-effect failures fail the task instead of being swallowed (B2)", async () => {
+    // B2: With dangerouslyAutoApprove on, pendingOrAuto runs the side
+    // effect inside dispatchToolCall via resolveApproval. If
+    // executeApprovedAction throws (here: writeFileSync against a
+    // directory path), the chat-task loop previously caught the throw
+    // and stuffed it back as a recoverable tool result, letting the
+    // model declare the task complete. ApprovedActionFailedError is
+    // re-thrown so the owning task fails properly.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-dangerously-ws-"));
+    const config = buildConfig(workspaceRoot, "dangerously-failpath", { dangerouslyAutoApprove: true });
+    const provider = normalizeProvider(config.provider);
+
+    // "." resolves to the workspace root, which is a directory — the
+    // writeFileSync inside executeApprovedAction will throw EISDIR.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: ".", content: "should-not-land" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const task = await submitTask(config, "write to a directory", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("failed");
+    // The approval row WAS marked approved (we passed that gate); the
+    // side-effect failure is the only thing that prevented success.
+    const state = readState(config.instance);
+    const approvals = state.approvals.filter((a) => a.taskId === task.id);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.status).toBe("approved");
+    // The per-action file.write audit row should NOT exist — the throw
+    // happened before that mutateState. That gap (approved without
+    // matching side-effect audit) is exactly the trail signal that an
+    // approved action failed.
+    const writeAudits = state.audit.filter((a) => a.action === "file.write" && a.taskId === task.id);
+    expect(writeAudits).toHaveLength(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("imperative dispatch auto-resolves under the flag (B1)", async () => {
+    // B1: the legacy prefix-dispatch path in runTask (used by
+    // `POST /api/tasks` and `gini task submit`) also honors
+    // dangerouslyAutoApprove. requestFileWrite still creates a pending
+    // approval; the imperative wrapper then immediately resolves it
+    // through the same resolveApproval pipeline the chat-task
+    // dispatcher uses.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-dangerously-ws-"));
+    const config = buildConfig(workspaceRoot, "dangerously-imperative", { dangerouslyAutoApprove: true });
+
+    const task = await submitTask(config, "write imp.txt :: from-imperative");
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(await Bun.file(join(workspaceRoot, "imp.txt")).text()).toBe("from-imperative");
+
+    const state = readState(config.instance);
+    const approvals = state.approvals.filter((a) => a.taskId === task.id);
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]?.status).toBe("approved");
+    const writeAudits = state.audit.filter((a) => a.action === "file.write" && a.taskId === task.id);
+    expect(writeAudits).toHaveLength(1);
+    expect(writeAudits[0]?.evidence?.autoApprovedReason).toBe("dangerouslyAutoApprove");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("imperative dispatch still pauses for approval when the flag is off", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-dangerously-ws-"));
+    const config = buildConfig(workspaceRoot, "dangerously-imperative-off");
+
+    const task = await submitTask(config, "write imp-off.txt :: should-wait");
+    const paused = await waitForTerminal(config, task.id);
+
+    expect(paused.status).toBe("waiting_approval");
+    expect(existsSync(join(workspaceRoot, "imp-off.txt"))).toBe(false);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

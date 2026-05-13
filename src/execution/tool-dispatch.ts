@@ -21,7 +21,7 @@ import {
   now,
   readState
 } from "../state";
-import { findTask, resolveApproval, runTerminalCommand } from "../agent";
+import { ApprovedActionFailedError, findTask, resolveApproval, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
@@ -935,10 +935,20 @@ async function pendingOrAuto(
 ): Promise<DispatchResult> {
   const approvalId = await request();
   if (!config.dangerouslyAutoApprove) return { kind: "pending", approvalId };
-  const { toolResult } = await resolveApproval(config, approvalId, {
-    actor: "runtime",
-    resumeChatTask: false,
-    evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
-  });
-  return { kind: "sync", result: toolResult ?? "Auto-approved." };
+  try {
+    const { toolResult } = await resolveApproval(config, approvalId, {
+      actor: "runtime",
+      resumeChatTask: false,
+      evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+    });
+    return { kind: "sync", result: toolResult ?? "Auto-approved." };
+  } catch (err) {
+    // Side-effect failed AFTER we marked the approval approved. Wrap in
+    // ApprovedActionFailedError so the chat-task loop's generic catch
+    // re-throws it (instead of converting to a recoverable tool result)
+    // and the outer runChatTask handler fails the owning task. Without
+    // this the model would receive a string like "Error: EISDIR" and
+    // could go on to declare the task complete despite the failure.
+    throw new ApprovedActionFailedError(approvalId, err);
+  }
 }

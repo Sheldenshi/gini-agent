@@ -13,7 +13,7 @@ import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEF
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
-import { status, updateAutoApproveCommands, updateDangerouslyAutoApprove } from "./runtime";
+import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
@@ -36,22 +36,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
-    // Settings: auto-approve allowlist for terminal_exec.
+    // Settings: auto-approve controls.
+    //   - `patterns`: shell-glob allowlist for terminal_exec only.
+    //   - `dangerouslyAutoApprove`: global bypass for every
+    //     approval-gated tool in the chat-task dispatcher (also the
+    //     legacy imperative path; see RuntimeConfig.dangerouslyAutoApprove
+    //     for scope).
+    // PATCH accepts either field individually or both together; omitted
+    // keys are left at their current value.
     ["GET", /^\/api\/settings\/auto-approve$/, () => json({
       patterns: config.autoApproveCommands ?? [],
       dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove),
     })],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
-      let patterns = config.autoApproveCommands ?? [];
-      if (Array.isArray(payload.patterns)) {
-        patterns = updateAutoApproveCommands(config, payload.patterns.map(String));
-      }
-      let dangerous = Boolean(config.dangerouslyAutoApprove);
-      if (typeof payload.dangerouslyAutoApprove === "boolean") {
-        dangerous = updateDangerouslyAutoApprove(config, payload.dangerouslyAutoApprove);
-      }
-      return json({ patterns, dangerouslyAutoApprove: dangerous });
+      return json(updateAutoApproveSettings(config, {
+        patterns: Array.isArray(payload.patterns) ? payload.patterns.map(String) : undefined,
+        dangerouslyAutoApprove: typeof payload.dangerouslyAutoApprove === "boolean" ? payload.dangerouslyAutoApprove : undefined
+      }));
     }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],

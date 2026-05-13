@@ -152,6 +152,61 @@ the next task. The runtime reads `config.json` once at server start and
 holds `RuntimeConfig` in memory, so edits don't take effect until you
 restart `gini run` (stop the tmux session and re-issue the command).
 
+## Approval Settings
+
+Two approval-bypass controls live behind the same endpoint
+(`/api/settings/auto-approve`):
+
+- **`autoApproveCommands` (shell-glob allowlist for `terminal_exec`).**
+  Skip the human gate for specific shell commands the agent runs.
+  Patterns are anchored on both ends (so `memo *` matches `memo notes
+  -a` but NOT `rm -rf / && memo notes`); `*` and `?` use standard glob
+  semantics, everything else is a literal match. Auto-approved
+  commands still write a high-risk `terminal.exec` audit row with
+  `evidence.autoApproved=true` and
+  `evidence.autoApprovedReason=<pattern>`.
+
+- **`dangerouslyAutoApprove` (global bypass for every approval-gated
+  tool).** When `true`, every approval-gated tool —
+  `file_write`, `file_patch`, `terminal_exec`, `code_exec`,
+  `browser_upload_file` — auto-resolves through the same approval and
+  audit pipeline as a human-approved call, with
+  `evidence.autoApprovedReason="dangerouslyAutoApprove"` stamped on
+  both the `approval.approved` audit row and the per-action audit
+  row. Applies to both the chat-task dispatcher (`POST /api/chat/<id>/messages`)
+  and the legacy imperative dispatcher (`POST /api/tasks`, `gini task
+  submit`). Default is `false`. Intended for trusted local dev loops
+  only — there is no human review for any side effect when this is
+  on. See [ADR 0006](adr/0006-dangerously-auto-approve.md) for the
+  full design and audit contract.
+
+Read current settings:
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7337/api/settings/auto-approve
+```
+
+Set patterns:
+
+```sh
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"patterns": ["memo *", "remindctl *"]}' \
+  http://127.0.0.1:7337/api/settings/auto-approve
+```
+
+Toggle the global bypass:
+
+```sh
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"dangerouslyAutoApprove": true}' \
+  http://127.0.0.1:7337/api/settings/auto-approve
+```
+
+Both fields can be set in a single PATCH and either is optional;
+omitted keys keep their current value. The endpoint persists to
+`~/.gini/instances/<instance>/config.json` in one write and takes
+effect immediately for new tool dispatches.
+
 ## Cleanup
 
 Remove a single instance:
