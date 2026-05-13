@@ -6,6 +6,7 @@ import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
+import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 
 const instance = parseInstance();
 const config = loadConfig(instance);
@@ -124,6 +125,22 @@ process.on("SIGTERM", () => {
   // pipes and process.exit doesn't wait for pending writes — that race would
   // drop the shutdown marker.
   drained.finally(() => {
+    // Browser-driven autostart refresh: if /api/setup/provider just wrote
+    // a refresh marker for this instance, consume it and spawn the
+    // detached `gini autostart enable --kind gateway` child. The drain
+    // above guarantees that the response to that POST has been fully
+    // flushed before we get here — `server.stop(true)` waits for all
+    // in-flight responses to finish writing. The marker → spawn step
+    // is the LAST thing we do before exiting, so the connection has
+    // closed and the client has the response in hand by the time
+    // launchctl bootstrap fires in the child.
+    try {
+      consumeAutostartRefresh(config.instance);
+    } catch (error) {
+      appendLog(config.instance, "autostart.refresh.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
       process.exit(0);
     });

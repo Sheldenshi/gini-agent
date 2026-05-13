@@ -24,12 +24,12 @@
 // (admin path can detect a plist on disk and re-run `autostart enable`).
 // We keep this module API-thin so the gateway doesn't shell out.
 
-import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { configPath, projectRoot } from "../paths";
+import { configPath } from "../paths";
 import { normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
 const SUPPORTED_KINDS = ["openai", "codex"] as const;
@@ -116,11 +116,16 @@ export async function setSetupProvider(
     config.provider = normalizeProvider({ name: "openai", model });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
-    // Schedule plist refresh AFTER the response flushes. The detached
-    // child will bootout+bootstrap the gateway; launchd respawns us
-    // with the new OPENAI_API_KEY baked into EnvironmentVariables so
-    // future crashes/respawns see the new key.
-    const refreshed = scheduleAutostartRefresh(config.instance);
+    // Request plist refresh via a marker file + SIGTERM. The previous
+    // approach (setImmediate → setTimeout(200ms) → detached spawn) was a
+    // heuristic — a slow client could still be mid-read when launchctl
+    // bootouts the gateway, breaking the user's POST response mid-flush.
+    // The new approach hooks the actual response lifecycle: we self-
+    // signal SIGTERM so Bun's `server.stop(true)` drains in-flight
+    // responses (including this one) before our SIGTERM handler reads
+    // the marker and execs the refresh as the very last thing on the
+    // way out. See src/runtime/autostart-refresh.ts.
+    const refreshed = requestAutostartRefresh(config.instance);
 
     return {
       ok: true,
@@ -155,83 +160,6 @@ export async function setSetupProvider(
     provider: providerHealth(config),
     plistRefreshNeeded: false
   };
-}
-
-// Schedule a plist refresh AFTER the current HTTP response flushes.
-// Returns true when a refresh was scheduled, false otherwise (non-darwin
-// or no autostart plist on disk).
-//
-// Why a detached subprocess: refreshing the plist means
-// `launchctl bootout` of the gateway service, which kills us — the
-// process answering the HTTP request. If we did it inline, the response
-// would never reach the browser. Instead we:
-//   1. Return the HTTP response immediately (caller flushes JSON).
-//   2. setImmediate (fires after the response handler returns) spawns
-//      a detached `bun run gini autostart enable --instance <inst>`
-//      child that inherits no parent ties (own pgid, ignore SIGTERM
-//      relay from us, stdin closed).
-//   3. The detached child runs bootout+bootstrap. We get killed; launchd
-//      respawns us with the new EnvironmentVariables containing the new
-//      OPENAI_API_KEY. The web service is not touched (the autostart
-//      enable enumerates both kinds, so we ALSO bootout/bootstrap the
-//      web service — which is fine because the user is currently in
-//      /setup, then router.replace('/') hits the BFF which retries with
-//      lazy file-based runtime URL/token. They'll see a brief loading
-//      state but no broken nav.)
-//
-// The caller still surfaces `plistRefreshNeeded:true` for diagnostic
-// transparency; the difference vs. round 2 is that the refresh now
-// actually happens.
-function scheduleAutostartRefresh(instance: string): boolean {
-  if (process.platform !== "darwin") return false;
-  const home = process.env.HOME || homedir();
-  const gatewayPlist = join(home, "Library", "LaunchAgents", `ai.lilac.gini.${instance}.gateway.plist`);
-  if (!existsSync(gatewayPlist)) return false;
-
-  // Tests set GINI_SKIP_PLIST_REFRESH=1 to assert that the gateway
-  // *would* refresh without actually firing a detached `bun run gini
-  // autostart enable` subprocess (which would touch the developer's
-  // real LaunchAgents dir). The return value still flips true so the
-  // contract is observable.
-  if (process.env.GINI_SKIP_PLIST_REFRESH === "1") return true;
-
-  // setImmediate fires after the current task — the request handler —
-  // returns, but before any new I/O turns. By the time it fires Bun.serve
-  // has already started flushing the JSON response to the client. We add
-  // a tiny extra delay (200ms) to make sure the response bytes hit the
-  // socket buffer before we tell launchctl to bootout the gateway.
-  setImmediate(() => {
-    setTimeout(() => {
-      try {
-        // --kind gateway: only refresh the gateway plist. The web service
-        // doesn't consume OPENAI_API_KEY directly (no Next.js code reads
-        // process.env.OPENAI_API_KEY), so its plist env doesn't need to
-        // change. Critically, NOT bootouting the web service keeps the
-        // browser's redirect-to-/ working immediately after this call —
-        // the user's session never sees a dead web server. The BFF's
-        // lazy file-based runtime URL/token (web/src/lib/runtime.ts)
-        // picks up the new gateway port when launchd respawns it.
-        const child = spawn(process.execPath, ["run", "gini", "autostart", "enable", "--instance", instance, "--kind", "gateway"], {
-          cwd: projectRoot(),
-          // detached:true puts the child in its own process group so a
-          // SIGTERM landing on the gateway doesn't propagate. We also
-          // unref so the gateway's event loop doesn't wait on this
-          // child (which doesn't matter much because we're about to be
-          // killed, but is hygienic).
-          detached: true,
-          stdio: "ignore",
-          env: { ...process.env, GINI_INSTANCE: instance }
-        });
-        child.unref();
-      } catch {
-        // Best-effort. If spawn fails (e.g. PATH oddity) the user can
-        // still re-run `gini autostart enable` manually. We don't have a
-        // good place to log this — the gateway is already exiting from
-        // launchd's perspective on next bootout — so we swallow.
-      }
-    }, 200);
-  });
-  return true;
 }
 
 function secretsPath(): string {
