@@ -42,7 +42,7 @@ import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 
-const MAX_LOOP_ITERATIONS = 8;
+const MAX_LOOP_ITERATIONS = 40;
 
 // runChatTask: kicks off the chat-task loop for a freshly submitted task.
 // Sets the task to running, builds the initial system + user messages,
