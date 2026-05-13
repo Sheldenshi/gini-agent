@@ -1,8 +1,9 @@
+import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
-import { loadConfig, parseInstance } from "./paths";
+import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 
@@ -53,6 +54,14 @@ const server = Bun.serve({
   hostname: "127.0.0.1",
   fetch: createHandler(config)
 });
+
+// Record the live port so clients (CLI status, autostart web shim, BFF
+// lazy-read in web/src/lib/runtime.ts) can discover it without having to
+// hash the instance name or read GINI_PORT. `gini start` also writes
+// this file in process.ts, but the autostart flow execs us directly and
+// bypasses that helper — so we must write it here too. Cleaned up on
+// SIGTERM below.
+writeFileSync(runtimePortPath(config.instance), String(server.port));
 
 appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
