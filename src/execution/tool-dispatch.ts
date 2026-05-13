@@ -43,6 +43,7 @@ import {
   browserType,
   browserVision,
   browserWaitFor,
+  peekCurrentBrowserUrl,
   resolveUploadPath
 } from "../tools/browser";
 
@@ -240,10 +241,14 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
 // Wraps a browser tool function with the trace+audit ceremony every other
 // chat-task tool emits. Browser tools return JSON strings on their own
 // (success or error), so we don't second-guess their result — we just log
-// the dispatch and pass it through. Audit risk is `low` for read-only
-// surface (navigate/snapshot/scroll/back/press/console/close) and `medium`
-// for the two side-effecting calls (click/type) so the activity trail
-// stays consistent with how file/terminal tools are categorized.
+// the dispatch and pass it through. Audit risk is `low` for the read-only
+// surface (navigate/snapshot/hover/scroll/back/press/console/close/wait_for/
+// tabs:list/vision) and `medium` for the side-effecting calls
+// (click/type/drag/select_option/tabs:new/tabs:switch/tabs:close) so the
+// activity trail stays consistent with how file/terminal tools are
+// categorized. browser.upload_file does NOT pass through here — it's
+// approval-gated upstream (high risk) and executed via the approval
+// branch in agent.executeApprovedAction.
 async function browserDispatch(
   config: RuntimeConfig,
   taskId: string,
@@ -279,6 +284,10 @@ async function runBrowserDispatch(
   // Side-effecting actions get medium risk so the activity trail flags them
   // alongside file/terminal actions; read-only paths (navigate, snapshot,
   // hover, console, scroll, back, close, vision) stay low.
+  // browser.upload_file is intentionally absent: it never reaches
+  // runBrowserDispatch because it's intercepted as a high-risk approval
+  // request (see requestBrowserUpload) and executed via
+  // agent.executeApprovedAction after explicit user consent.
   const MEDIUM_RISK_ACTIONS = new Set([
     "browser.click",
     "browser.type",
@@ -286,8 +295,7 @@ async function runBrowserDispatch(
     "browser.select_option",
     "browser.tabs.new",
     "browser.tabs.switch",
-    "browser.tabs.close",
-    "browser.upload_file"
+    "browser.tabs.close"
   ]);
   const risk: "low" | "medium" = MEDIUM_RISK_ACTIONS.has(action) ? "medium" : "low";
   let parsed: { success?: boolean; error?: string } = {};
@@ -758,6 +766,12 @@ async function requestBrowserUpload(
   // model as a tool error (matching how requestFileWrite handles
   // assertInsideWorkspace failures).
   const resolved = resolveUploadPath(config.workspaceRoot, userPath);
+  // Capture the destination URL before the approval is created so the
+  // approval card surfaces where the file is about to land. May be null
+  // when the agent hasn't opened a browser session yet (no navigation
+  // before the upload request) — the approval still works, the UI just
+  // can't show a destination.
+  const currentUrl = peekCurrentBrowserUrl(taskId) ?? null;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     const approval = createApproval(state, {
@@ -770,7 +784,7 @@ async function requestBrowserUpload(
         ref,
         path: userPath,
         resolvedPath: resolved.absolute,
-        currentUrl: "",
+        currentUrl,
         toolCallId
       }
     });
@@ -779,7 +793,7 @@ async function requestBrowserUpload(
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser upload (chat-task)",
-      data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId }
+      data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId, destination: currentUrl }
     });
     return approval.id;
   });

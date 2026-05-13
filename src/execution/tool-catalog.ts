@@ -374,7 +374,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
             enum: ["visible", "hidden", "attached", "detached"],
             description: "Element state to wait for when using `ref`. Defaults to 'visible'."
           },
-          timeoutMs: { type: "number", description: "Maximum wait in milliseconds. Defaults to 10000.", default: 10000 }
+          timeoutMs: { type: "number", description: "Maximum wait in milliseconds. Defaults to 10000. Hard cap of 60000 (60s); larger values are silently clamped.", default: 10000 }
         }
       }
     }

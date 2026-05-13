@@ -689,11 +689,15 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
 
   if (approval.action === "browser.upload_file") {
     const ref = String(approval.payload.ref);
-    const resolvedPath = String(approval.payload.resolvedPath);
-    const displayPath = String(approval.payload.path);
+    // We pass the USER-SUPPLIED path (approval.payload.path), not the
+    // resolved one captured at approval time. browserUploadFileApproved
+    // re-runs resolveUploadPath at execution time so a TOCTOU symlink
+    // swap between approval and execution is caught.
+    const userPath = String(approval.payload.path);
+    const displayPath = userPath;
     let result: string;
     if (approval.taskId) {
-      result = await browserUploadFileApproved(approval.taskId, ref, resolvedPath, displayPath);
+      result = await browserUploadFileApproved(approval.taskId, ref, config.workspaceRoot, userPath);
     } else {
       result = JSON.stringify({ success: false, error: "Browser upload approval missing taskId." });
     }

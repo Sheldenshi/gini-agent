@@ -41,6 +41,34 @@ function startFixtureServer(): { url: string; close: () => void } {
 <button id="target" onmouseenter="document.getElementById('reveal').textContent='TREASURE-FOUND'">Hover me</button>
 <div id="reveal">(hidden)</div>
 </body></html>`
+    },
+    "/drag": {
+      contentType: "text/html",
+      body: `<!doctype html><html><head><title>drag-fixture</title></head><body>
+<div id="src" draggable="true" style="width:100px;height:100px;background:#eee;display:inline-block">SOURCE</div>
+<div id="dst" style="width:100px;height:100px;background:#ddd;display:inline-block;margin-left:80px">TARGET</div>
+<div id="result">(no drop)</div>
+<script>
+const src = document.getElementById('src');
+const dst = document.getElementById('dst');
+src.addEventListener('dragstart', (e) => { e.dataTransfer.setData('text/plain', 'PAYLOAD-X'); });
+dst.addEventListener('dragover', (e) => { e.preventDefault(); });
+dst.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const data = e.dataTransfer.getData('text/plain');
+  document.getElementById('result').textContent = 'DROP-OK-' + data;
+});
+</script>
+</body></html>`
+    },
+    "/upload": {
+      contentType: "text/html",
+      body: `<!doctype html><html><head><title>upload-fixture</title></head><body>
+<form>
+  <input type="file" id="picker" onchange="document.getElementById('out').textContent = this.files[0] ? this.files[0].name : 'none';">
+</form>
+<div id="out">(no file)</div>
+</body></html>`
     }
   };
   const server = Bun.serve({
@@ -127,6 +155,17 @@ async function waitForCompletion(taskId: string, timeoutMs: number): Promise<Tas
       lastStep = task.currentStep;
       process.stdout.write(`    → ${task.currentStep}\n`);
     }
+    // Auto-approve any pending approvals so we can exercise approval-gated
+    // tools (e.g. browser_upload_file) end-to-end without a human in the
+    // loop. This harness is local-only and the user explicitly invokes it.
+    if (task.status === "waiting_approval" || task.status === "awaiting_approval" || (task.status === "running" && task.currentStep?.toLowerCase().includes("approval"))) {
+      const approvals = (await api(`/api/approvals`)) as Array<{ id: string; taskId: string; status: string }>;
+      const pending = approvals.find((a) => a.taskId === taskId && a.status === "pending");
+      if (pending) {
+        process.stdout.write(`    → auto-approving ${pending.id}\n`);
+        await api(`/api/approvals/${pending.id}/approve`, { method: "POST" });
+      }
+    }
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") {
       return task;
     }
@@ -194,6 +233,27 @@ const TESTS: TestCase[] = [
     expectedToolNames: ["browser.navigate", "browser.vision"],
     expectInFinalText: (text) => /example domain/i.test(text),
     timeoutMs: 240_000
+  },
+  {
+    name: "browser_drag",
+    prompt:
+      `Use the browser tools. Navigate to ${FIXTURE.url}/drag. The page has a draggable SOURCE box and a TARGET box. ` +
+      "Take a snapshot to find the two box refs, then use browser_drag with fromRef=SOURCE-ref and toRef=TARGET-ref. " +
+      "After the drag, use browser_console with expression `document.getElementById('result').textContent` to read the result, then reply with that text on its own line prefixed with 'DROP='.",
+    expectedToolNames: ["browser.navigate", "browser.drag"],
+    expectInFinalText: (text) => /DROP-OK-PAYLOAD-X/.test(text) || /DROP=.*DROP-OK/.test(text),
+    timeoutMs: 240_000
+  },
+  {
+    name: "browser_upload_file",
+    prompt:
+      `Use the browser tools. Navigate to ${FIXTURE.url}/upload. The page has a file <input>. ` +
+      "Take a snapshot, find the file input's ref, then use browser_upload_file with that ref and path 'e2e-upload-fixture.txt' (a file at the workspace root). " +
+      "After the upload completes (the user will approve it), use browser_console with expression `document.getElementById('out').textContent` to read what filename appears on the page. " +
+      "Reply with that filename on its own line prefixed with 'UPLOADED='.",
+    expectedToolNames: ["browser.navigate", "browser.upload_file"],
+    expectInFinalText: (text) => /UPLOADED=e2e-upload-fixture\.txt/.test(text) || /e2e-upload-fixture\.txt/i.test(text),
+    timeoutMs: 300_000
   }
 ];
 

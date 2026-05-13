@@ -19,8 +19,10 @@
 // `headless` flag against the same profile dir.
 //
 // Tasks are keyed by taskId and idle-swept after 5 minutes. Side-effecting
-// actions (click/type) skip the approval gate; the snapshot itself is the
-// trace evidence.
+// actions (click/type/drag/select_option/tabs:new/tabs:switch/tabs:close)
+// skip the approval gate; the snapshot itself is the trace evidence.
+// browser_upload_file is the lone exception — it's approval-gated (high
+// risk) because it can exfiltrate workspace files to a remote site.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -34,6 +36,22 @@ import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types"
 // runtime restarts. Wiped only by the explicit wipe-profile action.
 export function chromeProfileDirFor(instance: Instance): string {
   return join(instanceRoot(instance), "chrome-profile");
+}
+
+// Synchronously read the current URL of the task's browser session, if any.
+// Used by approval flows (e.g. browser.upload_file) so the approval card
+// can surface the upload destination to the user without forcing a
+// withSession round-trip. Returns undefined when no session exists yet —
+// the agent may request upload before navigating, in which case there's
+// simply no destination URL to display.
+export function peekCurrentBrowserUrl(taskId: string): string | undefined {
+  const session = sessions.get(taskId);
+  if (!session) return undefined;
+  try {
+    return session.page.url();
+  } catch {
+    return undefined;
+  }
 }
 
 const SNAPSHOT_CHAR_BUDGET = 32_000;
@@ -57,9 +75,10 @@ interface Session {
   ownsContext: boolean;
   // Tabs the agent itself opened during this task. Used by closeSession to
   // drain agent-opened tabs at task end without touching tabs the user
-  // opened or another task owns. Populated by getOrCreate (the initial
-  // page) and by browser_tabs action:"new". Pages closed via
-  // browser_tabs action:"close" are removed.
+  // opened or another task owns. Populated by getOrCreate ONLY when it
+  // actually created a fresh page (a reused pre-existing page is a user
+  // page and stays out of the set) and by browser_tabs action:"new".
+  // Pages closed via browser_tabs action:"close" are removed.
   ownedPageIds: Set<Page>;
 }
 
@@ -430,6 +449,12 @@ async function getOrCreate(taskId: string): Promise<Session> {
     const context = handle.context;
     const reusable = sessions.size === 0 ? context.pages()[0] : undefined;
     const page = reusable ?? (await context.newPage());
+    // Only mark the page as agent-owned when we just created it. A reused
+    // pre-existing page (CDP-attached user tab, managed-mode profile's
+    // initial tab) belongs to the user — closing it on session teardown
+    // would kill the user's window/tab.
+    const ownedPageIds = new Set<Page>();
+    if (!reusable) ownedPageIds.add(page);
     const session: Session = {
       context,
       page,
@@ -437,7 +462,7 @@ async function getOrCreate(taskId: string): Promise<Session> {
       lastActivity: Date.now(),
       inFlight: 0,
       ownsContext: false,
-      ownedPageIds: new Set<Page>([page])
+      ownedPageIds
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -575,8 +600,15 @@ export async function disconnectSharedBrowser(): Promise<void> {
       if (!session) continue;
       try {
         // Persistent and cdp both share a single context — close just the
-        // page; teardownHandle below closes the context once.
-        await session.page.close().catch(() => undefined);
+        // pages we own. teardownHandle below closes the whole context for
+        // persistent mode (so agent-opened pages would go away anyway), but
+        // in CDP mode the user's browser process stays alive, so any
+        // agent-opened tabs we don't close here would survive disconnect
+        // as orphan tabs in the user's window.
+        for (const page of session.ownedPageIds) {
+          await page.close().catch(() => undefined);
+        }
+        session.ownedPageIds.clear();
       } catch {
         // ignore
       }
@@ -636,7 +668,14 @@ export async function closeAll(): Promise<void> {
     sessions.delete(id);
     if (!session) continue;
     try {
-      await session.page.close().catch(() => undefined);
+      // Close every agent-owned page. In CDP mode this is the only thing
+      // that reaps agent-opened tabs (the user's browser stays alive).
+      // In persistent mode teardownHandle closes the whole context next,
+      // so this is harmless redundancy.
+      for (const page of session.ownedPageIds) {
+        await page.close().catch(() => undefined);
+      }
+      session.ownedPageIds.clear();
     } catch {
       // ignore
     }
@@ -1398,7 +1437,10 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
     if (typeof args.timeoutMs !== "number" || !Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0) {
       return fail("Argument 'timeoutMs' must be a positive number.");
     }
-    timeoutMs = args.timeoutMs;
+    // Hard upper bound: 60s. Any larger value gets silently clamped so an
+    // agent can't wedge a tool call for minutes on a stuck condition. The
+    // catalog entry documents the cap.
+    timeoutMs = Math.min(args.timeoutMs, 60_000);
   }
   try {
     return await withSession(taskId, async (session) => {
@@ -1465,22 +1507,25 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         return ok({ url: session.page.url(), tabs });
       }
       if (action === "new") {
+        if (args.url !== undefined && (typeof args.url !== "string" || args.url.length === 0)) {
+          return fail("Argument 'url' must be a non-empty string.");
+        }
         const url = str(args.url);
         if (url) {
           const blocked = safetyCheck(url);
           if (blocked) return fail(blocked);
         }
         const page = await session.context.newPage();
+        // Mark the freshly-opened tab as agent-owned IMMEDIATELY so any
+        // failure between here and the final session.page swap (goto error,
+        // console attach error, snapshot throw, even a sync throw between
+        // awaits) still leaves the tab tracked for closeSession to reap.
+        // Without this, an orphan tab survives task teardown.
+        session.ownedPageIds.add(page);
         attachConsole(taskId, page);
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
         }
-        // Mark the freshly-opened tab as agent-owned so closeSession at
-        // task end will drain it (alongside the initial page recorded in
-        // getOrCreate). Add to the ownership set BEFORE swapping
-        // session.page so a concurrent closeSession can't observe the
-        // page as the active one without also seeing it in the set.
-        session.ownedPageIds.add(page);
         // Clear refs BEFORE swapping the page so any concurrent stale ref
         // lookup hitting session.refs while session.page is the new tab
         // fails fast against an empty map rather than silently resolving
@@ -1531,9 +1576,13 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
       // browser_tabs:new), the delete is a harmless no-op.
       session.ownedPageIds.delete(target);
       if (wasActive) {
-        // Pick whatever's left, or create a fresh page so the session
-        // isn't left pointing at a closed handle. A freshly-opened
-        // fallback page counts as agent-owned (we just created it).
+        // Match the invariant the new/switch branches follow: clear refs
+        // BEFORE assigning session.page so a stale-ref lookup that races
+        // the page swap fails fast against an empty map. Then pick
+        // whatever's left, or create a fresh page so the session isn't
+        // left pointing at a closed handle. A freshly-opened fallback page
+        // counts as agent-owned (we just created it).
+        session.refs = new Map();
         const remaining = session.context.pages();
         if (remaining[0]) {
           session.page = remaining[0];
@@ -1542,8 +1591,12 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           session.ownedPageIds.add(fallback);
           session.page = fallback;
         }
+      } else {
+        // Active page didn't change, but refs map points at the old
+        // snapshot we're about to refresh — drop it now for consistency
+        // with the wasActive branch.
+        session.refs = new Map();
       }
-      session.refs = new Map();
       const snap = await snapshot(session.page, false);
       session.refs = snap.refs;
       return ok({
@@ -1595,17 +1648,17 @@ export async function browserVision(
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
+      // Capture the disconnect generation BEFORE the screenshot. A slow
+      // screenshot (large full-page captures can take seconds) followed by
+      // a disconnect mid-await would otherwise slip past the post-fetch
+      // check and let us forward stale bytes from a torn-down browser.
+      const capturedGeneration = currentDisconnectGeneration();
       const buf = await session.page.screenshot({ type: "png", fullPage: full });
       if (buf.length > MAX_SCREENSHOT_BYTES) {
         return fail(
           `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
         );
       }
-      // Capture the disconnect generation BEFORE the provider fetch. A
-      // disconnect that runs while we're awaiting the model would otherwise
-      // let us return an "answer" based on a screenshot from a torn-down
-      // browser — confusing at best, misleading at worst.
-      const capturedGeneration = currentDisconnectGeneration();
       const imageBase64 = Buffer.from(buf).toString("base64");
       const result = await generateVisionAnalysis(config, {
         prompt: question,
@@ -1613,6 +1666,9 @@ export async function browserVision(
         mimeType: "image/png",
         maxTokens: 512
       });
+      // Re-check after the provider response too — a disconnect that
+      // started while we were awaiting the model is just as bad as one
+      // that started during the screenshot.
       if (currentDisconnectGeneration() !== capturedGeneration) {
         return fail("Browser disconnecting, retry shortly.");
       }
@@ -1637,9 +1693,10 @@ export async function browserVision(
 // isn't a file, or resolves outside the workspace via a symlink.
 //
 // Shared by browser_upload_file's pre-approval gate (so the user sees a
-// real, validated path on the approval card) and the post-approval
-// executor (defense in depth — the realpath is re-checked at execute time
-// in case the file was swapped between request and approval).
+// real, validated path on the approval card) AND by the post-approval
+// executor (browserUploadFileApproved), which re-runs THIS function
+// against the user-supplied path — not the pre-resolved one — so a
+// TOCTOU symlink swap between request and approval is rejected.
 export function resolveUploadPath(
   workspaceRoot: string,
   userPath: string
@@ -1735,27 +1792,40 @@ export async function browserUploadFile(
 }
 
 // Approved-upload executor. Called by agent.executeApprovedAction after the
-// user explicitly authorizes a browser.upload_file approval. Skips the path
-// resolution dance (already done at request time and stored on the
-// approval payload as `resolvedPath`) and just resolves the ref + runs
-// setInputFiles. Returns the same envelope shape browserUploadFile uses so
-// the chat-task loop feeds the success message back as the tool result.
+// user explicitly authorizes a browser.upload_file approval. RE-runs
+// resolveUploadPath against the user-supplied path at execute time (NOT
+// the pre-resolved path captured at approval time) so a TOCTOU swap —
+// an attacker (or buggy tool) replacing the workspace file with a symlink
+// to /etc/passwd between approval and execution — fails closed. Returns
+// the same envelope shape browserUploadFile uses so the chat-task loop
+// feeds the success message back as the tool result.
 export async function browserUploadFileApproved(
   taskId: string,
   ref: string,
-  absolutePath: string,
-  displayPath: string
+  workspaceRoot: string,
+  userPath: string
 ): Promise<string> {
+  let resolved: { absolute: string; displayPath: string };
+  try {
+    resolved = resolveUploadPath(workspaceRoot, userPath);
+  } catch (error) {
+    // The approval payload stored a resolved path that passed the symlink
+    // check at request time. If the same validation fails NOW the path
+    // changed underneath us — refuse rather than upload whatever the
+    // symlink now points at.
+    const message = error instanceof Error ? error.message : String(error);
+    return fail(`Upload path changed between approval and execution: ${message}`);
+  }
   try {
     return await withSession(taskId, async (session) => {
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.setInputFiles(absolutePath, { timeout: 10_000 });
+      await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
       const snap = await snapshot(session.page, false);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
-        path: displayPath,
+        path: resolved.displayPath,
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated

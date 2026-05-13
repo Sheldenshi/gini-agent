@@ -726,31 +726,26 @@ describe("browserVision", () => {
     expect(parsed.error).toMatch(/5MB cap/);
   });
 
-  test("bails with 'Browser disconnecting' if the generation advances between screenshot and provider return", async () => {
-    // The fake page's screenshot first bumps the disconnect generation
-    // BEFORE returning bytes — that simulates a teardown that races a
-    // long-running screenshot. browserVision captures the generation
-    // AFTER the screenshot resolves, so we instead bump from inside the
-    // echo vision stub (which fires between screenshot and the final
-    // re-check). Custom stub is simpler than racing setTimeout.
+  test("bails with 'Browser disconnecting' if the generation advances between baseline and provider return", async () => {
+    // browserVision captures the disconnect generation BEFORE the
+    // screenshot await, then re-checks AFTER the provider response. To
+    // exercise that re-check we bump the generation from inside the fake
+    // screenshot itself, AFTER browserVision has captured its baseline —
+    // i.e. while browserVision is suspended on the screenshot await. By
+    // the time the provider call finishes and the re-check fires, the
+    // generation has moved past the baseline and browserVision returns
+    // the standard "Browser disconnecting" sentinel.
     const fakePage = {
-      screenshot: async () => Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+      screenshot: async () => {
+        // Bump while suspended inside the screenshot await — this is the
+        // window the re-check is designed to catch.
+        browserTest.bumpDisconnectGenerationForTest();
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      },
       url: () => "https://example.com/disconnect"
     };
     browserTest.installFakeSessionWithPageForTest("vision-disconnect", fakePage);
-    // The echo vision stub returns a stub answer but ALSO advances the
-    // disconnect generation as a side effect — mimicking a teardown
-    // that ran while we were awaiting the provider response.
-    setEchoVisionResponse({
-      text: "fake-answer",
-      // Side-effect: bump the generation. The setEchoVisionResponse
-      // path doesn't expose hooks, so we hijack the provider override
-      // shape (provider is optional).
-      provider: { name: "echo", model: "gini-echo-v0" }
-    });
-    // Schedule the bump to happen between the screenshot resolve and
-    // the provider call — easier to read than racing through the stub.
-    const original = browserTest.currentDisconnectGenerationForTest();
+    setEchoVisionResponse({ text: "fake-answer" });
     const config: RuntimeConfig = {
       instance: "test",
       port: 7337,
@@ -760,21 +755,10 @@ describe("browserVision", () => {
       stateRoot: "/tmp/gini-vision-test",
       logRoot: "/tmp/gini-vision-test-logs"
     };
-    // Kick off the call, then immediately bump the generation on the
-    // same tick. The fake screenshot resolves synchronously (via the
-    // microtask queue), capturedGeneration is captured next, then the
-    // echo vision returns, then the post-fetch re-check fires.
-    const callPromise = browserVision("vision-disconnect", { question: "what" }, config);
-    // Defer the bump to AFTER browserVision has captured its baseline.
-    await Promise.resolve();
-    await Promise.resolve();
-    browserTest.bumpDisconnectGenerationForTest();
-    const raw = await callPromise;
+    const raw = await browserVision("vision-disconnect", { question: "what" }, config);
     const parsed = JSON.parse(raw) as { success: boolean; error?: string };
     expect(parsed.success).toBe(false);
     expect(parsed.error).toMatch(/disconnecting/i);
-    // Restore the global counter so subsequent tests start fresh.
-    void original;
   });
 
   test("envelope carries provider cost so the dispatcher can accumulate it into task.cost", async () => {
