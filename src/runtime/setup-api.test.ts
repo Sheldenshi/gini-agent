@@ -8,7 +8,7 @@
 //   - rejection paths return ok:false with a descriptive error
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getSetupStatus, setSetupProvider } from "./setup-api";
 import { loadConfig } from "../paths";
@@ -39,6 +39,8 @@ describe("setup-api", () => {
   let s: ReturnType<typeof scratch>;
   let config: RuntimeConfig;
 
+  let prevSkipRefresh: string | undefined;
+
   beforeEach(() => {
     env = {
       HOME: process.env.HOME,
@@ -49,6 +51,12 @@ describe("setup-api", () => {
     process.env.HOME = s.home;
     process.env.GINI_STATE_ROOT = s.stateRoot;
     delete process.env.OPENAI_API_KEY;
+    // Prevent the setSetupProvider path from spawning a real detached
+    // `gini autostart enable` subprocess during tests — the production
+    // path schedules one to refresh the launchd plist's EnvironmentVariables,
+    // but tests assert the contract without firing a real refresh.
+    prevSkipRefresh = process.env.GINI_SKIP_PLIST_REFRESH;
+    process.env.GINI_SKIP_PLIST_REFRESH = "1";
     config = loadConfig(`setup-api-${tag()}`);
   });
 
@@ -58,6 +66,8 @@ describe("setup-api", () => {
     else process.env.GINI_STATE_ROOT = env.GINI_STATE_ROOT;
     if (env.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
+    if (prevSkipRefresh === undefined) delete process.env.GINI_SKIP_PLIST_REFRESH;
+    else process.env.GINI_SKIP_PLIST_REFRESH = prevSkipRefresh;
     s.cleanup();
   });
 
@@ -151,6 +161,20 @@ describe("setup-api", () => {
     } finally {
       rmSync(gatewayPlist, { force: true });
     }
+  });
+
+  test("POST openai chmods existing secrets.env to 0600 even if it was 0644", async () => {
+    // Reproduces MEDIUM-8: writeFileSync's `mode` option only applies on
+    // file creation. If secrets.env pre-existed with 0644 (hand-edited or
+    // restored from a backup), the write would leave it world-readable.
+    const secretsPath = join(s.home, ".gini", "secrets.env");
+    mkdirSync(join(s.home, ".gini"), { recursive: true });
+    writeFileSync(secretsPath, "# stale\n");
+    chmodSync(secretsPath, 0o644);
+    expect(statSync(secretsPath).mode & 0o777).toBe(0o644);
+    const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-mode-test" });
+    expect(result.ok).toBe(true);
+    expect(statSync(secretsPath).mode & 0o777).toBe(0o600);
   });
 
   test("re-POSTing openai overwrites the previous key in secrets.env (no duplicate lines)", async () => {

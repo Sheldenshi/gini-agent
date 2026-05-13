@@ -24,10 +24,11 @@
 // (admin path can detect a plist on disk and re-run `autostart enable`).
 // We keep this module API-thin so the gateway doesn't shell out.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { configPath } from "../paths";
+import { configPath, projectRoot } from "../paths";
 import { normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
@@ -115,12 +116,11 @@ export async function setSetupProvider(
     config.provider = normalizeProvider({ name: "openai", model });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
-    // Best-effort plist refresh: if an autostart plist already exists
-    // for this instance, re-run `gini autostart enable` in the background
-    // so its EnvironmentVariables pick up the new key. The current
-    // gateway already has the new key in process.env, so this is purely
-    // about surviving the next launchd respawn cycle.
-    const refreshed = maybeRefreshAutostartPlist(config.instance);
+    // Schedule plist refresh AFTER the response flushes. The detached
+    // child will bootout+bootstrap the gateway; launchd respawns us
+    // with the new OPENAI_API_KEY baked into EnvironmentVariables so
+    // future crashes/respawns see the new key.
+    const refreshed = scheduleAutostartRefresh(config.instance);
 
     return {
       ok: true,
@@ -143,31 +143,94 @@ export async function setSetupProvider(
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
   config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  // Codex switching DOES require a plist refresh: the gateway's config.json
+  // is the source of truth for which provider it boots with, and that's
+  // already updated. But the plist still has GINI_INSTANCE etc — no env
+  // change. The reason to refresh is if a prior openai run wrote
+  // OPENAI_API_KEY into the plist env and the user has now switched to
+  // codex; the stale key is harmless (codex ignores it). So we skip the
+  // refresh on codex.
   return {
     ok: true,
     provider: providerHealth(config),
-    // Codex provider reads creds from ~/.codex/auth.json directly (no
-    // secrets.env entry), so no plist refresh is required.
     plistRefreshNeeded: false
   };
 }
 
-// If the gateway plist already exists on disk, return true so the
-// response signals the caller that a future launchd respawn would use
-// stale env. We deliberately do NOT bootout+bootstrap from here —
-// doing that would kill the running gateway mid-response (the same
-// process we're answering from).
+// Schedule a plist refresh AFTER the current HTTP response flushes.
+// Returns true when a refresh was scheduled, false otherwise (non-darwin
+// or no autostart plist on disk).
 //
-// Instead, the user (or the CLI `gini autostart enable` flow they run
-// after using /setup) is responsible for refreshing the plist when
-// they want the new env to take effect across reboots. The running
-// gateway has the new key in process.env already, so the in-flight
-// session is fully functional.
-function maybeRefreshAutostartPlist(instance: string): boolean {
+// Why a detached subprocess: refreshing the plist means
+// `launchctl bootout` of the gateway service, which kills us — the
+// process answering the HTTP request. If we did it inline, the response
+// would never reach the browser. Instead we:
+//   1. Return the HTTP response immediately (caller flushes JSON).
+//   2. setImmediate (fires after the response handler returns) spawns
+//      a detached `bun run gini autostart enable --instance <inst>`
+//      child that inherits no parent ties (own pgid, ignore SIGTERM
+//      relay from us, stdin closed).
+//   3. The detached child runs bootout+bootstrap. We get killed; launchd
+//      respawns us with the new EnvironmentVariables containing the new
+//      OPENAI_API_KEY. The web service is not touched (the autostart
+//      enable enumerates both kinds, so we ALSO bootout/bootstrap the
+//      web service — which is fine because the user is currently in
+//      /setup, then router.replace('/') hits the BFF which retries with
+//      lazy file-based runtime URL/token. They'll see a brief loading
+//      state but no broken nav.)
+//
+// The caller still surfaces `plistRefreshNeeded:true` for diagnostic
+// transparency; the difference vs. round 2 is that the refresh now
+// actually happens.
+function scheduleAutostartRefresh(instance: string): boolean {
   if (process.platform !== "darwin") return false;
   const home = process.env.HOME || homedir();
   const gatewayPlist = join(home, "Library", "LaunchAgents", `ai.lilac.gini.${instance}.gateway.plist`);
   if (!existsSync(gatewayPlist)) return false;
+
+  // Tests set GINI_SKIP_PLIST_REFRESH=1 to assert that the gateway
+  // *would* refresh without actually firing a detached `bun run gini
+  // autostart enable` subprocess (which would touch the developer's
+  // real LaunchAgents dir). The return value still flips true so the
+  // contract is observable.
+  if (process.env.GINI_SKIP_PLIST_REFRESH === "1") return true;
+
+  // setImmediate fires after the current task — the request handler —
+  // returns, but before any new I/O turns. By the time it fires Bun.serve
+  // has already started flushing the JSON response to the client. We add
+  // a tiny extra delay (200ms) to make sure the response bytes hit the
+  // socket buffer before we tell launchctl to bootout the gateway.
+  setImmediate(() => {
+    setTimeout(() => {
+      try {
+        // --kind gateway: only refresh the gateway plist. The web service
+        // doesn't consume OPENAI_API_KEY directly (no Next.js code reads
+        // process.env.OPENAI_API_KEY), so its plist env doesn't need to
+        // change. Critically, NOT bootouting the web service keeps the
+        // browser's redirect-to-/ working immediately after this call —
+        // the user's session never sees a dead web server. The BFF's
+        // lazy file-based runtime URL/token (web/src/lib/runtime.ts)
+        // picks up the new gateway port when launchd respawns it.
+        const child = spawn(process.execPath, ["run", "gini", "autostart", "enable", "--instance", instance, "--kind", "gateway"], {
+          cwd: projectRoot(),
+          // detached:true puts the child in its own process group so a
+          // SIGTERM landing on the gateway doesn't propagate. We also
+          // unref so the gateway's event loop doesn't wait on this
+          // child (which doesn't matter much because we're about to be
+          // killed, but is hygienic).
+          detached: true,
+          stdio: "ignore",
+          env: { ...process.env, GINI_INSTANCE: instance }
+        });
+        child.unref();
+      } catch {
+        // Best-effort. If spawn fails (e.g. PATH oddity) the user can
+        // still re-run `gini autostart enable` manually. We don't have a
+        // good place to log this — the gateway is already exiting from
+        // launchd's perspective on next bootout — so we swallow.
+      }
+    }, 200);
+  });
   return true;
 }
 
@@ -200,6 +263,11 @@ function writeKeyToSecretsFile(name: string, value: string): void {
     existing += line + "\n";
   }
   writeFileSync(path, existing, { mode: 0o600 });
+  // writeFileSync's `mode` option only applies on file CREATION. If the
+  // file pre-existed with 0644 (e.g. a user hand-edited it), the write
+  // above keeps that permission. Explicit chmod ensures mode 0600 on
+  // every write so secrets aren't world-readable.
+  try { chmodSync(path, 0o600); } catch { /* best-effort */ }
 }
 
 function hasCodexAuth(): boolean {
