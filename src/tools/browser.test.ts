@@ -297,6 +297,169 @@ describe("browser disconnect lifecycle", () => {
   });
 });
 
+// Walker behavior: <select> options should land in the snapshot as sibling
+// rows immediately after the select itself, each with its own @eN ref and a
+// value="..." annotation. We sidestep Chromium by mocking the page.evaluate
+// surface — it just runs the walker's function literal locally against a
+// hand-built fake document. The walker only relies on a small slice of DOM
+// APIs (tagName, attributes, children, computed style, bounding rect), so
+// the stubs stay compact.
+describe("snapshot walker — <select> option surfacing", () => {
+  test("emits <option> children as @eN-refed siblings after the select", async () => {
+    type FakeEl = {
+      tagName: string;
+      type?: string;
+      value?: string;
+      disabled?: boolean;
+      hidden?: boolean;
+      label?: string;
+      text?: string;
+      _attrs: Record<string, string>;
+      _children: FakeEl[];
+      _textContent: string;
+      getAttribute(name: string): string | null;
+      setAttribute(name: string, value: string): void;
+      removeAttribute(name: string): void;
+      getBoundingClientRect(): { width: number; height: number };
+      get children(): FakeEl[];
+      get textContent(): string;
+      querySelectorAll(selector: string): FakeEl[];
+    };
+    const makeEl = (init: Partial<FakeEl> & { tagName: string; visible?: boolean; children?: FakeEl[]; textContent?: string }): FakeEl => {
+      const visible = init.visible ?? true;
+      const children = init.children ?? [];
+      const el: FakeEl = {
+        tagName: init.tagName,
+        type: init.type,
+        value: init.value,
+        disabled: init.disabled,
+        hidden: init.hidden,
+        label: init.label,
+        text: init.text,
+        _attrs: { ...(init as { _attrs?: Record<string, string> })._attrs },
+        _children: children,
+        _textContent: init.textContent ?? "",
+        getAttribute(name: string) {
+          return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name]! : null;
+        },
+        setAttribute(name: string, value: string) {
+          this._attrs[name] = value;
+        },
+        removeAttribute(name: string) {
+          delete this._attrs[name];
+        },
+        getBoundingClientRect() {
+          return visible ? { width: 100, height: 20 } : { width: 0, height: 0 };
+        },
+        get children() {
+          return this._children;
+        },
+        get textContent() {
+          return this._textContent;
+        },
+        querySelectorAll(selector: string) {
+          // Only used by the walker for `option` (and the cleanup
+          // `[data-gini-ref]` selector at the top of snapshot()).
+          const matches: FakeEl[] = [];
+          const recurse = (node: FakeEl) => {
+            if (selector === "option") {
+              if (node.tagName === "OPTION") matches.push(node);
+            } else if (selector.startsWith("[") && selector.endsWith("]")) {
+              const attr = selector.slice(1, -1);
+              if (Object.prototype.hasOwnProperty.call(node._attrs, attr)) matches.push(node);
+            }
+            for (const child of node._children) recurse(child);
+          };
+          for (const child of this._children) recurse(child);
+          return matches;
+        }
+      };
+      return el;
+    };
+
+    // <body>
+    //   <select name="size">
+    //     <option value="s">Small</option>
+    //     <option value="m">Medium</option>
+    //     <option value="l" disabled>Large</option>
+    //   </select>
+    // </body>
+    const optS = makeEl({ tagName: "OPTION", value: "s", text: "Small", label: "Small", textContent: "Small" });
+    const optM = makeEl({ tagName: "OPTION", value: "m", text: "Medium", label: "Medium", textContent: "Medium" });
+    const optL = makeEl({ tagName: "OPTION", value: "l", text: "Large", label: "Large", disabled: true, textContent: "Large" });
+    const select = makeEl({
+      tagName: "SELECT",
+      value: "s",
+      children: [optS, optM, optL],
+      textContent: "Small Medium Large"
+    });
+    const body = makeEl({ tagName: "BODY", children: [select] });
+
+    const docQueryAll = (selector: string): FakeEl[] => body.querySelectorAll(selector);
+    const originalDocument = (globalThis as Record<string, unknown>).document;
+    const originalWindow = (globalThis as Record<string, unknown>).window;
+    const originalCSS = (globalThis as Record<string, unknown>).CSS;
+    (globalThis as unknown as { document: unknown }).document = {
+      body,
+      querySelectorAll: docQueryAll,
+      querySelector: (_sel: string) => null,
+      getElementById: (_id: string) => null
+    };
+    (globalThis as unknown as { window: unknown }).window = {
+      getComputedStyle: (_el: unknown) => ({ display: "block", visibility: "visible" })
+    };
+    (globalThis as unknown as { CSS: unknown }).CSS = { escape: (s: string) => s };
+
+    // Fake Page whose page.evaluate(fn, arg) simply runs fn(arg) locally.
+    let pageCallCount = 0;
+    const fakePage = {
+      evaluate: <A, R>(fn: (arg: A) => R | Promise<R>, arg?: A): Promise<R> => {
+        pageCallCount++;
+        return Promise.resolve(fn(arg as A));
+      },
+      locator: (_sel: string) => ({} as unknown)
+    } as unknown as import("playwright-core").Page;
+
+    try {
+      const result = await browserTest.snapshotForTest(fakePage, false);
+      expect(pageCallCount).toBeGreaterThanOrEqual(1);
+      // The select itself must be present as a combobox.
+      expect(result.text).toContain("combobox");
+      // The two enabled options should each show as an `option "<name>"
+      // value="<v>"` row.
+      const optionLines = result.text.split("\n").filter((line) => line.includes(" option "));
+      expect(optionLines.length).toBeGreaterThanOrEqual(2);
+      expect(result.text).toContain('option "Small" value="s"');
+      expect(result.text).toContain('option "Medium" value="m"');
+      // Disabled option is filtered.
+      expect(result.text).not.toContain('value="l"');
+      // Distinct refs per option (we just check that each option line
+      // carries its own [@eN] token and they're not the same).
+      const refs = optionLines
+        .map((line) => /\[(@e\d+)\]/.exec(line)?.[1])
+        .filter((r): r is string => Boolean(r));
+      expect(refs.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(refs).size).toBe(refs.length);
+    } finally {
+      if (originalDocument === undefined) {
+        delete (globalThis as Record<string, unknown>).document;
+      } else {
+        (globalThis as Record<string, unknown>).document = originalDocument;
+      }
+      if (originalWindow === undefined) {
+        delete (globalThis as Record<string, unknown>).window;
+      } else {
+        (globalThis as Record<string, unknown>).window = originalWindow;
+      }
+      if (originalCSS === undefined) {
+        delete (globalThis as Record<string, unknown>).CSS;
+      } else {
+        (globalThis as Record<string, unknown>).CSS = originalCSS;
+      }
+    }
+  });
+});
+
 describe("chromeProfileDirFor", () => {
   test("derives the per-instance profile path from instance name", async () => {
     const { chromeProfileDirFor } = await import("./browser");

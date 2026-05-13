@@ -896,6 +896,31 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
             depth,
             full: false
           });
+          // For <select>, surface its <option> children as sibling rows at
+          // depth+1 so the agent can address each option by its own @eN
+          // ref (browser_click / browser_select_option). The bare walker
+          // skips <option> elements because they have a zero-size bounding
+          // rect in the native renderer; we explicitly enumerate via
+          // querySelectorAll so options nested inside <optgroup> are
+          // captured too.
+          if (tag === "SELECT") {
+            const options = (el as HTMLSelectElement).querySelectorAll("option");
+            for (const opt of Array.from(options)) {
+              if (opt.disabled || opt.hidden) continue;
+              const optRef = `@e${nextId++}`;
+              opt.setAttribute(attr, optRef.slice(1));
+              const labelOrText = (opt.label || opt.text || "").trim().slice(0, 120);
+              out.push({
+                ref: optRef,
+                role: "option",
+                name: labelOrText,
+                value: opt.value,
+                url: "",
+                depth: depth + 1,
+                full: false
+              });
+            }
+          }
         } else if (fullMode && visible) {
           // In full mode, also record landmark/heading text so the snapshot
           // captures structural cues the model can use for orientation.
@@ -1272,5 +1297,12 @@ export const __test = {
   },
   clearFakeSessionsForTest(): void {
     sessions.clear();
+  },
+  // Expose the in-page walker for direct unit testing. Callers supply a
+  // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against
+  // a pre-populated `globalThis.document` (and friends) — that lets
+  // browser walk semantics be asserted without spawning Chromium.
+  snapshotForTest(page: Page, full: boolean): Promise<SnapshotResult> {
+    return snapshot(page, full);
   }
 };
