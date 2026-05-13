@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 
-export interface ProfileRow { id: string; name: string; status: string }
+export interface ProfileRow { id: string; name: string; status: string; providerName?: string; model?: string }
 
 export function ProfileCard({
   profiles,

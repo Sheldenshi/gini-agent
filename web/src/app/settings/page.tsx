@@ -89,12 +89,15 @@ export default function SettingsPage() {
   });
 
   const activeProfileId = profiles.data?.activeProfileId;
+  const activeProfile = profiles.data?.profiles.find((p) => p.id === activeProfileId);
+  const catalogEntry = catalog.data?.find((c) => c.name === activeProfile?.providerName);
+  const activeProviderDisplayName = catalogEntry?.displayName ?? activeProfile?.providerName;
 
   return (
     <>
       <PageHeader title="Settings" description="Providers, profiles, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
-        <ProviderCard catalog={catalog.data} />
+        <ProviderCard displayName={activeProviderDisplayName} model={activeProfile?.model} />
 
         <ProfileCard
           profiles={profiles.data?.profiles ?? []}
