@@ -94,10 +94,37 @@ const schedulerDone: Promise<void> = (async function schedulerLoop(): Promise<vo
   }
 })();
 
-process.on("SIGTERM", () => {
+process.on("SIGTERM", async () => {
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
-  server.stop(true);
+  // Drain in-flight HTTP responses BEFORE we start tearing the process
+  // down. `server.stop(false)` returns a promise that resolves when
+  // active requests have completed writing — without this, a setup POST
+  // that triggered the SIGTERM (see src/runtime/autostart-refresh.ts)
+  // could have its response body cut mid-stream when the process exits.
+  //
+  // Bun's server.stop(true) FORCE-closes connections (per
+  // node_modules/bun-types/docs/runtime/http/server.mdx:251-258). We
+  // want stop(false) — the polite "wait for in-flight" variant.
+  //
+  // Failsafe: if a single connection is hung (stalled client, broken
+  // pipe), don't block shutdown indefinitely. Race the drain against a
+  // 5s budget; on timeout, log and proceed (a force-stop happens
+  // implicitly on process.exit).
+  try {
+    await Promise.race([
+      server.stop(false),
+      Bun.sleep(5000).then(() => {
+        appendLog(config.instance, "runtime.stop.timeout", {
+          waited_ms: 5000
+        });
+      })
+    ]);
+  } catch (error) {
+    appendLog(config.instance, "runtime.stop.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
   // Wait for the in-flight tick before exiting so we don't kill a job
   // mid-execution and leave its JobRunRecord stuck "running". The tick
   // catches its own errors, so schedulerDone shouldn't reject — but we
