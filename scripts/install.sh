@@ -309,15 +309,21 @@ enable_autostart() {
 }
 
 # Read the per-instance web port from ~/.gini/instances/<inst>/web.port,
-# polling for up to 30s while the autostart web shim writes it. The
+# polling for up to 90s while the autostart web shim writes it. The
 # default web port is hash-derived (src/paths.ts:defaultWebPort) so it
 # is almost never 3000 for non-`main` instances; even for `main`
 # install.sh must not assume 3000 because future versions could change
 # the hashing scheme. Echoes the port on success, empty on timeout.
+#
+# Why 90s: the autostart web shim has a 60s budget to wait for the
+# gateway to come up before exec'ing bun run dev (see buildWebShim in
+# src/cli/autostart.ts); we leave headroom on top of that so the
+# install script doesn't give up before the shim has had a chance to
+# write web.port.
 read_web_port() {
   local instance="$1"
   local port_file="$HOME/.gini/instances/$instance/web.port"
-  local timeout=30
+  local timeout=90
   local i=0
   while [ $i -lt $timeout ]; do
     if [ -f "$port_file" ]; then
@@ -376,7 +382,7 @@ open_setup_in_browser() {
   local web_url
   web_url="$(wait_for_web_healthz "$DEFAULT_INSTANCE")"
   if [ -z "$web_url" ]; then
-    info "Webapp didn't respond within 60s. After install completes, run 'gini status' to find the web port and open <web_url>/setup in your browser."
+    info "Webapp didn't respond within 120s. After install completes, run 'gini status' to find the web port and open <web_url>/setup in your browser."
     return
   fi
   # `open` works in both interactive and non-interactive (piped) sessions

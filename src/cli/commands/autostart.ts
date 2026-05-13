@@ -74,6 +74,18 @@ export async function autostart(ctx: CliContext): Promise<void> {
 
   if (sub === "enable") {
     const kindFlag = flagValue(ctx.rawArgs, "--kind");
+    // LOW-E: validate --kind explicitly. The pre-fix behavior silently
+    // fell through to "both kinds" on a typo (e.g. `--kind gatway`),
+    // which is surprising and hides intent. Now a bad value is a clear
+    // non-zero exit with a descriptive error.
+    if (kindFlag !== undefined && kindFlag !== "gateway" && kindFlag !== "web") {
+      print({
+        ok: false,
+        error: `Invalid --kind value '${kindFlag}'. Allowed: gateway, web (or omit for both).`
+      });
+      process.exitCode = 1;
+      return;
+    }
     const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
     const result = await enable(instance, testRoot, kinds);
     print(result);
@@ -110,6 +122,18 @@ export async function autostart(ctx: CliContext): Promise<void> {
     return;
   }
   if (sub === "kick") {
+    // LOW-E: validate --kind for kick the same way enable does. The
+    // pre-fix behavior silently fell through to "both kinds" on a typo,
+    // which is surprising and hides intent.
+    const kindFlag = flagValue(ctx.rawArgs, "--kind");
+    if (kindFlag !== undefined && kindFlag !== "gateway" && kindFlag !== "web") {
+      print({
+        ok: false,
+        error: `Invalid --kind value '${kindFlag}'. Allowed: gateway, web (or omit for both).`
+      });
+      process.exitCode = 1;
+      return;
+    }
     const result = kick(instance, ctx.rawArgs);
     print(result);
     if (!result.ok) process.exitCode = 1;
