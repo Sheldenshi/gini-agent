@@ -34,6 +34,7 @@ import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
 import { approvalToolCallId } from "./execution/tool-dispatch";
+import { browserUploadFileApproved } from "./tools/browser";
 import { syncSubagentFromTask } from "./capabilities/subagents";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
@@ -684,6 +685,57 @@ async function executeApprovedAction(config: RuntimeConfig, approval: Approval):
       ].filter(Boolean).join("\n\n");
       await resumeChatTask(config, approval.taskId, chatToolCallId, summary || `Command finished with exit ${exitCode}.`);
     }
+  }
+
+  if (approval.action === "browser.upload_file") {
+    const ref = String(approval.payload.ref);
+    const resolvedPath = String(approval.payload.resolvedPath);
+    const displayPath = String(approval.payload.path);
+    let result: string;
+    if (approval.taskId) {
+      result = await browserUploadFileApproved(approval.taskId, ref, resolvedPath, displayPath);
+    } else {
+      result = JSON.stringify({ success: false, error: "Browser upload approval missing taskId." });
+    }
+    let parsed: { success?: boolean; error?: string } = {};
+    try {
+      parsed = JSON.parse(result) as { success?: boolean; error?: string };
+    } catch {
+      parsed = { success: true };
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(state, {
+        actor: "runtime",
+        action: "browser.upload_file",
+        target: displayPath,
+        risk: "high",
+        taskId: approval.taskId,
+        runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+        approvalId: approval.id,
+        evidence: { ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null }
+      });
+      if (approval.taskId && !chatToolCallId) {
+        completeApprovedTask(
+          state,
+          approval.taskId,
+          parsed.success === false ? "Browser upload failed." : "Browser upload completed.",
+          parsed.success === false ? parsed.error ?? undefined : undefined
+        );
+      }
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: parsed.success === false ? "error" : "tool",
+        message: `Browser tool browser.upload_file`,
+        data: { ref, path: displayPath, success: parsed.success !== false, error: parsed.error ?? null }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    if (chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return;
   }
 }
 

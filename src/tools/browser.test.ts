@@ -12,13 +12,15 @@ import {
   browserVision,
   browserWaitFor,
   closeAll,
+  currentDisconnectGeneration,
   disconnectSharedBrowser,
   safetyCheck,
   setBrowserInstance,
   withTeardownLock
 } from "./browser";
+import { dispatchToolCall } from "../execution/tool-dispatch";
 import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
-import { mutateState, readState } from "../state";
+import { createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
 // Direct unit coverage for the URL safety guard. We exercise the function
@@ -1444,5 +1446,224 @@ describe("browserUploadFile", () => {
       WORKSPACE
     );
     expect(JSON.parse(raw).error).toContain("Unknown ref @e99");
+  });
+});
+
+// browser_upload_file dispatched through the chat-task tool dispatcher must
+// route through the approval gate (file egress is irreversible from the
+// user's perspective and gets a high-risk row, same as file_write).
+describe("dispatchToolCall(browser_upload_file)", () => {
+  const ROOT = "/tmp/gini-browser-upload-dispatch-tests";
+  const WORKSPACE = join(ROOT, "workspace");
+
+  function dispatchConfig(instance: string): RuntimeConfig {
+    process.env.GINI_STATE_ROOT = ROOT;
+    process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+    rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
+    return {
+      instance,
+      port: 7339,
+      token: "test-token",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: WORKSPACE,
+      stateRoot: `${ROOT}/instances/${instance}`,
+      logRoot: `${ROOT}-logs/${instance}`
+    };
+  }
+
+  test("returns kind:'pending' with an approval row at risk 'high'", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    writeFileSync(join(WORKSPACE, "report.txt"), "hello upload\n");
+    const config = dispatchConfig("browser-upload-dispatch");
+    // The dispatcher needs a real task row to attach the approval to.
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "upload test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_upload_file",
+      "call_upload_1",
+      JSON.stringify({ ref: "@e3", path: "report.txt" })
+    );
+    expect(result.kind).toBe("pending");
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) =>
+      result.kind === "pending" && a.id === result.approvalId
+    );
+    expect(approval).toBeDefined();
+    expect(approval!.risk).toBe("high");
+    expect(approval!.action).toBe("browser.upload_file");
+    expect(approval!.target).toBe("report.txt");
+    // Approval payload carries enough for the executor to act without
+    // re-walking the workspace.
+    expect(approval!.payload.ref).toBe("@e3");
+    expect(approval!.payload.path).toBe("report.txt");
+    expect(typeof approval!.payload.resolvedPath).toBe("string");
+    expect(String(approval!.payload.resolvedPath).endsWith("/report.txt")).toBe(true);
+    expect(approval!.payload.toolCallId).toBe("call_upload_1");
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("propagates outside-workspace path errors instead of opening an approval", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-upload-dispatch-escape");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "upload escape", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "browser_upload_file",
+        "call_upload_escape_1",
+        JSON.stringify({ ref: "@e1", path: "../escape.txt" })
+      )
+    ).rejects.toThrow(/outside workspace/);
+    // No approval row should exist.
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+});
+
+// closeSession must drain agent-opened tabs (tracked via ownedPageIds) so
+// the user's window/tabs stay alive while the agent's scratch pages are
+// closed when the task ends.
+describe("closeSession drains agent-owned pages", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("each agent-opened tab is closed via its close() handle", async () => {
+    // Plant a session with 3 agent-owned pages. The fake context returns
+    // those pages from .pages() (no user-owned tabs in this scenario).
+    const closed: string[] = [];
+    const makePage = (label: string): Partial<import("playwright-core").Page> => ({
+      url: () => `https://example.com/${label}`,
+      title: () => Promise.resolve(label),
+      close: (async () => {
+        closed.push(label);
+      }) as unknown as import("playwright-core").Page["close"]
+    });
+    const p0 = makePage("p0");
+    const p1 = makePage("p1");
+    const p2 = makePage("p2");
+    // Install with p0 as the active page, then manually extend
+    // ownedPageIds to include p1 + p2 (mimicking two browser_tabs:new
+    // calls during the task).
+    browserTest.installFakeSessionWithPageForTest("drain-pages-task", p0);
+    const session = browserTest.getFakeSessionForTest("drain-pages-task");
+    expect(session).toBeDefined();
+    session!.ownedPageIds.add(p1 as unknown as import("playwright-core").Page);
+    session!.ownedPageIds.add(p2 as unknown as import("playwright-core").Page);
+
+    await browserTest.closeSessionForTest("drain-pages-task");
+
+    // All three agent-owned pages should have had close() called.
+    expect(closed.sort()).toEqual(["p0", "p1", "p2"]);
+  });
+});
+
+// browser_select_option should accept an option ref alone and walk up to
+// the containing <select>, using the option's `value` attribute when the
+// caller didn't supply an explicit value/values.
+describe("browserSelectOption option-ref inference", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("walks up from an OPTION to its parent SELECT and uses the option's value attribute", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-option-ref", fakePage);
+
+    // The option locator: evaluate returns { tagName: "OPTION", value: "bmw" }.
+    // .locator("xpath=...") returns a new fake "select" locator whose
+    // selectOption() captures the call so the test can assert it ran with
+    // "bmw".
+    let captured: { selection: unknown; timeout?: number } | undefined;
+    const selectLocator = {
+      selectOption: async (selection: unknown, opts?: { timeout?: number }) => {
+        captured = { selection, timeout: opts?.timeout };
+        return [];
+      }
+    };
+    const optionLocator = {
+      evaluate: async (_fn: (el: Element) => { tagName: string; value: string }) =>
+        ({ tagName: "OPTION", value: "bmw" }),
+      locator: (selector: string) => {
+        // Must walk via xpath up to the parent select.
+        if (selector !== "xpath=ancestor::select[1]") {
+          throw new Error(`Unexpected selector: ${selector}`);
+        }
+        return selectLocator;
+      }
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", optionLocator);
+    browserTest.setFakeSessionRefsForTest("sel-option-ref", refs);
+
+    const raw = await browserSelectOption("sel-option-ref", { ref: "@e5" });
+    const parsed = JSON.parse(raw) as { success: boolean; selected?: unknown };
+    expect(parsed.success).toBe(true);
+    expect(parsed.selected).toBe("bmw");
+    expect(captured).toBeDefined();
+    expect(captured!.selection).toBe("bmw");
+    expect(captured!.timeout).toBe(10_000);
+  });
+
+  test("explicit value overrides the option's value attribute when an option ref is supplied", async () => {
+    const fakePage = makeFakePageForRefTools();
+    browserTest.installFakeSessionWithPageForTest("sel-option-override", fakePage);
+
+    let captured: { selection: unknown } | undefined;
+    const selectLocator = {
+      selectOption: async (selection: unknown) => {
+        captured = { selection };
+        return [];
+      }
+    };
+    const optionLocator = {
+      evaluate: async () => ({ tagName: "OPTION", value: "bmw" }),
+      locator: () => selectLocator
+    };
+    const refs = new Map<string, unknown>();
+    refs.set("@e5", optionLocator);
+    browserTest.setFakeSessionRefsForTest("sel-option-override", refs);
+
+    const raw = await browserSelectOption("sel-option-override", { ref: "@e5", value: "audi" });
+    const parsed = JSON.parse(raw) as { success: boolean; selected?: unknown };
+    expect(parsed.success).toBe(true);
+    // Explicit value wins over the inferred option value.
+    expect(parsed.selected).toBe("audi");
+    expect(captured!.selection).toBe("audi");
+  });
+});
+
+// currentDisconnectGeneration is the read-only counter used by browserVision
+// to detect a teardown that happens between screenshot and provider response.
+describe("currentDisconnectGeneration", () => {
+  afterEach(() => {
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("returns the same value the test-helper exposes", () => {
+    const before = browserTest.currentDisconnectGenerationForTest();
+    expect(currentDisconnectGeneration()).toBe(before);
+    const after = browserTest.bumpDisconnectGenerationForTest();
+    expect(currentDisconnectGeneration()).toBe(after);
   });
 });

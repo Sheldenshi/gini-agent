@@ -55,6 +55,12 @@ interface Session {
   // The field is retained to keep the test helpers stable; it's always
   // false in production code paths.
   ownsContext: boolean;
+  // Tabs the agent itself opened during this task. Used by closeSession to
+  // drain agent-opened tabs at task end without touching tabs the user
+  // opened or another task owns. Populated by getOrCreate (the initial
+  // page) and by browser_tabs action:"new". Pages closed via
+  // browser_tabs action:"close" are removed.
+  ownedPageIds: Set<Page>;
 }
 
 // Discriminated union describing the currently-installed shared handle.
@@ -179,6 +185,14 @@ function isHandleAlive(handle: SharedHandle): boolean {
   } catch {
     return false;
   }
+}
+
+// Exposed so callers like browserVision can capture the current disconnect
+// generation before doing slow work (provider fetch) and re-check after,
+// bailing if the browser was torn down underneath them. Same value the
+// internal admission gate compares against.
+export function currentDisconnectGeneration(): number {
+  return disconnectGeneration;
 }
 
 async function ensureShared(): Promise<SharedHandle> {
@@ -422,7 +436,8 @@ async function getOrCreate(taskId: string): Promise<Session> {
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: false
+      ownsContext: false,
+      ownedPageIds: new Set<Page>([page])
     };
     sessions.set(taskId, session);
     // Attach console capture eagerly so page.goto errors before the
@@ -479,10 +494,16 @@ async function closeSession(taskId: string): Promise<void> {
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
   try {
-    // Shared context (persistent/cdp): close only the page. The user's
-    // window, tabs, and the agent's persistent profile stay alive — the
-    // next task lands in the same profile.
-    await session.page.close().catch(() => undefined);
+    // Shared context (persistent/cdp): close every page the agent opened
+    // during this task. The user's window, tabs the user opened
+    // themselves, and the agent's persistent profile stay alive — the
+    // ownedPageIds set tracks ONLY agent-opened tabs (initial page from
+    // getOrCreate plus any browser_tabs action:"new"), so user tabs are
+    // never in this set. The next task lands in the same profile.
+    for (const page of session.ownedPageIds) {
+      await page.close().catch(() => undefined);
+    }
+    session.ownedPageIds.clear();
   } catch {
     // Already closed or browser disconnected; nothing useful to do.
   }
@@ -1267,21 +1288,23 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
   }
 }
 
-// Select option(s) on a <select> by ref. Exactly one of `value` (single)
-// or `values` (multi-select) must be supplied; we forward whatever was
-// provided to Playwright's selectOption, which accepts both shapes.
+// Select option(s) on a <select> by ref. Callers can address either:
+//
+//   1. The <select> directly + value/values — Playwright's normal contract.
+//   2. A specific <option> ref alone — we walk up to the containing
+//      <select> and use the option's `value` attribute. The snapshot
+//      walker surfaces both the select and its options as @eN refs, so
+//      the model often picks an option ref naturally; rather than fight
+//      the model into picking the select, we accept either shape.
+//
+// If both an option ref AND a value/values are supplied, the explicit
+// value wins (callers may override the option's default value attribute).
 export async function browserSelectOption(taskId: string, args: Record<string, unknown>): Promise<string> {
   const ref = str(args.ref);
   if (!ref) return fail("Missing required string argument: ref");
   const value = typeof args.value === "string" ? args.value : undefined;
   const valuesRaw = args.values;
   const hasValues = valuesRaw !== undefined;
-  if (value === undefined && !hasValues) {
-    return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
-  }
-  if (value !== undefined && hasValues) {
-    return fail("Provide either 'value' or 'values', not both.");
-  }
   let values: string[] | undefined;
   if (hasValues) {
     if (!Array.isArray(valuesRaw) || !valuesRaw.every((v): v is string => typeof v === "string")) {
@@ -1289,11 +1312,51 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
     }
     values = valuesRaw;
   }
+  if (value !== undefined && hasValues) {
+    return fail("Provide either 'value' or 'values', not both.");
+  }
   try {
     return await withSession(taskId, async (session) => {
-      const locator = session.refs.get(ref);
+      let locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      const selection = value ?? (values as string[]);
+
+      // Detect whether the resolved element is an <option>. If so, walk
+      // up to the containing <select> and (when no explicit value/values
+      // was supplied) infer the value from the option's `value` attribute.
+      // Errors evaluating tagName fall back to "treat as select" — that
+      // keeps existing select-ref callers working under any future
+      // walker change that surfaces non-OPTION refs.
+      let inferredValue: string | undefined;
+      try {
+        const meta = await locator.evaluate((el: Element) => ({
+          tagName: el.tagName,
+          value: el.getAttribute("value") ?? (el as HTMLOptionElement).value ?? ""
+        }));
+        if (meta.tagName === "OPTION") {
+          inferredValue = typeof meta.value === "string" ? meta.value : undefined;
+          // Walk up to the parent <select>; .selectOption only works on
+          // <select>, not on individual <option> nodes.
+          locator = locator.locator("xpath=ancestor::select[1]");
+        }
+      } catch {
+        // If evaluate fails (no such element, page navigated away mid-
+        // call, etc.) we fall through to the original selectOption call,
+        // which will surface its own structured error to the caller.
+      }
+
+      // Selection priority: explicit value > explicit values[] > inferred
+      // value from option ref. If none of those are available, fail with
+      // the standard message.
+      let selection: string | string[];
+      if (value !== undefined) {
+        selection = value;
+      } else if (values !== undefined) {
+        selection = values;
+      } else if (inferredValue !== undefined) {
+        selection = inferredValue;
+      } else {
+        return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
+      }
       await locator.selectOption(selection, { timeout: 10_000 });
       const snap = await snapshot(session.page, false);
       session.refs = snap.refs;
@@ -1412,6 +1475,12 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         if (url) {
           await page.goto(url, { waitUntil: "domcontentloaded" });
         }
+        // Mark the freshly-opened tab as agent-owned so closeSession at
+        // task end will drain it (alongside the initial page recorded in
+        // getOrCreate). Add to the ownership set BEFORE swapping
+        // session.page so a concurrent closeSession can't observe the
+        // page as the active one without also seeing it in the set.
+        session.ownedPageIds.add(page);
         // Clear refs BEFORE swapping the page so any concurrent stale ref
         // lookup hitting session.refs while session.page is the new tab
         // fails fast against an empty map rather than silently resolving
@@ -1456,11 +1525,23 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
       if (!target) return fail(`No tab at index ${args.index}.`);
       const wasActive = target === session.page;
       await target.close();
+      // Drop the closed page from agent ownership if we had it. If the
+      // page wasn't agent-owned (rare in practice — the agent normally
+      // only addresses tabs it can see, and it opens new ones via
+      // browser_tabs:new), the delete is a harmless no-op.
+      session.ownedPageIds.delete(target);
       if (wasActive) {
         // Pick whatever's left, or create a fresh page so the session
-        // isn't left pointing at a closed handle.
+        // isn't left pointing at a closed handle. A freshly-opened
+        // fallback page counts as agent-owned (we just created it).
         const remaining = session.context.pages();
-        session.page = remaining[0] ?? (await session.context.newPage());
+        if (remaining[0]) {
+          session.page = remaining[0];
+        } else {
+          const fallback = await session.context.newPage();
+          session.ownedPageIds.add(fallback);
+          session.page = fallback;
+        }
       }
       session.refs = new Map();
       const snap = await snapshot(session.page, false);
@@ -1524,37 +1605,33 @@ export async function browserVision(
   }
 }
 
-// Upload a workspace file to a file-input element by ref. The user-supplied
-// path is treated as workspace-relative, validated to be inside the
-// workspace, and then re-validated after symlink resolution so a planted
-// symlink pointing at /etc/passwd can't escape the sandbox. The realpath is
-// what gets handed to Playwright's setInputFiles.
-export async function browserUploadFile(
-  taskId: string,
-  args: Record<string, unknown>,
-  workspaceRoot: string
-): Promise<string> {
-  const ref = str(args.ref);
-  if (!ref) return fail("Missing required string argument: ref");
-  const userPath = str(args.path);
-  if (!userPath) return fail("Missing required string argument: path");
-  let absolute: string;
-  try {
-    absolute = assertInsideWorkspace(workspaceRoot, userPath);
-  } catch (error) {
-    return fail(error instanceof Error ? error.message : String(error));
-  }
+// Validate that a workspace-relative `userPath` points at an in-workspace
+// regular file and return both the absolute path and a workspace-relative
+// display path (for trace/approval rendering). Throws with a structured
+// message when the path is missing, outside the workspace, doesn't exist,
+// isn't a file, or resolves outside the workspace via a symlink.
+//
+// Shared by browser_upload_file's pre-approval gate (so the user sees a
+// real, validated path on the approval card) and the post-approval
+// executor (defense in depth — the realpath is re-checked at execute time
+// in case the file was swapped between request and approval).
+export function resolveUploadPath(
+  workspaceRoot: string,
+  userPath: string
+): { absolute: string; displayPath: string } {
+  if (!userPath) throw new Error("Missing required string argument: path");
+  const absolute = assertInsideWorkspace(workspaceRoot, userPath);
   if (!existsSync(absolute)) {
-    return fail(`Upload path does not exist: ${userPath}`);
+    throw new Error(`Upload path does not exist: ${userPath}`);
   }
   let st: ReturnType<typeof statSync>;
   try {
     st = statSync(absolute);
   } catch (error) {
-    return fail(`Cannot stat upload path: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`Cannot stat upload path: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (!st.isFile()) {
-    return fail(`Upload path is not a file: ${userPath}`);
+    throw new Error(`Upload path is not a file: ${userPath}`);
   }
   // Resolve symlinks and re-run the workspace check. A symlink under the
   // workspace pointing at /etc/passwd would otherwise let an agent
@@ -1567,7 +1644,7 @@ export async function browserUploadFile(
   try {
     real = realpathSync(absolute);
   } catch (error) {
-    return fail(`Cannot resolve upload path: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`Cannot resolve upload path: ${error instanceof Error ? error.message : String(error)}`);
   }
   let realWorkspace: string;
   try {
@@ -1581,18 +1658,79 @@ export async function browserUploadFile(
   try {
     assertInsideWorkspace(realWorkspace, real);
   } catch {
-    return fail(`Path resolves outside workspace via symlink: ${userPath}`);
+    throw new Error(`Path resolves outside workspace via symlink: ${userPath}`);
+  }
+  return { absolute: real, displayPath: userPath };
+}
+
+// Upload a workspace file to a file-input element by ref. The user-supplied
+// path is treated as workspace-relative, validated to be inside the
+// workspace, and then re-validated after symlink resolution so a planted
+// symlink pointing at /etc/passwd can't escape the sandbox. The realpath is
+// what gets handed to Playwright's setInputFiles.
+//
+// NOTE: The chat-task dispatcher now routes browser_upload_file through an
+// approval gate (see src/execution/tool-dispatch.ts::requestBrowserUpload
+// and src/agent.ts::executeApprovedAction). This function remains as the
+// direct, unapproved path used by tests and any non-chat-task caller that
+// has already validated user intent.
+export async function browserUploadFile(
+  taskId: string,
+  args: Record<string, unknown>,
+  workspaceRoot: string
+): Promise<string> {
+  const ref = str(args.ref);
+  if (!ref) return fail("Missing required string argument: ref");
+  const userPath = str(args.path);
+  if (!userPath) return fail("Missing required string argument: path");
+  let resolved: { absolute: string; displayPath: string };
+  try {
+    resolved = resolveUploadPath(workspaceRoot, userPath);
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
   }
   try {
     return await withSession(taskId, async (session) => {
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
-      await locator.setInputFiles(real, { timeout: 10_000 });
+      await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
       const snap = await snapshot(session.page, false);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
-        path: userPath,
+        path: resolved.displayPath,
+        snapshot: snap.text,
+        elementCount: snap.elementCount,
+        truncated: snap.truncated
+      });
+    });
+  } catch (error) {
+    return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Approved-upload executor. Called by agent.executeApprovedAction after the
+// user explicitly authorizes a browser.upload_file approval. Skips the path
+// resolution dance (already done at request time and stored on the
+// approval payload as `resolvedPath`) and just resolves the ref + runs
+// setInputFiles. Returns the same envelope shape browserUploadFile uses so
+// the chat-task loop feeds the success message back as the tool result.
+export async function browserUploadFileApproved(
+  taskId: string,
+  ref: string,
+  absolutePath: string,
+  displayPath: string
+): Promise<string> {
+  try {
+    return await withSession(taskId, async (session) => {
+      const locator = session.refs.get(ref);
+      if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
+      await locator.setInputFiles(absolutePath, { timeout: 10_000 });
+      const snap = await snapshot(session.page, false);
+      session.refs = snap.refs;
+      return ok({
+        url: session.page.url(),
+        path: displayPath,
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
@@ -1668,26 +1806,30 @@ export const __test = {
   // Synchronously poke inFlight on a synthetic session so the drain
   // test can verify disconnect waits without spinning up Playwright.
   installFakeSessionForTest(taskId: string, inFlight: number): void {
+    const fakePage = { close: () => Promise.resolve() } as unknown as Page;
     sessions.set(taskId, {
       context: {} as BrowserContext,
-      page: { close: () => Promise.resolve() } as unknown as Page,
+      page: fakePage,
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight,
-      ownsContext: false
+      ownsContext: false,
+      ownedPageIds: new Set<Page>([fakePage])
     });
   },
   // Install a synthetic session with a caller-provided `page` so tool
   // entry points (browserVision, etc.) can be exercised against a
   // hand-built page without spawning Chromium.
   installFakeSessionWithPageForTest(taskId: string, page: Partial<Page>): void {
+    const realPage = page as unknown as Page;
     sessions.set(taskId, {
       context: {} as BrowserContext,
-      page: page as unknown as Page,
+      page: realPage,
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: false
+      ownsContext: false,
+      ownedPageIds: new Set<Page>([realPage])
     });
   },
   // Install a synthetic session with both a `page` and `context` so tab-
@@ -1698,19 +1840,32 @@ export const __test = {
     page: Partial<Page>,
     context: Partial<BrowserContext>
   ): void {
+    const realPage = page as unknown as Page;
     sessions.set(taskId, {
       context: context as unknown as BrowserContext,
-      page: page as unknown as Page,
+      page: realPage,
       refs: new Map(),
       lastActivity: Date.now(),
       inFlight: 0,
-      ownsContext: false
+      ownsContext: false,
+      ownedPageIds: new Set<Page>([realPage])
     });
   },
   // Read the currently-installed page on a fake session so tests can
   // assert that a tab-management operation actually swapped session.page.
   getFakeSessionPageForTest(taskId: string): Page | undefined {
     return sessions.get(taskId)?.page;
+  },
+  // Read the entire fake session so tests can mutate ownedPageIds directly
+  // (used by the closeSession drain test to simulate agent-opened tabs).
+  getFakeSessionForTest(taskId: string): Session | undefined {
+    return sessions.get(taskId);
+  },
+  // Run closeSession against a synthetic session — the production
+  // closeSession is module-private, but tests need to exercise its
+  // ownedPageIds drain behavior end-to-end.
+  closeSessionForTest(taskId: string): Promise<void> {
+    return closeSession(taskId);
   },
   // Read the currently-installed refs map so tests can assert it was
   // cleared (e.g. tab switch / new / close should clear the refs).

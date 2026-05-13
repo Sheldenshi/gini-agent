@@ -41,9 +41,9 @@ import {
   browserSnapshot,
   browserTabs,
   browserType,
-  browserUploadFile,
   browserVision,
-  browserWaitFor
+  browserWaitFor,
+  resolveUploadPath
 } from "../tools/browser";
 
 export type DispatchResult =
@@ -123,16 +123,10 @@ export async function dispatchToolCall(
     case "browser_vision":
       return { kind: "sync", result: await browserDispatchWithConfig(config, taskId, "browser.vision", browserVision, args) };
     case "browser_upload_file":
-      return {
-        kind: "sync",
-        result: await runBrowserDispatch(
-          config,
-          taskId,
-          "browser.upload_file",
-          () => browserUploadFile(taskId, args, config.workspaceRoot),
-          args
-        )
-      };
+      // Uploading a workspace file egresses bytes to a remote site —
+      // explicit, side-effecting, irreversible from the user's
+      // perspective. Route through the approval gate like file.write.
+      return { kind: "pending", approvalId: await requestBrowserUpload(config, taskId, toolCallId, args) };
     case "file_write":
       return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
     case "file_patch":
@@ -676,6 +670,52 @@ async function requestFileWrite(
       type: "approval",
       message: "Approval requested for file write (chat-task)",
       data: { approvalId: approval.id, target, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated browser_upload_file. Validates the workspace path (and
+// its symlink target) before opening the approval row so the user sees a
+// real, in-workspace file on the approval card. The actual setInputFiles
+// call runs in agent.executeApprovedAction's "browser.upload_file"
+// branch, which calls browserUploadFileApproved with the captured ref +
+// resolved path.
+async function requestBrowserUpload(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const ref = requireString(args, "ref");
+  const userPath = requireString(args, "path");
+  // resolveUploadPath throws on invalid / outside-workspace / symlink-escape.
+  // Let it propagate so the dispatch loop surfaces the error message to the
+  // model as a tool error (matching how requestFileWrite handles
+  // assertInsideWorkspace failures).
+  const resolved = resolveUploadPath(config.workspaceRoot, userPath);
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "browser.upload_file",
+      target: resolved.displayPath,
+      risk: "high",
+      reason: "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
+      payload: {
+        ref,
+        path: userPath,
+        resolvedPath: resolved.absolute,
+        currentUrl: "",
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser upload (chat-task)",
+      data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId }
     });
     return approval.id;
   });
