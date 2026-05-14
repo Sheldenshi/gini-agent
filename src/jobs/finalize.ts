@@ -12,12 +12,12 @@
 // Idempotent: if the run is already terminal, this is a no-op.
 
 import type { RuntimeConfig, Task } from "../types";
-import { addAudit, appendEvent, appendLog, mutateState, now } from "../state";
+import { addAudit, appendEvent, appendLog, isTerminalTaskStatus, mutateState, now } from "../state";
 import { syncChatTaskResult } from "../execution/chat";
 
 export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task): Promise<void> {
   if (!task.jobId) return;
-  if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") return;
+  if (!isTerminalTaskStatus(task.status)) return;
   // Capture session/oneShot context inside the mutateState write so the
   // post-write chat sync uses the same view we used to flip the run.
   let chatSessionIdToSync: string | undefined;
