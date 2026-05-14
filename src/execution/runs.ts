@@ -1,5 +1,5 @@
 import type { RuntimeConfig, RunRecord, RunStatus, Task } from "../types";
-import { createPlanStep, createRun, mutateState, now, readState } from "../state";
+import { createPlanStep, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 
 export function listRuns(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -65,7 +65,7 @@ export async function updateRunFromTask(config: RuntimeConfig, task: Task) {
     run.cost = task.cost;
     run.updatedAt = now();
     if (task.status === "running") run.startedAt ??= run.updatedAt;
-    if (["completed", "failed", "cancelled"].includes(task.status)) run.completedAt = run.updatedAt;
+    if (isTerminalTaskStatus(task.status)) run.completedAt = run.updatedAt;
     run.approvalIds = Array.from(new Set([...run.approvalIds, ...task.approvalIds]));
     const executeStep = state.planSteps.find((item) => item.runId === run.id && item.taskId === task.id)
       ?? state.planSteps.find((item) => item.runId === run.id && item.title.includes("Execute"));

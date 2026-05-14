@@ -4,6 +4,7 @@ import {
   createChatMessage,
   createChatSession,
   deleteChatSession,
+  isTerminalTaskStatus,
   mutateState,
   readState,
   renameChatSession
@@ -145,7 +146,7 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     // ChatMessageRecord. waiting_approval is in-flight — the synthetic
     // placeholder rendered by getChatSession swaps out automatically once
     // approval grants and the task finishes.
-    if (task.status !== "completed" && task.status !== "failed" && task.status !== "cancelled") {
+    if (!isTerminalTaskStatus(task.status)) {
       throw new Error(`Task is not ready for chat sync: ${task.status}`);
     }
     // [SILENT] sentinel — emitted by scheduled jobs that have nothing

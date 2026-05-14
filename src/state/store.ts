@@ -1,10 +1,19 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState } from "../types";
+import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
 import { addAudit } from "./audit";
 import { getMemoryDb, memoryDbPath } from "./memory-db";
+
+// Shared terminal-status predicate. Every site that mutates
+// `task.status` should check this before flipping so a cancelled /
+// failed / completed task isn't resurrected by a stale in-flight
+// code path. Returns `true` for the three terminal states in the
+// TaskStatus union.
+export function isTerminalTaskStatus(status: TaskStatus): boolean {
+  return status === "completed" || status === "failed" || status === "cancelled";
+}
 
 export function createEmptyState(instance: Instance): RuntimeState {
   const at = now();

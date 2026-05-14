@@ -11,7 +11,8 @@ export {
   readState,
   writeState,
   mutateState,
-  seedDefaultAgentFromRuntimeConfig
+  seedDefaultAgentFromRuntimeConfig,
+  isTerminalTaskStatus
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
