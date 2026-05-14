@@ -35,6 +35,24 @@ export default function ConnectionsPage() {
   const skills = useSkills();
   const invalidate = useInvalidate();
   const [open, setOpen] = useState(false);
+  // Auto-open the Add Connector dialog when the page loads with a
+  // recognized `?provider=<id>` query param. This is the back half of the
+  // Skills page "Connect →" deeplink — without it, the user lands here
+  // with the param set but still has to click "Add connector" manually.
+  // We wait for the providers list to arrive so an unknown id doesn't
+  // open the dialog with a stale fallback selection. Runs once per
+  // providers-fetch.
+  const [autoOpenedFor, setAutoOpenedFor] = useState<string | null>(null);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (!providers.data || providers.data.length === 0) return;
+    const candidate = new URL(window.location.href).searchParams.get("provider");
+    if (!candidate) return;
+    if (autoOpenedFor === candidate) return;
+    if (!providers.data.some((p) => p.id === candidate)) return;
+    setOpen(true);
+    setAutoOpenedFor(candidate);
+  }, [providers.data, autoOpenedFor]);
 
   const skillsByProvider = useMemo(() => groupDependentsByProvider(skills.data ?? []), [skills.data]);
 
@@ -122,6 +140,7 @@ export default function ConnectionsPage() {
                         </div>
                       )}
                     </div>
+                    <ConnectorFields connector={connector} />
                     <div>
                       <h4 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Dependent skills</h4>
                       {dependents.length === 0 ? (
@@ -175,6 +194,44 @@ export default function ConnectionsPage() {
         )}
       </div>
     </>
+  );
+}
+
+// Surface the connector's stored fields on the card so the user can
+// inspect what they entered after creation. Non-secret fields (api_url,
+// account ids) come from `metadata.fields` and are shown verbatim. Secret
+// fields list their `secretRefs[].purpose` only — never the value — so the
+// user can confirm "yes, the token is on file" without leaking it.
+function ConnectorFields({ connector }: { connector: ConnectorRecord }) {
+  const meta = (connector.metadata ?? {}) as Record<string, unknown>;
+  const rawFields = meta.fields;
+  const fieldEntries: Array<[string, string]> = [];
+  if (rawFields && typeof rawFields === "object" && !Array.isArray(rawFields)) {
+    for (const [key, value] of Object.entries(rawFields as Record<string, unknown>)) {
+      if (typeof value === "string") fieldEntries.push([key, value]);
+      else if (value != null) fieldEntries.push([key, String(value)]);
+    }
+  }
+  const secrets = connector.secretRefs ?? [];
+  if (fieldEntries.length === 0 && secrets.length === 0) return null;
+  return (
+    <div>
+      <h4 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Fields</h4>
+      <ul className="space-y-1">
+        {fieldEntries.map(([key, value]) => (
+          <li key={`field-${key}`} className="flex items-start justify-between gap-2 text-xs">
+            <span className="font-mono text-muted-foreground">{key}</span>
+            <span className="break-all font-mono text-[11px]">{value}</span>
+          </li>
+        ))}
+        {secrets.map((ref) => (
+          <li key={`secret-${ref.purpose}`} className="flex items-start justify-between gap-2 text-xs">
+            <span className="font-mono text-muted-foreground">{ref.purpose}</span>
+            <span className="font-mono text-[11px] text-muted-foreground">secret on file</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
