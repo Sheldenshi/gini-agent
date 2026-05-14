@@ -77,11 +77,11 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     method: "POST",
     body: JSON.stringify({ source: "openclaw", path: process.cwd() })
   });
-  const profileResult = await api(config, "/api/profiles", {
+  const agentResult = await api(config, "/api/agents", {
     method: "POST",
-    body: JSON.stringify({ name: "smoke-profile", toolsets: ["file", "memory", "session_search"] })
+    body: JSON.stringify({ name: "smoke-agent", toolsets: ["file", "memory", "session_search"] })
   });
-  await api(config, `/api/profiles/${profileResult.id}/use`, { method: "POST" });
+  await api(config, `/api/agents/${agentResult.id}/use`, { method: "POST" });
   const relayResult = await api(config, "/api/relays", {
     method: "POST",
     body: JSON.stringify({ name: "smoke-relay", endpoint: "local://smoke", mode: "local-only" })
@@ -125,7 +125,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     mcpId: mcpResult.id,
     messagingId: messagingResult.id,
     importReportId: importResult.id,
-    profileId: profileResult.id,
+    agentId: agentResult.id,
     relayId: relayResult.id,
     notificationId: notificationResult.id,
     snapshotId: snapshotResult.snapshotId,

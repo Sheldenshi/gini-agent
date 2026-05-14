@@ -43,7 +43,7 @@ bun run gini evidence
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
 | Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks |
-| Profiles/config | `gini profiles list/create/use`, instance-aware config |
+| Agents/config | `gini agents list/create/use/delete`, instance-aware config |
 | Import inspection | `gini import inspect openclaw <path>`, read-only by default |
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
@@ -59,7 +59,7 @@ Stable local clients use the gateway API:
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
-- `/api/messaging`, `/api/mcp`, `/api/subagents`
+- `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`

@@ -1,6 +1,7 @@
 import type { RuntimeConfig } from "../types";
 import { submitTask } from "../agent";
 import { addAudit, createMessagingBridgeRecord, createMessagingMessageRecord, mutateState, now, readState } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 
 export async function addMessagingBridge(config: RuntimeConfig, input: Record<string, unknown>) {
   const name = String(input.name ?? "");
@@ -67,8 +68,29 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
     const bridge = state.messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
     if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
     const text = String(input.text ?? "").trim();
-    const target = String(input.target ?? bridge.deliveryTargets[0] ?? "local");
     if (!text) throw new Error("Outbound message text is required.");
+    // Active-agent messaging-target whitelist. When the caller supplies an
+    // explicit target outside the filter we reject loudly so a misrouted
+    // message can't sneak past the agent's policy. When the caller doesn't
+    // specify a target we pick the first bridge.deliveryTarget that's
+    // permitted; if none are permitted we fall back to the bridge's
+    // first target so messaging never silently fails on a fresh instance
+    // with no agent restriction.
+    const effective = resolveEffectiveContext(state, config);
+    const requested = typeof input.target === "string" && input.target.length > 0 ? input.target : undefined;
+    let target: string;
+    if (requested !== undefined) {
+      if (effective.messagingTargetFilter && !effective.messagingTargetFilter.has(requested)) {
+        const agentLabel = effective.agentId ?? "active agent";
+        throw new Error(`Target '${requested}' not permitted by active agent '${agentLabel}'`);
+      }
+      target = requested;
+    } else if (effective.messagingTargetFilter) {
+      const permitted = bridge.deliveryTargets.find((t) => effective.messagingTargetFilter!.has(t));
+      target = permitted ?? bridge.deliveryTargets[0] ?? "local";
+    } else {
+      target = bridge.deliveryTargets[0] ?? "local";
+    }
     const status = bridge.status === "configured" ? "sent" : "failed";
     const message = createMessagingMessageRecord(state, {
       bridgeId: bridge.id,

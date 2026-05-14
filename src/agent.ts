@@ -36,6 +36,7 @@ import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
 import { approvalToolCallId } from "./execution/tool-dispatch";
+import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
 import { syncSubagentFromTask } from "./capabilities/subagents";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
@@ -287,7 +288,14 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   }
 
   // No tool matched: fall through to provider summarization.
-  const activeMemory = await mutateState(config.instance, (state) => state.memories.filter((memory) => memory.status === "active"));
+  // Phase C — resolve the active agent so memory access (pinned + recall +
+  // proposed) all use the same isolation key.
+  const memoryState = await mutateState(config.instance, (state) => state);
+  const memoryEffective = resolveEffectiveContext(memoryState, config);
+  const activeAgentId = memoryEffective.agentId;
+  const activeMemory = memoryState.memories.filter((memory) =>
+    memory.status === "active" && (!activeAgentId || memory.agentId === activeAgentId)
+  );
 
   // Hindsight phase 5: auto-recall. Pull relevant facts/opinions from the
   // four-network store and inject as additional context. Best-effort — if
@@ -295,23 +303,30 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   // legacy MemoryRecord injection only.
   let recalledContext: string | undefined;
   let hindsightUnitsRecalled = 0;
-  try {
-    const recalled = await recall(config, { query: task.input, tokenBudget: 1500, sourceTaskId: taskId });
-    if (recalled.units.length > 0) {
-      hindsightUnitsRecalled = recalled.units.length;
-      // Pass the formatted block to the provider as system-area context;
-      // generateTaskSummary places it in `instructions` (system role) so it
-      // inherits the model's default trust without verbal pleading.
-      recalledContext = recalled.units
-        .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
-        .join("\n");
+  if (activeAgentId) {
+    try {
+      const recalled = await recall(config, {
+        agentId: activeAgentId,
+        query: task.input,
+        tokenBudget: 1500,
+        sourceTaskId: taskId
+      });
+      if (recalled.units.length > 0) {
+        hindsightUnitsRecalled = recalled.units.length;
+        // Pass the formatted block to the provider as system-area context;
+        // generateTaskSummary places it in `instructions` (system role) so it
+        // inherits the model's default trust without verbal pleading.
+        recalledContext = recalled.units
+          .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
+          .join("\n");
+      }
+    } catch (error) {
+      appendTrace(config.instance, taskId, {
+        type: "memory",
+        message: "auto-recall failed",
+        data: { error: error instanceof Error ? error.message : String(error) }
+      });
     }
-  } catch (error) {
-    appendTrace(config.instance, taskId, {
-      type: "memory",
-      message: "auto-recall failed",
-      data: { error: error instanceof Error ? error.message : String(error) }
-    });
   }
 
   // Debounced streaming: codex emits many small SSE deltas. Buffer them and
@@ -353,10 +368,17 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     if (lower.includes("remember ")) {
+      // Phase C — reject loud when no active agent so we don't silently
+      // leak into a default pool. Message matches createMemoryFromInput
+      // so the gateway's statusFromErrorMessage mapping to 400 applies
+      // uniformly across the legacy + remember-prefix create paths.
+      if (!activeAgentId) {
+        throw new Error("Cannot create memory: no active agent.");
+      }
       const content = item.input.split(/remember\s+/i).at(-1)?.trim() || item.input;
       const memory = createMemory(state, {
+        agentId: activeAgentId,
         content,
-        scope: "project",
         sourceTaskId: item.id,
         confidence: 0.7,
         status: "proposed",
@@ -433,10 +455,23 @@ function shouldAutoRetain(task: Task): boolean {
 
 function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
   if (!shouldAutoRetain(task)) return;
+  // Phase C — resolve the active agent at retain time so the new units
+  // land in the right pool. If no agent is active (degenerate state), skip
+  // retain rather than leaking into the default bank.
+  const state = readState(config.instance);
+  const effective = resolveEffectiveContext(state, config);
+  if (!effective.agentId) {
+    appendTrace(config.instance, task.id, {
+      type: "memory",
+      message: "auto-retain skipped: no active agent",
+      data: {}
+    });
+    return;
+  }
   const text = task.summary
     ? `Task input: ${task.input}\n\nTask summary: ${task.summary}`
     : `Task input: ${task.input}`;
-  retain(config, { text, sourceTaskId: task.id })
+  retain(config, { agentId: effective.agentId, text, sourceTaskId: task.id })
     .then((result) => {
       appendTrace(config.instance, task.id, {
         type: "memory",

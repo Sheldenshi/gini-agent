@@ -31,7 +31,9 @@ import type {
 import {
   DEFAULT_BANK_ID,
   appendTrace,
+  bankIdForAgent,
   deserializeEmbedding,
+  ensureAgentBank,
   ensureDefaultBank,
   getMemoryDb,
   linksFromMany,
@@ -61,6 +63,12 @@ export const CHANNEL_MULTIPLIERS: Record<MemoryLink["linkType"], number> = {
 export type RecallChannel = "semantic" | "bm25" | "graph" | "temporal";
 
 export interface RecallInput {
+  // Phase C — required isolation key. Recall filters all candidates by
+  // `agent_id = agentId` before fusion so we never waste work on units
+  // outside the active agent's pool. Callers resolve this from
+  // resolveEffectiveContext(state, config).agentId; the chat-task loop
+  // does this once per task and threads it through.
+  agentId: string;
   bankId?: string;
   query: string;
   tokenBudget?: number;
@@ -87,8 +95,13 @@ export interface RecallOutput {
 
 export async function recall(config: RuntimeConfig, input: RecallInput): Promise<RecallOutput> {
   const instance = config.instance;
+  if (!input.agentId) throw new Error("recall: agentId is required (Phase C per-agent memory isolation)");
   ensureDefaultBank(instance);
-  const bankId = input.bankId ?? DEFAULT_BANK_ID;
+  // Ensure the agent's per-agent bank exists; first access creates it
+  // empty. The bank is the primary scope; agent_id on each unit is the
+  // belt-and-braces filter used by every channel below.
+  ensureAgentBank(instance, input.agentId);
+  const bankId = input.bankId ?? bankIdForAgent(input.agentId);
   const tokenBudget = input.tokenBudget ?? DEFAULT_TOKEN_BUDGET;
 
   // 1. Embed the query (we'll need it for semantic + graph seeds).
@@ -97,13 +110,14 @@ export async function recall(config: RuntimeConfig, input: RecallInput): Promise
 
   // 2. Run channels in parallel where they're independent. Semantic channel
   // is scoped to the active provider's model — vectors from other models
-  // live in a different space, so a cross-model cosine is meaningless.
+  // live in a different space, so a cross-model cosine is meaningless. All
+  // channels additionally filter by agent_id (Phase C isolation).
   const [semanticHits, bm25Hits, temporalHits] = await Promise.all([
-    runSemanticChannel(instance, bankId, queryVector ?? null, embedProvider.model, input.network),
-    Promise.resolve(runBm25Channel(instance, bankId, input.query, input.network)),
-    Promise.resolve(runTemporalChannel(instance, bankId, input.query, input.reference, input.network))
+    runSemanticChannel(instance, bankId, input.agentId, queryVector ?? null, embedProvider.model, input.network),
+    Promise.resolve(runBm25Channel(instance, bankId, input.agentId, input.query, input.network)),
+    Promise.resolve(runTemporalChannel(instance, bankId, input.agentId, input.query, input.reference, input.network))
   ]);
-  const graphHits = runGraphChannel(instance, semanticHits.slice(0, GRAPH_SEED_K).map((entry) => entry.unit.id));
+  const graphHits = runGraphChannel(instance, input.agentId, semanticHits.slice(0, GRAPH_SEED_K).map((entry) => entry.unit.id));
 
   // 3. RRF fuse.
   const fused = fuseRrf({
@@ -168,6 +182,7 @@ interface ChannelHit {
 async function runSemanticChannel(
   instance: string,
   bankId: string,
+  agentId: string,
   queryVector: Float32Array | null,
   queryModel: string,
   networks: Network[] | undefined
@@ -180,13 +195,15 @@ async function runSemanticChannel(
   // Filter by embedding_model: cross-model cosine is meaningless. Units
   // embedded with a different model become invisible to semantic recall
   // until a `gini embedding reembed` walks them with the new provider.
+  // Also filter by agent_id (Phase C) so we never score units outside the
+  // active agent's pool.
   const rows = db
     .query<RawUnitRow, (string | number)[]>(
-      `SELECT * FROM memory_units WHERE bank_id = ? AND status = 'active'
+      `SELECT * FROM memory_units WHERE bank_id = ? AND agent_id = ? AND status = 'active'
               AND embedding IS NOT NULL AND embedding_dim = ?
               AND embedding_model = ? ${networkClause}`
     )
-    .all(bankId, queryVector.length, queryModel, ...(networks ?? []));
+    .all(bankId, agentId, queryVector.length, queryModel, ...(networks ?? []));
   const hits: ChannelHit[] = [];
   for (const row of rows) {
     const vector = deserializeEmbedding(row.embedding, row.embedding_dim);
@@ -202,6 +219,7 @@ async function runSemanticChannel(
 function runBm25Channel(
   instance: string,
   bankId: string,
+  agentId: string,
   query: string,
   networks: Network[] | undefined
 ): ChannelHit[] {
@@ -220,11 +238,11 @@ function runBm25Channel(
         `SELECT mu.*, bm25(memory_units_fts) AS rank
          FROM memory_units_fts
          JOIN memory_units mu ON mu.rowid = memory_units_fts.rowid
-         WHERE memory_units_fts MATCH ? AND mu.bank_id = ? AND mu.status = 'active' ${networkClause}
+         WHERE memory_units_fts MATCH ? AND mu.bank_id = ? AND mu.agent_id = ? AND mu.status = 'active' ${networkClause}
          ORDER BY rank
          LIMIT 100`
       )
-      .all(safe, bankId, ...(networks ?? []));
+      .all(safe, bankId, agentId, ...(networks ?? []));
     return rows.map((row) => ({
       unit: rowToUnit(row),
       // FTS5 bm25() returns negative scores (lower = better); flip to positive
@@ -239,6 +257,7 @@ function runBm25Channel(
 interface RawUnitRow {
   id: string;
   bank_id: string;
+  agent_id: string | null;
   text: string;
   embedding: Uint8Array | null;
   embedding_dim: number | null;
@@ -266,6 +285,7 @@ function rowToUnit(row: RawUnitRow): MemoryUnit {
   return {
     id: row.id,
     bankId: row.bank_id,
+    agentId: row.agent_id,
     text: row.text,
     embedding: deserializeEmbedding(row.embedding, row.embedding_dim),
     embeddingDim: row.embedding_dim,
@@ -290,7 +310,7 @@ function rowToUnit(row: RawUnitRow): MemoryUnit {
 // out to GRAPH_HOPS hops, decaying activation by δ * channel-multiplier per
 // hop. Stops at units below GRAPH_MIN_ACTIVATION. Returns one entry per
 // visited non-seed unit.
-function runGraphChannel(instance: string, seedIds: string[]): ChannelHit[] {
+function runGraphChannel(instance: string, agentId: string, seedIds: string[]): ChannelHit[] {
   if (seedIds.length === 0) return [];
   const db = getMemoryDb(instance);
   // activation map: unitId -> max activation observed so far.
@@ -323,11 +343,15 @@ function runGraphChannel(instance: string, seedIds: string[]): ChannelHit[] {
 
   const ids = [...activation.keys()];
   const placeholders = ids.map(() => "?").join(",");
+  // Belt-and-braces: seeds are already agent-scoped (semantic channel
+  // filters on agent_id), but spreading activation crosses memory_links
+  // edges and a future cross-agent link would otherwise leak. Filter
+  // explicitly so the graph channel can't escape the agent's pool.
   const rows = db
     .query<RawUnitRow, string[]>(
-      `SELECT * FROM memory_units WHERE id IN (${placeholders}) AND status = 'active'`
+      `SELECT * FROM memory_units WHERE id IN (${placeholders}) AND agent_id = ? AND status = 'active'`
     )
-    .all(...ids);
+    .all(...ids, agentId);
   const hits: ChannelHit[] = rows.map((row) => ({
     unit: rowToUnit(row),
     score: activation.get(row.id) ?? 0
@@ -339,6 +363,7 @@ function runGraphChannel(instance: string, seedIds: string[]): ChannelHit[] {
 function runTemporalChannel(
   instance: string,
   bankId: string,
+  agentId: string,
   query: string,
   reference: string | undefined,
   networks: Network[] | undefined
@@ -354,14 +379,14 @@ function runTemporalChannel(
   const rows = db
     .query<RawUnitRow, (string | number)[]>(
       `SELECT * FROM memory_units
-       WHERE bank_id = ? AND status = 'active'
+       WHERE bank_id = ? AND agent_id = ? AND status = 'active'
          AND occurred_start IS NOT NULL AND occurred_end IS NOT NULL
          AND occurred_start <= ? AND occurred_end >= ?
          ${networkClause}
        ORDER BY occurred_start DESC
        LIMIT 100`
     )
-    .all(bankId, range.end, range.start, ...(networks ?? []));
+    .all(bankId, agentId, range.end, range.start, ...(networks ?? []));
 
   const queryMid = (Date.parse(range.start) + Date.parse(range.end)) / 2;
   const queryHalfWidth = Math.max(1, (Date.parse(range.end) - Date.parse(range.start)) / 2);

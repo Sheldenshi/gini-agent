@@ -9,7 +9,7 @@ import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, up
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
 import { embeddingStatus, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
-import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, DEFAULT_BANK_ID, type Network } from "./state";
+import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
@@ -21,7 +21,8 @@ import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./
 import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
-import { createProfile, listProfiles, useProfile } from "./capabilities/profiles";
+import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
+import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
@@ -82,7 +83,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/audit$/, () => json(readState(config.instance).audit)],
     ["GET", /^\/api\/events$/, () => json(readState(config.instance).events)],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
-    ["GET", /^\/api\/memory$/, () => json(readState(config.instance).memories)],
+    ["GET", /^\/api\/memory$/, () => {
+      // Phase C — MemoryRecord listings are scoped to the active agent so
+      // the web UI's "Memory" page only shows the active agent's pool.
+      const state = readState(config.instance);
+      const effective = resolveEffectiveContext(state, config);
+      const memories = effective.agentId
+        ? state.memories.filter((memory) => memory.agentId === effective.agentId)
+        : state.memories;
+      return json(memories);
+    }],
     ["POST", /^\/api\/memory$/, async (request) => {
       return json(await createMemoryFromInput(config, await body(request)), 201);
     }],
@@ -94,9 +104,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // Hindsight phase 4: reflect pipeline.
     ["POST", /^\/api\/memory\/reflect$/, async (request) => {
       const payload = await body(request);
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
       const query = String(payload.query ?? "").trim();
       if (!query) return json({ error: "query is required" }, 400);
       const result = await reflect(config, {
+        agentId: effective.agentId,
         query,
         bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
         tokenBudget: typeof payload.tokenBudget === "number" ? payload.tokenBudget : undefined,
@@ -107,6 +120,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // Hindsight phase 3: recall pipeline.
     ["POST", /^\/api\/memory\/recall$/, async (request) => {
       const payload = await body(request);
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
       const query = String(payload.query ?? "").trim();
       if (!query) return json({ error: "query is required" }, 400);
       const networkRaw = Array.isArray(payload.network) ? payload.network : undefined;
@@ -114,6 +129,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         ? networkRaw.filter((value): value is Network => value === "world" || value === "experience" || value === "opinion" || value === "observation")
         : undefined;
       const result = await recall(config, {
+        agentId: effective.agentId,
         query,
         bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
         tokenBudget: typeof payload.tokenBudget === "number" ? payload.tokenBudget : undefined,
@@ -126,9 +142,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // catch-all /api/memory/:id pattern below.
     ["POST", /^\/api\/memory\/retain$/, async (request) => {
       const payload = await body(request);
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
       const text = String(payload.text ?? "").trim();
       if (!text) return json({ error: "text is required" }, 400);
       const result = await retain(config, {
+        agentId: effective.agentId,
         text,
         bankId: typeof payload.bankId === "string" ? payload.bankId : undefined,
         sourceTaskId: typeof payload.sourceTaskId === "string" ? payload.sourceTaskId : undefined,
@@ -140,8 +159,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/memory\/units$/, (request) => {
       const url = new URL(request.url);
       const networkParam = url.searchParams.get("network");
-      const bankId = url.searchParams.get("bank") ?? DEFAULT_BANK_ID;
       ensureDefaultBank(config.instance);
+      // Phase C — list the active agent's units by default. Caller may
+      // still override with ?bank= for the legacy default bank, but the
+      // agent_id filter still applies so cross-agent visibility never
+      // accidentally leaks through.
+      const state = readState(config.instance);
+      const effective = resolveEffectiveContext(state, config);
+      const agentId = effective.agentId;
+      const defaultBank = agentId ? `bank_${agentId}` : DEFAULT_BANK_ID;
+      const bankId = url.searchParams.get("bank") ?? defaultBank;
       const networks = networkParam
         ? networkParam.split(",").filter((value): value is Network =>
             value === "world" || value === "experience" || value === "opinion" || value === "observation"
@@ -149,6 +176,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         : undefined;
       const limit = Number(url.searchParams.get("limit") ?? 200);
       const units = listMemoryUnits(config.instance, bankId, {
+        agentId,
         network: networks && networks.length > 0 ? networks : undefined,
         limit
       });
@@ -166,7 +194,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/reranker\/status$/, () => json(rerankerStatus(config))],
     ["GET", /^\/api\/memory\/banks$/, () => {
       ensureDefaultBank(config.instance);
-      return json(listBanks(config.instance));
+      // Phase C — list banks belonging to the active agent only. The
+      // ambient default bank stays hidden so the web Memory page surfaces
+      // a single per-agent bank instead of a mixed pool.
+      const state = readState(config.instance);
+      const effective = resolveEffectiveContext(state, config);
+      if (effective.agentId) {
+        ensureAgentBank(config.instance, effective.agentId);
+      }
+      const banks = listBanks(config.instance).filter((bank) =>
+        effective.agentId ? bank.agentId === effective.agentId : true
+      );
+      return json(banks);
     }],
     ["GET", /^\/api\/memory\/banks\/([^/]+)$/, (_request, params) => {
       ensureDefaultBank(config.instance);
@@ -263,9 +302,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
-    ["GET", /^\/api\/profiles$/, () => json(listProfiles(config))],
-    ["POST", /^\/api\/profiles$/, async (request) => json(await createProfile(config, await body(request)), 201)],
-    ["POST", /^\/api\/profiles\/([^/]+)\/use$/, async (_request, params) => json(await useProfile(config, params[0]))],
+    ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
+    ["POST", /^\/api\/agents$/, async (request) => json(await createAgent(config, await body(request)), 201)],
+    ["POST", /^\/api\/agents\/([^/]+)\/use$/, async (_request, params) => json(await useAgent(config, params[0]))],
+    ["DELETE", /^\/api\/agents\/([^/]+)$/, async (_request, params) => json(await deleteAgent(config, params[0]))],
     ["GET", /^\/api\/parity\/hermes$/, () => json(hermesParityChecks(config))],
     ["GET", /^\/api\/readiness\/v1$/, () => json(v1Readiness(config))],
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
@@ -342,7 +382,17 @@ function json(value: unknown, statusCode = 200): Response {
 // previous catch-all 500. Anything else stays 500.
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
+  if (message.startsWith("Agent not found")) return 404;
   if (message.startsWith("Invalid input")) return 400;
+  // Agent delete guards (default agent, active agent) throw user-input
+  // errors that should surface as 400.
+  if (message.startsWith("Cannot delete")) return 400;
+  // Memory write paths (createMemoryFromInput, the "remember "-prefix
+  // path in agent.ts) throw this when no agent is active. Sibling routes
+  // (/memory/retain, /memory/recall, /memory/reflect) already return 400
+  // for the same condition — map this here so legacy POST /api/memory
+  // matches.
+  if (message.includes("no active agent")) return 400;
   // Browser-connect surfaces user-input failures with these prefixes;
   // forward them to 400 so the webapp can surface the original error text
   // rather than a generic "internal error". Connectivity failures

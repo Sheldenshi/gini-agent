@@ -20,7 +20,6 @@ import type {
 import type {
   ChatMessage,
   ChatSession,
-  ReadinessResult,
   RuntimeStateSnapshot
 } from "@/lib/view-types";
 
@@ -82,7 +81,7 @@ export function useHindsightUnits(network: string = "all") {
   return useQuery<HindsightUnitView[]>({
     queryKey: ["memory", "hindsight", network],
     queryFn: () => {
-      const params = new URLSearchParams({ bank: "bank_default", limit: "200" });
+      const params = new URLSearchParams({ limit: "200" });
       if (network !== "all") params.set("network", network);
       return api<HindsightUnitView[]>(`/memory/units?${params.toString()}`);
     },
@@ -309,21 +308,6 @@ export function useWipeBrowserProfile() {
   });
 }
 
-export function useReadiness() {
-  return useQuery<ReadinessResult>({
-    queryKey: ["readiness"],
-    queryFn: () => api<ReadinessResult>("/readiness/v1"),
-    refetchInterval: 30_000
-  });
-}
-
-export function useParity() {
-  return useQuery<ReadinessResult>({
-    queryKey: ["parity"],
-    queryFn: () => api<ReadinessResult>("/parity/hermes"),
-    refetchInterval: 30_000
-  });
-}
 
 /**
  * Returns a function that batches invalidate() calls within a tick.

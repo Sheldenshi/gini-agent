@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import {
   closeAllMemoryDbs,
   countByNetwork,
@@ -14,6 +15,7 @@ import {
   insertMemoryUnit,
   linkUnitToEntity,
   linksFrom,
+  listMemoryUnits,
   memoryDbPath,
   probeMemoryDb,
   removeMemoryDb,
@@ -265,6 +267,107 @@ describe("memory-db schema and storage", () => {
     const fresh = getMemoryDb(instance);
     const c = fresh.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM memory_units").get()?.c;
     expect(c).toBe(0);
+  });
+
+  test("upgrades a v1-shaped DB (no agent_id columns) without throwing", () => {
+    // Reproduce the pre-Phase-C schema on disk, close, then reopen via
+    // applyMigrations. The bug being guarded against: emitting
+    //   CREATE INDEX ... ON memory_units(agent_id)
+    // before the additive ensureColumn ALTER TABLEs ran would throw
+    // "no such column: agent_id" on every existing v1 install.
+    const instance = "mem-v1-upgrade";
+    mkdirSync(instanceRoot(instance), { recursive: true });
+    const path = memoryDbPath(instance);
+
+    // Hand-craft a v1 schema: same shape as the original applyMigrations
+    // but WITHOUT the agent_id columns or their indexes. Includes the
+    // FTS5 mirror so the upgrade has to coexist with the triggers.
+    const raw = new Database(path, { create: true });
+    raw.exec("PRAGMA journal_mode = WAL");
+    raw.exec("PRAGMA synchronous = NORMAL");
+    raw.exec("PRAGMA foreign_keys = ON");
+    raw.exec(`
+      CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE memory_banks (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        agent_name TEXT,
+        background TEXT,
+        skepticism INTEGER NOT NULL DEFAULT 3,
+        literalism INTEGER NOT NULL DEFAULT 3,
+        empathy INTEGER NOT NULL DEFAULT 3,
+        bias_strength REAL NOT NULL DEFAULT 0.5,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE memory_units (
+        id TEXT PRIMARY KEY,
+        bank_id TEXT NOT NULL REFERENCES memory_banks(id) ON DELETE CASCADE,
+        text TEXT NOT NULL,
+        embedding BLOB,
+        embedding_dim INTEGER,
+        embedding_model TEXT,
+        occurred_start TEXT,
+        occurred_end TEXT,
+        mentioned_at TEXT NOT NULL,
+        network TEXT NOT NULL CHECK (network IN ('world','experience','opinion','observation')),
+        confidence REAL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        source_task_id TEXT,
+        source_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('proposed','active','archived','rejected','conflicted')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_used_at TEXT,
+        usage_count INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX idx_memory_units_bank ON memory_units(bank_id);
+      CREATE INDEX idx_memory_units_network ON memory_units(bank_id, network);
+      CREATE INDEX idx_memory_units_status ON memory_units(bank_id, status);
+      INSERT INTO schema_meta(key, value) VALUES ('version', '1');
+      INSERT INTO memory_banks (id, name, created_at, updated_at)
+        VALUES ('bank_default', 'default', '2025-01-01', '2025-01-01');
+      INSERT INTO memory_units
+        (id, bank_id, text, mentioned_at, network, metadata, status, created_at, updated_at, usage_count)
+        VALUES ('mu_legacy_1', 'bank_default', 'legacy row without agent_id', '2025-01-01', 'world', '{}', 'active', '2025-01-01', '2025-01-01', 0);
+    `);
+    raw.close();
+
+    // Reopen through the production code path — must NOT throw.
+    expect(() => getMemoryDb(instance)).not.toThrow();
+
+    const db = getMemoryDb(instance);
+    // Schema is now upgraded: agent_id columns exist on both tables.
+    const banksCols = db
+      .query<{ name: string }, []>(`PRAGMA table_info(memory_banks)`)
+      .all()
+      .map((row) => row.name);
+    expect(banksCols).toContain("agent_id");
+    const unitsCols = db
+      .query<{ name: string }, []>(`PRAGMA table_info(memory_units)`)
+      .all()
+      .map((row) => row.name);
+    expect(unitsCols).toContain("agent_id");
+    // schema_meta is bumped to the current version.
+    const versionRow = db
+      .query<{ value: string }, [string]>("SELECT value FROM schema_meta WHERE key = ?")
+      .get("version");
+    expect(versionRow?.value).toBe(String(MEMORY_SCHEMA_VERSION));
+
+    // Legacy row survives and subsequent agent_id-scoped queries work
+    // (i.e. the agent_id index is usable).
+    const legacy = getMemoryUnit(instance, "mu_legacy_1");
+    expect(legacy?.agentId).toBeNull();
+
+    // Insert a new row stamped with an agent and confirm the agent_id
+    // filter narrows correctly — exercises the new agent_id index path.
+    const stamped = insertMemoryUnit(instance, {
+      text: "scoped to agent",
+      network: "world",
+      agentId: "agent_test"
+    });
+    const scoped = listMemoryUnits(instance, "bank_default", { agentId: "agent_test" });
+    expect(scoped.map((unit) => unit.id)).toEqual([stamped.id]);
   });
 
   test("resetInstance clears the memory DB and probe reports zero units", () => {

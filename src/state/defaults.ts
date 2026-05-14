@@ -1,4 +1,4 @@
-import type { Instance, ProfileRecord, ToolRecord, ToolsetRecord } from "../types";
+import type { AgentRecord, Instance, ToolRecord, ToolsetRecord } from "../types";
 import { riskForTool } from "../execution/tool-risk";
 
 export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[] {
@@ -129,16 +129,22 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
   }));
 }
 
-export function defaultProfile(instance: Instance, at: string): ProfileRecord {
+export function defaultAgent(instance: Instance, at: string): AgentRecord {
+  // providerName/model intentionally left undefined here. The seeding
+  // step in createEmptyState / normalizeState populates them from
+  // RuntimeConfig.provider on first run (or on the one-time migration
+  // away from the legacy echo defaults). Leaving them undefined here
+  // means an agent created via this helper without further seeding
+  // simply falls back to the instance provider in
+  // resolveEffectiveContext.
   return {
-    id: "profile_default",
+    id: "agent_default",
     instance,
     name: "default",
     status: "active",
-    providerName: "echo",
-    model: "gini-echo-v0",
+    providerName: undefined,
+    model: undefined,
     toolsets: ["file", "terminal", "memory", "session_search", "delegation"],
-    memoryScopes: ["user", "project", "device", "temporary"],
     messagingTargets: [],
     createdAt: at,
     updatedAt: at

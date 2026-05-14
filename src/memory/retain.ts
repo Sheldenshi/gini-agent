@@ -30,6 +30,8 @@ import {
   DEFAULT_BANK_ID,
   addAudit,
   appendTrace,
+  bankIdForAgent,
+  ensureAgentBank,
   ensureDefaultBank,
   getMemoryDb,
   insertLink,
@@ -43,6 +45,7 @@ import {
 } from "../state";
 import { generateStructured } from "../provider";
 import { cosineSimilarity, getEmbeddingProvider } from "../embeddings";
+import { providerOverrideForRuntime } from "../execution/effective-context";
 import { resolveOrCreateEntity } from "./entities";
 import {
   factExtractionValidator,
@@ -62,6 +65,10 @@ export const FACT_EXTRACTION_USER_TEMPLATE = (text: string, mentionedAt: string)
   `MENTIONED_AT: ${mentionedAt}\n\nTEXT:\n"""\n${text}\n"""\n\nReturn { "facts": [ {what, when, where, who, why, fact_type, occurred_start?, occurred_end?, entities?: [{text, entity_type?}], causal_relations?: [{target_fact_index, relation_type, strength}]} ] }. Use ISO 8601 strings for occurred_start/occurred_end. fact_type ∈ {world, experience, opinion}.`;
 
 export interface RetainInput {
+  // Phase C: stamped onto every unit so the recall pipeline can filter the
+  // active agent's pool without joining memory_banks. Required: a write with
+  // no agentId would leak into the global pool, so we reject loud.
+  agentId: string;
   bankId?: string;
   text: string;
   sourceTaskId?: string;
@@ -79,9 +86,15 @@ export interface RetainOutput {
 
 export async function retain(config: RuntimeConfig, input: RetainInput): Promise<RetainOutput> {
   const instance = config.instance;
+  if (!input.agentId) throw new Error("retain: agentId is required (Phase C per-agent memory isolation)");
   ensureDefaultBank(instance);
-  const bankId = input.bankId ?? DEFAULT_BANK_ID;
+  ensureAgentBank(instance, input.agentId);
+  const bankId = input.bankId ?? bankIdForAgent(input.agentId);
   const mentionedAt = input.mentionedAt ?? now();
+
+  // Resolve the active agent's provider override once (if any). Embedding
+  // and reranker calls keep reading config.provider — see ADR 0006.
+  const providerOverride = providerOverrideForRuntime(config);
 
   // 1. LLM extraction.
   const extraction = await generateStructured(config, {
@@ -90,7 +103,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     schemaName: "FactExtractionResponse",
     validator: factExtractionValidator,
     echoTag: "fact-extraction"
-  });
+  }, providerOverride);
   const facts = extraction.data.facts ?? [];
 
   // 2. Temporal normalization.
@@ -108,6 +121,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
     const fact = normalized[i]!;
     const unit = insertMemoryUnit(instance, {
       bankId,
+      agentId: input.agentId,
       text: narratives[i]!,
       embedding: embeddings[i] ?? null,
       embeddingModel: embedProvider.model,
@@ -247,7 +261,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   let observationsRegenerated = 0;
   for (const entityId of touchedEntityIds) {
     try {
-      await regenerateObservation(config, bankId, entityId);
+      await regenerateObservation(config, bankId, entityId, input.agentId, providerOverride);
       observationsRegenerated += 1;
     } catch (error) {
       // Observation failures are non-fatal — emit a trace and continue.
@@ -334,7 +348,13 @@ async function maybeReinforceOpinions(config: RuntimeConfig, bankId: string, uni
   }
 }
 
-async function regenerateObservation(config: RuntimeConfig, bankId: string, entityId: string): Promise<void> {
+async function regenerateObservation(
+  config: RuntimeConfig,
+  bankId: string,
+  entityId: string,
+  agentId: string,
+  providerOverride?: import("../types").ProviderConfig
+): Promise<void> {
   const instance = config.instance;
   const facts = unitsForEntity(instance, entityId, OBSERVATION_FACT_LIMIT)
     .filter((unit) => unit.network === "world" || unit.network === "experience");
@@ -357,7 +377,7 @@ async function regenerateObservation(config: RuntimeConfig, bankId: string, enti
     schemaName: "ObservationExtractionResponse",
     validator: observationExtractionValidator,
     echoTag: `observation:${entityId}`
-  });
+  }, providerOverride);
   const observations = result.data.observations.map((entry) => entry.observation).filter(Boolean);
   if (observations.length === 0) return;
   const summary = observations.join(" ");
@@ -365,7 +385,7 @@ async function regenerateObservation(config: RuntimeConfig, bankId: string, enti
   // can reach it.
   const embedProvider = getEmbeddingProvider(config);
   const [vector] = await embedProvider.embed([summary]);
-  upsertObservationUnit(instance, bankId, entityId, summary, vector ?? null, embedProvider.model);
+  upsertObservationUnit(instance, bankId, entityId, summary, vector ?? null, embedProvider.model, agentId);
 }
 
 // --------------------------------------------------------------------------

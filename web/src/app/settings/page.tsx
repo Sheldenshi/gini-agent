@@ -4,29 +4,24 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useInvalidate, useParity, useReadiness, useState_ } from "@/lib/queries";
-import { InstanceCard } from "./_components/InstanceCard";
+import { useInvalidate, useStatus } from "@/lib/queries";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
-import { ProfileCard, type ProfileRow } from "./_components/ProfileCard";
+import { AgentCard, type AgentRow } from "./_components/AgentCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
 import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
-import { DevicesCard, PromotionsCard, type DeviceRow, type PromotionRow } from "./_components/DevicesCard";
-import { SnapshotsCard, type SnapshotRow } from "./_components/SnapshotsCard";
-import { ParityCard } from "./_components/ParityCard";
+import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 
 export default function SettingsPage() {
-  const state = useState_();
-  const parity = useParity();
-  const readiness = useReadiness();
   const invalidate = useInvalidate();
+  const status = useStatus();
   const catalog = useQuery({
     queryKey: ["providers"],
     queryFn: () => api<ProviderCatalogItem[]>("/providers/catalog"),
     refetchInterval: 60_000
   });
-  const profiles = useQuery({
-    queryKey: ["profiles"],
-    queryFn: () => api<{ profiles: ProfileRow[]; activeProfileId?: string }>("/profiles")
+  const agents = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
   });
   const toolsets = useQuery({
     queryKey: ["toolsets"],
@@ -44,17 +39,10 @@ export default function SettingsPage() {
     queryKey: ["devices"],
     queryFn: () => api<DeviceRow[]>("/devices")
   });
-  const promotions = useQuery({
-    queryKey: ["promotions"],
-    queryFn: () => api<PromotionRow[]>("/promotions")
-  });
-  // Snapshots are exposed via /api/state but not via a dedicated /snapshots
-  // route, so we read from the state snapshot. (See src/state.ts:readState.)
-  const snapshots = ((state.data?.snapshots ?? []) as SnapshotRow[]).slice().reverse();
 
-  const useProfile = useMutation({
-    mutationFn: (id: string) => api(`/profiles/${encodeURIComponent(id)}/use`, { method: "POST" }),
-    onSuccess: () => { toast.success("Profile activated"); invalidate(["profiles", "state"]); },
+  const useAgent = useMutation({
+    mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
+    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state"]); },
     onError: (error: Error) => toast.error(error.message)
   });
 
@@ -101,22 +89,30 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const activeProfileId = profiles.data?.activeProfileId ?? state.data?.activeProfileId;
+  const activeAgentId = agents.data?.activeAgentId;
+  // Prefer activeAgent.resolvedProvider (Phase B) and fall back to
+  // provider.provider for safety during rollout — older runtimes that
+  // pre-date the activeAgent block still surface the legacy field.
+  const effectiveProviderName = status.data?.activeAgent?.resolvedProvider?.name
+    ?? status.data?.provider?.provider?.name;
+  const effectiveProviderModel = status.data?.activeAgent?.resolvedProvider?.model
+    ?? status.data?.provider?.provider?.model;
+  const catalogEntry = catalog.data?.find((c) => c.name === effectiveProviderName);
+  const displayName = catalogEntry?.displayName ?? effectiveProviderName;
+  const agentWarnings = status.data?.activeAgent?.warnings ?? [];
 
   return (
     <>
-      <PageHeader title="Settings" description="Instance, providers, profiles, integrations, devices, parity & readiness" />
+      <PageHeader title="Settings" description="Providers, agents, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
-        <div className="grid gap-3 lg:grid-cols-2">
-          <InstanceCard instance={state.data?.instance} activeProfileId={activeProfileId} />
-          <ProviderCard catalog={catalog.data} />
-        </div>
+        <ProviderCard displayName={displayName} model={effectiveProviderModel} />
 
-        <ProfileCard
-          profiles={profiles.data?.profiles ?? []}
-          activeProfileId={activeProfileId}
-          pending={useProfile.isPending}
-          onUse={(id) => useProfile.mutate(id)}
+        <AgentCard
+          agents={agents.data?.agents ?? []}
+          activeAgentId={activeAgentId}
+          warnings={agentWarnings}
+          pending={useAgent.isPending}
+          onUse={(id) => useAgent.mutate(id)}
         />
 
         <ToolsetsCard
@@ -148,15 +144,6 @@ export default function SettingsPage() {
           onRevoke={(id) => deviceRevoke.mutate(id)}
           onCreatePairing={() => createPairing.mutate()}
         />
-
-        <PromotionsCard promotions={promotions.data ?? []} />
-
-        <SnapshotsCard snapshots={snapshots} />
-
-        <div className="grid gap-3 lg:grid-cols-2">
-          <ParityCard title="Hermes parity" result={parity.data} />
-          <ParityCard title="V1 readiness" result={readiness.data} />
-        </div>
       </div>
     </>
   );

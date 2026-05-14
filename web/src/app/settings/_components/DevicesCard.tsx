@@ -6,7 +6,6 @@ import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 
 export interface DeviceRow { id: string; name: string; status: string }
-export interface PromotionRow { id: string; status: string; candidateRef: string; summary: string }
 
 export function DevicesCard({
   devices,
@@ -65,30 +64,3 @@ export function DevicesCard({
   );
 }
 
-export function PromotionsCard({ promotions }: { promotions: PromotionRow[] }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-sm">Promotions</CardTitle>
-        <CardDescription>{promotions.length} candidates</CardDescription>
-      </CardHeader>
-      <CardContent>
-        {promotions.length === 0 ? (
-          <EmptyState title="No promotions" />
-        ) : (
-          <ul className="divide-y divide-border">
-            {promotions.map((item) => (
-              <li key={item.id} className="py-2">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-mono text-xs">{item.candidateRef}</span>
-                  <StatusPill value={item.status} />
-                </div>
-                <p className="mt-1 text-xs text-muted-foreground">{item.summary}</p>
-              </li>
-            ))}
-          </ul>
-        )}
-      </CardContent>
-    </Card>
-  );
-}

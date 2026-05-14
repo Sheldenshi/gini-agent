@@ -15,6 +15,16 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
 
+## Architecture decisions
+
+- [ADR 0001 — Local Runtime Architecture](docs/adr/0001-local-runtime-architecture.md)
+- [ADR 0002 — Minimal Trust Substrate](docs/adr/0002-trust-substrate.md)
+- [ADR 0003 — Instances And Control Surface](docs/adr/0003-instances-and-control-surface.md)
+- [ADR 0004 — Agent Loop With Native Tool Calling](docs/adr/0004-agent-loop-tool-calling.md)
+- [ADR 0005 — Subagent Delegation](docs/adr/0005-subagent-delegation.md)
+- [ADR 0006 — Agents Replace Profiles And Drive Runtime Behavior](docs/adr/0006-agents-replace-profiles.md)
+- [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
+
 ## Architecture In One Sentence
 
 Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract.
