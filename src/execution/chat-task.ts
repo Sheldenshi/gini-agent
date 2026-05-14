@@ -17,9 +17,10 @@ import {
   appendTrace,
   mutateState,
   now,
-  readState
+  readState,
+  readTrace
 } from "../state";
-import { findTask } from "../agent";
+import { ApprovedActionFailedError, findTask } from "../agent";
 import { recall } from "../memory";
 import {
   generateToolCallingResponse,
@@ -28,6 +29,7 @@ import {
 } from "../provider";
 import { buildAgentSystemContext } from "../system-prompt";
 import type {
+  CostRecord,
   PendingToolCall,
   RuntimeConfig,
   RuntimeState,
@@ -43,7 +45,54 @@ import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subage
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { resolveEffectiveContext } from "./effective-context";
 
-const MAX_LOOP_ITERATIONS = 8;
+// Default safety cap on chat-task loop iterations. Each iteration is one
+// model call (followed by zero or more tool dispatches). Most tasks finish
+// in well under 10 iterations; the cap exists to bound runaway loops, not
+// to be a meaningful budget for normal work. Power users can override this
+// per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
+const MAX_LOOP_ITERATIONS = 90;
+
+// Resolve the effective iteration cap from config, falling back to the
+// default when the user hasn't set one or set an invalid value. Validation
+// is intentionally minimal — positive integer or fall back. We log a single
+// warning trace from runLoop on fallback so the user can spot the typo.
+function resolveIterationCap(config: RuntimeConfig): { cap: number; warnReason?: string } {
+  const raw = config.agent?.maxIterations;
+  if (raw === undefined) return { cap: MAX_LOOP_ITERATIONS };
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+    return {
+      cap: MAX_LOOP_ITERATIONS,
+      warnReason: `agent.maxIterations must be a positive integer; got ${JSON.stringify(raw)}. Using default ${MAX_LOOP_ITERATIONS}.`
+    };
+  }
+  return { cap: raw };
+}
+
+// Add an incremental cost record (from a single model call) into a running
+// accumulator. Token totals sum across calls; USD estimates sum when
+// present. `provider`/`model` track the most recent call so the surfaced
+// cost row reflects whichever model spent the bulk of the budget — this
+// mirrors how upstream UIs display task.cost as the latest provider used
+// rather than a multi-provider rollup.
+function addCost(accumulator: CostRecord | undefined, increment: CostRecord | undefined): CostRecord | undefined {
+  if (!increment) return accumulator;
+  if (!accumulator) {
+    // Clone to avoid the caller mutating the original later.
+    return { ...increment };
+  }
+  const sum = (a: number | undefined, b: number | undefined): number | undefined => {
+    if (a === undefined && b === undefined) return undefined;
+    return (a ?? 0) + (b ?? 0);
+  };
+  return {
+    provider: increment.provider ?? accumulator.provider,
+    model: increment.model ?? accumulator.model,
+    inputTokens: sum(accumulator.inputTokens, increment.inputTokens),
+    outputTokens: sum(accumulator.outputTokens, increment.outputTokens),
+    totalTokens: sum(accumulator.totalTokens, increment.totalTokens),
+    estimatedUsd: sum(accumulator.estimatedUsd, increment.estimatedUsd)
+  };
+}
 
 // runChatTask: kicks off the chat-task loop for a freshly submitted task.
 // Sets the task to running, builds the initial system + user messages,
@@ -251,27 +300,59 @@ async function runLoop(
   const providerTools = toProviderTools(tools);
   const toolsHash = hashCatalog(tools);
 
+  const { cap, warnReason } = resolveIterationCap(config);
+  if (warnReason) {
+    // Only emit the invalid-config warning once per task. resumeChatTask
+    // re-enters runLoop after every approval, so without this guard a task
+    // that bounces through several approvals would log the same warning
+    // for each resume — noisy and confusing in the trace.
+    const priorTraces = readTrace(config.instance, taskId);
+    const alreadyWarned = priorTraces.some(
+      (t) =>
+        t.type === "warning" &&
+        typeof (t.data as Record<string, unknown> | undefined)?.reason === "string" &&
+        (t.data as Record<string, unknown>).reason === warnReason
+    );
+    if (!alreadyWarned) {
+      appendTrace(config.instance, taskId, {
+        type: "warning",
+        message: `Invalid agent.maxIterations config; using default.`,
+        data: { reason: warnReason, defaultCap: MAX_LOOP_ITERATIONS }
+      });
+    }
+  }
+
   let iterations = iterationsSoFar;
   let workingMessages = messages.slice();
+  // Carry the running cost across approval resumes by seeding from the
+  // task's existing cost row (set by a prior runLoop entry). Each model
+  // call adds into this accumulator and we write it back on every
+  // persistence point so partial work is never lost — including on pause,
+  // graceful exhaustion, and the failure fallback.
+  let accumulatedCost: CostRecord | undefined = taskRow?.cost ? { ...taskRow.cost } : undefined;
 
-  while (iterations < MAX_LOOP_ITERATIONS) {
+  while (iterations < cap) {
     iterations += 1;
 
-    // Cancellation bail-out. If the task was cancelled externally (e.g.
-    // user clicked cancel, or a parent task's cancellation cascaded into
-    // this child via cancelDescendantTasks), stop the loop here so we
-    // don't keep running model calls and dispatching tools against a
-    // task that's already terminal.
+    // Terminal-state bail-out. If the task was already moved to any
+    // terminal status — cancelled externally, failed by a concurrent
+    // approval denial, or completed by a parallel path — stop the loop
+    // here so we don't (a) keep running model calls against a dead
+    // task or (b) overwrite the terminal status with a later
+    // "completed" write at the end of the loop. Previously this only
+    // checked for "cancelled", which let a race-lost auto-approve
+    // continue iterating after a concurrent user-deny had already
+    // failed the task.
     {
-      const cancelCheck = readState(config.instance).tasks.find((t) => t.id === taskId);
-      if (!cancelCheck || cancelCheck.status === "cancelled") {
+      const terminalCheck = readState(config.instance).tasks.find((t) => t.id === taskId);
+      if (!terminalCheck || terminalCheck.status === "cancelled" || terminalCheck.status === "failed" || terminalCheck.status === "completed") {
         appendTrace(config.instance, taskId, {
           type: "task",
-          message: "Chat task loop noticed cancellation",
-          data: { iterations }
+          message: `Chat task loop noticed terminal status (${terminalCheck?.status ?? "missing"})`,
+          data: { iterations, status: terminalCheck?.status }
         });
-        await syncSubagentFromTask(config, cancelCheck ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
-        return cancelCheck ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+        await syncSubagentFromTask(config, terminalCheck ?? ({ id: taskId, subagentId: undefined } as unknown as Task));
+        return terminalCheck ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
       }
     }
 
@@ -309,6 +390,7 @@ async function runLoop(
       effective.providerSource === "agent" ? effective.provider : undefined
     );
     await flush();
+    accumulatedCost = addCost(accumulatedCost, result.cost);
 
     appendTrace(config.instance, taskId, {
       type: "model",
@@ -331,7 +413,7 @@ async function runLoop(
         item.status = "completed";
         item.currentStep = "Completed";
         item.summary = finalText || "(no content)";
-        item.cost = result.cost;
+        item.cost = accumulatedCost;
         // partialSummary is no longer the source of truth — clear it so
         // the chat UI uses the synced summary instead.
         item.partialSummary = undefined;
@@ -395,6 +477,15 @@ async function runLoop(
           });
         }
       } catch (error) {
+        // An approved side effect (file.write, terminal.exec, etc.) that
+        // failed AFTER the approval was marked approved is fundamentally
+        // different from a validation/dispatch error: the human gate (or
+        // its dangerouslyAutoApprove equivalent) was already burned, so
+        // letting the model retry as if nothing happened risks declaring
+        // the task complete despite an audit-row gap. Let those escape
+        // up to runChatTask's outer .catch so the task is failed.
+        if (error instanceof ApprovedActionFailedError) throw error;
+
         // Dispatch failed (bad args, unknown tool, validation error). Feed
         // the error back to the model as the tool result so it can recover.
         const message = error instanceof Error ? error.message : String(error);
@@ -427,6 +518,10 @@ async function runLoop(
         item.status = "waiting_approval";
         item.currentStep = "Waiting for approval";
         item.toolCallState = snapshot;
+        // Persist the partial cost up to this pause so it isn't lost if
+        // the approval is denied (failTask reads the row as-is) or the
+        // task waits a long time before resuming.
+        item.cost = accumulatedCost;
         item.updatedAt = now();
         return item;
       });
@@ -442,25 +537,78 @@ async function runLoop(
     // All sync — keep looping.
   }
 
-  // Hit the iteration cap. Complete with whatever partialSummary we have.
-  const exhausted = await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    item.status = "failed";
-    item.currentStep = "Failed";
-    item.error = `Chat task exceeded ${MAX_LOOP_ITERATIONS} model iterations.`;
-    item.toolCallState = undefined;
-    item.updatedAt = now();
-    return item;
-  });
-  appendTrace(config.instance, taskId, {
-    type: "error",
-    message: "Chat task hit iteration cap",
-    data: { iterations: MAX_LOOP_ITERATIONS }
-  });
-  await updateRunFromTask(config, exhausted);
-  await syncSubagentFromTask(config, exhausted);
-  if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
-  return exhausted;
+  // Hit the iteration cap. Instead of failing outright, give the model one
+  // last turn with NO tools available and an explicit instruction to write
+  // a final answer summarizing what it learned and what it couldn't finish.
+  // The summary call's cost is recorded on the task just like any other
+  // model call. If the summary call itself fails (provider error, etc.),
+  // fall back to the legacy failure path so we don't lose the user's work.
+  const summaryInstruction =
+    `You have reached the maximum number of tool-calling iterations (${cap}). ` +
+    `No further tools are available. Please write a final answer summarizing ` +
+    `what you have learned so far and what you were unable to complete.`;
+  const summaryMessages: ToolCallingMessage[] = [
+    ...workingMessages,
+    { role: "user", content: summaryInstruction }
+  ];
+  try {
+    const summaryResult = await generateToolCallingResponse(config, summaryMessages, []);
+    accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
+    const finalText = summaryResult.text || "(no content)";
+    const exhausted = await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      item.status = "completed";
+      item.currentStep = `Completed (iteration cap reached: ${cap})`;
+      item.summary = finalText;
+      item.cost = accumulatedCost;
+      item.partialSummary = undefined;
+      item.toolCallState = undefined;
+      item.updatedAt = now();
+      return item;
+    });
+    appendTrace(config.instance, taskId, {
+      type: "warning",
+      message: `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
+      data: { iterations: cap }
+    });
+    appendTrace(config.instance, taskId, {
+      type: "model",
+      message: `${summaryResult.provider.name} provider produced exhaustion summary`,
+      data: {
+        provider: summaryResult.provider,
+        responseId: summaryResult.responseId,
+        usage: summaryResult.usage,
+        finishReason: summaryResult.finishReason
+      }
+    });
+    await updateRunFromTask(config, exhausted);
+    await syncSubagentFromTask(config, exhausted);
+    if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    return exhausted;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const exhausted = await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      item.status = "failed";
+      item.currentStep = "Failed";
+      item.error = `Chat task exceeded ${cap} model iterations.`;
+      // Preserve the accumulated cost from the loop so the audit row
+      // reflects all model calls leading up to the failed summary turn.
+      item.cost = accumulatedCost;
+      item.toolCallState = undefined;
+      item.updatedAt = now();
+      return item;
+    });
+    appendTrace(config.instance, taskId, {
+      type: "error",
+      message: "Chat task hit iteration cap and tool-less summary call failed",
+      data: { iterations: cap, summaryError: message }
+    });
+    await updateRunFromTask(config, exhausted);
+    await syncSubagentFromTask(config, exhausted);
+    if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    return exhausted;
+  }
 }
 
 // Resume a paused chat task after one of its tool approvals resolved.

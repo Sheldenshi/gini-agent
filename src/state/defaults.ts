@@ -1,4 +1,5 @@
 import type { AgentRecord, Instance, ToolRecord, ToolsetRecord } from "../types";
+import { riskForTool } from "../execution/tool-risk";
 
 export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[] {
   return [
@@ -78,23 +79,54 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       scopes: ["job", "messaging"],
       createdAt: at,
       updatedAt: at
+    },
+    {
+      id: "toolset_browser",
+      instance,
+      name: "browser",
+      description: "Browser automation: navigate, snapshot, click, type, and inspect web pages.",
+      status: "disabled",
+      toolNames: [
+        "browser.navigate",
+        "browser.snapshot",
+        "browser.click",
+        "browser.type",
+        "browser.press",
+        "browser.scroll",
+        "browser.back",
+        "browser.console",
+        "browser.close",
+        "browser.vision",
+        "browser.hover",
+        "browser.drag",
+        "browser.select_option",
+        "browser.wait_for",
+        "browser.tabs",
+        "browser.upload_file"
+      ],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
     }
   ];
 }
 
 export function defaultTools(instance: Instance, at: string): ToolRecord[] {
-  return defaultToolsets(instance, at).flatMap((toolset) => toolset.toolNames.map((name) => ({
-    id: `tool_${name.replaceAll(".", "_")}`,
-    instance,
-    name,
-    description: `${name} from ${toolset.name} toolset`,
-    toolset: toolset.name,
-    status: toolset.status === "enabled" ? "available" : "disabled",
-    risk: name.includes("write") || name.includes("exec") || name.includes("invoke") || name.includes("send") ? "high" : "low",
-    requiresApproval: name.includes("write") || name.includes("exec") || name.includes("invoke") || name.includes("send"),
-    createdAt: at,
-    updatedAt: at
-  } satisfies ToolRecord)));
+  return defaultToolsets(instance, at).flatMap((toolset) => toolset.toolNames.map((name) => {
+    const risk = riskForTool(name);
+    return {
+      id: `tool_${name.replaceAll(".", "_")}`,
+      instance,
+      name,
+      description: `${name} from ${toolset.name} toolset`,
+      toolset: toolset.name,
+      status: toolset.status === "enabled" ? "available" : "disabled",
+      risk,
+      requiresApproval: risk === "high",
+      createdAt: at,
+      updatedAt: at
+    } satisfies ToolRecord;
+  }));
 }
 
 export function defaultAgent(instance: Instance, at: string): AgentRecord {

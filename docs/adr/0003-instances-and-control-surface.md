@@ -2,11 +2,18 @@
 
 ## Decision
 
-Gini is instance-aware. The default instance is `dev`, and `--instance <name>` or `GINI_INSTANCE` selects another instance. The CLI, runtime API, web control plane, traces, logs, state, config, workspace, and memory database all use the selected instance.
+Gini is instance-aware. There are two flavors:
+
+- **Production end-users** run the installed `gini` CLI (from `curl|bash`). The wrapper at `~/.local/bin/gini` always sets `GINI_INSTANCE=default`, pinning end-users to a single `default` instance with stable, memorable ports (web `7777`, runtime `7778`).
+- **Developers** run `bun run gini ...` from a repo checkout. The instance is auto-derived from the repo root directory basename (`boston`, `rabat`, `gini-agent`, etc.), so each worktree gets isolated state without typing `--instance`. Ports for these instances are deterministic per-name hashes within a 100-port window, so parallel worktrees coexist without manual port wrangling.
+
+`--instance <name>` or `GINI_INSTANCE` overrides either default. The CLI, runtime API, web control plane, traces, logs, state, config, workspace, and memory database all use the selected instance.
 
 ## Context
 
-Multiple coding agents, worktrees, smoke tests, and personal runtimes need to coexist on one machine. Gini must avoid hardcoding a single global install.
+The `default` instance exists for end-users; everything else exists for developers. Most users will only ever see `default` and never think about the concept. Developers running coding agents in parallel Conductor worktrees need isolation by default — sharing a single `dev` instance across worktrees silently mixed state and was a frequent footgun.
+
+Pinning `default` to fixed memorable ports lets `gini start` produce a stable URL (`http://127.0.0.1:7777`) that users can bookmark, share in docs, and recognize. Pinning is wrong for developer worktrees because two worktrees on the same machine would collide; hashing the worktree name keeps them independent.
 
 ## Required Now
 
@@ -17,7 +24,8 @@ Multiple coding agents, worktrees, smoke tests, and personal runtimes need to co
 - `status` and `doctor` report instance identity.
 - `reset` and `uninstall --instance <name>` affect only the selected instance; `uninstall` (no flag) performs a full uninstall with prompts that can also clear every instance.
 - Runtime API and web UI expose the instance.
-- Per-instance runtime and web ports are deterministic and collision-aware.
+- The `default` instance gets pinned ports (web `7777`, runtime `7778`).
+- All other instances get deterministic hash-derived ports within a 100-port window.
 
 ## Deferred
 
@@ -28,13 +36,15 @@ Multiple coding agents, worktrees, smoke tests, and personal runtimes need to co
 ## Consequences For Coding Agents
 
 - New runtime-owned files should live under instance-specific roots unless they are deliberate workspace artifacts approved by the user.
-- Tests and smoke flows should use non-production instances.
+- Tests and smoke flows should use non-`default` instances (they get their own ephemeral or named instance).
 - Do not run concurrent install/reset work against the same instance unless the test is intentionally checking shared-instance behavior.
 - Status output should make instance confusion visible.
 
 ## Acceptance Checks
 
-- `bun run gini --instance sandbox reset` does not affect the `dev` instance.
+- `bun run gini --instance sandbox reset` does not affect the auto-derived worktree instance.
 - Multiple `bun run gini smoke` invocations can run concurrently because they create separate smoke instances by default.
 - `bun run gini --instance sandbox doctor` reports `sandbox`.
+- `bun run gini status` from a worktree named `boston` reports instance `boston`.
+- `gini status` from the installed wrapper reports instance `default` on ports 7777/7778.
 - Web and API for a running instance show the same instance identity.

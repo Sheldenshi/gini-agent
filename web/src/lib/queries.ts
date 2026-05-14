@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@ta
 import { api } from "@/lib/api";
 import type {
   Approval,
+  BrowserConnectionRecord,
   ConnectorRecord,
   ImprovementProposal,
   JobRecord,
@@ -228,6 +229,85 @@ export function useRenameChatSession() {
     }
   });
 }
+
+// Browser-connect status. Shape mirrors the gateway response from
+// /api/browser: { connected: boolean, record?: BrowserConnectionRecord }.
+// Polled every 5s when idle, and every 1s while a connect/disconnect
+// mutation is in flight, so the status card reflects an external `gini
+// browser connect/disconnect` without a manual refresh.
+export interface BrowserConnectionStatus {
+  connected: boolean;
+  record?: BrowserConnectionRecord;
+}
+
+// Polls `GET /api/browser` to keep the /browser page in sync with the
+// runtime. The default cadence is 5s when nothing's happening — that's
+// well below the 3-minute Chrome dev-tools cookie lifetime and noticeably
+// less chatter than the previous 3s. Pass `isActive: true` while a
+// connect / disconnect mutation is in flight to drop to 1s; once
+// settled the caller flips the flag back. We deliberately do NOT switch
+// to SSE — the cost of holding an EventSource open across every chat
+// session that lands the /browser tab outweighs the gain.
+export function useBrowserConnection(options?: { isActive?: boolean }) {
+  const isActive = options?.isActive ?? false;
+  return useQuery<BrowserConnectionStatus>({
+    queryKey: ["browser"],
+    queryFn: () => api<BrowserConnectionStatus>("/browser"),
+    refetchInterval: isActive ? 1000 : 5000
+  });
+}
+
+export function useConnectBrowser() {
+  const qc = useQueryClient();
+  return useMutation<BrowserConnectionStatus, Error, { cdpUrl?: string; port?: number }>({
+    mutationFn: (input) =>
+      api<BrowserConnectionStatus>("/browser/connect", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
+    }
+  });
+}
+
+export function useDisconnectBrowser() {
+  const qc = useQueryClient();
+  return useMutation<BrowserConnectionStatus, Error, void>({
+    mutationFn: () =>
+      api<BrowserConnectionStatus>("/browser/disconnect", { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
+    }
+  });
+}
+
+// Wipe the per-instance Chrome profile dir. Destructive — removes all
+// saved cookies / sign-ins / browsing data. The gateway rejects this
+// while a visible window is connected (the user must disconnect first),
+// so the caller surfaces a tooltip on the disabled state.
+export interface WipeProfileResult {
+  wiped: boolean;
+  dataDir: string;
+}
+
+export function useWipeBrowserProfile() {
+  const qc = useQueryClient();
+  return useMutation<WipeProfileResult, Error, void>({
+    mutationFn: () =>
+      api<WipeProfileResult>("/browser/wipe-profile", { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["browser"] });
+      qc.invalidateQueries({ queryKey: ["events"] });
+      qc.invalidateQueries({ queryKey: ["audit"] });
+    }
+  });
+}
+
 
 /**
  * Returns a function that batches invalidate() calls within a tick.

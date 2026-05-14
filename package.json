@@ -21,7 +21,8 @@
     "typescript": "latest"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0"
+    "@huggingface/transformers": "^4.2.0",
+    "playwright-core": "^1.60.0"
   },
   "trustedDependencies": [
     "onnxruntime-node",

@@ -188,6 +188,251 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_navigate",
+      description: "Open a URL in a headless browser session and return a compact accessibility snapshot with @eN refs the agent can click or type into.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Absolute http(s) URL to navigate to." }
+        },
+        required: ["url"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_snapshot",
+      description: "Re-snapshot the current browser page. Default returns interactive elements with @eN refs; pass full=true for a richer tree including landmarks and headings.",
+      parameters: {
+        type: "object",
+        properties: {
+          full: { type: "boolean", description: "If true, include landmark/heading nodes alongside interactive elements.", default: false }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_click",
+      description: "Click an element on the current page by its @eN ref from the latest snapshot. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_type",
+      description: "Clear and type text into an input element identified by its @eN ref. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Input ref like '@e3' from the latest snapshot." },
+          text: { type: "string", description: "Text to type into the input." }
+        },
+        required: ["ref", "text"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_press",
+      description: "Press a keyboard key on the current page (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          key: { type: "string", description: "Key name as Playwright understands it (e.g. 'Enter', 'ArrowDown', 'Control+A')." }
+        },
+        required: ["key"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_scroll",
+      description: "Scroll the current page up or down by one viewport. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          direction: { type: "string", enum: ["up", "down"], description: "Scroll direction." }
+        },
+        required: ["direction"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_back",
+      description: "Navigate back one entry in the browser history. Returns a fresh snapshot.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_console",
+      description: "Read recent console messages from the current page. Optionally evaluate a JavaScript expression and return its result.",
+      parameters: {
+        type: "object",
+        properties: {
+          expression: { type: "string", description: "Optional JavaScript expression to evaluate in the page context." },
+          clear: { type: "boolean", description: "If true, clear the captured console buffer before returning.", default: false }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_close",
+      description: "Close the browser session for the current task. Frees the underlying BrowserContext immediately instead of waiting for the idle sweeper.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_hover",
+      description: "Hover over an element on the current page by its @eN ref. Useful for revealing tooltips or :hover-only menus. Returns a fresh snapshot.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_drag",
+      description: "Drag from one element to another by their @eN refs.",
+      parameters: {
+        type: "object",
+        properties: {
+          fromRef: { type: "string", description: "Source element ref like '@e3' from the latest snapshot." },
+          toRef: { type: "string", description: "Target element ref like '@e7' from the latest snapshot." }
+        },
+        required: ["fromRef", "toRef"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_select_option",
+      description: "Select an option in a <select> element by its @eN ref. Pass `value` for single-select or `values` for multi-select. Exactly one of the two must be provided.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Select element ref like '@e3' from the latest snapshot." },
+          value: { type: "string", description: "Option value to select (single-select). Mutually exclusive with `values`." },
+          values: { type: "array", items: { type: "string" }, description: "Option values to select (multi-select). Mutually exclusive with `value`." }
+        },
+        required: ["ref"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_wait_for",
+      description: "Wait for an element (by @eN ref) to reach a state, or for a substring to appear in the page text. Exactly one of `ref` or `text` must be supplied. Returns a fresh snapshot after the wait completes.",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "Element ref like '@e3' from the latest snapshot. Mutually exclusive with `text`." },
+          text: { type: "string", description: "Substring to wait for in document.body.innerText. Mutually exclusive with `ref`." },
+          state: {
+            type: "string",
+            enum: ["visible", "hidden", "attached", "detached"],
+            description: "Element state to wait for when using `ref`. Defaults to 'visible'."
+          },
+          timeoutMs: { type: "number", description: "Maximum wait in milliseconds. Defaults to 10000. Hard cap of 60000 (60s); larger values are silently clamped.", default: 10000 }
+        }
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_tabs",
+      description: "Manage browser tabs: list current tabs, open a new tab, switch the active tab, or close a tab. `index` (zero-based) is required for switch and close. `url` is optional for `new` (the new tab is created blank if omitted).",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["list", "new", "switch", "close"],
+            description: "Tab operation to perform."
+          },
+          url: { type: "string", description: "Absolute http(s) URL to load when action='new'. Optional." },
+          index: { type: "number", description: "Zero-based tab index for action='switch' or action='close'." }
+        },
+        required: ["action"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_upload_file",
+      description: "Upload a workspace file via a file input. Path is workspace-relative and validated against escapes (including symlink targets).",
+      parameters: {
+        type: "object",
+        properties: {
+          ref: { type: "string", description: "File-input element ref like '@e3' from the latest snapshot." },
+          path: { type: "string", description: "Workspace-relative path to the file to upload." }
+        },
+        required: ["ref", "path"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
+      name: "browser_vision",
+      description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
+      parameters: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "Question to ask about the page screenshot." },
+          full: { type: "boolean", default: false, description: "If true, capture the full scrollable page; otherwise just the viewport." }
+        },
+        required: ["question"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the

@@ -134,16 +134,39 @@ export async function uninstallAll(options: UninstallAllOptions): Promise<Uninst
   return { instances, stopped, stopErrors, deletedInstances: options.deleteInstances };
 }
 
-// Updates the auto-approve command allowlist on the live config object
-// (mutated in place so the HTTP handler closure picks it up immediately)
-// and persists the new list to disk so it survives restarts. Patterns
-// are filtered through trim() to drop accidental whitespace and empties
-// from the UI text input. Returns the updated list so callers can
-// confirm the new state.
-export function updateAutoApproveCommands(config: RuntimeConfig, patterns: string[]): string[] {
-  const cleaned = patterns.map((p) => (typeof p === "string" ? p.trim() : "")).filter((p) => p.length > 0);
-  config.autoApproveCommands = cleaned;
+// Update the auto-approve settings on the live config object and
+// persist to disk in one write. Either or both of `patterns` and
+// `dangerouslyAutoApprove` can be supplied; omitted keys are left
+// alone. Returns the merged effective values so callers can confirm.
+// Patterns are filtered through trim() to drop accidental whitespace
+// and empties from the UI text input.
+export function updateAutoApproveSettings(
+  config: RuntimeConfig,
+  input: { patterns?: string[]; dangerouslyAutoApprove?: boolean }
+): { patterns: string[]; dangerouslyAutoApprove: boolean } {
+  if (input.patterns !== undefined) {
+    const cleaned = input.patterns.map((p) => (typeof p === "string" ? p.trim() : "")).filter((p) => p.length > 0);
+    config.autoApproveCommands = cleaned;
+  }
+  if (input.dangerouslyAutoApprove !== undefined) {
+    config.dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
   ensureDir(instanceRoot(config.instance));
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  return cleaned;
+  return {
+    patterns: config.autoApproveCommands ?? [],
+    dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove)
+  };
+}
+
+// Back-compat shim: kept for callers that only want to mutate the
+// allowlist. Delegates to updateAutoApproveSettings so persistence
+// stays single-sourced.
+export function updateAutoApproveCommands(config: RuntimeConfig, patterns: string[]): string[] {
+  return updateAutoApproveSettings(config, { patterns }).patterns;
+}
+
+// Back-compat shim for the flag.
+export function updateDangerouslyAutoApprove(config: RuntimeConfig, enabled: boolean): boolean {
+  return updateAutoApproveSettings(config, { dangerouslyAutoApprove: enabled }).dangerouslyAutoApprove;
 }

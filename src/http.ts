@@ -13,7 +13,7 @@ import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ens
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
-import { status, updateAutoApproveCommands } from "./runtime";
+import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
@@ -23,6 +23,7 @@ import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
 import { resolveEffectiveContext } from "./execution/effective-context";
+import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { createSkillFromInput, getSkill, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -36,13 +37,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
-    // Settings: auto-approve allowlist for terminal_exec.
-    ["GET", /^\/api\/settings\/auto-approve$/, () => json({ patterns: config.autoApproveCommands ?? [] })],
+    // Settings: auto-approve controls.
+    //   - `patterns`: shell-glob allowlist for terminal_exec only.
+    //   - `dangerouslyAutoApprove`: global bypass for every
+    //     approval-gated tool in the chat-task dispatcher (also the
+    //     legacy imperative path; see RuntimeConfig.dangerouslyAutoApprove
+    //     for scope).
+    // PATCH accepts either field individually or both together; omitted
+    // keys are left at their current value.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => json({
+      patterns: config.autoApproveCommands ?? [],
+      dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove),
+    })],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
-      const raw = Array.isArray(payload.patterns) ? payload.patterns : [];
-      const cleaned = updateAutoApproveCommands(config, raw.map(String));
-      return json({ patterns: cleaned });
+      return json(updateAutoApproveSettings(config, {
+        patterns: Array.isArray(payload.patterns) ? payload.patterns.map(String) : undefined,
+        dangerouslyAutoApprove: typeof payload.dangerouslyAutoApprove === "boolean" ? payload.dangerouslyAutoApprove : undefined
+      }));
     }],
     ["GET", /^\/api\/mobile\/bootstrap$/, () => json(mobileBootstrap(config))],
     ["GET", /^\/api\/chat$/, () => json(listChatSessions(config))],
@@ -260,6 +272,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
     ["POST", /^\/api\/promotions\/([^/]+)\/reject$/, async (_request, params) => json(await reviewPromotion(config, params[0], "reject"))],
+    ["GET", /^\/api\/browser$/, () => json(getBrowserConnection(config))],
+    ["POST", /^\/api\/browser\/connect$/, async (request) => {
+      const payload = await body(request);
+      return json(await connectBrowser(config, payload), 201);
+    }],
+    ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
+    ["POST", /^\/api\/browser\/wipe-profile$/, async () => json(await wipeBrowserProfile(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],
@@ -374,6 +393,16 @@ function statusFromErrorMessage(message: string): number {
   // for the same condition — map this here so legacy POST /api/memory
   // matches.
   if (message.includes("no active agent")) return 400;
+  // Browser-connect surfaces user-input failures with these prefixes;
+  // forward them to 400 so the webapp can surface the original error text
+  // rather than a generic "internal error". Connectivity failures
+  // (unreachable CDP) and discovery failures (no Chrome on PATH) are also
+  // user-correctable, not internal errors.
+  if (message.startsWith("Invalid cdpUrl")) return 400;
+  if (message.startsWith("Unsupported cdpUrl protocol")) return 400;
+  if (message.startsWith("Invalid port")) return 400;
+  if (message.startsWith("Could not reach CDP endpoint")) return 400;
+  if (message.startsWith("Could not locate")) return 400;
   return 500;
 }
 

@@ -62,9 +62,21 @@ through the same loop. So the loop comes first.
 - All tool dispatches still write `audit` and `trace` records — same
   shape as the legacy path, with `(chat-task)` suffixes in trace
   messages so the timeline is unambiguous.
-- Approvals stay the only path to side effects. The model cannot bypass
-  them: `dispatchToolCall` always creates an approval for high-risk
-  tools, and `executeApprovedAction` is the only writer.
+- Approvals stay the only path to side effects under default
+  configuration: `dispatchToolCall` creates an approval row for
+  high-risk tools and `executeApprovedAction` is the only writer.
+  Two operator-configured bypasses are sanctioned and documented:
+    - The terminal allowlist (`autoApproveCommands`) skips approval-
+      row creation entirely for matching commands and stamps the
+      matched pattern on the `terminal.exec` audit row's
+      `evidence.autoApprovedReason`.
+    - `dangerouslyAutoApprove` (ADR 0006) still creates an approval
+      row and runs through `executeApprovedAction`, but skips the
+      human decision step; both the `approval.approved` audit row and
+      the per-action audit row carry
+      `evidence.autoApprovedReason="dangerouslyAutoApprove"` so
+      reviewers can distinguish auto-approved from human-approved
+      actions.
 
 ## Deferred
 

@@ -9,6 +9,7 @@ import {
   Boxes,
   Cable,
   Cog,
+  Globe,
   Home,
   ListTodo,
   Menu,
@@ -34,6 +35,7 @@ const NAV = [
   { href: "/subagents", label: "Subagents", icon: Users },
   { href: "/jobs", label: "Jobs", icon: Timer },
   { href: "/connections", label: "Connections", icon: Cable },
+  { href: "/browser", label: "Browser", icon: Globe },
   { href: "/permissions", label: "Permissions", icon: AlertTriangle },
   { href: "/activity", label: "Activity", icon: Activity },
   { href: "/settings", label: "Settings", icon: Cog }

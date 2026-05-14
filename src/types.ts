@@ -1,4 +1,7 @@
-export type Instance = "dev" | "sandbox" | "production" | string;
+// `default` is the production end-user install (set by ~/.local/bin/gini).
+// Anything else is a developer worktree (auto-derived from the repo dir
+// basename) or a named test/smoke instance.
+export type Instance = "default" | string;
 
 export type TaskStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
@@ -37,6 +40,34 @@ export type MessagingBridgeStatus = "configured" | "disabled" | "error";
 export type ImportSource = "hermes" | "openclaw";
 
 export type AgentStatus = "active" | "inactive";
+
+// Headed-browser connection mode. `managed` means the runtime spawned the
+// Chrome process and owns its lifecycle (PID + dedicated user-data-dir).
+// `cdp` means the user pointed us at an existing CDP endpoint (e.g. their
+// own already-running Chrome) and we never touch the process. The two modes
+// share most of the same record so the API stays uniform.
+export type BrowserConnectionMode = "managed" | "cdp";
+
+export interface BrowserConnectionRecord {
+  mode: BrowserConnectionMode;
+  // ws:// CDP debugger URL. For `managed` we discover it by polling the
+  // launched Chrome's /json/version endpoint; for `cdp` it's the value the
+  // user supplied. Stored normalized (no credentials in the path).
+  cdpUrl: string;
+  // PID of the Chrome we spawned. Null when mode === "cdp" because we
+  // don't own that process and must not signal it on disconnect.
+  pid: number | null;
+  // Profile directory passed to Chrome via --user-data-dir. Null for
+  // mode: "cdp". Survives disconnect so the user's signed-in state stays
+  // intact across reconnects.
+  dataDir: string | null;
+  // Absolute path of the Chrome binary the runtime launched. Null for cdp
+  // mode (we never resolved a binary). Useful for surfacing in the UI so
+  // users can confirm which install is being driven.
+  chromePath: string | null;
+  // ISO timestamp of when the connection record was created/updated.
+  startedAt: string;
+}
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
@@ -89,6 +120,29 @@ export interface RuntimeConfig {
   // evidence.autoApproved=true plus the matched pattern, so the activity
   // trail stays intact. Empty / undefined means no auto-approval.
   autoApproveCommands?: string[];
+  // When true, bypass the approval gate for every approval-gated tool —
+  // chat-task (file_write, file_patch, terminal_exec, code_exec,
+  // browser_upload_file) AND the legacy imperative dispatch path
+  // (`POST /api/tasks` / `gini task submit "write …"`). Each call
+  // still produces an approval row (status="approved") and matching
+  // audit rows (approval.approved and the per-action side-effect row)
+  // carry `evidence.autoApproved=true` plus
+  // `evidence.autoApprovedReason="dangerouslyAutoApprove"`, so the
+  // trail stays inspectable — only the human gate is skipped.
+  // Intended for trusted, dev-mode use only. See ADR 0006 for the
+  // full audit contract.
+  dangerouslyAutoApprove?: boolean;
+  // Power-user agent budget knobs. Lives under a nested `agent` namespace so
+  // future budgets (token cap, wall-clock cap, etc.) can hang off the same
+  // object without further config-shape churn. Validated leniently at the
+  // call site — an invalid value falls back to the built-in default.
+  agent?: {
+    // Hard cap on chat-task loop iterations (model -> tool -> model cycles).
+    // When the cap is hit the loop gracefully produces a tool-less final
+    // summary instead of failing outright. Must be a positive integer; any
+    // non-conforming value falls back to the built-in default.
+    maxIterations?: number;
+  };
 }
 
 export interface RuntimeState {
@@ -125,6 +179,12 @@ export interface RuntimeState {
   messagingMessages: MessagingMessageRecord[];
   runs: RunRecord[];
   planSteps: PlanStepRecord[];
+  // Optional headed-browser connection. Populated by the browser-connect
+  // capability and consumed by the session manager in src/tools/browser.ts
+  // to switch from headless `chromium.launch()` to `chromium.connectOverCDP()`
+  // so authenticated state lives in the user's Chrome profile, not the
+  // ephemeral test context. Purely opt-in; legacy state files omit it.
+  browser?: BrowserConnectionRecord | null;
 }
 
 export type TaskMode = "chat" | "imperative";
@@ -279,7 +339,7 @@ export interface TraceRecord {
   taskId: string;
   instance: Instance;
   at: string;
-  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error";
+  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error" | "warning";
   message: string;
   data?: Record<string, unknown>;
 }
@@ -493,7 +553,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable" | "browser.upload_file";
   target: string;
   risk: RiskLevel;
   reason: string;

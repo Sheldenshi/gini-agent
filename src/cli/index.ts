@@ -21,6 +21,7 @@ import { pairing, device } from "./commands/pairing";
 import { mobile } from "./commands/mobile";
 import { search } from "./commands/search";
 import { toolset } from "./commands/toolsets";
+import { browser } from "./commands/browser";
 import { subagent } from "./commands/subagents";
 import { mcp } from "./commands/mcp";
 import { messaging } from "./commands/messaging";
@@ -66,7 +67,7 @@ export async function run(): Promise<void> {
   // the user didn't explicitly target one instance. We must distinguish "user
   // typed --instance" from "we resolved a default instance" — stripGlobalArgs
   // erases the flag, so we sniff the raw args here. The installed wrapper sets
-  // GINI_INSTANCE=main on every invocation, so env presence cannot count as
+  // GINI_INSTANCE=default on every invocation, so env presence cannot count as
   // "explicit"; only an explicit --instance flag opts into single-instance mode.
   const explicitInstance = hasFlag(args, "--instance");
 
@@ -126,6 +127,7 @@ export async function run(): Promise<void> {
     case "search": await search(ctx); break;
     case "toolset":
     case "toolsets": await toolset(ctx); break;
+    case "browser": await browser(ctx); break;
     case "subagent":
     case "subagents": await subagent(ctx); break;
     case "mcp": await mcp(ctx); break;

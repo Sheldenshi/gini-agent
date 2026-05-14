@@ -65,6 +65,11 @@ gini start
 
 The installer walks you through provider setup (OpenAI API key or existing `codex --login` auth). `gini start` prints the runtime and web URLs.
 
+After install, the URLs are stable:
+
+- web: `http://127.0.0.1:7777`
+- runtime: `http://127.0.0.1:7778`
+
 ### Update
 
 ```bash
@@ -83,12 +88,9 @@ bun run gini install
 bun run gini start
 ```
 
-When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
+When you run `bun run gini` from a repo clone, the instance is auto-derived from the repo directory basename (`gini-agent`, `boston`, `rabat`, etc.) so each worktree gets isolated state without typing `--instance` every time. The installed `gini` command from `curl | bash` always uses the `default` instance, so developer worktrees and end-user state never collide. Per-instance runtime and web ports are deterministic hashes within a 100-port window starting at 7337 (runtime) / 3000 (web); `gini status` prints the actual URLs.
 
-- runtime: `http://127.0.0.1:7337`
-- web: `http://127.0.0.1:3000`
-
-Run a foreground instance for coding-agent worktrees:
+Run a foreground instance with an explicit name:
 
 ```bash
 bun run gini run --instance feature-x
@@ -137,7 +139,7 @@ Use Codex OAuth:
 
 ```bash
 codex --login
-bun run gini provider set codex gpt-5.4
+bun run gini provider set codex gpt-5.5
 bun run gini doctor
 ```
 

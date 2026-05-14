@@ -5,7 +5,7 @@
 // split must remain re-exported here.
 
 export { now, id } from "./ids";
-export { assertInsideWorkspace, hashSecret } from "./security";
+export { assertInsideWorkspace, assertInsideWorkspaceNoSymlinkEscape, hashSecret } from "./security";
 export {
   createEmptyState,
   readState,
