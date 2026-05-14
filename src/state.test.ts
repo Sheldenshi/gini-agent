@@ -16,7 +16,6 @@ describe("state primitives", () => {
     const state = createEmptyState("dev");
     const memory = createMemory(state, {
       content: "Gini keeps receipts.",
-      scope: "project",
       confidence: 0.8,
       status: "proposed",
       sensitivity: "normal",

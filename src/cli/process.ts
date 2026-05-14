@@ -256,7 +256,11 @@ export async function existingWebUrl(config: RuntimeConfig, webPort: number): Pr
       // for THIS instance — which leads to "running" banners that point at the
       // wrong runtime.
       if (body && body.ok === true && body.service === "gini-web" && body.instance === config.instance) {
-        return candidateUrl;
+        // Probe over IPv4 (127.0.0.1) but advertise the localhost form to the
+        // user. Next.js dev's `allowedDevOrigins` defaults to `localhost`, so
+        // opening the IPv4 URL would block HMR/chunk fetches and break
+        // hydration. See web/next.config.ts.
+        return `http://localhost:${candidate}`;
       }
     } catch { /* try next port */ }
   }
@@ -339,9 +343,13 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // it without having to scan a port range. Cleared on stop and on stale-pid
   // detection above.
   writeFileSync(webPortPath(config.instance), String(port));
-  const webUrl = `http://127.0.0.1:${port}`;
+  // Probe over IPv4 for determinism, advertise localhost to the user. Next.js
+  // dev's `allowedDevOrigins` defaults to `localhost`, so opening the IPv4
+  // form in a browser blocks HMR/chunk fetches and breaks hydration.
+  const probeUrl = `http://127.0.0.1:${port}`;
+  const webUrl = `http://localhost:${port}`;
   try {
-    await waitForWebHealthz(webUrl, child.pid, config.instance);
+    await waitForWebHealthz(probeUrl, child.pid, config.instance);
     return foreground ? { webUrl, child } : { webUrl };
   } catch (error) {
     // Kill the child group so we don't leak processes on failure. In foreground

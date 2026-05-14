@@ -174,22 +174,69 @@ describe("runtime api", () => {
     expect(state.audit.some((event) => event.action === "file.search")).toBe(true);
   });
 
-  test("supports profile config equivalents and Hermes parity reporting", async () => {
-    const config = testConfig("profiles-parity");
+  test("supports agent config equivalents and Hermes parity reporting", async () => {
+    const config = testConfig("agents-parity");
     const handler = createHandler(config);
 
-    const created = await call(handler, config, "/api/profiles", {
+    const created = await call(handler, config, "/api/agents", {
       method: "POST",
-      body: JSON.stringify({ name: "research", toolsets: ["file", "web", "session_search"], memoryScopes: ["user", "project"] })
+      body: JSON.stringify({ name: "research", toolsets: ["file", "web", "session_search"] })
     });
-    const active = await call(handler, config, `/api/profiles/${created.id}/use`, { method: "POST" });
-    const profiles = await call(handler, config, "/api/profiles");
+    const active = await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+    const agents = await call(handler, config, "/api/agents");
     const parity = await call(handler, config, "/api/parity/hermes");
 
     expect(active.status).toBe("active");
-    expect(profiles.activeProfileId).toBe(created.id);
+    expect(agents.activeAgentId).toBe(created.id);
     expect(parity.ok).toBe(true);
-    expect(parity.checks.some((item: { id: string; status: string }) => item.id === "profiles" && item.status === "pass")).toBe(true);
+    expect(parity.checks.some((item: { id: string; status: string }) => item.id === "agents" && item.status === "pass")).toBe(true);
+  });
+
+  test("DELETE /api/agents/:id removes the agent and cascades cleanup", async () => {
+    const config = testConfig("agents-delete");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scratch" })
+    });
+    const deleted = await call(handler, config, `/api/agents/${created.id}`, { method: "DELETE" });
+
+    expect(deleted.ok).toBe(true);
+    expect(deleted.id).toBe(created.id);
+    expect(deleted.bankDeleted).toBe(true);
+
+    const after = await call(handler, config, "/api/agents");
+    expect(after.agents.find((agent: { id: string }) => agent.id === created.id)).toBeUndefined();
+
+    // Idempotent: a second delete on the same id returns 404, not 500.
+    const followUp = await rawCall(handler, config, `/api/agents/${created.id}`, { method: "DELETE" }, config.token);
+    expect(followUp.status).toBe(404);
+  });
+
+  test("DELETE /api/agents/:id rejects the default agent with 400", async () => {
+    const config = testConfig("agents-delete-default");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/agents/agent_default", { method: "DELETE" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot delete the default agent");
+  });
+
+  test("DELETE /api/agents/:id rejects the active agent with 400", async () => {
+    const config = testConfig("agents-delete-active");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "active" })
+    });
+    await call(handler, config, `/api/agents/${created.id}/use`, { method: "POST" });
+
+    const response = await rawCall(handler, config, `/api/agents/${created.id}`, { method: "DELETE" }, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("Cannot delete the active agent");
   });
 
   test("supports relay degraded health and notification delivery records", async () => {
@@ -432,11 +479,11 @@ describe("runtime api", () => {
 
     const memory = await call(handler, config, "/api/memory", {
       method: "POST",
-      body: JSON.stringify({ content: "original memory", scope: "user", status: "active" })
+      body: JSON.stringify({ content: "original memory", status: "active" })
     });
     const edited = await call(handler, config, `/api/memory/${memory.id}`, {
       method: "PATCH",
-      body: JSON.stringify({ content: "edited memory", scope: "temporary" })
+      body: JSON.stringify({ content: "edited memory" })
     });
     const archived = await call(handler, config, `/api/memory/${memory.id}`, { method: "DELETE" });
 
@@ -448,7 +495,6 @@ describe("runtime api", () => {
     const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
 
     expect(edited.content).toBe("edited memory");
-    expect(edited.scope).toBe("temporary");
     expect(archived.status).toBe("archived");
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");
@@ -478,6 +524,41 @@ describe("runtime api", () => {
     expect(inbound.status).toBe("received");
     expect(outbound.status).toBe("sent");
     expect(messages).toHaveLength(2);
+  });
+
+  test("rejects send to a target outside the active agent's messagingTargets filter", async () => {
+    const config = testConfig("messaging-agent-filter");
+    const handler = createHandler(config);
+
+    // Bridge advertises two targets so the per-call `target` selector has
+    // something to disagree with the agent filter about.
+    const bridge = await call(handler, config, "/api/messaging", {
+      method: "POST",
+      body: JSON.stringify({ name: "multi", kind: "demo", deliveryTargets: ["local", "slack"] })
+    });
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "local-only", toolsets: ["file"], messagingTargets: ["local"] })
+    });
+    await call(handler, config, `/api/agents/${agent.id}/use`, { method: "POST" });
+
+    // local target is permitted → succeeds.
+    const allowed = await call(handler, config, `/api/messaging/${bridge.id}/send`, {
+      method: "POST",
+      body: JSON.stringify({ text: "ok", target: "local" })
+    });
+    expect(allowed.status).toBe("sent");
+
+    // slack is outside the agent filter → server returns 400 with a typed
+    // error message that names both target and agent.
+    const rejected = await rawCall(handler, config, `/api/messaging/${bridge.id}/send`, {
+      method: "POST",
+      body: JSON.stringify({ text: "nope", target: "slack" })
+    }, config.token);
+    expect(rejected.ok).toBe(false);
+    const errorBody = await rejected.json();
+    expect(String(errorBody.error)).toContain("not permitted by active agent");
+    expect(String(errorBody.error)).toContain("slack");
   });
 
   test("returns a JSON pointer at GET / instead of static HTML", async () => {
@@ -598,6 +679,66 @@ describe("runtime api", () => {
     expect(chat.messages.some((message: { role: string; runId?: string }) => message.role === "assistant" && message.runId === submitted.runId)).toBe(true);
     expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
   });
+
+  // Round-1 review fix: browser-connect throws with prefixes that the
+  // gateway's catch-all previously mapped to 500. The webapp needs them as
+  // 4xx so it can render the original message instead of "internal error".
+  test("browser connect returns 400 for unsupported cdpUrl protocol", async () => {
+    const config = testConfig("browser-bad-proto");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ cdpUrl: "file:///etc/passwd" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Unsupported/);
+  });
+
+  test("browser connect returns 400 for garbage cdpUrl", async () => {
+    const config = testConfig("browser-bad-url");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ cdpUrl: "not-a-url" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Invalid cdpUrl/);
+  });
+
+  test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
+    const config = testConfig("browser-unreachable");
+    const handler = createHandler(config);
+    // Port 1 is reserved; probe will time out. The point of this test is
+    // the status mapping, so use a short-lived test by aborting once we
+    // see the response.
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/browser/connect",
+      {
+        method: "POST",
+        body: JSON.stringify({ cdpUrl: "http://127.0.0.1:1/" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/Could not reach CDP endpoint/);
+  }, 30_000);
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

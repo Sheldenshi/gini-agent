@@ -4,9 +4,10 @@ import { runDueJobs } from "./jobs";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
-import { appendLog } from "./state";
+import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
+import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -27,6 +28,38 @@ const instance = parseInstance();
 const config = loadConfig(instance);
 install(config);
 writePid(config);
+
+// Inform the browser session manager which instance to consult for the
+// optional CDP connection record. Without this the manager falls back to
+// the headless launch path (which is fine for unit tests that import the
+// tools directly).
+setBrowserInstance(config.instance);
+
+// Clear any stale browser connection record on startup. A managed record
+// only describes a Chrome window the runtime previously opened — that
+// window is gone after a restart, so the record is misleading: GET
+// /api/browser would report `connected: true` and the next agent tool call
+// would relaunch a visible Chrome window unprompted (because the session
+// manager reads state.browser and takes the headed persistent branch).
+// The on-disk persistent profile is independent of this record and stays
+// put — only the "user wants a visible window NOW" signal resets. The user
+// hits Connect again when they want the window back.
+{
+  const existing = readState(config.instance).browser ?? null;
+  if (existing) {
+    void mutateState(config.instance, (state) => {
+      state.browser = null;
+    })
+      .then(() => {
+        appendLog(config.instance, "browser.stale-record-cleared", { mode: existing.mode });
+      })
+      .catch((error) => {
+        appendLog(config.instance, "browser.stale-record-clear-error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      });
+  }
+}
 
 // Hindsight phase 6: opportunistic legacy migration. Runs once per server
 // start; subsequent starts are no-ops because each migrated record carries
@@ -162,7 +195,14 @@ process.on("SIGTERM", async () => {
   // shutdown forever. After the timeout we proceed even if the tick
   // hasn't unwound — the OS will reap the child process tree on exit.
   const drained = Promise.race([
-    schedulerDone.catch(() => {}),
+    Promise.all([
+      schedulerDone.catch(() => {}),
+      // Close any live headless browser contexts so Chromium child
+      // processes exit cleanly with the runtime instead of being reaped
+      // by the OS at the very end. Errors are swallowed — a stuck
+      // close shouldn't block runtime shutdown.
+      closeBrowserSessions().catch(() => {})
+    ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);
   // Print a stable shutdown marker so the foreground log capture (and any

@@ -5,12 +5,13 @@
 // split must remain re-exported here.
 
 export { now, id } from "./ids";
-export { assertInsideWorkspace, hashSecret } from "./security";
+export { assertInsideWorkspace, assertInsideWorkspaceNoSymlinkEscape, hashSecret } from "./security";
 export {
   createEmptyState,
   readState,
   writeState,
-  mutateState
+  mutateState,
+  seedDefaultAgentFromRuntimeConfig
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
@@ -20,6 +21,9 @@ export {
   closeAllMemoryDbs,
   removeMemoryDb,
   ensureDefaultBank,
+  ensureAgentBank,
+  bankIdForAgent,
+  deleteBankAndUnits,
   insertMemoryUnit,
   getMemoryUnit,
   countMemoryUnits,
@@ -99,9 +103,9 @@ export {
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
   createImportReport,
-  createProfileRecord,
+  createAgentRecord,
   createRelayRecord,
   createNotificationRecord,
-  activateProfile,
+  activateAgent,
   updateConnectorHealth
 } from "./records";

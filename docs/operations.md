@@ -10,7 +10,7 @@ One-line install:
 curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/install.sh | bash
 ```
 
-The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `main` instance under `~/.gini/instances/main/`. The wrapper defaults `GINI_INSTANCE=main` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `main` while repo-clone developers stay on `dev`.
+The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `default` instance under `~/.gini/instances/default/`. The wrapper defaults `GINI_INSTANCE=default` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `default`. Repo-clone developers running `bun run gini` get an instance auto-derived from the repo directory basename so each worktree is isolated by default.
 
 On macOS, the installer also enables autostart for the `main` instance (LaunchAgents at `~/Library/LaunchAgents/ai.lilaclabs.gini.main.gateway.plist` and `…main.web.plist`) and opens the Gini webapp's `/setup` page in your default browser. From the browser you pick a provider (OpenAI API key or Codex `codex --login` auth), submit, and the runtime starts using it on the next request. Pass `--no-autostart` to skip the LaunchAgent step (you'll need to run `gini start` manually and visit `/setup` to configure a provider).
 
@@ -29,7 +29,7 @@ Use Codex OAuth as the preferred interactive provider:
 
 ```sh
 codex --login
-bun run gini provider set codex gpt-5.4
+bun run gini provider set codex gpt-5.5
 bun run gini doctor
 ```
 
@@ -61,12 +61,12 @@ bun run gini run --instance feature-x
 
 `start` and `run` print the runtime gateway URL and the Next.js web URL.
 
-For `dev`, defaults are:
+The production `default` instance (installed via `curl|bash`) is pinned to memorable ports:
 
-- runtime: `http://127.0.0.1:7337`
-- web: `http://127.0.0.1:3000`
+- web: `http://127.0.0.1:7777`
+- runtime: `http://127.0.0.1:7778`
 
-Other instances get deterministic ports and isolated state.
+Developer worktree instances (auto-derived from the repo directory basename when running `bun run gini`) get deterministic hash-derived ports within a 100-port window starting at 7337 (runtime) / 3000 (web), so parallel worktrees coexist without manual `--port` wrangling. `gini status` prints the live URLs.
 
 ## Parallel Smoke Tests
 
@@ -122,6 +122,94 @@ If you're working on gini-agent itself and want to test the install/update/unins
 ```
 
 This is the same as the default install except it clones from your local repo into `~/.gini/runtime`. After you commit changes locally, `gini update` will pull them in. `gini uninstall` works exactly the same as a real install (same marker, same wrapper path).
+
+## Agent Iteration Cap
+
+The chat-task agent loop is bounded by a per-iteration cap that prevents
+runaway tool-calling. The default is 90 iterations (one iteration = one
+model call plus any tool dispatches that follow). Most tasks finish well
+under 10 iterations; the cap exists as a safety bound, not a meaningful
+budget for normal work.
+
+When the cap is hit the loop does NOT fail. Instead it makes one final
+tool-less model call asking for a summary of what was learned and what
+remained undone, and completes the task with that text. A warning trace
+records the cap hit so the activity is auditable.
+
+To override the cap for a single instance, edit
+`~/.gini/instances/<instance>/config.json` and add an `agent` object:
+
+```json
+{
+  "instance": "main",
+  "port": 7337,
+  "...": "...",
+  "agent": {
+    "maxIterations": 150
+  }
+}
+```
+
+`maxIterations` must be a positive integer. Invalid values (zero, negative,
+non-numeric) fall back to the built-in default and emit a warning trace on
+the next task. The runtime reads `config.json` once at server start and
+holds `RuntimeConfig` in memory, so edits don't take effect until you
+restart `gini run` (stop the tmux session and re-issue the command).
+
+## Approval Settings
+
+Two approval-bypass controls live behind the same endpoint
+(`/api/settings/auto-approve`):
+
+- **`autoApproveCommands` (shell-glob allowlist for `terminal_exec`).**
+  Skip the human gate for specific shell commands the agent runs.
+  Patterns are anchored on both ends (so `memo *` matches `memo notes
+  -a` but NOT `rm -rf / && memo notes`); `*` and `?` use standard glob
+  semantics, everything else is a literal match. Auto-approved
+  commands still write a high-risk `terminal.exec` audit row with
+  `evidence.autoApproved=true` and
+  `evidence.autoApprovedReason=<pattern>`.
+
+- **`dangerouslyAutoApprove` (global bypass for every approval-gated
+  tool).** When `true`, every approval-gated tool —
+  `file_write`, `file_patch`, `terminal_exec`, `code_exec`,
+  `browser_upload_file` — auto-resolves through the same approval and
+  audit pipeline as a human-approved call, with
+  `evidence.autoApprovedReason="dangerouslyAutoApprove"` stamped on
+  both the `approval.approved` audit row and the per-action audit
+  row. Applies to both the chat-task dispatcher (`POST /api/chat/<id>/messages`)
+  and the legacy imperative dispatcher (`POST /api/tasks`, `gini task
+  submit`). Default is `false`. Intended for trusted local dev loops
+  only — there is no human review for any side effect when this is
+  on. See [ADR 0006](adr/0006-dangerously-auto-approve.md) for the
+  full design and audit contract.
+
+Read current settings:
+
+```sh
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7337/api/settings/auto-approve
+```
+
+Set patterns:
+
+```sh
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"patterns": ["memo *", "remindctl *"]}' \
+  http://127.0.0.1:7337/api/settings/auto-approve
+```
+
+Toggle the global bypass:
+
+```sh
+curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+  -d '{"dangerouslyAutoApprove": true}' \
+  http://127.0.0.1:7337/api/settings/auto-approve
+```
+
+Both fields can be set in a single PATCH and either is optional;
+omitted keys keep their current value. The endpoint persists to
+`~/.gini/instances/<instance>/config.json` in one write and takes
+effect immediately for new tool dispatches.
 
 ## Cleanup
 

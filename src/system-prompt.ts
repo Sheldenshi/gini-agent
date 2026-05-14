@@ -22,7 +22,7 @@ const INSTRUCTIONS = [
 export function buildAgentSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
   const parts = [INSTRUCTIONS];
   if (memories.length > 0) {
-    const pinned = memories.map((memory) => `- (${memory.scope}) ${memory.content}`).join("\n");
+    const pinned = memories.map((memory) => `- ${memory.content}`).join("\n");
     parts.push(`Pinned memories about this user (curated, always relevant):\n${pinned}`);
   }
   if (recalledContext && recalledContext.trim().length > 0) {

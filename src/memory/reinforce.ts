@@ -31,6 +31,7 @@ import {
 } from "../state";
 import { generateStructured } from "../provider";
 import { cosineSimilarity } from "../embeddings";
+import { providerOverrideForRuntime } from "../execution/effective-context";
 import {
   opinionAssessmentValidator,
   type AssessmentVerdict
@@ -52,6 +53,11 @@ export async function reinforceOpinionsForUnits(
 ): Promise<void> {
   if (units.length === 0) return;
   const instance = config.instance;
+  // Resolve the active agent's provider override once. The reinforcement
+  // assessment is structured LLM generation and should follow the agent's
+  // provider just like retain/reflect do (ADR 0006). Embeddings stay on
+  // config.provider.
+  const providerOverride = providerOverrideForRuntime(config);
   for (const unit of units) {
     // Only facts (world/experience) trigger reinforcement; skip opinions
     // and observations to avoid feedback loops.
@@ -66,7 +72,7 @@ export async function reinforceOpinionsForUnits(
           schemaName: "OpinionAssessment",
           validator: opinionAssessmentValidator,
           echoTag: `assess:${opinion.id}`
-        });
+        }, providerOverride);
         const before = opinion.confidence ?? 0.5;
         const after = applyVerdict(before, result.data.verdict);
         if (after !== before) {

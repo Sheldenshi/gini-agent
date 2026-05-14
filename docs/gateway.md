@@ -36,14 +36,14 @@ Some local harness operations, such as smoke setup and evidence bundle generatio
 
 ## Instances
 
-Instances isolate state, logs, ports, tokens, workspaces, and web build directories. The default instance is `dev`.
+Instances isolate state, logs, ports, tokens, workspaces, and web build directories. The installed end-user CLI uses the `default` instance; `bun run gini` from a repo checkout auto-derives the instance from the repo directory basename so each worktree is isolated.
 
 ```sh
 bun run gini run --instance feature-x
 bun run gini start --instance personal
 ```
 
-`dev` defaults to runtime port `7337` and web port `3000`. Other instances derive deterministic ports and walk forward if a port is busy. Explicit `--port`, `--web-port`, `GINI_PORT`, and `GINI_WEB_PORT` stay strict: if the pinned port is busy, startup fails instead of silently moving.
+The `default` instance is pinned to memorable ports — web `7777`, runtime `7778` — so end-users always know what URL to hit. Other instances derive deterministic hash-based ports in a 100-port window (runtime base 7337, web base 3000) and walk forward if a port is busy. Explicit `--port`, `--web-port`, `GINI_PORT`, and `GINI_WEB_PORT` stay strict: if the pinned port is busy, startup fails instead of silently moving.
 
 ## Disk Layout
 

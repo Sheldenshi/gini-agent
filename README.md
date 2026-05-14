@@ -16,6 +16,16 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
 - [Roadmap](ROADMAP.md): shipped surfaces and what's planned, with design intent
 
+## Architecture decisions
+
+- [ADR 0001 — Local Runtime Architecture](docs/adr/0001-local-runtime-architecture.md)
+- [ADR 0002 — Minimal Trust Substrate](docs/adr/0002-trust-substrate.md)
+- [ADR 0003 — Instances And Control Surface](docs/adr/0003-instances-and-control-surface.md)
+- [ADR 0004 — Agent Loop With Native Tool Calling](docs/adr/0004-agent-loop-tool-calling.md)
+- [ADR 0005 — Subagent Delegation](docs/adr/0005-subagent-delegation.md)
+- [ADR 0006 — Agents Replace Profiles And Drive Runtime Behavior](docs/adr/0006-agents-replace-profiles.md)
+- [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
+
 ## Architecture In One Sentence
 
 Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract.
@@ -61,6 +71,11 @@ Caveat on macOS 26 (Tahoe): after a SIGKILL, launchd sometimes refuses to auto-r
 
 If you opted out of autostart (`--no-autostart`) or you're on Linux (autostart is macOS-only in v1), run `gini setup` then `gini start` to launch the runtime by hand.
 
+After install, the URLs are stable:
+
+- web: `http://127.0.0.1:7777`
+- runtime: `http://127.0.0.1:7778`
+
 ### Update
 
 ```bash
@@ -79,12 +94,9 @@ bun run gini install
 bun run gini start
 ```
 
-When you run the CLI from a repo clone, the default instance is `dev`. The installed `gini` command from `curl | bash` defaults to `main` instead so developer state and end-user state stay separate. For the `dev` instance the URLs default to:
+When you run `bun run gini` from a repo clone, the instance is auto-derived from the repo directory basename (`gini-agent`, `boston`, `rabat`, etc.) so each worktree gets isolated state without typing `--instance` every time. The installed `gini` command from `curl | bash` always uses the `default` instance, so developer worktrees and end-user state never collide. Per-instance runtime and web ports are deterministic hashes within a 100-port window starting at 7337 (runtime) / 3000 (web); `gini status` prints the actual URLs.
 
-- runtime: `http://127.0.0.1:7337`
-- web: `http://127.0.0.1:3000`
-
-Run a foreground instance for coding-agent worktrees:
+Run a foreground instance with an explicit name:
 
 ```bash
 bun run gini run --instance feature-x
@@ -133,7 +145,7 @@ Use Codex OAuth:
 
 ```bash
 codex --login
-bun run gini provider set codex gpt-5.4
+bun run gini provider set codex gpt-5.5
 bun run gini doctor
 ```
 

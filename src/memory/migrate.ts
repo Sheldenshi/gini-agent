@@ -2,9 +2,9 @@
 // store into the four-network SQLite store.
 //
 // Heuristic mapping:
-//   - scope    -> stays in record metadata as `legacyScope`. Future work may
-//                 namespace banks per project/user; v1 lumps everything into
-//                 the instance's default bank.
+//   - scope    -> dropped from MemoryRecord but legacy state files on disk
+//                 may still carry it; preserved as `metadata.legacyScope` on
+//                 the imported Hindsight unit purely as a breadcrumb.
 //   - content  -> embedded with the current provider, inserted as a
 //                 MemoryUnit. Network classified by a tiny rule:
 //                   first-person language ("I ", "did ", "recommended ",
@@ -28,10 +28,13 @@
 import type { Instance, MemoryRecord, RuntimeConfig } from "../types";
 import {
   DEFAULT_BANK_ID,
+  bankIdForAgent,
+  ensureAgentBank,
   ensureDefaultBank,
   insertMemoryUnit,
   mutateState,
-  now
+  now,
+  readState
 } from "../state";
 import { getEmbeddingProvider } from "../embeddings";
 
@@ -64,8 +67,13 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
   ensureDefaultBank(instance);
 
   // Snapshot the records to migrate. We do not run retain on each one —
-  // that would burn LLM tokens at scale — just embed and insert.
+  // that would burn LLM tokens at scale — just embed and insert. The
+  // legacy MemoryRecord already carries `agentId` after the Phase C
+  // normalizeState backfill; we use it directly so the migrated unit lands
+  // in the same agent's pool.
   const snapshot = await mutateState(instance, (state) => state.memories.slice());
+  const state = readState(instance);
+  const fallbackAgentId = state.activeAgentId ?? state.agents[0]?.id ?? "agent_default";
   const provider = getEmbeddingProvider(config);
 
   const report: MigrationReport = {
@@ -88,15 +96,23 @@ export async function migrateLegacyMemories(config: RuntimeConfig): Promise<Migr
     }
     try {
       const [vector] = await provider.embed([record.content]);
+      const agentId = record.agentId ?? fallbackAgentId;
+      ensureAgentBank(instance, agentId);
+      // legacyScope breadcrumb: legacy state files persisted before scope
+      // was dropped from MemoryRecord may still carry the field on disk;
+      // preserve it as an opaque breadcrumb on the imported Hindsight unit
+      // for downstream debugging. The field is not consulted at runtime.
+      const legacyScope = (record as unknown as { scope?: unknown }).scope;
       const unit = insertMemoryUnit(instance, {
-        bankId: DEFAULT_BANK_ID,
+        bankId: bankIdForAgent(agentId),
+        agentId,
         text: record.content,
         embedding: vector ?? null,
         embeddingModel: provider.model,
         network: classifyNetwork(record.content),
         confidence: typeof record.confidence === "number" ? record.confidence : null,
         metadata: {
-          legacyScope: record.scope,
+          legacyScope,
           legacyProvenance: record.provenance,
           legacyId: record.id
         },

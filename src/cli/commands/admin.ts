@@ -17,7 +17,7 @@ import {
   start as startLifecycle,
   stopRuntime
 } from "../process";
-import { print } from "../output";
+import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall } from "./autostart";
 
@@ -54,7 +54,7 @@ export async function install_(ctx: CliContext): Promise<void> {
 
 export async function start(ctx: CliContext): Promise<boolean> {
   const { banner, runtimeStarted } = await startLifecycle(ctx.config, ctx.web);
-  print(banner);
+  printStartBanner(banner);
   return runtimeStarted;
 }
 
@@ -491,7 +491,7 @@ export async function runForeground(ctx: CliContext): Promise<void> {
     const { banner, children } = await startLifecycle(ctx.config, { ...ctx.web, foreground: true });
     runtimeChild = children.runtime;
     webChild = children.web;
-    print(banner);
+    printStartBanner(banner);
   } catch (error) {
     // Startup failed — clean up any partial state and surface the error.
     shuttingDown = true;

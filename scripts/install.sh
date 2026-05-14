@@ -5,7 +5,7 @@ REPO_URL="https://github.com/Lilac-Labs/gini-agent"
 RUNTIME_DIR="$HOME/.gini/runtime"
 BIN_DIR="$HOME/.local/bin"
 WRAPPER_PATH="$BIN_DIR/gini"
-DEFAULT_INSTANCE="main"
+DEFAULT_INSTANCE="default"
 PATH_MANUAL=0
 SETUP_RAN=0
 
@@ -210,7 +210,7 @@ if [ -f "$HOME/.gini/secrets.env" ]; then
   set +a
   set -e
 fi
-export GINI_INSTANCE="${GINI_INSTANCE:-main}"
+export GINI_INSTANCE="${GINI_INSTANCE:-default}"
 cd "$HOME/.gini/runtime"
 exec bun run gini "$@"
 WRAPPER

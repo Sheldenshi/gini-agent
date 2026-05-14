@@ -182,9 +182,15 @@ export async function generateToolCallingResponse(
   config: RuntimeConfig,
   messages: ToolCallingMessage[],
   tools: ToolFunctionSpec[],
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  // Optional per-call override. Resolved by the chat-task loop from the
+  // active agent's providerName/model via resolveEffectiveContext. We do
+  // NOT mutate config.provider — embeddings and the reranker still read
+  // from config and must not be retargeted by agent switches. When
+  // omitted, behavior matches the legacy single-provider path.
+  providerOverride?: ProviderConfig
 ): Promise<ToolCallingResult> {
-  const provider = normalizeProvider(config.provider);
+  const provider = normalizeProvider(providerOverride ?? config.provider);
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const lastUserText = typeof lastUser?.content === "string" ? lastUser.content : "";
 
@@ -202,12 +208,15 @@ export async function generateToolCallingResponse(
     return result;
   }
 
-  // Codex/responses API. With tools present, route to the native
-  // function-calling responses path. Without tools, fall back to a plain
-  // text completion (preserves legacy callers like `generateTaskSummary`
-  // pathways that still pass through this function).
+  // Codex/responses API. Route to the native function-calling responses
+  // path whenever tools are present OR the message history already
+  // contains tool-calling traffic (assistant tool_calls / tool results).
+  // The latter matters for the graceful-exhaustion summary call: it
+  // passes `tools: []` but needs the prior tool transcript preserved so
+  // the model can summarize what it learned. Falling back to the text-
+  // only `/responses` path here would strip that transcript.
   if (provider.name === "codex") {
-    if (tools.length > 0) {
+    if (tools.length > 0 || messagesContainToolTraffic(messages)) {
       return callToolCallingResponses(provider, messages, tools, onDelta);
     }
     const systemContext = stitchSystemFromMessages(messages);
@@ -225,6 +234,20 @@ export async function generateToolCallingResponse(
   }
 
   return callToolCallingChatCompletions(provider, messages, tools, onDelta);
+}
+
+// True when the message array carries assistant `tool_calls` entries or
+// `tool` result messages. Used to decide whether the codex routing must
+// preserve the full Responses-API tool transcript even when the caller
+// passes an empty tools list (e.g. the iteration-cap summary turn).
+function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
+  for (const message of messages) {
+    if (message.role === "tool") return true;
+    if (message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // When falling back to the responses API for codex, collapse all `system`
@@ -781,9 +804,13 @@ export async function generateTaskSummary(
   input: string,
   memories: MemoryRecord[],
   recalledContext?: string,
-  onDelta?: (text: string) => void
+  onDelta?: (text: string) => void,
+  // Optional per-call override. Resolved by callers from the active agent's
+  // providerName/model via resolveEffectiveContext. Embeddings/reranker still
+  // read config.provider — do NOT mutate config here.
+  providerOverride?: ProviderConfig
 ): Promise<ProviderResult> {
-  const provider = normalizeProvider(config.provider);
+  const provider = normalizeProvider(providerOverride ?? config.provider);
   if (provider.name === "echo") {
     const memoryText = memories.length > 0 ? ` Active memory: ${memories.map((memory) => memory.content).join(" | ")}` : "";
     return {
@@ -864,9 +891,14 @@ function resolveEchoStub(tag: string): unknown {
 
 export async function generateStructured<T>(
   config: RuntimeConfig,
-  request: StructuredRequest<T>
+  request: StructuredRequest<T>,
+  // Optional per-call override. Resolved by callers from the active agent's
+  // providerName/model via resolveEffectiveContext. Used by retain/reflect/
+  // reinforce so Hindsight extraction follows the agent's provider just like
+  // chat-task inference does. Embeddings/reranker stay on config.provider.
+  providerOverride?: ProviderConfig
 ): Promise<StructuredResult<T>> {
-  const provider = normalizeProvider(config.provider);
+  const provider = normalizeProvider(providerOverride ?? config.provider);
   if (provider.name === "echo") {
     const tag = request.echoTag ?? request.schemaName;
     const stub = resolveEchoStub(tag);
@@ -1376,4 +1408,174 @@ function readOpenAIError(payload: Record<string, unknown>): string | undefined {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+// ---------------- Vision (image input) ----------------
+//
+// Single-shot vision call: caller provides a prompt + one inline base64 PNG/JPEG,
+// the provider returns plain text. Used by browser_vision to ask the configured
+// vision model about a page screenshot without exposing pixels to the agent
+// loop itself. We intentionally keep the surface tiny — one image, low detail,
+// small max_tokens — so cost stays bounded.
+export interface VisionRequest {
+  prompt: string;
+  imageBase64: string;
+  mimeType: "image/png" | "image/jpeg";
+  // Caps the model's response length. Defaults to 512 (small budget keeps
+  // surprise costs predictable; callers that need more should raise the cap
+  // explicitly and document why).
+  maxTokens?: number;
+}
+
+export interface VisionResult {
+  text: string;
+  provider: ProviderConfig;
+  usage?: Record<string, unknown>;
+  cost?: CostRecord;
+}
+
+// Echo provider vision stubs — mirror of echoToolCallingStubs. Tests register
+// canned results; default fallback returns a deterministic "Vision stub: <prompt>"
+// so callers that forget to seed a stub still see a stable shape.
+const echoVisionStubs: Array<{ tag?: string; result: Omit<VisionResult, "provider"> & { provider?: ProviderConfig } }> = [];
+
+export function setEchoVisionResponse(
+  result: Omit<VisionResult, "provider"> & { provider?: ProviderConfig },
+  tag?: string
+): void {
+  echoVisionStubs.push({ tag, result });
+}
+
+export function clearEchoVisionResponses(): void {
+  echoVisionStubs.length = 0;
+}
+
+function nextEchoVisionResult(provider: ProviderConfig, prompt: string): VisionResult {
+  const stub = echoVisionStubs.shift();
+  if (stub) {
+    return { provider: stub.result.provider ?? provider, ...stub.result };
+  }
+  return { provider, text: `Vision stub: ${prompt}` };
+}
+
+export async function generateVisionAnalysis(
+  config: RuntimeConfig,
+  request: VisionRequest
+): Promise<VisionResult> {
+  const provider = normalizeProvider(config.provider);
+  const maxTokens = request.maxTokens ?? 512;
+  if (provider.name === "echo") {
+    return nextEchoVisionResult(provider, request.prompt);
+  }
+  if (provider.name === "codex") {
+    return callVisionCodex(provider, request, maxTokens);
+  }
+  // openai / openrouter / local — all expose chat-completions with the same
+  // multi-modal content array shape (`type: "image_url"`).
+  return callVisionChatCompletions(provider, request, maxTokens);
+}
+
+async function callVisionCodex(
+  provider: ProviderConfig,
+  request: VisionRequest,
+  maxTokens: number
+): Promise<VisionResult> {
+  const bearer = readCodexBearer(provider);
+  const baseUrl = provider.baseUrl ?? DEFAULT_CODEX_BASE_URL;
+  const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+  const response = await fetch(`${baseUrl}/responses`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+      accept: "application/json",
+      ...codexHeaders(bearer)
+    },
+    body: JSON.stringify({
+      model: provider.model,
+      store: false,
+      stream: false,
+      instructions: "",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_text", text: request.prompt },
+            { type: "input_image", image_url: dataUrl, detail: "low" }
+          ]
+        }
+      ],
+      max_output_tokens: maxTokens
+    })
+  });
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Codex vision request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const text = extractOutputText(payload);
+  const usage = isRecord(payload.usage) ? payload.usage : undefined;
+  return {
+    provider,
+    text,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
+}
+
+async function callVisionChatCompletions(
+  provider: ProviderConfig,
+  request: VisionRequest,
+  maxTokens: number
+): Promise<VisionResult> {
+  const envName = provider.apiKeyEnv ?? "OPENAI_API_KEY";
+  const apiKey = provider.name === "local" ? process.env[envName] : readOpenAIBearer(provider);
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+    ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
+  };
+  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
+  // OpenAI's newer o-series chat models reject `max_tokens` outright and
+  // require `max_completion_tokens`. Older OpenAI models still accept the
+  // legacy field. OpenRouter / local OpenAI-compatible gateways may not
+  // recognize the newer name yet, so we keep `max_tokens` for them. Send
+  // only the field each backend expects to avoid double-counting or
+  // 400-level errors.
+  const tokenBudgetField = provider.name === "openai"
+    ? { max_completion_tokens: maxTokens }
+    : { max_tokens: maxTokens };
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      model: provider.model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: request.prompt },
+            { type: "image_url", image_url: { url: dataUrl, detail: "low" } }
+          ]
+        }
+      ],
+      ...tokenBudgetField
+    })
+  });
+  const rawPayload = await response.text();
+  const payload = parseJsonObject(rawPayload);
+  if (!response.ok) {
+    const fallback = rawPayload.slice(0, 500) || `Vision request failed with HTTP ${response.status}`;
+    throw new Error(readOpenAIError(payload) ?? fallback);
+  }
+  const text = extractChatText(payload);
+  const usage = isRecord(payload.usage) ? payload.usage : undefined;
+  return {
+    provider,
+    text,
+    usage,
+    cost: estimateCost(provider, usage)
+  };
 }

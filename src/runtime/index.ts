@@ -1,7 +1,8 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { Instance, RuntimeConfig } from "../types";
 import { configPath, ensureDir, instanceRoot, instancesRoot } from "../paths";
-import { readState, taskCounts } from "../state";
+import { readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
+import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
 
@@ -12,6 +13,22 @@ export function status(config: RuntimeConfig) {
   // open the DB here unless one already exists on disk to avoid creating an
   // empty memory.db side-effect from a read-only status call.
   const memoryUnits = countMemoryUnitsIfPresent(config);
+  // Surface the active-agent overrides so clients (Settings page, mobile
+  // app) can render the resolved provider and any warnings without
+  // re-deriving the intersection logic. Omitted when no active agent.
+  const effective = resolveEffectiveContext(state, config);
+  const activeAgent = effective.agentId
+    ? {
+        id: effective.agentId,
+        name: state.agents.find((a) => a.id === effective.agentId)?.name ?? effective.agentId,
+        resolvedProvider: { name: effective.provider.name, model: effective.provider.model },
+        providerSource: effective.providerSource,
+        toolsetFilter: effective.toolsetFilter ? Array.from(effective.toolsetFilter) : undefined,
+        messagingTargetFilter: effective.messagingTargetFilter ? Array.from(effective.messagingTargetFilter) : undefined,
+        memoryNamespace: effective.memoryNamespace ?? effective.agentId,
+        warnings: effective.warnings
+      }
+    : undefined;
   return {
     ok: true,
     instance: config.instance,
@@ -25,7 +42,8 @@ export function status(config: RuntimeConfig) {
     missedJobs,
     connectors: state.connectors.length,
     memoryUnits,
-    provider: providerHealth(config)
+    provider: providerHealth(config),
+    activeAgent
   };
 }
 
@@ -52,6 +70,13 @@ export function install(config: RuntimeConfig): void {
   ensureDir(instanceRoot(config.instance));
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   readState(config.instance);
+  // Seed the default agent's provider fields from the freshly-written
+  // config so `gini run --provider X` (or any CLI install) propagates
+  // to the active agent. Fire-and-forget: the mutateState write either
+  // settles before any chat task picks it up (typical) or the next
+  // resolveEffectiveContext call sees the unseeded agent and falls
+  // back to config.provider — both are safe.
+  void seedDefaultAgentFromRuntimeConfig(config);
 }
 
 export function resetInstance(config: RuntimeConfig): void {
@@ -109,16 +134,39 @@ export async function uninstallAll(options: UninstallAllOptions): Promise<Uninst
   return { instances, stopped, stopErrors, deletedInstances: options.deleteInstances };
 }
 
-// Updates the auto-approve command allowlist on the live config object
-// (mutated in place so the HTTP handler closure picks it up immediately)
-// and persists the new list to disk so it survives restarts. Patterns
-// are filtered through trim() to drop accidental whitespace and empties
-// from the UI text input. Returns the updated list so callers can
-// confirm the new state.
-export function updateAutoApproveCommands(config: RuntimeConfig, patterns: string[]): string[] {
-  const cleaned = patterns.map((p) => (typeof p === "string" ? p.trim() : "")).filter((p) => p.length > 0);
-  config.autoApproveCommands = cleaned;
+// Update the auto-approve settings on the live config object and
+// persist to disk in one write. Either or both of `patterns` and
+// `dangerouslyAutoApprove` can be supplied; omitted keys are left
+// alone. Returns the merged effective values so callers can confirm.
+// Patterns are filtered through trim() to drop accidental whitespace
+// and empties from the UI text input.
+export function updateAutoApproveSettings(
+  config: RuntimeConfig,
+  input: { patterns?: string[]; dangerouslyAutoApprove?: boolean }
+): { patterns: string[]; dangerouslyAutoApprove: boolean } {
+  if (input.patterns !== undefined) {
+    const cleaned = input.patterns.map((p) => (typeof p === "string" ? p.trim() : "")).filter((p) => p.length > 0);
+    config.autoApproveCommands = cleaned;
+  }
+  if (input.dangerouslyAutoApprove !== undefined) {
+    config.dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
   ensureDir(instanceRoot(config.instance));
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  return cleaned;
+  return {
+    patterns: config.autoApproveCommands ?? [],
+    dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove)
+  };
+}
+
+// Back-compat shim: kept for callers that only want to mutate the
+// allowlist. Delegates to updateAutoApproveSettings so persistence
+// stays single-sourced.
+export function updateAutoApproveCommands(config: RuntimeConfig, patterns: string[]): string[] {
+  return updateAutoApproveSettings(config, { patterns }).patterns;
+}
+
+// Back-compat shim for the flag.
+export function updateDangerouslyAutoApprove(config: RuntimeConfig, enabled: boolean): boolean {
+  return updateAutoApproveSettings(config, { dangerouslyAutoApprove: enabled }).dangerouslyAutoApprove;
 }

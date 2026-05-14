@@ -27,7 +27,7 @@ The product promise is operational trust. The system can start small, but it mus
 ## Consequences For Coding Agents
 
 - If a new action can mutate state outside the task/run record, add an audit event.
-- If a new action can affect user files or system state, route it through approval first.
+- If a new action can affect user files or system state, route it through approval first. The operator can opt into the sanctioned bypass (`dangerouslyAutoApprove`, ADR 0006) which still produces the full approval + audit trail with an explicit auto-approved marker — but new tools should be designed assuming the human gate is the default.
 - If a new action happens during execution, append trace evidence.
 
 ## Acceptance Checks

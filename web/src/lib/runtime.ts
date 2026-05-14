@@ -52,7 +52,7 @@ function stateRoot(): string {
 }
 
 export function runtimeInstance(): string {
-  return process.env.GINI_INSTANCE ?? "dev";
+  return process.env.GINI_INSTANCE ?? "default";
 }
 
 // Resolve the gateway URL with this precedence:
@@ -60,13 +60,13 @@ export function runtimeInstance(): string {
 //   2. ~/.gini/instances/<inst>/runtime.port (written by src/server.ts on
 //      boot). This lets the BFF survive a gateway restart that picks a
 //      different port without the user restarting the web process.
-//   3. Hardcoded http://127.0.0.1:7337 fallback (legacy dev instance default).
+//   3. Hardcoded http://127.0.0.1:7778 fallback (production `default` instance).
 export function runtimeUrl(): string {
   if (process.env.GINI_RUNTIME_URL) return process.env.GINI_RUNTIME_URL;
   const portFile = join(stateRoot(), "instances", runtimeInstance(), "runtime.port");
   const port = readFileWithMtimeCache(portFile);
   if (port) return `http://127.0.0.1:${port}`;
-  return "http://127.0.0.1:7337";
+  return "http://127.0.0.1:7778";
 }
 
 // Resolve the gateway bearer token with this precedence:

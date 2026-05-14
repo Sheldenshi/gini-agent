@@ -21,12 +21,32 @@ import {
   now,
   readState
 } from "../state";
-import { findTask, runTerminalCommand } from "../agent";
+import { ApprovalRaceLostError, ApprovedActionFailedError, findTask, resolveApproval, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { createScheduledJob } from "../jobs";
+import { riskForAction } from "./tool-risk";
+import {
+  browserBack,
+  browserClick,
+  browserClose,
+  browserConsole,
+  browserDrag,
+  browserHover,
+  browserNavigate,
+  browserPress,
+  browserScroll,
+  browserSelectOption,
+  browserSnapshot,
+  browserTabs,
+  browserType,
+  browserVision,
+  browserWaitFor,
+  peekCurrentBrowserUrl,
+  resolveUploadPath
+} from "../tools/browser";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -64,14 +84,68 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "create_job":
       return { kind: "sync", result: await createJobTool(config, taskId, args) };
+    case "browser_navigate":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
+    case "browser_snapshot":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.snapshot", () => browserSnapshot(taskId, args), args) };
+    case "browser_click":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.click", () => browserClick(taskId, args), args) };
+    case "browser_type":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.type", () => browserType(taskId, args), args) };
+    case "browser_press":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.press", () => browserPress(taskId, args), args) };
+    case "browser_scroll":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.scroll", () => browserScroll(taskId, args), args) };
+    case "browser_back":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.back", () => browserBack(taskId, args), args) };
+    case "browser_console":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.console", () => browserConsole(taskId, args), args) };
+    case "browser_close":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.close", () => browserClose(taskId, args), args) };
+    case "browser_hover":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.hover", () => browserHover(taskId, args), args) };
+    case "browser_drag":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.drag", () => browserDrag(taskId, args), args) };
+    case "browser_select_option":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.select_option", () => browserSelectOption(taskId, args), args) };
+    case "browser_wait_for":
+      return { kind: "sync", result: await browserDispatch(config, taskId, "browser.wait_for", () => browserWaitFor(taskId, args), args) };
+    case "browser_tabs": {
+      // tabs.list is read-only (low risk); tabs.new/switch/close mutate the
+      // active page (medium). Encode that into the action label so the risk
+      // registry in tool-risk.ts picks the right bucket without re-parsing
+      // args downstream.
+      const tabsAction = typeof args.action === "string" ? args.action : "";
+      const label =
+        tabsAction === "new" || tabsAction === "switch" || tabsAction === "close"
+          ? `browser.tabs.${tabsAction}`
+          : "browser.tabs.list";
+      return { kind: "sync", result: await browserDispatch(config, taskId, label, () => browserTabs(taskId, args), args) };
+    }
+    case "browser_vision": {
+      const result = await browserDispatch(config, taskId, "browser.vision", () => browserVision(taskId, args, config), args);
+      // Roll the vision provider's spend into the owning task's cost row
+      // so the chat UI's running token / USD total reflects the
+      // out-of-band vision call. The envelope carries `cost` as a
+      // CostRecord (or null) — parse it once and accumulate via
+      // addCostToTask. Failures here are best-effort; the tool result
+      // already flows back to the model.
+      await accumulateBrowserVisionCost(config, taskId, result);
+      return { kind: "sync", result };
+    }
+    case "browser_upload_file":
+      // Uploading a workspace file egresses bytes to a remote site —
+      // explicit, side-effecting, irreversible from the user's
+      // perspective. Route through the approval gate like file.write.
+      return pendingOrAuto(config, () => requestBrowserUpload(config, taskId, toolCallId, args));
     case "file_write":
-      return { kind: "pending", approvalId: await requestFileWrite(config, taskId, toolCallId, args) };
+      return pendingOrAuto(config, () => requestFileWrite(config, taskId, toolCallId, args));
     case "file_patch":
-      return { kind: "pending", approvalId: await requestFilePatch(config, taskId, toolCallId, args) };
+      return pendingOrAuto(config, () => requestFilePatch(config, taskId, toolCallId, args));
     case "terminal_exec":
-      return await terminalExecDispatch(config, taskId, toolCallId, args);
+      return terminalExecDispatch(config, taskId, toolCallId, args);
     case "code_exec":
-      return { kind: "pending", approvalId: await requestCodeExec(config, taskId, toolCallId, args) };
+      return pendingOrAuto(config, () => requestCodeExec(config, taskId, toolCallId, args));
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
@@ -163,6 +237,147 @@ async function fileSearch(config: RuntimeConfig, taskId: string, args: Record<st
   });
   await recordLowRiskAudit(config, taskId, "file.search", pattern, { matches: matches.length });
   return matches.join("\n") || "No matches.";
+}
+
+// Wraps a browser tool invocation with the trace+audit ceremony every other
+// chat-task tool emits. Browser tools return JSON strings on their own
+// (success or error), so we don't second-guess their result — we just log
+// the dispatch and pass it through. Audit risk is derived from the single
+// source of truth in src/execution/tool-risk.ts:
+//   - read-only paths (navigate/snapshot/hover/scroll/back/press/console/
+//     close/wait_for/tabs.list/vision) are "low"
+//   - side-effecting calls (click/type/drag/select_option/tabs.{new,switch,
+//     close}) are "medium"
+// browser.upload_file is classified "high" in the registry but never
+// reaches this dispatcher: it's intercepted as an approval request in
+// requestBrowserUpload and executed via agent.executeApprovedAction after
+// explicit user consent.
+//
+// Callers pass a thunk so the legacy `(taskId, args)` tools and the
+// config-bearing browser_vision can share one wrapper without forcing a
+// uniform signature on the tool functions themselves.
+async function browserDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  action: string,
+  thunk: () => Promise<string>,
+  args: Record<string, unknown>
+): Promise<string> {
+  const result = await thunk();
+  const risk = riskForAction(action);
+  let parsed: { success?: boolean; error?: string } = {};
+  try {
+    parsed = JSON.parse(result) as { success?: boolean; error?: string };
+  } catch {
+    // Result wasn't JSON — treat as opaque success.
+    parsed = { success: true };
+  }
+  // When the browser tool's safety check blocks a URL (which may contain a
+  // bearer/api-token pattern), the raw URL would otherwise be persisted to
+  // both trace data and the audit row, where it surfaces in the activity
+  // UI and on disk. Redact the URL and target in that case so secrets
+  // don't leak through the audit trail. Other failures (network, timeout,
+  // unknown ref) keep the URL since it's needed for debugging.
+  //
+  // Match both "Blocked:" (active safety rejection) and "Invalid URL:"
+  // (URL parse failure) — defense in depth so any safety-rejection prefix
+  // routed through this dispatcher won't leak the input string. The error
+  // message itself can also echo the raw URL (e.g. `Invalid URL: <raw>`),
+  // so we substitute a generic "[redacted]" string for the persisted error
+  // on the redaction path while still letting the original error reach the
+  // model via the returned tool result.
+  const safetyBlocked =
+    parsed.success === false &&
+    typeof parsed.error === "string" &&
+    (parsed.error.startsWith("Blocked:") || parsed.error.startsWith("Invalid URL:"));
+  const safeArgs = safetyBlocked && typeof args.url === "string"
+    ? { ...args, url: "[redacted]" }
+    : args;
+  const safeTarget = safetyBlocked && typeof args.url === "string"
+    ? "[redacted]"
+    : typeof args.url === "string"
+      ? args.url
+      : typeof args.ref === "string"
+        ? args.ref
+        : action;
+  const safeError = safetyBlocked ? "[redacted]" : parsed.error ?? null;
+  appendTrace(config.instance, taskId, {
+    type: parsed.success === false ? "error" : "tool",
+    message: `Browser tool ${action}`,
+    data: { action, args: safeArgs, success: parsed.success !== false, error: safeError }
+  });
+  await mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    state.audit.unshift({
+      id: `audit_${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`,
+      instance: state.instance,
+      at: now(),
+      actor: "agent",
+      action,
+      target: safeTarget,
+      risk,
+      taskId: item.id,
+      runId: item.runId,
+      evidence: { args: safeArgs, success: parsed.success !== false, error: safeError }
+    });
+    item.updatedAt = now();
+  });
+  return result;
+}
+
+// Sum a per-call CostRecord into the owning task's running cost row.
+// Mirrors addCost in src/execution/chat-task.ts: token totals add; USD
+// estimates add when present; provider/model track the most recent call.
+// This keeps task.cost honest when out-of-band side calls (like
+// browser_vision's provider request) consume tokens the main agent loop
+// doesn't see directly.
+async function accumulateBrowserVisionCost(
+  config: RuntimeConfig,
+  taskId: string,
+  rawResult: string
+): Promise<void> {
+  let parsed: { cost?: Record<string, unknown> | null } = {};
+  try {
+    parsed = JSON.parse(rawResult) as typeof parsed;
+  } catch {
+    return;
+  }
+  if (!parsed.cost || typeof parsed.cost !== "object") return;
+  const increment = parsed.cost as {
+    provider?: string;
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    estimatedUsd?: number;
+  };
+  // Skip entirely if there's nothing numeric to add (e.g. the provider
+  // didn't return usage). Avoids pointless mutateState round-trips.
+  if (
+    increment.inputTokens === undefined &&
+    increment.outputTokens === undefined &&
+    increment.totalTokens === undefined &&
+    increment.estimatedUsd === undefined
+  ) {
+    return;
+  }
+  await mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    const sum = (a: number | undefined, b: number | undefined): number | undefined => {
+      if (a === undefined && b === undefined) return undefined;
+      return (a ?? 0) + (b ?? 0);
+    };
+    const prev = item.cost;
+    item.cost = {
+      provider: increment.provider ?? prev?.provider ?? "",
+      model: increment.model ?? prev?.model ?? "",
+      inputTokens: sum(prev?.inputTokens, increment.inputTokens),
+      outputTokens: sum(prev?.outputTokens, increment.outputTokens),
+      totalTokens: sum(prev?.totalTokens, increment.totalTokens),
+      estimatedUsd: sum(prev?.estimatedUsd, increment.estimatedUsd)
+    };
+    item.updatedAt = now();
+  });
 }
 
 async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
@@ -499,6 +714,58 @@ async function requestFileWrite(
   });
 }
 
+// Approval-gated browser_upload_file. Validates the workspace path (and
+// its symlink target) before opening the approval row so the user sees a
+// real, in-workspace file on the approval card. The actual setInputFiles
+// call runs in agent.executeApprovedAction's "browser.upload_file"
+// branch, which calls browserUploadFileApproved with the captured ref +
+// resolved path.
+async function requestBrowserUpload(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const ref = requireString(args, "ref");
+  const userPath = requireString(args, "path");
+  // resolveUploadPath throws on invalid / outside-workspace / symlink-escape.
+  // Let it propagate so the dispatch loop surfaces the error message to the
+  // model as a tool error (matching how requestFileWrite handles
+  // assertInsideWorkspace failures).
+  const resolved = resolveUploadPath(config.workspaceRoot, userPath);
+  // Capture the destination URL before the approval is created so the
+  // approval card surfaces where the file is about to land. May be null
+  // when the agent hasn't opened a browser session yet (no navigation
+  // before the upload request) — the approval still works, the UI just
+  // can't show a destination.
+  const currentUrl = peekCurrentBrowserUrl(taskId) ?? null;
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "browser.upload_file",
+      target: resolved.displayPath,
+      risk: "high",
+      reason: "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
+      payload: {
+        ref,
+        path: userPath,
+        resolvedPath: resolved.absolute,
+        currentUrl,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser upload (chat-task)",
+      data: { approvalId: approval.id, target: resolved.displayPath, ref, toolCallId, destination: currentUrl }
+    });
+    return approval.id;
+  });
+}
+
 async function requestFilePatch(
   config: RuntimeConfig,
   taskId: string,
@@ -542,12 +809,15 @@ async function requestFilePatch(
   });
 }
 
-// Either auto-approves (if the user added a matching pattern to
-// `RuntimeConfig.autoApproveCommands`) or creates an approval row and
-// pauses the task. Auto-approved commands still produce a high-risk
-// `terminal.exec` audit row so the activity trail is identical from the
-// reviewer's perspective — the only difference is `evidence.autoApproved
-// = true` and `evidence.autoApprovedReason = <matched pattern>`.
+// Routes a terminal command to either:
+//   1. Allowlist fast-path: `RuntimeConfig.autoApproveCommands` matched the
+//      command, so we run it via `runTerminalCommand` without an approval
+//      row. The audit trail records `evidence.autoApproved=true,
+//      autoApprovedReason=<matched pattern>` on the side-effect audit row.
+//   2. Standard flow: create a pending approval and let the chat-task loop
+//      pause. `pendingOrAuto` may immediately resolve it through
+//      `resolveApproval` when `RuntimeConfig.dangerouslyAutoApprove` is on,
+//      in which case the full approval row + audit pair is still produced.
 async function terminalExecDispatch(
   config: RuntimeConfig,
   taskId: string,
@@ -573,7 +843,18 @@ async function terminalExecDispatch(
     return { kind: "sync", result: result.summary };
   }
 
-  const approvalId = await mutateState(config.instance, (state: RuntimeState) => {
+  return pendingOrAuto(config, () => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty));
+}
+
+async function requestTerminalExec(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  command: string,
+  timeoutMs: number,
+  pty: boolean
+): Promise<string> {
+  return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     const approval = createApproval(state, {
       taskId: item.id,
@@ -592,7 +873,6 @@ async function terminalExecDispatch(
     });
     return approval.id;
   });
-  return { kind: "pending", approvalId };
 }
 
 async function requestCodeExec(
@@ -632,4 +912,53 @@ async function requestCodeExec(
 export function approvalToolCallId(payload: Record<string, unknown>): string | undefined {
   const id = payload.toolCallId;
   return typeof id === "string" ? id : undefined;
+}
+
+// ---------------- pendingOrAuto ----------------
+//
+// Single-point wrapper for every approval-gated tool. When
+// `RuntimeConfig.dangerouslyAutoApprove` is off this is a no-op and we
+// return the pending approval as usual so the chat-task loop pauses for
+// the human gate. When on, the freshly-created approval is immediately
+// resolved through the same `resolveApproval` -> `executeApprovedAction`
+// path that user-driven approvals take, so approval creation, the approve
+// audit row, the per-action side-effect audit, and the tool result string
+// all live in one canonical place (agent.ts) instead of being duplicated
+// here per action. Each side effect still emits a fully populated
+// approval row (status=approved, evidence.autoApproved=true,
+// autoApprovedReason="dangerouslyAutoApprove") and audit row, so the
+// reviewer sees an identical trail to a normal flow except for that
+// marker.
+async function pendingOrAuto(
+  config: RuntimeConfig,
+  request: () => Promise<string>
+): Promise<DispatchResult> {
+  const approvalId = await request();
+  if (!config.dangerouslyAutoApprove) return { kind: "pending", approvalId };
+  try {
+    const { toolResult } = await resolveApproval(config, approvalId, {
+      actor: "runtime",
+      resumeChatTask: false,
+      evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+    });
+    return { kind: "sync", result: toolResult ?? "Auto-approved." };
+  } catch (err) {
+    // Race-loss: another caller (concurrent deny / cancel / double-
+    // approve) decided this approval between our request* call and our
+    // resolveApproval call. The other party is responsible for the
+    // task's terminal transition; we just stop pretending we own the
+    // action and let the chat-task loop's next-iteration cancellation
+    // check observe the decided state. Returning a sync tool result
+    // keeps the dispatch loop honest without escalating to task failure.
+    if (err instanceof ApprovalRaceLostError) {
+      return { kind: "sync", result: `Action skipped: approval was already ${err.status} by another caller.` };
+    }
+    // Side-effect failed AFTER we marked the approval approved. Wrap in
+    // ApprovedActionFailedError so the chat-task loop's generic catch
+    // re-throws it (instead of converting to a recoverable tool result)
+    // and the outer runChatTask handler fails the owning task. Without
+    // this the model would receive a string like "Error: EISDIR" and
+    // could go on to declare the task complete despite the failure.
+    throw new ApprovedActionFailedError(approvalId, err);
+  }
 }

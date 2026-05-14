@@ -79,7 +79,17 @@ tmux send-keys -t $SESSION "bun run gini run --instance $(basename "$(pwd)")" En
 ```
 
 If `tmux has-session -t gini-<instance>` returns non-zero, the run script
-hasn't been started yet — ask the user to start it from Conductor rather
-than starting it yourself. Prefer reading the log files above for
-historical output; use `capture-pane` only when you need exactly what's
-on screen right now.
+isn't up yet. Start it yourself with the same pattern Conductor uses —
+`tmux new-session -A` attaches to an existing session or creates a new one,
+so it's safe to call unconditionally:
+
+```bash
+instance=$(basename "$(pwd)")
+tmux new-session -d -A -s "gini-$instance" "bun run gini run --instance $instance"
+```
+
+(Conductor's workspace `conductor.json` run script uses the same flag, so
+this matches what the user sees when they click Run.)
+
+Prefer reading the log files above for historical output; use
+`capture-pane` only when you need exactly what's on screen right now.

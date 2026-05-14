@@ -2,6 +2,56 @@ export function print(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
+const ANSI = {
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  red: "\x1b[31m",
+  dim: "\x1b[2m",
+  bold: "\x1b[1m",
+  reset: "\x1b[0m"
+} as const;
+
+function paint(color: keyof typeof ANSI, text: string): string {
+  // Skip colors when stdout isn't a TTY (piped/redirected) so callers parsing
+  // output don't have to strip escape codes.
+  if (!process.stdout.isTTY) return text;
+  return `${ANSI[color]}${text}${ANSI.reset}`;
+}
+
+interface StartBanner {
+  started?: boolean;
+  running?: boolean;
+  url?: string;
+  webUrl?: string;
+  webError?: string;
+  instance?: string;
+  foreground?: boolean;
+}
+
+// Friendly multi-line banner for `gini start` / `gini run`. Replaces the raw
+// JSON dump so users see a clear status indicator and clickable web URL.
+// Keeps each field on its own line — terminals make URLs clickable when they
+// stand alone with no surrounding punctuation.
+export function printStartBanner(value: unknown): void {
+  const banner = value as StartBanner;
+  const justStarted = banner.started === true;
+  const wasRunning = !justStarted && banner.running === true;
+  const dot = paint("green", "●");
+  const verb = justStarted ? "started" : wasRunning ? "running" : "running";
+  const mode = banner.foreground ? paint("dim", " (foreground — Ctrl-C to stop)") : "";
+  const lines: string[] = [];
+  lines.push(`${dot} ${paint("bold", "Gini")} ${verb}${mode}`);
+  if (banner.instance) lines.push(`  ${paint("dim", "Instance")}  ${banner.instance}`);
+  if (banner.webUrl) lines.push(`  ${paint("dim", "Web     ")}  ${banner.webUrl}`);
+  if (banner.webError) {
+    // The runtime is still up if only the web failed — surface it here so the
+    // user can recover (e.g. retry, look at logs) without re-running status.
+    lines.push(`  ${paint("yellow", "⚠ Web failed:")} ${banner.webError}`);
+    if (banner.url) lines.push(`  ${paint("dim", "Runtime ")}  ${banner.url}`);
+  }
+  console.log(lines.join("\n"));
+}
+
 export function compactTask(task: { id: string; status: string; title: string; updatedAt: string }) {
   return { id: task.id, status: task.status, title: task.title, updatedAt: task.updatedAt };
 }
@@ -13,16 +63,16 @@ export function improvementPayload(kind: string, title: string, content: string)
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
   }
-  return { content, scope: "project", confidence: 0.75 };
+  return { content, confidence: 0.75 };
 }
 
 export function help(): void {
   console.log(`Gini CLI
 
 Usage:
-  bun run gini install [--instance dev]
-  bun run gini start|stop|status|doctor|reset [--instance dev] [--port 7337]
-  bun run gini run [--instance dev] [--no-web]
+  bun run gini install [--instance <name>]
+  bun run gini start|stop|status|doctor|reset [--instance <name>] [--port <port>]
+  bun run gini run [--instance <name>] [--no-web]
   bun run gini uninstall [--instance <name>] [--yes] [--purge]
   bun run gini update
   bun run gini setup [--force] [--yes]
@@ -44,11 +94,12 @@ Usage:
   bun run gini mobile bootstrap
   bun run gini search <query>
   bun run gini toolsets list|enable|disable
+  bun run gini browser status|connect [--url WSURL]|disconnect|wipe-profile [--yes]
   bun run gini subagents list|spawn
   bun run gini mcp list|add|health|invoke|disable
   bun run gini messaging list|add|health|disable
   bun run gini import inspect hermes|openclaw <path>
-  bun run gini profiles list|create|use
+  bun run gini agents list|create|use
   bun run gini parity hermes
   bun run gini readiness v1
   bun run gini relays list|add|health

@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Instance, PairingStatus, RuntimeState } from "../types";
+import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
-import { defaultProfile, defaultTools, defaultToolsets } from "./defaults";
+import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
+import { addAudit } from "./audit";
+import { getMemoryDb, memoryDbPath } from "./memory-db";
 
 export function createEmptyState(instance: Instance): RuntimeState {
   const at = now();
@@ -41,8 +43,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
     mcpServers: [],
     messagingBridges: [],
     importReports: [],
-    profiles: [defaultProfile(instance, at)],
-    activeProfileId: "profile_default",
+    agents: [defaultAgent(instance, at)],
+    activeAgentId: "agent_default",
     relays: [],
     notifications: [],
     events: [],
@@ -86,6 +88,17 @@ export function writeState(instance: Instance, state: RuntimeState): void {
 // (writeFileSync to .tmp + renameSync) so a reader either sees the prior
 // state or the next state, never a torn write.
 const instanceLocks = new Map<Instance, Promise<unknown>>();
+
+// Public seed/migration entrypoint. Called at boot from `install()` so the
+// default agent picks up `gini run --provider X` on fresh instances and
+// migrates legacy davao-style instances away from the leaked echo
+// defaults. Idempotent — calling it twice with the same inputs is a no-op.
+// Writes back to disk only when something actually changed.
+export async function seedDefaultAgentFromRuntimeConfig(config: RuntimeConfig): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    seedDefaultAgentFromConfig(state, config.provider);
+  });
+}
 
 export async function mutateState<T>(instance: Instance, fn: (state: RuntimeState) => T): Promise<T> {
   const previous = instanceLocks.get(instance) ?? Promise.resolve();
@@ -143,7 +156,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "mcpServers",
     "messagingBridges",
     "importReports",
-    "profiles",
+    "agents",
     "relays",
     "notifications",
     "events",
@@ -168,7 +181,191 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
 }
 
+// Seed the default agent's provider fields from RuntimeConfig.provider when:
+//   1. The agent has never been configured (providerName/model undefined), OR
+//   2. The agent still carries the legacy hardcoded echo defaults AND the
+//      instance config points at a different provider — this corrects
+//      pre-Phase-B instances where the default leaked echo regardless of
+//      the user's `gini run --provider X` choice.
+// Idempotent: a second pass with the same inputs is a no-op. Touches only
+// the default agent (id === "agent_default" or the legacy "profile_default")
+// because non-default agents are user-authored and we don't want to clobber
+// their explicit picks.
+function seedDefaultAgentFromConfig(state: RuntimeState, provider: ProviderConfig): boolean {
+  const defaults = state.agents.filter((agent) => agent.id === "agent_default" || agent.id === "profile_default");
+  let mutated = false;
+  for (const agent of defaults) {
+    const needsSeed = !agent.providerName || !agent.model;
+    const legacyEcho = agent.providerName === "echo"
+      && agent.model === "gini-echo-v0"
+      && (provider.name !== "echo" || provider.model !== "gini-echo-v0");
+    if (!needsSeed && !legacyEcho) continue;
+    agent.providerName = provider.name;
+    agent.model = provider.model;
+    agent.updatedAt = now();
+    mutated = true;
+  }
+  return mutated;
+}
+
+// Pre-rename state files persisted `state.profiles` / `state.activeProfileId`.
+// After the profile→agent rename these fields still exist on disk; we rewrite
+// them in-place when first read. mutateState's read-modify-write cycle persists
+// the cleaned shape on the next mutation. Idempotent: when `agents` already
+// exists, the legacy `profiles` field is just dropped.
+function migrateProfileFieldsToAgent(state: RuntimeState): void {
+  const stateAny = state as unknown as {
+    profiles?: unknown;
+    agents?: unknown;
+    activeProfileId?: unknown;
+    activeAgentId?: unknown;
+  };
+  if (stateAny.profiles !== undefined && stateAny.agents === undefined) {
+    stateAny.agents = stateAny.profiles;
+  }
+  delete stateAny.profiles;
+  if (stateAny.activeProfileId !== undefined && stateAny.activeAgentId === undefined) {
+    stateAny.activeAgentId = stateAny.activeProfileId;
+  }
+  delete stateAny.activeProfileId;
+}
+
+// Drop the dead `MemoryRecord.scope` and `AgentRecord.memoryScopes` fields
+// from persisted state. Neither was consulted at runtime after Phase C —
+// `agentId` is the only memory isolation boundary. Idempotent: a second
+// pass over an already-cleaned state file matches no rows. Emits one
+// summary audit event per collection when something was stripped so the
+// cleanup shows up in `gini doctor` / /api/audit.
+function migrateDropDeadMemoryFields(state: RuntimeState): void {
+  let scopesStripped = 0;
+  if (Array.isArray(state.memories)) {
+    for (const memory of state.memories) {
+      const rec = memory as unknown as { scope?: unknown };
+      if (rec.scope !== undefined) {
+        delete rec.scope;
+        scopesStripped += 1;
+      }
+    }
+  }
+  let memoryScopesStripped = 0;
+  if (Array.isArray(state.agents)) {
+    for (const agent of state.agents) {
+      const rec = agent as unknown as { memoryScopes?: unknown };
+      if (rec.memoryScopes !== undefined) {
+        delete rec.memoryScopes;
+        memoryScopesStripped += 1;
+      }
+    }
+  }
+  if (scopesStripped > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "memory.scope.dropped",
+      target: "state.memories",
+      risk: "low",
+      evidence: { stripped: scopesStripped }
+    });
+  }
+  if (memoryScopesStripped > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "agent.memoryscopes.dropped",
+      target: "state.agents",
+      risk: "low",
+      evidence: { stripped: memoryScopesStripped }
+    });
+  }
+}
+
+// Phase C — per-agent memory isolation backfill for the legacy
+// MemoryRecord store. Walks state.memories and stamps `agentId` on rows
+// that pre-date Phase C, bundling all of them under whichever agent was
+// active at migration time (typically the default agent on davao-style
+// instances). Idempotent: rows already carrying `agentId` are skipped.
+// Audits the count so the rebucketing shows up in `gini doctor` /
+// /api/audit. Hindsight unit/bank backfill lives in
+// migrateHindsightAgentIdColumns (runs against SQLite, not JSON state).
+function migrateMemoryAgentId(state: RuntimeState): void {
+  if (!Array.isArray(state.memories) || state.memories.length === 0) return;
+  const defaultAgentId =
+    state.activeAgentId
+    ?? state.agents.find((agent) => agent.status === "active")?.id
+    ?? state.agents[0]?.id
+    ?? "agent_default";
+  let stamped = 0;
+  for (const memory of state.memories) {
+    if (memory.agentId) continue;
+    memory.agentId = defaultAgentId;
+    stamped += 1;
+  }
+  if (stamped > 0) {
+    addAudit(state, {
+      actor: "runtime",
+      action: "memory.agentid.backfill",
+      target: defaultAgentId,
+      risk: "low",
+      evidence: { stamped, agentId: defaultAgentId }
+    });
+  }
+}
+
+// Phase C — per-agent backfill on the SQLite hindsight store. Pre-Phase-C
+// rows have a NULL agent_id (default value from the ALTER TABLE). Walk the
+// DB once and stamp them with the migration-time active agent, mirroring
+// the JSON MemoryRecord backfill. Bank rows get the same treatment so
+// their `agentId` field is non-null going forward. Idempotent — only
+// touches NULL rows.
+function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState): void {
+  // Skip if no memory.db has been created yet — first-boot instances will
+  // pick up the column from CREATE TABLE and won't need the backfill.
+  if (!existsSync(memoryDbPath(instance))) return;
+  const defaultAgentId =
+    state.activeAgentId
+    ?? state.agents.find((agent) => agent.status === "active")?.id
+    ?? state.agents[0]?.id
+    ?? "agent_default";
+  try {
+    const db = getMemoryDb(instance);
+    const stampedUnits = db
+      .query<{ c: number }, []>(
+        "SELECT COUNT(*) AS c FROM memory_units WHERE agent_id IS NULL"
+      )
+      .get()?.c ?? 0;
+    if (stampedUnits > 0) {
+      db.run("UPDATE memory_units SET agent_id = ? WHERE agent_id IS NULL", [defaultAgentId]);
+    }
+    const stampedBanks = db
+      .query<{ c: number }, []>(
+        "SELECT COUNT(*) AS c FROM memory_banks WHERE agent_id IS NULL AND id != 'bank_default'"
+      )
+      .get()?.c ?? 0;
+    if (stampedBanks > 0) {
+      // The legacy `bank_default` row stays untagged so existing code that
+      // reads from it (ensureDefaultBank) keeps working; per-agent banks
+      // created by ensureAgentBank carry a non-null agent_id from inception.
+      db.run(
+        "UPDATE memory_banks SET agent_id = ? WHERE agent_id IS NULL AND id != 'bank_default'",
+        [defaultAgentId]
+      );
+    }
+    if (stampedUnits > 0 || stampedBanks > 0) {
+      addAudit(state, {
+        actor: "runtime",
+        action: "hindsight.agentid.backfill",
+        target: defaultAgentId,
+        risk: "low",
+        evidence: { units: stampedUnits, banks: stampedBanks, agentId: defaultAgentId }
+      });
+    }
+  } catch {
+    // SQLite open failures are surfaced through `gini doctor`'s probe; the
+    // normalizeState path stays best-effort so a corrupted DB doesn't block
+    // every read of state.json.
+  }
+}
+
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
+  migrateProfileFieldsToAgent(state);
   migrateLaneFieldToInstance(state);
   state.instance = instance;
   state.improvements ??= [];
@@ -185,13 +382,75 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.snapshots ??= [];
   state.tools ??= defaultTools(instance, now());
   state.toolsets ??= defaultToolsets(instance, now());
+  // Backfill any toolsets/tools that were added to defaults after this
+  // instance was first created. Without this, an existing instance that
+  // already has a `state.toolsets` array silently misses new toolsets
+  // (e.g. browser) and `/api/toolsets/<name>/enable` returns "Toolset
+  // not found". Match by name so user-renamed entries are left alone.
+  const at = now();
+  const desiredToolsets = defaultToolsets(instance, at);
+  const desiredTools = defaultTools(instance, at);
+  for (const ts of desiredToolsets) {
+    if (!state.toolsets!.some((existing) => existing.name === ts.name)) {
+      state.toolsets!.push(ts);
+    }
+  }
+  // For each defaults-known toolset, union its desired tool names into
+  // the (possibly pre-existing) state row, and synthesize matching tool
+  // rows whose status reflects the EXISTING toolset's status. This runs
+  // before the catch-all "add missing tools" pass below so a tool that
+  // belongs to an already-enabled toolset comes up "available" rather
+  // than inheriting the defaults' "disabled" status. Without this an
+  // older instance whose `browser` row is enabled but whose tool rows
+  // pre-date browser.vision et al. would render the new entries as
+  // disabled even though the toolset itself is on.
+  for (const desired of desiredToolsets) {
+    const existing = state.toolsets!.find((t) => t.name === desired.name);
+    if (!existing) continue;
+    // Union toolNames preserving the existing row's order; append any
+    // names that aren't already present.
+    const known = new Set(existing.toolNames);
+    for (const name of desired.toolNames) {
+      if (!known.has(name)) {
+        existing.toolNames.push(name);
+        known.add(name);
+      }
+    }
+    const existingStatus = existing.status;
+    for (const desiredTool of desiredTools) {
+      if (desiredTool.toolset !== desired.name) continue;
+      if (state.tools!.some((t) => t.name === desiredTool.name)) continue;
+      state.tools!.push({
+        ...desiredTool,
+        status: existingStatus === "enabled" ? "available" : "disabled"
+      });
+    }
+  }
+  // Catch-all final pass: tools whose toolset wasn't in the defaults
+  // (or matched by name above) but that ship in defaultTools. We use
+  // the desired tool's own status here since there's no existing
+  // toolset row to consult.
+  for (const tool of desiredTools) {
+    if (!state.tools!.some((existing) => existing.name === tool.name)) {
+      state.tools!.push(tool);
+    }
+  }
   state.subagents ??= [];
   state.mcpServers ??= [];
   state.messagingBridges ??= [];
   state.messagingMessages ??= [];
   state.importReports ??= [];
-  state.profiles ??= [defaultProfile(instance, now())];
-  state.activeProfileId ??= state.profiles.find((item) => item.status === "active")?.id ?? state.profiles[0]?.id;
+  state.agents ??= [defaultAgent(instance, now())];
+  state.activeAgentId ??= state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
+  // Phase C — per-agent memory isolation backfill. Runs after agents are
+  // present so the migration can stamp the right id. Both helpers are
+  // idempotent so a re-read of an already-migrated state file is a no-op.
+  migrateMemoryAgentId(state);
+  migrateHindsightAgentIdColumns(instance, state);
+  // Drop dead MemoryRecord.scope / AgentRecord.memoryScopes fields from
+  // legacy state files. Runs after agents are populated so the audit
+  // event can land on a valid state.
+  migrateDropDeadMemoryFields(state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];
@@ -237,6 +496,20 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     job.retryLimit ??= 0;
     job.timeoutSeconds ??= 30;
     job.runIds ??= [];
+  }
+  // Browser connection record is purely opt-in — feature added after the
+  // initial state shape. Normalize obviously bad shapes to null so a
+  // hand-edited state file can't crash downstream consumers; valid records
+  // pass through untouched.
+  if (state.browser !== undefined && state.browser !== null) {
+    const candidate = state.browser as Partial<typeof state.browser> & { cdpUrl?: unknown; mode?: unknown };
+    if (
+      typeof candidate !== "object" ||
+      typeof candidate.cdpUrl !== "string" ||
+      (candidate.mode !== "managed" && candidate.mode !== "cdp")
+    ) {
+      state.browser = null;
+    }
   }
   expirePairingCodes(state);
   return state;

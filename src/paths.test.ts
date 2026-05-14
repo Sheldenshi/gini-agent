@@ -5,9 +5,13 @@ import { join } from "node:path";
 import { defaultRuntimePort, defaultWebPort, loadConfig, migrateLegacyInstancePaths } from "./paths";
 
 describe("default port helpers", () => {
-  test("dev instance stays pinned to 7337/3000 (no muscle-memory regression)", () => {
-    expect(defaultRuntimePort("dev")).toBe(7337);
-    expect(defaultWebPort("dev")).toBe(3000);
+  test("production default instance is pinned to memorable 7777/7778 ports", () => {
+    // Production end-users (installed via curl|bash, GINI_INSTANCE=default)
+    // must always land on the same URL. Hashed defaults would force them to
+    // run `gini status` to discover a port — bad UX. Web is 7777 (the URL
+    // users hit), runtime is the adjacent 7778.
+    expect(defaultWebPort("default")).toBe(7777);
+    expect(defaultRuntimePort("default")).toBe(7778);
   });
 
   test("same instance name always picks the same default port (deterministic hash)", () => {

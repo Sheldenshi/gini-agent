@@ -5,29 +5,24 @@ import { EmptyState } from "@/components/PageHeader";
 
 export interface ProviderCatalogItem {
   id: string;
+  name: string;
   displayName: string;
   auth: string;
   models: string[];
 }
 
-export function ProviderCard({ catalog }: { catalog: ProviderCatalogItem[] | undefined }) {
+export function ProviderCard({ displayName, model }: { displayName?: string; model?: string }) {
   return (
     <Card>
-      <CardHeader><CardTitle className="text-sm">Provider catalog</CardTitle></CardHeader>
+      <CardHeader><CardTitle className="text-sm">Current provider</CardTitle></CardHeader>
       <CardContent>
-        {catalog && catalog.length > 0 ? (
-          <ul className="divide-y divide-border text-xs">
-            {catalog.map((item) => (
-              <li key={item.id} className="flex items-center justify-between gap-3 py-1.5">
-                <span className="truncate">{item.displayName}</span>
-                <span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
-                  {item.auth} · {item.models.length.toString().padStart(2, " ")} models
-                </span>
-              </li>
-            ))}
-          </ul>
+        {displayName ? (
+          <div>
+            <p className="text-sm">{displayName}</p>
+            {model ? <p className="mt-1 text-xs text-muted-foreground">{model}</p> : null}
+          </div>
         ) : (
-          <EmptyState title="No catalog" />
+          <EmptyState title="No active provider" />
         )}
       </CardContent>
     </Card>
