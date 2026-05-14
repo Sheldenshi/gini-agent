@@ -1,12 +1,15 @@
 ---
 name: apple-notes
 description: "Manage Apple Notes via memo CLI: create, search, edit."
-version: 1.0.0
-author: Gini
 license: MIT
-platforms: [macos]
-prerequisites:
-  commands: [memo]
+compatibility: "macOS only. Requires the `memo` CLI and Automation access to Notes.app."
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    platforms: [macos]
+    prerequisites:
+      commands: [memo]
 ---
 
 # Apple Notes

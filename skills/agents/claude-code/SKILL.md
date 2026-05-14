@@ -1,11 +1,18 @@
 ---
 name: claude-code
 description: "Delegate coding work to Claude Code CLI for repository edits, reviews, and multi-turn implementation sessions."
-version: 1.0.0
-author: Gini
 license: MIT
-prerequisites:
-  commands: [claude, git]
+compatibility: "Requires the `claude` CLI on PATH and a healthy claude-code connector."
+allowed-tools: "Bash"
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    prerequisites:
+      commands: [claude, git]
+    requires:
+      connectors:
+        - provider: claude-code
 ---
 
 # Claude Code CLI

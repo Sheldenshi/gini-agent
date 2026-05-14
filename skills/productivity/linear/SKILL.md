@@ -1,14 +1,20 @@
 ---
 name: linear
 description: "Query and update Linear issues via the Linear GraphQL API."
-version: 1.0.0
-author: Gini
 license: MIT
-prerequisites:
-  env: [LINEAR_API_KEY]
-requires:
-  identities:
-    - kind: linear
+compatibility: "Requires curl, jq, and a healthy Linear connector."
+allowed-tools: "Bash"
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    prerequisites:
+      commands: [curl, jq]
+      env: [LINEAR_API_KEY]
+    requires:
+      connectors:
+        - provider: linear
+          scopes: [issues:read, issues:write]
 ---
 
 # Linear

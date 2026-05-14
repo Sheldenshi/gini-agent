@@ -1,11 +1,18 @@
 ---
 name: codex
 description: "Delegate coding work to the OpenAI Codex CLI for repository changes, reviews, and focused fixes."
-version: 1.0.0
-author: Gini
 license: MIT
-prerequisites:
-  commands: [codex, git]
+compatibility: "Requires the `codex` CLI on PATH and a healthy codex connector."
+allowed-tools: "Bash"
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    prerequisites:
+      commands: [codex, git]
+    requires:
+      connectors:
+        - provider: codex
 ---
 
 # Codex CLI

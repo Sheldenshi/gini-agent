@@ -1,12 +1,15 @@
 ---
 name: apple-reminders
 description: "Apple Reminders via remindctl: add, list, complete."
-version: 1.0.0
-author: Gini
 license: MIT
-platforms: [macos]
-prerequisites:
-  commands: [remindctl]
+compatibility: "macOS only. Requires the `remindctl` CLI."
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    platforms: [macos]
+    prerequisites:
+      commands: [remindctl]
 ---
 
 # Apple Reminders
