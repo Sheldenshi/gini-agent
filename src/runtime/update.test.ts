@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { currentVersionInfo } from "./update";
+import { currentVersionInfo, formatInstallFailure } from "./update";
 
 function scratch(tag: string): string {
   const dir = `/tmp/gini-runtime-update-tests/${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -51,5 +51,22 @@ describe("runtime update metadata", () => {
 
     expect(info.installedRuntimePresent).toBe(true);
     expect(info.update.supported).toBe(true);
+  });
+});
+
+describe("runtime update install failures", () => {
+  test("includes captured bun install output in quiet mode", () => {
+    const message = formatInstallFailure("bun install", 1, "stdout line", Buffer.from("stderr line"));
+
+    expect(message).toContain("gini update: bun install failed (exit 1).");
+    expect(message).toContain("----- bun install output -----");
+    expect(message).toContain("stdout line");
+    expect(message).toContain("stderr line");
+  });
+
+  test("keeps install failure concise without captured output", () => {
+    const message = formatInstallFailure("bun install in web/", null);
+
+    expect(message).toBe("gini update: bun install in web/ failed (exit null).");
   });
 });

@@ -6,6 +6,7 @@ import { logDir, projectRoot } from "../paths";
 import type { Instance } from "../types";
 
 const EXPECTED_ORIGIN = "https://github.com/Lilac-Labs/gini-agent";
+const MAX_INSTALL_FAILURE_OUTPUT = 4000;
 
 export interface GiniVersionInfo {
   packageVersion: string;
@@ -75,6 +76,7 @@ export function refreshVersionInfo(runtimeDir = projectRoot()): GiniVersionInfo 
 
 export function updateRuntime(runtimeDir = installedRuntimeDir(), options: { stdio?: "inherit" | "pipe" } = {}): GiniUpdateResult {
   assertUpdateTarget(runtimeDir);
+  const stdio = options.stdio ?? "pipe";
 
   const beforeSha = requireGit(runtimeDir, ["rev-parse", "HEAD"], "could not read current HEAD");
   const fetchRes = spawnSync("git", ["-C", runtimeDir, "fetch", "origin"], { encoding: "utf8" });
@@ -90,17 +92,11 @@ export function updateRuntime(runtimeDir = installedRuntimeDir(), options: { std
   }
 
   const afterSha = requireGit(runtimeDir, ["rev-parse", "HEAD"], "could not read new HEAD");
-  const installRes = spawnSync("bun", ["install"], { cwd: runtimeDir, stdio: options.stdio ?? "pipe" });
-  if (installRes.status !== 0) {
-    throw new Error(`gini update: bun install failed (exit ${installRes.status ?? "null"}).`);
-  }
+  runBunInstall(runtimeDir, "bun install", stdio);
 
   const webDir = join(runtimeDir, "web");
   if (existsSync(join(webDir, "package.json"))) {
-    const webResult = spawnSync("bun", ["install"], { cwd: webDir, stdio: options.stdio ?? "pipe" });
-    if (webResult.status !== 0) {
-      throw new Error(`gini update: bun install in web/ failed (exit ${webResult.status ?? "null"}).`);
-    }
+    runBunInstall(webDir, "bun install in web/", stdio);
   }
 
   const upToDate = beforeSha === afterSha;
@@ -170,6 +166,37 @@ bun run src/cli.ts start --instance ${shellQuote(instance)}
     }
   });
   return true;
+}
+
+export function formatInstallFailure(
+  label: string,
+  status: number | null,
+  stdout?: string | Buffer | null,
+  stderr?: string | Buffer | null
+): string {
+  const output = [toText(stdout), toText(stderr)].filter(Boolean).join("\n").trim();
+  const base = `gini update: ${label} failed (exit ${status ?? "null"}).`;
+  if (!output) return base;
+  return `${base}\n\n----- bun install output -----\n${truncateOutput(output)}`;
+}
+
+function runBunInstall(cwd: string, label: string, stdio: "inherit" | "pipe"): void {
+  const result = stdio === "inherit"
+    ? spawnSync("bun", ["install"], { cwd, stdio: "inherit" })
+    : spawnSync("bun", ["install"], { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(formatInstallFailure(label, result.status, result.stdout, result.stderr));
+  }
+}
+
+function toText(value: string | Buffer | null | undefined): string {
+  if (!value) return "";
+  return typeof value === "string" ? value : value.toString("utf8");
+}
+
+function truncateOutput(value: string): string {
+  if (value.length <= MAX_INSTALL_FAILURE_OUTPUT) return value;
+  return `${value.slice(0, MAX_INSTALL_FAILURE_OUTPUT)}\n... output truncated ...`;
 }
 
 export function assertCurrentRuntimeUpdateSupported(runtimeDir = projectRoot()): void {
