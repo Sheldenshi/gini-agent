@@ -1,5 +1,10 @@
 # ADR 0005: Subagent Delegation
 
+> **Note (2026-05-13):** Subagent toolset filtering now intersects with
+> the parent **agent's** toolsets (not the global enabled set) before
+> the subagent's own `toolsetIds` narrows further. Provider and memory
+> namespace inherit from the parent agent. See ADR 0006 and ADR 0007.
+
 ## Decision
 
 Subagents are constrained child tasks running through the same chat-task

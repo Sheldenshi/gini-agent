@@ -16,7 +16,7 @@ These notes describe the current source layout and boundaries. Product direction
 - `src/memory/` contains retain, recall, reflect, reinforce, embeddings/reranker status, entity, temporal, migration, and schema logic.
 - `src/jobs/` contains scheduler job creation, execution, replay, and run history behavior.
 - `src/governance/` contains approvals-adjacent runtime workflows such as pairing, improvements, and promotions.
-- `src/capabilities/` contains skills, toolsets, profiles, and subagent records.
+- `src/capabilities/` contains skills, toolsets, agents, and subagent records.
 - `src/integrations/` contains connectors, MCP, messaging, import inspection, relay, and notification behavior.
 - `src/tools/` contains file, terminal, code, and web tool implementations.
 - `src/cli.ts` is the CLI shim.

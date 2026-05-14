@@ -6,7 +6,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { closeAllMemoryDbs, countMemoryUnits, ensureDefaultBank, listMemoryUnits, DEFAULT_BANK_ID } from "../state";
+import { bankIdForAgent, closeAllMemoryDbs, countMemoryUnits, ensureDefaultBank, listMemoryUnits, DEFAULT_BANK_ID } from "../state";
 import { setEchoStructuredResponse, clearEchoStructuredResponses } from "../provider";
 import { submitTask } from "../agent";
 import { readState } from "../state";
@@ -104,7 +104,10 @@ describe("phase 5 — auto-recall on task submit", () => {
     const first = await submitTask(config, "Please retain the secret token swordfish for testing.");
     await waitForCompletion(config, first.id);
     await Bun.sleep(150);
-    expect(listMemoryUnits(instance, DEFAULT_BANK_ID).length).toBeGreaterThan(0);
+    // Phase C — auto-retain stamps the active agent, so units land in the
+    // per-agent bank rather than the legacy default bank.
+    const agentId = readState(config.instance).activeAgentId ?? "agent_default";
+    expect(listMemoryUnits(instance, bankIdForAgent(agentId)).length).toBeGreaterThan(0);
 
     const second = await submitTask(config, "Tell me about the swordfish token from earlier.");
     await waitForCompletion(config, second.id);

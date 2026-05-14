@@ -26,7 +26,7 @@ import { subagent } from "./commands/subagents";
 import { mcp } from "./commands/mcp";
 import { messaging } from "./commands/messaging";
 import { importInspect } from "./commands/imports";
-import { profile } from "./commands/profiles";
+import { agent } from "./commands/agents";
 import { parity } from "./commands/parity";
 import { readiness } from "./commands/readiness";
 import { relay } from "./commands/relay";
@@ -135,8 +135,8 @@ export async function run(): Promise<void> {
     case "messaging": await messaging(ctx); break;
     case "import":
     case "imports": await importInspect(ctx); break;
-    case "profile":
-    case "profiles": await profile(ctx); break;
+    case "agent":
+    case "agents": await agent(ctx); break;
     case "parity": await parity(ctx); break;
     case "readiness": await readiness(ctx); break;
     case "relay":

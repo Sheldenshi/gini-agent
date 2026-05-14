@@ -472,7 +472,13 @@ export function allTools(): ToolCatalogTool[] {
 // toolset; if state has no `web` toolset the tool stays available unless an
 // explicit messaging toolset row is disabled. To keep behavior intuitive we
 // always allow web_fetch for now (low-risk, matches legacy `web ` prefix).
-export function buildToolCatalog(state: RuntimeState): ToolCatalogTool[] {
+//
+// `agentToolsetFilter` is the optional active-agent whitelist (toolset
+// names). When set, it intersects with the enabled-toolset filter — a tool
+// passes only if its owning toolset is BOTH globally enabled AND in the
+// agent's whitelist. Always-on tools (web_fetch, read_skill,
+// spawn_subagent, create_job) bypass both filters.
+export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
@@ -491,7 +497,9 @@ export function buildToolCatalog(state: RuntimeState): ToolCatalogTool[] {
     // (and chat-reminder delivery) on fresh instances. Low-risk by
     // design — the user can pause/delete any job from /jobs.
     if (tool.function.name === "create_job") return true;
-    return enabled.has(tool.toolset);
+    if (!enabled.has(tool.toolset)) return false;
+    if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
+    return true;
   });
 }
 

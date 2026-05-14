@@ -10,7 +10,8 @@ export {
   createEmptyState,
   readState,
   writeState,
-  mutateState
+  mutateState,
+  seedDefaultAgentFromRuntimeConfig
 } from "./store";
 export { appendTrace, readTrace, tracePath, appendLog } from "./trace";
 export { addAudit, appendEvent } from "./audit";
@@ -20,6 +21,9 @@ export {
   closeAllMemoryDbs,
   removeMemoryDb,
   ensureDefaultBank,
+  ensureAgentBank,
+  bankIdForAgent,
+  deleteBankAndUnits,
   insertMemoryUnit,
   getMemoryUnit,
   countMemoryUnits,
@@ -99,9 +103,9 @@ export {
   createMessagingBridgeRecord,
   createMessagingMessageRecord,
   createImportReport,
-  createProfileRecord,
+  createAgentRecord,
   createRelayRecord,
   createNotificationRecord,
-  activateProfile,
+  activateAgent,
   updateConnectorHealth
 } from "./records";

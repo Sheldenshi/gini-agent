@@ -7,7 +7,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
+  bankIdForAgent,
   closeAllMemoryDbs,
+  ensureAgentBank,
   ensureDefaultBank,
   insertEntity,
   insertLink,
@@ -20,6 +22,10 @@ import { echoEmbed } from "../embeddings";
 import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-recall-test";
+// Phase C — every test fixture uses a deterministic agent id so recall's
+// agent_id filter and the per-agent bank lookup both resolve consistently.
+const TEST_AGENT = "agent_test";
+const TEST_BANK = bankIdForAgent(TEST_AGENT);
 
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
@@ -56,19 +62,24 @@ describe("recall — semantic channel", () => {
   test("returns the unit closest to the query embedding first", async () => {
     const instance = "recall-semantic";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     const target = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "alpha bravo charlie delta echo",
       embedding: echoEmbed("alpha bravo charlie delta echo"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "completely unrelated topic about gardens and hedges",
       embedding: echoEmbed("completely unrelated topic about gardens and hedges"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const result = await recall(makeConfig(instance), { query: "alpha bravo charlie delta echo" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "alpha bravo charlie delta echo" });
     expect(result.units.length).toBeGreaterThan(0);
     expect(result.units[0]!.unit.id).toBe(target.id);
     expect(result.units[0]!.channels).toContain("semantic");
@@ -79,20 +90,25 @@ describe("recall — bm25 channel", () => {
   test("surfaces a lexical match when semantic similarity is weaker", async () => {
     const instance = "recall-bm25";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     // Distinct lexical word that exists in only one unit.
     const target = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "the quokka is a small marsupial",
       embedding: echoEmbed("the quokka is a small marsupial"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "office supplies inventory list",
       embedding: echoEmbed("office supplies inventory list"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const result = await recall(makeConfig(instance), { query: "quokka" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "quokka" });
     const hit = result.units.find((entry) => entry.unit.id === target.id);
     expect(hit).toBeDefined();
     expect(hit!.channels).toContain("bm25");
@@ -103,26 +119,31 @@ describe("recall — graph channel", () => {
   test("surfaces an indirectly connected unit via entity link", async () => {
     const instance = "recall-graph";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     const seed = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "Alice joined the company",
       embedding: echoEmbed("Alice joined the company"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     const linked = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "Alice gave a talk at the all-hands",
       embedding: echoEmbed("xyzzy plover something completely different"), // make semantic miss
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     // override embedding so the semantic channel won't surface it directly.
-    const entity = insertEntity(instance, { canonicalName: "Alice", entityType: "PERSON" });
+    const entity = insertEntity(instance, { bankId: TEST_BANK, canonicalName: "Alice", entityType: "PERSON" });
     linkUnitToEntity(instance, seed.id, entity.id, "Alice");
     linkUnitToEntity(instance, linked.id, entity.id, "Alice");
     insertLink(instance, { fromUnit: seed.id, toUnit: linked.id, linkType: "entity", weight: 1.0, entityId: entity.id });
     insertLink(instance, { fromUnit: linked.id, toUnit: seed.id, linkType: "entity", weight: 1.0, entityId: entity.id });
 
-    const result = await recall(makeConfig(instance), { query: "Alice joined the company" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "Alice joined the company" });
     const hit = result.units.find((entry) => entry.unit.id === linked.id);
     expect(hit).toBeDefined();
     expect(hit!.channels).toContain("graph");
@@ -133,7 +154,10 @@ describe("recall — temporal channel", () => {
   test("matches units within the query date range", async () => {
     const instance = "recall-temporal";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "happened in april",
       embedding: echoEmbed("happened in april"),
       embeddingModel: "echo-embed-v0",
@@ -142,6 +166,8 @@ describe("recall — temporal channel", () => {
       occurredEnd: "2025-04-10T23:59:59Z"
     });
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "happened way later",
       embedding: echoEmbed("happened way later"),
       embeddingModel: "echo-embed-v0",
@@ -150,6 +176,7 @@ describe("recall — temporal channel", () => {
       occurredEnd: "2025-09-01T23:59:59Z"
     });
     const result = await recall(makeConfig(instance), {
+      agentId: TEST_AGENT,
       query: "what happened on 2025-04-10",
       reference: "2025-12-01T00:00:00Z"
     });
@@ -161,7 +188,10 @@ describe("recall — temporal channel", () => {
   test("returns nothing temporal when the query has no temporal expression", async () => {
     const instance = "recall-temporal-empty";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "neutral fact",
       embedding: echoEmbed("neutral fact"),
       embeddingModel: "echo-embed-v0",
@@ -169,7 +199,7 @@ describe("recall — temporal channel", () => {
       occurredStart: "2025-04-10T00:00:00Z",
       occurredEnd: "2025-04-10T23:59:59Z"
     });
-    const result = await recall(makeConfig(instance), { query: "tell me everything you know" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "tell me everything you know" });
     const temporal = result.units.filter((entry) => entry.channels.includes("temporal"));
     expect(temporal.length).toBe(0);
   });
@@ -179,23 +209,28 @@ describe("recall — cross-model embedding filter", () => {
   test("semantic channel skips units embedded with a different model than the active provider", async () => {
     const instance = "recall-cross-model";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     // Active provider is echo (echo-embed-v0). Insert a unit with a stale
     // model id but otherwise-identical text — the semantic channel should
     // ignore it. The bm25 channel still matches lexically, so the unit may
     // appear via that path; we only assert it doesn't surface via semantic.
     const stale = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "lemur lemur lemur",
       embedding: echoEmbed("lemur lemur lemur"),
       embeddingModel: "text-embedding-3-small",
       network: "world"
     });
     const fresh = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "different content entirely",
       embedding: echoEmbed("different content entirely"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const result = await recall(makeConfig(instance), { query: "lemur lemur lemur" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "lemur lemur lemur" });
     const staleHit = result.units.find((entry) => entry.unit.id === stale.id);
     if (staleHit) {
       // If it shows up at all (via bm25), it must NOT be on the semantic channel.
@@ -211,8 +246,11 @@ describe("recall — RRF fusion + token budget", () => {
   test("a unit appearing in multiple channels ranks higher than one in a single channel", async () => {
     const instance = "recall-fusion";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     // Multi-channel hit: lexical match on "elephant" AND embedding close to query.
     const multi = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "elephant elephant elephant matters here",
       embedding: echoEmbed("elephant elephant elephant matters here"),
       embeddingModel: "echo-embed-v0",
@@ -220,12 +258,14 @@ describe("recall — RRF fusion + token budget", () => {
     });
     // Single-channel hit: only the embedding has overlap.
     const single = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "matters here truly",
       embedding: echoEmbed("matters here truly"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const result = await recall(makeConfig(instance), { query: "elephant matters here" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "elephant matters here" });
     const multiPos = result.units.findIndex((entry) => entry.unit.id === multi.id);
     const singlePos = result.units.findIndex((entry) => entry.unit.id === single.id);
     expect(multiPos).toBeGreaterThanOrEqual(0);
@@ -236,17 +276,20 @@ describe("recall — RRF fusion + token budget", () => {
   test("token budget caps the packed unit list", async () => {
     const instance = "recall-budget";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     // Insert ten 200-character units; budget = 100 tokens (~400 chars) packs ~2.
     const text = "padding ".repeat(25); // ~200 chars
     for (let i = 0; i < 10; i++) {
       insertMemoryUnit(instance, {
+        bankId: TEST_BANK,
+        agentId: TEST_AGENT,
         text: `${text} unique-token-${i}`,
         embedding: echoEmbed(`${text} unique-token-${i}`),
         embeddingModel: "echo-embed-v0",
         network: "world"
       });
     }
-    const result = await recall(makeConfig(instance), { query: "padding", tokenBudget: 100 });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "padding", tokenBudget: 100 });
     expect(result.totalTokens).toBeLessThanOrEqual(100);
     expect(result.units.length).toBeLessThan(10);
   });
@@ -260,19 +303,24 @@ describe("recall — cross-encoder reranking", () => {
     process.env.GINI_RERANKER_PROVIDER = "none";
     const instance = "recall-rerank-none";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "elephant elephant elephant matters here",
       embedding: echoEmbed("elephant elephant elephant matters here"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "matters here truly",
       embedding: echoEmbed("matters here truly"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const result = await recall(makeConfig(instance), { query: "elephant matters here" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "elephant matters here" });
     // Multi-channel hit (semantic+bm25) should rank ahead of the
     // single-channel hit. None reranker is a strict pass-through.
     expect(result.units[0]!.unit.text).toContain("elephant");
@@ -284,25 +332,32 @@ describe("recall — cross-encoder reranking", () => {
     process.env.GINI_RERANKER_PROVIDER = "echo";
     const instance = "recall-rerank-echo";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "first thing about widgets",
       embedding: echoEmbed("first thing about widgets"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "second thing about widgets",
       embedding: echoEmbed("second thing about widgets"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "third thing about widgets",
       embedding: echoEmbed("third thing about widgets"),
       embeddingModel: "echo-embed-v0",
       network: "world"
     });
-    const result = await recall(makeConfig(instance), { query: "thing about widgets" });
+    const result = await recall(makeConfig(instance), { agentId: TEST_AGENT, query: "thing about widgets" });
     expect(result.units.length).toBeGreaterThan(0);
     // Echo reranker assigns 1/(1+i) by input position, then re-sorts by
     // that score. The top unit must score 1; the second 0.5; etc.
@@ -311,5 +366,73 @@ describe("recall — cross-encoder reranking", () => {
     if (result.units.length > 2) expect(result.units[2]!.score).toBeCloseTo(1 / 3, 5);
     // Restore suite-wide pin for the rest of the file.
     process.env.GINI_RERANKER_PROVIDER = "none";
+  });
+});
+
+// Phase C — per-agent memory isolation. Seed two agents in the same
+// instance with overlapping content, then recall against each in turn:
+// neither pool should ever leak into the other.
+describe("recall — per-agent isolation", () => {
+  test("recall against one agent never surfaces another agent's units", async () => {
+    const instance = "recall-isolation";
+    ensureDefaultBank(instance);
+    const agentA = "agent_alpha";
+    const agentB = "agent_beta";
+    const bankA = bankIdForAgent(agentA);
+    const bankB = bankIdForAgent(agentB);
+    ensureAgentBank(instance, agentA);
+    ensureAgentBank(instance, agentB);
+    // Same text, same embedding — only the agent_id differs.
+    const onlyA = insertMemoryUnit(instance, {
+      bankId: bankA,
+      agentId: agentA,
+      text: "secret token swordfish",
+      embedding: echoEmbed("secret token swordfish"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    const onlyB = insertMemoryUnit(instance, {
+      bankId: bankB,
+      agentId: agentB,
+      text: "secret token swordfish",
+      embedding: echoEmbed("secret token swordfish"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    const fromA = await recall(makeConfig(instance), { agentId: agentA, query: "swordfish" });
+    expect(fromA.units.some((entry) => entry.unit.id === onlyA.id)).toBe(true);
+    expect(fromA.units.some((entry) => entry.unit.id === onlyB.id)).toBe(false);
+    const fromB = await recall(makeConfig(instance), { agentId: agentB, query: "swordfish" });
+    expect(fromB.units.some((entry) => entry.unit.id === onlyB.id)).toBe(true);
+    expect(fromB.units.some((entry) => entry.unit.id === onlyA.id)).toBe(false);
+  });
+
+  test("recall against a fresh agent returns an empty pool", async () => {
+    const instance = "recall-isolation-empty";
+    ensureDefaultBank(instance);
+    const populated = "agent_populated";
+    const fresh = "agent_fresh";
+    ensureAgentBank(instance, populated);
+    ensureAgentBank(instance, fresh);
+    insertMemoryUnit(instance, {
+      bankId: bankIdForAgent(populated),
+      agentId: populated,
+      text: "lots of content for the populated agent",
+      embedding: echoEmbed("lots of content for the populated agent"),
+      embeddingModel: "echo-embed-v0",
+      network: "world"
+    });
+    const result = await recall(makeConfig(instance), { agentId: fresh, query: "populated" });
+    expect(result.units.length).toBe(0);
+  });
+
+  test("recall without an agentId is a type error / runtime error", async () => {
+    const instance = "recall-isolation-typeguard";
+    ensureDefaultBank(instance);
+    // Cast through unknown to bypass the now-required agentId field for the
+    // runtime-error check; production callers cannot construct this shape.
+    await expect(
+      recall(makeConfig(instance), { query: "x" } as unknown as Parameters<typeof recall>[1])
+    ).rejects.toThrow(/agentId is required/);
   });
 });

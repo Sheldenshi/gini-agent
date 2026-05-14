@@ -39,7 +39,7 @@ export type MessagingBridgeStatus = "configured" | "disabled" | "error";
 
 export type ImportSource = "hermes" | "openclaw";
 
-export type ProfileStatus = "active" | "inactive";
+export type AgentStatus = "active" | "inactive";
 
 // Headed-browser connection mode. `managed` means the runtime spawned the
 // Chrome process and owns its lifecycle (PID + dedicated user-data-dir).
@@ -168,8 +168,8 @@ export interface RuntimeState {
   mcpServers: McpServerRecord[];
   messagingBridges: MessagingBridgeRecord[];
   importReports: ImportReport[];
-  profiles: ProfileRecord[];
-  activeProfileId?: string;
+  agents: AgentRecord[];
+  activeAgentId?: string;
   relays: RelayRecord[];
   notifications: NotificationRecord[];
   events: RuntimeEvent[];
@@ -483,15 +483,14 @@ export interface ProviderCatalogItem {
   costHint: "free" | "external" | "unknown";
 }
 
-export interface ProfileRecord {
+export interface AgentRecord {
   id: string;
   instance: Instance;
   name: string;
-  status: ProfileStatus;
+  status: AgentStatus;
   providerName?: ProviderName | "openrouter" | "local";
   model?: string;
   toolsets: string[];
-  memoryScopes: Array<"user" | "project" | "device" | "temporary">;
   messagingTargets: string[];
   createdAt: string;
   updatedAt: string;
@@ -564,8 +563,11 @@ export interface Approval {
 export interface MemoryRecord {
   id: string;
   instance: Instance;
+  // Per-agent isolation key. Optional in the type because legacy state
+  // files persisted before Phase C don't carry it; normalizeState
+  // backfills these by stamping the active agent at migration time.
+  agentId?: string;
   content: string;
-  scope: "user" | "project" | "device" | "temporary";
   sourceTaskId?: string;
   createdAt: string;
   updatedAt: string;
@@ -775,17 +777,44 @@ export interface SnapshotRecord {
   auditCount: number;
 }
 
+export interface ProviderHealth {
+  ok: boolean;
+  provider: ProviderConfig;
+  configured: boolean;
+  authPath?: string;
+  credentialType?: string;
+  message?: string;
+}
+
+export interface ActiveAgentSnapshot {
+  id: string;
+  name: string;
+  resolvedProvider: { name: string; model: string };
+  providerSource: "agent" | "instance";
+  toolsetFilter?: string[];
+  messagingTargetFilter?: string[];
+  // Phase C: the per-agent memory isolation key. Same as `id` today, but
+  // surfaced explicitly so clients can see the namespace without
+  // re-deriving the bank id or guessing how memory is scoped.
+  memoryNamespace: string;
+  warnings: string[];
+}
+
 export interface RuntimeStatus {
   ok: boolean;
   instance: Instance;
   port: number;
   stateRoot: string;
+  workspaceRoot?: string;
   pid?: number;
   taskCounts: Record<TaskStatus, number>;
   pendingApprovals: number;
   activeJobs: number;
   missedJobs: number;
   connectors: number;
+  memoryUnits?: number;
+  provider?: ProviderHealth;
+  activeAgent?: ActiveAgentSnapshot;
 }
 
 export interface ProviderResult {

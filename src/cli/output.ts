@@ -63,7 +63,7 @@ export function improvementPayload(kind: string, title: string, content: string)
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
   }
-  return { content, scope: "project", confidence: 0.75 };
+  return { content, confidence: 0.75 };
 }
 
 export function help(): void {
@@ -98,7 +98,7 @@ Usage:
   bun run gini mcp list|add|health|invoke|disable
   bun run gini messaging list|add|health|disable
   bun run gini import inspect hermes|openclaw <path>
-  bun run gini profiles list|create|use
+  bun run gini agents list|create|use
   bun run gini parity hermes
   bun run gini readiness v1
   bun run gini relays list|add|health

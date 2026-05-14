@@ -16,7 +16,7 @@ import type {
   NotificationRecord,
   PairedDevice,
   PairingCode,
-  ProfileRecord,
+  AgentRecord,
   PromotionProposal,
   RelayRecord,
   RunRecord,
@@ -653,23 +653,23 @@ export function createImportReport(
   return item;
 }
 
-export function createProfileRecord(
+export function createAgentRecord(
   state: RuntimeState,
-  profile: Omit<ProfileRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt">
-): ProfileRecord {
+  agent: Omit<AgentRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt">
+): AgentRecord {
   const at = now();
-  const item: ProfileRecord = {
-    id: id("profile"),
+  const item: AgentRecord = {
+    id: id("agent"),
     instance: state.instance,
     status: "inactive",
     createdAt: at,
     updatedAt: at,
-    ...profile
+    ...agent
   };
-  state.profiles.unshift(item);
+  state.agents.unshift(item);
   addAudit(state, {
     actor: "user",
-    action: "profile.created",
+    action: "agent.created",
     target: item.id,
     risk: "low",
     evidence: { name: item.name, toolsets: item.toolsets }
@@ -726,20 +726,20 @@ export function createNotificationRecord(
   return item;
 }
 
-export function activateProfile(state: RuntimeState, idOrName: string): ProfileRecord {
-  const profile = state.profiles.find((item) => item.id === idOrName || item.name === idOrName);
-  if (!profile) throw new Error(`Profile not found: ${idOrName}`);
-  for (const item of state.profiles) item.status = item.id === profile.id ? "active" : "inactive";
-  profile.updatedAt = now();
-  state.activeProfileId = profile.id;
+export function activateAgent(state: RuntimeState, idOrName: string): AgentRecord {
+  const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
+  if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+  for (const item of state.agents) item.status = item.id === agent.id ? "active" : "inactive";
+  agent.updatedAt = now();
+  state.activeAgentId = agent.id;
   addAudit(state, {
     actor: "user",
-    action: "profile.activated",
-    target: profile.id,
+    action: "agent.activated",
+    target: agent.id,
     risk: "low",
-    evidence: { name: profile.name }
+    evidence: { name: agent.name }
   });
-  return profile;
+  return agent;
 }
 
 export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {

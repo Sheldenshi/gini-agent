@@ -3,7 +3,9 @@
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
+  bankIdForAgent,
   closeAllMemoryDbs,
+  ensureAgentBank,
   ensureDefaultBank,
   insertMemoryUnit,
   listMemoryUnits,
@@ -21,6 +23,8 @@ import { echoEmbed } from "../embeddings";
 import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-reflect-test";
+const TEST_AGENT = "agent_test";
+const TEST_BANK = bankIdForAgent(TEST_AGENT);
 
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
@@ -54,7 +58,7 @@ function makeConfig(instance: string): RuntimeConfig {
 describe("verbalizeProfile bands", () => {
   test("low skepticism is trusting", () => {
     const text = verbalizeProfile({
-      id: "x", name: "x", agentName: null, background: null,
+      id: "x", agentId: null, name: "x", agentName: null, background: null,
       skepticism: 1, literalism: 3, empathy: 3, biasStrength: 0.5,
       createdAt: "", updatedAt: ""
     });
@@ -62,7 +66,7 @@ describe("verbalizeProfile bands", () => {
   });
   test("high empathy is highly empathetic", () => {
     const text = verbalizeProfile({
-      id: "x", name: "x", agentName: null, background: null,
+      id: "x", agentId: null, name: "x", agentName: null, background: null,
       skepticism: 3, literalism: 3, empathy: 5, biasStrength: 0.5,
       createdAt: "", updatedAt: ""
     });
@@ -70,7 +74,7 @@ describe("verbalizeProfile bands", () => {
   });
   test("max literalism is highly literal", () => {
     const text = verbalizeProfile({
-      id: "x", name: "x", agentName: null, background: null,
+      id: "x", agentId: null, name: "x", agentName: null, background: null,
       skepticism: 3, literalism: 5, empathy: 3, biasStrength: 0.5,
       createdAt: "", updatedAt: ""
     });
@@ -81,7 +85,7 @@ describe("verbalizeProfile bands", () => {
 describe("buildReflectSystemMessage bias modulation", () => {
   test("bias near 0 produces a neutral message without verbalized profile", () => {
     const message = buildReflectSystemMessage({
-      id: "x", name: "x", agentName: null, background: null,
+      id: "x", agentId: null, name: "x", agentName: null, background: null,
       skepticism: 1, literalism: 1, empathy: 1, biasStrength: 0,
       createdAt: "", updatedAt: ""
     }, []);
@@ -90,7 +94,7 @@ describe("buildReflectSystemMessage bias modulation", () => {
   });
   test("bias near 1 marks personality as very strong", () => {
     const message = buildReflectSystemMessage({
-      id: "x", name: "x", agentName: null, background: null,
+      id: "x", agentId: null, name: "x", agentName: null, background: null,
       skepticism: 5, literalism: 5, empathy: 5, biasStrength: 1,
       createdAt: "", updatedAt: ""
     }, []);
@@ -103,8 +107,11 @@ describe("reflect pipeline", () => {
   test("stores opinions returned by the LLM as opinion-network units", async () => {
     const instance = "reflect-happy";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     // Seed at least one fact so recall returns something (not strictly required).
     insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "Alice ships fast",
       embedding: echoEmbed("Alice ships fast"),
       embeddingModel: "echo-embed-v0",
@@ -116,11 +123,11 @@ describe("reflect pipeline", () => {
         { opinion: "I believe predictability matters more than speed.", confidence: 0.6, reasoning: "preference" }
       ]
     });
-    const result = await reflect(makeConfig(instance), { query: "What do you think of Alice?" });
+    const result = await reflect(makeConfig(instance), { agentId: TEST_AGENT, query: "What do you think of Alice?" });
     expect(result.opinions.length).toBe(2);
     expect(result.opinions[0]!.network).toBe("opinion");
     expect(result.opinions[0]!.confidence).toBe(0.8);
-    const opinionUnits = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "opinion" });
+    const opinionUnits = listMemoryUnits(instance, TEST_BANK, { network: "opinion" });
     expect(opinionUnits.length).toBeGreaterThanOrEqual(2);
   });
 });
@@ -140,12 +147,15 @@ describe("end-to-end: retain triggers opinion reinforcement", () => {
   test("a stored opinion's confidence shifts when a related fact is retained", async () => {
     const instance = "reflect-reinforce-e2e";
     ensureDefaultBank(instance);
+    ensureAgentBank(instance, TEST_AGENT);
     // Seed the canonical Alice entity and link an opinion to it. This is the
     // shape the agent gets in production: an earlier reflect formed an opinion
     // about Alice and we already linked it via the bank's entity store.
     const { insertEntity, linkUnitToEntity } = await import("../state");
-    const aliceEntity = insertEntity(instance, { canonicalName: "Alice", entityType: "PERSON" });
+    const aliceEntity = insertEntity(instance, { bankId: TEST_BANK, canonicalName: "Alice", entityType: "PERSON" });
     const opinion = insertMemoryUnit(instance, {
+      bankId: TEST_BANK,
+      agentId: TEST_AGENT,
       text: "I think Alice is reliable.",
       embedding: echoEmbed("I think Alice is reliable."),
       embeddingModel: "echo-embed-v0",
@@ -164,9 +174,9 @@ describe("end-to-end: retain triggers opinion reinforcement", () => {
     // Stub the assessment LLM call: reinforce.
     setEchoStructuredResponse(`assess:${opinion.id}`, { verdict: "reinforce", reasoning: "consistent shipping" });
 
-    await retain(makeConfig(instance), { text: "Alice shipped on time again.", mentionedAt: "2025-04-10T00:00:00Z" });
+    await retain(makeConfig(instance), { agentId: TEST_AGENT, text: "Alice shipped on time again.", mentionedAt: "2025-04-10T00:00:00Z" });
 
-    const opinions = listMemoryUnits(instance, DEFAULT_BANK_ID, { network: "opinion" });
+    const opinions = listMemoryUnits(instance, TEST_BANK, { network: "opinion" });
     const refreshed = opinions.find((unit) => unit.id === opinion.id);
     expect(refreshed!.confidence).toBeCloseTo(0.6, 5);
   });
