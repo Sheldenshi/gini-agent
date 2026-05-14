@@ -92,8 +92,6 @@ Common runtime checks:
 
 ```sh
 bun run gini doctor
-bun run gini parity hermes
-bun run gini readiness v1
 bun run gini evidence
 ```
 

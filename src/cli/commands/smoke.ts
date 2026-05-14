@@ -1,7 +1,7 @@
 // End-to-end smoke that exercises every governed surface against a fresh
 // runtime. Intentionally long: every step here corresponds to a contract the
 // runtime promises to keep, so removing one drops smoke coverage of that
-// contract. Output keys feed parity/readiness reports.
+// contract.
 import type { CliContext } from "../context";
 import type { RuntimeConfig } from "../../types";
 import { createEvidenceBundle, createSnapshot } from "../../runtime/harness";
@@ -25,7 +25,7 @@ export async function smoke(ctx: CliContext): Promise<void> {
 }
 
 async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
-  const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "remember Gini v0 prefers seamless Hermes-style continuity" }) });
+  const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "remember Gini keeps local runtime work inspectable" }) });
   await waitForTask(config, task.id);
   const state = await api(config, "/api/state");
   const memory = state.memories.find((item: { status: string }) => item.status === "proposed");
@@ -57,7 +57,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     body: JSON.stringify({ code: pairingResult.code, deviceName: "Smoke device" })
   });
   const mobileState = await apiWithToken(config, claimedDevice.token, "/api/mobile/bootstrap");
-  const searchResults = await api(config, "/api/search?q=Hermes");
+  const searchResults = await api(config, "/api/search?q=Gini");
   await api(config, "/api/toolsets/mcp/enable", { method: "POST" });
   const subagentResult = await api(config, "/api/subagents", {
     method: "POST",
@@ -75,15 +75,13 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
   await api(config, `/api/messaging/${messagingResult.id}/health`, { method: "POST" });
   const importResult = await api(config, "/api/imports/inspect", {
     method: "POST",
-    body: JSON.stringify({ source: "hermes", path: process.cwd() })
+    body: JSON.stringify({ source: "openclaw", path: process.cwd() })
   });
   const agentResult = await api(config, "/api/agents", {
     method: "POST",
     body: JSON.stringify({ name: "smoke-agent", toolsets: ["file", "memory", "session_search"] })
   });
   await api(config, `/api/agents/${agentResult.id}/use`, { method: "POST" });
-  const parityResult = await api(config, "/api/parity/hermes");
-  const readinessResult = await api(config, "/api/readiness/v1");
   const relayResult = await api(config, "/api/relays", {
     method: "POST",
     body: JSON.stringify({ name: "smoke-relay", endpoint: "local://smoke", mode: "local-only" })
@@ -128,8 +126,6 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     messagingId: messagingResult.id,
     importReportId: importResult.id,
     agentId: agentResult.id,
-    parityOk: parityResult.ok,
-    readinessOk: readinessResult.ok,
     relayId: relayResult.id,
     notificationId: notificationResult.id,
     snapshotId: snapshotResult.snapshotId,

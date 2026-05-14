@@ -1,6 +1,6 @@
 # Runtime Capabilities
 
-This document maps the current runtime surfaces to the product capabilities Gini is expected to provide. The CLI command is still named `gini readiness v1` for compatibility, but the product plan is now tracked by capability area rather than version labels.
+This document maps the current runtime surfaces to the product capabilities Gini is expected to provide.
 
 ## Verification
 
@@ -14,15 +14,11 @@ bun run gini smoke
 
 The smoke output should include:
 
-- `parityOk: true`
-- `readinessOk: true`
 - an `evidencePath`
 
 For an installed instance:
 
 ```sh
-bun run gini parity hermes
-bun run gini readiness v1
 bun run gini evidence
 ```
 
@@ -48,7 +44,7 @@ bun run gini evidence
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
 | Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks |
 | Agents/config | `gini agents list/create/use/delete`, instance-aware config |
-| Import inspection | `gini import inspect hermes|openclaw <path>`, read-only by default |
+| Import inspection | `gini import inspect openclaw <path>`, read-only by default |
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
 | Web control plane | Next.js app at `web/`, launched by `gini start` or `gini run` unless `--no-web` is set |
