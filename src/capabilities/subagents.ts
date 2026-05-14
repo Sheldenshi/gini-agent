@@ -15,6 +15,7 @@ import type { RuntimeConfig, RuntimeState, SubagentRecord, Task } from "../types
 import {
   appendTrace,
   createSubagentRecord,
+  isTerminalTaskStatus,
   mutateState,
   now,
   readState
@@ -105,8 +106,28 @@ export async function spawnSubagent(
   // be undefined to mean "inherit").
   const advertisedToolsets = toolsetIds ?? ["file", "terminal", "memory", "session_search"];
 
-  const subagent = await mutateState(config.instance, (state) =>
-    createSubagentRecord(state, {
+  // Re-check the parent task's terminal status atomically with
+  // subagent record creation. Without this serialization, a cancel
+  // queued behind the dispatcher's lock-free pre-check could win
+  // the lock between pre-check and here, leaving a fresh subagent
+  // record (and its subsequent task) running under a cancelled
+  // parent. We throw a structured error the dispatcher catches and
+  // converts to a "skipped" tool result.
+  const subagent = await mutateState(config.instance, (state) => {
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      // Refuse on `cancelled` (operator-initiated cancel race) AND
+      // `failed` (sibling approval denial / runtime failure
+      // mid-turn). `completed` is intentionally permitted because
+      // the Hermes-parity integration test exercises a legitimate
+      // "completed parent → attach a subagent for review" path —
+      // a successful completion is not a security-relevant
+      // boundary.
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot spawn subagent: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
+    return createSubagentRecord(state, {
       name,
       prompt,
       parentTaskId,
@@ -114,22 +135,82 @@ export async function spawnSubagent(
       systemPrompt,
       toolsetIds,
       skillNames
-    })
-  );
-
-  const task = await submitTask(config, prompt, {
-    mode: "chat",
-    parentTaskId,
-    subagentId: subagent.id
+    });
   });
 
-  await mutateState(config.instance, (state) => {
+  // If `submitTask` throws after we just created the
+  // `SubagentRecord` (e.g. its in-callback parent-status guard
+  // rejects because `cancelTask` raced between our record creation
+  // above and this submission), we MUST clean up the orphaned
+  // record so it doesn't stay in `queued` forever. Rethrow as a
+  // `Cannot spawn subagent ...` error so the dispatcher's existing
+  // catch translates it into a skipped tool result.
+  let task: Task;
+  try {
+    task = await submitTask(config, prompt, {
+      mode: "chat",
+      parentTaskId,
+      subagentId: subagent.id
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await mutateState(config.instance, (state) => {
+      const item = state.subagents.find((candidate) => candidate.id === subagent.id);
+      if (!item) return;
+      item.status = "failed";
+      item.error = message;
+      item.updatedAt = now();
+    });
+    if (message.startsWith("Cannot submit task: parent task ")) {
+      // Translate the `submitTask` cancelled/failed-parent
+      // rejection into the spawn_subagent vocabulary so the
+      // existing tool-dispatch catch chain (which special-cases
+      // `Cannot spawn subagent...`) converts it to a skipped tool
+      // result.
+      throw new Error(`Cannot spawn subagent: parent task ${parentTaskId} became terminal between record creation and task submission.`);
+    }
+    throw err;
+  }
+
+  // Respect a `cancelled` status that `cancelSubagent` may have
+  // written between the `SubagentRecord` creation above and this
+  // final attach mutation. An unconditional flip to `running`
+  // would overwrite a deliberate cancel, leaving the subagent
+  // record running against a freshly submitted child task the
+  // operator already asked us not to run. When the record was
+  // cancelled mid-spawn we ALSO cancel the just-submitted child
+  // task — otherwise the operator's intent is preserved at the
+  // record level but the side-effect-capable task survives.
+  const attachResult = await mutateState(config.instance, (state) => {
     const item = state.subagents.find((candidate) => candidate.id === subagent.id);
-    if (!item) return;
+    if (!item) return { childTaskShouldCancel: false as const };
     item.taskId = task.id;
+    if (item.status === "cancelled" || item.status === "failed") {
+      // Keep the prior terminal verdict; just record the taskId so
+      // observability tools can correlate the audit trail. Signal
+      // the post-mutation code to cancel the freshly-submitted
+      // child task too.
+      item.updatedAt = now();
+      return { childTaskShouldCancel: true as const, recordStatus: item.status };
+    }
     item.status = "running";
     item.updatedAt = now();
+    return { childTaskShouldCancel: false as const };
   });
+  if (attachResult.childTaskShouldCancel) {
+    appendTrace(config.instance, task.id, {
+      type: "task",
+      message: `Subagent record was ${attachResult.recordStatus} mid-spawn; cancelling freshly submitted child task`,
+      data: { subagentId: subagent.id, recordStatus: attachResult.recordStatus }
+    });
+    try {
+      await cancelTask(config, task.id);
+    } catch {
+      // Best-effort — if the child task race-completes faster than
+      // the cancel, the cascade is moot. The record's terminal
+      // verdict already reflects the operator's intent.
+    }
+  }
 
   appendTrace(config.instance, task.id, {
     type: "tool",

@@ -1,6 +1,6 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
-import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, createRun, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 
 export { finalizeJobRunFromTask } from "./finalize";
@@ -72,20 +72,42 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     }
     oneShot = input.oneShot;
   }
-  return mutateState(config.instance, (state) => createJob(state, {
-    name: String(input.name ?? "Untitled job"),
-    prompt: String(input.prompt ?? ""),
-    script: typeof input.script === "string" && input.script.trim() ? input.script : undefined,
-    intervalSeconds,
-    nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
-    deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : [],
-    context: Array.isArray(input.context) ? input.context.map(String) : [],
-    retryLimit,
-    timeoutSeconds,
-    costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
-    chatSessionId,
-    oneShot
-  }));
+  // A parent task that has already transitioned terminal must not
+  // create a durable scheduled job. Without this, a `cancelTask`
+  // queued between the dispatcher's lock-free pre-check and our
+  // `mutateState` below would win the lock, mark the task
+  // cancelled, and still leave a fresh recurring job behind. By
+  // doing the terminal check INSIDE the `mutateState` callback the
+  // per-instance lock serializes "is the task cancelled?" and
+  // "create the job" so neither can interleave.
+  const parentTaskId =
+    typeof input.parentTaskId === "string" ? input.parentTaskId : undefined;
+  return mutateState(config.instance, (state) => {
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      // Refuse on `cancelled` (operator cancel) AND `failed`
+      // (sibling denial / runtime failure mid-turn). `completed` is
+      // permitted because a legitimate parent's final action can
+      // be "schedule a recurring follow-up job."
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot create scheduled job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
+    return createJob(state, {
+      name: String(input.name ?? "Untitled job"),
+      prompt: String(input.prompt ?? ""),
+      script: typeof input.script === "string" && input.script.trim() ? input.script : undefined,
+      intervalSeconds,
+      nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
+      deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : [],
+      context: Array.isArray(input.context) ? input.context.map(String) : [],
+      retryLimit,
+      timeoutSeconds,
+      costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
+      chatSessionId,
+      oneShot
+    });
+  });
 }
 
 // Returns the most recent running run for the given jobId, or undefined.

@@ -7,6 +7,7 @@ import {
   appendTrace,
   assertInsideWorkspace,
   createApproval,
+  isTerminalTaskStatus,
   mutateState,
   now
 } from "../state";
@@ -61,6 +62,9 @@ export async function requestFileWrite(config: RuntimeConfig, task: Task): Promi
   assertInsideWorkspace(config.workspaceRoot, target);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
+    // Respect a prior terminal status — see requestShell for the
+    // imperative-dispatch sleep-window race this guards against.
+    if (isTerminalTaskStatus(item.status)) return item;
     const approval = createApproval(state, {
       taskId: item.id,
       action: "file.write",
@@ -89,6 +93,9 @@ export async function requestFilePatch(config: RuntimeConfig, task: Task): Promi
   const after = before.replace(oldText, newText);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
+    // Respect a prior terminal status — see requestShell for the
+    // imperative-dispatch sleep-window race this guards against.
+    if (isTerminalTaskStatus(item.status)) return item;
     const approval = createApproval(state, {
       taskId: item.id,
       action: "file.patch",

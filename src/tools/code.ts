@@ -1,7 +1,7 @@
 // Code tool: js/python execution always requires approval. The approved
 // action runs through the same terminal.exec path in agent.executeApprovedAction.
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
-import { appendTrace, createApproval, mutateState, now } from "../state";
+import { appendTrace, createApproval, isTerminalTaskStatus, mutateState, now } from "../state";
 import { findTask } from "../agent";
 
 export async function requestCodeExecution(config: RuntimeConfig, task: Task): Promise<Task> {
@@ -10,6 +10,9 @@ export async function requestCodeExecution(config: RuntimeConfig, task: Task): P
   const [, language, code] = match;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, task.id);
+    // Respect a prior terminal status — see requestShell for the
+    // imperative-dispatch sleep-window race this guards against.
+    if (isTerminalTaskStatus(item.status)) return item;
     const approval = createApproval(state, {
       taskId: item.id,
       action: "terminal.exec",

@@ -17,11 +17,12 @@ import {
   appendTrace,
   assertInsideWorkspace,
   createApproval,
+  isTerminalTaskStatus,
   mutateState,
   now,
   readState
 } from "../state";
-import { ApprovalRaceLostError, ApprovedActionFailedError, findTask, resolveApproval, runTerminalCommand } from "../agent";
+import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, findTask, resolveApproval, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
@@ -264,6 +265,19 @@ async function browserDispatch(
   thunk: () => Promise<string>,
   args: Record<string, unknown>
 ): Promise<string> {
+  // Pre-side-effect terminal check. Browser tools execute their
+  // action (click / type / navigate / etc.) inside the thunk
+  // BEFORE any audit/state mutation; without this check a
+  // `cancelTask` that landed between the chat-task per-call guard
+  // releasing its `mutateState` lock and our await on `thunk()`
+  // would let the browser action still mutate the page. We don't
+  // have a signal to thread into Playwright, so the best we can do
+  // is refuse to invoke the thunk when the task is already
+  // terminal.
+  const preStatus = readState(config.instance).tasks.find((t) => t.id === taskId)?.status;
+  if (preStatus && isTerminalTaskStatus(preStatus)) {
+    return JSON.stringify({ success: false, aborted: true, error: `Browser action skipped: task is already ${preStatus}.` });
+  }
   const result = await thunk();
   const risk = riskForAction(action);
   let parsed: { success?: boolean; error?: string } = {};
@@ -461,9 +475,21 @@ async function spawnSubagentTool(
   const skills = Array.isArray(args.skills) ? args.skills.map(String) : undefined;
   const timeoutMs = typeof args.timeout_ms === "number" && args.timeout_ms > 0 ? args.timeout_ms : 5 * 60 * 1000;
 
+  // Pre-side-effect terminal check. `spawnSubagent` creates a
+  // durable child task; refuse when the parent task is already
+  // terminal so cancel + auto-approve doesn't leak a fresh subagent
+  // run against a cancelled parent. The serialized re-check inside
+  // `spawnSubagent`'s `mutateState` is the authoritative guard;
+  // this is the cheap early-exit so we don't even reach the
+  // record-creation lock.
+  const stateNow = readState(config.instance);
+  const parentStatus = stateNow.tasks.find((t) => t.id === taskId)?.status;
+  if (parentStatus && isTerminalTaskStatus(parentStatus)) {
+    return `Error: spawn_subagent skipped because parent task is already ${parentStatus}.`;
+  }
+
   // Pre-flight depth check so we can return a clean error to the model
   // instead of throwing an exception that becomes a generic tool error.
-  const stateNow = readState(config.instance);
   const depth = subagentDepth(stateNow, taskId);
   if (depth >= MAX_SUBAGENT_DEPTH) {
     appendTrace(config.instance, taskId, {
@@ -509,6 +535,19 @@ async function spawnSubagentTool(
     subagentId = created.id;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    // `spawnSubagent` refuses inside its own `mutateState` when
+    // the parent task is terminal. Convert that into a clean
+    // "skipped" tool result rather than the generic
+    // "spawn_subagent failed" tool error so the model sees a
+    // coherent no-op.
+    if (message.startsWith("Cannot spawn subagent: parent task ")) {
+      appendTrace(config.instance, taskId, {
+        type: "task",
+        message: `spawn_subagent skipped: parent task is terminal`,
+        data: { message }
+      });
+      return `Error: spawn_subagent skipped because parent task became terminal between pre-check and spawn.`;
+    }
     appendTrace(config.instance, taskId, {
       type: "error",
       message: `spawn_subagent failed: ${message}`,
@@ -576,6 +615,15 @@ async function createJobTool(
   // back into a session.
   const state = readState(config.instance);
   const task = state.tasks.find((item) => item.id === taskId);
+  // Pre-side-effect terminal check. `create_job` persists a
+  // durable scheduled job; refuse when the parent task is already
+  // terminal so cancel + auto-approve doesn't leak a recurring job
+  // past the cancellation. The serialized re-check inside
+  // `createScheduledJob`'s `mutateState` is the authoritative
+  // guard; this early-exit just avoids touching the lock.
+  if (task && isTerminalTaskStatus(task.status)) {
+    return `Error: create_job skipped because task is already ${task.status}.`;
+  }
   let chatSessionId: string | undefined;
   if (task?.runId) {
     const run = state.runs.find((item) => item.id === task.runId);
@@ -587,7 +635,21 @@ async function createJobTool(
     }
   }
 
-  const job = await createScheduledJob(config, { name, intervalSeconds, prompt, chatSessionId, oneShot });
+  // Pass `parentTaskId` so `createScheduledJob`'s own `mutateState`
+  // callback can re-check terminal status atomically. The earlier
+  // lock-free `readState` pre-check is kept as a fast path / error-
+  // message-quality improvement; this is the authoritative
+  // serialization point. `createScheduledJob` throws if the parent
+  // task is already terminal.
+  let job;
+  try {
+    job = await createScheduledJob(config, { name, intervalSeconds, prompt, chatSessionId, oneShot, parentTaskId: taskId });
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
+      return `Error: create_job skipped because parent task was cancelled between pre-check and job creation.`;
+    }
+    throw err;
+  }
 
   await mutateState(config.instance, (current) => {
     const item = findTask(current, taskId);
@@ -639,14 +701,17 @@ async function waitForSubagentTerminal(
         error: sub.resultError ?? sub.error
       };
     }
-    // Parent cancellation should short-circuit the wait so the parent
-    // task can exit cleanly. The cascade in cancelTask will eventually
-    // mark the subagent cancelled too, but we shouldn't pin the parent
-    // dispatch loop on that round-trip.
+    // Parent cancellation OR failure should short-circuit the wait
+    // so the parent task can exit cleanly. The cascade in
+    // `cancelTask` / `failTask` will eventually mark the subagent
+    // terminal too, but we shouldn't pin the parent dispatch loop
+    // on that round-trip. Checking `failed` (not just `cancelled`)
+    // matters because a sibling approval denial flips the parent
+    // through that branch.
     if (parentTaskId) {
       const parent = state.tasks.find((t) => t.id === parentTaskId);
-      if (parent?.status === "cancelled") {
-        return { status: "cancelled", error: "Parent task was cancelled while subagent was running." };
+      if (parent?.status === "cancelled" || parent?.status === "failed") {
+        return { status: parent.status, error: `Parent task was ${parent.status} while subagent was running.` };
       }
     }
     await Bun.sleep(pollMs);
@@ -700,6 +765,15 @@ async function requestFileWrite(
   assertInsideWorkspace(config.workspaceRoot, target);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    // Respect a terminal status the cancelled-task race opened up
+    // between the chat loop's top-of-iteration check and our claim
+    // on the per-instance lock. Throwing `TaskAlreadyTerminalError`
+    // lets `pendingOrAuto` short-circuit to a "skipped" tool result
+    // without creating a fresh approval row against an already-
+    // terminal task.
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
     const approval = createApproval(state, {
       taskId: item.id,
       action: "file.write",
@@ -746,6 +820,9 @@ async function requestBrowserUpload(
   const currentUrl = peekCurrentBrowserUrl(taskId) ?? null;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
     const approval = createApproval(state, {
       taskId: item.id,
       action: "browser.upload_file",
@@ -787,6 +864,9 @@ async function requestFilePatch(
   const after = before.replace(oldText, newText);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
     const approval = createApproval(state, {
       taskId: item.id,
       action: "file.patch",
@@ -835,6 +915,17 @@ async function terminalExecDispatch(
 
   const matchedPattern = matchAutoApprove(config.autoApproveCommands, command);
   if (matchedPattern) {
+    // Short-circuit BEFORE writing the auto-approved trace if the
+    // task already terminated. Without this the trace claims
+    // "Auto-approved terminal command" against a cancelled task
+    // before `runTerminalCommand`'s claim short-circuit catches the
+    // signal. `runTerminalCommand` still independently honors the
+    // registry abort once claimed, but skipping here is cheaper and
+    // keeps the trace honest.
+    const preStatus = await mutateState(config.instance, (state) => findTask(state, taskId).status);
+    if (isTerminalTaskStatus(preStatus)) {
+      return { kind: "sync", result: `Action skipped: task is already ${preStatus}.` };
+    }
     appendTrace(config.instance, taskId, {
       type: "approval",
       message: "Auto-approved terminal command (allowlist match)",
@@ -861,6 +952,9 @@ async function requestTerminalExec(
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
     const approval = createApproval(state, {
       taskId: item.id,
       action: "terminal.exec",
@@ -891,6 +985,9 @@ async function requestCodeExec(
   const command = codeExecutionCommand(language, code);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
     const approval = createApproval(state, {
       taskId: item.id,
       action: "terminal.exec",
@@ -938,14 +1035,45 @@ async function pendingOrAuto(
   config: RuntimeConfig,
   request: () => Promise<string>
 ): Promise<DispatchResult> {
-  const approvalId = await request();
+  // The `await request()` MUST live inside a try/catch so a
+  // `TaskAlreadyTerminalError` raised by the request helper
+  // (request* helpers refuse to create an approval against an
+  // already-terminal task) is converted to a "skipped" sync tool
+  // result rather than bubbling up as a generic tool error to the
+  // model. `ApprovalRaceLostError` is ALSO caught here for symmetry,
+  // although in practice it only fires from `resolveApproval` below
+  // — request* helpers throw the task-terminal variant instead.
+  let approvalId: string;
+  try {
+    approvalId = await request();
+  } catch (err) {
+    if (err instanceof TaskAlreadyTerminalError) {
+      return { kind: "sync", result: `Action skipped: task was already ${err.status} when the request reached the runtime.` };
+    }
+    if (err instanceof ApprovalRaceLostError) {
+      return { kind: "sync", result: `Action skipped: approval was already ${err.status} by another caller.` };
+    }
+    throw err;
+  }
   if (!config.dangerouslyAutoApprove) return { kind: "pending", approvalId };
   try {
-    const { toolResult } = await resolveApproval(config, approvalId, {
+    const { approval, toolResult } = await resolveApproval(config, approvalId, {
       actor: "runtime",
       resumeChatTask: false,
       evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
     });
+    // `executeApprovedAction`'s guard can flip the approval from
+    // `approved` back to `denied` (the
+    // `approval.cancelled_task_terminal` audit row) and return an
+    // undefined `toolResult`. Reporting "Auto-approved." in that
+    // case would tell the model the action succeeded when the
+    // audit trail says it was cancelled. Read the approval status
+    // from the row returned by `resolveApproval` and route the
+    // "denied / cancelled post-approval" case through the skipped
+    // sync result.
+    if (toolResult === undefined && approval.status === "denied") {
+      return { kind: "sync", result: `Action skipped: approval was cancelled before the side effect ran.` };
+    }
     return { kind: "sync", result: toolResult ?? "Auto-approved." };
   } catch (err) {
     // Race-loss: another caller (concurrent deny / cancel / double-
