@@ -56,7 +56,7 @@ function SidebarBody({ instance, onNavigate }: { instance: string; onNavigate?: 
           </div>
           <div className="flex flex-col leading-none">
             <span className="text-sm font-semibold">Gini</span>
-            <span className="font-mono text-[10px] text-sidebar-foreground/70">{instance}</span>
+            <span className="font-mono text-[11px] font-medium text-sidebar-foreground/80">{instance}</span>
           </div>
         </div>
         {mounted ? (
@@ -128,7 +128,7 @@ export function MobileTopBar({ instance }: { instance: string }) {
         </div>
         <div className="flex items-center gap-2 leading-none">
           <span className="text-sm font-semibold">Gini</span>
-          <span className="font-mono text-[10px] text-muted-foreground">{instance}</span>
+          <span className="font-mono text-[11px] font-medium text-muted-foreground">{instance}</span>
         </div>
       </div>
     </header>

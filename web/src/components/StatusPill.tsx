@@ -32,7 +32,7 @@ const TONES: Record<string, string> = {
 export function StatusPill({ value, className }: { value: string; className?: string }) {
   const tone = TONES[value] ?? "bg-zinc-500/10 text-zinc-400 border-zinc-500/30";
   return (
-    <Badge variant="outline" className={cn("font-mono text-[10px] uppercase tracking-wide", tone, className)}>
+    <Badge variant="outline" className={cn("font-mono text-[11px] font-semibold uppercase tracking-wide", tone, className)}>
       {value.replace(/_/g, " ")}
     </Badge>
   );
@@ -46,7 +46,7 @@ export function RiskPill({ value }: { value: string }) {
         ? "bg-amber-500/10 text-amber-400 border-amber-500/30"
         : "bg-emerald-500/10 text-emerald-400 border-emerald-500/30";
   return (
-    <Badge variant="outline" className={cn("font-mono text-[10px] uppercase tracking-wide", tone)}>
+    <Badge variant="outline" className={cn("font-mono text-[11px] font-semibold uppercase tracking-wide", tone)}>
       {value} risk
     </Badge>
   );
