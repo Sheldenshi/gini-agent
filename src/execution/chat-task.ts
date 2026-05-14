@@ -15,6 +15,7 @@ import {
   appendLog,
   appendTaskPartial,
   appendTrace,
+  isTerminalTaskStatus,
   mutateState,
   now,
   readState,
@@ -101,12 +102,30 @@ function addCost(accumulator: CostRecord | undefined, increment: CostRecord | un
 export async function runChatTask(config: RuntimeConfig, taskId: string): Promise<Task> {
   let task = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
+    // Respect a terminal status that was set BEFORE we acquired
+    // the lock. An unconditional flip to "running" would overwrite
+    // a `cancelled` status that `cancelTask` may have written
+    // between `submitTask` returning and `runChatTask` scheduling
+    // — letting a cancelled task continue running its tool-calling
+    // loop. Returning the item as-is lets the loop's terminal-bail
+    // check exit cleanly below.
+    if (isTerminalTaskStatus(item.status)) {
+      return item;
+    }
     item.status = "running";
     item.currentStep = "Thinking";
     item.mode = "chat";
     item.updatedAt = now();
     return item;
   });
+  if (isTerminalTaskStatus(task.status)) {
+    appendTrace(config.instance, taskId, {
+      type: "task",
+      message: `Chat task start aborted: already ${task.status}`,
+      data: { status: task.status }
+    });
+    return task;
+  }
   await updateRunFromTask(config, task);
 
   appendTrace(config.instance, taskId, {
@@ -346,7 +365,7 @@ async function runLoop(
     // failed the task.
     {
       const terminalCheck = readState(config.instance).tasks.find((t) => t.id === taskId);
-      if (!terminalCheck || terminalCheck.status === "cancelled" || terminalCheck.status === "failed" || terminalCheck.status === "completed") {
+      if (!terminalCheck || isTerminalTaskStatus(terminalCheck.status)) {
         appendTrace(config.instance, taskId, {
           type: "task",
           message: `Chat task loop noticed terminal status (${terminalCheck?.status ?? "missing"})`,
@@ -377,11 +396,29 @@ async function runLoop(
       }
     };
 
-    await mutateState(config.instance, (state) => {
+    // Re-check terminal status under the lock that flips
+    // currentStep to "Thinking" so a cancel queued between the
+    // lock-free top-of-loop check and this mutation doesn't get
+    // overwritten — AND so we don't fire a fresh provider call on
+    // a cancelled task.
+    const preModelGuard = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
+      if (isTerminalTaskStatus(item.status)) {
+        return { proceed: false as const, status: item.status };
+      }
       item.currentStep = "Thinking";
       item.updatedAt = now();
+      return { proceed: true as const };
     });
+    if (!preModelGuard.proceed) {
+      appendTrace(config.instance, taskId, {
+        type: "task",
+        message: `Chat task bail-out: terminal status (${preModelGuard.status}) observed before model call`,
+        data: { iterations, status: preModelGuard.status }
+      });
+      const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
+      return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+    }
 
     const result = await generateToolCallingResponse(
       config,
@@ -411,6 +448,12 @@ async function runLoop(
       const finalText = result.text || "";
       const finished = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
+        // Respect a prior terminal status. `cancelTask` may have
+        // flipped the task to `cancelled` while
+        // `generateToolCallingResponse` was in flight; overwriting
+        // to `completed` here would silently drop the operator's
+        // cancel.
+        if (isTerminalTaskStatus(item.status)) return item;
         item.status = "completed";
         item.currentStep = "Completed";
         item.summary = finalText || "(no content)";
@@ -437,6 +480,25 @@ async function runLoop(
       return finished;
     }
 
+    // Terminal re-check between model response and tool dispatch.
+    // Without this, a cancel that landed during the
+    // `generateToolCallingResponse` await still lets synchronous
+    // side-effecting tools run (browser click/type, create_job).
+    // Approval-gated tool helpers carry their own guard; this check
+    // closes the gap for low-risk tools.
+    {
+      const postModelStatus = readState(config.instance).tasks.find((t) => t.id === taskId)?.status;
+      if (postModelStatus && isTerminalTaskStatus(postModelStatus)) {
+        appendTrace(config.instance, taskId, {
+          type: "task",
+          message: `Chat task bail-out: terminal status (${postModelStatus}) observed after model response, before tool dispatch`,
+          data: { iterations, toolCalls: result.toolCalls.length, postModelStatus }
+        });
+        const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
+        return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+      }
+    }
+
     // Tool-call path: append the assistant message (with tool_calls), then
     // dispatch each call. Synchronous tools resolve immediately; gated
     // tools snapshot state and pause the task.
@@ -451,11 +513,33 @@ async function runLoop(
     const toolResultMessages: ToolCallingMessage[] = [];
 
     for (const call of result.toolCalls) {
-      await mutateState(config.instance, (state) => {
+      // Re-check terminal status under the same `mutateState` lock
+      // that flips currentStep. The post-model bail-out above is
+      // lock-free (`readState`), which leaves a window where a
+      // queued `cancelTask` could land between that `readState` and
+      // this mutation. Without this guard, currentStep gets set on
+      // a cancelled task and `dispatchToolCall` proceeds into side
+      // effects (browser click/type, spawn_subagent, create_job)
+      // before the next iteration's top-of-loop check observes the
+      // cancel.
+      const guard = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
+        if (isTerminalTaskStatus(item.status)) {
+          return { proceed: false as const, status: item.status };
+        }
         item.currentStep = `Working: ${call.function.name}`;
         item.updatedAt = now();
+        return { proceed: true as const };
       });
+      if (!guard.proceed) {
+        appendTrace(config.instance, taskId, {
+          type: "task",
+          message: `Chat task bail-out: terminal status (${guard.status}) observed before dispatch of ${call.function.name}`,
+          data: { iterations, toolCallId: call.id, postLockStatus: guard.status }
+        });
+        const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
+        return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
+      }
       try {
         const dispatch = await dispatchToolCall(
           config,
@@ -516,6 +600,10 @@ async function runLoop(
       };
       const paused = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
+        // Respect a prior terminal status so a cancel that fired
+        // during the tool-dispatch span doesn't get overwritten by
+        // `waiting_approval`.
+        if (isTerminalTaskStatus(item.status)) return item;
         item.status = "waiting_approval";
         item.currentStep = "Waiting for approval";
         item.toolCallState = snapshot;
@@ -558,6 +646,8 @@ async function runLoop(
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
+      // Respect a prior terminal status.
+      if (isTerminalTaskStatus(item.status)) return item;
       item.status = "completed";
       item.currentStep = `Completed (iteration cap reached: ${cap})`;
       item.summary = finalText;
@@ -590,6 +680,8 @@ async function runLoop(
     const message = error instanceof Error ? error.message : String(error);
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
+      // Respect a prior terminal status.
+      if (isTerminalTaskStatus(item.status)) return item;
       item.status = "failed";
       item.currentStep = "Failed";
       item.error = `Chat task exceeded ${cap} model iterations.`;
@@ -682,13 +774,26 @@ export async function resumeChatTask(
     });
   }
 
-  await mutateState(config.instance, (state) => {
+  const resumed = await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
+    // A terminal status set between `resumeChatTask` entry and this
+    // lock acquisition wins. Skip the resume so the loop doesn't
+    // re-enter a cancelled task.
+    if (isTerminalTaskStatus(item.status)) return item;
     item.status = "running";
     item.currentStep = "Thinking";
     item.toolCallState = undefined;
     item.updatedAt = now();
+    return item;
   });
+  if (isTerminalTaskStatus(resumed.status)) {
+    appendTrace(config.instance, taskId, {
+      type: "task",
+      message: `Resume aborted: task is already ${resumed.status}`,
+      data: { status: resumed.status }
+    });
+    return resumed;
+  }
 
   appendTrace(config.instance, taskId, {
     type: "task",
