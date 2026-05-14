@@ -20,7 +20,7 @@ defaults at creation; content is not.
 Before isolation, all memory — legacy `MemoryRecord` rows and
 Hindsight banks and units — lived in a single pool per instance.
 Switching the active profile could see and write each other's
-memories. With agents now driving runtime behavior (see ADR agents-replace-profiles),
+memories. With agents now driving runtime behavior (see ADR agents-replace-profiles.md),
 shared memory leaks context across personas: a "coding" agent's pinned
 memories would pollute the "research" agent's recall and vice versa.
 

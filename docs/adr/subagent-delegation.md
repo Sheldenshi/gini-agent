@@ -3,7 +3,7 @@
 > **Note (2026-05-13):** Subagent toolset filtering now intersects with
 > the parent **agent's** toolsets (not the global enabled set) before
 > the subagent's own `toolsetIds` narrows further. Provider and memory
-> namespace inherit from the parent agent. See ADR agents-replace-profiles and ADR agent-memory-isolation.
+> namespace inherit from the parent agent. See ADR agents-replace-profiles.md and ADR agent-memory-isolation.md.
 
 ## Decision
 

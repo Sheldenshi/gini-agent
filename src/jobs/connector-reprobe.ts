@@ -1,4 +1,4 @@
-// Periodic re-probe job (ADR connector-provider-spec-compliance § Probe contract).
+// Periodic re-probe job (ADR connector-provider-spec-compliance.md § Probe contract).
 //
 // Walks every connector in state and dispatches its provider's probe
 // when the per-provider interval has elapsed. Health transitions
@@ -15,7 +15,7 @@ import { addAudit, mutateState, readState } from "../state";
 import { getProvider } from "../integrations/connectors/registry";
 import { checkConnector } from "../integrations/connectors";
 
-const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes per ADR connector-provider-spec-compliance
+const DEFAULT_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes per ADR connector-provider-spec-compliance.md
 
 export interface ReprobeReport {
   considered: number;

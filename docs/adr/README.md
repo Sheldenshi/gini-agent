@@ -2,7 +2,7 @@
 
 Each file in this directory captures one architecture decision: the context, the choice, and its consequences. Update an existing ADR when implementation details shift, add a new ADR for a significant decision, and mark superseded ADRs with a link to their replacement.
 
-ADRs are named by slug, not number. The filename slug (e.g. `agent-memory-isolation`) is the citation key — pick it carefully and never rename it once merged. Cite an ADR by its slug in code comments and prose (`see ADR agent-memory-isolation`) and link by filename in markdown (`[Per-Agent Memory Isolation](./agent-memory-isolation.md)`).
+ADRs are named by slug, not number. The filename (e.g. `agent-memory-isolation.md`) is the citation key — pick it carefully and never rename it once merged. Always cite an ADR by its full filename including `.md` so the reference is unambiguously a file: `see ADR agent-memory-isolation.md` in prose and code comments, and `[Per-Agent Memory Isolation](./agent-memory-isolation.md)` for markdown links.
 
 ## Index
 

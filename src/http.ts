@@ -248,7 +248,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
     }],
-    // POST /api/skills accepts two payload shapes per ADR connector-provider-spec-compliance:
+    // POST /api/skills accepts two payload shapes per ADR connector-provider-spec-compliance.md:
     //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
     //     flow used by the install-skill meta-skill and remote/mobile UIs.
     //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/

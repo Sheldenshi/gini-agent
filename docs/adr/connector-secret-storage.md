@@ -1,6 +1,6 @@
 # ADR: Connector Secret Storage
 
-> Renamed from "Identity Secret Storage" per ADR connector-provider-spec-compliance. The decision is unchanged; only the vocabulary updated.
+> Renamed from "Identity Secret Storage" per ADR connector-provider-spec-compliance.md. The decision is unchanged; only the vocabulary updated.
 
 ## Decision
 
@@ -33,7 +33,7 @@ A future requirement for hardware-backed key material is addressed by Secure Enc
 - Each connector secret is stored at `~/.gini/instances/<instance>/secrets/<connector-id>.<purpose>.json`, mode `0600`, encrypted with the instance key (AES-256-GCM or libsodium secretbox).
 - `ConnectorRecord` persists only secret *references* (`{ purpose, path }`), never plaintext values, in instance state.
 - Secrets are added, rotated, and revoked exclusively through `POST` / `PATCH` / `DELETE /api/connectors/...` on the gateway. The CLI and web client call the same endpoints.
-- The gateway is the only process that decrypts secrets. Browser code, per ADR local-runtime-architecture, never receives them.
+- The gateway is the only process that decrypts secrets. Browser code, per ADR local-runtime-architecture.md, never receives them.
 - Every secret read and write emits an audit event with `target: connector.id` and `purpose`. The plaintext value is never logged.
 - Health probes (`POST /api/connectors/:id/health`) decrypt the secret in-process, hit the third-party API, and surface only the result.
 - The smoke flow exercises add, use, rotate, and delete for at least one non-demo connector provider.

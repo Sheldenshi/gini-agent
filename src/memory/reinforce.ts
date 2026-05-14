@@ -56,7 +56,7 @@ export async function reinforceOpinionsForUnits(
   const instance = config.instance;
   // Resolve the active agent's provider override once. The reinforcement
   // assessment is structured LLM generation and should follow the agent's
-  // provider just like retain/reflect do (ADR agents-replace-profiles). Embeddings stay on
+  // provider just like retain/reflect do (ADR agents-replace-profiles.md). Embeddings stay on
   // config.provider.
   const providerOverride = providerOverrideForRuntime(config);
   for (const unit of units) {

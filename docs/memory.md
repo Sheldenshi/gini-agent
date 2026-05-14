@@ -4,7 +4,7 @@ Gini memory is visible, governable, and local by default.
 
 Memory records live in `~/.gini/instances/<instance>/memory.db` using SQLite. The model cache for local embeddings and reranking lives in `~/.gini/models/`.
 
-Memory is scoped per agent. Each agent owns its own pool — banks, units, and legacy memory records all carry the active agent id, and recall filters on it across every channel. Switching the active agent changes which memories are recalled and pinned. New agents start with an empty pool; configuration is copied at creation, content is not. See [ADR agent-memory-isolation](./adr/agent-memory-isolation.md) for the isolation contract.
+Memory is scoped per agent. Each agent owns its own pool — banks, units, and legacy memory records all carry the active agent id, and recall filters on it across every channel. Switching the active agent changes which memories are recalled and pinned. New agents start with an empty pool; configuration is copied at creation, content is not. See [ADR agent-memory-isolation.md](./adr/agent-memory-isolation.md) for the isolation contract.
 
 ## Mental Model
 

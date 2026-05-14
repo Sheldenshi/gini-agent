@@ -1,4 +1,4 @@
-// Provider-module contract (ADR connector-provider-spec-compliance).
+// Provider-module contract (ADR connector-provider-spec-compliance.md).
 //
 // A ProviderModule encapsulates everything Gini needs to know about a
 // specific external integration — its label, the fields the Add Connector
@@ -17,7 +17,7 @@ export interface ProviderField {
   // Hint text rendered below the field.
   description?: string;
   // Whether the value is sensitive. Secret fields are persisted via the
-  // encrypted secrets store (ADR connector-secret-storage) and never written to state.json or
+  // encrypted secrets store (ADR connector-secret-storage.md) and never written to state.json or
   // audit evidence. Non-secret fields live on `connector.metadata.fields`.
   secret: boolean;
   // Whether the user must supply this field. The CRUD layer rejects
@@ -75,7 +75,7 @@ export interface ProviderModule {
   // Secret spec — purposes and env-var bindings the provider declares.
   // Omitted for providers that don't store secrets.
   secrets?: ProviderSecretSpec;
-  // Probe is optional per ADR connector-provider-spec-compliance. Providers with no remote system to
+  // Probe is optional per ADR connector-provider-spec-compliance.md. Providers with no remote system to
   // query (apple-notes via TCC, generic by definition) omit it; the
   // connector record's health falls back to a status-only check.
   probe?(ctx: ProbeContext): Promise<ProbeResult>;

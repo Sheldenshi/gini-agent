@@ -1276,7 +1276,7 @@ async function runApprovedAction(
     // `detached` option that turns the child into a session leader,
     // so a `process.kill(-pid)` group kill is unsafe (without
     // detached, `-pid` is a non-existent or our-own process group).
-    // ADR approval-execution-abort documents the residual gap; a true setsid wrap is
+    // ADR approval-execution-abort.md documents the residual gap; a true setsid wrap is
     // tracked as deferred work.
     let abortReason: string | undefined;
     const procExitedSentinel = proc.exited.then(() => "exited" as const);
@@ -1451,7 +1451,7 @@ async function runApprovedAction(
     // so a late rejection doesn't surface as unhandled. The audit
     // row reflects what the runtime acknowledged at signal
     // time, not what the browser eventually committed — the tradeoff
-    // is documented in ADR approval-execution-abort.
+    // is documented in ADR approval-execution-abort.md.
     const taskId = approval.taskId;
     const outcome = await raceWithAbort(
       () => browserUploadFileApproved(taskId, ref, config.workspaceRoot, userPath),

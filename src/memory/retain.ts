@@ -94,7 +94,7 @@ export async function retain(config: RuntimeConfig, input: RetainInput): Promise
   const mentionedAt = input.mentionedAt ?? now();
 
   // Resolve the active agent's provider override once (if any). Embedding
-  // and reranker calls keep reading config.provider — see ADR agents-replace-profiles.
+  // and reranker calls keep reading config.provider — see ADR agents-replace-profiles.md.
   const providerOverride = providerOverrideForRuntime(config);
 
   // 1. LLM extraction.

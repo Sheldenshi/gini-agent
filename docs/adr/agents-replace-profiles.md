@@ -61,7 +61,7 @@ label.
   - `messagingTargetFilter?: Set<string>` — caller-supplied targets are
     intersected; explicit out-of-set targets are rejected with a typed
     error.
-  - `memoryNamespace: string` — the agent id; see ADR agent-memory-isolation.
+  - `memoryNamespace: string` — the agent id; see ADR agent-memory-isolation.md.
   - `warnings: string[]` — unknown or disabled references; surfaced in
     `/api/status.activeAgent.warnings` but do not block activation.
 - Provider override applies to **all LLM generation** on the active task:
@@ -93,7 +93,7 @@ label.
 | `providerName + model` | Override when *both* set, else fall through to `config.provider`. Source recorded in `EffectiveContext.providerSource`. |
 | `toolsets` | Names intersected with `state.toolsets` enabled set. Subagent narrowing composes on top. Always-on tools bypass. |
 | `messagingTargets` | Intersected with caller-supplied targets. Explicit out-of-set targets rejected. When the bridge has no permitted target, fall back to the bridge's first delivery target so scheduled messaging does not silently break. |
-| `memoryNamespace` | Agent id. See ADR agent-memory-isolation. |
+| `memoryNamespace` | Agent id. See ADR agent-memory-isolation.md. |
 
 The "both required for an override" rule on provider is deliberate. A
 half-configured agent (e.g. `providerName: "openai"` but no `model`)

@@ -143,7 +143,7 @@ const schedulerDone: Promise<void> = (async function schedulerLoop(): Promise<vo
   }
 })();
 
-// Periodic connector re-probe loop (ADR connector-provider-spec-compliance § Probe contract). Runs
+// Periodic connector re-probe loop (ADR connector-provider-spec-compliance.md § Probe contract). Runs
 // alongside the scheduler so connector health reflects reality without
 // the user manually clicking "Check health". Cadence: every minute we
 // look at every connector and dispatch its provider probe iff the

@@ -1,13 +1,13 @@
 # ADR: Skills As Packages, Connectors As Credentials
 
-> Renamed from "Skills As Packages, Identities As Credentials" per ADR connector-provider-spec-compliance. The decision is unchanged; only the vocabulary updated.
+> Renamed from "Skills As Packages, Identities As Credentials" per ADR connector-provider-spec-compliance.md. The decision is unchanged; only the vocabulary updated.
 
 ## Decision
 
 Gini has two top-level user-facing primitives for integrating with the outside world:
 
 - **Skill** — the package. A folder under `skills/` (bundled) or `~/.gini/instances/<inst>/skills/` (user-installed) containing `SKILL.md` (markdown for the agent), optional helper scripts, and Anthropic Agent Skills frontmatter declaring requirements. This is the unit a user thinks of as "the Linear thing my agent can do." Already present in Gini.
-- **Connector** — the managed credential record. Stores secrets, scopes, and health for an external account (e.g. Linear API key, Google OAuth tokens) or local permission grant (e.g. macOS TCC for Notes). Renamed from "Identity" per ADR connector-provider-spec-compliance.
+- **Connector** — the managed credential record. Stores secrets, scopes, and health for an external account (e.g. Linear API key, Google OAuth tokens) or local permission grant (e.g. macOS TCC for Notes). Renamed from "Identity" per ADR connector-provider-spec-compliance.md.
 
 A skill is **active** if and only if every connector it declares as required exists and is healthy. Activation is automatic; deactivation is automatic when a connector becomes unhealthy. The agent loop never sees inactive skills.
 
@@ -35,7 +35,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 
 ### Connector record
 
-- `ConnectorRecord` is the managed credential record; secret storage follows ADR connector-secret-storage.
+- `ConnectorRecord` is the managed credential record; secret storage follows ADR connector-secret-storage.md.
 - `RuntimeState.connectors` holds them. No back-compat shim is exposed outside the normalizer.
 - HTTP route prefix is `/api/connectors`. The old `/api/identities` prefix has been removed.
 - CLI command is `gini connector ...`. The old `gini identity ...` command has been removed.
@@ -50,9 +50,9 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 
 ### Trust and audit
 
-- All connector mutations (create, update, rotate, delete, health) emit audit events tied to the connector id, per ADR trust-substrate.
+- All connector mutations (create, update, rotate, delete, health) emit audit events tied to the connector id, per ADR trust-substrate.md.
 - Secret values never appear in audit evidence. Audit may include the connector id, the purpose, and a boolean of whether resolution succeeded.
-- Risky tool calls that consume connector secrets continue to route through ADR trust-substrate approvals.
+- Risky tool calls that consume connector secrets continue to route through ADR trust-substrate.md approvals.
 
 ### UI
 
@@ -64,7 +64,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 - Merging Skill and Connector into one record. Breaks N:M cardinality (one connector serves many skills, one skill can need many connectors) and conflates curated bundled content with user-specific runtime data on differing lifecycles.
 - An "Integration" wrapper above Skill. Hermes and OpenClaw demonstrate that the skill *is* the integration; an additional layer adds vocabulary without changing semantics.
 - Punting credentials to environment variables (Hermes/OpenClaw approach). Incompatible with the screenless-Mac model where the user has no shell access to the host.
-- Reintroducing macOS Keychain as a secret backend (see ADR connector-secret-storage).
+- Reintroducing macOS Keychain as a secret backend (see ADR connector-secret-storage.md).
 
 ## Deferred
 
@@ -76,7 +76,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 ## Consequences For Coding Agents
 
 - Use `ConnectorRecord`, `/api/connectors`, and `gini connector` everywhere. Do not introduce or revive `Identity` naming.
-- When adding a provider, place per-provider code under `src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` (ADR connector-provider-spec-compliance) — fields, optional probe, optional detect — and register it in `registry.ts`.
+- When adding a provider, place per-provider code under `src/integrations/connectors/<provider>.ts`. Export a `ProviderModule` (ADR connector-provider-spec-compliance.md) — fields, optional probe, optional detect — and register it in `registry.ts`.
 - When adding a skill that needs credentials, declare them in the skill's frontmatter under `metadata.gini.requires.connectors` and reference them in scripts via env vars. Do not read connector records directly from skill code.
 - Skill activation filtering is a runtime concern. Do not duplicate the "is this skill active" check at the UI layer; ask the gateway.
 - Do not introduce an "Integration" type, table, or route. The skill is the package.

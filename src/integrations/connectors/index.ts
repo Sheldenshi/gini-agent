@@ -167,7 +167,7 @@ export async function resolveConnectorSecret(
   return value;
 }
 
-// Per-provider health probe dispatch. Probes are optional per ADR connector-provider-spec-compliance: a
+// Per-provider health probe dispatch. Probes are optional per ADR connector-provider-spec-compliance.md: a
 // provider without a `probe` falls back to a configured-status check (no
 // remote system to query). Connector records that reference an unknown
 // provider land at `unhealthy` with a surfaced message so the activation
@@ -254,7 +254,7 @@ export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean 
 }
 
 // Derive env var → (provider, purpose) mappings at runtime from each
-// registered provider's `envBindings`. This replaces the pre-ADR-connector-provider-spec-compliance
+// registered provider's `envBindings`. This replaces the pre-ADR-connector-provider-spec-compliance.md
 // hardcoded global map. Callers can ask "which env vars do these providers
 // expose, and which purpose holds the secret for each?" without
 // per-provider knowledge.

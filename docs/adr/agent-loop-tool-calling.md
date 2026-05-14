@@ -70,7 +70,7 @@ through the same loop. So the loop comes first.
       row creation entirely for matching commands and stamps the
       matched pattern on the `terminal.exec` audit row's
       `evidence.autoApprovedReason`.
-    - `dangerouslyAutoApprove` (ADR dangerously-auto-approve) still creates an approval
+    - `dangerouslyAutoApprove` (ADR dangerously-auto-approve.md) still creates an approval
       row and runs through `executeApprovedAction`, but skips the
       human decision step; both the `approval.approved` audit row and
       the per-action audit row carry

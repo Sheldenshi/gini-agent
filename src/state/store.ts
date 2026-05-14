@@ -191,7 +191,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
 }
 
-// ADR connector-provider-spec-compliance renamed `state.identities` → `state.connectors` and each
+// ADR connector-provider-spec-compliance.md renamed `state.identities` → `state.connectors` and each
 // record's `kind` → `provider`. State files written before that rename
 // still carry the old keys; rewrite them in-place so mutateState persists
 // the new shape on the next write. No back-compat shim is exposed outside
@@ -515,7 +515,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     // separate rows. Legacy records (pre-fix) default to "user" — bundled
     // records get re-tagged on the next loadSkillsFromDisk pass.
     skill.source ??= "user";
-    // ADR connector-provider-spec-compliance renamed SkillRecord.requiredIdentities (with `kind` keys) to
+    // ADR connector-provider-spec-compliance.md renamed SkillRecord.requiredIdentities (with `kind` keys) to
     // requiredConnectors (with `provider` keys). Rewrite in-place so the
     // record uses the new vocabulary; the loader will overwrite from disk
     // on the next reload anyway.

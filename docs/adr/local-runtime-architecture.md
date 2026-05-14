@@ -26,7 +26,7 @@ Gini needs Hermes-class runtime depth while keeping OpenClaw-style reach possibl
 - Production macOS LaunchAgent installation.
 - Native/mobile app UI.
 - Production relay, push notifications, and broad live messaging transports.
-- Real connector secret storage (see ADR connector-secret-storage, ADR skills-and-connectors, and ADR connector-provider-spec-compliance).
+- Real connector secret storage (see ADR connector-secret-storage.md, ADR skills-and-connectors.md, and ADR connector-provider-spec-compliance.md).
 
 ## Consequences For Coding Agents
 

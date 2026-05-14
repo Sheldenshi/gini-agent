@@ -38,7 +38,7 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - Helpers: `isSkillActive`, `resolveSkillEnv`, `resolveActiveSkillsEnv` keep their names — the verb operates on skills.
 - Web: `useIdentities` → `useConnectors`; the Connections page label stays "Connections" (user-facing) but the underlying queries and types match the new vocabulary.
 - State migration: on load, rename `state.identities` → `state.connectors` and `record.kind` → `record.provider` silently. No back-compat shim is exposed.
-- ADR connector-secret-storage title becomes "Connector Secret Storage"; ADR skills-and-connectors becomes "Skills and Connectors." Body text updated to match.
+- ADR connector-secret-storage.md title becomes "Connector Secret Storage"; ADR skills-and-connectors.md becomes "Skills and Connectors." Body text updated to match.
 
 ### SKILL.md spec compliance
 

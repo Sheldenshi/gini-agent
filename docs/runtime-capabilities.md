@@ -36,7 +36,7 @@ bun run gini evidence
 | Search | `gini search <query>`, `/api/search` with task, trace, memory, skill, and audit citations |
 | Jobs | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt jobs, and script jobs |
 | File tools | task inputs: `read`, `list`, `find`, `write`, `patch` |
-| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated (see `dangerouslyAutoApprove` in `docs/operations.md` and ADR dangerously-auto-approve for the opt-in global bypass) |
+| Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated (see `dangerouslyAutoApprove` in `docs/operations.md` and ADR dangerously-auto-approve.md for the opt-in global bypass) |
 | Approval settings | `GET/PATCH /api/settings/auto-approve` for `autoApproveCommands` (shell-glob allowlist for `terminal_exec`) and `dangerouslyAutoApprove` (global bypass for every approval-gated tool) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
 | Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, echo |
