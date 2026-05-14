@@ -74,7 +74,12 @@ export async function installSkillFromBody(
     if (!safe) throw new Error(`Refusing to write file outside skill folder: ${file.name}`);
     const target = join(dir, safe);
     mkdirSync(join(target, ".."), { recursive: true });
-    writeFileSync(target, file.content);
+    // Files dropped under `scripts/` are meant to be executed by the
+    // agent's terminal_exec wrapper (see ADR 0010 §Skills); land them
+    // mode 0755 so the spawn isn't blocked by a missing exec bit. Other
+    // payloads (REFERENCES.md, asset files) keep default permissions.
+    const isScript = safe.split(sep)[0] === "scripts";
+    writeFileSync(target, file.content, isScript ? { mode: 0o755 } : undefined);
   }
 
   await loadSkillsFromDisk(config);
@@ -152,6 +157,10 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
       // "untrusted" collapses to "draft" — the runtime status taxonomy
       // doesn't have an explicit "untrusted" cell.
       const next = input.status === "untrusted" ? "draft" : input.status as SkillRecord["status"];
+      // Capture prior status BEFORE mutating so the audit evidence
+      // accurately records the transition; otherwise previousStatus and
+      // status would always be equal.
+      const prev = skill.status;
       skill.status = next;
       skill.updatedAt = now();
       addAudit(state, {
@@ -159,7 +168,7 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
         action: "skill.trust",
         target: skill.id,
         risk: "medium",
-        evidence: { previousStatus: skill.status, status: next }
+        evidence: { previousStatus: prev, status: next }
       });
       return skill;
     }

@@ -11,13 +11,17 @@
 //     provider name when configured; null otherwise. `providerConfigured`
 //     is true when the active provider has valid creds — same definition
 //     `providerHealth` uses.
-//   - POST /api/setup/provider accepts {kind: "openai", apiKey} or
-//     {kind: "codex"}. OpenAI flow writes to ~/.gini/secrets.env using
+//   - POST /api/setup/provider accepts {provider: "openai", apiKey} or
+//     {provider: "codex"}. OpenAI flow writes to ~/.gini/secrets.env using
 //     the existing helper, then updates process.env so the running
 //     gateway picks up the new key on the very next provider call (no
 //     restart needed — readOpenAIBearer in src/provider.ts reads from
 //     env on each call). The runtime config is rewritten to `openai` so
-//     status calls reflect the new active provider.
+//     status calls reflect the new active provider. The field is named
+//     `provider` (not `kind`) to match the CLI surface — `gini provider
+//     set <name>` already uses this terminology. Note: this is the model
+//     provider (echo/openai/anthropic/codex), distinct from the connector
+//     provider concept introduced by ADR 0010.
 //
 // What this DOES do for plist refresh: when an OpenAI key is written
 // and a gateway plist exists on disk, this module calls
@@ -47,13 +51,13 @@ import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_KINDS = ["openai", "codex"] as const;
-type SupportedKind = (typeof SUPPORTED_KINDS)[number];
+const SUPPORTED_PROVIDERS = ["openai", "codex"] as const;
+type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
 export interface SetupStatus {
   ok: true;
   providerConfigured: boolean;
-  providers: SupportedKind[];
+  providers: SupportedProvider[];
   current: string | null;
   // Echoed from providerHealth so the browser knows why setup is needed
   // (e.g. "Set OPENAI_API_KEY to use the openai provider").
@@ -73,7 +77,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   return {
     ok: true,
     providerConfigured,
-    providers: [...SUPPORTED_KINDS],
+    providers: [...SUPPORTED_PROVIDERS],
     current,
     message: typeof health.message === "string" ? health.message : ""
   };
@@ -96,16 +100,17 @@ export async function setSetupProvider(
   config: RuntimeConfig,
   payload: Record<string, unknown>
 ): Promise<SetSetupProviderResult> {
-  const kind = typeof payload.kind === "string" ? payload.kind : "";
-  if (!SUPPORTED_KINDS.includes(kind as SupportedKind)) {
+  // Field name is `provider` to match the CLI (`gini provider set ...`).
+  const providerName = typeof payload.provider === "string" ? payload.provider : "";
+  if (!SUPPORTED_PROVIDERS.includes(providerName as SupportedProvider)) {
     return {
       ok: false,
       provider: providerHealth(config),
       plistRefreshNeeded: false,
-      error: `Unsupported provider kind '${kind}'. Allowed: ${SUPPORTED_KINDS.join(", ")}.`
+      error: `Unsupported provider '${providerName}'. Allowed: ${SUPPORTED_PROVIDERS.join(", ")}.`
     };
   }
-  if (kind === "openai") {
+  if (providerName === "openai") {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
     if (!apiKey) {
       return {
@@ -148,7 +153,7 @@ export async function setSetupProvider(
       plistRefreshNeeded: refreshed
     };
   }
-  // kind === "codex"
+  // providerName === "codex"
   if (!hasCodexAuth()) {
     return {
       ok: false,

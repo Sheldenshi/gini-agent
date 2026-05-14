@@ -90,7 +90,7 @@ export default function SetupPage() {
     try {
       const result = await api<SetupResult>("/setup/provider", {
         method: "POST",
-        body: JSON.stringify({ kind: "openai", apiKey })
+        body: JSON.stringify({ provider: "openai", apiKey })
       });
       if (!result.ok) {
         setError(result.error ?? "Setup failed.");
@@ -114,7 +114,7 @@ export default function SetupPage() {
     try {
       const result = await api<SetupResult>("/setup/provider", {
         method: "POST",
-        body: JSON.stringify({ kind: "codex" })
+        body: JSON.stringify({ provider: "codex" })
       });
       if (!result.ok) {
         setError(result.error ?? "Codex credentials not found. Run `codex --login` and retry.");

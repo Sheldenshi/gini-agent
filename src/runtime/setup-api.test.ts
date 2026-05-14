@@ -84,7 +84,7 @@ describe("setup-api", () => {
   });
 
   test("POST openai with apiKey writes secrets.env, sets process.env, updates config", async () => {
-    const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test-abcd1234" });
+    const result = await setSetupProvider(config, { provider: "openai", apiKey: "sk-test-abcd1234" });
     expect(result.ok).toBe(true);
     // plistRefreshNeeded only flips true when a gateway plist exists for
     // this instance — we don't write one in tests. The dedicated
@@ -110,13 +110,13 @@ describe("setup-api", () => {
   });
 
   test("POST openai without apiKey returns ok:false", async () => {
-    const result = await setSetupProvider(config, { kind: "openai", apiKey: "" });
+    const result = await setSetupProvider(config, { provider: "openai", apiKey: "" });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("apiKey is required");
   });
 
   test("POST codex fails when no auth.json exists", async () => {
-    const result = await setSetupProvider(config, { kind: "codex" });
+    const result = await setSetupProvider(config, { provider: "codex" });
     expect(result.ok).toBe(false);
     expect(result.error).toContain("Codex credentials not found");
   });
@@ -125,7 +125,7 @@ describe("setup-api", () => {
     const codexDir = join(s.home, ".codex");
     mkdirSync(codexDir, { recursive: true });
     writeFileSync(join(codexDir, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "sk-test" }));
-    const result = await setSetupProvider(config, { kind: "codex" });
+    const result = await setSetupProvider(config, { provider: "codex" });
     expect(result.ok).toBe(true);
     expect(result.plistRefreshNeeded).toBe(false);
     const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
@@ -133,16 +133,16 @@ describe("setup-api", () => {
     expect(cfg.provider?.name).toBe("codex");
   });
 
-  test("POST unknown kind rejects with descriptive error", async () => {
-    const result = await setSetupProvider(config, { kind: "anthropic" });
+  test("POST unknown provider rejects with descriptive error", async () => {
+    const result = await setSetupProvider(config, { provider: "anthropic" });
     expect(result.ok).toBe(false);
-    expect(result.error).toContain("Unsupported provider kind");
+    expect(result.error).toContain("Unsupported provider");
   });
 
   test("plistRefreshNeeded:true when an autostart plist already exists (macOS only)", async () => {
     if (process.platform !== "darwin") {
       // Linux: function returns false regardless.
-      const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test" });
+      const result = await setSetupProvider(config, { provider: "openai", apiKey: "sk-test" });
       expect(result.plistRefreshNeeded).toBe(false);
       return;
     }
@@ -155,7 +155,7 @@ describe("setup-api", () => {
     const gatewayPlist = join(launchAgents, `ai.lilaclabs.gini.${config.instance}.gateway.plist`);
     writeFileSync(gatewayPlist, "<?xml version=\"1.0\"?>\n");
     try {
-      const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-test" });
+      const result = await setSetupProvider(config, { provider: "openai", apiKey: "sk-test" });
       expect(result.ok).toBe(true);
       expect(result.plistRefreshNeeded).toBe(true);
     } finally {
@@ -172,14 +172,14 @@ describe("setup-api", () => {
     writeFileSync(secretsPath, "# stale\n");
     chmodSync(secretsPath, 0o644);
     expect(statSync(secretsPath).mode & 0o777).toBe(0o644);
-    const result = await setSetupProvider(config, { kind: "openai", apiKey: "sk-mode-test" });
+    const result = await setSetupProvider(config, { provider: "openai", apiKey: "sk-mode-test" });
     expect(result.ok).toBe(true);
     expect(statSync(secretsPath).mode & 0o777).toBe(0o600);
   });
 
   test("re-POSTing openai overwrites the previous key in secrets.env (no duplicate lines)", async () => {
-    await setSetupProvider(config, { kind: "openai", apiKey: "sk-first" });
-    await setSetupProvider(config, { kind: "openai", apiKey: "sk-second" });
+    await setSetupProvider(config, { provider: "openai", apiKey: "sk-first" });
+    await setSetupProvider(config, { provider: "openai", apiKey: "sk-second" });
     const secretsPath = join(s.home, ".gini", "secrets.env");
     const body = readFileSync(secretsPath, "utf8");
     const lines = body.split("\n").filter((l) => l.includes("OPENAI_API_KEY="));

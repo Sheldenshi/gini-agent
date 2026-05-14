@@ -52,7 +52,16 @@ export async function createConnector(config: RuntimeConfig, input: CreateConnec
       metadata: input.metadata
     };
     state.connectors.unshift(connector);
-    updateConnectorHealth(connector);
+    // For providers without a probe (demo, generic, claude-code, codex)
+    // there is no remote check that could refute the configured-status
+    // assumption, so the synchronous health-set is honest. For probe-based
+    // providers (linear), seeding `healthy` from `status === "configured"`
+    // would lie until the next reprobe — leave them at `health: "unknown"`
+    // so the activation gate (which treats unknown-with-probe as inactive)
+    // waits for the first real probe before surfacing dependent skills.
+    if (!module.probe) {
+      updateConnectorHealth(connector);
+    }
     addAudit(state, {
       actor: "user",
       action: "connector.create",
