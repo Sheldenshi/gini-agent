@@ -38,11 +38,12 @@
 // handler itself; the actual launchctl interaction is the detached
 // child's responsibility.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { configPath } from "../paths";
 import { normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
@@ -115,10 +116,9 @@ export async function setSetupProvider(
       };
     }
     // Persist to secrets.env so the wrapper-sourced env carries it on
-    // future shell launches. We avoid importing src/cli/* from runtime/
-    // (CLI is a client of the runtime API, not the other way around) so
-    // we re-implement the small write helper here.
-    writeKeyToSecretsFile("OPENAI_API_KEY", apiKey);
+    // future shell launches. The shared writer lives in src/state/ —
+    // both CLI and runtime are allowed to depend on src/state/.
+    writeKeyToSecretsEnv("OPENAI_API_KEY", apiKey);
     // Make the running gateway use the new key on its very next
     // provider call. readOpenAIBearer reads process.env on each call,
     // so this assignment is enough — no restart needed.
@@ -175,42 +175,6 @@ export async function setSetupProvider(
     provider: providerHealth(config),
     plistRefreshNeeded: false
   };
-}
-
-function secretsPath(): string {
-  // Mirror the resolution in src/cli/commands/setup.ts — prefer $HOME so
-  // tests overriding the env var don't fight os.homedir()'s macOS cache.
-  const home = process.env.HOME || homedir();
-  return join(home, ".gini", "secrets.env");
-}
-
-function shellSingleQuote(value: string): string {
-  return "'" + value.replace(/'/g, "'\\''") + "'";
-}
-
-// Re-implementation of src/cli/commands/setup.ts:writeKeyToSecretsFile.
-// We don't import from src/cli/* because src/runtime/* must not depend
-// on the CLI layer (per AGENTS.md boundary rules).
-function writeKeyToSecretsFile(name: string, value: string): void {
-  const path = secretsPath();
-  // mkdir if missing — secrets.env may be the first file we ever write
-  // here on a fresh install.
-  mkdirSync(dirname(path), { recursive: true });
-  let existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-  const line = `export ${name}=${shellSingleQuote(value)}`;
-  const pattern = new RegExp(`^\\s*(?:export\\s+)?${name}=.*$`, "m");
-  if (pattern.test(existing)) {
-    existing = existing.replace(pattern, line);
-  } else {
-    if (existing && !existing.endsWith("\n")) existing += "\n";
-    existing += line + "\n";
-  }
-  writeFileSync(path, existing, { mode: 0o600 });
-  // writeFileSync's `mode` option only applies on file CREATION. If the
-  // file pre-existed with 0644 (e.g. a user hand-edited it), the write
-  // above keeps that permission. Explicit chmod ensures mode 0600 on
-  // every write so secrets aren't world-readable.
-  try { chmodSync(path, 0o600); } catch { /* best-effort */ }
 }
 
 function hasCodexAuth(): boolean {

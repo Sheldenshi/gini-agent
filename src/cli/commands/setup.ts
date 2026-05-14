@@ -4,14 +4,15 @@
 // installs) can re-run `gini setup` idempotently, and run(io) so steps can
 // drive their own prompts via a shared SetupIO surface.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { configPath } from "../../paths";
 import { normalizeProvider } from "../../provider";
+import { ensureSecretsEnvPerms, secretsEnvPath, writeKeyToSecretsEnv } from "../../state/secrets-env";
 import type { RuntimeConfig } from "../../types";
 
 export interface SetupIO {
@@ -36,29 +37,11 @@ const COLOR = COLOR_ENABLED
   ? { cyan: "\x1b[36m", bold: "\x1b[1m", reset: "\x1b[0m", dim: "\x1b[2m" }
   : { cyan: "", bold: "", reset: "", dim: "" };
 
-function secretsPath(): string {
-  // Prefer $HOME so tests that override the env var see the override.
-  // os.homedir() caches the platform's getpwuid result on macOS and won't
-  // pick up a runtime HOME change.
-  const home = process.env.HOME || homedir();
-  return join(home, ".gini", "secrets.env");
-}
-
-function ensureSecretsPerms(): void {
-  const path = secretsPath();
-  if (!existsSync(path)) return;
-  try { chmodSync(path, 0o600); } catch { /* ignore — best-effort tightening */ }
-}
-
-// POSIX-safe single-quote escaping. Closes the literal string, inserts an
-// escaped quote, reopens. The single-quoted shell form is fully literal —
-// `$`, backticks, and backslashes pass through unchanged.
-function shellSingleQuote(value: string): string {
-  return "'" + value.replace(/'/g, "'\\''") + "'";
-}
-
-// Undo single-quote escaping written by writeKeyToSecretsFile. Inverse of
-// shellSingleQuote: strip surrounding quotes, replace each `'\''` with `'`.
+// Undo single-quote escaping written by writeKeyToSecretsEnv. Inverse of
+// the writer's POSIX ANSI-C quoting: strip surrounding quotes, replace
+// each `'\''` with `'`. Stays here (not in src/state/secrets-env.ts)
+// because it's only consumed by the CLI's "do we already have a key?"
+// readback.
 function unquoteSecretsValue(raw: string): string {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return "";
@@ -78,9 +61,9 @@ function secretsLineRegex(name: string): RegExp {
 }
 
 export function hasKeyInSecretsFile(name: string): boolean {
-  const path = secretsPath();
+  const path = secretsEnvPath();
   if (!existsSync(path)) return false;
-  ensureSecretsPerms();
+  ensureSecretsEnvPerms();
   const content = readFileSync(path, "utf8");
   const match = content.match(secretsLineRegex(name));
   if (!match) return false;
@@ -88,9 +71,9 @@ export function hasKeyInSecretsFile(name: string): boolean {
 }
 
 export function readKeyFromSecretsFile(name: string): string | null {
-  const path = secretsPath();
+  const path = secretsEnvPath();
   if (!existsSync(path)) return null;
-  ensureSecretsPerms();
+  ensureSecretsEnvPerms();
   const content = readFileSync(path, "utf8");
   const match = content.match(secretsLineRegex(name));
   if (!match) return null;
@@ -98,22 +81,11 @@ export function readKeyFromSecretsFile(name: string): string | null {
   return value.length > 0 ? value : null;
 }
 
-export function writeKeyToSecretsFile(name: string, value: string): void {
-  const path = secretsPath();
-  mkdirSync(dirname(path), { recursive: true });
-  let existing = existsSync(path) ? readFileSync(path, "utf8") : "";
-  const line = `export ${name}=${shellSingleQuote(value)}`;
-  // Replace both `export NAME=...` and bare `NAME=...` forms.
-  const pattern = new RegExp(`^\\s*(?:export\\s+)?${name}=.*$`, "m");
-  if (pattern.test(existing)) {
-    existing = existing.replace(pattern, line);
-  } else {
-    if (existing && !existing.endsWith("\n")) existing += "\n";
-    existing += line + "\n";
-  }
-  writeFileSync(path, existing, { mode: 0o600 });
-  ensureSecretsPerms();
-}
+// Re-export under the historical name so other CLI modules (provider,
+// admin) and tests that still import `writeKeyToSecretsFile` from
+// setup.ts keep working without churn. The implementation lives in
+// src/state/secrets-env.ts now.
+export const writeKeyToSecretsFile = writeKeyToSecretsEnv;
 
 export interface OpenAIKeyStatus {
   source: "env" | "file" | "missing";
