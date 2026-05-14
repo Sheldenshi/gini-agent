@@ -68,7 +68,12 @@ const isDarwin = process.platform === "darwin";
         return ok();
       }
     };
-    const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web"],
+      launchctl: deps
+    });
     expect(result.ok).toBe(true);
     expect(result.enabled).toBe(true);
     expect(result.rollbackState).toBe("clean");
@@ -104,7 +109,12 @@ const isDarwin = process.platform === "darwin";
         return fail("Could not kickstart service: 3: No such process");
       }
     };
-    const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web"],
+      launchctl: deps
+    });
     // Whole-enable still ok — bootstrap succeeded for both.
     expect(result.ok).toBe(true);
     expect(result.enabled).toBe(true);
@@ -142,7 +152,12 @@ const isDarwin = process.platform === "darwin";
       },
       kickstart: () => ok()
     };
-    const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web"],
+      launchctl: deps
+    });
     // Top-level: enable failed.
     expect(result.ok).toBe(false);
     expect(result.enabled).toBe(false);
@@ -178,7 +193,12 @@ const isDarwin = process.platform === "darwin";
       },
       kickstart: () => ok()
     };
-    const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web"],
+      launchctl: deps
+    });
     expect(result.ok).toBe(false);
     expect(result.rollbackState).toBe("rolled_back");
     expect(result.rollbackFailures).toBeUndefined();
@@ -196,7 +216,12 @@ const isDarwin = process.platform === "darwin";
       },
       kickstart: () => ok()
     };
-    const result = await enable(instance, { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot }, ["gateway", "web"], deps);
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web"],
+      launchctl: deps
+    });
     expect(result.ok).toBe(false);
     // "Could not find service" doesn't count as a real rollback failure —
     // the service was never loaded in the first place.

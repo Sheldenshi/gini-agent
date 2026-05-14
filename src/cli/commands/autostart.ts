@@ -90,7 +90,7 @@ export async function autostart(ctx: CliContext): Promise<void> {
       return;
     }
     const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
-    const result = await enable(instance, testRoot, kinds);
+    const result = await enable({ instance, testRoot, kinds });
     print(result);
     // When rollback itself failed, emit a clear stderr warning so the
     // operator sees the honest state at a glance instead of having to
@@ -246,8 +246,8 @@ function resolveLogRoot(instance: string, testRoot?: { stateRoot?: string; logRo
 // Test seam: rollback-failure surfacing has no other reachable path —
 // we can't easily make a real `launchctl bootout` fail without
 // holding launchd hostage. Tests inject mocks here to assert the
-// rollbackState bookkeeping. Production callers omit `__deps` and get
-// the real launchctl shellouts.
+// rollbackState bookkeeping. Production callers omit the `launchctl`
+// option and get the real launchctl shellouts.
 export interface EnableLaunchctlDeps {
   isLoaded: typeof isLoaded;
   bootout: typeof bootout;
@@ -255,16 +255,28 @@ export interface EnableLaunchctlDeps {
   kickstart: typeof kickstart;
 }
 
+export interface EnableOptions {
+  instance: string;
+  // Opt-in scratch state/log root for E2E tests. See ResolveLaunchOptions
+  // for the leak-prevention rationale.
+  testRoot?: { stateRoot?: string; logRoot?: string };
+  // Which kinds to bootstrap. Defaults to both (gateway + web).
+  // `--kind gateway` from the CLI narrows this for setup-api's refresh
+  // path so it doesn't kill the web service the browser is talking to.
+  kinds?: PlistKind[];
+  // Launchctl shellout injection seam — tests substitute mocks so the
+  // rollback-failure branch can be exercised without holding real
+  // launchd hostage. Omitted in production.
+  launchctl?: EnableLaunchctlDeps;
+}
+
 // Exported so tests can drive the rollback-failure path via injected
 // launchctl deps. Production CLI dispatch still goes through
 // `autostart()` at the top of this file.
-export async function enable(
-  instance: string,
-  testRoot?: { stateRoot?: string; logRoot?: string },
-  kinds: PlistKind[] = KINDS,
-  __deps?: EnableLaunchctlDeps
-): Promise<EnableResult> {
-  const deps: EnableLaunchctlDeps = __deps ?? { isLoaded, bootout, bootstrap, kickstart };
+export async function enable(options: EnableOptions): Promise<EnableResult> {
+  const { instance, testRoot } = options;
+  const kinds = options.kinds ?? KINDS;
+  const deps: EnableLaunchctlDeps = options.launchctl ?? { isLoaded, bootout, bootstrap, kickstart };
   const pair = resolveLaunchSpecPair({ instance, testRoot });
   const logRoot = resolveLogRoot(instance, testRoot);
   const results: PerKindEnableResult[] = [];
@@ -764,7 +776,7 @@ export async function maybeRefreshAutostart(instance: string): Promise<{ refresh
   const gatewayPlist = plistPathFor(instance, "gateway");
   if (!existsSync(gatewayPlist)) return { refreshed: false, reason: "no autostart plist on disk" };
   try {
-    const result = await enable(instance);
+    const result = await enable({ instance });
     return { refreshed: result.ok, ...(result.ok ? {} : { reason: result.error ?? "autostart enable failed" }) };
   } catch (error) {
     return { refreshed: false, reason: error instanceof Error ? error.message : String(error) };
