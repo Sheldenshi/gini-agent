@@ -68,7 +68,7 @@ tail -n 200 ~/.gini/instances/$INSTANCE/logs/runtime.jsonl
 ## Tmux session
 
 `bun run gini run` is launched inside a tmux session named `gini-<instance>`
-(e.g. `gini-rabat`) so the user can watch the live process and the agent
+so the user can watch the live process and the agent
 can restart it without disturbing what the user sees in their terminal.
 
 ```bash
