@@ -824,8 +824,35 @@ export interface RuntimeStatus {
   missedJobs: number;
   identities: number;
   memoryUnits?: number;
+  version?: GiniVersionInfo;
   provider?: ProviderHealth;
   activeAgent?: ActiveAgentSnapshot;
+}
+
+export interface GiniVersionInfo {
+  packageVersion: string;
+  runtimeDir: string;
+  git: {
+    sha: string | null;
+    shortSha: string | null;
+    branch: string | null;
+    origin: string | null;
+    upstreamSha: string | null;
+    updateAvailable: boolean;
+  };
+  installedRuntimePresent: boolean;
+}
+
+export interface GiniUpdateResult {
+  beforeSha: string;
+  afterSha: string;
+  commitCount: string;
+  upToDate: boolean;
+  runtimeDir: string;
+  version: GiniVersionInfo;
+  restart?: {
+    requested: boolean;
+  };
 }
 
 export interface ProviderResult {

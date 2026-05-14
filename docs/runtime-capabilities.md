@@ -40,6 +40,7 @@ bun run gini evidence
 | Approval settings | `GET/PATCH /api/settings/auto-approve` for `autoApproveCommands` (shell-glob allowlist for `terminal_exec`) and `dangerouslyAutoApprove` (global bypass for every approval-gated tool) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
 | Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, echo |
+| Runtime updates | `gini update`, `/api/version`, `/api/update/check`, `/api/update`; the web sidebar shows the current package/git version and can trigger an update |
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
 | Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks |
@@ -54,6 +55,7 @@ bun run gini evidence
 Stable local clients use the gateway API:
 
 - `/api/status`, `/api/healthz`, `/api/state`
+- `/api/version`, `/api/update/check`, `/api/update`
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/approvals`
 - `/api/memory`, `/api/banks`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/migrate`
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`

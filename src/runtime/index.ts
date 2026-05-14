@@ -5,6 +5,7 @@ import { readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../sta
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { providerHealth } from "../provider";
+import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -42,6 +43,7 @@ export function status(config: RuntimeConfig) {
     missedJobs,
     identities: state.identities.length,
     memoryUnits,
+    version: currentVersionInfo(),
     provider: providerHealth(config),
     activeAgent
   };

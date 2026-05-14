@@ -9,8 +9,10 @@ import {
   Boxes,
   Cable,
   Cog,
+  Download,
   Globe,
   Home,
+  Loader2,
   ListTodo,
   Menu,
   MessageSquare,
@@ -25,6 +27,11 @@ import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { useEffect, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { api } from "@/lib/api";
+import { useStatus } from "@/lib/queries";
+import type { GiniUpdateResult } from "@runtime/types";
 
 const NAV = [
   { href: "/", label: "Home", icon: Home },
@@ -93,6 +100,54 @@ function SidebarBody({ instance, onNavigate }: { instance: string; onNavigate?: 
           );
         })}
       </nav>
+      <UpdateReminder />
+    </div>
+  );
+}
+
+function UpdateReminder() {
+  const status = useStatus();
+  const qc = useQueryClient();
+  const version = status.data?.version;
+  const updateAvailable = version?.git.updateAvailable === true;
+  const update = useMutation({
+    mutationFn: () => api<GiniUpdateResult>("/update", { method: "POST" }),
+    onSuccess: (result) => {
+      if (result.upToDate) {
+        toast.success("Gini is already current");
+        qc.invalidateQueries({ queryKey: ["status"] });
+        return;
+      }
+      toast.success("Gini updated. Restarting...");
+      setTimeout(() => qc.invalidateQueries({ queryKey: ["status"] }), 4000);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  return (
+    <div className="border-t border-sidebar-border px-3 py-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <div className="truncate font-mono text-[10px] text-sidebar-foreground/65">
+            v{version?.packageVersion ?? "0.0.0"}{version?.git.shortSha ? ` · ${version.git.shortSha}` : ""}
+          </div>
+          {updateAvailable ? (
+            <div className="text-xs font-medium text-sidebar-foreground">Update ready</div>
+          ) : (
+            <div className="text-xs text-sidebar-foreground/65">Gini runtime</div>
+          )}
+        </div>
+        <Button
+          size="sm"
+          variant={updateAvailable ? "default" : "outline"}
+          className="h-7 shrink-0"
+          disabled={update.isPending}
+          onClick={() => update.mutate()}
+        >
+          {update.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+          Update
+        </Button>
+      </div>
     </div>
   );
 }

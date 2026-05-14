@@ -79,6 +79,7 @@ The gateway uses per-instance bearer tokens. Paired devices can receive their ow
 | `gini start --instance X` | daemon; runtime and web keep running after the shell exits |
 | `gini run --instance X` | foreground; runtime and web stop when the process receives Ctrl-C/HUP/TERM |
 | `gini stop --instance X` | stops runtime and web for an instance |
+| `gini update` | updates the installer-managed runtime and restarts a running instance when code changed |
 | `gini uninstall --instance X` | removes one instance's local state |
 | `gini uninstall` | full uninstall: stops every instance, removes installer-managed wrapper/runtime/PATH block, prompts before deleting instance state |
 
