@@ -39,6 +39,7 @@ import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
 import { syncSubagentFromTask } from "./capabilities/subagents";
+import { resolveActiveSkillsEnv } from "./integrations/identities";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
 // JobRunRecord from "running" to a terminal status when a Task with a
@@ -886,10 +887,12 @@ async function executeApprovedAction(
     const spawnArgs = usePty
       ? buildPtySpawnArgs(command)
       : ["zsh", "-lc", command];
+    const skillEnv = await resolveActiveSkillsEnv(config);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
-      stderr: "pipe"
+      stderr: "pipe",
+      env: { ...process.env, ...skillEnv }
     });
     const timeoutMs = Number(approval.payload.timeoutMs ?? 10_000);
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
@@ -1054,10 +1057,12 @@ export async function runTerminalCommand(
   const usePty = options.pty === true;
   const timeoutMs = options.timeoutMs ?? 60_000;
   const spawnArgs = usePty ? buildPtySpawnArgs(command) : ["zsh", "-lc", command];
+  const skillEnv = await resolveActiveSkillsEnv(config);
   const proc = spawn(spawnArgs, {
     cwd: config.workspaceRoot,
     stdout: "pipe",
-    stderr: "pipe"
+    stderr: "pipe",
+    env: { ...process.env, ...skillEnv }
   });
   const timeout = setTimeout(() => proc.kill(), timeoutMs);
   const [stdout, stderr, exitCode] = await Promise.all([

@@ -35,6 +35,7 @@ export interface ParsedSkillFile {
   version: string;
   platforms?: string[];
   prerequisites?: { commands?: string[]; env?: string[] };
+  requiredIdentities?: Array<{ kind: string; scopes?: string[] }>;
   body: string;
   // Original frontmatter for traceability. Loader doesn't read these
   // beyond the keys above, but we keep the whole map so future passes can
@@ -129,32 +130,67 @@ export function splitFrontmatter(text: string): { frontmatter: string; body: str
 //   key:                            (nested map; child indented by 2 spaces)
 //     subkey: value
 //     subkey: [a, b]
+//   key:                            (list of maps)
+//     - subkey: value
+//       other: value
+//   key:                            (list of scalars)
+//     - foo
+//     - bar
 // Comments (`# …`) are dropped. Booleans / numbers / quoted strings are
 // returned as JS values; unquoted strings stay as-is.
+type Container = Record<string, unknown> | unknown[];
+interface Frame { indent: number; container: Container }
+
 export function parseFrontmatter(text: string): Record<string, unknown> {
   const lines = text.split("\n");
   const root: Record<string, unknown> = {};
-  // Stack of (indent, container) so nested maps can be assembled top-down.
-  const stack: Array<{ indent: number; container: Record<string, unknown> }> = [
-    { indent: -1, container: root }
-  ];
+  const stack: Frame[] = [{ indent: -1, container: root }];
 
-  for (const raw of lines) {
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx += 1) {
+    const raw = lines[lineIdx]!;
     if (!raw.trim() || raw.trim().startsWith("#")) continue;
     const indent = raw.match(/^(\s*)/)?.[1]?.length ?? 0;
-    // Unwind deeper containers when indent retreats.
     while (stack.length > 1 && indent <= stack[stack.length - 1]!.indent) {
       stack.pop();
     }
     const line = raw.slice(indent);
+    const top = stack[stack.length - 1]!;
+
+    // List item: `- value` (scalar) or `- key: value` (start of a map).
+    if (line.startsWith("- ") || line === "-") {
+      const arr = top.container as unknown[];
+      if (!Array.isArray(arr)) continue;
+      const rest = line.slice(1).trim();
+      if (!rest) {
+        const child: Record<string, unknown> = {};
+        arr.push(child);
+        stack.push({ indent: indent + 2, container: child });
+        continue;
+      }
+      const colonIdx = rest.indexOf(":");
+      if (colonIdx < 0) {
+        arr.push(parseScalarOrInlineArray(rest));
+        continue;
+      }
+      // `- key: value` starts a new map element with the key already set.
+      const child: Record<string, unknown> = {};
+      const subKey = rest.slice(0, colonIdx).trim();
+      const subRest = rest.slice(colonIdx + 1).trim();
+      if (subRest) child[subKey] = parseScalarOrInlineArray(subRest);
+      arr.push(child);
+      stack.push({ indent: indent + 2, container: child });
+      continue;
+    }
+
     const colonIdx = line.indexOf(":");
     if (colonIdx < 0) continue;
     const key = line.slice(0, colonIdx).trim();
     const rest = line.slice(colonIdx + 1).trim();
-    const container = stack[stack.length - 1]!.container;
+    if (Array.isArray(top.container)) continue;
+    const container = top.container as Record<string, unknown>;
     if (!rest) {
-      // Open a nested map.
-      const child: Record<string, unknown> = {};
+      // Decide map vs list by looking ahead for the first indented item.
+      const child: Container = nextChildContainer(lines, lineIdx, indent);
       container[key] = child;
       stack.push({ indent, container: child });
       continue;
@@ -163,6 +199,19 @@ export function parseFrontmatter(text: string): Record<string, unknown> {
   }
 
   return root;
+}
+
+function nextChildContainer(lines: string[], startIndex: number, parentIndent: number): Container {
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const value = lines[index]!;
+    if (!value.trim() || value.trim().startsWith("#")) continue;
+    const indent = value.match(/^(\s*)/)?.[1]?.length ?? 0;
+    if (indent <= parentIndent) return {};
+    const rest = value.slice(indent);
+    if (rest.startsWith("- ") || rest === "-") return [];
+    return {};
+  }
+  return {};
 }
 
 function parseScalarOrInlineArray(value: string): unknown {
@@ -217,12 +266,29 @@ export function parseSkillFile(text: string): ParsedSkillFile {
       env: Array.isArray(pre.env) ? pre.env.map(String) : undefined
     };
   }
+  let requiredIdentities: ParsedSkillFile["requiredIdentities"];
+  if (fm.requires && typeof fm.requires === "object" && !Array.isArray(fm.requires)) {
+    const reqs = fm.requires as Record<string, unknown>;
+    if (Array.isArray(reqs.identities)) {
+      const collected: Array<{ kind: string; scopes?: string[] }> = [];
+      for (const entry of reqs.identities) {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+        const item = entry as Record<string, unknown>;
+        const kind = typeof item.kind === "string" ? item.kind : "";
+        if (!kind) continue;
+        const scopes = Array.isArray(item.scopes) ? item.scopes.map(String) : undefined;
+        collected.push(scopes ? { kind, scopes } : { kind });
+      }
+      requiredIdentities = collected;
+    }
+  }
   return {
     name,
     description,
     version,
     platforms,
     prerequisites,
+    requiredIdentities,
     body: body.trim(),
     frontmatter: fm
   };
@@ -284,7 +350,8 @@ function upsertSkillFromFile(
       existing.manifestPath !== origin.manifestPath ||
       existing.category !== origin.category ||
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
-      JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null);
+      JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
+      JSON.stringify(existing.requiredIdentities ?? null) !== JSON.stringify(parsed.requiredIdentities ?? null);
     const promoteBundledDraft = origin.source === "bundled" && existing.status === "draft";
     if (!changed && !promoteBundledDraft) return { record: existing, kind: "noop" };
     if (changed) {
@@ -303,6 +370,7 @@ function upsertSkillFromFile(
       existing.category = origin.category;
       existing.platforms = parsed.platforms;
       existing.prerequisites = parsed.prerequisites;
+      existing.requiredIdentities = parsed.requiredIdentities;
       existing.version += 1;
     }
     if (promoteBundledDraft) existing.status = "trusted";
@@ -324,6 +392,7 @@ function upsertSkillFromFile(
     category: origin.category,
     platforms: parsed.platforms,
     prerequisites: parsed.prerequisites,
+    requiredIdentities: parsed.requiredIdentities,
     source: origin.source
   });
   return { record, kind: "added" };

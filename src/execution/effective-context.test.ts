@@ -69,7 +69,7 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     memories: [],
     skills: [],
     jobs: [],
-    connectors: [],
+    identities: [],
     improvements: [],
     pairingCodes: [],
     devices: [],

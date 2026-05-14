@@ -57,7 +57,7 @@ Stable local clients use the gateway API:
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/approvals`
 - `/api/memory`, `/api/banks`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/migrate`
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`
-- `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
+- `/api/skills`, `/api/jobs`, `/api/identities`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/audit`, `/api/events`, `/api/events/stream`

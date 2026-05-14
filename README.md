@@ -24,7 +24,10 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [ADR 0004 — Agent Loop With Native Tool Calling](docs/adr/0004-agent-loop-tool-calling.md)
 - [ADR 0005 — Subagent Delegation](docs/adr/0005-subagent-delegation.md)
 - [ADR 0006 — Agents Replace Profiles And Drive Runtime Behavior](docs/adr/0006-agents-replace-profiles.md)
+- [ADR 0006 — dangerouslyAutoApprove](docs/adr/0006-dangerously-auto-approve.md)
 - [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
+- [ADR 0008 — Identity Secret Storage](docs/adr/0008-identity-secret-storage.md)
+- [ADR 0009 — Skills As Packages, Identities As Credentials](docs/adr/0009-skills-and-identities.md)
 
 ## Architecture In One Sentence
 
@@ -55,7 +58,7 @@ This repo includes a Bun TypeScript local runtime with:
 - paired-device auth and mobile bootstrap contracts for future mobile clients
 - instance-local snapshots and promotion proposal records
 - Local-first runtime primitives for memory, skills, jobs, search, providers, toolsets, subagents, MCP records, messaging records, and import inspection
-- OpenClaw-inspired connector and gateway structure
+- Skill-as-package + managed identity credential plane
 
 ## Quick Start
 
@@ -123,7 +126,7 @@ bun run gini task submit "read docs and summarize the gateway"
 bun run gini approvals
 bun run gini memory list
 bun run gini job add heartbeat 60 "check runtime health"
-bun run gini connectors health
+bun run gini identities health
 bun run gini evidence
 bun run gini search "runtime memory"
 bun run gini toolsets

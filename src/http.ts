@@ -4,7 +4,7 @@ import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkConnector } from "./integrations/connectors";
+import { checkIdentity, createIdentity, deleteIdentity, updateIdentity } from "./integrations/identities";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
 import { embeddingStatus, reembedBank } from "./memory/embedding";
@@ -260,8 +260,36 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
-    ["GET", /^\/api\/connectors$/, () => json(readState(config.instance).connectors)],
-    ["POST", /^\/api\/connectors\/([^/]+)\/health$/, async (_request, params) => json(await checkConnector(config, params[0]))],
+    ["GET", /^\/api\/identities$/, () => json(readState(config.instance).identities)],
+    ["POST", /^\/api\/identities$/, async (request) => {
+      const payload = await body(request);
+      const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
+        ? payload.secrets as Record<string, string>
+        : undefined;
+      return json(await createIdentity(config, {
+        name: String(payload.name ?? ""),
+        kind: String(payload.kind ?? ""),
+        scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
+        secrets
+      }), 201);
+    }],
+    ["PATCH", /^\/api\/identities\/([^/]+)$/, async (request, params) => {
+      const payload = await body(request);
+      const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
+        ? payload.secrets as Record<string, string>
+        : undefined;
+      const status = payload.status === "configured" || payload.status === "disabled" || payload.status === "error"
+        ? payload.status
+        : undefined;
+      return json(await updateIdentity(config, params[0], {
+        name: typeof payload.name === "string" ? payload.name : undefined,
+        scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
+        status,
+        secrets
+      }));
+    }],
+    ["DELETE", /^\/api\/identities\/([^/]+)$/, async (_request, params) => json(await deleteIdentity(config, params[0]))],
+    ["POST", /^\/api\/identities\/([^/]+)\/health$/, async (_request, params) => json(await checkIdentity(config, params[0]))],
     ["GET", /^\/api\/improvements$/, () => json(readState(config.instance).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],

@@ -680,6 +680,37 @@ describe("runtime api", () => {
     expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
   });
 
+  test("identity CRUD round-trips through /api/identities without persisting plaintext secrets", async () => {
+    const config = testConfig("identity-crud");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/identities", {
+      method: "POST",
+      body: JSON.stringify({ kind: "linear", name: "primary linear", scopes: ["read"], secrets: { token: "lin_secret_abc" } })
+    });
+
+    expect(created.kind).toBe("linear");
+    expect(created.secretRefs).toHaveLength(1);
+    expect(created.secretRefs[0].purpose).toBe("token");
+    const raw = readFileSync(`${config.stateRoot}/state.json`, "utf8");
+    expect(raw).not.toContain("lin_secret_abc");
+
+    const listed = await call(handler, config, "/api/identities");
+    expect(listed.some((item: { id: string }) => item.id === created.id)).toBe(true);
+
+    await call(handler, config, `/api/identities/${created.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ secrets: { token: "lin_secret_xyz" } })
+    });
+    const auditAfterRotate = readState(config.instance).audit;
+    expect(auditAfterRotate.some((event) => event.action === "identity.rotate")).toBe(true);
+
+    await call(handler, config, `/api/identities/${created.id}`, { method: "DELETE" });
+    const after = await call(handler, config, "/api/identities");
+    expect(after.some((item: { id: string }) => item.id === created.id)).toBe(false);
+    expect(existsSync(`${config.stateRoot}/secrets/${created.id}.token.json`)).toBe(false);
+  });
+
   // Round-1 review fix: browser-connect throws with prefixes that the
   // gateway's catch-all previously mapped to 500. The webapp needs them as
   // 4xx so it can render the original message instead of "internal error".

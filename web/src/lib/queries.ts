@@ -4,7 +4,7 @@ import { api } from "@/lib/api";
 import type {
   Approval,
   BrowserConnectionRecord,
-  ConnectorRecord,
+  IdentityRecord,
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
@@ -130,10 +130,10 @@ export function useJobRuns(jobId?: string) {
   });
 }
 
-export function useConnectors() {
-  return useQuery<ConnectorRecord[]>({
-    queryKey: ["connectors"],
-    queryFn: () => api<ConnectorRecord[]>("/connectors"),
+export function useIdentities() {
+  return useQuery<IdentityRecord[]>({
+    queryKey: ["identities"],
+    queryFn: () => api<IdentityRecord[]>("/identities"),
     refetchInterval: 10_000
   });
 }

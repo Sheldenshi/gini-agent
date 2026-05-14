@@ -50,7 +50,20 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     })
   });
   await api(config, `/api/improvements/${proposal.id}/approve`, { method: "POST" });
-  const connectorHealth = await api(config, "/api/connectors/conn_demo/health", { method: "POST" });
+  const identityHealth = await api(config, "/api/identities/id_demo/health", { method: "POST" });
+  // Optional Linear identity exercise: only runs when the host has a token
+  // in env (CI / contributor with a personal API key). Smoke succeeds
+  // without it so a fresh clone still passes.
+  let linearProbe: Record<string, unknown> | undefined;
+  if (process.env.LINEAR_API_KEY) {
+    const created = await api(config, "/api/identities", {
+      method: "POST",
+      body: JSON.stringify({ kind: "linear", name: "smoke-linear", scopes: ["read"], secrets: { token: process.env.LINEAR_API_KEY } })
+    });
+    const health = await api(config, `/api/identities/${created.id}/health`, { method: "POST" });
+    await api(config, `/api/identities/${created.id}`, { method: "DELETE" });
+    linearProbe = { id: created.id, health: health.health, message: health.message };
+  }
   const pairingResult = await api(config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 300 }) });
   const claimedDevice = await publicApi(config, "/api/pairing/claim", {
     method: "POST",
@@ -130,7 +143,8 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     notificationId: notificationResult.id,
     snapshotId: snapshotResult.snapshotId,
     promotionId: promotionResult.id,
-    connectorHealth: connectorHealth.health,
+    identityHealth: identityHealth.health,
+    linearProbe,
     traces: finalState.tasks.length,
     auditEvents: finalState.audit.length,
     evidencePath: bundle.path

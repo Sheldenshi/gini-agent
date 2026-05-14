@@ -43,6 +43,7 @@ import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { isSkillActive } from "../integrations/identities";
 import { resolveEffectiveContext } from "./effective-context";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
@@ -164,7 +165,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
     : buildAgentSystemContext(activeMemory, recalledContext);
-  const visibleSkills = filterSkillsForSubagent(state.skills, subagent);
+  const visibleSkills = filterSkillsForSubagent(state.skills, subagent).filter((skill) => isSkillActive(state, skill));
   const skillsBlock = buildTrustedSkillsBlock(visibleSkills);
   const systemContext = skillsBlock ? `${baseSystem}\n\n${skillsBlock}` : baseSystem;
 

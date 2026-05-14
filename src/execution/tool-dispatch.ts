@@ -27,6 +27,7 @@ import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
 import { createScheduledJob } from "../jobs";
+import { isSkillActive } from "../integrations/identities";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -419,6 +420,10 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
   const skill = matches.find((s) => (s.source ?? "user") === "bundled") ?? matches[0]!;
   if (skill.status !== "trusted") {
     throw new Error(`Skill ${name} is not trusted (current status: ${skill.status}). Ask the user to trust it via /skills before using.`);
+  }
+  if (!isSkillActive(state, skill)) {
+    const missing = (skill.requiredIdentities ?? []).map((entry) => entry.kind).join(", ");
+    throw new Error(`Skill ${name} is inactive: required identities not healthy (${missing || "unknown"}). Ask the user to add or repair the identity via /connections.`);
   }
   appendTrace(config.instance, taskId, {
     type: "tool",

@@ -81,7 +81,7 @@ export type RuntimeEventKind =
   | "job"
   | "memory"
   | "skill"
-  | "connector"
+  | "identity"
   | "mcp"
   | "messaging"
   | "provider"
@@ -156,7 +156,7 @@ export interface RuntimeState {
   memories: MemoryRecord[];
   skills: SkillRecord[];
   jobs: JobRecord[];
-  connectors: ConnectorRecord[];
+  identities: IdentityRecord[];
   improvements: ImprovementProposal[];
   pairingCodes: PairingCode[];
   devices: PairedDevice[];
@@ -339,7 +339,7 @@ export interface TraceRecord {
   taskId: string;
   instance: Instance;
   at: string;
-  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error" | "warning";
+  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "identity" | "error" | "warning";
   message: string;
   data?: Record<string, unknown>;
 }
@@ -553,7 +553,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable" | "browser.upload_file";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "identity.enable" | "browser.upload_file";
   target: string;
   risk: RiskLevel;
   reason: string;
@@ -620,6 +620,11 @@ export interface SkillRecord {
   // Frontmatter `prerequisites`. We keep `commands` and `env` as strings —
   // strings the LLM can later inspect or check via terminal_exec.
   prerequisites?: { commands?: string[]; env?: string[] };
+  // Frontmatter `requires.identities` — declares which identity kinds (and
+  // optionally scopes) the skill needs to function. The runtime gates the
+  // skill out of the agent loop's available-skills set until every entry
+  // matches a healthy IdentityRecord. Defaults to [].
+  requiredIdentities?: Array<{ kind: string; scopes?: string[] }>;
   // Origin of the loaded skill: "bundled" for vendored repo skills (under
   // <repo>/skills/), "user" for skills under ~/.gini/instances/<inst>/skills/.
   // Used by the loader to keep bundled and user records separate (so a
@@ -701,13 +706,19 @@ export interface CostRecord {
   estimatedUsd?: number;
 }
 
-export interface ConnectorRecord {
+export interface IdentitySecretRef {
+  purpose: string;
+  path: string;
+}
+
+export interface IdentityRecord {
   id: string;
   instance: Instance;
   name: string;
-  kind: "demo" | "github" | string;
+  kind: "demo" | "linear" | string;
   status: "configured" | "disabled" | "error";
   scopes: string[];
+  secretRefs: IdentitySecretRef[];
   createdAt: string;
   updatedAt: string;
   lastHealthAt?: string;
@@ -811,7 +822,7 @@ export interface RuntimeStatus {
   pendingApprovals: number;
   activeJobs: number;
   missedJobs: number;
-  connectors: number;
+  identities: number;
   memoryUnits?: number;
   provider?: ProviderHealth;
   activeAgent?: ActiveAgentSnapshot;
