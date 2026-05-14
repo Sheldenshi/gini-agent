@@ -2,8 +2,8 @@ import type {
   Approval,
   ChatMessageRecord,
   ChatSessionRecord,
+  ConnectorRecord,
   DeviceStatus,
-  IdentityRecord,
   ImportReport,
   ImprovementProposal,
   JobRecord,
@@ -282,7 +282,7 @@ export function createMemory(
 
 export function createSkill(
   state: RuntimeState,
-  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions" | "body"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions" | "body" | "manifestPath" | "category" | "platforms" | "prerequisites" | "requiredIdentities" | "source">>
+  skill: Omit<SkillRecord, "id" | "instance" | "createdAt" | "updatedAt" | "version" | "tests" | "successCount" | "failureCount" | "previousVersions" | "body"> & Partial<Pick<SkillRecord, "tests" | "successCount" | "failureCount" | "previousVersions" | "body" | "manifestPath" | "category" | "platforms" | "prerequisites" | "requiredConnectors" | "allowedTools" | "license" | "compatibility" | "validationStatus" | "validationMessage" | "source">>
 ): SkillRecord {
   const at = now();
   const item: SkillRecord = {
@@ -742,10 +742,10 @@ export function activateAgent(state: RuntimeState, idOrName: string): AgentRecor
   return agent;
 }
 
-export function updateIdentityHealth(identity: IdentityRecord): IdentityRecord {
-  identity.lastHealthAt = now();
-  identity.health = identity.status === "configured" ? "healthy" : "unhealthy";
-  identity.message = identity.kind === "demo" ? "Demo identity is available without secrets." : identity.message;
-  identity.updatedAt = now();
-  return identity;
+export function updateConnectorHealth(connector: ConnectorRecord): ConnectorRecord {
+  connector.lastHealthAt = now();
+  connector.health = connector.status === "configured" ? "healthy" : "unhealthy";
+  connector.message = connector.provider === "demo" ? "Demo connector is available without secrets." : connector.message;
+  connector.updatedAt = now();
+  return connector;
 }

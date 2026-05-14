@@ -28,6 +28,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { RuntimeConfig, RuntimeState, SkillRecord, SkillStatus } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now } from "../state";
 import { projectRoot, skillsDir } from "../paths";
+import { hasProvider } from "../integrations/connectors/registry";
 
 export interface ParsedSkillFile {
   name: string;
@@ -35,7 +36,12 @@ export interface ParsedSkillFile {
   version: string;
   platforms?: string[];
   prerequisites?: { commands?: string[]; env?: string[] };
-  requiredIdentities?: Array<{ kind: string; scopes?: string[] }>;
+  requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  allowedTools?: string;
+  license?: string;
+  compatibility?: string;
+  validationStatus?: "ok" | "unsupported";
+  validationMessage?: string;
   body: string;
   // Original frontmatter for traceability. Loader doesn't read these
   // beyond the keys above, but we keep the whole map so future passes can
@@ -251,44 +257,117 @@ function parseScalar(value: string): unknown {
   return value;
 }
 
-export function parseSkillFile(text: string): ParsedSkillFile {
+// Parse a SKILL.md file per the Anthropic Agent Skills spec
+// (https://agentskills.io/specification). Gini-specific extensions live
+// under `metadata.gini.*`.
+//
+// Spec-recognized top-level keys: `name`, `description`, `license`,
+// `compatibility`, `metadata`, `allowed-tools`. Frontmatter values outside
+// that set are tolerated but ignored.
+//
+// Gini extension keys (under `metadata.gini`):
+//   version, author, platforms,
+//   prerequisites: { commands, env },
+//   requires: { connectors: [{ provider, scopes? }, ...] },
+//   category   — used as a UI grouping hint
+//
+// For one release we accept legacy top-level fields (`version`,
+// `platforms`, `prerequisites`, `requires.identities` with `kind` keys)
+// and log a deprecation warning. Remove the fallback in the release after.
+export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFile {
   const { frontmatter, body } = splitFrontmatter(text);
   const fm = parseFrontmatter(frontmatter);
   const name = typeof fm.name === "string" ? fm.name : "";
   const description = typeof fm.description === "string" ? fm.description : "";
-  const version = fm.version === undefined ? "1.0.0" : String(fm.version);
-  const platforms = Array.isArray(fm.platforms) ? fm.platforms.map(String) : undefined;
+  const license = typeof fm.license === "string" ? fm.license : undefined;
+  const compatibility = typeof fm.compatibility === "string" ? fm.compatibility : undefined;
+  const allowedTools = typeof fm["allowed-tools"] === "string"
+    ? String(fm["allowed-tools"]).trim()
+    : undefined;
+
+  // Pull the gini extension namespace.
+  const metadata = fm.metadata && typeof fm.metadata === "object" && !Array.isArray(fm.metadata)
+    ? fm.metadata as Record<string, unknown>
+    : {};
+  const giniExt = metadata.gini && typeof metadata.gini === "object" && !Array.isArray(metadata.gini)
+    ? metadata.gini as Record<string, unknown>
+    : null;
+
+  // Source for version, platforms, prerequisites, requires.
+  // Prefer metadata.gini.*; fall back to top-level for one release.
+  function pickFromGiniOrTop(key: string): unknown {
+    if (giniExt && key in giniExt) return giniExt[key];
+    return fm[key];
+  }
+
+  const versionSource = pickFromGiniOrTop("version");
+  const version = versionSource === undefined ? "1.0.0" : String(versionSource);
+
+  const platformsSource = pickFromGiniOrTop("platforms");
+  const platforms = Array.isArray(platformsSource) ? platformsSource.map(String) : undefined;
+
   let prerequisites: ParsedSkillFile["prerequisites"];
-  if (fm.prerequisites && typeof fm.prerequisites === "object" && !Array.isArray(fm.prerequisites)) {
-    const pre = fm.prerequisites as Record<string, unknown>;
+  const preSource = pickFromGiniOrTop("prerequisites");
+  if (preSource && typeof preSource === "object" && !Array.isArray(preSource)) {
+    const pre = preSource as Record<string, unknown>;
     prerequisites = {
       commands: Array.isArray(pre.commands) ? pre.commands.map(String) : undefined,
       env: Array.isArray(pre.env) ? pre.env.map(String) : undefined
     };
   }
-  let requiredIdentities: ParsedSkillFile["requiredIdentities"];
-  if (fm.requires && typeof fm.requires === "object" && !Array.isArray(fm.requires)) {
-    const reqs = fm.requires as Record<string, unknown>;
-    if (Array.isArray(reqs.identities)) {
-      const collected: Array<{ kind: string; scopes?: string[] }> = [];
-      for (const entry of reqs.identities) {
+
+  let requiredConnectors: ParsedSkillFile["requiredConnectors"];
+  const requiresSource = pickFromGiniOrTop("requires");
+  if (requiresSource && typeof requiresSource === "object" && !Array.isArray(requiresSource)) {
+    const reqs = requiresSource as Record<string, unknown>;
+    const connectorList = Array.isArray(reqs.connectors)
+      ? reqs.connectors
+      : Array.isArray((reqs as { identities?: unknown }).identities)
+        ? (reqs as { identities: unknown[] }).identities
+        : null;
+    if (Array.isArray(connectorList)) {
+      // Warn once when the legacy `requires.identities` shape is used so
+      // skill authors know to migrate. The check on which key was present
+      // is best-effort — both shapes collapse to the same parsed result.
+      if (Array.isArray((reqs as { identities?: unknown }).identities) && !Array.isArray(reqs.connectors)) {
+        const where = sourcePath ? ` (${sourcePath})` : "";
+        console.warn(`[skill-loader] DEPRECATION${where}: requires.identities is renamed to requires.connectors; legacy field still accepted for one release.`);
+      }
+      const collected: Array<{ provider: string; scopes?: string[] }> = [];
+      for (const entry of connectorList) {
         if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
         const item = entry as Record<string, unknown>;
-        const kind = typeof item.kind === "string" ? item.kind : "";
-        if (!kind) continue;
+        // Spec form: `provider`. Legacy: `kind`. Accept both.
+        const provider = typeof item.provider === "string"
+          ? item.provider
+          : typeof item.kind === "string" ? item.kind : "";
+        if (!provider) continue;
         const scopes = Array.isArray(item.scopes) ? item.scopes.map(String) : undefined;
-        collected.push(scopes ? { kind, scopes } : { kind });
+        collected.push(scopes ? { provider, scopes } : { provider });
       }
-      requiredIdentities = collected;
+      requiredConnectors = collected;
     }
   }
+
+  // One-shot deprecation warnings for the legacy top-level Gini fields.
+  if (!giniExt) {
+    const legacyFields = ["version", "author", "platforms", "prerequisites", "requires"].filter((k) => k in fm);
+    if (legacyFields.length > 0) {
+      const where = sourcePath ? ` (${sourcePath})` : "";
+      console.warn(`[skill-loader] DEPRECATION${where}: Gini-specific fields [${legacyFields.join(", ")}] should live under metadata.gini.*; legacy top-level form still accepted for one release.`);
+    }
+  }
+
   return {
     name,
     description,
     version,
     platforms,
     prerequisites,
-    requiredIdentities,
+    requiredConnectors,
+    allowedTools,
+    license,
+    compatibility,
     body: body.trim(),
     frontmatter: fm
   };
@@ -327,6 +406,45 @@ export function bundledSkillsRoot(): string {
 // On match: only bump the numeric version when the content changed. On miss:
 // create bundled Gini skills with status="trusted" and user-instance skills
 // with status="draft".
+// Validate a parsed skill against the Anthropic Agent Skills spec and
+// against Gini extension rules. Returns a list of issues; empty array
+// means the skill passes. Used both by the loader (to mark a row as
+// `validationStatus: "unsupported"`) and by the `gini skill validate`
+// CLI command.
+export function validateParsedSkill(
+  parsed: ParsedSkillFile,
+  options: { manifestPath?: string; parentDirName?: string } = {}
+): string[] {
+  const issues: string[] = [];
+  if (!parsed.name.trim()) {
+    issues.push("Missing required `name` frontmatter field.");
+  } else {
+    if (parsed.name.length > 64) {
+      issues.push(`name "${parsed.name}" exceeds 64-character spec limit.`);
+    }
+    if (!/^[a-z][a-z0-9-]*$/.test(parsed.name)) {
+      issues.push(`name "${parsed.name}" must be lowercase, start with a letter, and contain only letters, digits, and hyphens.`);
+    }
+    if (options.parentDirName && options.parentDirName !== parsed.name) {
+      issues.push(`name "${parsed.name}" must match the parent directory name "${options.parentDirName}".`);
+    }
+  }
+  if (!parsed.description.trim()) {
+    issues.push("Missing required `description` frontmatter field.");
+  } else if (parsed.description.length > 1024) {
+    issues.push("description exceeds 1024-character spec limit.");
+  }
+  if (parsed.compatibility && parsed.compatibility.length > 500) {
+    issues.push("compatibility exceeds 500-character spec limit.");
+  }
+  for (const req of parsed.requiredConnectors ?? []) {
+    if (!hasProvider(req.provider)) {
+      issues.push(`Required provider "${req.provider}" is not in the connector registry; install a connector module or use "generic".`);
+    }
+  }
+  return issues;
+}
+
 function upsertSkillFromFile(
   state: RuntimeState,
   parsed: ParsedSkillFile,
@@ -343,15 +461,26 @@ function upsertSkillFromFile(
   const trimmedBody = parsed.body;
   const at = now();
 
+  // Validate at load time so the activation gate skips unsupported skills.
+  const parentDirName = basename(dirname(origin.manifestPath));
+  const issues = validateParsedSkill(parsed, { manifestPath: origin.manifestPath, parentDirName });
+  const validationStatus: "ok" | "unsupported" = issues.length === 0 ? "ok" : "unsupported";
+  const validationMessage = issues.length === 0 ? undefined : issues.join(" ");
+
   if (existing) {
     const changed =
       existing.body !== trimmedBody ||
       existing.description !== parsed.description ||
       existing.manifestPath !== origin.manifestPath ||
       existing.category !== origin.category ||
+      existing.allowedTools !== parsed.allowedTools ||
+      existing.license !== parsed.license ||
+      existing.compatibility !== parsed.compatibility ||
+      existing.validationStatus !== validationStatus ||
+      existing.validationMessage !== validationMessage ||
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
-      JSON.stringify(existing.requiredIdentities ?? null) !== JSON.stringify(parsed.requiredIdentities ?? null);
+      JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null);
     const promoteBundledDraft = origin.source === "bundled" && existing.status === "draft";
     if (!changed && !promoteBundledDraft) return { record: existing, kind: "noop" };
     if (changed) {
@@ -370,7 +499,12 @@ function upsertSkillFromFile(
       existing.category = origin.category;
       existing.platforms = parsed.platforms;
       existing.prerequisites = parsed.prerequisites;
-      existing.requiredIdentities = parsed.requiredIdentities;
+      existing.requiredConnectors = parsed.requiredConnectors;
+      existing.allowedTools = parsed.allowedTools;
+      existing.license = parsed.license;
+      existing.compatibility = parsed.compatibility;
+      existing.validationStatus = validationStatus;
+      existing.validationMessage = validationMessage;
       existing.version += 1;
     }
     if (promoteBundledDraft) existing.status = "trusted";
@@ -392,7 +526,12 @@ function upsertSkillFromFile(
     category: origin.category,
     platforms: parsed.platforms,
     prerequisites: parsed.prerequisites,
-    requiredIdentities: parsed.requiredIdentities,
+    requiredConnectors: parsed.requiredConnectors,
+    allowedTools: parsed.allowedTools,
+    license: parsed.license,
+    compatibility: parsed.compatibility,
+    validationStatus,
+    validationMessage,
     source: origin.source
   });
   return { record, kind: "added" };
@@ -415,7 +554,7 @@ export async function loadSkillsFromDisk(config: RuntimeConfig): Promise<SkillLo
       let parsed: ParsedSkillFile;
       try {
         const raw = readFileSync(entry.manifestPath, "utf8");
-        parsed = parseSkillFile(raw);
+        parsed = parseSkillFile(raw, entry.manifestPath);
       } catch (error) {
         result.skipped.push({
           name: basename(dirname(entry.manifestPath)),

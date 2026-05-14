@@ -19,12 +19,12 @@ export function createEmptyState(instance: Instance): RuntimeState {
     memories: [],
     skills: [],
     jobs: [],
-    identities: [
+    connectors: [
       {
         id: "id_demo",
         instance,
-        name: "Demo Identity",
-        kind: "demo",
+        name: "Demo Connector",
+        provider: "demo",
         status: "configured",
         scopes: ["demo:read"],
         secretRefs: [],
@@ -145,7 +145,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "memories",
     "skills",
     "jobs",
-    "identities",
+    "connectors",
     "improvements",
     "pairingCodes",
     "devices",
@@ -182,19 +182,25 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
 }
 
-// Pre-ADR-0009 state files persist a `connectors` array. Rename to
-// `identities` in-place; mutateState rewrites the file on the next mutation.
-// Also backfill the new `secretRefs` field so callers can rely on it being
-// an array.
-function migrateConnectorsToIdentities(state: RuntimeState): void {
+// ADR 0010 renamed `state.identities` → `state.connectors` and each
+// record's `kind` → `provider`. State files written before that rename
+// still carry the old keys; rewrite them in-place so mutateState persists
+// the new shape on the next write. No back-compat shim is exposed outside
+// this normalizer.
+function migrateIdentitiesToConnectors(state: RuntimeState): void {
   const stateAny = state as unknown as { connectors?: unknown; identities?: unknown };
-  if (stateAny.connectors !== undefined && stateAny.identities === undefined) {
-    stateAny.identities = stateAny.connectors;
+  if (stateAny.identities !== undefined && stateAny.connectors === undefined) {
+    stateAny.connectors = stateAny.identities;
   }
-  delete stateAny.connectors;
-  if (Array.isArray(state.identities)) {
-    for (const identity of state.identities) {
-      identity.secretRefs ??= [];
+  delete stateAny.identities;
+  if (Array.isArray(state.connectors)) {
+    for (const connector of state.connectors) {
+      const rec = connector as unknown as { kind?: unknown; provider?: unknown; secretRefs?: unknown };
+      if (rec.kind !== undefined && rec.provider === undefined) {
+        rec.provider = rec.kind;
+      }
+      delete rec.kind;
+      connector.secretRefs ??= [];
     }
   }
 }
@@ -385,10 +391,10 @@ function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState)
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
   migrateProfileFieldsToAgent(state);
   migrateLaneFieldToInstance(state);
-  migrateConnectorsToIdentities(state);
+  migrateIdentitiesToConnectors(state);
   state.instance = instance;
   state.improvements ??= [];
-  state.identities ??= [];
+  state.connectors ??= [];
   state.tasks ??= [];
   state.approvals ??= [];
   state.audit ??= [];
@@ -500,6 +506,24 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     // separate rows. Legacy records (pre-fix) default to "user" — bundled
     // records get re-tagged on the next loadSkillsFromDisk pass.
     skill.source ??= "user";
+    // ADR 0010 renamed SkillRecord.requiredIdentities (with `kind` keys) to
+    // requiredConnectors (with `provider` keys). Rewrite in-place so the
+    // record uses the new vocabulary; the loader will overwrite from disk
+    // on the next reload anyway.
+    const legacy = skill as unknown as { requiredIdentities?: unknown };
+    if (Array.isArray(legacy.requiredIdentities) && !skill.requiredConnectors) {
+      skill.requiredConnectors = legacy.requiredIdentities
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") return null;
+          const item = entry as Record<string, unknown>;
+          const provider = typeof item.kind === "string" ? item.kind : typeof item.provider === "string" ? item.provider : "";
+          if (!provider) return null;
+          const scopes = Array.isArray(item.scopes) ? item.scopes.map(String) : undefined;
+          return scopes ? { provider, scopes } : { provider };
+        })
+        .filter((entry): entry is { provider: string; scopes?: string[] } => entry !== null);
+    }
+    delete legacy.requiredIdentities;
   }
   for (const subagent of state.subagents) {
     // Slice 4 introduced `systemPrompt` (always present) and optional

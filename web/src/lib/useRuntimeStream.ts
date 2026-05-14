@@ -12,7 +12,7 @@ const EVENT_KINDS = [
   "job",
   "memory",
   "skill",
-  "identity",
+  "connector",
   "mcp",
   "messaging",
   "provider",

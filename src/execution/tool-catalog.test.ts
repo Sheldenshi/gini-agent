@@ -31,7 +31,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     tasks: [], approvals: [], audit: [], memories: [], skills: [], jobs: [],
-    identities: [], improvements: [], pairingCodes: [], devices: [],
+    connectors: [], improvements: [], pairingCodes: [], devices: [],
     promotions: [], snapshots: [], tools: [], toolsets, subagents: [],
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
     activeAgentId: undefined, relays: [], notifications: [], events: [],

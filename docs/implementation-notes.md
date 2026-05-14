@@ -17,7 +17,7 @@ These notes describe the current source layout and boundaries. Product direction
 - `src/jobs/` contains scheduler job creation, execution, replay, and run history behavior.
 - `src/governance/` contains approvals-adjacent runtime workflows such as pairing, improvements, and promotions.
 - `src/capabilities/` contains skills, toolsets, agents, and subagent records.
-- `src/integrations/` contains identities, MCP, messaging, import inspection, relay, and notification behavior.
+- `src/integrations/` contains connectors, MCP, messaging, import inspection, relay, and notification behavior.
 - `src/tools/` contains file, terminal, code, and web tool implementations.
 - `src/cli.ts` is the CLI shim.
 - `src/cli/` contains CLI routing, API helpers, process management, output helpers, and command modules.
@@ -31,7 +31,7 @@ These notes describe the current source layout and boundaries. Product direction
 - API responses must not expose bearer tokens, secret hashes, or credential material.
 - CLI commands should prefer public runtime APIs when exercising product behavior.
 - Direct module calls from CLI are reserved for local harness/process operations such as install, smoke setup, snapshots, and evidence bundles.
-- New identity kinds, tools, providers, and client surfaces should land in focused modules before adding router or CLI commands.
+- New connector providers, tools, model providers, and client surfaces should land in focused modules before adding router or CLI commands.
 - Hermes-parity features should first add durable runtime records and safe inspection flows before adding live external transports.
 - MCP, messaging, and import integrations must fail visibly and must not mutate external installs or credentials by default.
 

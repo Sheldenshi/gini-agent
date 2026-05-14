@@ -39,7 +39,7 @@ import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
 import { syncSubagentFromTask } from "./capabilities/subagents";
-import { resolveActiveSkillsEnv } from "./integrations/identities";
+import { resolveActiveSkillsEnv } from "./integrations/connectors";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
 // JobRunRecord from "running" to a terminal status when a Task with a

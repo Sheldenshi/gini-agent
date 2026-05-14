@@ -680,35 +680,48 @@ describe("runtime api", () => {
     expect(runs.some((item: { id: string }) => item.id === submitted.runId)).toBe(true);
   });
 
-  test("identity CRUD round-trips through /api/identities without persisting plaintext secrets", async () => {
-    const config = testConfig("identity-crud");
+  test("connector CRUD round-trips through /api/connectors without persisting plaintext secrets", async () => {
+    const config = testConfig("connector-crud");
     const handler = createHandler(config);
 
-    const created = await call(handler, config, "/api/identities", {
+    const created = await call(handler, config, "/api/connectors", {
       method: "POST",
-      body: JSON.stringify({ kind: "linear", name: "primary linear", scopes: ["read"], secrets: { token: "lin_secret_abc" } })
+      body: JSON.stringify({ provider: "linear", name: "primary linear", scopes: ["read"], secrets: { token: "lin_secret_abc" } })
     });
 
-    expect(created.kind).toBe("linear");
+    expect(created.provider).toBe("linear");
     expect(created.secretRefs).toHaveLength(1);
     expect(created.secretRefs[0].purpose).toBe("token");
     const raw = readFileSync(`${config.stateRoot}/state.json`, "utf8");
     expect(raw).not.toContain("lin_secret_abc");
 
-    const listed = await call(handler, config, "/api/identities");
+    const listed = await call(handler, config, "/api/connectors");
     expect(listed.some((item: { id: string }) => item.id === created.id)).toBe(true);
 
-    await call(handler, config, `/api/identities/${created.id}`, {
+    await call(handler, config, `/api/connectors/${created.id}`, {
       method: "PATCH",
       body: JSON.stringify({ secrets: { token: "lin_secret_xyz" } })
     });
     const auditAfterRotate = readState(config.instance).audit;
-    expect(auditAfterRotate.some((event) => event.action === "identity.rotate")).toBe(true);
+    expect(auditAfterRotate.some((event) => event.action === "connector.rotate")).toBe(true);
 
-    await call(handler, config, `/api/identities/${created.id}`, { method: "DELETE" });
-    const after = await call(handler, config, "/api/identities");
+    await call(handler, config, `/api/connectors/${created.id}`, { method: "DELETE" });
+    const after = await call(handler, config, "/api/connectors");
     expect(after.some((item: { id: string }) => item.id === created.id)).toBe(false);
     expect(existsSync(`${config.stateRoot}/secrets/${created.id}.token.json`)).toBe(false);
+  });
+
+  test("GET /api/connectors/providers returns the registry", async () => {
+    const config = testConfig("providers-list");
+    const handler = createHandler(config);
+    const providers = await call(handler, config, "/api/connectors/providers");
+    expect(Array.isArray(providers)).toBe(true);
+    const ids = providers.map((p: { id: string }) => p.id);
+    expect(ids).toContain("demo");
+    expect(ids).toContain("linear");
+    expect(ids).toContain("generic");
+    expect(ids).toContain("claude-code");
+    expect(ids).toContain("codex");
   });
 
   // Round-1 review fix: browser-connect throws with prefixes that the

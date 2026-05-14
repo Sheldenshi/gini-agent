@@ -1,10 +1,11 @@
-// Linear personal API key probe. Personal API keys authenticate with
-// `Authorization: <token>` — Linear does NOT accept `Bearer <token>`
-// for personal keys (only OAuth tokens use Bearer).
+// Linear provider module. Personal API keys authenticate with
+// `Authorization: <token>` — Linear does NOT accept `Bearer <token>` for
+// personal keys (only OAuth tokens use Bearer).
 //
-// We hit the viewer query which is the cheapest authenticated GraphQL
-// call. Any 401/403, network error, or GraphQL error counts as a failed
-// probe.
+// The probe hits the viewer query (cheapest authenticated GraphQL call).
+// Any 401/403, network error, or GraphQL error counts as a failed probe.
+
+import type { ProviderModule } from "./types";
 
 export interface LinearProbeOk {
   ok: true;
@@ -56,3 +57,31 @@ export async function probeLinear(token: string): Promise<LinearProbeOk | Linear
     clearTimeout(timer);
   }
 }
+
+export const linearProvider: ProviderModule = {
+  id: "linear",
+  label: "Linear",
+  description: "Query and update Linear issues via the Linear GraphQL API.",
+  fields: [
+    {
+      name: "token",
+      label: "Personal API token",
+      description: "Get one at https://linear.app/settings/account/security.",
+      secret: true,
+      required: true,
+      placeholder: "lin_api_…"
+    }
+  ],
+  secrets: {
+    purposes: ["token"],
+    envBindings: { LINEAR_API_KEY: "token" }
+  },
+  async probe(ctx) {
+    const token = await ctx.resolveSecret("token");
+    if (!token) return { ok: false, message: "Missing token secret." };
+    const result = await probeLinear(token);
+    return result.ok
+      ? { ok: true, message: `Authenticated as ${result.viewer.name}` }
+      : { ok: false, message: result.error };
+  }
+};

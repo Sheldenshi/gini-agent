@@ -1,8 +1,10 @@
-# ADR 0008: Identity Secret Storage
+# ADR 0008: Connector Secret Storage
+
+> Renamed from "Identity Secret Storage" per ADR 0010. The decision is unchanged; only the vocabulary updated.
 
 ## Decision
 
-Identity secrets are stored as encrypted files inside the instance directory. Each instance owns a per-instance encryption key on disk; individual secrets are encrypted with that key and written under `~/.gini/instances/<instance>/secrets/`.
+Connector secrets are stored as encrypted files inside the instance directory. Each instance owns a per-instance encryption key on disk; individual secrets are encrypted with that key and written under `~/.gini/instances/<instance>/secrets/`.
 
 The macOS Keychain is rejected as a secret storage backend for this product. It is not deferred and not an opt-in alternative.
 
@@ -28,13 +30,13 @@ A future requirement for hardware-backed key material is addressed by Secure Enc
 ## Required Now
 
 - Each instance owns a key file at `~/.gini/instances/<instance>/secrets/.key`, mode `0600`, created on install.
-- Each identity secret is stored at `~/.gini/instances/<instance>/secrets/<identity-id>.json`, mode `0600`, encrypted with the instance key (AES-256-GCM or libsodium secretbox).
-- `IdentityRecord` persists only secret *references* (`{ purpose, path }`), never plaintext values, in instance state.
-- Secrets are added, rotated, and revoked exclusively through `POST` / `PATCH` / `DELETE /api/identities/...` on the gateway. The CLI and web client call the same endpoints.
+- Each connector secret is stored at `~/.gini/instances/<instance>/secrets/<connector-id>.<purpose>.json`, mode `0600`, encrypted with the instance key (AES-256-GCM or libsodium secretbox).
+- `ConnectorRecord` persists only secret *references* (`{ purpose, path }`), never plaintext values, in instance state.
+- Secrets are added, rotated, and revoked exclusively through `POST` / `PATCH` / `DELETE /api/connectors/...` on the gateway. The CLI and web client call the same endpoints.
 - The gateway is the only process that decrypts secrets. Browser code, per ADR 0001, never receives them.
-- Every secret read and write emits an audit event with `target: identity.id` and `purpose`. The plaintext value is never logged.
-- Health probes (`POST /api/identities/:id/health`) decrypt the secret in-process, hit the third-party API, and surface only the result.
-- The smoke flow exercises add, use, rotate, and delete for at least one non-demo identity kind.
+- Every secret read and write emits an audit event with `target: connector.id` and `purpose`. The plaintext value is never logged.
+- Health probes (`POST /api/connectors/:id/health`) decrypt the secret in-process, hit the third-party API, and surface only the result.
+- The smoke flow exercises add, use, rotate, and delete for at least one non-demo connector provider.
 
 ## Rejected
 
@@ -50,15 +52,15 @@ A future requirement for hardware-backed key material is addressed by Secure Enc
 ## Consequences For Coding Agents
 
 - Do not import, shell out to, or add a dependency on `keytar`, the `security` CLI, or any Keychain API. Do not add a `backend` discriminator anticipating one.
-- Do not add fields to `IdentityRecord` that hold plaintext secret material; only references.
-- Route new identity kinds through the gateway add/rotate/delete endpoints. Do not read or write the `secrets/` directory from clients.
-- When adding a tool that consumes an identity, fetch the secret through the gateway's resolver, stamp the identity id into the audit event, and never include the secret in trace evidence.
+- Do not add fields to `ConnectorRecord` that hold plaintext secret material; only references.
+- Route new connector providers through the gateway add/rotate/delete endpoints. Do not read or write the `secrets/` directory from clients.
+- When adding a tool that consumes a connector, fetch the secret through the gateway's resolver, stamp the connector id into the audit event, and never include the secret in trace evidence.
 
 ## Acceptance Checks
 
 - A fresh instance install creates `~/.gini/instances/<instance>/secrets/` with mode `0700` and a `.key` file with mode `0600`.
-- `POST /api/identities` accepts a secret payload, writes an encrypted file, and returns a record whose state JSON contains only the reference.
-- Inspecting `state.json` after adding an identity shows no plaintext secret bytes.
+- `POST /api/connectors` accepts a secret payload, writes an encrypted file, and returns a record whose state JSON contains only the reference.
+- Inspecting `state.json` after adding a connector shows no plaintext secret bytes.
 - `PATCH` rotates the secret without changing the record id; the old ciphertext is overwritten.
 - `DELETE` removes both the record and the secret file.
 - Audit events appear for add, rotate, use, and delete, and none of them contain the secret value.

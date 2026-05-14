@@ -12,12 +12,12 @@ Gini needs Hermes-class runtime depth while keeping OpenClaw-style reach possibl
 
 ## Required Now
 
-- `gini` CLI commands for install, start, run, stop, status, doctor, task, chat, runs, approval, memory, skill, job, identity, trace, audit, evidence, parity, readiness, and smoke.
+- `gini` CLI commands for install, start, run, stop, status, doctor, task, chat, runs, approval, memory, skill, job, connector, trace, audit, evidence, parity, readiness, and smoke.
 - Runtime state is scoped by instance under `~/.gini/instances/<instance>/` by default.
 - Runtime logs are scoped inside the same instance directory.
 - Local API requires a bearer token stored in the instance config.
 - The Next.js control plane uses a server-side BFF proxy so browser JavaScript never receives the gateway token.
-- Conversations, runs, plan steps, tasks, traces, audit events, approvals, jobs, memories, skills, and identity records are persisted.
+- Conversations, runs, plan steps, tasks, traces, audit events, approvals, jobs, memories, skills, and connector records are persisted.
 - Risky file, terminal, and code actions create approval records before side effects.
 - The provider layer supports deterministic `echo`, Codex OAuth, OpenAI API keys, and OpenRouter-compatible records.
 
@@ -26,7 +26,7 @@ Gini needs Hermes-class runtime depth while keeping OpenClaw-style reach possibl
 - Production macOS LaunchAgent installation.
 - Native/mobile app UI.
 - Production relay, push notifications, and broad live messaging transports.
-- Real identity secret storage (see ADR 0008 and ADR 0009).
+- Real connector secret storage (see ADR 0008, ADR 0009, and ADR 0010).
 
 ## Consequences For Coding Agents
 
@@ -37,7 +37,7 @@ Gini needs Hermes-class runtime depth while keeping OpenClaw-style reach possibl
 
 ## Acceptance Checks
 
-- `bun run gini smoke` exercises task, memory, job, identity, trace, audit, parity, readiness, and runtime health.
+- `bun run gini smoke` exercises task, memory, job, connector, trace, audit, parity, readiness, and runtime health.
 - `bun run gini provider set codex <model>` configures Codex OAuth without copying token values into Gini config.
 - `bun run gini provider set openai <model>` configures a real model provider without persisting API keys.
 - Reset affects only the selected instance.

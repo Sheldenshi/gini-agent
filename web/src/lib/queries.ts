@@ -4,7 +4,7 @@ import { api } from "@/lib/api";
 import type {
   Approval,
   BrowserConnectionRecord,
-  IdentityRecord,
+  ConnectorRecord,
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
@@ -130,11 +130,32 @@ export function useJobRuns(jobId?: string) {
   });
 }
 
-export function useIdentities() {
-  return useQuery<IdentityRecord[]>({
-    queryKey: ["identities"],
-    queryFn: () => api<IdentityRecord[]>("/identities"),
+export function useConnectors() {
+  return useQuery<ConnectorRecord[]>({
+    queryKey: ["connectors"],
+    queryFn: () => api<ConnectorRecord[]>("/connectors"),
     refetchInterval: 10_000
+  });
+}
+
+export interface ProviderDescriptor {
+  id: string;
+  label: string;
+  description: string;
+  fields: Array<{ name: string; label: string; description?: string; secret: boolean; required?: boolean; placeholder?: string }>;
+  secrets?: { purposes: string[]; envBindings: Record<string, string> };
+  hasProbe: boolean;
+  hasDetect: boolean;
+  probeIntervalMs?: number;
+}
+
+export function useProviders() {
+  return useQuery<ProviderDescriptor[]>({
+    queryKey: ["connector-providers"],
+    queryFn: () => api<ProviderDescriptor[]>("/connectors/providers"),
+    // The registry is built at runtime startup; it doesn't change between
+    // reloads, so a long stale time avoids unnecessary refetches.
+    staleTime: 5 * 60_000
   });
 }
 

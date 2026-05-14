@@ -81,7 +81,7 @@ export type RuntimeEventKind =
   | "job"
   | "memory"
   | "skill"
-  | "identity"
+  | "connector"
   | "mcp"
   | "messaging"
   | "provider"
@@ -156,7 +156,7 @@ export interface RuntimeState {
   memories: MemoryRecord[];
   skills: SkillRecord[];
   jobs: JobRecord[];
-  identities: IdentityRecord[];
+  connectors: ConnectorRecord[];
   improvements: ImprovementProposal[];
   pairingCodes: PairingCode[];
   devices: PairedDevice[];
@@ -339,7 +339,7 @@ export interface TraceRecord {
   taskId: string;
   instance: Instance;
   at: string;
-  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "identity" | "error" | "warning";
+  type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error" | "warning";
   message: string;
   data?: Record<string, unknown>;
 }
@@ -553,7 +553,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "identity.enable" | "browser.upload_file";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable" | "browser.upload_file";
   target: string;
   risk: RiskLevel;
   reason: string;
@@ -620,11 +620,23 @@ export interface SkillRecord {
   // Frontmatter `prerequisites`. We keep `commands` and `env` as strings —
   // strings the LLM can later inspect or check via terminal_exec.
   prerequisites?: { commands?: string[]; env?: string[] };
-  // Frontmatter `requires.identities` — declares which identity kinds (and
-  // optionally scopes) the skill needs to function. The runtime gates the
-  // skill out of the agent loop's available-skills set until every entry
-  // matches a healthy IdentityRecord. Defaults to [].
-  requiredIdentities?: Array<{ kind: string; scopes?: string[] }>;
+  // Frontmatter `metadata.gini.requires.connectors` — declares which provider
+  // ids (and optionally scopes) the skill needs to function. The runtime
+  // gates the skill out of the agent loop's available-skills set until every
+  // entry matches a healthy ConnectorRecord. Defaults to [].
+  requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  // Spec-compliant top-level `allowed-tools` declaration (space-separated in
+  // the source frontmatter, normalized to the original string here). Stored
+  // so the UI and install-skill flow can surface it; not enforced yet.
+  allowedTools?: string;
+  // Spec-compliant top-level `license` and `compatibility` fields.
+  license?: string;
+  compatibility?: string;
+  // Set when the skill fails frontmatter or spec validation (unknown
+  // provider, bad name format, etc.). When present, the skill never reaches
+  // the activation gate.
+  validationStatus?: "ok" | "unsupported";
+  validationMessage?: string;
   // Origin of the loaded skill: "bundled" for vendored repo skills (under
   // <repo>/skills/), "user" for skills under ~/.gini/instances/<inst>/skills/.
   // Used by the loader to keep bundled and user records separate (so a
@@ -706,24 +718,32 @@ export interface CostRecord {
   estimatedUsd?: number;
 }
 
-export interface IdentitySecretRef {
+export interface ConnectorSecretRef {
   purpose: string;
   path: string;
 }
 
-export interface IdentityRecord {
+export interface ConnectorRecord {
   id: string;
   instance: Instance;
   name: string;
-  kind: "demo" | "linear" | string;
+  // Discriminator: identifies which provider module handles this connector
+  // ("demo", "linear", "claude-code", "codex", "generic", or any module id
+  // in the registry). Renamed from `kind` in ADR 0010.
+  provider: string;
   status: "configured" | "disabled" | "error";
   scopes: string[];
-  secretRefs: IdentitySecretRef[];
+  secretRefs: ConnectorSecretRef[];
   createdAt: string;
   updatedAt: string;
   lastHealthAt?: string;
   health: "unknown" | "healthy" | "unhealthy";
   message?: string;
+  // Free-form per-record metadata. The `generic` provider uses this to
+  // persist non-secret dynamic fields (base URLs, account ids, …) that the
+  // user supplies in the Add Connector dialog. Provider-specific keys live
+  // under a nested namespace (e.g. `metadata.fields`) by convention.
+  metadata?: Record<string, unknown>;
 }
 
 export interface ImprovementProposal {
@@ -822,7 +842,7 @@ export interface RuntimeStatus {
   pendingApprovals: number;
   activeJobs: number;
   missedJobs: number;
-  identities: number;
+  connectors: number;
   memoryUnits?: number;
   provider?: ProviderHealth;
   activeAgent?: ActiveAgentSnapshot;

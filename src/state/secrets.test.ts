@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, rmSync, statSync } from "node:fs";
 import {
-  deleteIdentitySecrets,
+  deleteConnectorSecrets,
   deleteSecret,
   ensureSecretsDir,
   getInstanceKey,
@@ -63,7 +63,7 @@ describe("secret round-trip", () => {
     expect(raw).not.toContain("another_plaintext_value");
   });
 
-  test("isolates secrets between different identities", () => {
+  test("isolates secrets between different connectors", () => {
     const instance = "isolated";
     const a = writeSecret(instance, "id_a", "token", "alpha");
     const b = writeSecret(instance, "id_b", "token", "beta");
@@ -89,12 +89,12 @@ describe("delete", () => {
     expect(existsSync(ref.path)).toBe(false);
   });
 
-  test("deleteIdentitySecrets removes every file for an identity", () => {
+  test("deleteConnectorSecrets removes every file for a connector", () => {
     const instance = "del-all";
     const refToken = writeSecret(instance, "id_multi", "token", "t");
     const refRefresh = writeSecret(instance, "id_multi", "refresh", "r");
     const refOther = writeSecret(instance, "id_other", "token", "o");
-    deleteIdentitySecrets(instance, "id_multi");
+    deleteConnectorSecrets(instance, "id_multi");
     expect(existsSync(refToken.path)).toBe(false);
     expect(existsSync(refRefresh.path)).toBe(false);
     expect(existsSync(refOther.path)).toBe(true);

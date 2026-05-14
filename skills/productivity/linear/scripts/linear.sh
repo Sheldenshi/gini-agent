@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Thin curl wrapper around the Linear GraphQL endpoint. Pass the query as $1.
 # LINEAR_API_KEY is injected by the Gini runtime when a healthy `linear`
-# identity exists; the user does not export it manually.
+# connector exists; the user does not export it manually.
 set -euo pipefail
 
 if [[ -z "${LINEAR_API_KEY:-}" ]]; then
-  echo "LINEAR_API_KEY is not set. Add a 'linear' identity via /connections." >&2
+  echo "LINEAR_API_KEY is not set. Add a 'linear' connector via /connections." >&2
   exit 1
 fi
 

@@ -12,53 +12,59 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
-import { useIdentities, useInvalidate, useSkills } from "@/lib/queries";
-import type { IdentityRecord, SkillRecord } from "@runtime/types";
+import { useConnectors, useInvalidate, useProviders, useSkills } from "@/lib/queries";
+import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 
 interface CreateBody {
-  kind: string;
+  provider: string;
   name: string;
   scopes: string[];
   secrets: Record<string, string>;
+  metadata?: Record<string, unknown>;
+}
+
+interface GenericField {
+  name: string;
+  value: string;
+  secret: boolean;
 }
 
 export default function ConnectionsPage() {
-  const identities = useIdentities();
+  const connectors = useConnectors();
+  const providers = useProviders();
   const skills = useSkills();
   const invalidate = useInvalidate();
   const [open, setOpen] = useState(false);
 
-  const skillsByKind = useMemo(() => groupDependentsByKind(skills.data ?? []), [skills.data]);
+  const skillsByProvider = useMemo(() => groupDependentsByProvider(skills.data ?? []), [skills.data]);
 
   const health = useMutation({
-    mutationFn: (id: string) => api<IdentityRecord>(`/identities/${id}/health`, { method: "POST" }),
+    mutationFn: (id: string) => api<ConnectorRecord>(`/connectors/${id}/health`, { method: "POST" }),
     onSuccess: () => {
       toast.success("Health checked");
-      invalidate(["identities", "events", "skills"]);
+      invalidate(["connectors", "events", "skills"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
 
   const create = useMutation({
     mutationFn: (body: CreateBody) =>
-      api<IdentityRecord>("/identities", { method: "POST", body: JSON.stringify(body) }),
+      api<ConnectorRecord>("/connectors", { method: "POST", body: JSON.stringify(body) }),
     onSuccess: async (created) => {
       toast.success(`Added ${created.name}`);
-      invalidate(["identities", "events", "skills"]);
-      // Run an initial health probe so the dependents become active right
-      // away when the credentials are correct.
-      await api(`/identities/${created.id}/health`, { method: "POST" }).catch(() => undefined);
-      invalidate(["identities", "skills"]);
+      invalidate(["connectors", "events", "skills"]);
+      await api(`/connectors/${created.id}/health`, { method: "POST" }).catch(() => undefined);
+      invalidate(["connectors", "skills"]);
       setOpen(false);
     },
     onError: (error: Error) => toast.error(error.message)
   });
 
   const remove = useMutation({
-    mutationFn: (id: string) => api<{ id: string }>(`/identities/${id}`, { method: "DELETE" }),
+    mutationFn: (id: string) => api<{ id: string }>(`/connectors/${id}`, { method: "DELETE" }),
     onSuccess: () => {
-      toast.success("Identity removed");
-      invalidate(["identities", "events", "skills"]);
+      toast.success("Connector removed");
+      invalidate(["connectors", "events", "skills"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -67,45 +73,50 @@ export default function ConnectionsPage() {
     <>
       <PageHeader
         title="Connections"
-        description="External identities and credential health"
+        description="External connectors and credential health"
         actions={
           <Dialog open={open} onOpenChange={setOpen}>
             <DialogTrigger asChild>
-              <Button size="sm">Add identity</Button>
+              <Button size="sm">Add connector</Button>
             </DialogTrigger>
-            <AddIdentityDialog open={open} onSubmit={(body) => create.mutate(body)} pending={create.isPending} />
+            <AddConnectorDialog
+              open={open}
+              onSubmit={(body) => create.mutate(body)}
+              pending={create.isPending}
+              providers={providers.data ?? []}
+            />
           </Dialog>
         }
       />
       <div className="flex-1 overflow-auto p-6">
-        {(identities.data ?? []).length === 0 ? (
-          <EmptyState title="No identities configured" description="Add one to activate skills that depend on it." />
+        {(connectors.data ?? []).length === 0 ? (
+          <EmptyState title="No connectors configured" description="Add one to activate skills that depend on it." />
         ) : (
           <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-3">
-            {(identities.data ?? []).map((identity) => {
-              const dependents = skillsByKind.get(identity.kind) ?? [];
+            {(connectors.data ?? []).map((connector) => {
+              const dependents = skillsByProvider.get(connector.provider) ?? [];
               return (
-                <Card key={identity.id}>
+                <Card key={connector.id}>
                   <CardHeader>
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <CardTitle className="text-sm">{identity.name}</CardTitle>
-                        <CardDescription className="font-mono text-[11px]">{identity.kind} · {identity.id}</CardDescription>
+                        <CardTitle className="text-sm">{connector.name}</CardTitle>
+                        <CardDescription className="font-mono text-[11px]">{connector.provider} · {connector.id}</CardDescription>
                       </div>
                       <div className="flex flex-wrap items-center justify-end gap-1.5">
-                        <StatusPill value={identity.status} />
-                        <StatusPill value={identity.health} />
+                        <StatusPill value={connector.status} />
+                        <StatusPill value={connector.health} />
                       </div>
                     </div>
                   </CardHeader>
                   <CardContent className="space-y-2">
                     <div>
                       <h4 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">Scopes</h4>
-                      {identity.scopes.length === 0 ? (
+                      {connector.scopes.length === 0 ? (
                         <p className="text-xs text-muted-foreground">none</p>
                       ) : (
                         <div className="flex flex-wrap gap-1">
-                          {identity.scopes.map((scope) => (
+                          {connector.scopes.map((scope) => (
                             <span key={scope} className="rounded border border-border bg-card/50 px-1.5 py-0.5 font-mono text-[10px]">{scope}</span>
                           ))}
                         </div>
@@ -118,7 +129,7 @@ export default function ConnectionsPage() {
                       ) : (
                         <ul className="space-y-1">
                           {dependents.map((skill) => {
-                            const active = identity.health === "healthy" && skill.status === "trusted";
+                            const active = connector.health === "healthy" && skill.status === "trusted";
                             return (
                               <li key={skill.id} className="flex items-center justify-between gap-2 text-xs">
                                 <span className="font-mono">{skill.name}</span>
@@ -131,18 +142,18 @@ export default function ConnectionsPage() {
                         </ul>
                       )}
                     </div>
-                    {identity.message ? <p className="text-xs text-muted-foreground">{identity.message}</p> : null}
+                    {connector.message ? <p className="text-xs text-muted-foreground">{connector.message}</p> : null}
                     <p className="font-mono text-[10px] text-muted-foreground">
-                      last health {identity.lastHealthAt ? new Date(identity.lastHealthAt).toLocaleString() : "never"}
+                      last health {connector.lastHealthAt ? new Date(connector.lastHealthAt).toLocaleString() : "never"}
                     </p>
                     <div className="flex gap-2">
                       <Button
                         size="sm"
                         variant="outline"
                         disabled={health.isPending}
-                        onClick={() => health.mutate(identity.id)}
+                        onClick={() => health.mutate(connector.id)}
                       >
-                        {health.isPending && health.variables === identity.id ? "Checking…" : "Check health"}
+                        {health.isPending && health.variables === connector.id ? "Checking…" : "Check health"}
                       </Button>
                       <Button
                         size="sm"
@@ -150,7 +161,7 @@ export default function ConnectionsPage() {
                         className="text-destructive"
                         disabled={remove.isPending}
                         onClick={() => {
-                          if (confirm(`Delete identity ${identity.name}?`)) remove.mutate(identity.id);
+                          if (confirm(`Delete connector ${connector.name}?`)) remove.mutate(connector.id);
                         }}
                       >
                         Delete
@@ -167,43 +178,78 @@ export default function ConnectionsPage() {
   );
 }
 
-function groupDependentsByKind(skills: SkillRecord[]): Map<string, SkillRecord[]> {
-  const byKind = new Map<string, SkillRecord[]>();
+function groupDependentsByProvider(skills: SkillRecord[]): Map<string, SkillRecord[]> {
+  const byProvider = new Map<string, SkillRecord[]>();
   for (const skill of skills) {
-    const required = skill.requiredIdentities ?? [];
+    const required = skill.requiredConnectors ?? [];
     for (const requirement of required) {
-      const list = byKind.get(requirement.kind) ?? [];
+      const list = byProvider.get(requirement.provider) ?? [];
       list.push(skill);
-      byKind.set(requirement.kind, list);
+      byProvider.set(requirement.provider, list);
     }
   }
-  return byKind;
+  return byProvider;
 }
 
-function AddIdentityDialog({
+type ProviderField = {
+  name: string;
+  label: string;
+  description?: string;
+  secret: boolean;
+  required?: boolean;
+  placeholder?: string;
+};
+
+type ProviderDescriptor = {
+  id: string;
+  label: string;
+  description: string;
+  fields: ProviderField[];
+};
+
+function AddConnectorDialog({
   open,
   onSubmit,
-  pending
+  pending,
+  providers
 }: {
   open: boolean;
   onSubmit: (body: CreateBody) => void;
   pending: boolean;
+  providers: ProviderDescriptor[];
 }) {
-  const [kind, setKind] = useState("demo");
+  // Resolve a sensible initial provider once the providers list arrives.
+  // Read the URL once on mount so a `?provider=linear` deeplink (used by
+  // the Skills page "Connect →" affordance) pre-selects the right
+  // provider. Falls back to the first registered provider.
+  const initialProvider = useMemo(() => {
+    if (typeof window !== "undefined") {
+      const url = new URL(window.location.href);
+      const candidate = url.searchParams.get("provider");
+      if (candidate && providers.some((p) => p.id === candidate)) return candidate;
+    }
+    return providers[0]?.id ?? "demo";
+  }, [providers]);
+
+  const [provider, setProvider] = useState(initialProvider);
   const [name, setName] = useState("");
   const [scopes, setScopes] = useState("");
-  const [token, setToken] = useState("");
+  const [fieldValues, setFieldValues] = useState<Record<string, string>>({});
+  const [genericFields, setGenericFields] = useState<GenericField[]>([{ name: "", value: "", secret: false }]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
-      setKind("demo");
+      setProvider(initialProvider);
       setName("");
       setScopes("");
-      setToken("");
+      setFieldValues({});
+      setGenericFields([{ name: "", value: "", secret: false }]);
       setError(null);
     }
-  }, [open]);
+  }, [open, initialProvider]);
+
+  const selectedProvider = providers.find((p) => p.id === provider);
 
   const submit = () => {
     setError(null);
@@ -211,63 +257,157 @@ function AddIdentityDialog({
       setError("Name is required.");
       return;
     }
-    if (kind === "linear" && !token.trim()) {
-      setError("Linear identities need an API token.");
+    if (!selectedProvider) {
+      setError(`Provider ${provider} is not registered.`);
       return;
     }
     const secrets: Record<string, string> = {};
-    if (token.trim()) secrets.token = token.trim();
+    const metadataFields: Record<string, string> = {};
+
+    if (provider === "generic") {
+      // Validate dynamic fields. Each field must have a non-empty name.
+      const cleaned = genericFields.filter((f) => f.name.trim().length > 0);
+      if (cleaned.length === 0) {
+        setError("Generic connectors need at least one field.");
+        return;
+      }
+      for (const field of cleaned) {
+        const key = field.name.trim();
+        const value = field.value.trim();
+        if (!value) continue;
+        if (field.secret) secrets[key] = value;
+        else metadataFields[key] = value;
+      }
+    } else {
+      // Fixed-shape providers: validate against the declared field list.
+      for (const field of selectedProvider.fields) {
+        const raw = fieldValues[field.name] ?? "";
+        if (field.required && !raw.trim()) {
+          setError(`${field.label} is required.`);
+          return;
+        }
+        if (!raw.trim()) continue;
+        if (field.secret) secrets[field.name] = raw.trim();
+        else metadataFields[field.name] = raw.trim();
+      }
+    }
+
     onSubmit({
-      kind,
+      provider,
       name: name.trim(),
       scopes: scopes.split(",").map((s) => s.trim()).filter(Boolean),
-      secrets
+      secrets,
+      metadata: Object.keys(metadataFields).length > 0 ? { fields: metadataFields } : undefined
     });
   };
 
   return (
     <DialogContent>
       <DialogHeader>
-        <DialogTitle>Add identity</DialogTitle>
-        <DialogDescription>Connect a new identity for skills to use.</DialogDescription>
+        <DialogTitle>Add connector</DialogTitle>
+        <DialogDescription>{selectedProvider?.description ?? "Connect a new external system."}</DialogDescription>
       </DialogHeader>
       <div className="space-y-3">
         <div className="space-y-1">
-          <Label htmlFor="identity-name">Name</Label>
-          <Input id="identity-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary linear" />
+          <Label htmlFor="connector-name">Name</Label>
+          <Input id="connector-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary linear" />
         </div>
         <div className="space-y-1">
-          <Label htmlFor="identity-kind">Kind</Label>
-          <Select value={kind} onValueChange={setKind}>
-            <SelectTrigger id="identity-kind"><SelectValue /></SelectTrigger>
+          <Label htmlFor="connector-provider">Provider</Label>
+          <Select value={provider} onValueChange={setProvider}>
+            <SelectTrigger id="connector-provider"><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="demo">demo</SelectItem>
-              <SelectItem value="linear">linear</SelectItem>
+              {providers.map((p) => (
+                <SelectItem key={p.id} value={p.id}>{p.label} ({p.id})</SelectItem>
+              ))}
             </SelectContent>
           </Select>
         </div>
         <div className="space-y-1">
-          <Label htmlFor="identity-scopes">Scopes (comma-separated)</Label>
-          <Input id="identity-scopes" value={scopes} onChange={(e) => setScopes(e.target.value)} placeholder="read, write" />
+          <Label htmlFor="connector-scopes">Scopes (comma-separated)</Label>
+          <Input id="connector-scopes" value={scopes} onChange={(e) => setScopes(e.target.value)} placeholder="read, write" />
         </div>
-        {kind === "linear" ? (
-          <div className="space-y-1">
-            <Label htmlFor="identity-token">Linear API token</Label>
-            <Input
-              id="identity-token"
-              type="password"
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              placeholder="lin_api_…"
-              autoComplete="off"
-            />
-          </div>
-        ) : null}
+
+        {provider === "generic" ? (
+          <GenericFieldEditor fields={genericFields} onChange={setGenericFields} />
+        ) : (
+          selectedProvider?.fields.map((field) => (
+            <div key={field.name} className="space-y-1">
+              <Label htmlFor={`connector-${field.name}`}>{field.label}{field.required ? " *" : ""}</Label>
+              <Input
+                id={`connector-${field.name}`}
+                type={field.secret ? "password" : "text"}
+                value={fieldValues[field.name] ?? ""}
+                onChange={(e) => setFieldValues((prev) => ({ ...prev, [field.name]: e.target.value }))}
+                placeholder={field.placeholder}
+                autoComplete="off"
+              />
+              {field.description ? <p className="text-[11px] text-muted-foreground">{field.description}</p> : null}
+            </div>
+          ))
+        )}
+
         {error ? <p className="text-xs text-destructive">{error}</p> : null}
       </div>
       <DialogFooter>
         <Button onClick={submit} disabled={pending}>{pending ? "Adding…" : "Add"}</Button>
       </DialogFooter>
     </DialogContent>
+  );
+}
+
+function GenericFieldEditor({
+  fields,
+  onChange
+}: {
+  fields: GenericField[];
+  onChange: (next: GenericField[]) => void;
+}) {
+  function update(index: number, patch: Partial<GenericField>) {
+    onChange(fields.map((f, i) => (i === index ? { ...f, ...patch } : f)));
+  }
+  function add() {
+    onChange([...fields, { name: "", value: "", secret: false }]);
+  }
+  function remove(index: number) {
+    onChange(fields.filter((_, i) => i !== index));
+  }
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <Label>Fields</Label>
+        <Button type="button" size="sm" variant="outline" onClick={add}>Add field</Button>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Define the credentials and config the dependent skill expects. Secret fields are stored encrypted.
+      </p>
+      {fields.map((field, index) => (
+        <div key={index} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto_auto] items-center gap-2 rounded-md border border-border p-2">
+          <Input
+            placeholder="field name (e.g. base_url)"
+            value={field.name}
+            onChange={(e) => update(index, { name: e.target.value })}
+          />
+          <Input
+            placeholder={field.secret ? "secret value" : "value"}
+            type={field.secret ? "password" : "text"}
+            value={field.value}
+            onChange={(e) => update(index, { value: e.target.value })}
+          />
+          <label className="flex items-center gap-1 text-[11px]">
+            <input
+              type="checkbox"
+              checked={field.secret}
+              onChange={(e) => update(index, { secret: e.target.checked })}
+              className="h-4 w-4 rounded border-border"
+            />
+            secret
+          </label>
+          <Button type="button" size="sm" variant="ghost" className="text-destructive" onClick={() => remove(index)}>
+            ×
+          </Button>
+        </div>
+      ))}
+    </div>
   );
 }

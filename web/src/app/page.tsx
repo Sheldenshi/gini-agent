@@ -7,7 +7,7 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import {
   useApprovals,
-  useIdentities,
+  useConnectors,
   useEvents,
   useInvalidate,
   useJobs,
@@ -24,7 +24,7 @@ export default function HomePage() {
   const tasks = useTasks();
   const approvals = useApprovals();
   const jobs = useJobs();
-  const identities = useIdentities();
+  const connectors = useConnectors();
   const events = useEvents();
   const memories = useMemories();
   const invalidate = useInvalidate();
@@ -33,13 +33,13 @@ export default function HomePage() {
   // microtask-coalesced refetches. Wrapping in useCallback is harmless but no
   // longer load-bearing.
   useRuntimeStream(useCallback(() => {
-    invalidate(["status", "state", "tasks", "approvals", "jobs", "identities", "events", "memory"]);
+    invalidate(["status", "state", "tasks", "approvals", "jobs", "connectors", "events", "memory"]);
   }, [invalidate]));
 
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
   const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
   const failedJobs = (jobs.data ?? []).filter((j) => j.status === "failed");
-  const identityIssues = (identities.data ?? []).filter((c) => c.health === "unhealthy" || c.status === "error");
+  const connectorIssues = (connectors.data ?? []).filter((c) => c.health === "unhealthy" || c.status === "error");
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
   const proposedMemories = (memories.data ?? []).filter((m) => m.status === "proposed");
 
@@ -71,7 +71,7 @@ export default function HomePage() {
           <Stat title="Active tasks" value={String(activeTasks.length)} sub={activeTasks.length > 0 ? "in flight" : "no work in flight"} />
           <Stat title="Pending approvals" value={String(pending.length)} sub={pending.length > 0 ? "needs review" : "all clear"} />
           <Stat title="Failed jobs" value={String(failedJobs.length)} sub={`${jobs.data?.length ?? 0} jobs`} />
-          <Stat title="Identity issues" value={String(identityIssues.length)} sub={`${identities.data?.length ?? 0} configured`} />
+          <Stat title="Connector issues" value={String(connectorIssues.length)} sub={`${connectors.data?.length ?? 0} configured`} />
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">

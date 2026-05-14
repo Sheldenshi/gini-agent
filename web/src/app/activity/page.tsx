@@ -19,7 +19,7 @@ const KIND_OPTIONS: RuntimeEventKind[] = [
   "job",
   "memory",
   "skill",
-  "identity",
+  "connector",
   "mcp",
   "messaging",
   "provider",
