@@ -398,3 +398,50 @@ describe("bundled apple skills (macOS only)", () => {
     expect(reminders?.status).toBe("trusted");
   });
 });
+
+describe("bundled autonomous agent skills", () => {
+  let root: string;
+  let prevState: string | undefined;
+  let prevLog: string | undefined;
+  let prevBundled: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "gini-agent-skills-"));
+    prevState = process.env.GINI_STATE_ROOT;
+    prevLog = process.env.GINI_LOG_ROOT;
+    prevBundled = process.env.GINI_BUNDLED_SKILLS;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+    delete process.env.GINI_BUNDLED_SKILLS;
+  });
+
+  afterEach(() => {
+    if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevState;
+    if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+    else process.env.GINI_LOG_ROOT = prevLog;
+    if (prevBundled !== undefined) process.env.GINI_BUNDLED_SKILLS = prevBundled;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("loads codex and claude-code as draft bundled skills", async () => {
+    const config = buildConfig("loader-autonomous-agent-vendored");
+    const result = await loadSkillsFromDisk(config);
+    const names = result.added.map((s) => s.name);
+    expect(names).toContain("codex");
+    expect(names).toContain("claude-code");
+
+    const skills = readState(config.instance).skills;
+    const codex = skills.find((s) => s.name === "codex");
+    expect(codex?.source).toBe("bundled");
+    expect(codex?.category).toBe("autonomous-ai-agents");
+    expect(codex?.status).toBe("draft");
+    expect(codex?.prerequisites?.commands).toEqual(["codex", "git"]);
+
+    const claudeCode = skills.find((s) => s.name === "claude-code");
+    expect(claudeCode?.source).toBe("bundled");
+    expect(claudeCode?.category).toBe("autonomous-ai-agents");
+    expect(claudeCode?.status).toBe("draft");
+    expect(claudeCode?.prerequisites?.commands).toEqual(["claude", "git"]);
+  });
+});
