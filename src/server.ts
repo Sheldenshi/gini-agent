@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
+import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
@@ -142,6 +143,34 @@ const schedulerDone: Promise<void> = (async function schedulerLoop(): Promise<vo
   }
 })();
 
+// Periodic connector re-probe loop (ADR 0010 § Probe contract). Runs
+// alongside the scheduler so connector health reflects reality without
+// the user manually clicking "Check health". Cadence: every minute we
+// look at every connector and dispatch its provider probe iff the
+// provider declares one AND the per-provider interval has elapsed
+// (default 30 minutes). Probes that fail close the health to
+// "unhealthy"; transitions emit an audit event.
+const REPROBE_TICK_INTERVAL_MS = Number(process.env.GINI_REPROBE_TICK_MS ?? 60_000);
+let reprobeStopped = false;
+const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> {
+  while (!reprobeStopped) {
+    try {
+      const report = await runConnectorReprobe(config);
+      if (report.transitioned.length > 0) {
+        appendLog(config.instance, "connector.reprobe.transitions", {
+          transitions: report.transitioned
+        });
+      }
+    } catch (error) {
+      appendLog(config.instance, "connector.reprobe.error", {
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+    if (reprobeStopped) break;
+    await Bun.sleep(REPROBE_TICK_INTERVAL_MS);
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -156,6 +185,7 @@ process.on("SIGTERM", async () => {
   shutdownStarted = true;
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
+  reprobeStopped = true;
   // Drain in-flight HTTP responses BEFORE we start tearing the process
   // down. `server.stop(false)` returns a promise that resolves when
   // active requests have completed writing — without this, a setup POST
@@ -197,6 +227,7 @@ process.on("SIGTERM", async () => {
   const drained = Promise.race([
     Promise.all([
       schedulerDone.catch(() => {}),
+      reprobeDone.catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
