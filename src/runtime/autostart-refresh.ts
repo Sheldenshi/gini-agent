@@ -46,7 +46,7 @@ import { spawn } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { plistPathFor } from "../cli/autostart";
+import { plistPathFor } from "../integrations/launchd";
 import { logDir, projectRoot } from "../paths";
 import type { Instance } from "../types";
 
