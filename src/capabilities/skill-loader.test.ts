@@ -434,13 +434,13 @@ describe("bundled autonomous agent skills", () => {
     const skills = readState(config.instance).skills;
     const codex = skills.find((s) => s.name === "codex");
     expect(codex?.source).toBe("bundled");
-    expect(codex?.category).toBe("autonomous-ai-agents");
+    expect(codex?.category).toBe("agnets");
     expect(codex?.status).toBe("draft");
     expect(codex?.prerequisites?.commands).toEqual(["codex", "git"]);
 
     const claudeCode = skills.find((s) => s.name === "claude-code");
     expect(claudeCode?.source).toBe("bundled");
-    expect(claudeCode?.category).toBe("autonomous-ai-agents");
+    expect(claudeCode?.category).toBe("agnets");
     expect(claudeCode?.status).toBe("draft");
     expect(claudeCode?.prerequisites?.commands).toEqual(["claude", "git"]);
   });
