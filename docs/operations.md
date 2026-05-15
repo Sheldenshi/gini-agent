@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/
 
 The installer detects OS and arch, installs Bun if missing, clones the runtime into `~/.gini/runtime`, installs dependencies, drops a `gini` wrapper at `~/.local/bin/gini`, ensures `~/.local/bin` is on `PATH`, and initializes the `default` instance under `~/.gini/instances/default/`. The wrapper defaults `GINI_INSTANCE=default` (override via `--instance` or the `GINI_INSTANCE` env var) so installed users land on `default`. Repo-clone developers running `bun run gini` get an instance auto-derived from the repo directory basename so each worktree is isolated by default.
 
-On macOS, the installer also enables autostart for the `main` instance (LaunchAgents at `~/Library/LaunchAgents/ai.lilaclabs.gini.main.gateway.plist` and `…main.web.plist`) and opens the Gini webapp's `/setup` page in your default browser. From the browser you pick a provider (OpenAI API key or Codex `codex --login` auth), submit, and the runtime starts using it on the next request. Pass `--no-autostart` to skip the LaunchAgent step (you'll need to run `gini start` manually and visit `/setup` to configure a provider).
+On macOS, the installer also enables autostart for the `default` instance (LaunchAgents at `~/Library/LaunchAgents/ai.lilaclabs.gini.default.gateway.plist` and `~/Library/LaunchAgents/ai.lilaclabs.gini.default.web.plist`) and opens the Gini webapp's `/setup` page in your default browser. From the browser you pick a provider (OpenAI API key or Codex `codex --login` auth), submit, and the runtime starts using it on the next request. Pass `--no-autostart` to skip the LaunchAgent step (you'll need to run `gini start` manually and visit `/setup` to configure a provider).
 
 Why the browser flow: piped `curl … | bash` has no controlling terminal, so the legacy `gini setup` prompt would never run. The new flow makes the same UX work for both interactive and piped installs — the runtime comes up, the browser opens, and the user fills a form. For OpenAI, the setup endpoint writes your API key to `~/.gini/secrets.env` with mode 0600; the running gateway picks it up immediately (no restart), and the autostart plist's `EnvironmentVariables` is refreshed in the background so future launchd respawns retain the key. The key is never written to `config.json` and never leaves your machine except in API calls to OpenAI. For Codex, no token values are stored by gini — the runtime reads `~/.codex/auth.json` on demand.
 
@@ -141,8 +141,8 @@ To override the cap for a single instance, edit
 
 ```json
 {
-  "instance": "main",
-  "port": 7337,
+  "instance": "default",
+  "port": 7778,
   "...": "...",
   "agent": {
     "maxIterations": 150

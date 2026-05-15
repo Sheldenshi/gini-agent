@@ -125,6 +125,6 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - Native/mobile app UI.
 - Production relay for off-LAN access.
 - Push notification delivery.
-- LaunchAgent-style auto-start.
+- Linux autostart parity.
 
 Those should build on the existing gateway contract rather than changing the runtime/source-of-truth model.

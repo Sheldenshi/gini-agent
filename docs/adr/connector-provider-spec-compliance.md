@@ -16,7 +16,7 @@ Skills are discovered by filesystem watch, matching every other agent ecosystem.
 
 ## Context
 
-Three prior ADRs (0006 Identity Secret Storage, 0007 Skills and Identities — now numbered 0008 and 0009 after the merge collision) established the model: separate credential plane (Identity), separate skill plane, activation by dependency. The work shipped. In use, three things became clear:
+ADR connector-secret-storage.md and ADR skills-and-connectors.md established the model: separate credential plane (then named Identity), separate skill plane, activation by dependency. The work shipped. In use, three things became clear:
 
 1. **"Identity" was awkward for the heterogeneous cases.** A Linear identity reads fine ("I am authenticated to Linear"). An Apple Notes identity reads strangely (you don't have a Notes "identity"; you have a *connection* to it via OS permission). A Claude Code CLI identity reads stranger still. "Connector" is industry vocabulary (Zapier, Airbyte, Vercel, n8n) and fits every case: a Linear connector, an Apple Notes connector, a Claude Code connector, a generic connector.
 2. **"Kind" was opaque.** It told the reader nothing about what it discriminates. "Provider" matches the OAuth/auth-provider vocabulary every developer already knows and reads correctly across cases: provider=linear, provider=apple-notes, provider=claude-code.

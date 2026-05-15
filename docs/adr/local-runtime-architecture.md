@@ -21,12 +21,15 @@ Gini needs Hermes-class runtime depth while keeping OpenClaw-style reach possibl
 - Risky file, terminal, and code actions create approval records before side effects.
 - The provider layer supports deterministic `echo`, Codex OAuth, OpenAI API keys, and OpenRouter-compatible records.
 
+## Implemented Since
+
+- Production macOS LaunchAgent installation; see ADR instances-and-control-surface.md.
+- Real connector secret storage; see ADR connector-secret-storage.md, ADR skills-and-connectors.md, and ADR connector-provider-spec-compliance.md.
+
 ## Deferred
 
-- Production macOS LaunchAgent installation.
 - Native/mobile app UI.
 - Production relay, push notifications, and broad live messaging transports.
-- Real connector secret storage (see ADR connector-secret-storage.md, ADR skills-and-connectors.md, and ADR connector-provider-spec-compliance.md).
 
 ## Consequences For Coding Agents
 
