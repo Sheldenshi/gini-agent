@@ -2,6 +2,7 @@ import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
+import { Cron } from "croner";
 
 export { finalizeJobRunFromTask } from "./finalize";
 
@@ -43,12 +44,77 @@ function assertNonNegativeInt(label: string, value: unknown): number {
 }
 
 export async function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
+  // Cron-vs-interval mutual exclusion. A job is driven by EITHER a 5-field
+  // Unix cron expression (wall-clock + per-job IANA timezone) OR an
+  // interval-from-now (`intervalSeconds`). Reject payloads that explicitly
+  // set both — the caller is ambiguous and silently picking one would
+  // surprise the user. `intervalSeconds === undefined` (the absent case)
+  // is the "not set" sentinel even though JSON.stringify(NaN) === "null"
+  // — `null` flows into assertPositiveInt below and gets rejected.
+  let cronExpression: string | undefined;
+  let cronTimezone: string | undefined;
+  if (input.cronExpression !== undefined && input.cronExpression !== null) {
+    if (typeof input.cronExpression !== "string" || input.cronExpression.trim().length === 0) {
+      throw new Error(`Invalid input: cronExpression must be a non-empty string (got ${String(input.cronExpression)})`);
+    }
+    cronExpression = input.cronExpression.trim();
+    if (input.intervalSeconds !== undefined) {
+      throw new Error("Invalid input: cronExpression and intervalSeconds are mutually exclusive");
+    }
+  }
+  if (input.cronTimezone !== undefined && input.cronTimezone !== null) {
+    if (typeof input.cronTimezone !== "string" || input.cronTimezone.length === 0) {
+      throw new Error(`Invalid input: cronTimezone must be a non-empty string (got ${String(input.cronTimezone)})`);
+    }
+    cronTimezone = input.cronTimezone;
+  }
+  // If a cron timezone is supplied without a cronExpression, that's a
+  // payload mistake — the timezone is meaningless on an interval job.
+  if (cronTimezone !== undefined && cronExpression === undefined) {
+    throw new Error("Invalid input: cronTimezone may only be set when cronExpression is set");
+  }
+
+  // Validate the cron expression + timezone by constructing a Cron
+  // instance. Croner throws synchronously on either an unparseable
+  // pattern or an unknown IANA TZ — re-throw as `Invalid input: …` so
+  // the HTTP layer surfaces a typed 400. Default timezone is "UTC".
+  let initialCronNextRunMs: number | undefined;
+  if (cronExpression !== undefined) {
+    const tz = cronTimezone ?? "UTC";
+    let cron: Cron;
+    try {
+      cron = new Cron(cronExpression, { timezone: tz });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Croner throws `TypeError: CronPattern: invalid …` for syntax
+      // failures and `TypeError: CronOptions: Invalid timezone …` for
+      // bad IANA identifiers. Split the error surface so callers know
+      // which input was bad.
+      if (/timezone/i.test(message)) {
+        throw new Error(`Invalid input: cronTimezone "${tz}" is not a valid IANA timezone (${message})`);
+      }
+      throw new Error(`Invalid input: cronExpression is not a valid 5-field Unix cron (${message})`);
+    }
+    const next = cron.nextRun();
+    if (!next) {
+      // Cron returned null — e.g. a pattern that can never fire. Treat as
+      // input error so the agent rewrites the expression.
+      throw new Error(`Invalid input: cronExpression "${cronExpression}" has no future runs`);
+    }
+    initialCronNextRunMs = next.getTime();
+  }
+
   // Only fall back to defaults when the field is truly absent. An explicit
   // NaN-from-JSON arrives as `null`, and `null ?? 60` would silently
   // promote a bogus payload to a happy path — instead, validate it.
-  const intervalSeconds = input.intervalSeconds === undefined
-    ? 60
-    : assertPositiveInt("intervalSeconds", input.intervalSeconds);
+  // When cronExpression is set, intervalSeconds is stored as 0 (sentinel
+  // for "not interval-driven") so the field stays a `number` and the
+  // existing JobRecord shape isn't disturbed by a giant migration.
+  const intervalSeconds = cronExpression !== undefined
+    ? 0
+    : input.intervalSeconds === undefined
+      ? 60
+      : assertPositiveInt("intervalSeconds", input.intervalSeconds);
   const timeoutSeconds = input.timeoutSeconds === undefined
     ? 600
     : assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
@@ -120,12 +186,20 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
         throw new Error(`Cannot create scheduled job: parent task ${parentTaskId} is already ${parent.status}.`);
       }
     }
+    // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
+    // wall-clock moment (resolved above via Cron.nextRun()), interval-driven
+    // jobs anchor `intervalSeconds` from now.
+    const initialNextRunAtMs = cronExpression !== undefined
+      ? (initialCronNextRunMs as number)
+      : Date.now() + intervalSeconds * 1000;
     return createJob(state, {
       name: String(input.name ?? "Untitled job"),
       prompt: String(input.prompt ?? ""),
       script: typeof input.script === "string" && input.script.trim() ? input.script : undefined,
       intervalSeconds,
-      nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
+      cronExpression,
+      cronTimezone: cronExpression !== undefined ? (cronTimezone ?? "UTC") : undefined,
+      nextRunAt: new Date(initialNextRunAtMs).toISOString(),
       deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : [],
       context: Array.isArray(input.context) ? input.context.map(String) : [],
       retryLimit,
@@ -160,6 +234,42 @@ function advanceNextRunAt(prevNextRunAtMs: number, intervalSeconds: number, nowM
   return { nextRunAtMs: next, missed };
 }
 
+// Cron-driven equivalent of advanceNextRunAt. Walks forward through cron-
+// matched moments starting at the run we just claimed: the first advance
+// consumes that run, each subsequent advance is a missed cron-fire that
+// has already drifted into the past (e.g. the runtime was offline). Mirrors
+// the interval helper's contract — the cron version delegates the "what's
+// the next match?" math to croner so DST transitions, leap years, and
+// month-end edge cases are handled natively. Returns the new nextRunAt
+// (ms) and the count of EXTRA missed cron fires (>= 0).
+function advanceCronNextRunAt(
+  cronExpression: string,
+  cronTimezone: string,
+  prevNextRunAtMs: number,
+  nowMs: number
+): { nextRunAtMs: number; missed: number } {
+  const cron = new Cron(cronExpression, { timezone: cronTimezone });
+  // croner's nextRun(prev) returns the FIRST fire strictly after `prev`,
+  // so passing the previous nextRunAt yields the natural next match.
+  let next = cron.nextRun(new Date(prevNextRunAtMs));
+  let missed = 0;
+  // Defensive: a pathological pattern that returns null. We treat it as
+  // a fallback to "stay where we are" so the scheduler doesn't crash.
+  // createScheduledJob's validation already rejected unfire-able patterns
+  // at submit time, so reaching this branch implies clock skew or a
+  // truly degenerate edge.
+  if (!next) {
+    return { nextRunAtMs: prevNextRunAtMs, missed: 0 };
+  }
+  while (next.getTime() <= nowMs) {
+    const after = cron.nextRun(next);
+    if (!after) break;
+    next = after;
+    missed += 1;
+  }
+  return { nextRunAtMs: next.getTime(), missed };
+}
+
 export async function runDueJobs(config: RuntimeConfig): Promise<void> {
   // Atomic claim: select due jobs, skip ones that already have a running
   // run (overlap protection), advance nextRunAt drift-free, and create the
@@ -179,7 +289,12 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 
       // Drift-free nextRunAt + missedRuns. The first advance consumes the
       // tick we're claiming now; each additional advance is a missed run.
-      const { nextRunAtMs, missed } = advanceNextRunAt(dueAt, job.intervalSeconds, dateNow);
+      // Cron-driven jobs use the cron-aware helper so DST + month-end
+      // boundaries are handled natively; interval jobs keep the linear
+      // step math.
+      const { nextRunAtMs, missed } = job.cronExpression
+        ? advanceCronNextRunAt(job.cronExpression, job.cronTimezone ?? "UTC", dueAt, dateNow)
+        : advanceNextRunAt(dueAt, job.intervalSeconds, dateNow);
       job.nextRunAt = new Date(nextRunAtMs).toISOString();
       if (missed > 0) job.missedRuns += missed;
       job.lastRunAt = now();
@@ -407,7 +522,9 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
       const dueAt = new Date(item.nextRunAt).getTime();
       const dateNow = Date.now();
       if (dueAt <= dateNow) {
-        const { nextRunAtMs, missed } = advanceNextRunAt(dueAt, item.intervalSeconds, dateNow);
+        const { nextRunAtMs, missed } = item.cronExpression
+          ? advanceCronNextRunAt(item.cronExpression, item.cronTimezone ?? "UTC", dueAt, dateNow)
+          : advanceNextRunAt(dueAt, item.intervalSeconds, dateNow);
         item.nextRunAt = new Date(nextRunAtMs).toISOString();
         if (missed > 0) item.missedRuns += missed;
       }

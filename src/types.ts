@@ -731,6 +731,19 @@ export interface JobRecord {
   //   `autoApprovedReason="dangerouslyAutoApprove"` (job-scoped, not global).
   autoApproveCommands?: string[];
   dangerouslyAutoApprove?: boolean;
+  // Wall-clock scheduling: when set, this 5-field Unix cron expression
+  // drives the job's nextRunAt instead of `intervalSeconds`. Exactly one
+  // of (intervalSeconds, cronExpression) is the active driver per job;
+  // `createScheduledJob` rejects payloads that supply both explicitly.
+  // For cron-driven jobs `intervalSeconds` is stored as `0` (a sentinel
+  // meaning "not interval-driven") rather than left undefined, to avoid
+  // a state migration on every existing JobRecord.
+  cronExpression?: string;
+  // IANA timezone identifier (e.g. "America/Los_Angeles", "Europe/Berlin").
+  // Resolved at create time — defaults to "UTC" when `cronExpression` is
+  // set but `cronTimezone` is omitted. Croner validates the identifier on
+  // construction; an unknown TZ surfaces as `Invalid input: cronTimezone …`.
+  cronTimezone?: string;
   createdAt: string;
   updatedAt: string;
   lastRunAt?: string;
