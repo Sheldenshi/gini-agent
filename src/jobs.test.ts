@@ -415,6 +415,111 @@ describe("cron lifecycle", () => {
     expect(jobs[0]?.oneShot).toBe(false);
   });
 
+  test("create_job dispatch persists the per-job auto-approve envelope", async () => {
+    // The agent passes `autoApproveCommands`, `dangerouslyAutoApprove`, and
+    // `timeoutSeconds` through the tool spec to schedule an unattended job.
+    // The dispatch path must forward all three onto the JobRecord so
+    // `dispatchPromptRun` can clone them into the spawned task's config.
+    const config = testConfig("jobs-create-tool-envelope");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_envelope",
+      JSON.stringify({
+        name: "envelope-job",
+        intervalSeconds: 60,
+        prompt: "do work",
+        autoApproveCommands: ["git *", "gh *"],
+        dangerouslyAutoApprove: true,
+        timeoutSeconds: 600
+      })
+    );
+    expect(result.kind).toBe("sync");
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.autoApproveCommands).toEqual(["git *", "gh *"]);
+    expect(jobs[0]?.dangerouslyAutoApprove).toBe(true);
+    expect(jobs[0]?.timeoutSeconds).toBe(600);
+
+    // Audit row carries the envelope so a reviewer can see exactly what
+    // the agent opted into when it scheduled the job.
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.created" && event.target === jobs[0]!.id
+    );
+    expect(audit?.evidence?.dangerouslyAutoApprove).toBe(true);
+    expect(audit?.evidence?.autoApproveCommands).toEqual(["git *", "gh *"]);
+    expect(audit?.evidence?.timeoutSeconds).toBe(600);
+  });
+
+  test("create_job dispatch rejects non-boolean dangerouslyAutoApprove", async () => {
+    const config = testConfig("jobs-create-tool-validate-1");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_bad_flag",
+        JSON.stringify({ name: "bad", intervalSeconds: 60, prompt: "x", dangerouslyAutoApprove: "true" })
+      )
+    ).rejects.toThrow(/dangerouslyAutoApprove must be a boolean/);
+    // No job should have been persisted.
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch rejects non-string entries in autoApproveCommands", async () => {
+    const config = testConfig("jobs-create-tool-validate-2");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_bad_entry",
+        JSON.stringify({ name: "bad", intervalSeconds: 60, prompt: "x", autoApproveCommands: ["ok", 7] })
+      )
+    ).rejects.toThrow(/autoApproveCommands entries must be strings/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch rejects non-integer timeoutSeconds", async () => {
+    const config = testConfig("jobs-create-tool-validate-3");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_bad_timeout",
+        JSON.stringify({ name: "bad", intervalSeconds: 60, prompt: "x", timeoutSeconds: -5 })
+      )
+    ).rejects.toThrow(/timeoutSeconds must be a positive integer/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
   test("scheduled prompt job with chatSessionId delivers an assistant chat message", async () => {
     // End-to-end test: create a job linked to a chat session, force its
     // nextRunAt into the past, let runDueJobs claim + dispatch it, wait
