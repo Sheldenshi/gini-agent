@@ -50,7 +50,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     ? 60
     : assertPositiveInt("intervalSeconds", input.intervalSeconds);
   const timeoutSeconds = input.timeoutSeconds === undefined
-    ? 30
+    ? 600
     : assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
   const retryLimit = input.retryLimit === undefined
     ? 0

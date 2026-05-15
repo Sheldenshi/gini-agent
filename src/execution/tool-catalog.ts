@@ -444,7 +444,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt on a fixed interval. The job's response is delivered as an assistant message back to this chat session when it fires. Use for reminders ('in 2 minutes', 'every hour'), periodic checks, or any user request mentioning 'remind me', 'every N minutes/hours', or 'cron job'. Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `autoApproveCommands` for the shell patterns it will need to run, or `dangerouslyAutoApprove: true` for tasks that need broad action — otherwise the job will stall at the first approval gate forever. Bump `timeoutSeconds` above the 30s default whenever the prompt involves git/gh, repo cloning, or multi-file scans.",
+      description: "Schedule a recurring or one-shot job that runs a prompt on a fixed interval. The job's response is delivered as an assistant message back to this chat session when it fires. Use for reminders ('in 2 minutes', 'every hour'), periodic checks, or any user request mentioning 'remind me', 'every N minutes/hours', or 'cron job'. Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `autoApproveCommands` for the shell patterns it will need to run, or `dangerouslyAutoApprove: true` for tasks that need broad action — otherwise the job will stall at the first approval gate forever. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
@@ -463,7 +463,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
           },
           timeoutSeconds: {
             type: "number",
-            description: "Wall-clock seconds before the spawned task is killed. Default 30. Bump to 600+ for jobs that clone repos, run multi-file scans, or call external CLIs. The model will be terminated mid-thought if this is too low."
+            description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
           }
         },
         required: ["name", "intervalSeconds", "prompt"]

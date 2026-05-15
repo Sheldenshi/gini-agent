@@ -316,7 +316,7 @@ export function createJob(
     deliveryTargets: [],
     context: [],
     retryLimit: 0,
-    timeoutSeconds: 30,
+    timeoutSeconds: 600,
     runCount: 0,
     missedRuns: 0,
     taskIds: [],
