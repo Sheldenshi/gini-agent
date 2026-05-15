@@ -437,7 +437,7 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
   }
   if (!isSkillActive(state, skill)) {
     const missing = (skill.requiredConnectors ?? []).map((entry) => entry.provider).join(", ");
-    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to add or repair the connector via /connections.`);
+    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to set up the missing connector — they can click [Set up <Provider>] next to the affected skill on the /skills page, or paste the credential and you'll wire it up.`);
   }
   appendTrace(config.instance, taskId, {
     type: "tool",

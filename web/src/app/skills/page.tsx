@@ -29,11 +29,15 @@ type DetectionReport = {
 
 // Per-row state for the inline Add Connector dialog. The Skills page renders
 // one dialog at a time; pendingProvider holds the provider id so the modal
-// opens pre-scoped to the row the user clicked from.
+// opens pre-scoped to the row the user clicked from. mode toggles between
+// creating a new connector ("create") and rotating the secret on an existing
+// one ("rotate"); rotate carries the connectorId so submit can PATCH it.
 interface InlineDialogState {
   open: boolean;
   provider: string;
   suggestedName: string;
+  mode: "create" | "rotate";
+  connectorId?: string;
 }
 
 export default function SkillsPage() {
@@ -44,7 +48,7 @@ export default function SkillsPage() {
   const connectors = useConnectors();
   const providers = useProviders();
   const invalidate = useInvalidate();
-  const [dialog, setDialog] = useState<InlineDialogState>({ open: false, provider: "", suggestedName: "" });
+  const [dialog, setDialog] = useState<InlineDialogState>({ open: false, provider: "", suggestedName: "", mode: "create" });
 
   useEffect(() => {
     const timer = setTimeout(() => setDebounced(search), 200);
@@ -104,7 +108,22 @@ export default function SkillsPage() {
       // re-probe. Failures land on the connector record itself.
       await api(`/connectors/${created.id}/health`, { method: "POST" }).catch(() => undefined);
       invalidate(["connectors", "skills"]);
-      setDialog({ open: false, provider: "", suggestedName: "" });
+      setDialog({ open: false, provider: "", suggestedName: "", mode: "create" });
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const rotate = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: CreateConnectorBody }) =>
+      api<ConnectorRecord>(`/connectors/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    onSuccess: async (updated) => {
+      toast.success(`Rotated ${updated.name}`);
+      invalidate(["connectors", "events", "skills"]);
+      // Re-probe immediately so the row flips back to healthy without
+      // waiting on the periodic re-probe — same pattern as the create path.
+      await api(`/connectors/${updated.id}/health`, { method: "POST" }).catch(() => undefined);
+      invalidate(["connectors", "skills"]);
+      setDialog({ open: false, provider: "", suggestedName: "", mode: "create" });
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -311,6 +330,59 @@ export default function SkillsPage() {
                               <span className="text-[10px] text-muted-foreground">
                                 Not supported — use the <span className="font-mono">generic</span> provider or request native support.
                               </span>
+                            ) : matches.length > 0 ? (
+                              // Matching connector(s) exist but none satisfy
+                              // (typically: unhealthy creds). Render the
+                              // first one inline with Rotate + Disconnect so
+                              // the user can fix it without leaving the
+                              // page. We deliberately do NOT show "Set up"
+                              // here to avoid creating a second connector
+                              // for the same provider.
+                              (() => {
+                                const broken = matches[0]!;
+                                const label = broken.health === "unhealthy" ? "unhealthy" : broken.health;
+                                return (
+                                  <div className="flex flex-col items-end gap-1">
+                                    <div className="flex items-center gap-1.5">
+                                      <Badge variant="outline" className="text-[10px] text-amber-600">
+                                        {label} ({broken.name})
+                                      </Badge>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        className="h-6 px-2 text-[10px]"
+                                        disabled={rotate.isPending}
+                                        onClick={() =>
+                                          setDialog({
+                                            open: true,
+                                            provider: req.provider,
+                                            suggestedName: broken.name,
+                                            mode: "rotate",
+                                            connectorId: broken.id
+                                          })
+                                        }
+                                      >
+                                        Rotate
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-6 px-2 text-[10px]"
+                                        disabled={disconnect.isPending}
+                                        onClick={() => {
+                                          const message = `Disconnect ${broken.name}?\nThis will deactivate ${dependentCount} dependent skill${dependentCount === 1 ? "" : "s"}.`;
+                                          if (confirm(message)) disconnect.mutate(broken.id);
+                                        }}
+                                      >
+                                        Disconnect
+                                      </Button>
+                                    </div>
+                                    {broken.message ? (
+                                      <p className="text-[10px] text-muted-foreground">{broken.message}</p>
+                                    ) : null}
+                                  </div>
+                                );
+                              })()
                             ) : (
                               <Button
                                 size="sm"
@@ -320,7 +392,8 @@ export default function SkillsPage() {
                                   setDialog({
                                     open: true,
                                     provider: req.provider,
-                                    suggestedName: provider.label
+                                    suggestedName: provider.label,
+                                    mode: "create"
                                   })
                                 }
                               >
@@ -457,14 +530,19 @@ export default function SkillsPage() {
       <AddConnectorDialog
         open={dialog.open}
         onOpenChange={(open) =>
-          setDialog((prev) => (open ? prev : { open: false, provider: "", suggestedName: "" }))
+          setDialog((prev) => (open ? prev : { open: false, provider: "", suggestedName: "", mode: "create" }))
         }
-        onSubmit={(body) => create.mutate(body)}
-        pending={create.isPending}
+        onSubmit={(body) =>
+          dialog.mode === "rotate" && dialog.connectorId
+            ? rotate.mutate({ id: dialog.connectorId, body })
+            : create.mutate(body)
+        }
+        pending={dialog.mode === "rotate" ? rotate.isPending : create.isPending}
         providers={providers.data ?? []}
         defaultProvider={dialog.provider || undefined}
         defaultName={dialog.suggestedName}
         lockProvider
+        mode={dialog.mode}
       />
     </>
   );

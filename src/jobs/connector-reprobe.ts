@@ -29,6 +29,10 @@ export async function runConnectorReprobe(config: RuntimeConfig): Promise<Reprob
   const at = Date.now();
 
   for (const connector of state.connectors) {
+    // Skip tombstoned records — a successful re-probe would write back
+    // health: "healthy" + status: "configured", undoing a deliberate
+    // disconnect of an auto-source connector.
+    if (connector.status === "disabled") continue;
     report.considered += 1;
     const module = getProvider(connector.provider);
     if (!module?.probe) continue;

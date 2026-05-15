@@ -51,6 +51,12 @@ export interface AddConnectorDialogProps {
   // a single provider — the Skills page rows pass this so the user can't
   // accidentally create a Linear connector from the "Set up Codex" button.
   lockProvider?: boolean;
+  // "create" (default) opens an Add Connector dialog wired to POST. "rotate"
+  // opens a Rotate Credential dialog with the same field UI but skips the
+  // name/scopes inputs (we're not replacing those, just the secret) and
+  // changes the title/button label so the user knows they're updating an
+  // existing record. The caller still owns the actual API call via onSubmit.
+  mode?: "create" | "rotate";
 }
 
 export function AddConnectorDialog({
@@ -61,7 +67,8 @@ export function AddConnectorDialog({
   providers,
   defaultProvider,
   defaultName,
-  lockProvider = false
+  lockProvider = false,
+  mode = "create"
 }: AddConnectorDialogProps) {
   const initialProvider = useMemo(() => {
     if (defaultProvider && providers.some((p) => p.id === defaultProvider)) return defaultProvider;
@@ -90,7 +97,7 @@ export function AddConnectorDialog({
 
   const submit = () => {
     setError(null);
-    if (!name.trim()) {
+    if (mode === "create" && !name.trim()) {
       setError("Name is required.");
       return;
     }
@@ -117,7 +124,11 @@ export function AddConnectorDialog({
     } else {
       for (const field of selectedProvider.fields) {
         const raw = fieldValues[field.name] ?? "";
-        if (field.required && !raw.trim()) {
+        // In rotate mode the user is replacing secrets only; non-secret
+        // metadata fields keep their stored values, so don't block the
+        // submission on them being empty.
+        const requiredHere = field.required && (mode === "create" || field.secret);
+        if (requiredHere && !raw.trim()) {
           setError(`${field.label} is required.`);
           return;
         }
@@ -127,9 +138,14 @@ export function AddConnectorDialog({
       }
     }
 
+    if (mode === "rotate" && Object.keys(secrets).length === 0) {
+      setError("Provide at least one new secret value to rotate.");
+      return;
+    }
+
     onSubmit({
       provider,
-      name: name.trim(),
+      name: (mode === "rotate" ? defaultName ?? name : name).trim(),
       scopes: scopes.split(",").map((s) => s.trim()).filter(Boolean),
       secrets,
       metadata: Object.keys(metadataFields).length > 0 ? { fields: metadataFields } : undefined
@@ -140,29 +156,37 @@ export function AddConnectorDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add connector</DialogTitle>
-          <DialogDescription>{selectedProvider?.description ?? "Connect a new external system."}</DialogDescription>
+          <DialogTitle>{mode === "rotate" ? `Rotate ${defaultName ?? "credential"}` : "Add connector"}</DialogTitle>
+          <DialogDescription>
+            {mode === "rotate"
+              ? "Replace the stored secret(s). The connector record, name, and scopes stay the same."
+              : selectedProvider?.description ?? "Connect a new external system."}
+          </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
-          <div className="space-y-1">
-            <Label htmlFor="connector-name">Name</Label>
-            <Input id="connector-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary linear" />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="connector-provider">Provider</Label>
-            <Select value={provider} onValueChange={setProvider} disabled={lockProvider}>
-              <SelectTrigger id="connector-provider"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {providers.map((p) => (
-                  <SelectItem key={p.id} value={p.id}>{p.label} ({p.id})</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="connector-scopes">Scopes (comma-separated)</Label>
-            <Input id="connector-scopes" value={scopes} onChange={(e) => setScopes(e.target.value)} placeholder="read, write" />
-          </div>
+          {mode === "create" ? (
+            <>
+              <div className="space-y-1">
+                <Label htmlFor="connector-name">Name</Label>
+                <Input id="connector-name" value={name} onChange={(e) => setName(e.target.value)} placeholder="primary linear" />
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="connector-provider">Provider</Label>
+                <Select value={provider} onValueChange={setProvider} disabled={lockProvider}>
+                  <SelectTrigger id="connector-provider"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {providers.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>{p.label} ({p.id})</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="connector-scopes">Scopes (comma-separated)</Label>
+                <Input id="connector-scopes" value={scopes} onChange={(e) => setScopes(e.target.value)} placeholder="read, write" />
+              </div>
+            </>
+          ) : null}
 
           {provider === "generic" ? (
             <GenericFieldEditor fields={genericFields} onChange={setGenericFields} />
@@ -186,7 +210,9 @@ export function AddConnectorDialog({
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
         </div>
         <DialogFooter>
-          <Button onClick={submit} disabled={pending}>{pending ? "Adding…" : "Add"}</Button>
+          <Button onClick={submit} disabled={pending}>
+            {pending ? (mode === "rotate" ? "Saving…" : "Adding…") : mode === "rotate" ? "Save" : "Add"}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

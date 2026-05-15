@@ -5,7 +5,7 @@
 set -euo pipefail
 
 if [[ -z "${LINEAR_API_KEY:-}" ]]; then
-  echo "LINEAR_API_KEY is not set. Add a 'linear' connector via /connections." >&2
+  echo "LINEAR_API_KEY is not set. Add a 'linear' connector via the Skills page (Set up Linear button)." >&2
   exit 1
 fi
 
