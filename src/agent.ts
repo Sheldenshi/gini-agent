@@ -550,7 +550,7 @@ function shouldAutoRetain(task: Task): boolean {
   // else goes through the extractor — which returns an empty fact list for
   // non-factual inputs ("hi", "ok", "yes") at the cost of one structured-LLM
   // call. We accept that cost so short personal-fact disclosures ("my name is
-  // shelden", "I prefer dark mode") aren't filtered out by a length heuristic.
+  // Sam", "I prefer dark mode") aren't filtered out by a length heuristic.
   //
   // We apply the same shape gates as the dispatcher so natural-language
   // prompts ("read this paper carefully", "find me a restaurant") still get
