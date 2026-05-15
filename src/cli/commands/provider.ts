@@ -34,22 +34,31 @@ export async function provider(ctx: CliContext): Promise<void> {
     if (name !== "echo" && name !== "openai" && name !== "codex" && name !== "openrouter" && name !== "local") {
       throw new Error(USAGE);
     }
+    if (positional.length > 2) {
+      // Symmetric with the unknown-flag rejection: don't silently drop tokens
+      // the user typed. Catches typos like
+      // `gini provider set local model-a model-b`.
+      throw new Error(`Unexpected extra argument(s): ${positional.slice(2).join(", ")}\n${USAGE}`);
+    }
 
     const baseUrl = flags["--base-url"];
     const apiKeyEnv = flags["--api-key-env"];
     const extraBodyRaw = flags["--extra-body"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {
+      // Parse and shape-validate as separate steps so a "not an object"
+      // error doesn't get swallowed and re-wrapped as "is not valid JSON".
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(extraBodyRaw);
-        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-          throw new Error("--extra-body must be a JSON object");
-        }
-        extraBody = parsed as Record<string, unknown>;
+        parsed = JSON.parse(extraBodyRaw);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`--extra-body is not valid JSON: ${message}`);
       }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("--extra-body must be a JSON object");
+      }
+      extraBody = parsed as Record<string, unknown>;
     }
 
     config.provider = normalizeProvider({

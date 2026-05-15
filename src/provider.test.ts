@@ -1025,6 +1025,160 @@ describe("provider", () => {
     }
   });
 
+  test("extraBody.functions/function_call/store are stripped (legacy + retention guards)", async () => {
+    // OpenAI's deprecated function-calling fields and the data-retention
+    // `store` flag must not be settable through extraBody. The runtime
+    // doesn't read message.function_call from responses, so a poisoned
+    // legacy schema would silently drop function results; `store` would
+    // change retention behavior inconsistently with the /responses path.
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: {
+          functions: [{ name: "evil", parameters: {} }],
+          function_call: { name: "evil" },
+          store: true,
+          chat_template_kwargs: { enable_thinking: true }
+        }
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect("functions" in sent).toBe(false);
+      expect("function_call" in sent).toBe(false);
+      expect("store" in sent).toBe(false);
+      // Non-reserved key still flows through.
+      expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody.max_tokens flows through for non-vision calls (vision still wins via post-spread)", async () => {
+    // The runtime only sets max_tokens/max_completion_tokens for vision,
+    // and vision spreads tokenBudgetField AFTER the sanitized extras. So
+    // tool-calling/structured/summary callers must be able to set
+    // max_tokens via extraBody legitimately, and vision callers must
+    // still see their explicit budget win.
+    const originalFetch = globalThis.fetch;
+    const requestBodies: Record<string, unknown>[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      requestBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: { max_tokens: 256 }
+      });
+      // Tool-calling: extraBody.max_tokens flows through.
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(requestBodies[0]?.max_tokens).toBe(256);
+
+      // Vision: caller's explicit maxTokens wins (post-spread).
+      requestBodies.length = 0;
+      await generateVisionAnalysis(config(provider), {
+        prompt: "what?",
+        imageBase64: "AAAA",
+        mimeType: "image/png",
+        maxTokens: 32
+      });
+      // local provider uses the legacy max_tokens field (not max_completion_tokens).
+      expect(requestBodies[0]?.max_tokens).toBe(32);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("extraBody with __proto__/constructor/prototype keys cannot pollute or smuggle", async () => {
+    // Object.entries on a JSON.parse-produced object yields __proto__ as an
+    // own enumerable key. Without an explicit drop, the spread would forward
+    // it to the API. The denylist + Object.create(null) output object keep
+    // both runtime safety and wire safety.
+    const originalFetch = globalThis.fetch;
+    let capturedRawBody: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      capturedRawBody = String(init.body);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const polluted = JSON.parse('{"__proto__":{"model":"hijacked"},"constructor":1,"prototype":2,"chat_template_kwargs":{"x":1}}');
+      const provider = normalizeProvider({
+        name: "local",
+        model: "real-model",
+        baseUrl: "http://127.0.0.1:8000/v1",
+        extraBody: polluted
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      // Wire-level check: the serialized JSON must not contain the
+      // prototype-pollution keys at all. We check the raw body string
+      // because `"__proto__" in parsedObject` is always true (inherited
+      // from Object.prototype) — it doesn't reflect what was sent.
+      expect(capturedRawBody).toBeDefined();
+      expect(capturedRawBody!.includes("__proto__")).toBe(false);
+      expect(capturedRawBody!.includes("\"constructor\"")).toBe(false);
+      expect(capturedRawBody!.includes("\"prototype\"")).toBe(false);
+      // Object-level check via hasOwnProperty (the safe predicate).
+      const sent = JSON.parse(capturedRawBody!);
+      expect(Object.prototype.hasOwnProperty.call(sent, "__proto__")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(sent, "constructor")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(sent, "prototype")).toBe(false);
+      // Runtime model still wins regardless.
+      expect(sent.model).toBe("real-model");
+      // The legitimate non-reserved field still flows through.
+      expect(sent.chat_template_kwargs).toEqual({ x: 1 });
+      // The runtime's own object prototype isn't polluted.
+      expect(({} as { model?: unknown }).model).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("baseUrl with trailing slash is normalized so the path doesn't double up", async () => {
+    const originalFetch = globalThis.fetch;
+    let capturedUrl: string | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "x",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1/" // note trailing slash
+      });
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      expect(capturedUrl).toBe("http://127.0.0.1:8000/v1/chat/completions");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   test("extraBody cannot override built-in fields like model/messages/stream/tools", async () => {
     const originalFetch = globalThis.fetch;
     let captured: { url: string; init: RequestInit } | undefined;

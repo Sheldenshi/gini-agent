@@ -273,7 +273,7 @@ async function callToolCallingChatCompletions(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = trimBaseUrl(provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL);
   const wantStream = Boolean(onDelta);
   const body: Record<string, unknown> = {
     ...sanitizeExtraBody(provider.extraBody),
@@ -994,7 +994,7 @@ async function callStructuredChatCompletions<T>(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = trimBaseUrl(provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -1135,7 +1135,8 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+  const baseUrl = trimBaseUrl(provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL);
+  const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -1420,9 +1421,31 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 // Reserved fields that the runtime must own — never let `extraBody` overwrite
 // them. Without this, a poisoned config (or a careless --extra-body argument)
-// could redirect the call to a different model, smuggle in extra tools, or
-// flip stream mode and break response parsing. The denylist is the single
-// source of truth so every chat-completions call site stays consistent.
+// could redirect the call to a different model, smuggle in extra tools, flip
+// stream mode and break response parsing, or change data-retention behavior.
+// The denylist is the single source of truth so every chat-completions call
+// site stays consistent.
+//
+// Maintainer note: when you add a runtime-owned chat-completions request
+// field (e.g. another tool-shape variant, a new structured-output mode), add
+// it here too. Vision's `max_tokens`/`max_completion_tokens` are NOT in the
+// list — vision spreads its `tokenBudgetField` AFTER the sanitized extras so
+// vision callers still win, while non-vision callers can put their own
+// `max_tokens` in extraBody legitimately.
+//
+// `functions` and `function_call` cover OpenAI's deprecated legacy
+// function-calling API. The runtime ignores `message.function_call` in
+// responses (extractToolCalls only walks `tool_calls`), so a poisoned
+// extraBody using the legacy schema would silently drop function results.
+//
+// `store` controls whether the provider persists the chat completion for
+// distillation/evals. The /responses path pins `store: false` explicitly;
+// chat-completions paths must stay consistent.
+//
+// Also block `__proto__`/`constructor`/`prototype` to defend against
+// prototype-pollution-style payloads — Object.entries already returns
+// __proto__ as an own key when JSON.parse produced it, so without an
+// explicit drop the spread would forward it to the API.
 const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "model",
   "messages",
@@ -1430,18 +1453,34 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "tools",
   "tool_choice",
   "response_format",
-  "max_tokens",
-  "max_completion_tokens"
+  "functions",
+  "function_call",
+  "store",
+  "__proto__",
+  "constructor",
+  "prototype"
 ]);
 
 function sanitizeExtraBody(extraBody: Record<string, unknown> | undefined): Record<string, unknown> {
   if (!extraBody) return {};
-  const out: Record<string, unknown> = {};
+  // `Object.create(null)` for the output so future spreads can't be
+  // surprised by an inherited prototype. Object.entries on the input only
+  // yields own enumerable string-keyed properties, which is what we want.
+  const out: Record<string, unknown> = Object.create(null);
   for (const [key, value] of Object.entries(extraBody)) {
     if (RESERVED_EXTRA_BODY_KEYS.has(key)) continue;
     out[key] = value;
   }
   return out;
+}
+
+// Strip a trailing slash from a baseUrl so callers can write either
+// `http://x/v1` or `http://x/v1/` and the resulting request URL stays
+// `http://x/v1/chat/completions` (not `http://x/v1//chat/completions` —
+// some OpenAI-compatible servers reject the doubled slash). Mirrors the
+// pattern in src/embeddings.ts.
+function trimBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "");
 }
 
 // ---------------- Vision (image input) ----------------
@@ -1570,7 +1609,7 @@ async function callVisionChatCompletions(
     ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
-  const baseUrl = provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL;
+  const baseUrl = trimBaseUrl(provider.baseUrl ?? DEFAULT_OPENAI_BASE_URL);
   const dataUrl = `data:${request.mimeType};base64,${request.imageBase64}`;
   // OpenAI's newer o-series chat models reject `max_tokens` outright and
   // require `max_completion_tokens`. Older OpenAI models still accept the

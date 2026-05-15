@@ -125,6 +125,22 @@ describe("provider CLI", () => {
     const ctx = makeCtx(["provider", "set", "local", "m", "--base-url", "--api-key-env", "FOO"]);
     await expect(provider(ctx)).rejects.toThrow(/--base-url requires a value/);
   });
+
+  test("--extra-body with non-object JSON gets the right error (not the JSON-parse-error wrapper)", async () => {
+    // Round-1 wrapped the shape error inside the JSON-parse catch, producing
+    // the misleading "is not valid JSON: --extra-body must be a JSON object".
+    // Now the error should be just "--extra-body must be a JSON object".
+    const ctx = makeCtx(["provider", "set", "local", "m", "--extra-body", JSON.stringify(["a", "b"])]);
+    await expect(provider(ctx)).rejects.toThrow(/^--extra-body must be a JSON object$/);
+  });
+
+  test("set rejects extra positional arguments", async () => {
+    // Symmetric with the unknown-flag rejection: a typo like
+    // `gini provider set local model-a model-b` shouldn't silently drop
+    // `model-b`.
+    const ctx = makeCtx(["provider", "set", "local", "model-a", "model-b"]);
+    await expect(provider(ctx)).rejects.toThrow(/Unexpected extra argument/);
+  });
 });
 
 function makeCtx(cliArgs: string[]): CliContext {
