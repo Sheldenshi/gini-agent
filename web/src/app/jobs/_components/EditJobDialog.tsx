@@ -11,12 +11,25 @@ import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import type { JobRecord } from "@runtime/types";
 
+type ScheduleMode = "interval" | "cron";
+
 export function EditJobDialog({ job }: { job: JobRecord }) {
   const invalidate = useInvalidate();
   const [open, setOpen] = useState(false);
-  // Per the brief: editable fields are schedule (intervalSeconds in the
-  // runtime), retryLimit, timeoutSeconds, costBudget, deliveryTargets[].
-  const [intervalSeconds, setIntervalSeconds] = useState(String(job.intervalSeconds));
+  // Schedule mode: interval-driven (intervalSeconds) or cron-driven
+  // (cronExpression + cronTimezone). Initial mode is derived from the job
+  // record so a cron job opens straight into cron mode. The runtime accepts
+  // four transitions (interval->interval, cron->cron, interval->cron,
+  // cron->interval); we just produce the right patch shape in submit().
+  const [mode, setMode] = useState<ScheduleMode>(job.cronExpression ? "cron" : "interval");
+  // Per the brief: editable fields are schedule (interval seconds OR cron
+  // expression + timezone), retryLimit, timeoutSeconds, costBudget,
+  // deliveryTargets[].
+  const [intervalSeconds, setIntervalSeconds] = useState(
+    job.cronExpression ? "60" : String(job.intervalSeconds)
+  );
+  const [cronExpression, setCronExpression] = useState(job.cronExpression ?? "");
+  const [cronTimezone, setCronTimezone] = useState(job.cronTimezone ?? "UTC");
   const [retryLimit, setRetryLimit] = useState(String(job.retryLimit));
   const [timeoutSeconds, setTimeoutSeconds] = useState(String(job.timeoutSeconds));
   const [costBudget, setCostBudget] = useState(typeof job.costBudget === "number" ? String(job.costBudget) : "");
@@ -26,14 +39,19 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
   // (parent JobDetail re-renders with a different `job` when the user picks
   // a different row in the list). Reset form state when the job id changes
   // OR when the dialog opens — otherwise edits silently overwrite the wrong
-  // record with stale field values from the previous selection.
+  // record with stale field values from the previous selection. The mode
+  // gets reset alongside the fields so opening on a cron job after editing
+  // an interval one doesn't strand the form in the wrong shape.
   useEffect(() => {
-    setIntervalSeconds(String(job.intervalSeconds));
+    setMode(job.cronExpression ? "cron" : "interval");
+    setIntervalSeconds(job.cronExpression ? "60" : String(job.intervalSeconds));
+    setCronExpression(job.cronExpression ?? "");
+    setCronTimezone(job.cronTimezone ?? "UTC");
     setRetryLimit(String(job.retryLimit));
     setTimeoutSeconds(String(job.timeoutSeconds));
     setCostBudget(typeof job.costBudget === "number" ? String(job.costBudget) : "");
     setDeliveryTargetsRaw((job.deliveryTargets ?? []).join(", "));
-  }, [job.id, job.intervalSeconds, job.retryLimit, job.timeoutSeconds, job.costBudget, job.deliveryTargets, open]);
+  }, [job.id, job.intervalSeconds, job.cronExpression, job.cronTimezone, job.retryLimit, job.timeoutSeconds, job.costBudget, job.deliveryTargets, open]);
 
   const update = useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
@@ -48,8 +66,22 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
 
   function submit() {
     const patch: Record<string, unknown> = {};
-    const interval = Number(intervalSeconds);
-    if (Number.isFinite(interval) && interval > 0) patch.intervalSeconds = interval;
+    // Schedule fields depend on the selected mode. We send the inactive
+    // mode's fields as `null` so the runtime clears them — that's how the
+    // cron->interval and interval->cron switches stay in a coherent shape
+    // server-side (mirrors how `costBudget: null` already clears the budget).
+    if (mode === "interval") {
+      const interval = Number(intervalSeconds);
+      if (Number.isFinite(interval) && interval > 0) patch.intervalSeconds = interval;
+      patch.cronExpression = null;
+      patch.cronTimezone = null;
+    } else {
+      const expr = cronExpression.trim();
+      if (expr.length > 0) patch.cronExpression = expr;
+      const tz = cronTimezone.trim();
+      patch.cronTimezone = tz.length > 0 ? tz : "UTC";
+      patch.intervalSeconds = null;
+    }
     const retry = Number(retryLimit);
     if (Number.isFinite(retry) && retry >= 0) patch.retryLimit = retry;
     const timeout = Number(timeoutSeconds);
@@ -84,15 +116,68 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
         </DialogHeader>
         <div className="grid gap-3">
           <div className="grid gap-1.5">
-            <Label htmlFor="job-interval">Schedule (interval seconds)</Label>
-            <Input
-              id="job-interval"
-              type="number"
-              min={1}
-              value={intervalSeconds}
-              onChange={(event) => setIntervalSeconds(event.target.value)}
-            />
+            <Label>Schedule mode</Label>
+            <div className="inline-flex rounded-md border border-border p-0.5" role="radiogroup" aria-label="Schedule mode">
+              <Button
+                type="button"
+                size="sm"
+                variant={mode === "interval" ? "default" : "ghost"}
+                role="radio"
+                aria-checked={mode === "interval"}
+                onClick={() => setMode("interval")}
+              >
+                Interval
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={mode === "cron" ? "default" : "ghost"}
+                role="radio"
+                aria-checked={mode === "cron"}
+                onClick={() => setMode("cron")}
+              >
+                Cron
+              </Button>
+            </div>
           </div>
+          {mode === "interval" ? (
+            <div className="grid gap-1.5">
+              <Label htmlFor="job-interval">Schedule (interval seconds)</Label>
+              <Input
+                id="job-interval"
+                type="number"
+                min={1}
+                value={intervalSeconds}
+                onChange={(event) => setIntervalSeconds(event.target.value)}
+              />
+            </div>
+          ) : (
+            <>
+              <div className="grid gap-1.5">
+                <Label htmlFor="job-cron-expression">Cron expression</Label>
+                <Input
+                  id="job-cron-expression"
+                  className="font-mono"
+                  placeholder="0 9 * * *"
+                  value={cronExpression}
+                  onChange={(event) => setCronExpression(event.target.value)}
+                />
+                <p className="text-[10px] text-muted-foreground">
+                  5-field Unix cron: minute hour day-of-month month day-of-week. 0=Sunday.
+                </p>
+              </div>
+              <div className="grid gap-1.5">
+                <Label htmlFor="job-cron-timezone">Timezone</Label>
+                <Input
+                  id="job-cron-timezone"
+                  className="font-mono"
+                  placeholder="America/Los_Angeles"
+                  value={cronTimezone}
+                  onChange={(event) => setCronTimezone(event.target.value)}
+                />
+              </div>
+            </>
+          )}
           <div className="grid grid-cols-2 gap-3">
             <div className="grid gap-1.5">
               <Label htmlFor="job-retry">Retry limit</Label>
