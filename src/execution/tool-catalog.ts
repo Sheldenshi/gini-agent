@@ -444,12 +444,20 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt on a fixed interval. The job's response is delivered as an assistant message back to this chat session when it fires. Use for reminders ('in 2 minutes', 'every hour'), periodic checks, or any user request mentioning 'remind me', 'every N minutes/hours', or 'cron job'. Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `autoApproveCommands` for the shell patterns it will need to run, or `dangerouslyAutoApprove: true` for tasks that need broad action — otherwise the job will stall at the first approval gate forever. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
+      description: "Schedule a recurring or one-shot job that runs a prompt. The job's response is delivered as an assistant message back to this chat session when it fires. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `autoApproveCommands` for the shell patterns it will need to run, or `dangerouslyAutoApprove: true` for tasks that need broad action — otherwise the job will stall at the first approval gate forever. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
           name: { type: "string", description: "Short human-readable label (e.g. 'cake-reminder')." },
-          intervalSeconds: { type: "number", description: "Seconds between runs. For a one-shot reminder, this is the delay until the single fire (e.g. 120 for 'in 2 minutes')." },
+          intervalSeconds: { type: "number", description: "Seconds between runs (from-now timing). For a one-shot reminder, this is the delay until the single fire (e.g. 120 for 'in 2 minutes'). Mutually exclusive with `cronExpression`." },
+          cronExpression: {
+            type: "string",
+            description: "Standard 5-field Unix cron: `minute hour day-of-month month day-of-week`. No seconds field, no year field. Day-of-week is 0-6 with 0 = Sunday (NOT ISO 1=Monday); `1` is Monday, `5` is Friday. Examples: '0 9 * * *' (every day at 09:00), '30 8 * * 1-5' (08:30 on weekdays), '0 */2 * * *' (every 2 hours), '0 0 1 * *' (midnight on the 1st of each month). FOOTGUN: if you restrict BOTH day-of-month and day-of-week, Unix cron OR's them — '0 0 1 * 1' means 'midnight on the 1st OR every Monday', NOT 'when the 1st is a Monday'. There is no Unix-cron expression for 'first Monday of the month'; refuse such requests or split into two separate jobs. Mutually exclusive with `intervalSeconds`. Always pair with `cronTimezone` for wall-clock-named times."
+          },
+          cronTimezone: {
+            type: "string",
+            description: "IANA timezone identifier (e.g. 'America/Los_Angeles', 'Europe/Berlin', 'Asia/Tokyo', 'UTC'). Defaults to 'UTC' when omitted. Always set this explicitly when the user names a wall-clock time — '9am' alone is ambiguous; '9am America/Los_Angeles' is not. Only valid alongside `cronExpression`."
+          },
           prompt: { type: "string", description: "The instruction the agent will receive when the job fires. Phrase it from the user's perspective (e.g. 'Remind me to take the cake out of the oven.')." },
           oneShot: { type: "boolean", description: "If true, the job is paused after its first successful run. Defaults to false (recurring)." },
           autoApproveCommands: {
@@ -466,7 +474,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
             description: "Wall-clock seconds before the spawned task is killed. Default 600 (10 min) — enough for typical git/gh + multi-file scan jobs. Drop lower (e.g. 60-120) for trivial reminders; raise (e.g. 1800-3600) when the prompt invokes external CLIs like codex or claude-code that can run several minutes. The model will be terminated mid-thought if this is too low."
           }
         },
-        required: ["name", "intervalSeconds", "prompt"]
+        required: ["name", "prompt"]
       }
     }
   }

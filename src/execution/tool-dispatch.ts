@@ -599,10 +599,45 @@ async function createJobTool(
 ): Promise<string> {
   const name = requireString(args, "name");
   const prompt = requireString(args, "prompt");
-  if (typeof args.intervalSeconds !== "number" || !Number.isFinite(args.intervalSeconds) || args.intervalSeconds <= 0 || !Number.isInteger(args.intervalSeconds)) {
-    throw new Error("Invalid input: intervalSeconds must be a positive integer.");
+  // Exactly one of (intervalSeconds, cronExpression) must drive the
+  // schedule. The authoritative validation lives in `createScheduledJob`,
+  // but doing a fast-path check here gives the agent a typed tool-result
+  // error before we touch the per-instance lock.
+  const intervalProvided = args.intervalSeconds !== undefined && args.intervalSeconds !== null;
+  const cronProvided = args.cronExpression !== undefined && args.cronExpression !== null;
+  if (intervalProvided && cronProvided) {
+    throw new Error("Invalid input: cronExpression and intervalSeconds are mutually exclusive.");
   }
-  const intervalSeconds = args.intervalSeconds;
+  if (!intervalProvided && !cronProvided) {
+    throw new Error("Invalid input: create_job requires either intervalSeconds or cronExpression.");
+  }
+  let intervalSeconds: number | undefined;
+  if (intervalProvided) {
+    if (typeof args.intervalSeconds !== "number" || !Number.isFinite(args.intervalSeconds) || args.intervalSeconds <= 0 || !Number.isInteger(args.intervalSeconds)) {
+      throw new Error("Invalid input: intervalSeconds must be a positive integer.");
+    }
+    intervalSeconds = args.intervalSeconds;
+  }
+  let cronExpression: string | undefined;
+  if (cronProvided) {
+    if (typeof args.cronExpression !== "string" || args.cronExpression.trim().length === 0) {
+      throw new Error("Invalid input: cronExpression must be a non-empty string.");
+    }
+    cronExpression = args.cronExpression;
+  }
+  let cronTimezone: string | undefined;
+  if (args.cronTimezone !== undefined && args.cronTimezone !== null) {
+    if (typeof args.cronTimezone !== "string" || args.cronTimezone.length === 0) {
+      throw new Error("Invalid input: cronTimezone must be a non-empty string.");
+    }
+    cronTimezone = args.cronTimezone;
+  }
+  // `cronTimezone` without `cronExpression` is a payload mistake (it has
+  // nothing to apply to). Reject up-front so the agent sees the error
+  // before the lock-serialized re-check in `createScheduledJob` does.
+  if (cronTimezone !== undefined && cronExpression === undefined) {
+    throw new Error("Invalid input: cronTimezone may only be set when cronExpression is set.");
+  }
   // Coerce oneShot to a strict boolean. Treat `undefined`/`null` as false
   // (recurring), and anything else (string "true", number 1) is rejected
   // so the agent has a clean contract.
@@ -687,7 +722,12 @@ async function createJobTool(
   try {
     job = await createScheduledJob(config, {
       name,
+      // intervalSeconds is undefined when cron drives the schedule —
+      // createScheduledJob's mutual-exclusion guard treats that as the
+      // "not interval-driven" case and stores 0 as the sentinel.
       intervalSeconds,
+      cronExpression,
+      cronTimezone,
       prompt,
       chatSessionId,
       oneShot,
@@ -715,6 +755,8 @@ async function createJobTool(
       evidence: {
         name,
         intervalSeconds,
+        cronExpression,
+        cronTimezone,
         oneShot,
         chatSessionId,
         jobId: job.id,
@@ -732,6 +774,8 @@ async function createJobTool(
       jobId: job.id,
       name,
       intervalSeconds,
+      cronExpression,
+      cronTimezone,
       oneShot,
       chatSessionId,
       dangerouslyAutoApprove,
@@ -740,7 +784,13 @@ async function createJobTool(
     }
   });
 
-  const cadence = oneShot ? "one-shot" : `every ${intervalSeconds}s`;
+  // Cadence string surfaces the right vocabulary back to the agent so its
+  // follow-up reply to the user describes the actual schedule shape.
+  const cadence = oneShot
+    ? "one-shot"
+    : cronExpression
+      ? `cron \"${cronExpression}\" (${cronTimezone ?? "UTC"})`
+      : `every ${intervalSeconds}s`;
   return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}.`;
 }
 
