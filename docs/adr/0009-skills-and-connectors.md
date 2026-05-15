@@ -56,7 +56,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 
 ### UI
 
-- The web "Connections" tab keeps its user-facing label and supports add, rotate, and delete in addition to the existing health probe.
+- The web Connectors page (`/connectors`) supports add, rotate, and delete in addition to the existing health probe.
 - Skills view surfaces dependency state: each skill shows its required connectors and whether they are satisfied.
 
 ## Rejected

@@ -36,7 +36,7 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - CLI: `gini identity ...` → `gini connector ...`.
 - Audit event names: `identity.*` → `connector.*`.
 - Helpers: `isSkillActive`, `resolveSkillEnv`, `resolveActiveSkillsEnv` keep their names — the verb operates on skills.
-- Web: `useIdentities` → `useConnectors`; the Connections page label stays "Connections" (user-facing) but the underlying queries and types match the new vocabulary.
+- Web: `useIdentities` → `useConnectors`. The route moves from `/connections` to `/connectors`; sidebar label and page title both read "Connectors". Underlying queries and types match the new vocabulary.
 - State migration: on load, rename `state.identities` → `state.connectors` and `record.kind` → `record.provider` silently. No back-compat shim is exposed.
 - ADR 0008 title becomes "Connector Secret Storage"; ADR 0009 becomes "Skills and Connectors." Body text updated to match.
 
@@ -106,7 +106,7 @@ Both are bundled, trusted by default, and declare `metadata.gini.requires.connec
 
 - **Skills page** (new) at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `untrusted`. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. "Connect →" affordance on missing connectors opens the Add Connector dialog with `provider` pre-filled.
 - **Trust toggle** on each user-installed skill ("source: user"). Bundled skills are auto-trusted and the toggle is read-only.
-- **Connections page** continues to exist with the updated vocabulary internally. Cards label "Connector" not "Identity"; dependents column reads "Used by: linear skill, custom-jira skill."
+- **Connectors page** at `/connectors`. Cards label "Connector" not "Identity"; dependents column reads "Used by: linear skill, custom-jira skill."
 
 ## Rejected
 
@@ -148,5 +148,5 @@ Both are bundled, trusted by default, and declare `metadata.gini.requires.connec
 - create-skill meta-skill is bundled, trusted, active, and produces a valid SKILL.md when invoked via a real agent task.
 - install-skill meta-skill is bundled, trusted, active, and installs a pasted SKILL.md end-to-end (validating, reviewing, walking trust, installing via API, confirming activation).
 - Periodic re-probe job runs at the configured interval, updates health, emits audit events on transitions.
-- A live browser test of the Connections page + Skills page confirms the renamed vocabulary, add/delete flows, trust toggle, and deeplink between pages all work.
+- A live browser test of the Connectors page + Skills page confirms the renamed vocabulary, add/delete flows, trust toggle, and deeplink between pages all work.
 - A live functional test on the running instance invokes both meta-skills via a task and verifies the outcome on disk.

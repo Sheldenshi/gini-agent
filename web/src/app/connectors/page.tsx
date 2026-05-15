@@ -29,7 +29,7 @@ interface GenericField {
   secret: boolean;
 }
 
-export default function ConnectionsPage() {
+export default function ConnectorsPage() {
   const connectors = useConnectors();
   const providers = useProviders();
   const skills = useSkills();
@@ -90,7 +90,7 @@ export default function ConnectionsPage() {
   return (
     <>
       <PageHeader
-        title="Connections"
+        title="Connectors"
         description="External connectors and credential health"
         actions={
           <Dialog open={open} onOpenChange={setOpen}>

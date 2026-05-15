@@ -233,7 +233,7 @@ export default function SkillsPage() {
                               </Badge>
                             ) : !provider ? (
                               // Provider isn't in the registry, so the
-                              // Connections page dropdown won't list it.
+                              // Connectors page dropdown won't list it.
                               // Avoid linking to a dead-end and steer the
                               // user toward the documented escape hatch.
                               <span className="text-[10px] text-muted-foreground">
@@ -241,7 +241,7 @@ export default function SkillsPage() {
                               </span>
                             ) : (
                               <Link
-                                href={`/connections?provider=${encodeURIComponent(req.provider)}`}
+                                href={`/connectors?provider=${encodeURIComponent(req.provider)}`}
                                 className="rounded border border-border bg-card px-1.5 py-0.5 text-[10px] hover:bg-accent"
                               >
                                 Connect →

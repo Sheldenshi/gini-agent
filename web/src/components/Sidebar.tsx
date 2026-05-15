@@ -41,7 +41,7 @@ const NAV = [
   { href: "/skills", label: "Skills", icon: Wrench },
   { href: "/subagents", label: "Subagents", icon: Users },
   { href: "/jobs", label: "Jobs", icon: Timer },
-  { href: "/connections", label: "Connections", icon: Cable },
+  { href: "/connectors", label: "Connectors", icon: Cable },
   { href: "/browser", label: "Browser", icon: Globe },
   { href: "/permissions", label: "Permissions", icon: AlertTriangle },
   { href: "/activity", label: "Activity", icon: Activity },

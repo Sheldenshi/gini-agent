@@ -113,7 +113,7 @@ will need.
    when trust was granted.
 
 8. If any required connector is missing or unhealthy, point the user at
-   the Connections page (`/connections?provider=<id>`). The deeplink
+   the Connectors page (`/connectors?provider=<id>`). The deeplink
    pre-fills the Add Connector dialog with the right provider.
 
 ## Rules
