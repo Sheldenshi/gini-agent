@@ -2,9 +2,13 @@
 
 import Link from "next/link";
 import { useCallback, useMemo } from "react";
+import { useMutation } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
-import { StatusPill } from "@/components/StatusPill";
+import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { api } from "@/lib/api";
 import {
   useApprovals,
   useEvents,
@@ -14,6 +18,9 @@ import {
   useTasks
 } from "@/lib/queries";
 import { useRuntimeStream } from "@/lib/useRuntimeStream";
+import type { Approval } from "@runtime/types";
+
+const HOME_APPROVAL_LIMIT = 3;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -32,8 +39,20 @@ export default function HomePage() {
     invalidate(["status", "state", "tasks", "approvals", "events", "memory"]);
   }, [invalidate]));
 
+  const decide = useMutation({
+    mutationFn: ({ id, op }: { id: string; op: "approve" | "deny" }) =>
+      api<Approval>(`/approvals/${id}/${op}`, { method: "POST" }),
+    onSuccess: (_, vars) => {
+      toast.success(`${vars.op}: ${vars.id}`);
+      invalidate(["approvals", "tasks", "task", "state", "events", "audit"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
   const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
+  const pendingVisible = pending.slice(0, HOME_APPROVAL_LIMIT);
+  const pendingExtra = pending.length - pendingVisible.length;
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
   const proposedMemories = (memories.data ?? []).filter((m) => m.status === "proposed");
 
@@ -98,6 +117,60 @@ export default function HomePage() {
             </CardContent>
           </Card>
         </div>
+
+        {pending.length > 0 ? (
+          <Card>
+            <CardHeader>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <CardTitle className="text-sm">Needs your approval</CardTitle>
+                  <CardDescription>Pending actions blocking tasks</CardDescription>
+                </div>
+                {pendingExtra > 0 ? (
+                  <Link
+                    href="/permissions"
+                    className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent"
+                  >
+                    View all ({pending.length})
+                  </Link>
+                ) : null}
+              </div>
+            </CardHeader>
+            <CardContent>
+              <ul className="divide-y divide-border">
+                {pendingVisible.map((approval) => (
+                  <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-mono text-[11px]">{approval.action}</span>
+                        <RiskPill value={approval.risk} />
+                      </div>
+                      <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
+                      <p className="line-clamp-2 text-sm">{approval.reason}</p>
+                    </div>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="sm"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
+                      >
+                        Approve
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decide.isPending}
+                        onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                      >
+                        Deny
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        ) : null}
 
         <Card>
           <CardHeader>
