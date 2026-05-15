@@ -331,31 +331,48 @@ export function useWipeBrowserProfile() {
 
 
 /**
- * Returns a function that batches invalidate() calls within a tick.
+ * Returns a function that batches invalidate() calls within a short time
+ * window.
  *
- * Why this matters: the SSE stream can fire many events in rapid succession
- * (e.g. on connection open the runtime replays the recent event log). If every
- * event triggers a separate invalidateQueries() call, React Query schedules a
- * refetch + render per call, which re-runs the SSE-subscribing component's
- * effects, which can re-open the EventSource, which replays again. Coalescing
- * via queueMicrotask collapses N events in the same tick into a single
- * invalidate-per-key, breaking the feedback loop.
+ * Why this matters: the SSE stream fires many events in rapid succession on
+ * connection open (the runtime replays its recent event log — 100+ events).
+ * Each event arrives in its own task tick, so microtask-level coalescing
+ * does NOT batch them. We need a small wall-clock window.
  *
- * The returned function reference is stable across renders so it can be used
- * directly as a dep without retriggering effects.
+ * Trailing-edge debounce with a hard max-wait:
+ *   - First call: schedule a flush BURST_MS later.
+ *   - Subsequent calls within the window: add keys, reset the timer (up to
+ *     BURST_MAX_MS total wait so we still flush during a sustained stream).
+ *
+ * 80ms is below human perception latency for "instant" UI updates and well
+ * above the inter-arrival gap of replayed SSE events (~ms apart), so the
+ * historical replay collapses to a single flush per unique key.
+ *
+ * The returned function reference is stable across renders.
  */
+const BURST_MS = 80;
+const BURST_MAX_MS = 500;
+
 export function useInvalidate() {
   const qc = useQueryClient();
   const pendingRef = useRef<Set<string> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const firstScheduledAtRef = useRef<number>(0);
   const flush = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
     const set = pendingRef.current;
     pendingRef.current = null;
+    firstScheduledAtRef.current = 0;
     if (!set) return;
     for (const key of set) qc.invalidateQueries({ queryKey: [key] });
   }, [qc]);
   useEffect(() => {
-    // On unmount, drop any pending batch.
     return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
       pendingRef.current = null;
     };
   }, []);
@@ -363,9 +380,13 @@ export function useInvalidate() {
     (keys: string[]) => {
       if (!pendingRef.current) {
         pendingRef.current = new Set();
-        queueMicrotask(flush);
+        firstScheduledAtRef.current = Date.now();
       }
       for (const key of keys) pendingRef.current.add(key);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      const elapsed = Date.now() - firstScheduledAtRef.current;
+      const wait = Math.min(BURST_MS, Math.max(0, BURST_MAX_MS - elapsed));
+      timerRef.current = setTimeout(flush, wait);
     },
     [flush]
   );
