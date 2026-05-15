@@ -81,21 +81,32 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
   let initialCronNextRunMs: number | undefined;
   if (cronExpression !== undefined) {
     const tz = cronTimezone ?? "UTC";
+    // Croner validates the cron expression eagerly in the constructor
+    // but defers IANA timezone validation until the first nextRun() call
+    // (the timezone is only consulted when converting a Date). Wrap both
+    // calls so we surface a typed `Invalid input: …` regardless of which
+    // input was bad. Pattern errors look like `CronPattern: …`; timezone
+    // errors mention `timezone` in the message.
     let cron: Cron;
     try {
       cron = new Cron(cronExpression, { timezone: tz });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      // Croner throws `TypeError: CronPattern: invalid …` for syntax
-      // failures and `TypeError: CronOptions: Invalid timezone …` for
-      // bad IANA identifiers. Split the error surface so callers know
-      // which input was bad.
       if (/timezone/i.test(message)) {
         throw new Error(`Invalid input: cronTimezone "${tz}" is not a valid IANA timezone (${message})`);
       }
       throw new Error(`Invalid input: cronExpression is not a valid 5-field Unix cron (${message})`);
     }
-    const next = cron.nextRun();
+    let next: Date | null;
+    try {
+      next = cron.nextRun();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/timezone/i.test(message)) {
+        throw new Error(`Invalid input: cronTimezone "${tz}" is not a valid IANA timezone (${message})`);
+      }
+      throw new Error(`Invalid input: cronExpression is not a valid 5-field Unix cron (${message})`);
+    }
     if (!next) {
       // Cron returned null — e.g. a pattern that can never fire. Treat as
       // input error so the agent rewrites the expression.
@@ -249,17 +260,26 @@ function advanceCronNextRunAt(
   nowMs: number
 ): { nextRunAtMs: number; missed: number } {
   const cron = new Cron(cronExpression, { timezone: cronTimezone });
-  // croner's nextRun(prev) returns the FIRST fire strictly after `prev`,
-  // so passing the previous nextRunAt yields the natural next match.
-  let next = cron.nextRun(new Date(prevNextRunAtMs));
-  let missed = 0;
-  // Defensive: a pathological pattern that returns null. We treat it as
-  // a fallback to "stay where we are" so the scheduler doesn't crash.
-  // createScheduledJob's validation already rejected unfire-able patterns
-  // at submit time, so reaching this branch implies clock skew or a
-  // truly degenerate edge.
-  if (!next) {
+  // Mirror the interval helper's contract: starting from the run we just
+  // claimed (`prevNextRunAtMs`), `consume` is the first cron-matched
+  // moment strictly after that — analogous to `prev + step` for intervals.
+  // The loop then walks subsequent matches and counts each that's still
+  // in the past as a missed fire.
+  const consume = cron.nextRun(new Date(prevNextRunAtMs));
+  if (!consume) {
+    // Defensive: a pathological pattern that returns null. We treat it
+    // as a fallback to "stay where we are" so the scheduler doesn't
+    // crash. createScheduledJob's validation already rejected unfire-able
+    // patterns at submit time, so reaching this branch implies clock
+    // skew or a truly degenerate edge.
     return { nextRunAtMs: prevNextRunAtMs, missed: 0 };
+  }
+  let next = cron.nextRun(consume);
+  let missed = 0;
+  if (!next) {
+    // Same defensive fallback — but `consume` is a valid future-ish
+    // anchor, so use it as the new nextRunAt.
+    return { nextRunAtMs: consume.getTime(), missed: 0 };
   }
   while (next.getTime() <= nowMs) {
     const after = cron.nextRun(next);

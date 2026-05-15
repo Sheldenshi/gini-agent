@@ -500,6 +500,117 @@ describe("cron lifecycle", () => {
     expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
+  test("create_job dispatch persists cronExpression + cronTimezone", async () => {
+    // Happy-path cron creation through the tool dispatch surface. The
+    // agent should be able to schedule a wall-clock job by name +
+    // expression + tz, and the resulting JobRecord must carry both fields
+    // verbatim (plus intervalSeconds=0 as the "not interval-driven"
+    // sentinel).
+    const config = testConfig("jobs-create-tool-cron");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_create_job_cron",
+      JSON.stringify({
+        name: "daily-9am",
+        prompt: "morning report",
+        cronExpression: "0 9 * * *",
+        cronTimezone: "America/Los_Angeles"
+      })
+    );
+    expect(result.kind).toBe("sync");
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.cronExpression).toBe("0 9 * * *");
+    expect(jobs[0]?.cronTimezone).toBe("America/Los_Angeles");
+    expect(jobs[0]?.intervalSeconds).toBe(0);
+
+    // Audit + return-message both reflect the cron cadence so a reviewer
+    // and the agent's follow-up reply describe the schedule correctly.
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.created" && event.target === jobs[0]!.id
+    );
+    expect(audit?.evidence?.cronExpression).toBe("0 9 * * *");
+    expect(audit?.evidence?.cronTimezone).toBe("America/Los_Angeles");
+    if (result.kind === "sync") {
+      expect(result.result).toContain("cron");
+      expect(result.result).toContain("America/Los_Angeles");
+    }
+  });
+
+  test("create_job dispatch rejects both intervalSeconds and cronExpression set", async () => {
+    const config = testConfig("jobs-create-tool-mutex");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_both",
+        JSON.stringify({
+          name: "both",
+          prompt: "x",
+          intervalSeconds: 60,
+          cronExpression: "0 9 * * *"
+        })
+      )
+    ).rejects.toThrow(/mutually exclusive/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch rejects when neither intervalSeconds nor cronExpression is set", async () => {
+    const config = testConfig("jobs-create-tool-neither");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_neither",
+        JSON.stringify({ name: "neither", prompt: "x" })
+      )
+    ).rejects.toThrow(/requires either intervalSeconds or cronExpression/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch rejects malformed cronExpression", async () => {
+    const config = testConfig("jobs-create-tool-bad-cron");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_bad_cron",
+        JSON.stringify({ name: "bad", prompt: "x", cronExpression: "foo bar baz qux quux" })
+      )
+    ).rejects.toThrow(/Invalid input: cronExpression/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
   test("create_job dispatch rejects non-integer timeoutSeconds", async () => {
     const config = testConfig("jobs-create-tool-validate-3");
     const taskId = await mutateState(config.instance, (state) => {
