@@ -552,7 +552,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     job.deliveryTargets ??= [];
     job.context ??= [];
     job.retryLimit ??= 0;
-    job.timeoutSeconds ??= 30;
+    job.timeoutSeconds ??= 600;
     job.runIds ??= [];
   }
   // Browser connection record is purely opt-in — feature added after the
