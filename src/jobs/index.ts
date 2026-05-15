@@ -580,22 +580,179 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
   // Validate up-front so 400-class errors come back as `Invalid input: ...`
   // before we open a mutateState write. Only validate fields the caller
   // actually supplied.
-  if (input.intervalSeconds !== undefined) assertPositiveInt("intervalSeconds", input.intervalSeconds);
+  //
+  // The patch shape lets callers swap a job between interval-driven and
+  // cron-driven without removing/recreating it. The four transitions are:
+  //   - interval -> interval: { intervalSeconds: N }
+  //   - cron -> cron: { cronExpression, cronTimezone? } (TZ alone is also legal
+  //     when the job is already cron-driven)
+  //   - interval -> cron: { cronExpression, cronTimezone?, intervalSeconds: null }
+  //   - cron -> interval: { intervalSeconds: N, cronExpression: null, cronTimezone?: null }
+  // `null` on cronExpression / cronTimezone / intervalSeconds means "clear"
+  // (mirrors the existing `costBudget: null` precedent below). The mutual-
+  // exclusion rule is: a single patch may not set BOTH a positive
+  // intervalSeconds AND a cronExpression — that's ambiguous, same as in
+  // `createScheduledJob`.
+  const setsIntervalPositive =
+    input.intervalSeconds !== undefined && input.intervalSeconds !== null;
+  const setsCronExpression =
+    input.cronExpression !== undefined && input.cronExpression !== null;
+  if (setsIntervalPositive && setsCronExpression) {
+    throw new Error("Invalid input: cronExpression and intervalSeconds are mutually exclusive");
+  }
+  if (setsIntervalPositive) assertPositiveInt("intervalSeconds", input.intervalSeconds);
   if (input.timeoutSeconds !== undefined) assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
   if (input.retryLimit !== undefined) assertNonNegativeInt("retryLimit", input.retryLimit);
+
+  // Validate the cron fields' shape (but not the expression semantics yet —
+  // that requires the existing job to compute the effective timezone, so we
+  // defer to inside mutateState).
+  let cronExpressionPatch: string | undefined;
+  if (setsCronExpression) {
+    if (typeof input.cronExpression !== "string" || input.cronExpression.trim().length === 0) {
+      throw new Error(`Invalid input: cronExpression must be a non-empty string (got ${String(input.cronExpression)})`);
+    }
+    cronExpressionPatch = input.cronExpression.trim();
+  }
+  let cronTimezonePatch: string | undefined;
+  const setsCronTimezone =
+    input.cronTimezone !== undefined && input.cronTimezone !== null;
+  if (setsCronTimezone) {
+    if (typeof input.cronTimezone !== "string" || input.cronTimezone.length === 0) {
+      throw new Error(`Invalid input: cronTimezone must be a non-empty string (got ${String(input.cronTimezone)})`);
+    }
+    cronTimezonePatch = input.cronTimezone;
+  }
+
   return mutateState(config.instance, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     if (typeof input.name === "string") job.name = input.name;
     if (typeof input.prompt === "string") job.prompt = input.prompt;
     if (typeof input.script === "string") job.script = input.script || undefined;
-    if (typeof input.intervalSeconds === "number") job.intervalSeconds = input.intervalSeconds;
     if (Array.isArray(input.deliveryTargets)) job.deliveryTargets = input.deliveryTargets.map(String);
     if (Array.isArray(input.context)) job.context = input.context.map(String);
     if (typeof input.retryLimit === "number") job.retryLimit = input.retryLimit;
     if (typeof input.timeoutSeconds === "number") job.timeoutSeconds = input.timeoutSeconds;
     if (typeof input.costBudget === "number") job.costBudget = Math.max(0, input.costBudget);
     else if (input.costBudget === null) job.costBudget = undefined;
+
+    // Schedule-mode transitions. The block below handles three orthogonal
+    // intents the caller can express in one patch:
+    //   1. clear cron (cronExpression: null) — implies switching to interval
+    //      (or the patch must also supply intervalSeconds; we don't refuse
+    //      here since `nextRunAt` is recomputed below).
+    //   2. set/replace cron expression and/or timezone.
+    //   3. set a positive intervalSeconds — implies switching off cron if it
+    //      was set.
+    // After applying intent, we recompute nextRunAt exactly once so the
+    // scheduler picks up the new cadence on its next tick.
+    const clearingCron =
+      input.cronExpression === null ||
+      (setsIntervalPositive && !setsCronExpression && job.cronExpression !== undefined);
+    const clearingInterval = input.intervalSeconds === null;
+    const clearingCronTimezone = input.cronTimezone === null;
+
+    // Resolve the NEW (post-patch) cron expression + timezone. We need these
+    // both to validate via croner and to recompute nextRunAt.
+    let newCronExpression: string | undefined = job.cronExpression;
+    let newCronTimezone: string | undefined = job.cronTimezone;
+    if (clearingCron) {
+      newCronExpression = undefined;
+      // Dropping the expression also drops the timezone — a TZ alone is
+      // meaningless on an interval job (mirrors createScheduledJob's rule).
+      newCronTimezone = undefined;
+    } else if (cronExpressionPatch !== undefined) {
+      newCronExpression = cronExpressionPatch;
+      // If a TZ is provided alongside, use it; otherwise default to the
+      // job's existing TZ if any, else "UTC".
+      if (cronTimezonePatch !== undefined) newCronTimezone = cronTimezonePatch;
+      else if (clearingCronTimezone) newCronTimezone = "UTC";
+      else if (newCronTimezone === undefined) newCronTimezone = "UTC";
+    } else if (cronTimezonePatch !== undefined) {
+      // Timezone-only update. Legal ONLY if the job is already cron-driven
+      // (or just became cron-driven in this patch — handled above).
+      if (newCronExpression === undefined) {
+        throw new Error("Invalid input: cronTimezone may only be set when cronExpression is set");
+      }
+      newCronTimezone = cronTimezonePatch;
+    } else if (clearingCronTimezone) {
+      // Explicit null on timezone with no cronExpression change: only legal
+      // if cron is also being cleared (handled above) — otherwise refuse,
+      // since "cron job with no timezone" is not a valid state.
+      if (newCronExpression !== undefined && !clearingCron) {
+        throw new Error("Invalid input: cronTimezone may not be cleared while cronExpression is set");
+      }
+      newCronTimezone = undefined;
+    }
+
+    // If we end up cron-driven, validate via croner and recompute nextRunAt
+    // from the cron schedule. If we end up interval-driven, recompute
+    // nextRunAt from `now + intervalSeconds`.
+    let newIntervalSeconds = job.intervalSeconds;
+    if (typeof input.intervalSeconds === "number") {
+      newIntervalSeconds = input.intervalSeconds;
+    } else if (clearingInterval && newCronExpression !== undefined) {
+      // Cron-driven jobs use 0 as the sentinel for "not interval-driven"
+      // (matches createScheduledJob's storage convention).
+      newIntervalSeconds = 0;
+    } else if (newCronExpression !== undefined && job.cronExpression === undefined) {
+      // Caller is switching interval -> cron but didn't explicitly null the
+      // intervalSeconds. Coerce it to the sentinel so the JobRecord stays in
+      // a coherent shape.
+      newIntervalSeconds = 0;
+    } else if (newCronExpression === undefined && job.cronExpression !== undefined && job.intervalSeconds === 0) {
+      // Cron -> interval requested (cronExpression: null) but caller forgot
+      // to supply a positive intervalSeconds. Refuse so we don't leave the
+      // job in an unfireable shape.
+      throw new Error("Invalid input: clearing cronExpression requires a positive intervalSeconds in the same patch");
+    }
+
+    // Recompute nextRunAt for any schedule-shape change.
+    const scheduleChanged =
+      newCronExpression !== job.cronExpression ||
+      newCronTimezone !== job.cronTimezone ||
+      (typeof input.intervalSeconds === "number" && newIntervalSeconds !== job.intervalSeconds);
+    if (scheduleChanged) {
+      if (newCronExpression !== undefined) {
+        const tz = newCronTimezone ?? "UTC";
+        // Re-validate via croner — same error shapes as createScheduledJob.
+        let cron: Cron;
+        try {
+          cron = new Cron(newCronExpression, { timezone: tz });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (/timezone/i.test(message)) {
+            throw new Error(`Invalid input: cronTimezone "${tz}" is not a valid IANA timezone (${message})`);
+          }
+          throw new Error(`Invalid input: cronExpression is not a valid 5-field Unix cron (${message})`);
+        }
+        let next: Date | null;
+        try {
+          next = cron.nextRun();
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          if (/timezone/i.test(message)) {
+            throw new Error(`Invalid input: cronTimezone "${tz}" is not a valid IANA timezone (${message})`);
+          }
+          throw new Error(`Invalid input: cronExpression is not a valid 5-field Unix cron (${message})`);
+        }
+        if (!next) {
+          throw new Error(`Invalid input: cronExpression "${newCronExpression}" has no future runs`);
+        }
+        job.nextRunAt = new Date(next.getTime()).toISOString();
+      } else {
+        // Interval-driven post-patch. Anchor nextRunAt to now + interval.
+        if (!Number.isFinite(newIntervalSeconds) || newIntervalSeconds <= 0) {
+          throw new Error("Invalid input: a non-cron job requires a positive intervalSeconds");
+        }
+        job.nextRunAt = new Date(Date.now() + newIntervalSeconds * 1000).toISOString();
+      }
+    }
+
+    job.cronExpression = newCronExpression;
+    job.cronTimezone = newCronTimezone;
+    job.intervalSeconds = newIntervalSeconds;
     job.updatedAt = now();
     addAudit(state, { actor: "user", action: "job.updated", target: job.id, risk: "low" });
     return job;
