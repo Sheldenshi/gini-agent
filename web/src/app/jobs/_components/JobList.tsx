@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import type { JobRecord } from "@runtime/types";
+import { scheduleLabel } from "./schedule-label";
 
 export function JobList({
   jobs,
@@ -36,7 +37,7 @@ export function JobList({
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <CardTitle className="line-clamp-1 text-sm">{job.name}</CardTitle>
-                <CardDescription className="font-mono text-[11px]">{job.id} · every {job.intervalSeconds}s</CardDescription>
+                <CardDescription className="font-mono text-[11px]">{job.id} · {scheduleLabel(job)}</CardDescription>
               </div>
               <StatusPill value={job.status} />
             </div>

@@ -8,6 +8,7 @@ import { StatusPill } from "@/components/StatusPill";
 import type { JobRecord, JobRunRecord } from "@runtime/types";
 import { RunList } from "./RunList";
 import { EditJobDialog } from "./EditJobDialog";
+import { scheduleLabel } from "./schedule-label";
 
 export function JobDetail({
   job,
@@ -27,7 +28,7 @@ export function JobDetail({
         <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
           <div className="min-w-0">
             <CardTitle className="truncate text-base">{job.name}</CardTitle>
-            <CardDescription className="font-mono text-[11px]">{job.id} · every {job.intervalSeconds}s</CardDescription>
+            <CardDescription className="font-mono text-[11px]">{job.id} · {scheduleLabel(job)}</CardDescription>
           </div>
           <div className="flex items-center gap-2">
             <StatusPill value={job.status} />
