@@ -75,7 +75,7 @@ export async function installSkillFromBody(
     const target = join(dir, safe);
     mkdirSync(join(target, ".."), { recursive: true });
     // Files dropped under `scripts/` are meant to be executed by the
-    // agent's terminal_exec wrapper (see ADR 0012 §Skills); land them
+    // agent's terminal_exec wrapper (see ADR connector-provider-spec-compliance.md §Skills); land them
     // mode 0755 so the spawn isn't blocked by a missing exec bit. Other
     // payloads (REFERENCES.md, asset files) keep default permissions.
     const isScript = safe.split(sep)[0] === "scripts";
@@ -148,7 +148,7 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
     // Status-only PATCH (used by install-skill meta-skill to flip trust)
     // skips the version bump and previousVersions push — it's a trust
-    // decision, not a content edit. ADR 0012 §UI requires this surface.
+    // decision, not a content edit. ADR connector-provider-spec-compliance.md §UI requires this surface.
     if (
       typeof input.status === "string" &&
       Object.keys(input).length === 1 &&

@@ -18,19 +18,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Architecture decisions
 
-- [ADR 0001 — Local Runtime Architecture](docs/adr/0001-local-runtime-architecture.md)
-- [ADR 0002 — Minimal Trust Substrate](docs/adr/0002-trust-substrate.md)
-- [ADR 0003 — Instances And Control Surface](docs/adr/0003-instances-and-control-surface.md)
-- [ADR 0004 — Agent Loop With Native Tool Calling](docs/adr/0004-agent-loop-tool-calling.md)
-- [ADR 0005 — Subagent Delegation](docs/adr/0005-subagent-delegation.md)
-- [ADR 0006 — Agents Replace Profiles And Drive Runtime Behavior](docs/adr/0006-agents-replace-profiles.md)
-- [ADR 0006 — dangerouslyAutoApprove](docs/adr/0006-dangerously-auto-approve.md)
-- [ADR 0007 — Per-Agent Memory Isolation](docs/adr/0007-agent-memory-isolation.md)
-- [ADR 0008 — Connector Secret Storage](docs/adr/0008-connector-secret-storage.md)
-- [ADR 0009 — Skills As Packages, Connectors As Credentials](docs/adr/0009-skills-and-connectors.md)
-- [ADR 0010 — Approval Execution Abort Protocol](docs/adr/0010-approval-execution-abort.md)
-- [ADR 0010 — Runtime Update Surface And Automatic Restart](docs/adr/0010-runtime-update-surface.md)
-- [ADR 0012 — Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](docs/adr/0012-connector-provider-spec-compliance.md)
+- [Architecture Decision Records](docs/adr/README.md): index of all ADRs and how to add new ones
 
 ## Architecture In One Sentence
 
@@ -71,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/Lilac-Labs/gini-agent/main/scripts/
 
 On macOS the installer enables autostart (per-user LaunchAgents for the runtime and webapp), waits for the webapp to come up, and opens the `/setup` page in your browser. Pick a provider in the browser form (OpenAI API key or existing `codex --login` auth) and you land on the running app. The runtime stays alive across reboots and crashes until you explicitly run `gini stop` or `gini autostart disable`.
 
-If the browser doesn't open automatically (or you want to navigate manually), run `gini status` to print the actual web URL — the port is hash-derived per instance, so it's almost never `:3000` for instances other than `dev`. The installer also prints the URL right before opening the browser.
+If the browser doesn't open automatically (or you want to navigate manually), run `gini status` to print the actual web URL. The installed `default` instance always lives at `:7777`; other instances get hash-derived ports, so check `gini status` rather than guessing. The installer also prints the URL right before opening the browser.
 
 Caveat on macOS 26 (Tahoe): after a SIGKILL, launchd sometimes refuses to auto-respawn (`pended nondemand spawn = inefficient`). Run `gini autostart kick` to force a respawn when that happens; RunAtLoad still fires at login.
 
@@ -102,7 +90,7 @@ bun run gini install
 bun run gini start
 ```
 
-When you run `bun run gini` from a repo clone, the instance is auto-derived from the repo directory basename (`gini-agent`, `boston`, `rabat`, etc.) so each worktree gets isolated state without typing `--instance` every time. The installed `gini` command from `curl | bash` always uses the `default` instance, so developer worktrees and end-user state never collide. Per-instance runtime and web ports are deterministic hashes within a 100-port window starting at 7337 (runtime) / 3000 (web); `gini status` prints the actual URLs.
+When you run `bun run gini` from a repo clone, the instance is auto-derived from the repo directory basename, so each worktree gets isolated state without typing `--instance` every time. The installed `gini` command from `curl | bash` always uses the `default` instance, so developer worktrees and end-user state never collide. Per-instance runtime and web ports are deterministic hashes within a 100-port window starting at 7337 (runtime) / 3000 (web); `gini status` prints the actual URLs.
 
 Run a foreground instance with an explicit name:
 
@@ -211,7 +199,7 @@ Full uninstall with two prompts (asks before deleting instance state):
 bun run gini uninstall
 ```
 
-See the Uninstall subsection under Quick Start for the `--yes` and `--purge` variants.
+Pass `--yes` to skip prompts, or `--purge` to wipe all instance state in one step.
 
 For disposable development or tests:
 
@@ -240,3 +228,7 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 
 
 This is the short preview. See the full roadmap in [ROADMAP.md](ROADMAP.md).
+
+## License
+
+[MIT](LICENSE)

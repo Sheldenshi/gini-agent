@@ -196,7 +196,7 @@ export default function SkillsPage() {
                   <Button size="sm" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "test" })}>Test</Button>
                   {/*
                     Trust toggle. Bundled skills (source === "bundled") are
-                    auto-trusted and the buttons are read-only. ADR 0012 §UI.
+                    auto-trusted and the buttons are read-only. ADR connector-provider-spec-compliance.md §UI.
                   */}
                   <Button size="sm" variant="outline" disabled={action.isPending || detail.source === "bundled"} onClick={() => action.mutate({ id: detail.id, op: "trust" })}>Trust</Button>
                   <Button size="sm" variant="outline" disabled={action.isPending || detail.source === "bundled"} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>

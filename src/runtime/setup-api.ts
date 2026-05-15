@@ -21,7 +21,7 @@
 //     `provider` (not `kind`) to match the CLI surface — `gini provider
 //     set <name>` already uses this terminology. Note: this is the model
 //     provider (echo/openai/anthropic/codex), distinct from the connector
-//     provider concept introduced by ADR 0012.
+//     provider concept introduced by ADR connector-provider-spec-compliance.md.
 //
 // What this DOES do for plist refresh: when an OpenAI key is written
 // and a gateway plist exists on disk, this module calls

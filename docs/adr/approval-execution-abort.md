@@ -1,4 +1,4 @@
-# ADR 0010: Approval execution abort protocol
+# ADR: Approval execution abort protocol
 
 ## Decision
 
@@ -268,6 +268,4 @@ not a hardcoded value.
   the pre-spawn (`spawnSkipped: true`) and post-spawn variants of the
   aborted row are accepted to absorb claim-vs-spawn microtask ordering
   on slow CI.
-- ADR 0002 (trust substrate) and ADR 0006 (`dangerouslyAutoApprove`,
-  file: `0006-dangerously-auto-approve.md`)
-  cross-link to this ADR.
+- ADR trust-substrate.md and ADR dangerously-auto-approve.md cross-link to this ADR.

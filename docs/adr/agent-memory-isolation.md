@@ -1,9 +1,8 @@
-# ADR 0007: Per-Agent Memory Isolation
+# ADR: Per-Agent Memory Isolation
 
 - **Status:** Accepted
 - **Date:** 2026-05-13
-- **See also:** [ADR 0006: Agents Replace Profiles And Drive Runtime
-  Behavior](./0006-agents-replace-profiles.md)
+- **See also:** [Agents Replace Profiles And Drive Runtime Behavior](./agents-replace-profiles.md)
 
 ## Decision
 
@@ -21,7 +20,7 @@ defaults at creation; content is not.
 Before isolation, all memory — legacy `MemoryRecord` rows and
 Hindsight banks and units — lived in a single pool per instance.
 Switching the active profile could see and write each other's
-memories. With agents now driving runtime behavior (see ADR 0006),
+memories. With agents now driving runtime behavior (see ADR agents-replace-profiles.md),
 shared memory leaks context across personas: a "coding" agent's pinned
 memories would pollute the "research" agent's recall and vice versa.
 

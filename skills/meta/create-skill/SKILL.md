@@ -135,10 +135,10 @@ When converting a legacy SKILL.md, the recipe is:
 1. Move `version`, `author`, `platforms`, `prerequisites`, and
    `requires.connectors` (with `provider:` items) under
    `metadata.gini.*` — paying attention to the renames introduced by
-   ADR 0012:
+   ADR connector-provider-spec-compliance.md:
    - `requires.identities[].kind` → `requires.connectors[].provider`.
    The legacy `requires.identities` / `kind:` shape is what older
-   pre-ADR-0012 SKILL.md files used; rewrite both keys when migrating.
+   pre-ADR-connector-provider-spec-compliance.md SKILL.md files used; rewrite both keys when migrating.
 
 2. Move `compatibility` to the top level if you can describe the host
    contract in ≤ 500 chars.

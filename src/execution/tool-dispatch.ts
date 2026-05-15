@@ -448,9 +448,9 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     name: skill.name,
     version: skill.version,
     bytes: skill.body.length,
-    // ADR 0012: capture the declared allowed-tools at read time so the audit
+    // ADR connector-provider-spec-compliance.md: capture the declared allowed-tools at read time so the audit
     // trail records the contract the agent agreed to follow when invoking
-    // this skill. Not enforced at the tool dispatcher yet — see ADR 0012
+    // this skill. Not enforced at the tool dispatcher yet — see ADR connector-provider-spec-compliance.md
     // "Deferred" for the enforcement plan.
     allowedTools: skill.allowedTools
   });

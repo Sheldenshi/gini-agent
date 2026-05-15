@@ -15,6 +15,8 @@ Keep ADRs current when architecture changes.
 - Update an existing ADR when the original decision still stands but implementation details, consequences, or acceptance checks changed.
 - Add a new ADR for a significant architecture decision, trust boundary, persistence model, process shape, provider strategy, client contract, or operational workflow.
 - If a change makes an ADR obsolete, mark the old decision as superseded and link to the replacement ADR.
+- ADRs are named by slug (`docs/adr/<slug>.md`), no number prefix. Pick the slug carefully and never rename it once merged — the filename is the citation key.
+- Always cite an ADR by its full filename including `.md` so the reference is unambiguously a file: `see ADR agent-memory-isolation.md` in prose and code comments, and `[Per-Agent Memory Isolation](./agent-memory-isolation.md)` for markdown links.
 
 ## Boundaries
 
@@ -68,7 +70,7 @@ tail -n 200 ~/.gini/instances/$INSTANCE/logs/runtime.jsonl
 ## Tmux session
 
 `bun run gini run` is launched inside a tmux session named `gini-<instance>`
-(e.g. `gini-rabat`) so the user can watch the live process and the agent
+so the user can watch the live process and the agent
 can restart it without disturbing what the user sees in their terminal.
 
 ```bash

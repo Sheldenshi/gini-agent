@@ -181,7 +181,7 @@ Two approval-bypass controls live behind the same endpoint
   and the legacy imperative dispatcher (`POST /api/tasks`, `gini task
   submit`). Default is `false`. Intended for trusted local dev loops
   only — there is no human review for any side effect when this is
-  on. See [ADR 0006](adr/0006-dangerously-auto-approve.md) for the
+  on. See [ADR dangerously-auto-approve.md](adr/dangerously-auto-approve.md) for the
   full design and audit contract.
 
 Read current settings:

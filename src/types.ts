@@ -129,7 +129,7 @@ export interface RuntimeConfig {
   // carry `evidence.autoApproved=true` plus
   // `evidence.autoApprovedReason="dangerouslyAutoApprove"`, so the
   // trail stays inspectable — only the human gate is skipped.
-  // Intended for trusted, dev-mode use only. See ADR 0006 for the
+  // Intended for trusted, dev-mode use only. See ADR dangerously-auto-approve.md for the
   // full audit contract.
   dangerouslyAutoApprove?: boolean;
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so
@@ -729,7 +729,7 @@ export interface ConnectorRecord {
   name: string;
   // Discriminator: identifies which provider module handles this connector
   // ("demo", "linear", "claude-code", "codex", "generic", or any module id
-  // in the registry). Renamed from `kind` in ADR 0012.
+  // in the registry). Renamed from `kind` in ADR connector-provider-spec-compliance.md.
   provider: string;
   status: "configured" | "disabled" | "error";
   scopes: string[];

@@ -1,4 +1,4 @@
-// Provider-module registry (ADR 0012).
+// Provider-module registry (ADR connector-provider-spec-compliance.md).
 //
 // Every concrete provider lives in this folder as `<id>.ts` and exports a
 // `ProviderModule`. The registry collects them at import time so the

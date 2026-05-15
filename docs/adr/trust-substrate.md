@@ -1,4 +1,4 @@
-# ADR 0002: Minimal Trust Substrate
+# ADR: Minimal Trust Substrate
 
 ## Decision
 
@@ -28,10 +28,10 @@ The product promise is operational trust. The system can start small, but it mus
 ## Consequences For Coding Agents
 
 - If a new action can mutate state outside the task/run record, add an audit event.
-- If a new action can affect user files or system state, route it through approval first. The operator can opt into the sanctioned bypass (`dangerouslyAutoApprove`, ADR 0006) which still produces the full approval + audit trail with an explicit auto-approved marker — but new tools should be designed assuming the human gate is the default.
+- If a new action can affect user files or system state, route it through approval first. The operator can opt into the sanctioned bypass (`dangerouslyAutoApprove`, ADR dangerously-auto-approve.md) which still produces the full approval + audit trail with an explicit auto-approved marker — but new tools should be designed assuming the human gate is the default.
 - If a new action happens during execution, append trace evidence.
 - If a new bundled skill wraps a side-effecting command, keep the underlying command approval-gated unless an explicit auto-approve rule covers it.
-- If a new approval-gated action awaits anything cancellable (a spawned proc, an HTTP request, etc.), thread the abort signal from `claimApproval` into the side effect so `cancelTask` can intercept in-flight work. The contract is documented in ADR 0010.
+- If a new approval-gated action awaits anything cancellable (a spawned proc, an HTTP request, etc.), thread the abort signal from `claimApproval` into the side effect so `cancelTask` can intercept in-flight work. The contract is documented in ADR approval-execution-abort.md.
 
 ## Acceptance Checks
 

@@ -550,7 +550,7 @@ function shouldAutoRetain(task: Task): boolean {
   // else goes through the extractor — which returns an empty fact list for
   // non-factual inputs ("hi", "ok", "yes") at the cost of one structured-LLM
   // call. We accept that cost so short personal-fact disclosures ("my name is
-  // shelden", "I prefer dark mode") aren't filtered out by a length heuristic.
+  // Sam", "I prefer dark mode") aren't filtered out by a length heuristic.
   //
   // We apply the same shape gates as the dispatcher so natural-language
   // prompts ("read this paper carefully", "find me a restaurant") still get
@@ -1276,7 +1276,7 @@ async function runApprovedAction(
     // `detached` option that turns the child into a session leader,
     // so a `process.kill(-pid)` group kill is unsafe (without
     // detached, `-pid` is a non-existent or our-own process group).
-    // ADR 0010 documents the residual gap; a true setsid wrap is
+    // ADR approval-execution-abort.md documents the residual gap; a true setsid wrap is
     // tracked as deferred work.
     let abortReason: string | undefined;
     const procExitedSentinel = proc.exited.then(() => "exited" as const);
@@ -1451,7 +1451,7 @@ async function runApprovedAction(
     // so a late rejection doesn't surface as unhandled. The audit
     // row reflects what the runtime acknowledged at signal
     // time, not what the browser eventually committed — the tradeoff
-    // is documented in ADR 0010.
+    // is documented in ADR approval-execution-abort.md.
     const taskId = approval.taskId;
     const outcome = await raceWithAbort(
       () => browserUploadFileApproved(taskId, ref, config.workspaceRoot, userPath),

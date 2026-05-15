@@ -1,4 +1,4 @@
-# ADR 0012: Connector + Provider Vocabulary, Spec Compliance, and Meta-Skills
+# ADR: Connector + Provider Vocabulary, Spec Compliance, and Meta-Skills
 
 ## Decision
 
@@ -38,7 +38,7 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - Helpers: `isSkillActive`, `resolveSkillEnv`, `resolveActiveSkillsEnv` keep their names — the verb operates on skills.
 - Web: `useIdentities` → `useConnectors`. The route moves from `/connections` to `/connectors`; sidebar label and page title both read "Connectors". Underlying queries and types match the new vocabulary.
 - State migration: on load, rename `state.identities` → `state.connectors` and `record.kind` → `record.provider` silently. No back-compat shim is exposed.
-- ADR 0008 title becomes "Connector Secret Storage"; ADR 0009 becomes "Skills and Connectors." Body text updated to match.
+- ADR connector-secret-storage.md title becomes "Connector Secret Storage"; ADR skills-and-connectors.md becomes "Skills and Connectors." Body text updated to match.
 
 ### SKILL.md spec compliance
 

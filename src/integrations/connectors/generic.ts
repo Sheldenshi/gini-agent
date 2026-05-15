@@ -1,6 +1,6 @@
 import type { ProviderModule } from "./types";
 
-// The "generic" provider is the escape hatch (ADR 0012) used when a skill
+// The "generic" provider is the escape hatch (ADR connector-provider-spec-compliance.md) used when a skill
 // declares a connector requirement for a system Gini has no native module
 // for. The user provides arbitrary `{ name, value, secret }` fields in the
 // Add Connector dialog; secrets land in the encrypted store, non-secrets

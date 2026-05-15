@@ -1,4 +1,4 @@
-# ADR 0010: Runtime update surface and automatic restart
+# ADR: Runtime update surface and automatic restart
 
 ## Decision
 

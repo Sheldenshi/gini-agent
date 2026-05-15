@@ -9,7 +9,6 @@ import { api } from "@/lib/api";
 import { useChatSessions, useInvalidate, useState_, useStatus, useTask, useTasks } from "@/lib/queries";
 import type { Task, TraceRecord } from "@runtime/types";
 import type { ChatSession } from "@/lib/view-types";
-import { SubmitForm } from "./_components/SubmitForm";
 import { TaskList, type TaskFilter } from "./_components/TaskList";
 import { TaskDetail } from "./_components/TaskDetail";
 import { FleetDashboard } from "./_components/FleetDashboard";
@@ -29,7 +28,6 @@ export default function TasksPage() {
   // straight into a specific task. Falls back to "all" filter so the task
   // is visible in the list panel.
   const initial = params?.get("id") ?? null;
-  const [input, setInput] = useState("");
   const [filter, setFilter] = useState<string>(initial ? "all" : "active");
   const [selected, setSelected] = useState<string | null>(initial);
   const tasks = useTasks();
@@ -47,17 +45,6 @@ export default function TasksPage() {
     }
   }, [initial, selected]);
 
-  const submit = useMutation({
-    mutationFn: (text: string) => api<Task>("/tasks", { method: "POST", body: JSON.stringify({ input: text }) }),
-    onSuccess: (task) => {
-      toast.success(`Task submitted: ${task.id}`);
-      setInput("");
-      setSelected(task.id);
-      invalidate(["tasks", "state", "events"]);
-    },
-    onError: (error: Error) => toast.error(error.message)
-  });
-
   const action = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "retry" | "cancel" }) =>
       api<Task>(`/tasks/${id}/${op}`, { method: "POST" }),
@@ -70,7 +57,7 @@ export default function TasksPage() {
 
   return (
     <>
-      <PageHeader title="Tasks" description="Submit, monitor, and inspect tasks" />
+      <PageHeader title="Tasks" description="Monitor and inspect tasks" />
       <div className="px-4 pt-4 md:px-6 md:pt-6">
         <FleetDashboard
           tasks={tasks.data ?? []}
@@ -81,12 +68,6 @@ export default function TasksPage() {
       </div>
       <div className="flex flex-1 flex-col gap-4 overflow-hidden p-4 md:flex-row md:p-6">
         <div className="flex w-full shrink-0 flex-col gap-4 md:w-[420px]">
-          <SubmitForm
-            input={input}
-            pending={submit.isPending}
-            onChange={setInput}
-            onSubmit={() => submit.mutate(input.trim())}
-          />
           <TaskList
             tasks={tasks.data ?? []}
             filters={FILTERS}

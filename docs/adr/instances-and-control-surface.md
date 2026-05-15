@@ -1,11 +1,11 @@
-# ADR 0003: Instances And Control Surface
+# ADR: Instances And Control Surface
 
 ## Decision
 
 Gini is instance-aware. There are two flavors:
 
 - **Production end-users** run the installed `gini` CLI (from `curl|bash`). The wrapper at `~/.local/bin/gini` always sets `GINI_INSTANCE=default`, pinning end-users to a single `default` instance with stable, memorable ports (web `7777`, runtime `7778`).
-- **Developers** run `bun run gini ...` from a repo checkout. The instance is auto-derived from the repo root directory basename (`boston`, `rabat`, `gini-agent`, etc.), so each worktree gets isolated state without typing `--instance`. Ports for these instances are deterministic per-name hashes within a 100-port window, so parallel worktrees coexist without manual port wrangling.
+- **Developers** run `bun run gini ...` from a repo checkout. The instance is auto-derived from the repo root directory basename (e.g. `gini-agent`, or whatever a worktree is named), so each worktree gets isolated state without typing `--instance`. Ports for these instances are deterministic per-name hashes within a 100-port window, so parallel worktrees coexist without manual port wrangling.
 
 `--instance <name>` or `GINI_INSTANCE` overrides either default. The CLI, runtime API, web control plane, traces, logs, state, config, workspace, and memory database all use the selected instance.
 
@@ -62,6 +62,6 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
 - `bun run gini --instance sandbox reset` does not affect the auto-derived worktree instance.
 - Multiple `bun run gini smoke` invocations can run concurrently because they create separate smoke instances by default.
 - `bun run gini --instance sandbox doctor` reports `sandbox`.
-- `bun run gini status` from a worktree named `boston` reports instance `boston`.
+- `bun run gini status` from a worktree directory reports the worktree basename as the instance.
 - `gini status` from the installed wrapper reports instance `default` on ports 7777/7778.
 - Web and API for a running instance show the same instance identity.

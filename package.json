@@ -2,6 +2,7 @@
   "name": "gini-agent",
   "version": "0.0.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "bin": {
     "gini": "./src/cli.ts"

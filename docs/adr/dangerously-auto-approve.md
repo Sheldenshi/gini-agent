@@ -1,4 +1,4 @@
-# ADR 0006: dangerouslyAutoApprove — sanctioned approval-bypass mode
+# ADR: dangerouslyAutoApprove — sanctioned approval-bypass mode
 
 ## Decision
 
@@ -38,7 +38,7 @@ gate for specific `terminal_exec` patterns. That mechanism is too
 narrow for a trusted local dev loop where the operator wants every
 file write and shell command the agent issues to fire without prompts.
 
-ADR 0002 (trust substrate) and ADR 0004 (agent loop) both describe
+ADR trust-substrate.md and ADR agent-loop-tool-calling.md both describe
 approvals as *the* path to side effects. We did not want to weaken
 those invariants by allowing the model to bypass them — the bypass has
 to be (a) an explicit operator configuration choice, (b) auditable
@@ -101,7 +101,7 @@ human gate or routes through the same shared path.
   `config.json` directly.
 - ~~A more general approval-execution claim/cancellation protocol that
   lets `cancelTask` abort an already-approved async side effect~~ —
-  shipped in ADR 0010. The in-flight registry threads an
+  shipped in ADR approval-execution-abort.md. The in-flight registry threads an
   `AbortSignal` through `executeApprovedAction` and `cancelTask`
   fans the abort out to every active executor for the cancelled
   task. The audit trail gains `*_aborted` action names plus an

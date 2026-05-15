@@ -121,7 +121,7 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
 //
 // Embeddings and the reranker do NOT use this — they continue to read
 // config.provider directly so semantic recall stays stable across agent
-// switches (see ADR 0006).
+// switches (see ADR agents-replace-profiles.md).
 export function providerOverrideForRuntime(config: RuntimeConfig): ProviderConfig | undefined {
   const state = readState(config.instance);
   const effective = resolveEffectiveContext(state, config);

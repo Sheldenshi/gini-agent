@@ -63,7 +63,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
 
   // Resolve the active agent's provider override once. Used for the LLM
   // generation and opinion-extraction calls below. Embeddings/reranker
-  // stay on config.provider (semantic-recall stability — see ADR 0006).
+  // stay on config.provider (semantic-recall stability — see ADR agents-replace-profiles.md).
   const providerOverride = providerOverrideForRuntime(config);
 
   // 1. Recall.
