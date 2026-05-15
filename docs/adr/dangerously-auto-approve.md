@@ -154,3 +154,93 @@ human gate or routes through the same shared path.
   (allowlist and non-allowlist), the imperative dispatch path, the
   symlink-escape rejection, the side-effect-failure propagation, and
   the direct `resolveApproval` unit shape.
+
+## Per-Job Scope
+
+`RuntimeConfig.dangerouslyAutoApprove` and
+`RuntimeConfig.autoApproveCommands` are operator-only global config.
+That shape is right for a trusted local dev loop, but it falls down for
+scheduled jobs: a `create_job` invocation that the user expects to run
+*unattended* (recurring, no human at fire-time) cannot be configured to
+auto-approve through chat without first asking the operator to flip a
+global switch that affects every other task on the instance. The
+job-spawned chat-task hits the first approval gate and stalls in
+`waiting_approval` forever.
+
+The refinement: thread the same envelope **per-job** without changing
+its shape or semantics.
+
+- `JobRecord` gains two optional fields,
+  `autoApproveCommands?: string[]` and
+  `dangerouslyAutoApprove?: boolean`. Both default to absent, in which
+  case the job-spawned task inherits the current per-instance
+  RuntimeConfig behavior (no change for legacy jobs).
+- `createScheduledJob` validates both fields with the same shape as
+  the operator-side validators (non-empty strings inside the array,
+  strict boolean for the flag) and persists them onto the JobRecord.
+- `dispatchPromptRun` builds a *cloned* RuntimeConfig via
+  `buildTaskConfig`, overlays the job's envelope onto the clone, and
+  hands the clone to `submitTask`. The clone — never the original —
+  is what the spawned chat-task sees. `dangerouslyAutoApprove=true`
+  on the job sets the same flag on the clone; a non-empty
+  `autoApproveCommands` is merged onto the cloned array (the
+  operator's global allowlist still applies; the per-job opt-in
+  widens it for that job's task only).
+- The scheduled-run path (`runDueJobs` → `dispatchPromptRun`) and the
+  manual / replay paths (`runJobNow` → `dispatchPromptRun`) both go
+  through the same `buildTaskConfig` seam, so an operator who clicks
+  Run / replays a job tests the same envelope the scheduler will use
+  at fire-time.
+- `create_job` tool spec exposes `autoApproveCommands`,
+  `dangerouslyAutoApprove`, and `timeoutSeconds` to the chat agent.
+  The tool description states: "When a scheduled job needs to run
+  *unattended*, set `autoApproveCommands` for the commands it will
+  need to run, or `dangerouslyAutoApprove: true` for tasks that need
+  broad action — otherwise the job will stall at the first approval
+  gate forever." The dispatcher validates the envelope before reaching
+  `createScheduledJob` so a bad payload returns a typed
+  `Invalid input: …` tool-result.
+- Audit/trace evidence on the `job.created` row captures the envelope
+  the agent chose so a reviewer can answer "what bypass did this job
+  schedule for itself?" without replaying the conversation.
+
+### Trust model
+
+The per-job opt-in does NOT widen the system's trust surface — it
+shifts the opt-in point from operator config to a chat exchange:
+
+1. The user describes unattended work in natural language ("read the
+   docs every morning and open a PR with the cleanup").
+2. The chat agent translates intent into the envelope — choosing
+   `autoApproveCommands` for narrow opt-in (`"git *"`, `"gh *"`,
+   `"rg *"`) and only escalating to `dangerouslyAutoApprove: true`
+   when the user explicitly authorizes broad action.
+3. The runtime applies the envelope **only** to that job's spawned
+   tasks via the cloned config. The operator's global RuntimeConfig is
+   never mutated.
+4. The same audit contract applies: every auto-approved side effect
+   produces an approval row (status="approved") and an action audit
+   row, both stamped with `evidence.autoApproved=true` and
+   `evidence.autoApprovedReason=<matched pattern>` (for the allowlist
+   fast path) or `"dangerouslyAutoApprove"` (for the full bypass).
+   The `job.created` audit row also captures which envelope the agent
+   scheduled, so the trail shows both the original opt-in and every
+   action that fired under it.
+
+### Consequences for coding agents
+
+- New approval-gated tools added in the future continue to inherit the
+  bypass via the existing `pendingOrAuto` / allowlist paths in
+  `tool-dispatch.ts`. No additional per-job wiring is needed because
+  the envelope flows through `RuntimeConfig`, which is what those
+  paths already read.
+- `buildTaskConfig` MUST NOT mutate its `config` argument. Cloning the
+  config (including a fresh array for `autoApproveCommands`) is what
+  keeps the operator's global RuntimeConfig isolated from the
+  per-job envelope. Failing to clone would silently leak the job's
+  bypass into every other task on the instance.
+- `src/jobs/auto-approve.test.ts` covers the end-to-end matrix
+  (allowlist fast-path, full bypass via `resolveApproval`, default
+  behavior preserved without the envelope) plus the validators on the
+  persistence layer; `src/jobs.test.ts` adds the equivalent matrix at
+  the `create_job` tool-dispatch entry point.
