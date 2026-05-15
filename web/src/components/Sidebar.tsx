@@ -142,19 +142,21 @@ function UpdateReminder() {
           {updateAvailable ? (
             <div className="text-xs font-medium text-sidebar-foreground">Update ready</div>
           ) : (
-            <div className="text-xs text-sidebar-foreground/65">Gini runtime</div>
+            <div className="text-xs text-sidebar-foreground/65">Gini agent</div>
           )}
         </div>
-        <Button
-          size="sm"
-          variant={updateAvailable ? "default" : "outline"}
-          className="h-7 shrink-0"
-          disabled={update.isPending || !updateSupported}
-          onClick={() => update.mutate()}
-        >
-          {update.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
-          Update
-        </Button>
+        {updateAvailable ? (
+          <Button
+            size="sm"
+            variant="default"
+            className="h-7 shrink-0"
+            disabled={update.isPending || !updateSupported}
+            onClick={() => update.mutate()}
+          >
+            {update.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+            Update
+          </Button>
+        ) : null}
       </div>
     </div>
   );
