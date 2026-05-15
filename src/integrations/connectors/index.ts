@@ -15,6 +15,11 @@ export interface CreateConnectorInput {
   metadata?: Record<string, unknown>;
 }
 
+// CRUD-created connectors always carry `source: "user"`. The detection
+// job creates `source: "auto"` records directly on the state slab without
+// going through this helper so the auto-create path keeps its own audit
+// signal (`connector.auto_create`).
+
 export interface UpdateConnectorInput {
   name?: string;
   scopes?: string[];
@@ -49,7 +54,8 @@ export async function createConnector(config: RuntimeConfig, input: CreateConnec
       createdAt: at,
       updatedAt: at,
       health: "unknown",
-      metadata: input.metadata
+      metadata: input.metadata,
+      source: "user"
     };
     state.connectors.unshift(connector);
     // For providers without a probe (demo, generic, claude-code, codex)
@@ -116,11 +122,41 @@ export async function updateConnector(
   });
 }
 
-export async function deleteConnector(config: RuntimeConfig, connectorId: string): Promise<{ id: string }> {
-  deleteConnectorSecrets(config.instance, connectorId);
+export async function deleteConnector(config: RuntimeConfig, connectorId: string): Promise<{ id: string; tombstoned?: boolean }> {
+  // Read the source up-front so we can decide whether to physically wipe
+  // the encrypted secrets. Auto-source connectors don't carry secrets
+  // today (claude-code/codex are presence-only), but the wipe is still
+  // safe to skip — the tombstone path leaves the record in place so a
+  // future "rotate" or "edit" could rebuild it.
+  const initial = readState(config.instance).connectors.find((c) => c.id === connectorId);
+  if (!initial) throw new Error(`Connector not found: ${connectorId}`);
+  const isAuto = initial.source === "auto";
+
+  if (!isAuto) {
+    deleteConnectorSecrets(config.instance, connectorId);
+  }
+
   return mutateState(config.instance, (state) => {
     const index = state.connectors.findIndex((candidate) => candidate.id === connectorId);
     if (index < 0) throw new Error(`Connector not found: ${connectorId}`);
+    if (isAuto) {
+      // Tombstone — keep the record around with `status: "disabled"` so
+      // the detection job (which skips disabled rows) doesn't immediately
+      // re-create the connector after the user explicitly disconnected it.
+      const connector = state.connectors[index]!;
+      connector.status = "disabled";
+      connector.health = "unknown";
+      connector.message = undefined;
+      connector.updatedAt = now();
+      addAudit(state, {
+        actor: "user",
+        action: "connector.disable",
+        target: connectorId,
+        risk: "medium",
+        evidence: { provider: connector.provider, name: connector.name, source: connector.source }
+      });
+      return { id: connectorId, tombstoned: true };
+    }
     const [connector] = state.connectors.splice(index, 1);
     addAudit(state, {
       actor: "user",

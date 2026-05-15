@@ -39,7 +39,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
         secretRefs: [],
         createdAt: at,
         updatedAt: at,
-        health: "unknown"
+        health: "unknown",
+        source: "user"
       }
     ],
     improvements: [],
@@ -210,6 +211,11 @@ function migrateIdentitiesToConnectors(state: RuntimeState): void {
       }
       delete rec.kind;
       connector.secretRefs ??= [];
+      // Auto-detection landed after the original ConnectorRecord shape;
+      // pre-existing records were all created via the user-driven CRUD
+      // path, so default `source: "user"`. The detection job stamps
+      // "auto" when it materializes a new record.
+      connector.source ??= "user";
     }
   }
 }

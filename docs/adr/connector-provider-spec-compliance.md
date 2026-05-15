@@ -36,7 +36,7 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - CLI: `gini identity ...` → `gini connector ...`.
 - Audit event names: `identity.*` → `connector.*`.
 - Helpers: `isSkillActive`, `resolveSkillEnv`, `resolveActiveSkillsEnv` keep their names — the verb operates on skills.
-- Web: `useIdentities` → `useConnectors`. The route moves from `/connections` to `/connectors`; sidebar label and page title both read "Connectors". Underlying queries and types match the new vocabulary.
+- Web: `useIdentities` → `useConnectors`. There is no standalone Connectors page in the sidebar — connector setup happens inline on the Skills page next to the rows that depend on a connector. The `useConnectors` hook stays the canonical client query so the inline rows can read connector state without coupling to page lifecycle.
 - State migration: on load, rename `state.identities` → `state.connectors` and `record.kind` → `record.provider` silently. No back-compat shim is exposed.
 - ADR connector-secret-storage.md title becomes "Connector Secret Storage"; ADR skills-and-connectors.md becomes "Skills and Connectors." Body text updated to match.
 
@@ -104,9 +104,13 @@ Both are bundled, trusted by default, and declare `metadata.gini.requires.connec
 
 ### Web UI
 
-- **Skills page** (new) at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `untrusted`. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. "Connect →" affordance on missing connectors opens the Add Connector dialog with `provider` pre-filled.
+- **Skills page** at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `untrusted`. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. Connector management happens inline:
+  - Missing connectors render an inline `[Set up <Label>]` button that opens the Add Connector dialog scoped to that provider (no navigation).
+  - Healthy connectors render a `[Disconnect]` affordance. Disconnect calls `DELETE /api/connectors/<id>`; the gateway tombstones `source: "auto"` records (status="disabled") and physically deletes `source: "user"` records.
+  - A `Refresh detection` button at the top of the page calls `POST /api/connectors/detect` to re-run the auto-detection pass on demand.
 - **Trust toggle** on each user-installed skill ("source: user"). Bundled skills are auto-trusted and the toggle is read-only.
-- **Connectors page** at `/connectors`. Cards label "Connector" not "Identity"; dependents column reads "Used by: linear skill, custom-jira skill."
+- **Auto-detected connectors** (`source: "auto"`) are returned by `GET /api/connectors` but are not surfaced anywhere in the UI when no installed skill depends on their provider. They become visible the moment a dependent skill installs and references their provider — by appearing on that skill's row.
+- There is **no standalone Connectors page**. The `/connectors` route does not exist; the sidebar has no Connectors entry.
 
 ## Rejected
 
@@ -143,10 +147,14 @@ Both are bundled, trusted by default, and declare `metadata.gini.requires.connec
 - `bun run gini connector add --provider demo --name test` works; `bun run gini connector list` shows it; `bun run gini connector remove <id>` removes it.
 - HTTP CRUD round-trip on `/api/connectors` confirms plaintext secrets never appear in state.json.
 - Add Connector dialog shows correct fields per provider (token for linear, dynamic for generic, none for claude-code/codex).
-- Skills page shows every loaded skill with correct activation status, with "Connect →" on missing connectors deeplinking to Add Connector with provider pre-filled.
+- Skills page shows every loaded skill with correct activation status, with `[Set up <Label>]` on missing connectors opening the Add Connector dialog inline (no navigation, provider locked to the row's requirement).
+- Skills page exposes inline `[Disconnect]` next to healthy connectors, and the gateway tombstones auto-source records on delete (status="disabled") so the next detection pass does not re-create them.
+- `runConnectorDetection` runs at gateway startup and via `POST /api/connectors/detect`; idempotent (no duplicate records on repeat runs, skips disabled tombstones).
+- Auto-detected connectors with no dependent skill installed never render in the UI; `GET /api/connectors` still returns them.
+- The standalone `/connectors` page is gone (404). The sidebar has no Connectors entry.
 - Trust toggle on user-installed skills works; activation gate respects it.
 - create-skill meta-skill is bundled, trusted, active, and produces a valid SKILL.md when invoked via a real agent task.
 - install-skill meta-skill is bundled, trusted, active, and installs a pasted SKILL.md end-to-end (validating, reviewing, walking trust, installing via API, confirming activation).
 - Periodic re-probe job runs at the configured interval, updates health, emits audit events on transitions.
-- A live browser test of the Connectors page + Skills page confirms the renamed vocabulary, add/delete flows, trust toggle, and deeplink between pages all work.
+- A live browser test of the Skills page confirms the inline Set Up dialog, the inline Disconnect with tombstone behavior for auto-source connectors, the Refresh detection action, and the trust toggle. Visiting `/connectors` returns 404 and the sidebar has no Connectors entry.
 - A live functional test on the running instance invokes both meta-skills via a task and verifies the outcome on disk.

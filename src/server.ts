@@ -2,6 +2,7 @@ import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
+import { runConnectorDetection } from "./jobs/connector-detection";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
@@ -95,6 +96,24 @@ loadSkillsFromDisk(config)
   })
   .catch((error) => {
     appendLog(config.instance, "skills.load.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+// Auto-detect connectors with `source: "auto"` for any provider that
+// declares a `detect()` (today claude-code and codex). Idempotent: skips
+// providers that already have a record or a disabled tombstone. Errors
+// are absorbed so a flaky `which` lookup can't block startup.
+runConnectorDetection(config)
+  .then((report) => {
+    appendLog(config.instance, "connector.detection.startup", {
+      considered: report.considered,
+      created: report.created.length,
+      skipped: report.skipped.length
+    });
+  })
+  .catch((error) => {
+    appendLog(config.instance, "connector.detection.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });

@@ -32,8 +32,19 @@ export const codexProvider: ProviderModule = {
     return { ok: false, message: "codex on PATH but no auth (no ~/.codex/auth.json and no OPENAI_API_KEY)." };
   },
   async detect() {
+    // Detect when both the binary is on PATH AND at least one auth surface
+    // exists (~/.codex/auth.json from `codex login`, or the OPENAI_API_KEY
+    // env var). Without the auth check, a fresh `codex` install would seed
+    // an unhealthy auto-connector that does nothing useful.
     const path = which("codex");
     if (!path) return { detected: false };
-    return { detected: true, suggestedName: "codex", message: `Found codex at ${path}.` };
+    const authFile = join(homedir(), ".codex", "auth.json");
+    const hasAuthFile = existsSync(authFile);
+    const hasEnv = Boolean(process.env.OPENAI_API_KEY);
+    if (!hasAuthFile && !hasEnv) {
+      return { detected: false, message: `codex found at ${path} but no auth source.` };
+    }
+    const via = hasAuthFile ? authFile : "OPENAI_API_KEY";
+    return { detected: true, suggestedName: "Codex", message: `Found codex at ${path}; auth via ${via}.` };
   }
 };

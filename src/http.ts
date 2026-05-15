@@ -6,6 +6,7 @@ import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
+import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
 import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
 import { embeddingStatus, reembedBank } from "./memory/embedding";
@@ -340,6 +341,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["DELETE", /^\/api\/connectors\/([^/]+)$/, async (_request, params) => json(await deleteConnector(config, params[0]))],
     ["POST", /^\/api\/connectors\/([^/]+)\/health$/, async (_request, params) => json(await checkConnector(config, params[0]))],
+    // On-demand auto-detection — Skills page "Refresh detection" button
+    // calls this. Same job that runs at gateway startup; idempotent.
+    ["POST", /^\/api\/connectors\/detect$/, async () => json(await runConnectorDetection(config))],
     ["GET", /^\/api\/improvements$/, () => json(readState(config.instance).improvements)],
     ["POST", /^\/api\/improvements$/, async (request) => json(await proposeImprovement(config, await body(request)), 201)],
     ["POST", /^\/api\/improvements\/([^/]+)\/approve$/, async (_request, params) => json(await reviewImprovement(config, params[0], "approve"))],

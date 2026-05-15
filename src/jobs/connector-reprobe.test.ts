@@ -44,6 +44,60 @@ describe("runConnectorReprobe", () => {
     expect(report.probed).toBe(0);
   });
 
+  test("skips disabled (tombstoned) connectors so detection-deleted auto records aren't resurrected", async () => {
+    const config = buildConfig("reprobe-tombstone");
+    // Stale lastHealthAt (>30m) ensures the interval gate would otherwise
+    // allow a re-probe. Without the disabled-skip guard, the linear probe
+    // would run and (when the connector has a probe) write back fresh
+    // health/status — clobbering the tombstone.
+    const stale = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    await mutateState(config.instance, (state) => {
+      state.connectors.push({
+        id: "id_linear_disabled",
+        instance: state.instance,
+        name: "tombstoned linear",
+        provider: "linear",
+        status: "disabled",
+        scopes: [],
+        secretRefs: [],
+        source: "auto",
+        createdAt: stale,
+        updatedAt: stale,
+        lastHealthAt: stale,
+        health: "unknown"
+      });
+      state.connectors.push({
+        id: "id_linear_active",
+        instance: state.instance,
+        name: "active linear",
+        provider: "linear",
+        status: "configured",
+        scopes: [],
+        secretRefs: [],
+        source: "user",
+        createdAt: stale,
+        updatedAt: stale,
+        lastHealthAt: stale,
+        health: "healthy"
+      });
+    });
+    const report = await runConnectorReprobe(config);
+    const state = readState(config.instance);
+    const disabled = state.connectors.find((c) => c.id === "id_linear_disabled");
+    const active = state.connectors.find((c) => c.id === "id_linear_active");
+    // Tombstoned record was never inspected — lastHealthAt unchanged,
+    // status unchanged, health unchanged.
+    expect(disabled?.lastHealthAt).toBe(stale);
+    expect(disabled?.status).toBe("disabled");
+    expect(disabled?.health).toBe("unknown");
+    // Disabled record was filtered out *before* report.considered++, so
+    // considered counts only the demo seed + active linear (2), not 3.
+    expect(report.considered).toBe(2);
+    // The active record went through the probe loop and lastHealthAt
+    // advanced — proves the loop did run, just not on the tombstone.
+    expect(active?.lastHealthAt).not.toBe(stale);
+  });
+
   test("respects per-provider interval and skips fresh probes", async () => {
     const config = buildConfig("reprobe-fresh");
     await mutateState(config.instance, (state) => {

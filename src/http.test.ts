@@ -692,6 +692,8 @@ describe("runtime api", () => {
     expect(created.provider).toBe("linear");
     expect(created.secretRefs).toHaveLength(1);
     expect(created.secretRefs[0].purpose).toBe("token");
+    // User-source default — only the auto-detection job emits "auto".
+    expect(created.source).toBe("user");
     const raw = readFileSync(`${config.stateRoot}/state.json`, "utf8");
     expect(raw).not.toContain("lin_secret_abc");
 
@@ -709,6 +711,49 @@ describe("runtime api", () => {
     const after = await call(handler, config, "/api/connectors");
     expect(after.some((item: { id: string }) => item.id === created.id)).toBe(false);
     expect(existsSync(`${config.stateRoot}/secrets/${created.id}.token.json`)).toBe(false);
+  });
+
+  test("deleting an auto-source connector tombstones the record with status=disabled", async () => {
+    const config = testConfig("connector-tombstone");
+    const handler = createHandler(config);
+    // Seed an auto-source connector directly on state (detection runs on
+    // the live gateway; this test boots a one-shot handler so we inject
+    // the record by hand).
+    await mutateState(config.instance, (state) => {
+      const at = new Date().toISOString();
+      state.connectors.push({
+        id: "id_auto_test",
+        instance: state.instance,
+        name: "auto-codex",
+        provider: "codex",
+        status: "configured",
+        scopes: [],
+        secretRefs: [],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "auto"
+      });
+    });
+    const result = await call(handler, config, "/api/connectors/id_auto_test", { method: "DELETE" });
+    expect(result.tombstoned).toBe(true);
+    const state = readState(config.instance);
+    const record = state.connectors.find((c) => c.id === "id_auto_test");
+    expect(record?.status).toBe("disabled");
+    expect(state.audit.some((event) => event.action === "connector.disable")).toBe(true);
+  });
+
+  test("POST /api/connectors/detect runs the detection job and is idempotent", async () => {
+    const config = testConfig("connector-detect-endpoint");
+    const handler = createHandler(config);
+    const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+    expect(first).toHaveProperty("considered");
+    expect(first).toHaveProperty("created");
+    // The second call should not create any new records — the detection
+    // logic is idempotent at the registry+state level.
+    const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+    const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
+    expect(createdProviders).toEqual([]);
   });
 
   test("GET /api/connectors/providers returns the registry", async () => {

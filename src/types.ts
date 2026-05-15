@@ -744,6 +744,14 @@ export interface ConnectorRecord {
   // user supplies in the Add Connector dialog. Provider-specific keys live
   // under a nested namespace (e.g. `metadata.fields`) by convention.
   metadata?: Record<string, unknown>;
+  // Origin marker: "auto" for connectors materialized by the startup
+  // detection job (claude-code, codex on PATH); "user" for connectors
+  // created via the Add Connector dialog or `gini connector add`. Drives
+  // delete semantics — auto records tombstone (status: "disabled") so the
+  // detection job won't immediately re-create them, while user records
+  // physically delete. Defaults to "user" via normalizeState for legacy
+  // records that pre-date this field.
+  source?: "auto" | "user";
 }
 
 export interface ImprovementProposal {

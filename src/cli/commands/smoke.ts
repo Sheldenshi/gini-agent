@@ -51,6 +51,11 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
   });
   await api(config, `/api/improvements/${proposal.id}/approve`, { method: "POST" });
   const connectorHealth = await api(config, "/api/connectors/id_demo/health", { method: "POST" });
+  // Auto-detection. Idempotent — a fresh smoke instance may pick up
+  // claude-code / codex if they're installed on the host; the second call
+  // returns `created: []`. Smoke just confirms the endpoint exists and the
+  // job is callable.
+  const detection = await api(config, "/api/connectors/detect", { method: "POST" });
   // Optional Linear connector exercise: only runs when the host has a token
   // in env (CI / contributor with a personal API key). Smoke succeeds
   // without it so a fresh clone still passes.
@@ -147,6 +152,8 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     snapshotId: snapshotResult.snapshotId,
     promotionId: promotionResult.id,
     connectorHealth: connectorHealth.health,
+    detectionConsidered: detection.considered,
+    detectionCreated: detection.created.length,
     linearProbe,
     validateReport: {
       total: Array.isArray(validateReport) ? validateReport.length : (validateReport?.results?.length ?? 0),

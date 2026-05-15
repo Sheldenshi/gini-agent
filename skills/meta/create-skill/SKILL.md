@@ -125,8 +125,10 @@ Gini extensions (under `metadata.gini`):
    - List the providers the skill declares in `requires.connectors`.
    - For each, check `GET /api/connectors`. If a healthy connector for
      that provider already exists, you are done.
-   - If not, tell the user the next step: "Open Connections, add a
-     connector with provider=<id>, then come back to /skills."
+   - If not, tell the user: "Open `/skills`, find the new skill, and
+     click the inline `[Set up <Provider>]` button next to the missing
+     connector." There is no standalone Connectors page; setup is
+     inline on the Skills page.
 
 ## Migration Mode
 
@@ -151,8 +153,8 @@ When converting a legacy SKILL.md, the recipe is:
 ## Rules
 
 - Never write a skill without validating first.
-- Always check the Connectors page for the providers the new skill will
-  depend on. Prefer existing providers over `generic`.
+- Always check `GET /api/connectors/providers` for the providers the new
+  skill will depend on. Prefer existing providers over `generic`.
 - Bundled skills are immutable from the agent's perspective — if the
   user asks to edit a bundled skill, instead create a user-source copy
   with the same name. The runtime keeps both as separate rows.

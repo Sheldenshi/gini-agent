@@ -112,9 +112,13 @@ will need.
    The PATCH emits an audit event `skill.trust` so the trail records
    when trust was granted.
 
-8. If any required connector is missing or unhealthy, point the user at
-   the Connectors page (`/connectors?provider=<id>`). The deeplink
-   pre-fills the Add Connector dialog with the right provider.
+8. If any required connector is missing or unhealthy, tell the user to
+   open the Skills page (`/skills`), find the row for the skill they
+   just installed, and click the inline `[Set up <Provider>]` button
+   next to the missing connector. There is no longer a standalone
+   Connectors page — connector setup happens inline. Alternatively,
+   collect the credential in chat and POST it directly to
+   `/api/connectors`.
 
 ## Rules
 

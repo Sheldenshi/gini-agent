@@ -11,8 +11,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
-import Link from "next/link";
 import { useConnectors, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
+import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 
 type ReloadReport = {
@@ -20,6 +20,25 @@ type ReloadReport = {
   updated: Array<{ id: string; name: string }>;
   skipped: Array<{ path: string; reason: string }>;
 };
+
+type DetectionReport = {
+  considered: number;
+  created: Array<{ id: string; provider: string; name: string }>;
+  skipped: Array<{ provider: string; reason: string }>;
+};
+
+// Per-row state for the inline Add Connector dialog. The Skills page renders
+// one dialog at a time; pendingProvider holds the provider id so the modal
+// opens pre-scoped to the row the user clicked from. mode toggles between
+// creating a new connector ("create") and rotating the secret on an existing
+// one ("rotate"); rotate carries the connectorId so submit can PATCH it.
+interface InlineDialogState {
+  open: boolean;
+  provider: string;
+  suggestedName: string;
+  mode: "create" | "rotate";
+  connectorId?: string;
+}
 
 export default function SkillsPage() {
   const [search, setSearch] = useState("");
@@ -29,6 +48,7 @@ export default function SkillsPage() {
   const connectors = useConnectors();
   const providers = useProviders();
   const invalidate = useInvalidate();
+  const [dialog, setDialog] = useState<InlineDialogState>({ open: false, provider: "", suggestedName: "", mode: "create" });
 
   useEffect(() => {
     const timer = setTimeout(() => setDebounced(search), 200);
@@ -67,6 +87,56 @@ export default function SkillsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  const detect = useMutation({
+    mutationFn: () => api<DetectionReport>("/connectors/detect", { method: "POST" }),
+    onSuccess: (result) => {
+      const created = result.created.length;
+      toast.success(created === 0 ? "Detection ran — no new connectors." : `Detected ${created} connector${created === 1 ? "" : "s"}.`);
+      invalidate(["connectors", "skills", "events"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const create = useMutation({
+    mutationFn: (body: CreateConnectorBody) =>
+      api<ConnectorRecord>("/connectors", { method: "POST", body: JSON.stringify(body) }),
+    onSuccess: async (created) => {
+      toast.success(`Added ${created.name}`);
+      invalidate(["connectors", "events", "skills"]);
+      // Best-effort initial probe — same pattern the old Connectors page
+      // used so the row flips to healthy without waiting on the periodic
+      // re-probe. Failures land on the connector record itself.
+      await api(`/connectors/${created.id}/health`, { method: "POST" }).catch(() => undefined);
+      invalidate(["connectors", "skills"]);
+      setDialog({ open: false, provider: "", suggestedName: "", mode: "create" });
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const rotate = useMutation({
+    mutationFn: ({ id, body }: { id: string; body: CreateConnectorBody }) =>
+      api<ConnectorRecord>(`/connectors/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    onSuccess: async (updated) => {
+      toast.success(`Rotated ${updated.name}`);
+      invalidate(["connectors", "events", "skills"]);
+      // Re-probe immediately so the row flips back to healthy without
+      // waiting on the periodic re-probe — same pattern as the create path.
+      await api(`/connectors/${updated.id}/health`, { method: "POST" }).catch(() => undefined);
+      invalidate(["connectors", "skills"]);
+      setDialog({ open: false, provider: "", suggestedName: "", mode: "create" });
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const disconnect = useMutation({
+    mutationFn: (id: string) => api<{ id: string; tombstoned?: boolean }>(`/connectors/${id}`, { method: "DELETE" }),
+    onSuccess: (result) => {
+      toast.success(result.tombstoned ? "Disconnected (kept as tombstone)" : "Connector removed");
+      invalidate(["connectors", "events", "skills"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
   const filtered = skills.data ?? [];
   const grouped = useMemo(() => groupByCategory(filtered), [filtered]);
   const detail = filtered.find((s) => s.id === selected) ?? filtered[0];
@@ -86,6 +156,9 @@ export default function SkillsPage() {
         description="Procedures the agent can use"
         actions={
           <>
+            <Button size="sm" variant="outline" disabled={detect.isPending} onClick={() => detect.mutate()}>
+              {detect.isPending ? "Detecting…" : "Refresh detection"}
+            </Button>
             <Button size="sm" variant="outline" disabled={reload.isPending} onClick={() => reload.mutate()}>
               {reload.isPending ? "Reloading…" : "Reload from disk"}
             </Button>
@@ -213,7 +286,9 @@ export default function SkillsPage() {
                   <Section title="Required connectors">
                     <ul className="space-y-1">
                       {(detail.requiredConnectors ?? []).map((req) => {
-                        const matches = (connectors.data ?? []).filter((c) => c.provider === req.provider);
+                        const matches = (connectors.data ?? []).filter(
+                          (c) => c.provider === req.provider && c.status !== "disabled"
+                        );
                         const provider = providersById.get(req.provider);
                         const hasProbe = Boolean(provider?.hasProbe);
                         // Mirror the runtime gate: a connector counts as
@@ -224,28 +299,106 @@ export default function SkillsPage() {
                         const satisfying = matches.find(
                           (c) => c.health === "healthy" || (!hasProbe && c.health === "unknown" && c.status === "configured")
                         );
+                        const dependentCount = countDependentSkills(filtered, req.provider);
                         return (
                           <li key={req.provider} className="flex items-center justify-between gap-2 text-xs">
-                            <span className="font-mono">{req.provider}{req.scopes?.length ? ` (${req.scopes.join(", ")})` : ""}</span>
+                            <span className="font-mono">
+                              {req.provider}
+                              {req.scopes?.length ? ` (${req.scopes.join(", ")})` : ""}
+                            </span>
                             {satisfying ? (
-                              <Badge variant="outline" className="text-[10px] text-emerald-600">
-                                {satisfying.health === "healthy" ? "healthy" : "configured"} ({satisfying.name})
-                              </Badge>
+                              <div className="flex items-center gap-1.5">
+                                <Badge variant="outline" className="text-[10px] text-emerald-600">
+                                  {satisfying.health === "healthy" ? "healthy" : "configured"} ({satisfying.name})
+                                </Badge>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-6 px-2 text-[10px]"
+                                  disabled={disconnect.isPending}
+                                  onClick={() => {
+                                    const message = `Disconnect ${satisfying.name}?\nThis will deactivate ${dependentCount} dependent skill${dependentCount === 1 ? "" : "s"}.`;
+                                    if (confirm(message)) disconnect.mutate(satisfying.id);
+                                  }}
+                                >
+                                  Disconnect
+                                </Button>
+                              </div>
                             ) : !provider ? (
-                              // Provider isn't in the registry, so the
-                              // Connectors page dropdown won't list it.
-                              // Avoid linking to a dead-end and steer the
-                              // user toward the documented escape hatch.
+                              // Provider isn't in the registry, so we can't
+                              // open the Add Connector dialog at it.
                               <span className="text-[10px] text-muted-foreground">
                                 Not supported — use the <span className="font-mono">generic</span> provider or request native support.
                               </span>
+                            ) : matches.length > 0 ? (
+                              // Matching connector(s) exist but none satisfy
+                              // (typically: unhealthy creds). Render the
+                              // first one inline with Rotate + Disconnect so
+                              // the user can fix it without leaving the
+                              // page. We deliberately do NOT show "Set up"
+                              // here to avoid creating a second connector
+                              // for the same provider.
+                              (() => {
+                                const broken = matches[0]!;
+                                const label = broken.health === "unhealthy" ? "unhealthy" : broken.health;
+                                return (
+                                  <div className="flex flex-col items-end gap-1">
+                                    <div className="flex items-center gap-1.5">
+                                      <Badge variant="outline" className="text-[10px] text-amber-600">
+                                        {label} ({broken.name})
+                                      </Badge>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        className="h-6 px-2 text-[10px]"
+                                        disabled={rotate.isPending}
+                                        onClick={() =>
+                                          setDialog({
+                                            open: true,
+                                            provider: req.provider,
+                                            suggestedName: broken.name,
+                                            mode: "rotate",
+                                            connectorId: broken.id
+                                          })
+                                        }
+                                      >
+                                        Rotate
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-6 px-2 text-[10px]"
+                                        disabled={disconnect.isPending}
+                                        onClick={() => {
+                                          const message = `Disconnect ${broken.name}?\nThis will deactivate ${dependentCount} dependent skill${dependentCount === 1 ? "" : "s"}.`;
+                                          if (confirm(message)) disconnect.mutate(broken.id);
+                                        }}
+                                      >
+                                        Disconnect
+                                      </Button>
+                                    </div>
+                                    {broken.message ? (
+                                      <p className="text-[10px] text-muted-foreground">{broken.message}</p>
+                                    ) : null}
+                                  </div>
+                                );
+                              })()
                             ) : (
-                              <Link
-                                href={`/connectors?provider=${encodeURIComponent(req.provider)}`}
-                                className="rounded border border-border bg-card px-1.5 py-0.5 text-[10px] hover:bg-accent"
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                onClick={() =>
+                                  setDialog({
+                                    open: true,
+                                    provider: req.provider,
+                                    suggestedName: provider.label,
+                                    mode: "create"
+                                  })
+                                }
                               >
-                                Connect →
-                              </Link>
+                                Set up {provider.label}
+                              </Button>
                             )}
                           </li>
                         );
@@ -373,6 +526,24 @@ export default function SkillsPage() {
           )}
         </div>
       </div>
+
+      <AddConnectorDialog
+        open={dialog.open}
+        onOpenChange={(open) =>
+          setDialog((prev) => (open ? prev : { open: false, provider: "", suggestedName: "", mode: "create" }))
+        }
+        onSubmit={(body) =>
+          dialog.mode === "rotate" && dialog.connectorId
+            ? rotate.mutate({ id: dialog.connectorId, body })
+            : create.mutate(body)
+        }
+        pending={dialog.mode === "rotate" ? rotate.isPending : create.isPending}
+        providers={providers.data ?? []}
+        defaultProvider={dialog.provider || undefined}
+        defaultName={dialog.suggestedName}
+        lockProvider
+        mode={dialog.mode}
+      />
     </>
   );
 }
@@ -413,6 +584,8 @@ function deriveActivation(
     const matches = connectorsByProv.get(req.provider) ?? [];
     const hasProbe = Boolean(providersById.get(req.provider)?.hasProbe);
     const satisfied = matches.some((c) => {
+      // Tombstoned (status: "disabled") records never satisfy.
+      if (c.status === "disabled") return false;
       if (c.health === "healthy") return true;
       if (!hasProbe && c.health === "unknown" && c.status === "configured") return true;
       return false;
@@ -469,6 +642,15 @@ function providersByIdMap(providers: ProviderDescriptor[]): Map<string, Provider
   const map = new Map<string, ProviderDescriptor>();
   for (const p of providers) map.set(p.id, p);
   return map;
+}
+
+function countDependentSkills(skills: SkillRecord[], providerId: string): number {
+  let count = 0;
+  for (const skill of skills) {
+    const required = skill.requiredConnectors ?? [];
+    if (required.some((r) => r.provider === providerId)) count += 1;
+  }
+  return count;
 }
 
 function groupByCategory(skills: SkillRecord[]): Array<{ category: string; items: SkillRecord[] }> {

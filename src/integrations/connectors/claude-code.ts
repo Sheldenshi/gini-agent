@@ -34,8 +34,15 @@ export const claudeCodeProvider: ProviderModule = {
     return { ok: false, message: `claude found at ${path} but neither auth status nor --version succeeded.` };
   },
   async detect() {
+    // Stricter than `probe`: detection materializes a connector record
+    // automatically, so we only return `detected: true` when both the
+    // binary is on PATH AND the auth surface reports authenticated.
+    // Without the auth check, a fresh `claude` install (binary present
+    // but unsigned-in) would seed an unhealthy auto-connector.
     const path = which("claude");
     if (!path) return { detected: false };
-    return { detected: true, suggestedName: "claude-code", message: `Found claude at ${path}.` };
+    const auth = spawnSync("claude", ["auth", "status", "--text"], { encoding: "utf8", timeout: 10_000 });
+    if (auth.status !== 0) return { detected: false, message: `claude found at ${path} but auth status not OK.` };
+    return { detected: true, suggestedName: "Claude Code", message: `Found claude at ${path}; signed in.` };
   }
 };

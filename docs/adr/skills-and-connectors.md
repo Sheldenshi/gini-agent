@@ -46,7 +46,7 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 - When the agent loop lists available skills, it filters out any skill whose `requiredConnectors` are not all satisfied by a healthy connector.
 - Skill execution paths (subprocess spawn, tool dispatch) re-check at call time as a defensive guard.
 - When a skill spawns a subprocess that declares `prerequisites.env`, the runtime resolves those env vars from matching connectors and injects them into the subprocess environment. Plaintext secrets never appear in skill records, state, audit, or trace evidence.
-- The Connections / Skills UI surface marks dependent skills as "needs setup: \<provider>" when their connectors are missing or unhealthy.
+- The Skills UI surface marks dependent skills as "needs setup: \<provider>" when their connectors are missing or unhealthy and exposes inline `[Set up <Label>]` to add the missing connector without leaving the page.
 
 ### Trust and audit
 
@@ -56,8 +56,8 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 
 ### UI
 
-- The web Connectors page (`/connectors`) supports add, rotate, and delete in addition to the existing health probe.
-- Skills view surfaces dependency state: each skill shows its required connectors and whether they are satisfied.
+- Connector setup happens inline on the Skills page next to the rows that depend on a connector. There is no standalone Connectors page; auto-detected connectors with no dependent skill are not surfaced in the UI.
+- Each skill row shows its required connectors and whether they are satisfied. Missing connectors expose `[Set up <Label>]`; healthy connectors expose `[Disconnect]`. Disconnect physically removes user-source records and tombstones auto-source records (`status: "disabled"`) so the auto-detection pass won't immediately re-create them.
 
 ## Rejected
 
