@@ -444,14 +444,27 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt on a fixed interval. The job's response is delivered as an assistant message back to this chat session when it fires. Use for reminders ('in 2 minutes', 'every hour'), periodic checks, or any user request mentioning 'remind me', 'every N minutes/hours', or 'cron job'. Set oneShot=true for single-fire reminders.",
+      description: "Schedule a recurring or one-shot job that runs a prompt on a fixed interval. The job's response is delivered as an assistant message back to this chat session when it fires. Use for reminders ('in 2 minutes', 'every hour'), periodic checks, or any user request mentioning 'remind me', 'every N minutes/hours', or 'cron job'. Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `autoApproveCommands` for the shell patterns it will need to run, or `dangerouslyAutoApprove: true` for tasks that need broad action — otherwise the job will stall at the first approval gate forever. Bump `timeoutSeconds` above the 30s default whenever the prompt involves git/gh, repo cloning, or multi-file scans.",
       parameters: {
         type: "object",
         properties: {
           name: { type: "string", description: "Short human-readable label (e.g. 'cake-reminder')." },
           intervalSeconds: { type: "number", description: "Seconds between runs. For a one-shot reminder, this is the delay until the single fire (e.g. 120 for 'in 2 minutes')." },
           prompt: { type: "string", description: "The instruction the agent will receive when the job fires. Phrase it from the user's perspective (e.g. 'Remind me to take the cake out of the oven.')." },
-          oneShot: { type: "boolean", description: "If true, the job is paused after its first successful run. Defaults to false (recurring)." }
+          oneShot: { type: "boolean", description: "If true, the job is paused after its first successful run. Defaults to false (recurring)." },
+          autoApproveCommands: {
+            type: "array",
+            items: { type: "string" },
+            description: "Shell command patterns that auto-approve without asking the user at fire-time. Use when the job must act unattended. Examples: 'git *', 'gh *', 'cd *', 'ls *', 'rg *'. Patterns are matched against the full command string; only add patterns that match the user's stated intent for the job."
+          },
+          dangerouslyAutoApprove: {
+            type: "boolean",
+            description: "If true, the scheduled task bypasses ALL approval gates (terminal, file write, file patch, code exec, etc.) at fire-time. Use sparingly — prefer specific `autoApproveCommands` when possible. Full audit trail is preserved (each approval row is still written and stamped autoApproved=true)."
+          },
+          timeoutSeconds: {
+            type: "number",
+            description: "Wall-clock seconds before the spawned task is killed. Default 30. Bump to 600+ for jobs that clone repos, run multi-file scans, or call external CLIs. The model will be terminated mid-thought if this is too low."
+          }
         },
         required: ["name", "intervalSeconds", "prompt"]
       }

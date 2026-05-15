@@ -613,6 +613,43 @@ async function createJobTool(
     }
     oneShot = args.oneShot;
   }
+  // Per-job auto-approve envelope. Same validation shape as
+  // `createScheduledJob` so the agent gets a typed rejection (which the
+  // chat-task loop relays back as a tool-result error) instead of
+  // silently coercing a bogus payload. The authoritative re-check lives
+  // in createScheduledJob; this is a fast-path so we can fail before
+  // touching the per-instance lock.
+  let dangerouslyAutoApprove: boolean | undefined;
+  if (args.dangerouslyAutoApprove !== undefined && args.dangerouslyAutoApprove !== null) {
+    if (typeof args.dangerouslyAutoApprove !== "boolean") {
+      throw new Error("Invalid input: dangerouslyAutoApprove must be a boolean.");
+    }
+    dangerouslyAutoApprove = args.dangerouslyAutoApprove;
+  }
+  let autoApproveCommands: string[] | undefined;
+  if (args.autoApproveCommands !== undefined && args.autoApproveCommands !== null) {
+    if (!Array.isArray(args.autoApproveCommands)) {
+      throw new Error("Invalid input: autoApproveCommands must be an array of strings.");
+    }
+    const cleaned: string[] = [];
+    for (const entry of args.autoApproveCommands) {
+      if (typeof entry !== "string") {
+        throw new Error("Invalid input: autoApproveCommands entries must be strings.");
+      }
+      if (entry.length === 0) {
+        throw new Error("Invalid input: autoApproveCommands entries must be non-empty strings.");
+      }
+      cleaned.push(entry);
+    }
+    autoApproveCommands = cleaned;
+  }
+  let timeoutSeconds: number | undefined;
+  if (args.timeoutSeconds !== undefined && args.timeoutSeconds !== null) {
+    if (typeof args.timeoutSeconds !== "number" || !Number.isFinite(args.timeoutSeconds) || args.timeoutSeconds <= 0 || !Number.isInteger(args.timeoutSeconds)) {
+      throw new Error("Invalid input: timeoutSeconds must be a positive integer.");
+    }
+    timeoutSeconds = args.timeoutSeconds;
+  }
 
   // Walk task -> run -> conversation to find the originating chat session.
   // If the caller is imperative (CLI, no run, or run without conversation),
@@ -648,7 +685,17 @@ async function createJobTool(
   // task is already terminal.
   let job;
   try {
-    job = await createScheduledJob(config, { name, intervalSeconds, prompt, chatSessionId, oneShot, parentTaskId: taskId });
+    job = await createScheduledJob(config, {
+      name,
+      intervalSeconds,
+      prompt,
+      chatSessionId,
+      oneShot,
+      parentTaskId: taskId,
+      dangerouslyAutoApprove,
+      autoApproveCommands,
+      timeoutSeconds
+    });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {
       return `Error: create_job skipped because parent task was cancelled between pre-check and job creation.`;
@@ -665,14 +712,32 @@ async function createJobTool(
       risk: "low",
       taskId: item.id,
       runId: item.runId,
-      evidence: { name, intervalSeconds, oneShot, chatSessionId, jobId: job.id }
+      evidence: {
+        name,
+        intervalSeconds,
+        oneShot,
+        chatSessionId,
+        jobId: job.id,
+        dangerouslyAutoApprove,
+        autoApproveCommands,
+        timeoutSeconds
+      }
     });
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
     type: "job",
     message: "Created scheduled job",
-    data: { jobId: job.id, name, intervalSeconds, oneShot, chatSessionId }
+    data: {
+      jobId: job.id,
+      name,
+      intervalSeconds,
+      oneShot,
+      chatSessionId,
+      dangerouslyAutoApprove,
+      autoApproveCommands,
+      timeoutSeconds
+    }
   });
 
   const cadence = oneShot ? "one-shot" : `every ${intervalSeconds}s`;
