@@ -263,9 +263,14 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
 }
 
 // A skill is active iff every required connector is satisfied by a
-// healthy ConnectorRecord of the matching provider. The agent loop filters
-// inactive skills out of its available-skills set; the UI still shows
-// them so users can see what's missing.
+// configured + healthy ConnectorRecord of the matching provider. The agent
+// loop filters inactive skills out of its available-skills set; the UI
+// still shows them so users can see what's missing.
+//
+// Both branches require `status === "configured"`. A `disabled` connector
+// is one the user explicitly turned off — even if a stale health probe
+// still says "healthy", we should not let it satisfy a skill. An `error`
+// status means setup failed and the connector isn't usable.
 //
 // `health: "unknown"` is treated as active when the matching provider has
 // no probe (we have no failing signal). It's treated as inactive when the
@@ -280,8 +285,9 @@ export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean 
     const hasProbe = Boolean(module?.probe);
     const match = state.connectors.find((candidate) => {
       if (candidate.provider !== requirement.provider) return false;
+      if (candidate.status !== "configured") return false;
       if (candidate.health === "healthy") return true;
-      if (!hasProbe && candidate.health === "unknown" && candidate.status === "configured") return true;
+      if (!hasProbe && candidate.health === "unknown") return true;
       return false;
     });
     if (!match) return false;

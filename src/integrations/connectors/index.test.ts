@@ -109,4 +109,28 @@ describe("isSkillActive", () => {
     const skill = newSkill({ requiredConnectors: [{ provider: "demo" }] });
     expect(isSkillActive(state, skill)).toBe(true);
   });
+
+  test("disabled connector with healthy probe does NOT satisfy a skill", () => {
+    // The user explicitly turned this connector off. A stale `health:
+    // "healthy"` from before they disabled it (or a probe job that ran
+    // anyway) must not let dependent skills activate behind their back.
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ provider: "linear", status: "disabled", health: "healthy" })];
+    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("error-status connector does NOT satisfy a skill even if a probe later returns healthy", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ provider: "linear", status: "error", health: "healthy" })];
+    const skill = newSkill({ requiredConnectors: [{ provider: "linear" }] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
+
+  test("disabled connector does NOT satisfy a no-probe provider either", () => {
+    const state = createEmptyState("dev");
+    state.connectors = [newConnector({ provider: "demo", status: "disabled", health: "unknown" })];
+    const skill = newSkill({ requiredConnectors: [{ provider: "demo" }] });
+    expect(isSkillActive(state, skill)).toBe(false);
+  });
 });
