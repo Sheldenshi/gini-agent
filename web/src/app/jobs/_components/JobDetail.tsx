@@ -29,6 +29,15 @@ export function JobDetail({
           <div className="min-w-0">
             <CardTitle className="truncate text-base">{job.name}</CardTitle>
             <CardDescription className="font-mono text-[11px]">{job.id} · {scheduleLabel(job)}</CardDescription>
+            {job.cronExpression ? (
+              // Surface the raw cron expression as a smaller monospace
+              // line so power users can still inspect the source-of-truth
+              // pattern even though the primary label renders the human
+              // English version above.
+              <p className="font-mono text-[10px] text-muted-foreground" title="Raw cron expression">
+                {job.cronExpression}
+              </p>
+            ) : null}
           </div>
           <div className="flex items-center gap-2">
             <StatusPill value={job.status} />

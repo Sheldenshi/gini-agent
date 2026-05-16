@@ -37,7 +37,17 @@ export function JobList({
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <CardTitle className="line-clamp-1 text-sm">{job.name}</CardTitle>
-                <CardDescription className="font-mono text-[11px]">{job.id} · {scheduleLabel(job)}</CardDescription>
+                <CardDescription
+                  className="font-mono text-[11px]"
+                  // Surface the raw cron expression as a hover tooltip on
+                  // cron jobs so power users can inspect the source pattern
+                  // without leaving the list. Interval jobs use the default
+                  // browser tooltip (none) — the label already shows the
+                  // cadence in full.
+                  title={job.cronExpression ?? undefined}
+                >
+                  {job.id} · {scheduleLabel(job)}
+                </CardDescription>
               </div>
               <StatusPill value={job.status} />
             </div>

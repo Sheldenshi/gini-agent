@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import type { JobRecord } from "@runtime/types";
+import { humanCron } from "./schedule-label";
 
 type ScheduleMode = "interval" | "cron";
 
@@ -177,6 +178,16 @@ export function EditJobDialog({ job }: { job: JobRecord }) {
                   value={cronExpression}
                   onChange={(event) => setCronExpression(event.target.value)}
                 />
+                {(() => {
+                  // Live human-English rendering of the user's cron input
+                  // via cronstrue. Returns null for unparseable patterns;
+                  // we just hide the helper line in that case rather than
+                  // surface a stack trace under the input.
+                  const human = humanCron(cronExpression);
+                  return human ? (
+                    <p className="text-[11px] text-foreground">{human}</p>
+                  ) : null;
+                })()}
                 <p className="text-[10px] text-muted-foreground">
                   5-field Unix cron: minute hour day-of-month month day-of-week. 0=Sunday.
                 </p>
