@@ -93,12 +93,24 @@ async function postJson(
   body: Record<string, unknown>,
   signal?: AbortSignal
 ): Promise<{ ok: true; result: unknown } | { ok: false; description: string; status: number }> {
-  const response = await fetch(telegramApiUrl(token, method), {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal
-  });
+  // Wrap fetch in try/catch so transport-level rejections (DNS failure,
+  // ECONNREFUSED, TLS errors, AbortError) flow through the same
+  // discriminated-union failure branch that Telegram-shaped errors take.
+  // Without this the throw propagates past callers' "row → failed" code,
+  // leaving the outbound MessagingMessageRecord stuck at status:"queued"
+  // even though the network call never reached the server.
+  let response: Response;
+  try {
+    response = await fetch(telegramApiUrl(token, method), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, description: message, status: 0 };
+  }
   const status = response.status;
   let payload: { ok?: boolean; result?: unknown; description?: string };
   try {
@@ -224,6 +236,34 @@ export async function getUpdates(
     };
   }
   return { ok: true, updates: payload.result };
+}
+
+// Runtime type guard for a single TelegramUpdate. The transport returns
+// `payload.result as TelegramUpdate[]` without per-element validation; this
+// guard is the missing per-element shape check the poller applies before
+// dispatch so malformed payloads (a non-numeric update_id, a message with
+// no chat, a callback_query with no from.id) don't throw inside the
+// dispatch handler or wedge the offset advancement.
+export function isValidTelegramUpdate(value: unknown): value is TelegramUpdate {
+  if (typeof value !== "object" || value === null) return false;
+  const u = value as Record<string, unknown>;
+  if (typeof u.update_id !== "number" || !Number.isFinite(u.update_id)) return false;
+  if (u.message !== undefined) {
+    const m = u.message as Record<string, unknown> | null;
+    if (!m || typeof m !== "object") return false;
+    const chat = (m as { chat?: unknown }).chat as Record<string, unknown> | undefined;
+    if (!chat || typeof chat !== "object") return false;
+    if (typeof (chat as { id?: unknown }).id !== "number") return false;
+  }
+  if (u.callback_query !== undefined) {
+    const cq = u.callback_query as Record<string, unknown> | null;
+    if (!cq || typeof cq !== "object") return false;
+    if (typeof (cq as { id?: unknown }).id !== "string") return false;
+    const from = (cq as { from?: unknown }).from as Record<string, unknown> | undefined;
+    if (!from || typeof from !== "object") return false;
+    if (typeof (from as { id?: unknown }).id !== "number") return false;
+  }
+  return true;
 }
 
 // Telegram's hard limit. Exported so the streaming reply manager and

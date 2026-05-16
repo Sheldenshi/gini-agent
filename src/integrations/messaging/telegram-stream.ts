@@ -29,6 +29,7 @@ import {
   readState
 } from "../../state";
 import { resolveConnectorSecret } from "../connectors";
+import { resolveTelegramConnector } from "./telegram-connector";
 import {
   editMessageText,
   sendMessage,
@@ -95,6 +96,18 @@ export async function dispatchOutboundMessage(
   if (bridge.kind !== "telegram") return message;
   if (!bridge.connectorId) {
     return markMessageFailed(config, message.id, "Telegram bridge missing connectorId.");
+  }
+  // Provider guard. A connector whose provider isn't "telegram" must not be
+  // used to drive the Bot API; mark the outbound row failed instead of
+  // shipping the token to api.telegram.org under the wrong contract.
+  try {
+    resolveTelegramConnector(readState(config.instance), bridge.connectorId);
+  } catch (error) {
+    return markMessageFailed(
+      config,
+      message.id,
+      error instanceof Error ? error.message : String(error)
+    );
   }
   const token = await resolveConnectorSecret(config, bridge.connectorId, "token");
   if (!token) {

@@ -13,6 +13,7 @@ import { resolveEffectiveContext } from "../execution/effective-context";
 import { checkConnector, resolveConnectorSecret } from "./connectors";
 import { dispatchOutboundMessage } from "./messaging/telegram-stream";
 import type { TelegramInlineKeyboardMarkup } from "./messaging/telegram-transport";
+import { resolveTelegramConnector } from "./messaging/telegram-connector";
 import { restartPoller, startPoller, stopPoller } from "./messaging/telegram-registry";
 
 export async function addMessagingBridge(config: RuntimeConfig, input: Record<string, unknown>) {
@@ -32,12 +33,28 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
 
   let initialTelegram: TelegramBridgeConfig | undefined;
   if (kind === "telegram") {
+    // Caller-supplied telegram config is restricted at create time. The
+    // allowlist must be empty (or absent) — non-empty entries must flow
+    // through addTelegramAllowlistEntry which validates each entry's
+    // telegramUserId, looks up the agentId, and audits the addition.
+    // botUsername is probe-derived (getMe) and updateOffset is poller-
+    // owned, so we ignore any caller-supplied values for both.
     const inbound = (input.telegram as Partial<TelegramBridgeConfig> | undefined) ?? undefined;
+    if (inbound && Array.isArray(inbound.allowlist) && inbound.allowlist.length > 0) {
+      throw new Error("Allowlist entries must be added via POST /api/messaging/:id/telegram/allow.");
+    }
     initialTelegram = {
-      allowlist: Array.isArray(inbound?.allowlist) ? inbound!.allowlist : [],
-      botUsername: typeof inbound?.botUsername === "string" ? inbound.botUsername : undefined,
-      updateOffset: typeof inbound?.updateOffset === "number" ? inbound.updateOffset : 0
+      allowlist: [],
+      botUsername: undefined,
+      updateOffset: 0
     };
+  }
+
+  // Verify the connector provider before the bridge row is created so we
+  // don't leak a half-configured telegram bridge that points at a
+  // non-telegram connector.
+  if (kind === "telegram" && connectorId) {
+    resolveTelegramConnector(readState(config.instance), connectorId);
   }
 
   const bridge = await mutateState(config.instance, (state) =>
@@ -80,6 +97,10 @@ export async function checkMessagingBridge(config: RuntimeConfig, idOrName: stri
       probeMessage = "Telegram bridge missing connectorId.";
     } else {
       try {
+        // Reject non-telegram connectors before the probe runs so the
+        // bot token never gets POSTed to e.g. api.linear.app/graphql by
+        // a connector whose provider has a different probe shape.
+        resolveTelegramConnector(readState(config.instance), initial.connectorId);
         const connector = await checkConnector(config, initial.connectorId);
         probeOk = connector.health === "healthy";
         probeMessage = connector.message;
@@ -147,6 +168,14 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   const bridge = readState(config.instance).messagingBridges.find((item) => item.id === idOrName || item.name === idOrName);
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
   if (bridge.status !== "configured") throw new Error(`Messaging bridge is not configured: ${idOrName}`);
+  // Telegram inbound is the allowlist's exclusive domain. Routing inbound
+  // text in via /receive would skip the from.id allowlist lookup, per-user
+  // chat session binding, externalId stamping, and per-task agent override
+  // that handleInboundMessage owns. The poller (or, later, a webhook) is
+  // the only acceptable entry point for telegram inbound.
+  if (bridge.kind === "telegram") {
+    throw new Error("Telegram bridges receive inbound messages via the poller; /receive is for local/demo bridges only.");
+  }
   const text = String(input.text ?? "").trim();
   if (!text) throw new Error("Inbound message text is required.");
   const target = String(input.target ?? "local");

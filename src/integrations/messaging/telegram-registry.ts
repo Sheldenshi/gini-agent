@@ -16,6 +16,17 @@ export function isPollerRunning(bridgeId: string): boolean {
   return POLLERS.has(bridgeId);
 }
 
+// Self-deregistration hook. A poller's runLoop calls this in a finally
+// block so every exit path (normal return, abort, 401, missing config,
+// thrown error) removes the entry from the registry. The same-handle
+// identity check protects against a stopPoller → startPoller race:
+// if a new handle has already replaced this one, we leave it alone so
+// the live poller doesn't get evicted by its dying predecessor.
+export function markPollerStopped(bridgeId: string, handle: TelegramPollerHandle): void {
+  const current = POLLERS.get(bridgeId);
+  if (current === handle) POLLERS.delete(bridgeId);
+}
+
 export function startPoller(config: RuntimeConfig, bridgeId: string): void {
   if (POLLERS.has(bridgeId)) return;
   const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
@@ -23,7 +34,12 @@ export function startPoller(config: RuntimeConfig, bridgeId: string): void {
   if (bridge.kind !== "telegram") return;
   if (bridge.status !== "configured") return;
   if (!bridge.connectorId) return;
-  const handle = startTelegramPoller(config, bridgeId);
+  // Pass markPollerStopped as the onExit callback so the poller can
+  // self-deregister on any exit path (401 token rejection, missing
+  // config, abort, error). Without this the dead handle sits in
+  // POLLERS forever and the next startPoller call no-ops, leaving the
+  // bridge silently inert after a token rotation.
+  const handle = startTelegramPoller(config, bridgeId, (h) => markPollerStopped(bridgeId, h));
   POLLERS.set(bridgeId, handle);
   appendLog(config.instance, "messaging.telegram.poller.started", { bridgeId });
 }

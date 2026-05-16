@@ -474,7 +474,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
 async function body(request: Request): Promise<Record<string, unknown>> {
   if (!request.body) return {};
-  return (await request.json()) as Record<string, unknown>;
+  // Wrap json() so a malformed body surfaces as a 400 via the existing
+  // "Invalid input" prefix mapping rather than the catch-all 500. The
+  // original error message is preserved for debugging.
+  try {
+    return (await request.json()) as Record<string, unknown>;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid input: malformed JSON body (${detail})`);
+  }
 }
 
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
@@ -516,6 +524,23 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Could not reach CDP endpoint")) return 400;
   if (message.startsWith("Could not locate")) return 400;
   if (message.startsWith("Web update is only available")) return 400;
+  // Telegram / messaging surface. Each one is user-input-correctable so
+  // the webapp + CLI surfaces a readable message instead of an opaque
+  // 500. Bridge / allowlist not-found cases are 404; everything else is
+  // 400 validation.
+  if (message.startsWith("Telegram bridges require")) return 400;
+  if (message.startsWith("Telegram bridge connector must be a telegram provider")) return 400;
+  if (message.startsWith("telegramUserId must be")) return 400;
+  if (message.startsWith("agentId is required")) return 400;
+  if (message.startsWith("Allowlist applies to telegram bridges only")) return 400;
+  if (message.startsWith("Allowlist entries must be added via")) return 400;
+  if (message.startsWith("Messaging bridge name is required")) return 400;
+  if (message.startsWith("Inbound message text is required")) return 400;
+  if (message.startsWith("Outbound message text is required")) return 400;
+  if (message.startsWith("Messaging bridge is not configured")) return 400;
+  if (message.startsWith("Telegram bridges receive inbound messages via the poller")) return 400;
+  if (message.startsWith("Messaging bridge not found")) return 404;
+  if (message.startsWith("Allowlist entry not found")) return 404;
   return 500;
 }
 

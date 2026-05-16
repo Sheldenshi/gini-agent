@@ -155,9 +155,12 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
 
   // Resolve the active agent up-front so memory recall and pinned-memory
   // filtering both use the same isolation key (Phase C). Without an active
-  // agent we skip auto-recall — Hindsight requires a namespace.
+  // agent we skip auto-recall — Hindsight requires a namespace. The task's
+  // own `agentId` (stamped at submitTask time for inbound multi-user
+  // channels like Telegram) takes precedence over the instance-wide active
+  // agent so concurrent inbound submissions can't clobber each other.
   const stateForAgent = readState(config.instance);
-  const effectiveForAgent = resolveEffectiveContext(stateForAgent, config);
+  const effectiveForAgent = resolveEffectiveContext(stateForAgent, config, task.agentId);
   const agentIdForMemory = effectiveForAgent.agentId;
 
   // Auto-recall: same as the legacy path. If recall fails we continue with
@@ -332,8 +335,10 @@ async function runLoop(
   // Resolve the active-agent overrides (provider, toolset filter, etc.).
   // Provider override flows into generateToolCallingResponse below; the
   // toolset filter narrows buildToolCatalog before the subagent filter
-  // narrows further (state → agent → subagent composition).
-  const effective = resolveEffectiveContext(state0, config);
+  // narrows further (state → agent → subagent composition). The per-task
+  // `agentId` (stamped at submitTask for per-user inbound paths) overrides
+  // the instance-wide active agent for the lifetime of this loop.
+  const effective = resolveEffectiveContext(state0, config, taskRow?.agentId);
   const tools = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
   const providerTools = toProviderTools(tools);
   const toolsHash = hashCatalog(tools);

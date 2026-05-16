@@ -22,7 +22,8 @@
 import type { RuntimeConfig } from "../../types";
 import { addAudit, appendLog, mutateState, now, readState } from "../../state";
 import { resolveConnectorSecret } from "../connectors";
-import { getUpdates, type TelegramUpdate } from "./telegram-transport";
+import { resolveTelegramConnector } from "./telegram-connector";
+import { getUpdates, isValidTelegramUpdate, type TelegramUpdate } from "./telegram-transport";
 import { handleCallbackQuery, handleInboundMessage } from "./telegram-handlers";
 
 export interface TelegramPollerHandle {
@@ -37,7 +38,11 @@ const LONG_POLL_TIMEOUT_SECONDS = 30;
 const BACKOFF_INITIAL_MS = 1000;
 const BACKOFF_CAP_MS = 30_000;
 
-export function startTelegramPoller(config: RuntimeConfig, bridgeId: string): TelegramPollerHandle {
+export function startTelegramPoller(
+  config: RuntimeConfig,
+  bridgeId: string,
+  onExit?: (handle: TelegramPollerHandle) => void
+): TelegramPollerHandle {
   const controller = new AbortController();
   let stopped = false;
   const stop = () => {
@@ -45,13 +50,24 @@ export function startTelegramPoller(config: RuntimeConfig, bridgeId: string): Te
     stopped = true;
     controller.abort();
   };
-  const done = runLoop(config, bridgeId, controller.signal, () => stopped).catch((error) => {
-    appendLog(config.instance, "messaging.telegram.poller.crashed", {
-      bridgeId,
-      error: error instanceof Error ? error.message : String(error)
+  // We need to pass the handle to onExit, but it's only assembled after
+  // the runLoop call. The closure captures `handle` so the .finally branch
+  // can self-deregister on every exit path (normal stop, abort, 401,
+  // missing config, thrown error) without leaving a stale entry in the
+  // registry that would block a future restart.
+  const handle: TelegramPollerHandle = { done: Promise.resolve(), stop };
+  const done = runLoop(config, bridgeId, controller.signal, () => stopped)
+    .catch((error) => {
+      appendLog(config.instance, "messaging.telegram.poller.crashed", {
+        bridgeId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    })
+    .finally(() => {
+      if (onExit) onExit(handle);
     });
-  });
-  return { done, stop };
+  handle.done = done;
+  return handle;
 }
 
 async function runLoop(
@@ -71,6 +87,19 @@ async function runLoop(
     }
     if (!bridge.connectorId) {
       await flipBridgeToError(config, bridgeId, "Telegram bridge missing connectorId.");
+      return;
+    }
+    // Provider guard. A connector whose provider isn't "telegram" must not
+    // be used to drive the Bot API; flip the bridge to error and exit so
+    // the token doesn't reach api.telegram.org under the wrong provider.
+    try {
+      resolveTelegramConnector(readState(config.instance), bridge.connectorId);
+    } catch (error) {
+      await flipBridgeToError(
+        config,
+        bridgeId,
+        error instanceof Error ? error.message : String(error)
+      );
       return;
     }
     const token = await resolveConnectorSecret(config, bridge.connectorId, "token");
@@ -120,32 +149,48 @@ async function runLoop(
       continue;
     }
 
-    // Track the max processed update_id so the offset advances even if
-    // a downstream dispatch throws. We bump after each dispatch
-    // attempt; Telegram guarantees update_ids are monotonically
-    // increasing within a bot.
-    let maxProcessed = offset - 1;
-    for (const update of updates) {
+    // Per-update dispatch. The handlers each advance
+    // `bridge.telegram.updateOffset` inside the same `mutateState` they
+    // use to record the durable inbound / audit row, so the offset
+    // never runs ahead of the side-effect commit. Malformed updates
+    // (validated by isValidTelegramUpdate) emit a dedicated audit row
+    // and bump the offset past their update_id if present, or past the
+    // previously-known last id if the update_id itself is unparseable,
+    // so a single bad payload can't wedge the bridge.
+    let lastValidOffset = offset - 1;
+    for (const rawUpdate of updates) {
+      if (!isValidTelegramUpdate(rawUpdate)) {
+        const raw = rawUpdate as { update_id?: unknown };
+        const parsedId = typeof raw.update_id === "number" && Number.isFinite(raw.update_id)
+          ? raw.update_id
+          : lastValidOffset + 1;
+        await emitMalformedAudit(config, bridgeId, parsedId, rawUpdate);
+        if (parsedId > lastValidOffset) lastValidOffset = parsedId;
+        continue;
+      }
       try {
-        await dispatchUpdate(config, bridgeId, update);
+        await dispatchUpdate(config, bridgeId, rawUpdate);
       } catch (error) {
         appendLog(config.instance, "messaging.telegram.dispatch.error", {
           bridgeId,
-          updateId: update.update_id,
+          updateId: rawUpdate.update_id,
           error: error instanceof Error ? error.message : String(error)
         });
+        // Per-update offset advancement still has to happen on throw —
+        // the handler's mutateState may not have landed. Bump here so
+        // a thrown dispatch doesn't wedge progress.
+        await mutateState(config.instance, (state) => {
+          const live = state.messagingBridges.find((b) => b.id === bridgeId);
+          if (!live?.telegram) return;
+          const next = rawUpdate.update_id + 1;
+          if (next > (live.telegram.updateOffset ?? 0)) {
+            live.telegram.updateOffset = next;
+            live.updatedAt = now();
+          }
+        });
       }
-      if (update.update_id > maxProcessed) maxProcessed = update.update_id;
+      if (rawUpdate.update_id > lastValidOffset) lastValidOffset = rawUpdate.update_id;
     }
-
-    // Advance the bridge's persisted offset to max+1 so a restart
-    // resumes after the last dispatched update.
-    await mutateState(config.instance, (state) => {
-      const live = state.messagingBridges.find((b) => b.id === bridgeId);
-      if (!live?.telegram) return;
-      live.telegram.updateOffset = maxProcessed + 1;
-      live.updatedAt = now();
-    });
   }
 }
 
@@ -155,16 +200,17 @@ async function dispatchUpdate(
   update: TelegramUpdate
 ): Promise<void> {
   if (update.message) {
-    await handleInboundMessage(config, bridgeId, update.message);
+    await handleInboundMessage(config, bridgeId, update.message, update.update_id);
     return;
   }
   if (update.callback_query) {
-    await handleCallbackQuery(config, bridgeId, update.callback_query);
+    await handleCallbackQuery(config, bridgeId, update.callback_query, update.update_id);
     return;
   }
   // Anything else is best-effort logged so we have forensics; we don't
   // dispatch channel posts, edited messages, chat-member updates,
-  // shipping queries, etc. for v1.
+  // shipping queries, etc. for v1. Advance offset in the same mutate so
+  // the unsupported update doesn't get re-delivered.
   const kinds = Object.keys(update).filter((k) => k !== "update_id");
   await mutateState(config.instance, (state) => {
     addAudit(state, {
@@ -174,6 +220,53 @@ async function dispatchUpdate(
       risk: "low",
       evidence: { bridgeId, updateId: update.update_id, kinds }
     });
+    const live = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (live?.telegram) {
+      const next = update.update_id + 1;
+      if (next > (live.telegram.updateOffset ?? 0)) {
+        live.telegram.updateOffset = next;
+        live.updatedAt = now();
+      }
+    }
+  });
+}
+
+// Audit row for a payload that failed schema validation. We truncate
+// the JSON serialization to keep the audit row a sane size and never
+// leak the bot token (the payload comes from getUpdates so it has no
+// token anyway, but the cap is defensive).
+const MALFORMED_PAYLOAD_LIMIT = 512;
+async function emitMalformedAudit(
+  config: RuntimeConfig,
+  bridgeId: string,
+  parsedUpdateId: number,
+  payload: unknown
+): Promise<void> {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(payload) ?? "";
+  } catch {
+    serialized = "(unserializable)";
+  }
+  if (serialized.length > MALFORMED_PAYLOAD_LIMIT) {
+    serialized = `${serialized.slice(0, MALFORMED_PAYLOAD_LIMIT)}…`;
+  }
+  await mutateState(config.instance, (state) => {
+    addAudit(state, {
+      actor: "runtime",
+      action: "messaging.telegram.malformed_update",
+      target: bridgeId,
+      risk: "low",
+      evidence: { bridgeId, parsedUpdateId, payload: serialized }
+    });
+    const live = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (live?.telegram) {
+      const next = parsedUpdateId + 1;
+      if (next > (live.telegram.updateOffset ?? 0)) {
+        live.telegram.updateOffset = next;
+        live.updatedAt = now();
+      }
+    }
   });
 }
 

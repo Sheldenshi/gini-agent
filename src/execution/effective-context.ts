@@ -37,8 +37,17 @@ export interface EffectiveContext {
   warnings: string[];
 }
 
-export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConfig): EffectiveContext {
-  const agent = state.agents.find((candidate) => candidate.id === state.activeAgentId);
+export function resolveEffectiveContext(
+  state: RuntimeState,
+  config: RuntimeConfig,
+  taskAgentId?: string
+): EffectiveContext {
+  // Per-task agent override takes precedence over the instance-wide active
+  // agent. Inbound multi-user channels (e.g. Telegram) stamp `task.agentId`
+  // during submitTask so the asynchronously-scheduled execution path reads
+  // a stable, per-message agent instead of racing on state.activeAgentId.
+  const resolvedId = taskAgentId ?? state.activeAgentId;
+  const agent = state.agents.find((candidate) => candidate.id === resolvedId);
   if (!agent) {
     return {
       provider: config.provider,

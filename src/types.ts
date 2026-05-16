@@ -277,6 +277,14 @@ export interface Task {
   // src/execution/chat-task.ts. "imperative" preserves the legacy CLI
   // prefix-dispatch behavior. Defaults to "imperative" for back-compat.
   mode?: TaskMode;
+  // Per-task active-agent override. When set, the execution layer resolves
+  // the agent for provider, toolset filter, messaging targets, and memory
+  // namespace from this id instead of the instance-wide `activeAgentId`.
+  // Stamped on inbound paths that route per-user (e.g. Telegram allowlist
+  // entries pin an agent per Telegram user) so concurrent users can't
+  // clobber each other's active-agent pointer. Optional — non-stamped
+  // callers fall back to `state.activeAgentId`.
+  agentId?: string;
   // Resume state for the chat-task loop while waiting on an approval. Cleared
   // once the loop finishes (completed/failed) so completed tasks don't retain
   // long-lived conversation snapshots in state.

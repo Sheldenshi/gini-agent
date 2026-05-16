@@ -1,7 +1,15 @@
-// Behavior tests for the Telegram messaging channel. We mock fetch so
-// no real Telegram traffic happens; the tests focus on the security
-// gates (allowlist by user_id, cross-user approval prevention) and the
-// data-flow invariants (updateOffset round-trip, message status flips).
+// Behavior tests for the Telegram messaging channel.
+//
+// Conventions:
+//   - The fetch mock fails closed in beforeAll. Any test that needs to
+//     allow a network call must install a per-test responder via
+//     mockFetch(...). An unmocked call to api.telegram.org throws and
+//     fails the test loudly so a real network request from a leaked
+//     poller can't be missed.
+//   - afterEach drains the poller registry via stopAllPollers so no
+//     worker outlives its case (addMessagingBridge starts a poller
+//     unconditionally for telegram bridges and the registry is process-
+//     singleton, so without this each test would leak a poller).
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
@@ -9,9 +17,14 @@ import type { ProviderConfig, RuntimeConfig } from "../../types";
 import { mutateState, readState } from "../../state";
 import { writeSecret } from "../../state/secrets";
 import { install } from "../../runtime";
-import { addMessagingBridge, addTelegramAllowlistEntry } from "../messaging";
+import {
+  addMessagingBridge,
+  addTelegramAllowlistEntry,
+  receiveMessagingInput
+} from "../messaging";
 import { handleCallbackQuery, handleInboundMessage } from "./telegram-handlers";
 import { dispatchOutboundMessage, splitForTelegram } from "./telegram-stream";
+import { stopAllPollers } from "./telegram-registry";
 
 const ROOT = "/tmp/gini-telegram-messaging-unit";
 
@@ -25,12 +38,31 @@ afterAll(() => {
 });
 
 const originalFetch = globalThis.fetch;
-afterEach(() => {
-  globalThis.fetch = originalFetch;
-});
+
+// Default fail-closed fetch. Replaces globalThis.fetch in beforeEach so
+// any unmocked call to api.telegram.org from a leaked poller (or a test
+// that forgot to install a responder) blows up loudly instead of
+// touching the real network.
+function failClosedFetch(): typeof fetch {
+  return (async (input: Request | string | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    if (url.includes("api.telegram.org")) {
+      throw new Error(`telegram.test: unmocked fetch ${url}`);
+    }
+    return new Response("", { status: 599, statusText: "no responder" });
+  }) as typeof fetch;
+}
 
 beforeEach(() => {
+  globalThis.fetch = failClosedFetch();
+});
+
+afterEach(async () => {
   globalThis.fetch = originalFetch;
+  // Drain leaked pollers. addMessagingBridge for kind === "telegram"
+  // unconditionally starts a worker; without this drain a stale worker
+  // would keep firing fetches against the next test's mocks.
+  await stopAllPollers();
 });
 
 interface FetchLog {
@@ -38,12 +70,12 @@ interface FetchLog {
   init?: RequestInit;
 }
 
-function captureFetch(responder: (url: string) => Response | Promise<Response>): FetchLog[] {
+function mockFetch(responder: (url: string, init?: RequestInit) => Response | Promise<Response>): FetchLog[] {
   const log: FetchLog[] = [];
   globalThis.fetch = (async (input: Request | string | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input.toString();
     log.push({ url, init });
-    return responder(url);
+    return responder(url, init);
   }) as typeof fetch;
   return log;
 }
@@ -89,6 +121,49 @@ describe("addMessagingBridge for telegram", () => {
     ).rejects.toThrow(/require connectorId/);
   });
 
+  test("rejects telegram bridges that point at a non-telegram connector", async () => {
+    const config = buildConfig("telegram-wrong-provider");
+    install(config);
+    // Seed a generic connector with a token secret — exactly the shape
+    // a malicious config would use to try to ship a Telegram bot token
+    // to a non-Telegram upstream.
+    const ref = writeSecret(config.instance, "id_generic", "token", "token");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push({
+        id: "id_generic",
+        instance: state.instance,
+        name: "generic-impostor",
+        provider: "generic",
+        status: "configured",
+        scopes: [],
+        secretRefs: [ref],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        health: "healthy",
+        source: "user"
+      });
+    });
+    await expect(
+      addMessagingBridge(config, { name: "tg-evil", kind: "telegram", connectorId: "id_generic" })
+    ).rejects.toThrow(/must be a telegram provider/);
+  });
+
+  test("rejects telegram bridge create with caller-supplied allowlist", async () => {
+    const config = buildConfig("telegram-no-direct-allowlist");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    await expect(
+      addMessagingBridge(config, {
+        name: "tg",
+        kind: "telegram",
+        connectorId: "id_conn",
+        telegram: {
+          allowlist: [{ telegramUserId: 7, agentId: "any" }]
+        }
+      })
+    ).rejects.toThrow(/Allowlist entries must be added via/);
+  });
+
   test("creates a telegram bridge with allowlist + offset initialized", async () => {
     const config = buildConfig("telegram-create");
     install(config);
@@ -102,6 +177,9 @@ describe("addMessagingBridge for telegram", () => {
     expect(bridge.connectorId).toBe("id_conn");
     expect(bridge.telegram?.allowlist).toEqual([]);
     expect(bridge.telegram?.updateOffset).toBe(0);
+    // The poller-owned fields are never seeded from caller input — even
+    // if a caller had snuck them past, addMessagingBridge ignores them.
+    expect(bridge.telegram?.botUsername).toBeUndefined();
   });
 });
 
@@ -122,9 +200,8 @@ describe("inbound message authorization", () => {
       agentId
     });
 
-    // Mock sendChatAction so the best-effort typing indicator doesn't
-    // touch the real network.
-    captureFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+    // Allow the typing-action best-effort fetch.
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
 
     await handleInboundMessage(config, bridge.id, {
       message_id: 100,
@@ -132,7 +209,7 @@ describe("inbound message authorization", () => {
       chat: { id: 555, type: "private" },
       date: Math.floor(Date.now() / 1000),
       text: "hello bot"
-    });
+    }, 42);
 
     const state = readState(config.instance);
     const inbound = state.messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
@@ -145,6 +222,9 @@ describe("inbound message authorization", () => {
 
     const task = state.tasks.find((t) => t.id === inbound!.taskId);
     expect(task?.mode).toBe("chat");
+    // The allowlist entry's pinned agent is stamped on the Task row so
+    // the chat-task loop doesn't have to consult activeAgentId.
+    expect(task?.agentId).toBe(agentId);
   });
 
   test("non-allowlisted user_id drops with an audit row", async () => {
@@ -159,7 +239,7 @@ describe("inbound message authorization", () => {
     const agentId = readState(config.instance).agents[0]!.id;
     await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 1, agentId });
 
-    captureFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
 
     await handleInboundMessage(config, bridge.id, {
       message_id: 7,
@@ -167,7 +247,7 @@ describe("inbound message authorization", () => {
       chat: { id: 555, type: "private" },
       date: Math.floor(Date.now() / 1000),
       text: "hi"
-    });
+    }, 11);
 
     const state = readState(config.instance);
     const inbound = state.messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
@@ -193,7 +273,7 @@ describe("inbound message authorization", () => {
     // Allowlist user 100 only.
     await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
 
-    captureFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
 
     await handleInboundMessage(config, bridge.id, {
       message_id: 1,
@@ -201,15 +281,104 @@ describe("inbound message authorization", () => {
       chat: { id: 555, type: "group" },             // group includes allowlisted user 100
       date: Math.floor(Date.now() / 1000),
       text: "drive the agent"
-    });
+    }, 1);
 
     const state = readState(config.instance);
     expect(state.messagingMessages.length).toBe(0);
     expect(state.audit.some((a) => a.action === "messaging.telegram.dropped")).toBe(true);
   });
+
+  test("duplicate externalId on restart is a no-op (advances offset, no second task)", async () => {
+    const config = buildConfig("telegram-inbound-dedupe");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    const msg = {
+      message_id: 7,
+      from: { id: 100, username: "u" },
+      chat: { id: 555, type: "private" as const },
+      date: Math.floor(Date.now() / 1000),
+      text: "first"
+    };
+    await handleInboundMessage(config, bridge.id, msg, 50);
+    const tasksAfterFirst = readState(config.instance).tasks.length;
+    // Replay the same update — simulates a poller resuming from an
+    // earlier offset after a crash before the offset advance landed.
+    await handleInboundMessage(config, bridge.id, msg, 50);
+    const tasksAfterSecond = readState(config.instance).tasks.length;
+    expect(tasksAfterSecond).toBe(tasksAfterFirst);
+    // The offset advanced past update_id=50 on both invocations.
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.telegram?.updateOffset).toBe(51);
+  });
+
+  test("concurrent inbound submissions from distinct allowlist entries run under their own agent", async () => {
+    const config = buildConfig("telegram-concurrent-agents");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    // Build two distinct agents and bind each to a separate allowlist
+    // entry so the per-task agent override has something to verify.
+    const stateBefore = readState(config.instance);
+    const agentA = stateBefore.agents[0]!.id;
+    let agentBId = "";
+    await mutateState(config.instance, (state) => {
+      const newAgent = {
+        id: "agent_B_id",
+        instance: state.instance,
+        name: "agent-B",
+        status: "inactive" as const,
+        toolsets: [] as string[],
+        messagingTargets: [] as string[],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      state.agents.push(newAgent);
+      agentBId = newAgent.id;
+    });
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId: agentA });
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 200, agentId: agentBId });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    // Interleave: fire both dispatches concurrently. The per-task agent
+    // override has to be stable per-task — without it, both tasks would
+    // see whichever activateAgent wrote last.
+    await Promise.all([
+      handleInboundMessage(config, bridge.id, {
+        message_id: 1, from: { id: 100 }, chat: { id: 1, type: "private" },
+        date: 0, text: "from A"
+      }, 1),
+      handleInboundMessage(config, bridge.id, {
+        message_id: 2, from: { id: 200 }, chat: { id: 2, type: "private" },
+        date: 0, text: "from B"
+      }, 2)
+    ]);
+
+    const state = readState(config.instance);
+    const inboundA = state.messagingMessages.find((m) => m.bridgeId === bridge.id && m.target === "1");
+    const inboundB = state.messagingMessages.find((m) => m.bridgeId === bridge.id && m.target === "2");
+    const taskA = state.tasks.find((t) => t.id === inboundA?.taskId);
+    const taskB = state.tasks.find((t) => t.id === inboundB?.taskId);
+    expect(taskA?.agentId).toBe(agentA);
+    expect(taskB?.agentId).toBe(agentBId);
+  });
 });
 
-describe("callback_query cross-user approval prevention", () => {
+describe("callback_query handling", () => {
   test("rejects a callback whose from.id doesn't own the approval's chat session", async () => {
     const config = buildConfig("telegram-cross-user");
     install(config);
@@ -269,21 +438,106 @@ describe("callback_query cross-user approval prevention", () => {
       });
     });
 
-    // Mock answerCallbackQuery so the rejection path can speak back.
-    captureFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
 
     // User B taps Approve in their own chat — must be rejected.
     await handleCallbackQuery(config, bridge.id, {
       id: "cbq_1",
       from: { id: 200, username: "userB" },
       data: "appr:appr_a"
-    });
+    }, 70);
 
     const state = readState(config.instance);
     const approval = state.approvals.find((a) => a.id === "appr_a");
     expect(approval?.status).toBe("pending");
     const drop = state.audit.find((a) => a.action === "messaging.telegram.dropped" && (a.evidence as Record<string, unknown> | undefined)?.reason === "cross_user_approval");
     expect(drop).toBeDefined();
+  });
+
+  test("validated callback acks immediately and edits the prompt message", async () => {
+    const config = buildConfig("telegram-callback-happy");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    await mutateState(config.instance, (state) => {
+      const liveBridge = state.messagingBridges.find((b) => b.id === bridge.id)!;
+      liveBridge.telegram!.allowlist[0]!.chatSessionId = "chat_user100";
+      state.chatSessions.push({
+        id: "chat_user100",
+        instance: state.instance,
+        title: "user",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      state.approvals.push({
+        id: "appr_x",
+        instance: state.instance,
+        action: "file.write",
+        target: "/tmp/x",
+        risk: "low",
+        status: "pending",
+        reason: "test approval low risk",
+        payload: {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      state.messagingMessages.push({
+        id: "msg_appr_x",
+        instance: state.instance,
+        bridgeId: bridge.id,
+        direction: "outbound",
+        status: "sent",
+        target: "555",
+        text: "approve?",
+        externalId: "42",
+        approvalId: "appr_x",
+        chatSessionId: "chat_user100",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    });
+
+    const log = mockFetch(async (url) => {
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 42 } }), { status: 200 });
+    });
+
+    await handleCallbackQuery(config, bridge.id, {
+      id: "cbq_x",
+      from: { id: 100, username: "u" },
+      data: "deny:appr_x"
+    }, 80);
+
+    // The deny path causes the agent to fail the task. Inspect the
+    // calls: the first call must be answerCallbackQuery (early ack);
+    // the prompt-edit must reflect the verdict.
+    const ackCalls = log.filter((entry) => entry.url.includes("answerCallbackQuery"));
+    const editCalls = log.filter((entry) => entry.url.includes("editMessageText"));
+    expect(ackCalls.length).toBeGreaterThanOrEqual(1);
+    expect(editCalls.length).toBeGreaterThanOrEqual(1);
+    // The ack must precede the editMessageText so the user sees the
+    // spinner clear before the verdict is written into the prompt.
+    const firstAckIndex = log.findIndex((entry) => entry.url.includes("answerCallbackQuery"));
+    const firstEditIndex = log.findIndex((entry) => entry.url.includes("editMessageText"));
+    expect(firstAckIndex).toBeLessThan(firstEditIndex);
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) => a.id === "appr_x");
+    expect(approval?.status).toBe("denied");
+    // Offset advances past the callback update in the same mutation
+    // that records the decision audit, so a poller restart doesn't
+    // re-dispatch the callback.
+    const live = state.messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.telegram?.updateOffset).toBe(81);
   });
 });
 
@@ -298,7 +552,7 @@ describe("dispatchOutboundMessage", () => {
       connectorId: "id_conn"
     });
 
-    const fetchLog = captureFetch(async (url) => {
+    const fetchLog = mockFetch(async (url) => {
       // Confirm the token went into the URL (the Bot API path includes
       // the token). We never log the token via audit — only here in the
       // test do we see it.
@@ -341,7 +595,7 @@ describe("dispatchOutboundMessage", () => {
       kind: "telegram",
       connectorId: "id_conn"
     });
-    captureFetch(async () =>
+    mockFetch(async () =>
       new Response(JSON.stringify({ ok: false, description: "Bad Request: chat not found" }), { status: 400 })
     );
     const message = {
@@ -364,6 +618,42 @@ describe("dispatchOutboundMessage", () => {
     expect(updated?.status).toBe("failed");
     expect(updated?.error).toContain("chat not found");
   });
+
+  test("fetch-level network failure flips message status to failed", async () => {
+    // Distinct from Telegram-shaped failures: this is a transport-level
+    // throw (DNS, ECONNREFUSED, TLS). Without the postJson try/catch the
+    // throw propagates past callers and the row stays "queued".
+    const config = buildConfig("telegram-dispatch-network-throw");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    mockFetch(async () => {
+      throw new Error("network unreachable");
+    });
+    const message = {
+      id: "msg_net_throw",
+      instance: config.instance,
+      bridgeId: bridge.id,
+      direction: "outbound" as const,
+      status: "queued" as const,
+      target: "555",
+      text: "hello",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await mutateState(config.instance, (s) => {
+      s.messagingMessages.unshift(message);
+    });
+    const reloaded = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)!;
+    await dispatchOutboundMessage(config, reloaded, message);
+    const updated = readState(config.instance).messagingMessages.find((m) => m.id === "msg_net_throw");
+    expect(updated?.status).toBe("failed");
+    expect(updated?.error).toContain("network unreachable");
+  });
 });
 
 describe("updateOffset persistence", () => {
@@ -383,6 +673,72 @@ describe("updateOffset persistence", () => {
     // Force a state re-read by going through readState again.
     const reloaded = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)!;
     expect(reloaded.telegram?.updateOffset).toBe(12345);
+  });
+
+  test("inbound handler advances offset in the same mutation as the inbound row", async () => {
+    const config = buildConfig("telegram-offset-with-inbound");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 1, agentId });
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 9,
+      from: { id: 1 },
+      chat: { id: 100, type: "private" },
+      date: 0,
+      text: "x"
+    }, 555);
+
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.telegram?.updateOffset).toBe(556);
+  });
+});
+
+describe("/receive bypass guard", () => {
+  test("receiveMessagingInput rejects telegram bridges", async () => {
+    const config = buildConfig("telegram-receive-rejected");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    await expect(
+      receiveMessagingInput(config, bridge.id, { text: "smuggled" })
+    ).rejects.toThrow(/receive inbound messages via the poller/);
+  });
+});
+
+describe("malformed payload handling", () => {
+  test("malformed update audits and skips dispatch", async () => {
+    // We exercise the validation path indirectly by importing the
+    // module-private helper through its export. The poller routes
+    // malformed updates through the same audit + offset advance code
+    // path.
+    const { isValidTelegramUpdate } = await import("./telegram-transport");
+    expect(isValidTelegramUpdate({})).toBe(false);
+    expect(isValidTelegramUpdate({ update_id: "not-a-number" })).toBe(false);
+    expect(isValidTelegramUpdate({ update_id: 1, message: { /* no chat */ } })).toBe(false);
+    expect(isValidTelegramUpdate({
+      update_id: 1,
+      callback_query: { id: "x" /* no from */ }
+    })).toBe(false);
+    expect(isValidTelegramUpdate({
+      update_id: 1,
+      message: { chat: { id: 2 } }
+    })).toBe(true);
+    expect(isValidTelegramUpdate({
+      update_id: 1,
+      callback_query: { id: "x", from: { id: 5 } }
+    })).toBe(true);
   });
 });
 

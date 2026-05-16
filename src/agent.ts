@@ -81,6 +81,12 @@ export interface SubmitTaskOptions {
   // "imperative" preserves the legacy CLI prefix-dispatch behavior. Defaults
   // to "imperative" for back-compat with the CLI; chat callers pass "chat".
   mode?: "chat" | "imperative";
+  // Per-task active-agent override. Inbound paths that route per-user (e.g.
+  // a Telegram allowlist entry pins an agent per Telegram user) stamp the
+  // resolved agent id here so the asynchronously-scheduled chat-task loop
+  // reads the right agent from the task row instead of racing on the global
+  // active-agent pointer.
+  agentId?: string;
 }
 
 // Run the messaging bridge reply hook for a task that just reached a
@@ -114,6 +120,7 @@ export async function submitTask(
     : { jobId: jobIdOrOptions, parentTaskId, subagentId, runId };
   const created = createTask(config.instance, input, options.jobId, options.parentTaskId, options.subagentId, options.runId);
   if (options.mode) created.mode = options.mode;
+  if (options.agentId) created.agentId = options.agentId;
   // When a parentTaskId is set, the upsert + the parent-status
   // check must serialize together. Without this, `spawnSubagent`'s
   // in-callback check inside `createSubagentRecord` can pass, then

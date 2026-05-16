@@ -64,15 +64,16 @@ async function emitOneApprovalPrompt(
   chatSessionId: string | undefined,
   approval: Approval
 ): Promise<void> {
-  // Idempotency: skip if we already emitted a prompt row for this
-  // approval. The poller's callback handler reads MessagingMessageRecord
-  // rows by approvalId to enforce cross-user routing, so duplicates
-  // would also confuse that lookup.
+  // Idempotency: only short-circuit on a successfully-sent prompt row.
+  // A prior `failed` (or transient `queued`) row would otherwise block
+  // every future retry, so we let those fall through to a fresh
+  // dispatch. The callback handler enforces cross-user routing using the
+  // most-recent outbound row for the approval, so a second row is safe.
   const state = readState(config.instance);
   const existing = state.messagingMessages.find(
     (m) => m.bridgeId === bridgeId && m.approvalId === approval.id && m.direction === "outbound"
   );
-  if (existing) return;
+  if (existing && existing.status === "sent") return;
 
   const text = formatApprovalPrompt(approval);
   const replyMarkup: TelegramInlineKeyboardMarkup = {
@@ -99,21 +100,43 @@ async function emitOneApprovalPrompt(
 
   const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
   if (!bridge) return;
-  await dispatchOutboundMessage(config, bridge, message, { replyMarkup });
+  const dispatched = await dispatchOutboundMessage(config, bridge, message, { replyMarkup });
+  // Inspect the dispatch outcome: only emit the prompt_sent audit when
+  // the row actually flipped to "sent". Otherwise emit a dedicated
+  // prompt_failed audit (with the captured error) so operators see the
+  // partial delivery — the generic messaging.telegram.send_failed row
+  // doesn't carry the approval correlation.
   await mutateState(config.instance, (s) => {
-    addAudit(s, {
-      actor: "runtime",
-      action: "messaging.telegram.approval_prompt_sent",
-      target: bridgeId,
-      risk: "low",
-      taskId: approval.taskId,
-      evidence: {
-        bridgeId,
-        approvalId: approval.id,
-        chatId,
-        chatSessionId
-      }
-    });
+    if (dispatched.status === "sent") {
+      addAudit(s, {
+        actor: "runtime",
+        action: "messaging.telegram.approval_prompt_sent",
+        target: bridgeId,
+        risk: "low",
+        taskId: approval.taskId,
+        evidence: {
+          bridgeId,
+          approvalId: approval.id,
+          chatId,
+          chatSessionId
+        }
+      });
+    } else {
+      addAudit(s, {
+        actor: "runtime",
+        action: "messaging.telegram.approval_prompt_failed",
+        target: bridgeId,
+        risk: "low",
+        taskId: approval.taskId,
+        evidence: {
+          bridgeId,
+          approvalId: approval.id,
+          chatId,
+          chatSessionId,
+          error: dispatched.error
+        }
+      });
+    }
   });
 }
 
