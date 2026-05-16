@@ -647,4 +647,3 @@ function countDependentSkills(skills: SkillRecord[], providerId: string): number
   }
   return count;
 }
-
