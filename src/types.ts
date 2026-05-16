@@ -457,6 +457,14 @@ export interface MessagingBridgeRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
+  // Per-bridge encrypted secret refs (e.g. the Telegram bot token). Stored
+  // via the same AES-GCM box as connectorSecrets — the connectorId namespace
+  // we use is `messaging.<bridgeId>` so a bridge delete cleans up its files.
+  secretRefs?: ConnectorSecretRef[];
+  // Bridge-kind-specific non-secret state. For telegram: { botUsername,
+  // lastOffset }. Kept as a free-form record so each kind can evolve without
+  // forcing a schema migration on the others.
+  metadata?: Record<string, unknown>;
 }
 
 export interface MessagingMessageRecord {
