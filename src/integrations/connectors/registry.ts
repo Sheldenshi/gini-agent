@@ -7,6 +7,7 @@
 import type { ProviderModule } from "./types";
 import { demoProvider } from "./demo";
 import { linearProvider } from "./linear";
+import { telegramProvider } from "./telegram";
 import { genericProvider } from "./generic";
 import { claudeCodeProvider } from "./claude-code";
 import { codexProvider } from "./codex";
@@ -22,6 +23,7 @@ function register(module: ProviderModule): void {
 
 register(demoProvider);
 register(linearProvider);
+register(telegramProvider);
 register(genericProvider);
 register(claudeCodeProvider);
 register(codexProvider);

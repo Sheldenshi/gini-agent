@@ -453,10 +453,48 @@ export interface MessagingBridgeRecord {
   kind: "telegram" | "discord" | "slack" | "email" | "imessage" | "demo" | string;
   status: MessagingBridgeStatus;
   deliveryTargets: string[];
+  // Optional connector id whose encrypted secret holds the bridge's
+  // credentials (ADR connector-secret-storage.md). For telegram this is
+  // the connector that owns the bot token; the gateway resolves the
+  // secret per-call via resolveConnectorSecret and never stamps the
+  // plaintext onto the bridge record.
+  connectorId?: string;
+  // Telegram-specific bridge configuration. Present only when
+  // kind === "telegram". The poller's restart-resilient updateOffset
+  // and the per-user allowlist live here so a single bridge row carries
+  // everything the long-poll worker needs.
+  telegram?: TelegramBridgeConfig;
   lastHealthAt?: string;
   message?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+// Telegram bridge configuration. See ADR telegram-messaging-channel.md.
+//
+// - botUsername is cached from getMe on the first successful probe and is
+//   display only — authorization NEVER uses it.
+// - updateOffset is `last_update_id + 1` and is persisted so a runtime
+//   restart resumes where the previous getUpdates call stopped without
+//   re-delivering updates the poller already dispatched.
+// - allowlist binds Telegram `user_id` → Gini `agentId`. The auth key is
+//   `user_id` (numeric, stable); `username` is display only because
+//   Telegram lets users change their handle, and a group chat_id is
+//   shared across members (so we never authorize by chat_id).
+export interface TelegramBridgeConfig {
+  botUsername?: string;
+  updateOffset?: number;
+  allowlist: TelegramAllowlistEntry[];
+}
+
+export interface TelegramAllowlistEntry {
+  telegramUserId: number;
+  telegramUsername?: string;
+  agentId: string;
+  // Populated lazily on the first inbound message from this user, so the
+  // poller can route every subsequent message into the same Gini chat
+  // session (preserving conversation context across messages).
+  chatSessionId?: string;
 }
 
 export interface MessagingMessageRecord {
@@ -472,6 +510,16 @@ export interface MessagingMessageRecord {
   taskId?: string;
   notificationId?: string;
   error?: string;
+  // The Gini chat session this message belongs to, when the bridge
+  // routes per-user conversations through chat sessions (telegram).
+  chatSessionId?: string;
+  // External message id assigned by the third-party platform (telegram
+  // `message_id`). Required for streaming reply edits via
+  // editMessageText.
+  externalId?: string;
+  // Approval id this outbound message corresponds to, when the message
+  // is an approval prompt with inline-keyboard buttons.
+  approvalId?: string;
 }
 
 export interface ImportReport {

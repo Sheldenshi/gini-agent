@@ -20,7 +20,16 @@ import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
-import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
+import {
+  addMessagingBridge,
+  addTelegramAllowlistEntry,
+  checkMessagingBridge,
+  disableMessagingBridge,
+  listMessagingMessages,
+  receiveMessagingInput,
+  removeTelegramAllowlistEntry,
+  sendMessagingOutput
+} from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
@@ -384,6 +393,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/send$/, async (request, params) => json(await sendMessagingOutput(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
+    // Telegram allowlist management. The bridge's allowlist is the
+    // ONLY source of truth for "which Telegram user_id is allowed to
+    // drive this bridge". Both routes require the bridge to be a
+    // telegram kind; addTelegramAllowlistEntry / remove… throw a
+    // clear error otherwise. See ADR telegram-messaging-channel.md.
+    ["POST", /^\/api\/messaging\/([^/]+)\/telegram\/allow$/, async (request, params) => json(await addTelegramAllowlistEntry(config, params[0], await body(request)), 201)],
+    ["DELETE", /^\/api\/messaging\/([^/]+)\/telegram\/allow\/([^/]+)$/, async (_request, params) => json(await removeTelegramAllowlistEntry(config, params[0], params[1]))],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
     // /api/setup/status to decide whether to render the form, and POSTs

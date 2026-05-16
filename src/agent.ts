@@ -54,6 +54,12 @@ import { resolveActiveSkillsEnv } from "./integrations/connectors";
 // jobId settles. Idempotent — safe to call from runTask, failTask, and
 // cancelTask without de-duping.
 import { finalizeJobRunFromTask } from "./jobs/finalize";
+// Sibling terminal-state hook for messaging bridges. Wrapped in try/catch
+// at the call sites (via runTerminalHooks) so a vanished bridge or a
+// transient HTTP failure to Telegram can't break the rest of the
+// terminal transition — particularly the run / job / subagent
+// propagation. See ADR telegram-messaging-channel.md.
+import { replyToMessagingFromTask } from "./integrations/messaging-finalize";
 import {
   matchesShape,
   shapeCode,
@@ -75,6 +81,22 @@ export interface SubmitTaskOptions {
   // "imperative" preserves the legacy CLI prefix-dispatch behavior. Defaults
   // to "imperative" for back-compat with the CLI; chat callers pass "chat".
   mode?: "chat" | "imperative";
+}
+
+// Run the messaging bridge reply hook for a task that just reached a
+// terminal status. Wrapped in try/catch so a vanished bridge or a
+// transient Telegram HTTP failure can't break the rest of the
+// terminal transition. The hook itself is a no-op for tasks that
+// didn't originate from a messaging bridge.
+async function replyToMessagingSafely(config: RuntimeConfig, task: Task): Promise<void> {
+  try {
+    await replyToMessagingFromTask(config, task);
+  } catch (error) {
+    appendLog(config.instance, "messaging.reply.error", {
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
 }
 
 export async function submitTask(
@@ -182,6 +204,7 @@ export async function cancelTask(config: RuntimeConfig, taskId: string): Promise
   });
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
+  await replyToMessagingSafely(config, task);
   await syncSubagentFromTask(config, task);
   // Cascade cancellation to descendant subagent tasks. If the cancelled
   // task spawned subagents (whose taskIds are children), cancel each one
@@ -519,6 +542,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   appendTrace(config.instance, taskId, { type: "task", message: "Task completed", data: { summary: task.summary } });
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
+  await replyToMessagingSafely(config, task);
 
   // Hindsight phase 5: auto-retain. Run async and don't block task completion.
   // The extractor decides whether anything factual is in the input — we only
@@ -532,6 +556,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
 async function finishTaskTransition(config: RuntimeConfig, task: Task): Promise<Task> {
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
+  if (isTerminalTaskStatus(task.status)) await replyToMessagingSafely(config, task);
   return task;
 }
 
@@ -634,6 +659,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
+  await replyToMessagingSafely(config, task);
   await syncSubagentFromTask(config, task);
   // Cascade cancellation to descendant subagent tasks when a parent
   // task is failed (e.g. via approval denial or a runtime exception).
@@ -695,6 +721,7 @@ export async function completeLowRiskToolTask(
   }
   await updateRunFromTask(config, completed);
   if (completed.jobId) await finalizeJobRunFromTask(config, completed);
+  if (isTerminalTaskStatus(completed.status)) await replyToMessagingSafely(config, completed);
   return completed;
 }
 
@@ -793,6 +820,7 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
     if (approval.task) {
       await updateRunFromTask(config, approval.task);
       if (approval.task.jobId) await finalizeJobRunFromTask(config, approval.task);
+      await replyToMessagingSafely(config, approval.task);
       await syncSubagentFromTask(config, approval.task);
       // Cascade cancellation to descendant subagent tasks. The
       // deny path flips the parent task to `failed` directly inside

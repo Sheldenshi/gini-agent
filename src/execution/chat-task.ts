@@ -45,8 +45,25 @@ import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import { dispatchToolCall } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
+import { replyToMessagingFromTask } from "../integrations/messaging-finalize";
+import { emitTelegramApprovalPromptsForTask } from "../integrations/messaging/telegram-approvals";
 import { isSkillActive } from "../integrations/connectors";
 import { resolveEffectiveContext } from "./effective-context";
+
+// Messaging bridge reply hook. Wrapped in try/catch so a transient HTTP
+// failure to telegram can't break the rest of the terminal transition.
+// No-op for tasks that didn't originate from an inbound messaging
+// message — the hook checks `m.taskId === task.id` internally.
+async function replyToMessagingSafely(config: RuntimeConfig, task: Task): Promise<void> {
+  try {
+    await replyToMessagingFromTask(config, task);
+  } catch (error) {
+    appendLog(config.instance, "messaging.reply.error", {
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
 // model call (followed by zero or more tool dispatches). Most tasks finish
@@ -478,6 +495,9 @@ async function runLoop(
       // the JobRunRecord stays stuck in `running` and the chat-session
       // delivery never fires. Idempotent — no-op for tasks without jobId.
       if (finished.jobId) await finalizeJobRunFromTask(config, finished);
+      // Sibling: reply to the originating messaging bridge if this task
+      // was driven by an inbound message. No-op for non-messaging tasks.
+      await replyToMessagingSafely(config, finished);
       return finished;
     }
 
@@ -622,6 +642,18 @@ async function runLoop(
         data: { approvalIds: pendingApprovals.map((p) => p.approvalId), iterations }
       });
       await updateRunFromTask(config, paused);
+      // Inline-keyboard approval routing for telegram-driven chats.
+      // Best-effort: a telegram HTTP failure here doesn't fail the task
+      // — the user can still resolve the approval via the web UI / CLI.
+      // No-op for tasks that didn't originate from a messaging bridge.
+      try {
+        await emitTelegramApprovalPromptsForTask(config, taskId, pendingApprovals);
+      } catch (error) {
+        appendLog(config.instance, "messaging.telegram.approval.emit_error", {
+          taskId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
       return paused;
     }
 
@@ -677,6 +709,7 @@ async function runLoop(
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    await replyToMessagingSafely(config, exhausted);
     return exhausted;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -702,6 +735,7 @@ async function runLoop(
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
+    await replyToMessagingSafely(config, exhausted);
     return exhausted;
   }
 }

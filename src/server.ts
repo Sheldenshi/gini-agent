@@ -10,6 +10,10 @@ import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
+import {
+  startConfiguredTelegramPollers,
+  stopAllPollers as stopAllTelegramPollers
+} from "./integrations/messaging/telegram-registry";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -99,6 +103,13 @@ loadSkillsFromDisk(config)
       error: error instanceof Error ? error.message : String(error)
     });
   });
+
+// Start every configured telegram messaging poller. Idempotent: only
+// bridges with kind=telegram, status=configured, and a connectorId
+// get a worker. The registry de-dupes starts so an explicit
+// /api/messaging/:id/health call later is a no-op for an already-
+// running poller. See ADR telegram-messaging-channel.md.
+startConfiguredTelegramPollers(config);
 
 // Auto-detect connectors with `source: "auto"` for any provider that
 // declares a `detect()` (today claude-code and codex). Idempotent: skips
@@ -251,7 +262,12 @@ process.on("SIGTERM", async () => {
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
       // close shouldn't block runtime shutdown.
-      closeBrowserSessions().catch(() => {})
+      closeBrowserSessions().catch(() => {}),
+      // Tear down telegram pollers. Each poller's AbortController
+      // unblocks its in-flight long-poll fetch so the worker exits
+      // within one event-loop tick instead of waiting up to 30s for
+      // the timeout window.
+      stopAllTelegramPollers().catch(() => {})
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);
