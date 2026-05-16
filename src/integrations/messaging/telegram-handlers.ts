@@ -168,6 +168,25 @@ export async function handleInboundMessage(
   // landing in the same session (preserving context).
   const sessionId = await ensureChatSessionForUser(config, bridge.id, entry);
 
+  // Live-status re-check before the side-effect-heavy submitTask call.
+  // The bridge snapshot at line 105 is stale across every await above
+  // (secret resolve, sendChatAction, ensureChatSessionForUser). A
+  // concurrent `disableMessagingBridge` lands here as a status flip on
+  // the persisted state file; refuse to submit a task whose reply path
+  // is no longer permitted.
+  const preDispatchBridge = readState(config.instance).messagingBridges.find(
+    (b) => b.id === bridgeId
+  );
+  if (preDispatchBridge?.status !== "configured") {
+    await auditDropped(config, bridgeId, updateId, "disabled_during_dispatch", {
+      chatId,
+      telegramUserId: fromId,
+      messageId: message.message_id,
+      bridgeStatus: preDispatchBridge?.status
+    });
+    return;
+  }
+
   // Create a conversation run + submit the chat task, mirroring
   // submitChatMessage in src/execution/chat.ts so messaging messages
   // produce identical run/task records to web-driven chats. The allowlist
@@ -184,6 +203,32 @@ export async function handleInboundMessage(
   await linkRunToTask(config, run.id, task);
 
   await mutateState(config.instance, (state) => {
+    // Second live-status check inside the durable write. submitTask
+    // already fired (we can't unsubmit it cleanly mid-flow), but the
+    // user-visible chat-message row, the inbound row that drives the
+    // reply target, and the run<->task binding are all gated here so a
+    // disable that lands between submitTask and this write doesn't
+    // create artifacts the operator just tried to silence.
+    const liveBridge = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (liveBridge?.status !== "configured") {
+      addAudit(state, {
+        actor: "runtime",
+        action: "messaging.telegram.disabled_during_dispatch",
+        target: bridgeId,
+        risk: "low",
+        taskId: task.id,
+        evidence: {
+          bridgeId,
+          chatId,
+          telegramUserId: fromId,
+          messageId: message.message_id,
+          bridgeStatus: liveBridge?.status,
+          taskId: task.id
+        }
+      });
+      advanceTelegramOffset(state, bridgeId, updateId);
+      return;
+    }
     const chatMessage = createChatMessage(state, {
       sessionId,
       role: "user",
@@ -307,6 +352,47 @@ export async function handleCallbackQuery(
       expectedTelegramUserId: owningEntry?.telegramUserId
     });
     if (token) await answerCallbackQuery(token, query.id, "This approval is for another user.").catch(() => {});
+    return;
+  }
+
+  // Live re-validation at the side-effect boundary. Every check above
+  // ran against the bridge snapshot captured at handler entry; the
+  // intervening `await resolveConnectorSecret` (and any future awaits)
+  // is a race window for `disableMessagingBridge`, the deleteAgent
+  // allowlist cascade, or `removeTelegramAllowlistEntry` to land. We
+  // re-read state and re-verify the bridge is still configured AND the
+  // (caller, owner) pair still resolves to the same allowlist entries,
+  // failing closed so a revoked user can't flip a pending approval
+  // through the gap.
+  const liveState = readState(config.instance);
+  const liveBridge = liveState.messagingBridges.find((b) => b.id === bridgeId);
+  if (!liveBridge || liveBridge.status !== "configured" || !liveBridge.telegram) {
+    await auditDropped(config, bridgeId, updateId, "callback_revoked", {
+      telegramUserId: fromId,
+      approvalId,
+      decisionKind,
+      reasonDetail: "bridge_unavailable"
+    });
+    if (token) await answerCallbackQuery(token, query.id, "Bridge unavailable.").catch(() => {});
+    return;
+  }
+  const liveEntry = findAllowlistEntry(liveBridge, fromId);
+  const liveOwningEntry = sessionIdOnPrompt
+    ? liveBridge.telegram.allowlist.find((a) => a.chatSessionId === sessionIdOnPrompt)
+    : undefined;
+  if (
+    !liveEntry ||
+    !liveOwningEntry ||
+    liveOwningEntry.telegramUserId !== fromId ||
+    liveEntry.telegramUserId !== liveOwningEntry.telegramUserId
+  ) {
+    await auditDropped(config, bridgeId, updateId, "callback_revoked", {
+      telegramUserId: fromId,
+      approvalId,
+      decisionKind,
+      reasonDetail: "allowlist_revoked"
+    });
+    if (token) await answerCallbackQuery(token, query.id, "Permission revoked.").catch(() => {});
     return;
   }
 

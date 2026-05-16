@@ -21,13 +21,14 @@ import {
   addMessagingBridge,
   addTelegramAllowlistEntry,
   disableMessagingBridge,
-  receiveMessagingInput
+  receiveMessagingInput,
+  removeTelegramAllowlistEntry
 } from "../messaging";
 import { replyToMessagingFromTask } from "../messaging-finalize";
 import { updateConnector } from "../connectors";
 import { handleCallbackQuery, handleInboundMessage } from "./telegram-handlers";
 import { dispatchOutboundMessage, splitForTelegram } from "./telegram-stream";
-import { isPollerRunning, stopAllPollers } from "./telegram-registry";
+import { isPollerRunning, startConfiguredTelegramPollers, stopAllPollers } from "./telegram-registry";
 
 const ROOT = "/tmp/gini-telegram-messaging-unit";
 
@@ -477,6 +478,58 @@ describe("inbound message authorization", () => {
     expect(taskA?.agentId).toBe(agentA);
     expect(taskB?.agentId).toBe(agentBId);
   });
+
+  test("bridge disabled before submitTask drops with disabled_during_dispatch", async () => {
+    // Pins the pre-submitTask live-status re-check in
+    // handleInboundMessage. The handler captures the bridge once at
+    // entry; if `disableMessagingBridge` lands between that capture and
+    // the (expensive, irreversible) submitTask call, the handler must
+    // not create a task that has no permitted reply channel.
+    const config = buildConfig("telegram-inbound-disabled-pre");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    // Disable the bridge before dispatch. This is the same shape as the
+    // race: the captured bridge snapshot is still "configured" but the
+    // live state is "disabled".
+    await disableMessagingBridge(config, bridge.id);
+
+    const tasksBefore = readState(config.instance).tasks.length;
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    await handleInboundMessage(config, bridge.id, {
+      message_id: 1,
+      from: { id: 100, username: "u" },
+      chat: { id: 555, type: "private" },
+      date: 0,
+      text: "should not dispatch"
+    }, 99);
+
+    const state = readState(config.instance);
+    expect(state.tasks.length).toBe(tasksBefore);
+    const inbound = state.messagingMessages.find(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
+    );
+    expect(inbound).toBeUndefined();
+    const drop = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.dropped" &&
+        (a.evidence as Record<string, unknown> | undefined)?.reason === "disabled_during_dispatch"
+    );
+    expect(drop).toBeDefined();
+    expect((drop!.evidence as Record<string, unknown>).bridgeStatus).toBe("disabled");
+    // Offset still advances so a poller restart doesn't re-dispatch
+    // this update.
+    const live = state.messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.telegram?.updateOffset).toBe(100);
+  });
 });
 
 describe("callback_query handling", () => {
@@ -642,6 +695,175 @@ describe("callback_query handling", () => {
   });
 });
 
+describe("callback live-revocation race", () => {
+  test("allowlist entry revoked mid-flight blocks decideApproval and audits the drop", async () => {
+    // Pins the live-state re-validation at the side-effect boundary
+    // in handleCallbackQuery. The handler captures the bridge once at
+    // entry, then awaits resolveConnectorSecret (and any future awaits)
+    // before deciding the approval. A concurrent revoke must not slip
+    // through that window.
+    const config = buildConfig("telegram-callback-revoked");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    await mutateState(config.instance, (state) => {
+      const liveBridge = state.messagingBridges.find((b) => b.id === bridge.id)!;
+      liveBridge.telegram!.allowlist[0]!.chatSessionId = "chat_user100";
+      state.chatSessions.push({
+        id: "chat_user100",
+        instance: state.instance,
+        title: "user",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      state.approvals.push({
+        id: "appr_revoked",
+        instance: state.instance,
+        action: "file.write",
+        target: "/tmp/r",
+        risk: "low",
+        status: "pending",
+        reason: "test approval revoked mid-flight",
+        payload: {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      state.messagingMessages.push({
+        id: "msg_appr_revoked",
+        instance: state.instance,
+        bridgeId: bridge.id,
+        direction: "outbound",
+        status: "sent",
+        target: "555",
+        text: "approve?",
+        externalId: "11",
+        approvalId: "appr_revoked",
+        chatSessionId: "chat_user100",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    // Race shape: start the callback handler, then immediately fire
+    // the revoke. The handler's first await (resolveConnectorSecret)
+    // enqueues a mutateState (the secret-use audit row) on the
+    // per-instance queue; the revoke's mutateState queues behind it
+    // and lands before the handler's live re-read runs. The
+    // captured-at-entry snapshot still says "entry present", but the
+    // live state has had it removed — exactly the window the guard
+    // protects.
+    const callbackPromise = handleCallbackQuery(config, bridge.id, {
+      id: "cbq_revoked",
+      from: { id: 100, username: "u" },
+      data: "appr:appr_revoked"
+    }, 90);
+    const revokePromise = removeTelegramAllowlistEntry(config, bridge.id, "100");
+    await Promise.all([callbackPromise, revokePromise]);
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) => a.id === "appr_revoked");
+    expect(approval?.status).toBe("pending");
+    const drop = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.dropped" &&
+        (a.evidence as Record<string, unknown> | undefined)?.reason === "callback_revoked"
+    );
+    expect(drop).toBeDefined();
+    expect((drop!.evidence as Record<string, unknown>).reasonDetail).toBe("allowlist_revoked");
+    expect((drop!.evidence as Record<string, unknown>).telegramUserId).toBe(100);
+  });
+
+  test("bridge disabled mid-flight blocks decideApproval with callback_revoked + bridge_unavailable", async () => {
+    const config = buildConfig("telegram-callback-bridge-disabled");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    const agentId = readState(config.instance).agents[0]!.id;
+    await addTelegramAllowlistEntry(config, bridge.id, { telegramUserId: 100, agentId });
+
+    await mutateState(config.instance, (state) => {
+      const liveBridge = state.messagingBridges.find((b) => b.id === bridge.id)!;
+      liveBridge.telegram!.allowlist[0]!.chatSessionId = "chat_user100";
+      state.chatSessions.push({
+        id: "chat_user100",
+        instance: state.instance,
+        title: "user",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        messageIds: [],
+        taskIds: [],
+        runIds: []
+      });
+      state.approvals.push({
+        id: "appr_disabled",
+        instance: state.instance,
+        action: "file.write",
+        target: "/tmp/d",
+        risk: "low",
+        status: "pending",
+        reason: "approval whose bridge was disabled",
+        payload: {},
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+      state.messagingMessages.push({
+        id: "msg_appr_disabled",
+        instance: state.instance,
+        bridgeId: bridge.id,
+        direction: "outbound",
+        status: "sent",
+        target: "555",
+        text: "approve?",
+        externalId: "12",
+        approvalId: "appr_disabled",
+        chatSessionId: "chat_user100",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      });
+    });
+
+    mockFetch(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 }));
+
+    // Race shape: callback in flight, disable lands during the
+    // resolveConnectorSecret await window via the per-instance
+    // mutateState queue.
+    const callbackPromise = handleCallbackQuery(config, bridge.id, {
+      id: "cbq_disabled",
+      from: { id: 100, username: "u" },
+      data: "appr:appr_disabled"
+    }, 91);
+    const disablePromise = disableMessagingBridge(config, bridge.id);
+    await Promise.all([callbackPromise, disablePromise]);
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) => a.id === "appr_disabled");
+    expect(approval?.status).toBe("pending");
+    const drop = state.audit.find(
+      (a) =>
+        a.action === "messaging.telegram.dropped" &&
+        (a.evidence as Record<string, unknown> | undefined)?.reason === "callback_revoked"
+    );
+    expect(drop).toBeDefined();
+    expect((drop!.evidence as Record<string, unknown>).reasonDetail).toBe("bridge_unavailable");
+  });
+});
+
 describe("dispatchOutboundMessage", () => {
   test("connector-resolves the token and stamps externalId on success", async () => {
     const config = buildConfig("telegram-dispatch-ok");
@@ -799,6 +1021,72 @@ describe("dispatchOutboundMessage", () => {
 
     expect(fetchCount).toBe(0);
     const updated = readState(config.instance).messagingMessages.find((m) => m.id === "msg_disabled");
+    expect(updated?.status).toBe("failed");
+    expect(updated?.error).toBe("Bridge is disabled");
+  });
+
+  test("bridge disabled mid-dispatch (post-secret-resolve) fails the row without shipping", async () => {
+    // Pins the live-status re-check immediately before the
+    // editMessageText/sendMessage call. The passed-in `bridge` is the
+    // pre-await snapshot from the caller (messaging-finalize, manual
+    // dispatch); a disable that lands during resolveConnectorSecret
+    // would otherwise reach api.telegram.org because the line-101
+    // guard only sees the stale snapshot.
+    const config = buildConfig("telegram-dispatch-disabled-midflight");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+
+    // Drain the poller so its background getUpdates loop doesn't bump
+    // the per-test fetch counter while we exercise dispatch.
+    await stopAllPollers();
+
+    const message = {
+      id: "msg_midflight_disabled",
+      instance: config.instance,
+      bridgeId: bridge.id,
+      direction: "outbound" as const,
+      status: "queued" as const,
+      target: "555",
+      text: "should not ship",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    await mutateState(config.instance, (s) => {
+      s.messagingMessages.unshift(message);
+    });
+
+    // Capture the bridge while it's still "configured" — this is the
+    // snapshot the caller (messaging-finalize / manual dispatch) would
+    // pass in, mirroring the line-37 capture in messaging-finalize.ts.
+    const capturedBridge = readState(config.instance).messagingBridges.find(
+      (b) => b.id === bridge.id
+    )!;
+    expect(capturedBridge.status).toBe("configured");
+
+    // Disable the bridge AFTER the snapshot. The captured object still
+    // says `configured`; only the live state knows the truth.
+    await disableMessagingBridge(config, bridge.id);
+    expect(capturedBridge.status).toBe("configured");
+
+    // Now install the fetch counter — after disable, after stop, so the
+    // only fetch that could increment it is a leak from dispatch.
+    let fetchCount = 0;
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      throw new Error("telegram.test: mid-flight disable must not fetch");
+    }) as unknown as typeof fetch;
+
+    await dispatchOutboundMessage(config, capturedBridge, message);
+
+    expect(fetchCount).toBe(0);
+    const updated = readState(config.instance).messagingMessages.find(
+      (m) => m.id === "msg_midflight_disabled"
+    );
     expect(updated?.status).toBe("failed");
     expect(updated?.error).toBe("Bridge is disabled");
   });
@@ -1030,6 +1318,47 @@ describe("malformed payload handling", () => {
       update_id: 1,
       callback_query: { id: "x", from: { id: 5 } }
     })).toBe(true);
+  });
+});
+
+describe("startConfiguredTelegramPollers boot contract", () => {
+  test("boot poller resumes from persisted updateOffset with long-poll timeout=30", async () => {
+    // Pins the restart-from-offset contract that ADR
+    // telegram-messaging-channel.md claims: after a runtime restart, the
+    // poller's first getUpdates call must use the persisted offset and
+    // the LONG_POLL_TIMEOUT_SECONDS long-poll window.
+    const config = buildConfig("telegram-boot-poller-offset");
+    install(config);
+    await seedTelegramConnector(config, "id_conn", "token");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      connectorId: "id_conn"
+    });
+    // addMessagingBridge starts a poller eagerly; stop it so we can
+    // simulate a fresh boot with a persisted offset.
+    await stopAllPollers();
+    await mutateState(config.instance, (state) => {
+      const live = state.messagingBridges.find((b) => b.id === bridge.id)!;
+      live.telegram!.updateOffset = 42;
+    });
+
+    const { promise: firstCall, resolve: signalFirstCall } = Promise.withResolvers<string>();
+    const log = mockFetch(async (url) => {
+      if (url.includes("getUpdates")) signalFirstCall(url);
+      return new Response(JSON.stringify({ ok: true, result: [] }), { status: 200 });
+    });
+
+    startConfiguredTelegramPollers(config);
+    const firstUrl = await firstCall;
+    // Stop the loop before afterEach drains it so we don't race past
+    // the assertions on a second iteration that bumps the call count.
+    await stopAllPollers();
+
+    expect(firstUrl).toContain("getUpdates");
+    expect(firstUrl).toContain("offset=42");
+    expect(firstUrl).toContain("timeout=30");
+    expect(log.filter((entry) => entry.url.includes("getUpdates")).length).toBeGreaterThanOrEqual(1);
   });
 });
 

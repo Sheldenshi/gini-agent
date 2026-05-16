@@ -1,4 +1,4 @@
-// Streaming reply manager + outbound dispatch for telegram messaging.
+// Outbound dispatch for telegram messaging.
 //
 // The poller drives inbound; this module handles the reply leg:
 //   - ensureChatSessionForUser: lazily binds a per-user Gini chat
@@ -10,10 +10,12 @@
 //     API; failures flip the message row to "failed" with the error
 //     captured.
 //
-// Streaming (editMessageText every <=1s) lives behind
-// streamPartialReply, kept simple for v1: a per-task last-edit timestamp
-// throttles edits. The brief flags that a fancier debounce is a
-// follow-up.
+// Streaming partial edits during an in-flight LLM round (the
+// "editMessageText every <=1s" path) is a follow-up tracked in ADR
+// telegram-messaging-channel.md under "Fancier streaming debounce".
+// Today the messaging-finalize hook posts the assistant's final body
+// once the task settles; a future change wiring a per-task LLM-stream
+// subscription into this module can add the throttled edit path.
 
 import type {
   MessagingBridgeRecord,
@@ -120,6 +122,17 @@ export async function dispatchOutboundMessage(
   if (!token) {
     return markMessageFailed(config, message.id, "Telegram bot token could not be resolved.");
   }
+  // Co-temporal status re-check immediately before the network call.
+  // The earlier line-101 guard reads the passed-in `bridge` snapshot,
+  // which the caller (the messaging-finalize hook or any future direct
+  // dispatcher) captured potentially many awaits ago. The
+  // `resolveConnectorSecret` await right above is the narrowest race
+  // window for `disableMessagingBridge` to land; re-read live state
+  // here so a disabled bridge never reaches api.telegram.org.
+  const liveBridge = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+  if (!liveBridge || liveBridge.status !== "configured") {
+    return markMessageFailed(config, message.id, `Bridge is ${liveBridge?.status ?? "missing"}`);
+  }
   const chatId = message.target;
   // Pre-split oversized text so callers can rely on full delivery; the
   // first chunk becomes the message we record and stamp externalId on,
@@ -185,28 +198,6 @@ export async function dispatchOutboundMessage(
   }
 
   return readState(config.instance).messagingMessages.find((m) => m.id === message.id) ?? message;
-}
-
-// Throttle map: bridgeId|externalId → last edit ts (ms). Streaming
-// edits beyond this rate get coalesced into the final edit emitted by
-// the messaging-finalize hook. The map is per-process; a runtime
-// restart drops it harmlessly because the placeholder either already
-// shows the final text (because finalize wrote it) or will be edited
-// to the final text on first finalize after restart.
-const lastEditAt = new Map<string, number>();
-const STREAM_EDIT_MIN_INTERVAL_MS = 1000;
-
-export function shouldStreamEdit(bridgeId: string, externalId: string): boolean {
-  const key = `${bridgeId}|${externalId}`;
-  const at = Date.now();
-  const last = lastEditAt.get(key) ?? 0;
-  if (at - last < STREAM_EDIT_MIN_INTERVAL_MS) return false;
-  lastEditAt.set(key, at);
-  return true;
-}
-
-export function clearStreamEdit(bridgeId: string, externalId: string): void {
-  lastEditAt.delete(`${bridgeId}|${externalId}`);
 }
 
 async function markMessageFailed(
