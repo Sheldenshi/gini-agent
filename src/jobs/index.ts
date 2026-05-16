@@ -1,6 +1,6 @@
 import { submitTask } from "../agent";
 import type { JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
-import { addAudit, appendEvent, appendLog, appendTrace, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
+import { addAudit, appendEvent, appendLog, appendTrace, createChatSession, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -142,6 +142,24 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     }
     chatSessionId = input.chatSessionId;
   }
+  // Dedicated-session option. When the agent's `create_job` tool fires (we
+  // detect that in the dispatcher and forward this flag), the new job
+  // should publish its future fires into a FRESH chat thread instead of
+  // burying the originating conversation under 365 daily reports. The
+  // session row is created inside the same `mutateState` write as the
+  // JobRecord below so a validation failure leaves no orphan thread. The
+  // resolved session id overwrites any caller-supplied `chatSessionId`.
+  let createDedicatedSessionTitle: string | undefined;
+  if (input.createDedicatedSession !== undefined && input.createDedicatedSession !== null) {
+    if (typeof input.createDedicatedSession !== "object" || Array.isArray(input.createDedicatedSession)) {
+      throw new Error(`Invalid input: createDedicatedSession must be an object`);
+    }
+    const opt = input.createDedicatedSession as { title?: unknown };
+    if (typeof opt.title !== "string" || opt.title.length === 0) {
+      throw new Error(`Invalid input: createDedicatedSession.title must be a non-empty string`);
+    }
+    createDedicatedSessionTitle = opt.title;
+  }
   let oneShot: boolean | undefined;
   if (input.oneShot !== undefined && input.oneShot !== null) {
     if (typeof input.oneShot !== "boolean") {
@@ -197,6 +215,16 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
         throw new Error(`Cannot create scheduled job: parent task ${parentTaskId} is already ${parent.status}.`);
       }
     }
+    // Dedicated-session creation. Done INSIDE the mutateState callback so
+    // it shares the same write as `createJob`: a validation failure (e.g.
+    // a bad parent task state) leaves no orphan chat row. The new
+    // session's id replaces any caller-supplied chatSessionId so the job's
+    // future fires post into the fresh thread.
+    let resolvedChatSessionId = chatSessionId;
+    if (createDedicatedSessionTitle !== undefined) {
+      const session = createChatSession(state, createDedicatedSessionTitle);
+      resolvedChatSessionId = session.id;
+    }
     // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
     // wall-clock moment (resolved above via Cron.nextRun()), interval-driven
     // jobs anchor `intervalSeconds` from now.
@@ -216,7 +244,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       retryLimit,
       timeoutSeconds,
       costBudget: typeof input.costBudget === "number" ? input.costBudget : undefined,
-      chatSessionId,
+      chatSessionId: resolvedChatSessionId,
       oneShot,
       dangerouslyAutoApprove,
       autoApproveCommands

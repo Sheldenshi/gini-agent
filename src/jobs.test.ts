@@ -323,7 +323,7 @@ describe("cron lifecycle", () => {
     expect(nan.status).toBe(400);
   });
 
-  test("create_job dispatch from a chat-bound task records chatSessionId", async () => {
+  test("create_job dispatch from a chat-bound task mints a dedicated chat session", async () => {
     const config = testConfig("jobs-create-tool-chat");
     // Build a chat session and a task whose runId points at it. This is
     // the shape submitChatMessage produces — we synthesize it directly so
@@ -368,20 +368,33 @@ describe("cron lifecycle", () => {
     );
     expect(result.kind).toBe("sync");
 
-    const jobs = readState(config.instance).jobs;
+    const stateAfter = readState(config.instance);
+    const jobs = stateAfter.jobs;
     expect(jobs).toHaveLength(1);
-    expect(jobs[0]?.chatSessionId).toBe(sessionId);
+    // The job points at a FRESH chat session, not the originating one —
+    // future fires post into the dedicated thread so the originating
+    // conversation doesn't get buried under repeated reports.
+    expect(jobs[0]?.chatSessionId).toBeDefined();
+    expect(jobs[0]?.chatSessionId).not.toBe(sessionId);
     expect(jobs[0]?.oneShot).toBe(true);
     expect(jobs[0]?.intervalSeconds).toBe(60);
     expect(jobs[0]?.prompt).toBe("Remind me.");
 
-    // Confirmation string contains the new job id and cadence.
+    // The new session exists and its title carries the job's name so the
+    // user can scan a list of dedicated threads.
+    const newSession = stateAfter.chatSessions.find((s) => s.id === jobs[0]!.chatSessionId);
+    expect(newSession).toBeDefined();
+    expect(newSession?.title).toContain("test-reminder");
+
+    // Confirmation string contains the new job id, cadence, and the new
+    // session id so the model can reference both in its reply to the user.
     if (result.kind === "sync") {
       expect(result.result).toContain(jobs[0]!.id);
       expect(result.result).toContain("one-shot");
+      expect(result.result).toContain(jobs[0]!.chatSessionId!);
     }
     // Audit row with actor:"agent" action:"job.created".
-    const audit = readState(config.instance).audit.find(
+    const audit = stateAfter.audit.find(
       (event) => event.action === "job.created" && event.target === jobs[0]!.id
     );
     expect(audit?.actor).toBe("agent");
@@ -413,6 +426,58 @@ describe("cron lifecycle", () => {
     // has a stable shape for downstream reads. Recurring behavior either
     // way (oneShot must be strictly === true to trigger the auto-pause).
     expect(jobs[0]?.oneShot).toBe(false);
+    // No chat session was created for the imperative path. The runtime
+    // only mints a dedicated thread when the agent invokes create_job
+    // from inside a chat task.
+    expect(readState(config.instance).chatSessions).toHaveLength(0);
+  });
+
+  test("HTTP POST /jobs does not auto-create a chat session (legacy path)", async () => {
+    // The dedicated-session behavior is specifically for agent-driven
+    // create_job tool calls. The legacy CLI path (`gini jobs add`) and
+    // HTTP POST /api/jobs path must continue to behave as today — no chat
+    // session is minted, the job carries no chatSessionId, and the user
+    // controls delivery through deliveryTargets / replay UI.
+    const config = testConfig("jobs-http-no-session");
+    const handler = createHandler(config);
+
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "legacy", script: "true", intervalSeconds: 60 })
+    });
+    expect(job.chatSessionId).toBeUndefined();
+    expect(readState(config.instance).chatSessions).toHaveLength(0);
+  });
+
+  test("create_job rejection inside mutateState leaves no orphan chat session", async () => {
+    // Atomicity guarantee: createScheduledJob mints the dedicated chat
+    // session and the JobRecord inside the SAME mutateState callback. If
+    // that callback throws — e.g. the parent task transitioned terminal
+    // between the dispatcher's lock-free pre-check and the serialized
+    // re-check — mutateState's read-modify-write contract discards the
+    // in-memory mutations and nothing is persisted. We exercise that
+    // path by injecting a cancelled parent task and asserting both the
+    // JobRecord and any chat row are absent.
+    const config = testConfig("jobs-orphan-rollback");
+    const { createScheduledJob } = await import("./jobs");
+    const parentTaskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "parent", undefined, undefined, undefined, undefined);
+      task.status = "cancelled";
+      upsertTask(state, task);
+      return task.id;
+    });
+    const beforeSessions = readState(config.instance).chatSessions.length;
+    await expect(
+      createScheduledJob(config, {
+        name: "rollback",
+        intervalSeconds: 60,
+        prompt: "x",
+        createDedicatedSession: { title: "Scheduled: rollback" },
+        parentTaskId
+      })
+    ).rejects.toThrow(/Cannot create scheduled job/);
+    expect(readState(config.instance).chatSessions.length).toBe(beforeSessions);
+    expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
   test("create_job dispatch persists the per-job auto-approve envelope", async () => {

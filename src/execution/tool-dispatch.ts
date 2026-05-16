@@ -686,10 +686,12 @@ async function createJobTool(
     timeoutSeconds = args.timeoutSeconds;
   }
 
-  // Walk task -> run -> conversation to find the originating chat session.
-  // If the caller is imperative (CLI, no run, or run without conversation),
-  // we leave chatSessionId undefined and the job runs without delivery
-  // back into a session.
+  // Walk task -> run -> conversation to determine whether the agent is
+  // invoking us from inside a chat task. If so, we want each scheduled
+  // job to publish into its OWN dedicated chat thread (so a daily report
+  // doesn't bury the originating conversation under 365 future fires).
+  // Otherwise (CLI / imperative task), the job runs without any chat
+  // delivery target — same as before.
   const state = readState(config.instance);
   const task = state.tasks.find((item) => item.id === taskId);
   // Pre-side-effect terminal check. `create_job` persists a
@@ -701,14 +703,15 @@ async function createJobTool(
   if (task && isTerminalTaskStatus(task.status)) {
     return `Error: create_job skipped because task is already ${task.status}.`;
   }
-  let chatSessionId: string | undefined;
+  // The agent's caller is "chat-bound" when its task is attached to a run
+  // whose conversation still exists. That's the trigger to mint a fresh
+  // chat thread for the job to deliver into.
+  let invokedFromChat = false;
   if (task?.runId) {
     const run = state.runs.find((item) => item.id === task.runId);
     if (run?.conversationId) {
-      // Confirm the session still exists; otherwise leave undefined so the
-      // dispatcher doesn't try to push the new task onto a missing record.
       const session = state.chatSessions.find((item) => item.id === run.conversationId);
-      if (session) chatSessionId = session.id;
+      if (session) invokedFromChat = true;
     }
   }
 
@@ -717,7 +720,10 @@ async function createJobTool(
   // lock-free `readState` pre-check is kept as a fast path / error-
   // message-quality improvement; this is the authoritative
   // serialization point. `createScheduledJob` throws if the parent
-  // task is already terminal.
+  // task is already terminal. When `invokedFromChat`, we ask
+  // createScheduledJob to mint a fresh ChatSessionRecord atomically
+  // alongside the JobRecord (single mutateState write — no orphan
+  // session on a validation failure).
   let job;
   try {
     job = await createScheduledJob(config, {
@@ -729,7 +735,10 @@ async function createJobTool(
       cronExpression,
       cronTimezone,
       prompt,
-      chatSessionId,
+      // Dedicated chat thread for chat-driven jobs. Title prefix
+      // "Scheduled: <name>" so the session list scans well; the
+      // createChatSession helper truncates to 80 chars.
+      createDedicatedSession: invokedFromChat ? { title: `Scheduled: ${name}` } : undefined,
       oneShot,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
@@ -742,6 +751,9 @@ async function createJobTool(
     }
     throw err;
   }
+  // The job's chatSessionId is the freshly-minted dedicated thread when
+  // invokedFromChat, or undefined for imperative/CLI invocations.
+  const chatSessionId = job.chatSessionId;
 
   await mutateState(config.instance, (current) => {
     const item = findTask(current, taskId);
@@ -791,7 +803,12 @@ async function createJobTool(
     : cronExpression
       ? `cron \"${cronExpression}\" (${cronTimezone ?? "UTC"})`
       : `every ${intervalSeconds}s`;
-  return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}.`;
+  // When the job has a dedicated chat thread, surface its id in the
+  // tool-call result so the model's follow-up reply can mention both the
+  // job id and the new chat id ("Each run posts into a dedicated thread.").
+  // Imperative/CLI invocations skip this suffix — there's no chat to point at.
+  const sessionSuffix = chatSessionId ? ` into ${chatSessionId}` : "";
+  return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}${sessionSuffix}.`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,
