@@ -126,6 +126,7 @@ bun run gini toolsets
 bun run gini subagent spawn reviewer "review recent traces"
 bun run gini mcp add demo echo ok
 bun run gini messaging add local demo local
+bun run gini messaging add tg telegram <chat-id> --bot-token <bot-token>
 bun run gini import inspect openclaw ~/.openclaw
 bun run gini snapshot create "before trying candidate"
 bun run gini provider show

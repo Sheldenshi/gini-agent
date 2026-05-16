@@ -1,17 +1,27 @@
 import type { CliContext } from "../context";
-import { restAfter } from "../args";
+import { parseSubArgs, restAfter } from "../args";
 import { api } from "../api";
 import { print } from "../output";
+
+const ADD_VALUE_FLAGS = new Set(["--bot-token"]);
 
 export async function messaging(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
   const sub = cliArgs[1] ?? "list";
   if (sub === "add") {
-    const [name, kind = "demo", ...targets] = restAfter(cliArgs, sub);
-    if (!name) throw new Error("Usage: gini messaging add <name> [kind] [delivery-targets...]");
+    const tail = restAfter(cliArgs, sub);
+    const parsed = parseSubArgs(tail, ADD_VALUE_FLAGS);
+    const [name, kind = "demo", ...targets] = parsed.positional;
+    if (!name) {
+      throw new Error(
+        "Usage: gini messaging add <name> [kind] [delivery-targets...] [--bot-token <token>]"
+      );
+    }
+    const body: Record<string, unknown> = { name, kind, deliveryTargets: targets };
+    if (parsed.flags["--bot-token"]) body.botToken = parsed.flags["--bot-token"];
     print(await api(config, "/api/messaging", {
       method: "POST",
-      body: JSON.stringify({ name, kind, deliveryTargets: targets })
+      body: JSON.stringify(body)
     }));
     return;
   }
