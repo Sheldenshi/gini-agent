@@ -341,8 +341,14 @@ export async function resolveSkillEnv(
   for (const envName of envNames) {
     const binding = bindings[envName];
     if (!binding) continue;
+    // Same status guard as isSkillActive: a `disabled` or `error` record
+    // with a stale `health: "healthy"` from a prior probe must not leak
+    // its secret into the spawn env.
     const connector = state.connectors.find(
-      (candidate) => candidate.provider === binding.provider && candidate.health === "healthy"
+      (candidate) =>
+        candidate.provider === binding.provider
+        && candidate.status === "configured"
+        && candidate.health === "healthy"
     );
     if (!connector) continue;
     const value = await resolveConnectorSecret(config, connector.id, binding.purpose);

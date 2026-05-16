@@ -282,7 +282,7 @@ export default function SkillsPage() {
                     <ul className="space-y-1">
                       {(detail.requiredConnectors ?? []).map((req) => {
                         const matches = (connectors.data ?? []).filter(
-                          (c) => c.provider === req.provider && c.status !== "disabled"
+                          (c) => c.provider === req.provider && c.status === "configured"
                         );
                         const provider = providersById.get(req.provider);
                         const hasProbe = Boolean(provider?.hasProbe);
@@ -579,10 +579,13 @@ function deriveActivation(
     const matches = connectorsByProv.get(req.provider) ?? [];
     const hasProbe = Boolean(providersById.get(req.provider)?.hasProbe);
     const satisfied = matches.some((c) => {
-      // Tombstoned (status: "disabled") records never satisfy.
-      if (c.status === "disabled") return false;
+      // Mirror the runtime gate exactly: only configured records ever
+      // satisfy. Disabled (tombstoned) and error-status records are
+      // excluded even if they carry a stale `health: "healthy"` from
+      // a prior probe.
+      if (c.status !== "configured") return false;
       if (c.health === "healthy") return true;
-      if (!hasProbe && c.health === "unknown" && c.status === "configured") return true;
+      if (!hasProbe && c.health === "unknown") return true;
       return false;
     });
     if (!satisfied) return { label: "needs setup", tone: "warn" };
