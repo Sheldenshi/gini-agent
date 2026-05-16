@@ -61,7 +61,7 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
     ```
 - `compatibility` carries a human-readable summary of environment requirements ("Requires curl and git. Needs a healthy Linear connector.").
 - Skill loader reads `metadata.gini.*` paths first. For one release, fall back to legacy top-level fields with a deprecation log. Remove the fallback in the release after.
-- Bundled skills migrated to the new shape in this PR: `apple-notes`, `apple-reminders`, `claude-code`, `codex`, `linear`.
+- Bundled skills migrated to the new shape in this PR: `apple-notes`, `apple-reminders`, `claude-code`, `codex`. (The `linear` skill was migrated alongside these but later removed; the `linear` provider itself remains in the registry for user-created connectors.)
 - The misspelled directory `skills/agnets/` is renamed to `skills/agents/`.
 
 ### Validation
