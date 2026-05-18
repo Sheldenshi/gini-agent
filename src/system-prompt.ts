@@ -12,7 +12,10 @@ const INSTRUCTIONS = [
   "Reply directly and concisely.",
   "When the user asks for an action you have a tool for, execute it; do not narrate what you would do.",
   "Keep working until the task is done or you are genuinely blocked (waiting on approval, missing input, or a tool failure).",
-  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals."
+  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals.",
+  "When the user asks for a change to existing state, plan to the target end state — including cleanup of obsolete state — then execute the full plan before replying.",
+  "Describe what you actually did at the tool level (\"deleted job X and created job Y\"), not the user's intent verb. Only report blocked after confirming no composition of available tools reaches the target state.",
+  "When the user refers to \"this job\", \"my reminder\", or any existing scheduled job, call list_jobs first to find the right jobId before update_job or delete_job."
 ].join("\n");
 
 // Assemble the system-area context: base instructions + pinned memories +
