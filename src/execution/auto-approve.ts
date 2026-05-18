@@ -46,3 +46,67 @@ function matchOne(pattern: string, command: string): boolean {
     return false;
   }
 }
+
+// Built-in dangerous-pattern blocklist. When `approvalMode` is "auto",
+// terminal commands matching any of these patterns are routed through the
+// human approval gate instead of being auto-approved. Operators can
+// extend the list via `RuntimeConfig.dangerousTerminalPatterns`. The
+// `autoApproveCommands` allowlist ALWAYS short-circuits the blocklist —
+// an explicit operator allow beats a heuristic block. See ADR
+// approval-mode.md.
+//
+// The patterns aim at irreversible / blast-radius-expanding shapes:
+//   - `rm -rf` / `rm -fr` targeting absolute paths or $HOME
+//   - any `sudo` invocation
+//   - pipe-to-shell (`| sh`, `| bash`) — the canonical
+//     fetch-and-execute footgun
+//   - chmod 777 (world-writable bit)
+//   - destructive git pushes / resets
+//   - writes into /etc/, ~/.ssh/, ~/.aws/
+//
+// Each entry is a substring matcher (not a glob) — we test whether the
+// command contains the pattern anywhere, which is the right semantics
+// for "does this string contain `sudo `" and friends. The matcher
+// returns the matched pattern (so the audit can record which rule
+// fired) or undefined.
+export const DEFAULT_DANGEROUS_TERMINAL_PATTERNS: readonly string[] = Object.freeze([
+  "rm -rf /",
+  "rm -fr /",
+  "rm -rf $HOME",
+  "rm -fr $HOME",
+  "rm -rf ~",
+  "rm -fr ~",
+  "sudo ",
+  "| sh",
+  "| bash",
+  "chmod 777",
+  "git push -f",
+  "git push --force",
+  "git reset --hard",
+  "> /etc/",
+  ">> /etc/",
+  "> ~/.ssh/",
+  ">> ~/.ssh/",
+  "> ~/.aws/",
+  ">> ~/.aws/"
+]);
+
+// Returns the first dangerous pattern that the command matches (substring),
+// or undefined when none match. Callers should also consult `matchAutoApprove`
+// first so an explicit operator allowlist wins.
+export function matchDangerousTerminal(
+  patterns: readonly string[] | undefined,
+  command: string
+): string | undefined {
+  if (!patterns || patterns.length === 0) return undefined;
+  for (const raw of patterns) {
+    if (typeof raw !== "string") continue;
+    // Patterns may carry significant trailing whitespace (e.g. "sudo "
+    // requires the trailing space so we don't match a binary literally
+    // named "sudoer"). Reject pure-whitespace entries via a trim check
+    // without mutating the pattern itself.
+    if (raw.trim().length === 0) continue;
+    if (command.includes(raw)) return raw;
+  }
+  return undefined;
+}
