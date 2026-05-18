@@ -419,6 +419,23 @@ export async function pairMessagingBridge(config: RuntimeConfig, idOrName: strin
   });
 }
 
+// True when the bridge currently has a valid (non-expired) pairing
+// code. The poller calls this to decide whether to nudge a denied
+// chat with a "send your pairing code" hint instead of going silent —
+// outside a pairing window the bot stays dark so strangers don't get
+// confirmation that it's running.
+export function hasActivePairingCode(config: RuntimeConfig, bridgeId: string): boolean {
+  const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
+  if (!bridge) return false;
+  const meta = bridge.metadata;
+  if (!meta) return false;
+  if (typeof meta.pairingCode !== "string") return false;
+  const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
+  if (!expiresRaw) return false;
+  const expiresAt = Date.parse(expiresRaw);
+  return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
+
 // Atomically validate and consume a pairing attempt. Returns true when
 // the message text matches the bridge's active pairing code AND the
 // chat is private AND the code hasn't expired — in which case the
@@ -491,6 +508,13 @@ export async function allowChat(config: RuntimeConfig, idOrName: string, chatId:
     // Drop the enrolled chat from the pending-attempts list so the
     // owner's view stays clean.
     meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
+    // An explicit allow closes any active pairing window — the
+    // operator just established trust through the CLI, so the
+    // pairing-window hint becomes noise. They can mint a fresh code
+    // with `gini messaging pair` whenever they want to onboard a
+    // new chat via the shortcut path.
+    delete meta.pairingCode;
+    delete meta.pairingCodeExpiresAt;
     live.metadata = meta;
     live.updatedAt = now();
     addAudit(state, {
