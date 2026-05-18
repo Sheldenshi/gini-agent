@@ -236,7 +236,12 @@ export function defaultConfig(instance: Instance): RuntimeConfig {
     },
     workspaceRoot: workspaceDir(instance),
     stateRoot: instanceRoot(instance),
-    logRoot: logDir(instance)
+    logRoot: logDir(instance),
+    // New instances default to "auto": auto-approve safe actions, gate
+    // dangerous terminal patterns. See ADR approval-mode.md. Legacy
+    // configs with `dangerouslyAutoApprove: true` are aliased to "yolo"
+    // at load time by `runtime/index.ts`.
+    approvalMode: "auto"
   };
 }
 
