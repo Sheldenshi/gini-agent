@@ -56,6 +56,33 @@ describe("formatTelegramMarkdownV2", () => {
     expect(formatTelegramMarkdownV2("see **README.md**!")).toBe("see *README\\.md*\\!");
   });
 
+  test("bold wrapping an inline code span renders as code only (no literal ** leak)", () => {
+    // Real-world agent output: **`git rebase`** highlights a command.
+    // Telegram MDV2 doesn't reliably support code nested in bold, so we
+    // drop the bold markers and keep the code span. Crucially the
+    // output must contain NO literal `**` characters — that was the
+    // exact regression that prompted this case.
+    const out = formatTelegramMarkdownV2("Run **`git rebase`** to replay commits.");
+    expect(out).toBe("Run `git rebase` to replay commits\\.");
+    expect(out.includes("**")).toBe(false);
+  });
+
+  test("bold runs survive across the code-span pre-pass", () => {
+    // Two bold phrases with a code span between them — both bold runs
+    // must render, and the code stays intact.
+    const out = formatTelegramMarkdownV2("**rebase** rewrites history; use `git log` then **squash** carefully.");
+    expect(out).toBe("*rebase* rewrites history; use `git log` then *squash* carefully\\.");
+  });
+
+  test("bold containing prose and a code span keeps the bold and the code together", () => {
+    // The agent emits a mixed bold span — we render it as `*…*` and
+    // re-inject the code placeholder inside. Telegram may or may not
+    // render the inner code, but the message is valid MDV2 and the
+    // text reads cleanly either way.
+    const out = formatTelegramMarkdownV2("**Use `npm install` now**.");
+    expect(out).toBe("*Use `npm install` now*\\.");
+  });
+
   test("control-byte sentinels in user input do not leak into the output as bold", () => {
     // If a (hypothetical) attacker put our internal placeholder bytes
     // directly into the input, they must be escaped or stripped — never
