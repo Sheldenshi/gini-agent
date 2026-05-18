@@ -224,7 +224,7 @@ export default function ChatPage() {
 
   return (
     <div className="flex flex-1 overflow-hidden">
-      <aside className="flex w-full shrink-0 flex-col border-b border-border md:w-[260px] md:border-r md:border-b-0">
+      <aside className="flex min-h-0 w-full shrink-0 flex-col border-b border-border md:w-[260px] md:border-r md:border-b-0">
         <div className="p-2">
           <button
             className="flex h-9 w-full items-center gap-1.5 rounded-lg px-2.5 text-sm font-normal hover:bg-accent disabled:opacity-50"
@@ -256,7 +256,7 @@ export default function ChatPage() {
         </ScrollArea>
       </aside>
 
-      <section className="flex min-w-0 flex-1 flex-col">
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col">
         {!selected ? (
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
             {orderedSessions.length === 0 ? "No chats yet — start a new one" : "Select a chat"}
