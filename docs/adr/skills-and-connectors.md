@@ -48,11 +48,11 @@ Cardinality forces this separation. A single Google connector powers Gmail, Cale
 - When a skill spawns a subprocess that declares `prerequisites.env`, the runtime resolves those env vars from matching connectors and injects them into the subprocess environment. Plaintext secrets never appear in skill records, state, audit, or trace evidence.
 - The Skills UI surface marks dependent skills as "needs setup: \<provider>" when their connectors are missing or unhealthy and exposes inline `[Set up <Label>]` to add the missing connector without leaving the page.
 
-### Trust and audit
+### Approval and audit
 
-- All connector mutations (create, update, rotate, delete, health) emit audit events tied to the connector id, per ADR trust-substrate.md.
+- All connector mutations (create, update, rotate, delete, health) emit audit events tied to the connector id, per ADR approval-and-audit-substrate.md.
 - Secret values never appear in audit evidence. Audit may include the connector id, the purpose, and a boolean of whether resolution succeeded.
-- Risky tool calls that consume connector secrets continue to route through ADR trust-substrate.md approvals.
+- Risky tool calls that consume connector secrets continue to route through ADR approval-and-audit-substrate.md approvals.
 
 ### UI
 

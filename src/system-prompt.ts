@@ -17,8 +17,8 @@ const INSTRUCTIONS = [
 
 // Assemble the system-area context: base instructions + pinned memories +
 // long-term recalled memory. Placing memory in the system channel (rather
-// than the user message) inherits the model's default trust for system
-// instructions — we don't have to talk the model into believing it.
+// than the user message) gives it higher-priority placement without
+// talking the model into believing it.
 export function buildAgentSystemContext(memories: MemoryRecord[], recalledContext?: string): string {
   const parts = [INSTRUCTIONS];
   if (memories.length > 0) {

@@ -157,7 +157,7 @@ export interface RuntimeConfig {
   // carry `evidence.autoApproved=true` plus
   // `evidence.autoApprovedReason="dangerouslyAutoApprove"`, so the
   // trail stays inspectable — only the human gate is skipped.
-  // Intended for trusted, dev-mode use only. See ADR dangerously-auto-approve.md for the
+  // Intended for operator-controlled dev-mode use only. See ADR dangerously-auto-approve.md for the
   // full audit contract.
   dangerouslyAutoApprove?: boolean;
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so

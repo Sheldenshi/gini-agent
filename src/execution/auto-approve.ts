@@ -1,6 +1,6 @@
 // Auto-approve allowlist matcher for shell commands.
 //
-// Users opt in to bypassing the approval gate for trusted commands by
+// Users opt in to bypassing the approval gate for selected commands by
 // listing shell-glob-like patterns in
 // `RuntimeConfig.autoApproveCommands`. Each pattern is matched against
 // the *full* command string the model emitted (we don't try to parse

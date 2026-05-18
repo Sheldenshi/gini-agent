@@ -81,7 +81,7 @@ Mobile, MCP, messaging bridges, and scripts should connect through the gateway c
 ## Why This Shape
 
 1. **Single source of truth.** Reloading the web app, running a CLI command, and opening a future mobile app all observe the same runtime state.
-2. **Clear trust boundary.** The browser never receives a bearer token. Trusted clients can hold their own tokens.
+2. **Clear token boundary.** The browser never receives a bearer token. Local clients that can safely store credentials can hold their own tokens.
 3. **Replaceable clients.** New surfaces do not require a second backend or a duplicated state model.
 4. **Parallel agent support.** Instances isolate ports, state, logs, workspaces, and runtime processes.
 

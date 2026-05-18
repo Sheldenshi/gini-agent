@@ -1,6 +1,6 @@
 # Gini Agent
 
-Gini Agent is a local-first personal agent runtime for people who want an agent they can install, operate, inspect, approve, debug, and trust.
+Gini Agent is a local-first personal agent runtime for people who want an agent they can install, operate, inspect, approve, and debug.
 
 Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an interaction surface. The runtime is the system of record for conversations, runs, tasks, approvals, memory, skills, jobs, tools, traces, audit events, and runtime health.
 
@@ -167,7 +167,7 @@ bun run gini provider set local gemma-4-31b-it-8bit \
   --extra-body '{"chat_template_kwargs":{"preserve_thinking":false,"enable_thinking":true}}'
 ```
 
-`--base-url` and `--api-key-env` also work for `openai` and `openrouter` (point at a proxy, swap which env var holds the key). `--extra-body` is forwarded into every chat-completions request — see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the full contract, the reserved-key denylist, and the trust boundary.
+`--base-url` and `--api-key-env` also work for `openai` and `openrouter` (point at a proxy, swap which env var holds the key). `--extra-body` is forwarded into every chat-completions request — see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the full contract, the reserved-key denylist, and the security boundary.
 
 ## Parallel Development
 
@@ -235,7 +235,7 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 - ✅ Auto-start after install (macOS LaunchAgents; runtime + webapp)
 - ✅ Browser-based onboarding at install (/setup route)
 - ⚪ iOS mobile app for remote control
-- ⚪ Trust layer (reproducible builds, verify-app)
+- ⚪ Verification layer (reproducible builds, verify-app)
 - ⚪ Gini as MCP server
 - ⚪ Task self-learning and iteration loop
 - ⚪ Native macOS app (Tauri shell, later)

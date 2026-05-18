@@ -139,7 +139,7 @@ describe("updateJob schedule-mode transitions", () => {
   });
 
   test("interval -> cron without explicit intervalSeconds: null still drops the field", async () => {
-    // A polite caller can patch just `cronExpression` and trust the runtime
+    // A polite caller can patch just `cronExpression` and rely on the runtime
     // to drop the stale intervalSeconds.
     const config = buildConfig("update-interval-to-cron-implicit");
     const created = await createScheduledJob(config, {

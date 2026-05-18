@@ -268,4 +268,4 @@ not a hardcoded value.
   the pre-spawn (`spawnSkipped: true`) and post-spawn variants of the
   aborted row are accepted to absorb claim-vs-spawn microtask ordering
   on slow CI.
-- ADR trust-substrate.md and ADR dangerously-auto-approve.md cross-link to this ADR.
+- ADR approval-and-audit-substrate.md and ADR dangerously-auto-approve.md cross-link to this ADR.

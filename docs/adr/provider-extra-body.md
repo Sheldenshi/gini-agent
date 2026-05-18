@@ -44,11 +44,11 @@ This is acceptable as long as agent provider overrides are limited to scenarios 
 
 This ADR fences the current behavior. A follow-up ADR will extend `AgentRecord` to carry full transport config (or define explicit inheritance rules) before agent provider overrides ship to end users.
 
-## Trust Boundary
+## Security Boundary
 
 `extraBody` is a CLI-only surface in this iteration. The `gini provider set` command is local, authenticated by file-system access to `~/.gini/instances/<inst>/config.json`. There is no HTTP route to mutate `extraBody`. A future `/api/providers/*` extension is plausible but explicitly out of scope here.
 
-`--api-key-env` plus `--base-url` together form a deliberate power-user feature: they let an operator point a local provider at any HTTP endpoint and bind any env var as the bearer source. A malicious local actor with write access to the instance config can use this to exfiltrate environment variables to an attacker-controlled URL on the next call. This is consistent with the CLI's existing trust model (anyone who can write `~/.gini/instances/...` can already redirect the runtime). It is documented here so future hardening discussions have a starting point.
+`--api-key-env` plus `--base-url` together form a deliberate power-user feature: they let an operator point a local provider at any HTTP endpoint and bind any env var as the bearer source. A malicious local actor with write access to the instance config can use this to exfiltrate environment variables to an attacker-controlled URL on the next call. This is consistent with the CLI's existing security model (anyone who can write `~/.gini/instances/...` can already redirect the runtime). It is documented here so future hardening discussions have a starting point.
 
 ## Test Surface
 
@@ -71,6 +71,6 @@ The mock server in `src/test-utils/openai-mock-server.ts` is bundled so anyone c
 ## Consequences
 
 - The `local` provider is now a first-class transport for OpenAI-compatible servers (oMLX, vLLM, LM Studio, llama.cpp). The studio deployment runs gini against oMLX-served Gemma with `chat_template_kwargs` reasoning control end-to-end.
-- The denylist is the trust boundary for chat-completions request bodies. Future runtime fields must extend it.
+- The denylist is the security boundary for chat-completions request bodies. Future runtime fields must extend it.
 - `parseSubArgs()` (added in `src/cli/args.ts`) is now available for any other command that needs strict positionals + value-bearing flags. The provider command is the first user.
 - The mock server in `src/test-utils/` establishes a convention for HTTP-level integration tests in this codebase. Future modules that speak HTTP can reuse the pattern.

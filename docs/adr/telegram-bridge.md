@@ -34,7 +34,7 @@ The Telegram Bot API caps the long-poll timeout at 50 seconds and uses an offset
 - SIGTERM aborts every active long-poll via `AbortController` so shutdown does not wait out the 25-second timeout.
 - The Telegram HTTP client (`src/integrations/telegram.ts`) is mockable via an injected `fetch`; the messaging module exposes `setMessagingDeps` for tests to substitute a stub `TelegramClient`. Production callers leave both unset.
 
-## Trust Boundary
+## Security Boundary
 
 - The bot token is a write-only field on the create payload. It is encrypted at rest and never re-emitted — neither on the bridge record, nor in audit evidence, nor on `MessagingMessageRecord`. A bridge owner has no API to read it back; they re-supply it by recreating the bridge.
 - The poller calls `receiveMessagingInput` which submits a chat-task. Task-level approval (per ADR `approval-execution-abort.md`) and the active-agent toolset/messaging-target filters (per `agents-replace-profiles.md`) apply unchanged. The bridge does not bypass them. The reply-mirror dispatches the assistant message back via `sendMessagingOutput`, which honors the same messaging-target filter — an agent restricted from a target via its messaging-target filter cannot use the bridge to escape that restriction.

@@ -150,8 +150,7 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
     // Enablement is an operator decision, not a content edit.
     if (
       typeof input.status === "string" &&
-      Object.keys(input).length === 1 &&
-      ["enabled", "disabled", "archived", "trusted", "untrusted", "draft"].includes(input.status)
+      Object.keys(input).length === 1
     ) {
       const next = normalizeSkillStatusInput(input.status);
       // Capture prior status BEFORE mutating so the audit evidence
@@ -199,8 +198,6 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
 }
 
 function normalizeSkillStatusInput(status: string): SkillRecord["status"] {
-  if (status === "trusted") return "enabled";
-  if (status === "draft" || status === "untrusted") return "disabled";
   if (status === "enabled" || status === "disabled" || status === "archived") return status;
   throw new Error(`Invalid skill status: ${status}`);
 }

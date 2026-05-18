@@ -5,7 +5,7 @@ Each file in this directory captures one architecture decision: the context, the
 ## Index
 
 - [Local Runtime Architecture](local-runtime-architecture.md)
-- [Minimal Trust Substrate](trust-substrate.md)
+- [Approval And Audit Substrate](approval-and-audit-substrate.md)
 - [Instances And Control Surface](instances-and-control-surface.md)
 - [Agent Loop With Native Tool Calling](agent-loop-tool-calling.md)
 - [Subagent Delegation](subagent-delegation.md)

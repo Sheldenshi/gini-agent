@@ -169,7 +169,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
   }
   // Per-job auto-approve envelope. Both fields are optional; reject malformed
   // payloads up-front so a typo doesn't silently fall back to legacy behavior.
-  // See ADR dangerously-auto-approve.md ("Per-job scope") for the trust model.
+  // See ADR dangerously-auto-approve.md ("Per-job scope") for the approval model.
   let dangerouslyAutoApprove: boolean | undefined;
   if (input.dangerouslyAutoApprove !== undefined && input.dangerouslyAutoApprove !== null) {
     if (typeof input.dangerouslyAutoApprove !== "boolean") {
@@ -448,7 +448,7 @@ async function dispatchPromptRun(
   // job's opt-in fields before handing it to submitTask. The spawned task
   // and every approval-gated dispatch inside it see the cloned config; the
   // operator's global RuntimeConfig stays untouched. See ADR
-  // dangerously-auto-approve.md ("Per-job scope") for the trust model.
+  // dangerously-auto-approve.md ("Per-job scope") for the approval model.
   const taskConfig: RuntimeConfig = buildTaskConfig(config, job);
 
   // Resolve session linkage up-front. If the job points at a session that

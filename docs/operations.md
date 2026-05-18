@@ -179,7 +179,7 @@ Two approval-bypass controls live behind the same endpoint
   both the `approval.approved` audit row and the per-action audit
   row. Applies to both the chat-task dispatcher (`POST /api/chat/<id>/messages`)
   and the legacy imperative dispatcher (`POST /api/tasks`, `gini task
-  submit`). Default is `false`. Intended for trusted local dev loops
+  submit`). Default is `false`. Intended for operator-controlled local dev loops
   only — there is no human review for any side effect when this is
   on. See [ADR dangerously-auto-approve.md](adr/dangerously-auto-approve.md) for the
   full design and audit contract.

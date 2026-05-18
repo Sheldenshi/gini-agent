@@ -94,10 +94,10 @@ tmux send-keys -t claude-gini '/exit' Enter
 
 ## Dialog Handling
 
-Claude Code can show first-run trust and permission dialogs in interactive
+Claude Code can show first-run workspace and permission dialogs in interactive
 mode. Inspect the pane before sending keys.
 
-Workspace trust usually defaults to the safe accept option:
+Workspace confirmation usually defaults to the safe accept option:
 
 ```bash
 tmux send-keys -t claude-gini Enter

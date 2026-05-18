@@ -509,6 +509,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   }
   for (const skill of state.skills) {
     const legacyStatus = (skill as unknown as { status?: string }).status;
+    // Compatibility only: older state files used pre-enablement skill statuses.
     if (legacyStatus === "trusted") skill.status = "enabled";
     else if (legacyStatus === "draft" || legacyStatus === "untrusted") skill.status = "disabled";
     else if (!legacyStatus) skill.status = "disabled";

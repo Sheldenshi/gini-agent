@@ -412,7 +412,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
         hindsightUnitsRecalled = recalled.units.length;
         // Pass the formatted block to the provider as system-area context;
         // generateTaskSummary places it in `instructions` (system role) so it
-        // inherits the model's default trust without verbal pleading.
+        // gets higher-priority placement without verbal pleading.
         recalledContext = recalled.units
           .map((entry, idx) => `${idx + 1}. (${entry.unit.network}) ${entry.unit.text}`)
           .join("\n");

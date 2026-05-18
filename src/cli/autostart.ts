@@ -222,7 +222,7 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // The WEB plist deliberately does NOT receive these secrets. The
   // Next.js BFF only proxies to the gateway over /api/*; it never
   // invokes a provider directly. Putting provider keys in the web
-  // process's env would widen the trust surface for zero gain — any
+  // process's env would widen the secret-exposure surface for zero gain — any
   // future client-side compromise or accidental log statement in the
   // web layer could expose a key the BFF has no business holding.
   const secretsBody = options.readSecretsFile

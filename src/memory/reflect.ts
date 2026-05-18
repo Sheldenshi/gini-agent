@@ -158,8 +158,8 @@ async function persistOpinions(
 
 const SKEPTICISM_BANDS: Record<number, string> = {
   1: "trusting and accepting of statements at face value",
-  2: "open and inclined to trust",
-  3: "balanced in your trust of statements",
+  2: "open and inclined to accept statements",
+  3: "balanced in your acceptance of statements",
   4: "cautious and inclined to verify",
   5: "skeptical and probing of claims"
 };

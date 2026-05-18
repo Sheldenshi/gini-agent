@@ -35,25 +35,22 @@ The flag is wired through:
 
 `RuntimeConfig.autoApproveCommands` already lets users skip the human
 gate for specific `terminal_exec` patterns. That mechanism is too
-narrow for a trusted local dev loop where the operator wants every
+narrow for an operator-controlled local dev loop where the operator wants every
 file write and shell command the agent issues to fire without prompts.
 
-ADR trust-substrate.md and ADR agent-loop-tool-calling.md both describe
+ADR approval-and-audit-substrate.md and ADR agent-loop-tool-calling.md both describe
 approvals as *the* path to side effects. We did not want to weaken
 those invariants by allowing the model to bypass them — the bypass has
 to be (a) an explicit operator configuration choice, (b) auditable
 exactly like a normal approval, and (c) localized so future tools that
 land approval gates inherit the bypass uniformly.
 
-A first attempt duplicated the side-effect, audit, and approval-row
-logic into per-tool helpers inside the dispatcher. Codex review caught
-that the duplication had drifted (the code_exec auto-helper was
-silently skipping approval-row creation). The shipped version
-refactors `agent.executeApprovedAction` to return its result string,
-adds a wrapper `agent.resolveApproval` that handles approval status +
-audit + side effect, and reduces the dispatcher to a single
-`pendingOrAuto(config, request)` helper that either pauses for the
-human gate or routes through the same shared path.
+The implementation keeps side-effect, audit, and approval-row logic in
+one shared path. `agent.executeApprovedAction` returns its result
+string, `agent.resolveApproval` handles approval status + audit + side
+effect, and the dispatcher uses a single `pendingOrAuto(config,
+request)` helper that either pauses for the human gate or routes
+through the same shared path.
 
 ## Required Now
 
@@ -159,7 +156,7 @@ human gate or routes through the same shared path.
 
 `RuntimeConfig.dangerouslyAutoApprove` and
 `RuntimeConfig.autoApproveCommands` are operator-only global config.
-That shape is right for a trusted local dev loop, but it falls down for
+That shape is right for an operator-controlled local dev loop, but it falls down for
 scheduled jobs: a `create_job` invocation that the user expects to run
 *unattended* (recurring, no human at fire-time) cannot be configured to
 auto-approve through chat without first asking the operator to flip a
@@ -204,9 +201,9 @@ its shape or semantics.
   the agent chose so a reviewer can answer "what bypass did this job
   schedule for itself?" without replaying the conversation.
 
-### Trust model
+### Approval model
 
-The per-job opt-in does NOT widen the system's trust surface — it
+The per-job opt-in does NOT widen the system's approval surface — it
 shifts the opt-in point from operator config to a chat exchange:
 
 1. The user describes unattended work in natural language ("read the

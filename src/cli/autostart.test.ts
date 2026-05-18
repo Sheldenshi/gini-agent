@@ -229,7 +229,7 @@ describe("resolveLaunchSpec", () => {
 
   // The Next.js BFF only proxies to the gateway over /api/*; it never
   // invokes a provider directly. Provider secrets in the web plist's
-  // EnvironmentVariables would widen the trust surface for zero gain,
+  // EnvironmentVariables would widen the secret-exposure surface for zero gain,
   // so they belong in the gateway plist only.
   test("does NOT merge secrets.env into web plist EnvironmentVariables", async () => {
     const { resolveLaunchSpecPair } = await import("./autostart");
