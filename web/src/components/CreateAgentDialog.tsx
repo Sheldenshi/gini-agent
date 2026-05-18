@@ -103,6 +103,9 @@ export function CreateAgentDialog({
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. research"
               autoFocus
+              required
+              aria-invalid={!!error}
+              aria-describedby="agent-name-error"
               disabled={create.isPending}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
@@ -112,7 +115,11 @@ export function CreateAgentDialog({
               }}
             />
           </div>
-          {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          {error ? (
+            <p id="agent-name-error" role="alert" className="text-xs text-destructive">
+              {error}
+            </p>
+          ) : null}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={create.isPending}>

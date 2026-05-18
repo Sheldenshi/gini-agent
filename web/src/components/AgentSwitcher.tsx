@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Boxes, Check, ChevronsUpDown } from "lucide-react";
+import { Boxes, ChevronsUpDown } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -11,6 +11,8 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
@@ -53,7 +55,6 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
             "flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 text-left outline-none transition-colors",
             isMobile ? "hover:bg-accent/60 focus-visible:bg-accent/60" : "hover:bg-sidebar-accent/60 focus-visible:bg-sidebar-accent/60"
           )}
-          aria-label="Switch agent"
         >
           <div
             className={cn(
@@ -86,23 +87,23 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
         {agents.length === 0 ? (
           <div className="px-2 py-2 text-xs text-muted-foreground">No agents configured</div>
         ) : (
-          agents.map((agent) => {
-            const active = agent.id === activeAgentId;
-            return (
-              <DropdownMenuItem
+          <DropdownMenuRadioGroup
+            value={activeAgentId ?? ""}
+            onValueChange={(id) => {
+              if (!id || id === activeAgentId) return;
+              useAgent.mutate(id);
+            }}
+          >
+            {agents.map((agent) => (
+              <DropdownMenuRadioItem
                 key={agent.id}
-                disabled={active || useAgent.isPending}
-                onSelect={() => {
-                  if (active) return;
-                  useAgent.mutate(agent.id);
-                }}
-                className="flex items-center justify-between gap-2"
+                value={agent.id}
+                disabled={useAgent.isPending}
               >
                 <span className="truncate">{agent.name}</span>
-                {active ? <Check className="h-3.5 w-3.5 shrink-0" /> : null}
-              </DropdownMenuItem>
-            );
-          })
+              </DropdownMenuRadioItem>
+            ))}
+          </DropdownMenuRadioGroup>
         )}
         <DropdownMenuSeparator />
         <DropdownMenuItem
