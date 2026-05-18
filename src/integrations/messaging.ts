@@ -3,8 +3,14 @@ import { submitTask } from "../agent";
 import { addAudit, createMessagingBridgeRecord, createMessagingMessageRecord, mutateState, now, readState } from "../state";
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../state/secrets";
 import { resolveEffectiveContext } from "../execution/effective-context";
-import { createTelegramClient, type TelegramClient, type TelegramClientOptions } from "./telegram";
+import {
+  createTelegramClient,
+  type TelegramClient,
+  type TelegramClientOptions,
+  type TelegramPhotoSource
+} from "./telegram";
 import { formatTelegramMarkdownV2 } from "./telegram-format";
+import type { MessagingMessageMedia } from "../types";
 
 // Namespace used when storing per-bridge secrets through the connector
 // secret store. Keeping it stable lets `deleteConnectorSecrets` find every
@@ -30,6 +36,35 @@ export function resetMessagingDeps(): void {
 function telegramClientFor(token: string, options?: TelegramClientOptions): TelegramClient {
   if (injectedDeps.telegramClientFactory) return injectedDeps.telegramClientFactory(token);
   return createTelegramClient(token, options);
+}
+
+// Translate the caller's photo input into a TelegramPhotoSource. Returns
+// undefined when no photo is supplied. We accept url/fileId/path on a
+// nested `photo` object; bytes uploads aren't reachable from the HTTP
+// surface today (no multipart inbound) and are reserved for in-process
+// callers like the agent's tool dispatcher.
+function parsePhotoInput(raw: unknown): TelegramPhotoSource | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const photo = raw as { url?: unknown; fileId?: unknown; path?: unknown; filename?: unknown; contentType?: unknown };
+  if (typeof photo.url === "string" && photo.url) return { kind: "url", url: photo.url };
+  if (typeof photo.fileId === "string" && photo.fileId) return { kind: "fileId", fileId: photo.fileId };
+  if (typeof photo.path === "string" && photo.path) {
+    return {
+      kind: "path",
+      path: photo.path,
+      filename: typeof photo.filename === "string" ? photo.filename : undefined,
+      contentType: typeof photo.contentType === "string" ? photo.contentType : undefined
+    };
+  }
+  return undefined;
+}
+
+function mediaRecordForOutbound(source: TelegramPhotoSource | undefined): MessagingMessageMedia | undefined {
+  if (!source) return undefined;
+  if (source.kind === "url") return { kind: "photo", url: source.url };
+  if (source.kind === "fileId") return { kind: "photo", fileId: source.fileId };
+  if (source.kind === "path") return { kind: "photo", path: source.path };
+  return { kind: "photo" };
 }
 
 export function readBridgeBotToken(config: RuntimeConfig, bridge: MessagingBridgeRecord): string | undefined {
@@ -164,8 +199,13 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
     (item) => item.id === idOrName || item.name === idOrName
   );
   if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+
+  // Photo input variants. Callers supply at most one of url/fileId/path
+  // on `input.photo`. When present, `text` becomes the optional caption;
+  // a caption-only send still requires non-empty text-or-photo somewhere.
+  const photoSource = parsePhotoInput(input.photo);
   const text = String(input.text ?? "").trim();
-  if (!text) throw new Error("Outbound message text is required.");
+  if (!text && !photoSource) throw new Error("Outbound message requires text or a photo.");
 
   // Active-agent messaging-target whitelist. When the caller supplies an
   // explicit target outside the filter we reject loudly so a misrouted
@@ -208,19 +248,25 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       // to skip the converter and send the raw string.
       const parseModeRaw = typeof input.parseMode === "string" ? input.parseMode : undefined;
       const useMdv2 = parseModeRaw !== "none";
-      const payload = useMdv2 ? formatTelegramMarkdownV2(text) : text;
+      const formatted = useMdv2 ? formatTelegramMarkdownV2(text) : text;
       try {
-        await telegramClientFor(token).sendMessage(
-          target,
-          payload,
-          useMdv2 ? { parseMode: "MarkdownV2" } : undefined
-        );
+        const client = telegramClientFor(token);
+        if (photoSource) {
+          await client.sendPhoto(target, photoSource, {
+            caption: formatted || undefined,
+            parseMode: useMdv2 && formatted ? "MarkdownV2" : undefined
+          });
+        } else {
+          await client.sendMessage(target, formatted, useMdv2 ? { parseMode: "MarkdownV2" } : undefined);
+        }
       } catch (error) {
         status = "failed";
         errorMessage = error instanceof Error ? error.message : String(error);
       }
     }
   }
+
+  const media = mediaRecordForOutbound(photoSource);
 
   return mutateState(config.instance, (live) => {
     const message = createMessagingMessageRecord(live, {
@@ -230,7 +276,8 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       target,
       text,
       notificationId: typeof input.notificationId === "string" ? input.notificationId : undefined,
-      error: errorMessage
+      error: errorMessage,
+      media
     });
     addAudit(live, {
       actor: "runtime",

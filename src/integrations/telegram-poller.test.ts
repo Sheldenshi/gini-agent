@@ -42,6 +42,9 @@ function deferredClient(): {
     async sendChatAction() {
       return true as const;
     },
+    async sendPhoto(chatId) {
+      return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+    },
     getUpdates(_offset, _timeout, signal) {
       return new Promise<TelegramUpdate[]>((resolve, reject) => {
         const entry: Pending = { resolve, reject };
@@ -145,6 +148,9 @@ describe("telegram poller supervisor", () => {
       async getMe() { return { id: 1, is_bot: true }; },
       async sendMessage(chatId, text) {
         return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
       },
       async sendChatAction() {
         chatActionCalls += 1;

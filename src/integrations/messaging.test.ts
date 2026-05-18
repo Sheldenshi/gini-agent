@@ -46,6 +46,10 @@ function stubClient(overrides: Partial<TelegramClient> = {}): { client: Telegram
       calls.push({ method: "sendChatAction", args: [chatId, action] });
       return true as const;
     },
+    sendPhoto: async (chatId, source, opts) => {
+      calls.push({ method: "sendPhoto", args: [chatId, source, opts] });
+      return { message_id: 2, date: 0, chat: { id: Number(chatId), type: "private" } };
+    },
     getUpdates: async () => {
       calls.push({ method: "getUpdates", args: [] });
       return [];
@@ -193,6 +197,72 @@ describe("messaging telegram wiring", () => {
 
     expect(outbound.status).toBe("failed");
     expect(outbound.error).toContain("chat not found");
+  });
+
+  test("photo input dispatches sendPhoto with the caption and MarkdownV2 parseMode", async () => {
+    const config = testConfig("telegram-send-photo-url");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["55"],
+      botToken: "TOK"
+    });
+
+    const outbound = await sendMessagingOutput(config, bridge.id, {
+      text: "see **chart.png**",
+      photo: { url: "https://example.com/c.png" }
+    });
+
+    expect(outbound.status).toBe("sent");
+    expect(outbound.media).toEqual({ kind: "photo", url: "https://example.com/c.png" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("sendPhoto");
+    const [chatId, source, opts] = calls[0]!.args as [
+      string,
+      { kind: string; url?: string },
+      { caption?: string; parseMode?: string }
+    ];
+    expect(chatId).toBe("55");
+    expect(source).toEqual({ kind: "url", url: "https://example.com/c.png" });
+    expect(opts?.caption).toBe("see *chart\\.png*");
+    expect(opts?.parseMode).toBe("MarkdownV2");
+  });
+
+  test("photo input with no text sends a photo without a caption", async () => {
+    const config = testConfig("telegram-send-photo-nocaption");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+
+    await sendMessagingOutput(config, bridge.id, {
+      photo: { fileId: "AgADX1Q" }
+    });
+
+    const [, source, opts] = calls[0]!.args as [string, unknown, { caption?: string; parseMode?: string }];
+    expect(source).toEqual({ kind: "fileId", fileId: "AgADX1Q" });
+    expect(opts?.caption).toBeUndefined();
+    expect(opts?.parseMode).toBeUndefined();
+  });
+
+  test("send requires either text or a photo", async () => {
+    const config = testConfig("telegram-send-empty");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    await expect(sendMessagingOutput(config, bridge.id, {})).rejects.toThrow(/text or a photo/);
   });
 
   test("disableMessagingBridge erases the stored bot token", async () => {

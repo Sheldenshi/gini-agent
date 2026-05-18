@@ -480,6 +480,18 @@ export interface MessagingMessageRecord {
   taskId?: string;
   notificationId?: string;
   error?: string;
+  // Optional media attachment. For outbound: the user-supplied source
+  // (url/fileId/path) the bridge dispatched. For inbound: the captured
+  // file on disk plus the originating Telegram file_id so the caller can
+  // re-download if needed. `text` carries the caption in both directions.
+  media?: MessagingMessageMedia;
+}
+
+export interface MessagingMessageMedia {
+  kind: "photo";
+  url?: string;
+  fileId?: string;
+  path?: string;
 }
 
 export interface ImportReport {

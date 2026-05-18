@@ -5,6 +5,8 @@
 // Inbound uses long-polling (getUpdates with a long `timeout`) so a local
 // Gini instance with no public webhook URL can still receive messages.
 
+import { basename } from "node:path";
+
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 
 export interface TelegramUser {
@@ -64,9 +66,25 @@ export interface SendMessageOptions {
   disableWebPagePreview?: boolean;
 }
 
+// Photo source variants. The first two go out as JSON; `bytes` and
+// `path` go out as multipart/form-data so the bot can upload local
+// files (e.g. agent-produced screenshots) without staging them behind a
+// public URL.
+export type TelegramPhotoSource =
+  | { kind: "url"; url: string }
+  | { kind: "fileId"; fileId: string }
+  | { kind: "bytes"; bytes: ArrayBuffer | Uint8Array | Blob; filename?: string; contentType?: string }
+  | { kind: "path"; path: string; filename?: string; contentType?: string };
+
+export interface SendPhotoOptions {
+  caption?: string;
+  parseMode?: TelegramParseMode;
+}
+
 export interface TelegramClient {
   getMe(): Promise<TelegramUser>;
   sendMessage(chatId: string | number, text: string, options?: SendMessageOptions): Promise<TelegramMessage>;
+  sendPhoto(chatId: string | number, source: TelegramPhotoSource, options?: SendPhotoOptions): Promise<TelegramMessage>;
   sendChatAction(chatId: string | number, action: TelegramChatAction): Promise<true>;
   getUpdates(offset: number | undefined, longPollSeconds: number, signal?: AbortSignal): Promise<TelegramUpdate[]>;
 }
@@ -93,6 +111,20 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
       init.body = JSON.stringify(payload);
     }
     const response = await fetchImpl(url, init);
+    return parseTelegramResponse<T>(response, method);
+  }
+
+  // Multipart variant used for binary uploads (sendPhoto with bytes or a
+  // local file path). FormData must NOT set its own content-type header
+  // — letting fetch generate the multipart boundary is the only way it
+  // gets the boundary right.
+  async function callMultipart<T>(method: string, form: FormData): Promise<T> {
+    const url = `${base}/bot${token}/${method}`;
+    const response = await fetchImpl(url, { method: "POST", body: form });
+    return parseTelegramResponse<T>(response, method);
+  }
+
+  async function parseTelegramResponse<T>(response: Response, method: string): Promise<T> {
     let body: TelegramResponse<T>;
     try {
       body = (await response.json()) as TelegramResponse<T>;
@@ -116,6 +148,35 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
         ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {})
       }),
     sendChatAction: (chatId, action) => call<true>("sendChatAction", { chat_id: chatId, action }),
+    sendPhoto: async (chatId, source, opts) => {
+      const captionFields = {
+        ...(opts?.caption !== undefined ? { caption: opts.caption } : {}),
+        ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {})
+      };
+      if (source.kind === "url") {
+        return call<TelegramMessage>("sendPhoto", { chat_id: chatId, photo: source.url, ...captionFields });
+      }
+      if (source.kind === "fileId") {
+        return call<TelegramMessage>("sendPhoto", { chat_id: chatId, photo: source.fileId, ...captionFields });
+      }
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      if (captionFields.caption !== undefined) form.append("caption", captionFields.caption);
+      if (captionFields.parse_mode) form.append("parse_mode", captionFields.parse_mode);
+      if (source.kind === "bytes") {
+        const blob =
+          source.bytes instanceof Blob
+            ? source.bytes
+            : new Blob([source.bytes as ArrayBuffer], { type: source.contentType ?? "application/octet-stream" });
+        form.append("photo", blob, source.filename ?? "photo");
+      } else {
+        // kind === "path": Bun.file gives us a Blob without buffering the
+        // whole file into memory.
+        const file = Bun.file(source.path);
+        form.append("photo", file, source.filename ?? basename(source.path));
+      }
+      return callMultipart<TelegramMessage>("sendPhoto", form);
+    },
     getUpdates: (offset, longPollSeconds, signal) =>
       call<TelegramUpdate[]>(
         "getUpdates",

@@ -83,6 +83,68 @@ describe("telegram client", () => {
     expect(payload).toEqual({ timeout: 1, allowed_updates: ["message"] });
   });
 
+  test("sendPhoto with a URL goes out as JSON with chat_id, photo, and caption", async () => {
+    let payload: Record<string, unknown> = {};
+    let observedContentType = "";
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        observedContentType = ((init.headers ?? {}) as Record<string, string>)["content-type"] ?? "";
+        payload = JSON.parse(String(init.body));
+        return {
+          ok: true,
+          result: { message_id: 9, date: 0, chat: { id: payload.chat_id, type: "private" } }
+        };
+      })
+    });
+    await client.sendPhoto(42, { kind: "url", url: "https://x.test/p.png" }, {
+      caption: "cap",
+      parseMode: "MarkdownV2"
+    });
+    expect(observedContentType).toContain("application/json");
+    expect(payload).toEqual({
+      chat_id: 42,
+      photo: "https://x.test/p.png",
+      caption: "cap",
+      parse_mode: "MarkdownV2"
+    });
+  });
+
+  test("sendPhoto with a fileId reuses the id without re-uploading", async () => {
+    let payload: Record<string, unknown> = {};
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        payload = JSON.parse(String(init.body));
+        return { ok: true, result: { message_id: 1, date: 0, chat: { id: 1, type: "private" } } };
+      })
+    });
+    await client.sendPhoto(1, { kind: "fileId", fileId: "ABC123" });
+    expect(payload).toEqual({ chat_id: 1, photo: "ABC123" });
+  });
+
+  test("sendPhoto with bytes posts multipart/form-data and never sets its own content-type", async () => {
+    let observedHeaders: Record<string, string> = {};
+    let observedBody: unknown = undefined;
+    const client = createTelegramClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        observedHeaders = (init.headers ?? {}) as Record<string, string>;
+        observedBody = init.body;
+        return { ok: true, result: { message_id: 1, date: 0, chat: { id: 1, type: "private" } } };
+      })
+    });
+    const bytes = new Uint8Array([1, 2, 3]);
+    await client.sendPhoto(1, { kind: "bytes", bytes, filename: "x.png", contentType: "image/png" }, {
+      caption: "hi"
+    });
+    // FormData lets fetch set the content-type automatically with the
+    // boundary; if we ever hand-roll the header the boundary is wrong.
+    expect(observedHeaders["content-type"]).toBeUndefined();
+    expect(observedBody).toBeInstanceOf(FormData);
+    const form = observedBody as FormData;
+    expect(form.get("chat_id")).toBe("1");
+    expect(form.get("caption")).toBe("hi");
+    expect(form.get("photo")).toBeInstanceOf(Blob);
+  });
+
   test("API-level failure (ok:false) raises with the description", async () => {
     const client = createTelegramClient("TOK", {
       fetchImpl: stubFetch(
