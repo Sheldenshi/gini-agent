@@ -80,7 +80,7 @@ function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited
       steps: Array.isArray(proposal.payload.steps) ? proposal.payload.steps.map(String) : [proposal.rationale],
       requiredTools: Array.isArray(proposal.payload.requiredTools) ? proposal.payload.requiredTools.map(String) : [],
       requiredPermissions: Array.isArray(proposal.payload.requiredPermissions) ? proposal.payload.requiredPermissions.map(String) : [],
-      status: proposal.payload.status === "trusted" ? "trusted" : "draft"
+      status: proposal.payload.status === "disabled" ? "disabled" : "enabled"
     });
     return skill.id;
   }

@@ -16,8 +16,8 @@ agent loop as their parents, with three knobs the parent can tune:
    down to a parent-supplied subset of toolsets. `read_skill`,
    `web_fetch`, and `spawn_subagent` itself stay always-on.
 3. **Skill whitelist.** The "Available skills:" block in the system
-   prompt is filtered down to a parent-supplied subset of trusted
-   skill names.
+   prompt is filtered down to a parent-supplied subset of enabled skill
+   names.
 
 The model spawns subagents through a `spawn_subagent` tool. The
 dispatch creates a `SubagentRecord`, submits a chat-mode child task,
@@ -53,7 +53,7 @@ calling, approvals, audit, and trace records for free.
   system prompt is a generic "focused subagent" preamble.
 - `runChatTask` looks up the SubagentRecord for the running task via
   `getSubagentForTask`. If present, the subagent's `systemPrompt`
-  replaces `buildAgentSystemContext` output, the trusted-skills block
+  replaces `buildAgentSystemContext` output, the enabled-skills block
   is filtered by `skillNames`, and the tool catalog is filtered by
   `toolsetIds`.
 - A `spawn_subagent` tool is added to the catalog (always-on) with

@@ -508,6 +508,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     run.approvalIds ??= [];
   }
   for (const skill of state.skills) {
+    const legacyStatus = (skill as unknown as { status?: string }).status;
+    if (legacyStatus === "trusted") skill.status = "enabled";
+    else if (legacyStatus === "draft" || legacyStatus === "untrusted") skill.status = "disabled";
+    else if (!legacyStatus) skill.status = "disabled";
     skill.tests ??= [];
     skill.successCount ??= 0;
     skill.failureCount ??= 0;
@@ -516,10 +520,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     // persisted before the loader landed don't carry them — backfill with
     // safe defaults so consumers can rely on `body` being a string.
     skill.body ??= "";
-    // Trust-hijack fix: skill records now carry an explicit `source` so
-    // bundled and user-instance skills with the same name coexist as
-    // separate rows. Legacy records (pre-fix) default to "user" — bundled
-    // records get re-tagged on the next loadSkillsFromDisk pass.
+    // Skill records carry an explicit `source` so bundled and user-instance
+    // skills with the same name coexist as separate rows. Legacy records
+    // default to "user" — bundled records get re-tagged on the next
+    // loadSkillsFromDisk pass.
     skill.source ??= "user";
     // ADR connector-provider-spec-compliance.md renamed SkillRecord.requiredIdentities (with `kind` keys) to
     // requiredConnectors (with `provider` keys). Rewrite in-place so the

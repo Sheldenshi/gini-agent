@@ -10,9 +10,9 @@
 // platforms, prerequisites, …) followed by a markdown body that teaches
 // the LLM how to use the skill. The loader parses both, upserts a
 // SkillRecord into runtime state (matching by `name`), and bumps `version`
-// when the file content changes. User-set fields (status — e.g. trusted /
-// disabled) are preserved so re-running the loader doesn't reset trust
-// decisions.
+// when the file content changes. User-set fields (status — enabled,
+// disabled, archived) are preserved so re-running the loader doesn't reset
+// the operator's enablement decision.
 //
 // Skills whose `platforms` doesn't include the host platform are skipped;
 // the LoadReport surfaces the reason so users can see why a skill wasn't
@@ -398,14 +398,11 @@ export function bundledSkillsRoot(): string {
 
 // Apply parsed file to the runtime state. Matches an existing skill by
 // (name, source) — bundled and user-instance skills with the same name
-// are kept as separate rows so a user-instance SKILL.md cannot hijack the
-// trust grant of a vendored bundled skill (see Review P1 #1). Preserves
-// user-managed fields (`tests`, success/failure counts, previousVersions,
-// lastUsedAt, and explicit disabled/archived status). Existing bundled records
-// left as draft by older loader versions are promoted to trusted on reload.
-// On match: only bump the numeric version when the content changed. On miss:
-// create bundled Gini skills with status="trusted" and user-instance skills
-// with status="draft".
+// are kept as separate rows so a user-instance SKILL.md cannot replace a
+// vendored bundled skill. Preserves user-managed fields (`tests`,
+// success/failure counts, previousVersions, lastUsedAt, and explicit
+// disabled/archived status). On match: only bump the numeric version when
+// the content changed. On miss: create filesystem skills as enabled.
 // Validate a parsed skill against the Anthropic Agent Skills spec and
 // against Gini extension rules. Returns a list of issues; empty array
 // means the skill passes. Used both by the loader (to mark a row as
@@ -482,8 +479,7 @@ function upsertSkillFromFile(
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
       JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null) ||
       (existing.manifestVersion ?? null) !== (parsed.version ?? null);
-    const promoteBundledDraft = origin.source === "bundled" && existing.status === "draft";
-    if (!changed && !promoteBundledDraft) return { record: existing, kind: "noop" };
+    if (!changed) return { record: existing, kind: "noop" };
     if (changed) {
       existing.previousVersions.unshift({
         version: existing.version,
@@ -509,12 +505,11 @@ function upsertSkillFromFile(
       existing.validationMessage = validationMessage;
       existing.version += 1;
     }
-    if (promoteBundledDraft) existing.status = "trusted";
     existing.updatedAt = at;
     return { record: existing, kind: "updated" };
   }
 
-  const initialStatus: SkillStatus = origin.source === "bundled" ? "trusted" : "draft";
+  const initialStatus: SkillStatus = "enabled";
   const record = createSkill(state, {
     name: parsed.name,
     description: parsed.description,

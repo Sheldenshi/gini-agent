@@ -416,24 +416,25 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
   return text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`;
 }
 
-// Skill catalog access. Returns the full markdown body of a trusted skill
+// Skill catalog access. Returns the full markdown body of an enabled skill
 // so the model can follow its instructions. We deliberately gate on the
-// "trusted" status — draft / disabled / archived skills are invisible
-// to the agent loop. The system prompt only advertises trusted skills, so
+// "enabled" status — disabled / archived skills are invisible
+// to the agent loop. The system prompt only advertises enabled skills, so
 // the model shouldn't request anything else; if it does, surface the
 // reason to the model as a tool error rather than silently returning empty.
 async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
   const name = requireString(args, "name");
   const state = readState(config.instance);
-  // Trust-hijack fix: when both a bundled and a user record share a name,
-  // prefer the bundled (vendored) row first since it's the audited source
-  // of truth. A user record with the same name remains independent and
-  // stays draft until the user trusts it.
+  // When both a bundled and a user record share a name, prefer an enabled
+  // bundled row first, then any enabled row. This mirrors the advertised
+  // skill block: disabled rows stay invisible even when they share a name
+  // with an enabled skill.
   const matches = state.skills.filter((s) => s.name === name);
   if (matches.length === 0) throw new Error(`No skill named ${name} is registered.`);
-  const skill = matches.find((s) => (s.source ?? "user") === "bundled") ?? matches[0]!;
-  if (skill.status !== "trusted") {
-    throw new Error(`Skill ${name} is not trusted (current status: ${skill.status}). Ask the user to trust it via /skills before using.`);
+  const enabledMatches = matches.filter((s) => s.status === "enabled");
+  const skill = enabledMatches.find((s) => (s.source ?? "user") === "bundled") ?? enabledMatches[0] ?? matches[0]!;
+  if (skill.status !== "enabled") {
+    throw new Error(`Skill ${name} is disabled (current status: ${skill.status}). Ask the user to enable it via /skills before using.`);
   }
   if (!isSkillActive(state, skill)) {
     const missing = (skill.requiredConnectors ?? []).map((entry) => entry.provider).join(", ");
