@@ -44,7 +44,7 @@ export default function SettingsPage() {
 
   const useAgent = useMutation({
     mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
-    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state", "memory"]); },
+    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state", "status", "memory"]); },
     onError: (error: Error) => toast.error(error.message)
   });
 
