@@ -94,7 +94,15 @@ gws meet conferenceRecords transcripts list \
   --params '{"parent":"conferenceRecords/<RECORD_ID>"}'
 gws meet conferenceRecords smartNotes list \
   --params '{"parent":"conferenceRecords/<RECORD_ID>"}'
+
+# Actual transcript TEXT — `transcripts list` returns metadata only
+# (timing, state, docsDestination); the spoken text lives in
+# `transcripts.entries`.
+gws meet conferenceRecords transcripts entries list \
+  --params '{"parent":"conferenceRecords/<RECORD_ID>/transcripts/<TRANSCRIPT_ID>"}'
 ```
+
+Each transcript also exposes a `docsDestination` pointing at a Google Doc with the human-readable rendering. Fetching that Doc requires Docs/Drive scope (which this skill does not advertise) — if those scopes were granted at setup, prefer the Doc for a clean readable transcript; otherwise stream `entries.list`.
 
 ### Sharing the join link
 
@@ -116,7 +124,7 @@ Use `gws meet spaces create` only when there is no associated event (a persisten
 1. Prefer Calendar `+insert --meet` over a standalone `gws meet spaces create` whenever a meeting has a scheduled time and attendees. The Calendar invite carries the Meet link and notifies attendees automatically; a standalone space does neither.
 2. `spaces.create` and `endActiveConference` are write/side-effecting actions. Confirm intent with the user before running either, even when `gws *` is auto-approved. Ending an active conference disconnects everyone currently in the call.
 3. Treat a Meet `meetingUri` like a credential to the room. Anyone with the link (and the configured `accessType`) can join. Confirm access settings before sharing in public channels.
-4. Recordings, transcripts, and smart notes are not available on every account. If `conferenceRecords transcripts list` returns an empty list or a 403, fall back to asking the user to enable recording in Workspace admin or to summarize the meeting another way.
+4. Recordings, transcripts, and smart notes are not available on every account. If `conferenceRecords transcripts entries list` returns an empty list or a 403, fall back to asking the user to enable recording in Workspace admin or to summarize the meeting another way. (`transcripts list` only tells you whether a transcript object exists; the entries call tells you whether there is any captured text to read.)
 5. For agent automations that need to know "did the meeting happen?" or "who showed up?", poll `conferenceRecords list` filtered by space — do not try to scrape Calendar.
 6. Personal `@gmail.com` accounts have feature gaps and stricter limits on Meet. Workspace tenants get the full feature set; tell the user when a feature requires Workspace.
 
