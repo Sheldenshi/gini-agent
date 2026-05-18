@@ -92,9 +92,8 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
               <DropdownMenuItem
                 key={agent.id}
                 disabled={active || useAgent.isPending}
-                onSelect={(event) => {
+                onSelect={() => {
                   if (active) return;
-                  event.preventDefault();
                   useAgent.mutate(agent.id);
                 }}
                 className="flex items-center justify-between gap-2"
@@ -107,8 +106,7 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
         )}
         <DropdownMenuSeparator />
         <DropdownMenuItem
-          onSelect={(event) => {
-            event.preventDefault();
+          onSelect={() => {
             setCreateOpen(true);
           }}
         >
