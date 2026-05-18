@@ -735,10 +735,11 @@ async function createJobTool(
       cronExpression,
       cronTimezone,
       prompt,
-      // Dedicated chat thread for chat-driven jobs. Title prefix
-      // "Scheduled: <name>" so the session list scans well; the
-      // createChatSession helper truncates to 80 chars.
-      createDedicatedSession: invokedFromChat ? { title: `Scheduled: ${name}` } : undefined,
+      // Dedicated chat thread for chat-driven jobs. Title defaults to
+      // the job name — the chat IS bound to that job's delivery, so the
+      // job name is the natural label in the session list. (createChatSession
+      // truncates to 80 chars.)
+      createDedicatedSession: invokedFromChat ? { title: name } : undefined,
       oneShot,
       parentTaskId: taskId,
       dangerouslyAutoApprove,

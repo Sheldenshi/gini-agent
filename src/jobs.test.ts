@@ -380,11 +380,12 @@ describe("cron lifecycle", () => {
     expect(jobs[0]?.intervalSeconds).toBe(60);
     expect(jobs[0]?.prompt).toBe("Remind me.");
 
-    // The new session exists and its title carries the job's name so the
-    // user can scan a list of dedicated threads.
+    // The new session exists and its title is exactly the job's name so the
+    // user can scan a list of dedicated threads — no "Scheduled:" prefix or
+    // other framing, since the chat IS bound to that job's delivery.
     const newSession = stateAfter.chatSessions.find((s) => s.id === jobs[0]!.chatSessionId);
     expect(newSession).toBeDefined();
-    expect(newSession?.title).toContain("test-reminder");
+    expect(newSession?.title).toBe("test-reminder");
 
     // Confirmation string contains the new job id, cadence, and the new
     // session id so the model can reference both in its reply to the user.
