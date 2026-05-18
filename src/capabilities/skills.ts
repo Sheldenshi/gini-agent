@@ -123,7 +123,7 @@ export async function createSkillFromInput(config: RuntimeConfig, input: Record<
     requiredTools: Array.isArray(input.requiredTools) ? input.requiredTools.map(String) : [],
     requiredPermissions: Array.isArray(input.requiredPermissions) ? input.requiredPermissions.map(String) : [],
     sourceTaskId: typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined,
-    status: input.status === "trusted" ? "trusted" : "draft",
+    status: input.status === "disabled" || input.status === "archived" ? input.status : "enabled",
     tests: Array.isArray(input.tests) ? input.tests.map(String) : []
   }));
 }
@@ -146,17 +146,14 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
   return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
-    // Status-only PATCH (used by install-skill meta-skill to flip trust)
-    // skips the version bump and previousVersions push — it's a trust
-    // decision, not a content edit. ADR connector-provider-spec-compliance.md §UI requires this surface.
+    // Status-only PATCH skips the version bump and previousVersions push.
+    // Enablement is an operator decision, not a content edit.
     if (
       typeof input.status === "string" &&
       Object.keys(input).length === 1 &&
-      ["trusted", "untrusted", "disabled", "archived", "draft"].includes(input.status)
+      ["enabled", "disabled", "archived", "trusted", "untrusted", "draft"].includes(input.status)
     ) {
-      // "untrusted" collapses to "draft" — the runtime status taxonomy
-      // doesn't have an explicit "untrusted" cell.
-      const next = input.status === "untrusted" ? "draft" : input.status as SkillRecord["status"];
+      const next = normalizeSkillStatusInput(input.status);
       // Capture prior status BEFORE mutating so the audit evidence
       // accurately records the transition; otherwise previousStatus and
       // status would always be equal.
@@ -165,9 +162,9 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
       skill.updatedAt = now();
       addAudit(state, {
         actor: "user",
-        action: "skill.trust",
+        action: "skill.status",
         target: skill.id,
-        risk: "medium",
+        risk: "low",
         evidence: { previousStatus: prev, status: next }
       });
       return skill;
@@ -201,7 +198,14 @@ export async function updateSkill(config: RuntimeConfig, idOrName: string, input
   });
 }
 
-export async function setSkillStatus(config: RuntimeConfig, idOrName: string, status: "trusted" | "disabled" | "archived") {
+function normalizeSkillStatusInput(status: string): SkillRecord["status"] {
+  if (status === "trusted") return "enabled";
+  if (status === "draft" || status === "untrusted") return "disabled";
+  if (status === "enabled" || status === "disabled" || status === "archived") return status;
+  throw new Error(`Invalid skill status: ${status}`);
+}
+
+export async function setSkillStatus(config: RuntimeConfig, idOrName: string, status: "enabled" | "disabled" | "archived") {
   return mutateState(config.instance, (state) => {
     const skill = state.skills.find((item) => item.id === idOrName || item.name === idOrName);
     if (!skill) throw new Error(`Skill not found: ${idOrName}`);
@@ -211,7 +215,7 @@ export async function setSkillStatus(config: RuntimeConfig, idOrName: string, st
       actor: "user",
       action: `skill.${status}`,
       target: skill.id,
-      risk: status === "trusted" ? "medium" : "low"
+      risk: "low"
     });
     return skill;
   });
@@ -274,8 +278,8 @@ export function validateSkills(config: RuntimeConfig) {
 function validateSkillRecord(skill: SkillRecord): string[] {
   const failures: string[] = [];
   if (!skill.name.trim()) failures.push("Skill name is required.");
-  if (skill.status === "trusted" && skill.tests.length === 0 && !skill.manifestPath) {
-    failures.push("Trusted API-created skills need at least one test.");
+  if (skill.status === "enabled" && skill.tests.length === 0 && !skill.manifestPath) {
+    failures.push("Enabled API-created skills need at least one test.");
   }
   if (skill.steps.some((step) => !step.trim())) failures.push("Skill steps cannot be empty.");
   // Surface loader-time validation results so /api/skills/validate

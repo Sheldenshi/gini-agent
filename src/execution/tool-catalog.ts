@@ -144,14 +144,14 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     // Skill catalog access. Always available so the model can opportunistically
-    // load any trusted skill listed in the system prompt without waiting for
+    // load any enabled skill listed in the system prompt without waiting for
     // the user to enable a toolset. Sync, low-risk, no approval needed: the
     // body is just text content that already lives in state.
     toolset: "skills",
     type: "function",
     function: {
       name: "read_skill",
-      description: "Read the full markdown body of a trusted skill by name. Use this when the system prompt advertises a skill and you need its instructions to follow.",
+      description: "Read the full markdown body of an enabled skill by name. Use this when the system prompt advertises a skill and you need its instructions to follow.",
       parameters: {
         type: "object",
         properties: {
@@ -180,7 +180,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
           prompt: { type: "string", description: "The user-facing instruction for the subagent." },
           system_prompt: { type: "string", description: "Optional override for the subagent's system instructions. Defaults to a generic 'focused subagent' preamble." },
           toolsets: { type: "array", items: { type: "string" }, description: "Optional list of toolset names to expose. Subset of the parent's enabled toolsets." },
-          skills: { type: "array", items: { type: "string" }, description: "Optional list of trusted skill names to advertise. Subset of the parent's trusted skills." },
+          skills: { type: "array", items: { type: "string" }, description: "Optional list of enabled skill names to advertise. Subset of the parent's enabled skills." },
           timeout_ms: { type: "number", description: "How long to wait for the subagent before timing out. Defaults to 300000 (5 minutes)." }
         },
         required: ["name", "prompt"]
@@ -503,7 +503,7 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
-    // Always expose read_skill so the model can load any trusted skill the
+    // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh
     // instance can't follow its own skill prompt without a toolset toggle.

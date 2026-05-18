@@ -312,14 +312,14 @@ function envBindingsForProviders(providers: string[]): Record<string, { provider
   return result;
 }
 
-// Aggregate env bindings across every trusted, active skill. Called at
+// Aggregate env bindings across every enabled, active skill. Called at
 // terminal_exec spawn time so a skill's scripts pick up declared
 // credentials regardless of which skill the model chose to follow.
 export async function resolveActiveSkillsEnv(config: RuntimeConfig): Promise<Record<string, string>> {
   const state = readState(config.instance);
   const out: Record<string, string> = {};
   for (const skill of state.skills) {
-    if (skill.status !== "trusted") continue;
+    if (skill.status !== "enabled") continue;
     if (!isSkillActive(state, skill)) continue;
     Object.assign(out, await resolveSkillEnv(config, skill));
   }

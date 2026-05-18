@@ -170,12 +170,12 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("read_skill returns the full body of a trusted skill", async () => {
+  test("read_skill returns the full body of an enabled skill", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-readskill");
     const provider = normalizeProvider(config.provider);
 
-    // Pre-create a trusted skill with a non-empty body — simulates a
+    // Pre-create an enabled skill with a non-empty body — simulates a
     // post-loadSkillsFromDisk state without exercising the loader here.
     const skill = await createSkillFromInput(config, {
       name: "apple-notes",
@@ -185,7 +185,7 @@ describe("chat-task loop", () => {
       const item = state.skills.find((s) => s.id === skill.id)!;
       item.body = "# Apple Notes\n\nUse `memo notes -a` to add a note.";
     });
-    await setSkillStatus(config, skill.id, "trusted");
+    await setSkillStatus(config, skill.id, "enabled");
 
     setEchoToolCallingResponse({
       provider,
@@ -216,42 +216,95 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("read_skill rejects non-trusted skills with a recoverable error", async () => {
+  test("read_skill chooses an enabled same-name user skill when the bundled row is disabled", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
-    const config = buildConfig(workspaceRoot, "chat-task-readskill-untrusted");
+    const config = buildConfig(workspaceRoot, "chat-task-readskill-same-name");
     const provider = normalizeProvider(config.provider);
 
-    // Create a draft skill (default status). The agent loop should see an
-    // error tool result and recover.
-    const skill = await createSkillFromInput(config, {
-      name: "draft-skill",
-      description: "Not yet trusted."
+    const bundled = await createSkillFromInput(config, {
+      name: "same-name",
+      description: "Bundled disabled skill."
+    });
+    const user = await createSkillFromInput(config, {
+      name: "same-name",
+      description: "User enabled skill."
     });
     await mutateState(config.instance, (state) => {
-      const item = state.skills.find((s) => s.id === skill.id)!;
-      item.body = "Some draft content.";
+      const bundledRow = state.skills.find((s) => s.id === bundled.id)!;
+      bundledRow.source = "bundled";
+      bundledRow.status = "disabled";
+      bundledRow.body = "disabled bundled body";
+      const userRow = state.skills.find((s) => s.id === user.id)!;
+      userRow.source = "user";
+      userRow.status = "enabled";
+      userRow.body = "enabled user body";
     });
 
     setEchoToolCallingResponse({
       provider,
       text: "",
       toolCalls: [
-        { id: "call_draft", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "draft-skill" }) } }
+        { id: "call_same_name", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "same-name" }) } }
       ],
       finishReason: "tool_calls"
     });
     setEchoToolCallingResponse({
       provider,
-      text: "Got it — that skill isn't trusted.",
+      text: "Loaded the enabled skill.",
       toolCalls: [],
       finishReason: "stop"
     });
 
-    const task = await submitTask(config, "use the draft skill", { mode: "chat" });
+    const task = await submitTask(config, "use the same-name skill", { mode: "chat" });
     const finished = await waitForTerminal(config, task.id);
 
     expect(finished.status).toBe("completed");
-    expect(finished.summary).toBe("Got it — that skill isn't trusted.");
+    const state = readState(config.instance);
+    const reads = state.audit.filter((a) => a.action === "skill.read" && a.taskId === task.id);
+    expect(reads).toHaveLength(1);
+    expect(reads[0]?.target).toBe(user.id);
+    expect(reads[0]?.evidence?.bytes).toBe("enabled user body".length);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("read_skill rejects disabled skills with a recoverable error", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-readskill-disabled");
+    const provider = normalizeProvider(config.provider);
+
+    // Create a disabled skill. The agent loop should see an
+    // error tool result and recover.
+    const skill = await createSkillFromInput(config, {
+      name: "disabled-skill",
+      description: "Currently disabled."
+    });
+    await setSkillStatus(config, skill.id, "disabled");
+    await mutateState(config.instance, (state) => {
+      const item = state.skills.find((s) => s.id === skill.id)!;
+      item.body = "Some disabled content.";
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_disabled", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "disabled-skill" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Got it — that skill is disabled.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "use the disabled skill", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Got it — that skill is disabled.");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

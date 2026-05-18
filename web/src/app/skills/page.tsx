@@ -56,7 +56,7 @@ export default function SkillsPage() {
   }, [search]);
 
   const action = useMutation({
-    mutationFn: ({ id, op }: { id: string; op: "test" | "trust" | "disable" | "rollback" }) =>
+    mutationFn: ({ id, op }: { id: string; op: "test" | "enable" | "disable" | "rollback" }) =>
       api<SkillRecord>(`/skills/${encodeURIComponent(id)}/${op}`, { method: "POST" }),
     onSuccess: (_, vars) => {
       toast.success(`${vars.op}: ${vars.id}`);
@@ -262,12 +262,11 @@ export default function SkillsPage() {
                 />
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "test" })}>Test</Button>
-                  {/*
-                    Trust toggle. Bundled skills (source === "bundled") are
-                    auto-trusted and the buttons are read-only. ADR connector-provider-spec-compliance.md §UI.
-                  */}
-                  <Button size="sm" variant="outline" disabled={action.isPending || detail.source === "bundled"} onClick={() => action.mutate({ id: detail.id, op: "trust" })}>Trust</Button>
-                  <Button size="sm" variant="outline" disabled={action.isPending || detail.source === "bundled"} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>
+                  {detail.status === "enabled" ? (
+                    <Button size="sm" variant="outline" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>
+                  ) : (
+                    <Button size="sm" variant="outline" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "enable" })}>Enable</Button>
+                  )}
                   <Button size="sm" variant="outline" disabled={action.isPending || detail.previousVersions.length === 0} onClick={() => action.mutate({ id: detail.id, op: "rollback" })}>
                     Rollback
                   </Button>
@@ -553,7 +552,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 }
 
 type Activation = {
-  label: "active" | "needs setup" | "untrusted" | "unsupported";
+  label: "active" | "needs setup" | "disabled" | "unsupported";
   tone: "ok" | "warn" | "neutral" | "danger";
 };
 
@@ -572,7 +571,7 @@ function deriveActivation(
   providersById: Map<string, ProviderDescriptor>
 ): Activation {
   if (skill.validationStatus === "unsupported") return { label: "unsupported", tone: "danger" };
-  if (skill.status === "draft" || skill.status === "disabled") return { label: "untrusted", tone: "neutral" };
+  if (skill.status === "disabled" || skill.status === "archived") return { label: "disabled", tone: "neutral" };
   const required = skill.requiredConnectors ?? [];
   if (required.length === 0) return { label: "active", tone: "ok" };
   for (const req of required) {

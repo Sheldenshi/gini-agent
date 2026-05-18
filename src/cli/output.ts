@@ -58,7 +58,7 @@ export function compactTask(task: { id: string; status: string; title: string; u
 
 export function improvementPayload(kind: string, title: string, content: string): Record<string, unknown> {
   if (kind === "skill") {
-    return { name: title, description: content, trigger: title, steps: [content], status: "draft" };
+    return { name: title, description: content, trigger: title, steps: [content], status: "enabled" };
   }
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
@@ -85,7 +85,7 @@ Usage:
   bun run gini approval approve|deny <approval-id>
   bun run gini memory list|add|approve|reject
   bun run gini reranker status
-  bun run gini skills list|add|show|search|validate|test|trust|disable|rollback
+  bun run gini skills list|add|show|search|validate|test|enable|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
   bun run gini connectors list|providers|add|remove|rotate|health
   bun run gini improvements list|propose|approve|reject

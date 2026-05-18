@@ -32,7 +32,7 @@ bun run gini evidence
 | Persistent memory | `gini memory list/add/edit/approve/reject/archive`, `/api/memory` |
 | Embeddings | Local Transformers.js by default; OpenAI and echo are opt-in. `gini embedding status`, `gini embedding reembed`, `/api/embedding/*` |
 | Reranker | Local Transformers.js cross-encoder by default; echo and none are opt-in. `gini reranker status`, `/api/reranker/status` |
-| Skills | Bundled Gini skills load as trusted; user-instance skills load as draft. `gini skills list/add/show/search/validate/test/trust/disable/rollback`, `/api/skills` |
+| Skills | Skills load enabled by default and can be enabled or disabled. `gini skills list/add/show/search/validate/test/enable/disable/rollback`, `/api/skills` |
 | Search | `gini search <query>`, `/api/search` with task, trace, memory, skill, and audit citations |
 | Jobs | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt jobs, and script jobs |
 | File tools | task inputs: `read`, `list`, `find`, `write`, `patch` |

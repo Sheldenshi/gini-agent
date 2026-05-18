@@ -23,7 +23,7 @@ import {
 
 // Default system prompt for a subagent when the caller doesn't provide one.
 // Keep it short and behavioral: the model gets the user-facing `prompt` as
-// its task input, plus the trusted-skill block and tool catalog as usual.
+// its task input, plus the enabled-skill block and tool catalog as usual.
 export const DEFAULT_SUBAGENT_SYSTEM_PROMPT =
   "You are a focused subagent inside the Gini runtime. " +
   "Your scope is the single task delegated to you by the parent agent. " +

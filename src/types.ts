@@ -11,7 +11,7 @@ export type RiskLevel = "low" | "medium" | "high";
 
 export type MemoryStatus = "proposed" | "active" | "archived" | "rejected" | "conflicted";
 
-export type SkillStatus = "draft" | "trusted" | "disabled" | "archived";
+export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
 
@@ -430,8 +430,8 @@ export interface SubagentRecord {
   // only tools belonging to one of these toolsets are exposed (skill catalog
   // tools like read_skill stay always-on).
   toolsetIds?: string[];
-  // Trusted skill name whitelist. When omitted/empty, the child sees every
-  // trusted skill the parent could see. When set, the "Available skills:"
+  // Enabled skill name whitelist. When omitted/empty, the child sees every
+  // enabled skill the parent could see. When set, the "Available skills:"
   // block in the system prompt is filtered down to this subset.
   skillNames?: string[];
   // Convenience mirror of the populated child task's summary/error so the
@@ -611,7 +611,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.trust" | "connector.enable" | "browser.upload_file";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "browser.upload_file";
   target: string;
   risk: RiskLevel;
   reason: string;
@@ -703,11 +703,9 @@ export interface SkillRecord {
   validationMessage?: string;
   // Origin of the loaded skill: "bundled" for vendored repo skills (under
   // <repo>/skills/), "user" for skills under ~/.gini/instances/<inst>/skills/.
-  // Used by the loader to keep bundled and user records separate (so a
-  // user-instance SKILL.md named "apple-notes" can't hijack the vendored
-  // trust grant). Bundled records are trusted by default; user records start
-  // draft. Defaults to "user" for legacy records via
-  // normalizeState so older state files keep loading.
+  // Used by the loader to keep bundled and user records separate. Defaults
+  // to "user" for legacy records via normalizeState so older state files keep
+  // loading.
   source?: "bundled" | "user";
 }
 

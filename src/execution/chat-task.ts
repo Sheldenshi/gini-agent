@@ -179,14 +179,14 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     memory.status === "active" && (!agentIdForMemory || memory.agentId === agentIdForMemory)
   );
   // Subagent path: child tasks override the default Gini preamble with the
-  // subagent's own system prompt and filter the trusted-skills block by the
+  // subagent's own system prompt and filter the enabled-skills block by the
   // subagent's skill whitelist (when set).
   const subagent = getSubagentForTask(state, task);
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
     : buildAgentSystemContext(activeMemory, recalledContext);
   const visibleSkills = filterSkillsForSubagent(state.skills, subagent).filter((skill) => isSkillActive(state, skill));
-  const skillsBlock = buildTrustedSkillsBlock(visibleSkills);
+  const skillsBlock = buildEnabledSkillsBlock(visibleSkills);
   const systemContext = skillsBlock ? `${baseSystem}\n\n${skillsBlock}` : baseSystem;
 
   // Conversation history: include prior turns from the same chat session so
@@ -244,11 +244,11 @@ function filterToolsForSubagent<T extends { toolset: string; function: { name: s
   });
 }
 
-// Filter the trusted-skill list down to a subagent's whitelist. When the
+// Filter the enabled-skill list down to a subagent's whitelist. When the
 // subagent has no whitelist (toolset-or-skill-undefined / inherit), the full
 // list is returned. When the whitelist is set, only matching skill names
-// are advertised — the read_skill tool itself still gates on `status ===
-// "trusted"` so a non-trusted skill can't slip through.
+// are advertised — the read_skill tool itself still gates on
+// `status === "enabled"` so a disabled skill can't slip through.
 function filterSkillsForSubagent(skills: SkillRecord[], subagent: SubagentRecord | undefined): SkillRecord[] {
   if (!subagent || !subagent.skillNames || subagent.skillNames.length === 0) return skills;
   const allowed = new Set(subagent.skillNames);
@@ -256,20 +256,20 @@ function filterSkillsForSubagent(skills: SkillRecord[], subagent: SubagentRecord
 }
 
 // Build the "Available skills:" block that gets prepended to the system
-// prompt for the agent loop. We only advertise *trusted* skills (draft /
-// disabled / archived stay invisible). The block lists each name +
+// prompt for the agent loop. We only advertise enabled skills (disabled /
+// archived stay invisible). The block lists each name +
 // frontmatter description; the model uses the read_skill tool to fetch
 // the full body when it actually needs the instructions. This keeps the
 // resident system prompt small even when many skills are registered.
-function buildTrustedSkillsBlock(skills: SkillRecord[]): string {
-  const trusted = skills.filter((s) => s.status === "trusted");
-  if (trusted.length === 0) return "";
+function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
+  const enabled = skills.filter((s) => s.status === "enabled");
+  if (enabled.length === 0) return "";
   // Dedupe by name, preferring bundled records over user records when both
   // exist with the same name. Mirrors the read_skill tool's tiebreak so
   // the advertised skill description matches the body that read_skill will
   // return.
   const byName = new Map<string, SkillRecord>();
-  for (const skill of trusted) {
+  for (const skill of enabled) {
     const existing = byName.get(skill.name);
     if (!existing) {
       byName.set(skill.name, skill);

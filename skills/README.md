@@ -40,7 +40,7 @@ runtime event.
 
 ## Auto-approving the underlying shell commands
 
-Skills like `apple-notes` and `apple-reminders` invoke trusted CLIs
+Skills like `apple-notes` and `apple-reminders` invoke local CLIs
 (`memo`, `remindctl`) through `terminal_exec`, which is approval-gated by
 default. To skip the approval prompt for those commands, add a glob
 pattern to the per-instance `autoApproveCommands` list in

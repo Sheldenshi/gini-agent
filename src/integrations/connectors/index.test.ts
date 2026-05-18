@@ -26,7 +26,7 @@ function newSkill(overrides: Partial<SkillRecord>): SkillRecord {
     steps: [],
     requiredTools: [],
     requiredPermissions: [],
-    status: "trusted",
+    status: "enabled",
     version: 1,
     createdAt: "",
     updatedAt: "",

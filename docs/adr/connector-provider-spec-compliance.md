@@ -98,17 +98,17 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 Two new bundled skills under `skills/meta/`:
 
 - **`create-skill`** — handles "create a skill that does X." Generates a spec-compliant SKILL.md, a stub script if needed, and `metadata.gini.requires.connectors` declarations. Validates before writing. Can also convert an existing non-spec skill to the new format.
-- **`install-skill`** — handles "install this skill" (pasted content, URL, or file path). Reads the SKILL.md, validates frontmatter, reviews scripts for risk (summarizes what they access), explains required connectors and `allowed-tools` to the user, installs via the API, walks through trust. Defaults to forward motion: when a required provider is not natively supported, installs with `generic` and continues, surfacing the tradeoff but not asking for a yes/no.
+- **`install-skill`** — handles "install this skill" (pasted content, URL, or file path). Reads the SKILL.md, validates frontmatter, reviews scripts for risk (summarizes what they access), explains required connectors and `allowed-tools` to the user, and installs via the API. Defaults to forward motion: when a required provider is not natively supported, installs with `generic` and continues, surfacing the tradeoff but not asking for a yes/no.
 
-Both are bundled, trusted by default, and declare `metadata.gini.requires.connectors: []` (they don't need external systems themselves).
+Both are bundled, enabled by default, and declare `metadata.gini.requires.connectors: []` (they don't need external systems themselves).
 
 ### Web UI
 
-- **Skills page** at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `untrusted`. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. Connector management happens inline:
+- **Skills page** at `/skills`. Lists every loaded SkillRecord with status: `active`, `needs setup`, `unsupported`, `disabled`. Per-skill rows show `requires.connectors`, `prerequisites.commands`, `prerequisites.env`, `allowed-tools` with per-entry resolution status. Connector management happens inline:
   - Missing connectors render an inline `[Set up <Label>]` button that opens the Add Connector dialog scoped to that provider (no navigation).
   - Healthy connectors render a `[Disconnect]` affordance. Disconnect calls `DELETE /api/connectors/<id>`; the gateway tombstones `source: "auto"` records (status="disabled") and physically deletes `source: "user"` records.
   - A `Refresh detection` button at the top of the page calls `POST /api/connectors/detect` to re-run the auto-detection pass on demand.
-- **Trust toggle** on each user-installed skill ("source: user"). Bundled skills are auto-trusted and the toggle is read-only.
+- **Enable/disable toggle** on each skill. Disabled skills stay invisible to the agent loop until re-enabled.
 - **Auto-detected connectors** (`source: "auto"`) are returned by `GET /api/connectors` but are not surfaced anywhere in the UI when no installed skill depends on their provider. They become visible the moment a dependent skill installs and references their provider — by appearing on that skill's row.
 - There is **no standalone Connectors page**. The `/connectors` route does not exist; the sidebar has no Connectors entry.
 
@@ -152,9 +152,9 @@ Both are bundled, trusted by default, and declare `metadata.gini.requires.connec
 - `runConnectorDetection` runs at gateway startup and via `POST /api/connectors/detect`; idempotent (no duplicate records on repeat runs, skips disabled tombstones).
 - Auto-detected connectors with no dependent skill installed never render in the UI; `GET /api/connectors` still returns them.
 - The standalone `/connectors` page is gone (404). The sidebar has no Connectors entry.
-- Trust toggle on user-installed skills works; activation gate respects it.
-- create-skill meta-skill is bundled, trusted, active, and produces a valid SKILL.md when invoked via a real agent task.
-- install-skill meta-skill is bundled, trusted, active, and installs a pasted SKILL.md end-to-end (validating, reviewing, walking trust, installing via API, confirming activation).
+- Enable/disable toggle on skills works; activation gate respects it.
+- create-skill meta-skill is bundled, enabled, active, and produces a valid SKILL.md when invoked via a real agent task.
+- install-skill meta-skill is bundled, enabled, active, and installs a pasted SKILL.md end-to-end (validating, reviewing, installing via API, confirming activation).
 - Periodic re-probe job runs at the configured interval, updates health, emits audit events on transitions.
-- A live browser test of the Skills page confirms the inline Set Up dialog, the inline Disconnect with tombstone behavior for auto-source connectors, the Refresh detection action, and the trust toggle. Visiting `/connectors` returns 404 and the sidebar has no Connectors entry.
+- A live browser test of the Skills page confirms the inline Set Up dialog, the inline Disconnect with tombstone behavior for auto-source connectors, the Refresh detection action, and the enable/disable toggle. Visiting `/connectors` returns 404 and the sidebar has no Connectors entry.
 - A live functional test on the running instance invokes both meta-skills via a task and verifies the outcome on disk.

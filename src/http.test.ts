@@ -267,7 +267,7 @@ describe("runtime api", () => {
       method: "POST",
       body: JSON.stringify({ name: "triage", steps: ["Read trace"], tests: ["has name"] })
     });
-    const trusted = await call(handler, config, `/api/skills/${skill.id}/trust`, { method: "POST" });
+    const enabled = await call(handler, config, `/api/skills/${skill.id}/enable`, { method: "POST" });
     const tested = await call(handler, config, `/api/skills/${skill.id}/test`, { method: "POST" });
     const updated = await call(handler, config, `/api/skills/${skill.id}`, {
       method: "PATCH",
@@ -284,7 +284,7 @@ describe("runtime api", () => {
     const replay = await call(handler, config, `/api/job-runs/${runs[0].id}/replay`, { method: "POST" });
     const events = await call(handler, config, "/api/events");
 
-    expect(trusted.status).toBe("trusted");
+    expect(enabled.status).toBe("enabled");
     expect(tested.ok).toBe(true);
     expect(updated.version).toBe(2);
     expect(rolledBack.version).toBe(3);

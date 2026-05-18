@@ -9,7 +9,7 @@ import { useInvalidate } from "@/lib/queries";
 //
 // Action-based dispatch is the primary discriminator because addAudit() funnels
 // every domain mutation through `kind: "runtime"`, so the SSE `kind` alone is
-// too coarse — a connector.create and a skill.trust both arrive as "runtime"
+// too coarse — a connector.create and a skill.enable both arrive as "runtime"
 // events.
 const ACTION_TO_KEYS: Record<string, string[]> = {
   approval: ["approvals"],
