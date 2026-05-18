@@ -1122,6 +1122,75 @@ describe("cron lifecycle", () => {
     ).rejects.toThrow(/Job not found/);
   });
 
+  test("update_job dispatch refuses to mutate when parent task is terminal", async () => {
+    // Defense-in-depth: when the parent task has gone terminal between
+    // the chat-task per-tool guard and dispatch, update_job must skip
+    // the mutation entirely so a cancelled task can't leak a patched
+    // job past the cancellation. Pre-check returns an Error string; the
+    // JobRecord stays untouched.
+    const config = testConfig("jobs-update-tool-terminal");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-keep", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      task.status = "cancelled";
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_update_terminal",
+      JSON.stringify({ jobId: job.id, name: "should-not-apply" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/Error: update_job skipped/);
+    }
+    // JobRecord is unchanged — name still "to-keep".
+    const after = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(after?.name).toBe("to-keep");
+  });
+
+  test("delete_job dispatch refuses to mutate when parent task is terminal", async () => {
+    // Same defense-in-depth as update_job: a cancelled parent task must
+    // not be able to delete a JobRecord through the agent tool path.
+    const config = testConfig("jobs-delete-tool-terminal");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "to-keep", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      task.status = "cancelled";
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "delete_job",
+      "call_delete_terminal",
+      JSON.stringify({ jobId: job.id })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/Error: delete_job skipped/);
+    }
+    // JobRecord is still present.
+    const after = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(after).toBeDefined();
+  });
+
   test("scheduled prompt job with chatSessionId delivers an assistant chat message", async () => {
     // End-to-end test: create a job linked to a chat session, force its
     // nextRunAt into the past, let runDueJobs claim + dispatch it, wait

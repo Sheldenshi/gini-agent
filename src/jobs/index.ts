@@ -605,8 +605,24 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
   return dispatchPromptRun(config, job, run, trigger);
 }
 
-export async function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
+export async function updateJobStatus(
+  config: RuntimeConfig,
+  jobId: string,
+  statusValue: "active" | "paused",
+  parentTaskId?: string
+) {
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to mutate if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job status: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     job.status = statusValue;
@@ -621,7 +637,12 @@ export async function updateJobStatus(config: RuntimeConfig, jobId: string, stat
   });
 }
 
-export async function updateJob(config: RuntimeConfig, jobId: string, input: Record<string, unknown>) {
+export async function updateJob(
+  config: RuntimeConfig,
+  jobId: string,
+  input: Record<string, unknown>,
+  parentTaskId?: string
+) {
   // Validate up-front so 400-class errors come back as `Invalid input: ...`
   // before we open a mutateState write. Only validate fields the caller
   // actually supplied.
@@ -713,6 +734,17 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
   }
 
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to mutate if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     if (typeof input.name === "string") job.name = input.name;
@@ -865,8 +897,19 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
   });
 }
 
-export async function removeJob(config: RuntimeConfig, jobId: string) {
+export async function removeJob(config: RuntimeConfig, jobId: string, parentTaskId?: string) {
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to delete if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot delete job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const index = state.jobs.findIndex((candidate) => candidate.id === jobId);
     if (index < 0) throw new Error(`Job not found: ${jobId}`);
     const [job] = state.jobs.splice(index, 1);
