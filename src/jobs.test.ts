@@ -828,6 +828,71 @@ describe("cron lifecycle", () => {
     expect(parsed.jobs[0]?.prompt.endsWith("…")).toBe(true);
   });
 
+  test("list_jobs dispatch returns verbatim prompts when fullPrompt is true", async () => {
+    // The agent needs the unstruncated prompt when it intends to edit it
+    // (append, search-and-replace), since update_job's prompt field is
+    // REPLACE-only. With `fullPrompt: true` the handler returns the
+    // entire stored prompt unchanged.
+    const config = testConfig("jobs-list-tool-full-prompt");
+    const handler = createHandler(config);
+    const longPrompt = "y".repeat(300);
+    await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "verbatim", prompt: longPrompt, intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const verbatim = await dispatchToolCall(
+      config,
+      taskId,
+      "list_jobs",
+      "call_full",
+      JSON.stringify({ fullPrompt: true })
+    );
+    if (verbatim.kind !== "sync") throw new Error("expected sync result");
+    const verbatimParsed = JSON.parse(verbatim.result) as { jobs: Array<{ prompt: string }> };
+    expect(verbatimParsed.jobs[0]?.prompt.length).toBe(longPrompt.length);
+    expect(verbatimParsed.jobs[0]?.prompt).toBe(longPrompt);
+    expect(verbatimParsed.jobs[0]?.prompt.endsWith("…")).toBe(false);
+
+    // Same job, without the flag, falls back to the 200-char truncation
+    // so a long prompt doesn't blow up the tool-result context.
+    const truncated = await dispatchToolCall(
+      config,
+      taskId,
+      "list_jobs",
+      "call_trunc",
+      JSON.stringify({})
+    );
+    if (truncated.kind !== "sync") throw new Error("expected sync result");
+    const truncatedParsed = JSON.parse(truncated.result) as { jobs: Array<{ prompt: string }> };
+    expect(truncatedParsed.jobs[0]?.prompt.length).toBeLessThan(longPrompt.length);
+    expect(truncatedParsed.jobs[0]?.prompt.endsWith("…")).toBe(true);
+  });
+
+  test("list_jobs dispatch rejects non-boolean fullPrompt", async () => {
+    const config = testConfig("jobs-list-tool-full-prompt-bad");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "list_jobs",
+        "call_full_bad",
+        JSON.stringify({ fullPrompt: "yes" })
+      )
+    ).rejects.toThrow(/fullPrompt must be a boolean/);
+  });
+
   test("update_job dispatch patches schedule and writes job.updated audit", async () => {
     const config = testConfig("jobs-update-tool");
     const handler = createHandler(config);

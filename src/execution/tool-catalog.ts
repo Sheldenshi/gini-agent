@@ -487,11 +487,12 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "list_jobs",
-      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, and a truncated prompt.",
+      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, and a truncated prompt. Pass `fullPrompt: true` when you intend to edit a prompt (e.g. 'append to this reminder' or 'change wording X to Y') so you get the verbatim prompt without truncation — otherwise prompts are truncated to 200 chars to keep the result compact.",
       parameters: {
         type: "object",
         properties: {
-          nameContains: { type: "string", description: "Optional case-insensitive substring filter on job name." }
+          nameContains: { type: "string", description: "Optional case-insensitive substring filter on job name." },
+          fullPrompt: { type: "boolean", description: "Optional. If true, return each job's prompt verbatim with no truncation. Default false. Set true when you intend to edit a prompt (append, search-and-replace) so update_job can submit the complete new prompt without losing tail content." }
         }
       }
     }

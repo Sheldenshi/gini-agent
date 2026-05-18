@@ -836,15 +836,26 @@ async function listJobsTool(
     }
     nameContains = args.nameContains.toLowerCase();
   }
+  let fullPrompt = false;
+  if (args.fullPrompt !== undefined && args.fullPrompt !== null) {
+    if (typeof args.fullPrompt !== "boolean") {
+      throw new Error("Invalid input: fullPrompt must be a boolean.");
+    }
+    fullPrompt = args.fullPrompt;
+  }
   const all = listJobs(config);
   const filtered = nameContains
     ? all.filter((job) => job.name.toLowerCase().includes(nameContains!))
     : all;
   // Compact summary: only the fields an agent needs to identify and
-  // describe a job. Prompts are truncated so a long-prompt job doesn't
-  // blow up the tool-result context. Schedule fields are reported as-is
-  // (cronExpression+cronTimezone for cron jobs, intervalSeconds for
-  // interval-driven jobs) so the agent can echo the user's vocabulary.
+  // describe a job. Prompts default to a 200-char truncation so a
+  // long-prompt job doesn't blow up the tool-result context. When the
+  // caller passes `fullPrompt: true` we return verbatim prompts — the
+  // agent needs this when it intends to edit a prompt (append /
+  // search-and-replace), since update_job's prompt field is REPLACE-only.
+  // Schedule fields are reported as-is (cronExpression+cronTimezone for
+  // cron jobs, intervalSeconds for interval-driven jobs) so the agent
+  // can echo the user's vocabulary.
   const summary = filtered.map((job) => ({
     id: job.id,
     name: job.name,
@@ -856,17 +867,22 @@ async function listJobsTool(
     nextRunAt: job.nextRunAt,
     lastRunAt: job.lastRunAt,
     chatSessionId: job.chatSessionId,
-    prompt: job.prompt.length > 200 ? `${job.prompt.slice(0, 200)}…` : job.prompt
+    prompt: fullPrompt
+      ? job.prompt
+      : job.prompt.length > 200
+        ? `${job.prompt.slice(0, 200)}…`
+        : job.prompt
   }));
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Listed jobs",
-    data: { total: all.length, returned: summary.length, nameContains }
+    data: { total: all.length, returned: summary.length, nameContains, fullPrompt }
   });
   await recordLowRiskAudit(config, taskId, "job.listed", "jobs", {
     total: all.length,
     returned: summary.length,
-    nameContains
+    nameContains,
+    fullPrompt
   });
   return JSON.stringify({ count: summary.length, jobs: summary });
 }
