@@ -21,8 +21,9 @@ Use `gws gmail` to read, search, send, reply, forward, draft, label, and triage 
 - `gws` installed and authenticated. If `gws auth login` has never been run on this instance, invoke the `google-workspace-setup` skill first to walk the user through install, OAuth, scope selection, and `autoApproveCommands`.
 - The OAuth scopes the user picked at login must cover the verbs the agent will use:
   - Read-only triage: `gmail.readonly`
-  - Send / reply / forward: `gmail.send` (or full `gmail`)
-  - Drafts and labels: full `gmail`
+  - Send a new message: `gmail.send`
+  - Reply, reply-all, forward: `gmail.modify` — upstream helpers fetch the original message to thread `In-Reply-To` / `References` headers, which `gmail.send` alone cannot do
+  - Drafts and labels: `gmail.modify` (or full `gmail`)
 
 ## When to Use
 
@@ -41,7 +42,7 @@ Use `gws gmail` to read, search, send, reply, forward, draft, label, and triage 
 
 ## Quick Reference
 
-The Gmail surface in `gws` is split into auto-generated API methods (`gws gmail messages list`, `gws gmail labels create`, …) plus a small set of curated helpers (`+send`, `+reply`, `+read`, `+triage`, …) that handle MIME encoding, threading, and base64 for you. Prefer the helpers for everyday tasks.
+The Gmail surface in `gws` is split into auto-generated API methods (`gws gmail users messages list`, `gws gmail users labels create`, …) plus a small set of curated helpers (`+send`, `+reply`, `+read`, `+triage`, …) that handle MIME encoding, threading, and base64 for you. Prefer the helpers for everyday tasks. The raw API is rooted at the `users` resource — every `--params` JSON must include `"userId": "me"` (or another delegated address).
 
 ### Send
 
@@ -75,20 +76,20 @@ gws gmail +read --id <MESSAGE_ID> --html         # HTML body instead of text
 
 ### Search and list
 
-`gws gmail messages list` accepts standard Gmail search operators via the `q` param (`from:`, `to:`, `subject:`, `label:`, `is:unread`, `has:attachment`, `newer_than:7d`, etc.).
+`gws gmail users messages list` accepts standard Gmail search operators via the `q` param (`from:`, `to:`, `subject:`, `label:`, `is:unread`, `has:attachment`, `newer_than:7d`, etc.).
 
 ```bash
-gws gmail messages list --params '{"q":"from:alice@example.com is:unread","maxResults":20}'
-gws gmail messages list --params '{"q":"label:invoices newer_than:30d"}' --page-all
+gws gmail users messages list --params '{"userId":"me","q":"from:alice@example.com is:unread","maxResults":20}'
+gws gmail users messages list --params '{"userId":"me","q":"label:invoices newer_than:30d"}' --page-all
 gws gmail +triage                                 # curated unread inbox digest
 ```
 
 ### Reply and forward
 
 ```bash
-gws gmail +reply --id <MESSAGE_ID> --body 'Thanks — will follow up.'
-gws gmail +reply-all --id <MESSAGE_ID> --body 'Looping in the team.'
-gws gmail +forward --id <MESSAGE_ID> --to charlie@example.com \
+gws gmail +reply --message-id <MESSAGE_ID> --body 'Thanks — will follow up.'
+gws gmail +reply-all --message-id <MESSAGE_ID> --body 'Looping in the team.'
+gws gmail +forward --message-id <MESSAGE_ID> --to charlie@example.com \
   --body 'FYI from the thread below.'
 ```
 
@@ -97,13 +98,14 @@ The helpers preserve `In-Reply-To` and `References` headers so the reply lands i
 ### Labels and drafts
 
 ```bash
-gws gmail labels list
-gws gmail labels create --json '{"name":"Receipts","labelListVisibility":"labelShow"}'
-gws gmail messages modify --params '{"id":"<MESSAGE_ID>"}' \
+gws gmail users labels list --params '{"userId":"me"}'
+gws gmail users labels create --params '{"userId":"me"}' \
+  --json '{"name":"Receipts","labelListVisibility":"labelShow"}'
+gws gmail users messages modify --params '{"userId":"me","id":"<MESSAGE_ID>"}' \
   --json '{"addLabelIds":["Label_123"],"removeLabelIds":["INBOX"]}'
 
-gws gmail drafts list
-gws gmail drafts get --params '{"id":"<DRAFT_ID>"}'
+gws gmail users drafts list --params '{"userId":"me"}'
+gws gmail users drafts get --params '{"userId":"me","id":"<DRAFT_ID>"}'
 ```
 
 ### Watch for new mail
@@ -117,7 +119,7 @@ gws gmail +watch        # streams new messages as NDJSON (one JSON object per li
 1. Every send is a side-effecting action. Confirm recipient list, subject, and body with the user before invoking `gws gmail +send` (or any `messages.send` / `drafts.send` call), even when `gws *` is auto-approved.
 2. Prefer the curated helpers (`+send`, `+reply`, `+read`, `+triage`) over the raw `gws gmail <resource> <method>` surface — they handle MIME, base64, threading, and HTML-to-text conversion automatically.
 3. When replying, use `+reply` / `+reply-all` so the thread stays intact. Building a new message with `+send` and pasting in the prior subject does not thread correctly.
-4. Treat `gmail.readonly` and `gmail.send` as separate trust boundaries. If the user only granted read-only at setup, never silently call a write method — direct them back to `google-workspace-setup` to widen scopes.
+4. Treat the Gmail scopes as three separate trust boundaries: `gmail.readonly` covers `+read` / `+triage` and any `messages.list`/`get` call; `gmail.send` covers a brand-new `+send` only; `gmail.modify` is required for `+reply`, `+reply-all`, `+forward`, labels, and drafts because those helpers must fetch the original message or mutate its state. If the user only granted a narrower scope at setup, never silently call a verb that needs a wider one — direct them back to `google-workspace-setup` to widen scopes.
 5. Do not bulk-send from a personal `@gmail.com` account. Google throttles or suspends accounts that look like bulk senders. Use a transactional provider for newsletters or anything addressed to more than a handful of recipients.
 6. Attachment cap is 25 MB total. For larger files, upload via `google-drive` and send the share link instead.
 7. Never paste raw message bodies that contain secrets (API keys, passwords, MFA codes) back into the chat transcript. Summarize, redact, or write to a file the user controls.
