@@ -15,12 +15,10 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { StatusPill } from "@/components/StatusPill";
 import {
   useBrowserConnection,
   useConnectBrowser,
-  useDisconnectBrowser,
-  useWipeBrowserProfile
+  useDisconnectBrowser
 } from "@/lib/queries";
 
 // Connect opens a visible browser so the user can sign in to sites the agent
@@ -28,14 +26,12 @@ import {
 export function BrowserSettingsCard() {
   const connect = useConnectBrowser();
   const disconnect = useDisconnectBrowser();
-  const wipe = useWipeBrowserProfile();
   const status = useBrowserConnection({
-    isActive: connect.isPending || disconnect.isPending || wipe.isPending
+    isActive: connect.isPending || disconnect.isPending
   });
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [cdpUrl, setCdpUrl] = useState("");
   const [disconnectOpen, setDisconnectOpen] = useState(false);
-  const [wipeOpen, setWipeOpen] = useState(false);
 
   const connected = status.data?.connected ?? false;
   const record = status.data?.record;
@@ -69,16 +65,6 @@ export function BrowserSettingsCard() {
     });
   };
 
-  const handleWipe = () => {
-    wipe.mutate(undefined, {
-      onSuccess: (result) => {
-        toast.success(`Wiped profile at ${result.dataDir}.`);
-        setWipeOpen(false);
-      },
-      onError: (error: Error) => toast.error(error.message)
-    });
-  };
-
   return (
     <>
       <Card>
@@ -92,7 +78,6 @@ export function BrowserSettingsCard() {
                   : "Connect to sign in to sites the agent needs."}
               </CardDescription>
             </div>
-            <StatusPill value={connected ? "active" : "disabled"} />
           </div>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -191,32 +176,6 @@ export function BrowserSettingsCard() {
               {connect.error.message}
             </p>
           ) : null}
-
-          <div className="border-t pt-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => setWipeOpen(true)}
-                disabled={connected || wipe.isPending}
-                title={
-                  connected
-                    ? "Disconnect Chrome before clearing saved sign-ins."
-                    : "Permanently delete all saved sign-ins and cookies."
-                }
-              >
-                {wipe.isPending ? "Wiping..." : "Wipe Profile"}
-              </Button>
-              <p className="text-[11px] text-muted-foreground">
-                Clears saved sign-ins for this agent.
-              </p>
-            </div>
-            {wipe.error ? (
-              <p className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
-                {wipe.error.message}
-              </p>
-            ) : null}
-          </div>
         </CardContent>
       </Card>
 
@@ -232,7 +191,7 @@ export function BrowserSettingsCard() {
           </DialogHeader>
           <p className="text-xs text-muted-foreground">
             {record?.mode === "managed" ? (
-              "Use Wipe Profile if you want to remove the saved sign-ins too."
+              "You can connect again whenever you need to sign into another site."
             ) : (
               "Your Chrome process is left alone."
             )}
@@ -247,29 +206,6 @@ export function BrowserSettingsCard() {
               disabled={disconnect.isPending}
             >
               {disconnect.isPending ? "Disconnecting..." : "Disconnect Chrome"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={wipeOpen} onOpenChange={setWipeOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Wipe browser profile?</DialogTitle>
-            <DialogDescription>
-              This permanently deletes saved sign-ins for this agent.
-            </DialogDescription>
-          </DialogHeader>
-          <p className="text-xs text-muted-foreground">
-            The next time the agent needs a signed-in site, you will need to connect and sign
-            in again.
-          </p>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button variant="outline">Cancel</Button>
-            </DialogClose>
-            <Button variant="destructive" onClick={handleWipe} disabled={wipe.isPending}>
-              {wipe.isPending ? "Wiping..." : "Wipe Profile"}
             </Button>
           </DialogFooter>
         </DialogContent>
