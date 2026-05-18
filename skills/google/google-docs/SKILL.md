@@ -1,0 +1,141 @@
+---
+name: google-docs
+description: "Google Docs via gws: read, append text, structured batch edits."
+license: MIT
+compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Docs scopes."
+metadata:
+  gini:
+    version: 1.0.0
+    author: Gini
+    platforms: [macos, linux]
+    prerequisites:
+      commands: [gws]
+---
+
+# Google Docs
+
+Use `gws docs` to create blank documents, read existing document content, append text, and run structured batch updates against the Docs v1 API. This is the **content** surface for Google Docs — for the file as an object (sharing, copying, moving, trashing) use `google-drive` instead.
+
+## Prerequisites
+
+- `gws` installed and authenticated. If `gws auth login` has never been run on this instance, invoke the `google-workspace-setup` skill first.
+- OAuth scopes the user picked at login must cover the verbs the agent will use:
+  - Read and edit Docs: `docs`
+  - Find docs by title (or list recent docs) before reading: pair with `drive.readonly`
+
+## When to Use
+
+- The user asks Gini to read, draft, or edit the **body** of a Google Doc.
+- Appending notes, meeting summaries, or AI-generated content to an existing doc.
+- Creating a new blank doc as a starting point (then editing it with `+write` or `batchUpdate`).
+- Running structured edits (insert text at index, replace all of a string, apply heading styles) via the `batchUpdate` API.
+
+## When NOT to Use
+
+- Sharing, moving, renaming, copying, trashing, or permission-managing a doc — use `google-drive` for the file-as-object surface.
+- Spreadsheets — use Sheets (`gws sheets ...`), not Docs.
+- Slide decks — use Slides (`gws slides ...`), not Docs.
+- Personal cross-device notes — use `apple-notes` or `obsidian`; a Google Doc is overkill and slower to sync.
+- Agent-internal scratch state — use the `memory` tool.
+- Long-form Markdown the user maintains locally — keep it in the repo or vault. Docs is for content that needs collaborative editing or live sharing.
+
+## Quick Reference
+
+The Docs surface has only three top-level methods (`documents.get`, `documents.create`, `documents.batchUpdate`) plus a `+write` helper for the common "append text" case.
+
+### Create a blank doc
+
+```bash
+gws docs documents create --json '{"title":"Weekly notes"}'
+```
+
+The response includes a `documentId` you will need for subsequent reads and writes. Other fields in the request (body, settings, …) are ignored by `documents.create` — set them with a follow-up `batchUpdate` call.
+
+### Read a doc
+
+```bash
+gws docs documents get --params '{"documentId":"<DOC_ID>"}'
+```
+
+The response is the full structured Docs JSON tree (`body.content[]` of paragraph, table, sectionBreak, etc. elements). For a plain-text dump, pipe through `jq`:
+
+```bash
+gws docs documents get --params '{"documentId":"<DOC_ID>"}' \
+  | jq -r '.body.content[].paragraph?.elements[]?.textRun?.content // empty'
+```
+
+### Append text (helper)
+
+```bash
+gws docs +write --document <DOC_ID> --text 'Hello, world!'
+gws docs +write --document <DOC_ID> --text "$(cat ./notes.md)"
+```
+
+`+write` inserts the given text at the end of the document body. For anything richer (bold, headings, bullet lists, replace-all, table insert) drop to `documents.batchUpdate`.
+
+### Structured edits (`batchUpdate`)
+
+The Docs API edits a doc as an ordered list of `requests`. Each request is one mutation. The whole batch is atomic — if any request is invalid, nothing is applied.
+
+```bash
+# Insert text at a specific index
+gws docs documents batchUpdate \
+  --params '{"documentId":"<DOC_ID>"}' \
+  --json '{
+    "requests": [
+      {"insertText": {"location": {"index": 1}, "text": "Heading\n"}}
+    ]
+  }'
+
+# Replace every occurrence of a placeholder
+gws docs documents batchUpdate \
+  --params '{"documentId":"<DOC_ID>"}' \
+  --json '{
+    "requests": [
+      {"replaceAllText": {
+         "containsText": {"text": "{{NAME}}", "matchCase": true},
+         "replaceText": "Alice"
+      }}
+    ]
+  }'
+
+# Apply heading style to a range
+gws docs documents batchUpdate \
+  --params '{"documentId":"<DOC_ID>"}' \
+  --json '{
+    "requests": [
+      {"updateParagraphStyle": {
+         "range": {"startIndex": 1, "endIndex": 8},
+         "paragraphStyle": {"namedStyleType": "HEADING_1"},
+         "fields": "namedStyleType"
+      }}
+    ]
+  }'
+```
+
+For schema details on each request type, inspect the method:
+
+```bash
+gws schema docs.documents.batchUpdate
+```
+
+### Find a doc by title before reading
+
+Use `google-drive` to locate the doc, then hand the ID to `gws docs`:
+
+```bash
+gws drive files list \
+  --params '{"q":"mimeType = '\''application/vnd.google-apps.document'\'' and name contains '\''Weekly notes'\''"}'
+```
+
+## Rules
+
+1. Every `documents.create`, `documents.batchUpdate`, and `+write` call is a write. Confirm target document, content, and (for `batchUpdate`) the request list before invoking, even when `gws *` is auto-approved.
+2. `documents.create` only accepts `title` — body content, settings, and permissions are ignored. To populate a new doc, follow create with `+write` or `batchUpdate`.
+3. `batchUpdate` is atomic across all requests in the array. Build the full request list, send it once, and check the reply rather than retrying mid-batch on partial failure.
+4. Index math on `batchUpdate` is brittle — every text insertion shifts the indices of subsequent content. When making multiple inserts, either order requests from highest index to lowest, or use `replaceAllText` (which is index-agnostic) when possible.
+5. For sharing, copying, moving, renaming, or trashing a doc — switch to `google-drive`. Docs only owns the body; Drive owns the file.
+6. For personal note-taking that should sync across the user's devices outside Google's ecosystem, prefer `apple-notes` or `obsidian` over creating a Google Doc. Use Docs when the user needs collaborative editing or live sharing.
+7. When dumping body text via `jq`, the path above only catches paragraph-level `textRun` content. Tables, footnotes, headers/footers, and embedded objects live in other branches of the tree — for a faithful export, use Drive's `files.export` with `mimeType: text/plain` instead.
+
+For flags not shown here, run `gws docs --help` or `gws schema docs.<resource>.<method>` to inspect a specific API method.
