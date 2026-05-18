@@ -27,7 +27,7 @@ import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
-import { createScheduledJob } from "../jobs";
+import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
 import {
@@ -86,6 +86,12 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await spawnSubagentTool(config, taskId, args) };
     case "create_job":
       return { kind: "sync", result: await createJobTool(config, taskId, args) };
+    case "list_jobs":
+      return { kind: "sync", result: await listJobsTool(config, taskId, args) };
+    case "update_job":
+      return { kind: "sync", result: await updateJobTool(config, taskId, args) };
+    case "delete_job":
+      return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -811,6 +817,233 @@ async function createJobTool(
   // Imperative/CLI invocations skip this suffix — there's no chat to point at.
   const sessionSuffix = chatSessionId ? ` into ${chatSessionId}` : "";
   return `Created job ${job.id} (\"${name}\"): ${cadence}, fires at ${job.nextRunAt}${sessionSuffix}.`;
+}
+
+// Read-only listing of scheduled jobs. Cheap, low-risk: just walks
+// `state.jobs` and returns a compact summary the agent can reason about
+// without spending tokens on internal-only fields. The agent uses this to
+// resolve "this job" / "my reminder" to a real job id before calling
+// update_job or delete_job.
+async function listJobsTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  let nameContains: string | undefined;
+  if (args.nameContains !== undefined && args.nameContains !== null) {
+    if (typeof args.nameContains !== "string") {
+      throw new Error("Invalid input: nameContains must be a string.");
+    }
+    nameContains = args.nameContains.toLowerCase();
+  }
+  const all = listJobs(config);
+  const filtered = nameContains
+    ? all.filter((job) => job.name.toLowerCase().includes(nameContains!))
+    : all;
+  // Compact summary: only the fields an agent needs to identify and
+  // describe a job. Prompts are truncated so a long-prompt job doesn't
+  // blow up the tool-result context. Schedule fields are reported as-is
+  // (cronExpression+cronTimezone for cron jobs, intervalSeconds for
+  // interval-driven jobs) so the agent can echo the user's vocabulary.
+  const summary = filtered.map((job) => ({
+    id: job.id,
+    name: job.name,
+    status: job.status,
+    cronExpression: job.cronExpression,
+    cronTimezone: job.cronTimezone,
+    intervalSeconds: job.intervalSeconds,
+    oneShot: job.oneShot === true,
+    nextRunAt: job.nextRunAt,
+    lastRunAt: job.lastRunAt,
+    chatSessionId: job.chatSessionId,
+    prompt: job.prompt.length > 200 ? `${job.prompt.slice(0, 200)}…` : job.prompt
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed jobs",
+    data: { total: all.length, returned: summary.length, nameContains }
+  });
+  await recordLowRiskAudit(config, taskId, "job.listed", "jobs", {
+    total: all.length,
+    returned: summary.length,
+    nameContains
+  });
+  return JSON.stringify({ count: summary.length, jobs: summary });
+}
+
+// Patch an existing job in place. Preferred over delete+create for
+// schedule/prompt/status changes — preserves job id, dedicated chat
+// thread, and run history. Validation lives in `updateJob` (typed
+// `Invalid input: …` errors surface back as tool-result errors).
+async function updateJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const jobId = requireString(args, "jobId");
+
+  // Collect status separately — `updateJob` handles every other field but
+  // status lives in `updateJobStatus` (different audit action vocabulary).
+  let statusPatch: "active" | "paused" | undefined;
+  if (args.status !== undefined && args.status !== null) {
+    if (args.status !== "active" && args.status !== "paused") {
+      throw new Error("Invalid input: status must be 'active' or 'paused'.");
+    }
+    statusPatch = args.status;
+  }
+
+  // Build the patch payload for `updateJob` — pass only the keys the
+  // caller explicitly supplied so we don't accidentally clear fields with
+  // undefined. `null` is meaningful (it's the "clear this field" signal
+  // for cronExpression / cronTimezone / intervalSeconds) so we preserve
+  // it.
+  const patch: Record<string, unknown> = {};
+  const passthrough = [
+    "name",
+    "prompt",
+    "intervalSeconds",
+    "cronExpression",
+    "cronTimezone",
+    "timeoutSeconds",
+    "autoApproveCommands",
+    "dangerouslyAutoApprove"
+  ] as const;
+  for (const key of passthrough) {
+    if (key in args) patch[key] = args[key];
+  }
+  // oneShot lives on the JobRecord but isn't part of `updateJob`'s patch
+  // contract — apply it directly inside the same mutateState so the audit
+  // row reflects every field the agent touched. We forward it via
+  // `mutateState` below after `updateJob` returns. Validate up-front so
+  // we fail before any persistence happens.
+  let oneShotPatch: boolean | undefined;
+  if (args.oneShot !== undefined && args.oneShot !== null) {
+    if (typeof args.oneShot !== "boolean") {
+      throw new Error("Invalid input: oneShot must be a boolean.");
+    }
+    oneShotPatch = args.oneShot;
+  }
+
+  const hasFieldPatch =
+    Object.keys(patch).length > 0 || oneShotPatch !== undefined;
+  if (!hasFieldPatch && statusPatch === undefined) {
+    throw new Error("Invalid input: update_job requires at least one field to change.");
+  }
+
+  // Capture the previous schedule shape for the audit evidence BEFORE we
+  // mutate, so a reviewer can see what the patch replaced.
+  const before = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!before) throw new Error(`Job not found: ${jobId}`);
+  const previousSchedule = {
+    cronExpression: before.cronExpression,
+    cronTimezone: before.cronTimezone,
+    intervalSeconds: before.intervalSeconds,
+    oneShot: before.oneShot === true,
+    status: before.status
+  };
+
+  if (hasFieldPatch && Object.keys(patch).length > 0) {
+    await updateJob(config, jobId, patch);
+  }
+  if (oneShotPatch !== undefined) {
+    await mutateState(config.instance, (state) => {
+      const job = state.jobs.find((candidate) => candidate.id === jobId);
+      if (!job) throw new Error(`Job not found: ${jobId}`);
+      job.oneShot = oneShotPatch;
+      job.updatedAt = now();
+    });
+  }
+  if (statusPatch !== undefined) {
+    await updateJobStatus(config, jobId, statusPatch);
+  }
+
+  const after = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!after) throw new Error(`Job not found after update: ${jobId}`);
+
+  // Compose evidence describing exactly which fields were touched. We
+  // record only the patch keys the caller supplied (plus `status` and
+  // `oneShot` if present) so the audit row mirrors the agent's intent.
+  const appliedFields = [
+    ...Object.keys(patch),
+    ...(oneShotPatch !== undefined ? ["oneShot"] : []),
+    ...(statusPatch !== undefined ? ["status"] : [])
+  ];
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(state, {
+      actor: "agent",
+      action: "job.updated",
+      target: jobId,
+      risk: "low",
+      taskId: item.id,
+      runId: item.runId,
+      evidence: {
+        jobId,
+        appliedFields,
+        patch: { ...patch, ...(oneShotPatch !== undefined ? { oneShot: oneShotPatch } : {}), ...(statusPatch !== undefined ? { status: statusPatch } : {}) },
+        previousSchedule
+      }
+    });
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: "Updated scheduled job",
+    data: { jobId, appliedFields }
+  });
+
+  const cadence = after.cronExpression
+    ? `cron \"${after.cronExpression}\" (${after.cronTimezone ?? "UTC"})`
+    : after.intervalSeconds
+      ? `every ${after.intervalSeconds}s`
+      : "no schedule";
+  return `Updated job ${after.id} (\"${after.name}\"): ${appliedFields.join(", ")}. Now ${after.status}, ${cadence}, next fires at ${after.nextRunAt}.`;
+}
+
+// Delete a job and cascade-remove its run history. Low-risk for symmetry
+// with create_job: the user can always re-create. Audit row preserves
+// the prior schedule shape so a reviewer can reconstruct what vanished.
+async function deleteJobTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const jobId = requireString(args, "jobId");
+  const before = listJobs(config).find((candidate) => candidate.id === jobId);
+  if (!before) throw new Error(`Job not found: ${jobId}`);
+  const previousSchedule = {
+    name: before.name,
+    cronExpression: before.cronExpression,
+    cronTimezone: before.cronTimezone,
+    intervalSeconds: before.intervalSeconds,
+    oneShot: before.oneShot === true,
+    status: before.status,
+    chatSessionId: before.chatSessionId
+  };
+  const removed = await removeJob(config, jobId);
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(state, {
+      actor: "agent",
+      action: "job.deleted",
+      target: jobId,
+      risk: "low",
+      taskId: item.id,
+      runId: item.runId,
+      evidence: {
+        jobId,
+        name: removed.name,
+        previousSchedule
+      }
+    });
+    item.updatedAt = now();
+  });
+  appendTrace(config.instance, taskId, {
+    type: "job",
+    message: "Deleted scheduled job",
+    data: { jobId, name: removed.name }
+  });
+  return `Deleted job ${removed.id} (\"${removed.name}\").`;
 }
 
 // Poll the subagent record until its child task reaches a terminal state,

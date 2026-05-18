@@ -477,6 +477,73 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["name", "prompt"]
       }
     }
+  },
+  {
+    // Read-only accessor for the scheduled job list. Cheap and low-risk;
+    // call this first whenever the user refers to "this job" or any
+    // existing scheduled job, so update_job / delete_job target the right
+    // id instead of accidentally creating a duplicate via create_job.
+    toolset: "jobs",
+    type: "function",
+    function: {
+      name: "list_jobs",
+      description: "List scheduled jobs visible to this instance. Cheap, side-effect-free; call this first when the user refers to 'this job', 'my reminder', or any existing scheduled job so you can target the right job id with update_job / delete_job (instead of creating a duplicate). Returns a compact JSON array with each job's id, name, status, schedule shape (cronExpression+cronTimezone OR intervalSeconds), oneShot flag, nextRunAt/lastRunAt timestamps, chatSessionId, and a truncated prompt.",
+      parameters: {
+        type: "object",
+        properties: {
+          nameContains: { type: "string", description: "Optional case-insensitive substring filter on job name." }
+        }
+      }
+    }
+  },
+  {
+    // Mutate an existing job in place. Preferred over delete+create when
+    // the user wants to change a job's schedule, prompt, or status —
+    // preserves the job id, chatSessionId, run history, and audit chain.
+    // Low-risk / no approval for the same reason as create_job: the user
+    // can always pause/delete from /jobs.
+    toolset: "jobs",
+    type: "function",
+    function: {
+      name: "update_job",
+      description: "Patch an existing scheduled job in place. Use this — NOT delete+create — when the user wants to change a job's schedule, prompt, name, status, or auto-approve envelope; this preserves the job id, its dedicated chat thread, and run history. Supply only the fields you want to change. Schedule transitions follow the same mutual-exclusion rule as create_job: a single patch may not set BOTH a positive intervalSeconds AND a cronExpression. To switch a job between cron-driven and interval-driven, pass the new driver and set the other to null (e.g. `{cronExpression: '0 9 * * *', cronTimezone: 'America/Los_Angeles', intervalSeconds: null}`). Call list_jobs first if you don't already know the jobId.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Id of the job to patch (e.g. 'job_a3aa6707'). Get this from list_jobs." },
+          name: { type: "string", description: "Optional new human-readable label." },
+          prompt: { type: "string", description: "Optional new instruction the agent will receive when the job fires." },
+          intervalSeconds: { type: "number", description: "Optional new interval. Pass a positive integer to make the job interval-driven; pass null to clear the interval when also setting cronExpression." },
+          cronExpression: { type: "string", description: "Optional new 5-field Unix cron expression. Pass a string to make the job cron-driven; pass null to clear it when switching to intervalSeconds." },
+          cronTimezone: { type: "string", description: "Optional new IANA timezone identifier (only valid with cronExpression). Pass null to clear (only legal when also clearing cronExpression)." },
+          oneShot: { type: "boolean", description: "Optional. If true the job is auto-paused after its first run." },
+          status: { type: "string", enum: ["active", "paused"], description: "Optional pause/resume. 'paused' stops the scheduler from firing the job; 'active' resumes it." },
+          autoApproveCommands: { type: "array", items: { type: "string" }, description: "Optional new list of auto-approve shell patterns for unattended fires." },
+          dangerouslyAutoApprove: { type: "boolean", description: "Optional. If true the scheduled task bypasses ALL approval gates at fire-time." },
+          timeoutSeconds: { type: "number", description: "Optional. Wall-clock seconds before the spawned task is killed." }
+        },
+        required: ["jobId"]
+      }
+    }
+  },
+  {
+    // Delete a scheduled job and its run history. Low-risk / no approval
+    // for symmetry with create_job: gating destroys the composition story
+    // (the agent should be able to do delete+create or update smoothly).
+    // The user can always restore via re-creation; audit trail is preserved.
+    toolset: "jobs",
+    type: "function",
+    function: {
+      name: "delete_job",
+      description: "Delete a scheduled job and its run history. Use sparingly — prefer update_job when changing a job's schedule, prompt, or status, since update preserves the job id, dedicated chat thread, and audit chain. Use delete_job when the user explicitly asks to remove a job, or when you must compose delete+create to reach a target state that update_job can't express. Call list_jobs first if you don't already know the jobId.",
+      parameters: {
+        type: "object",
+        properties: {
+          jobId: { type: "string", description: "Id of the job to delete (e.g. 'job_a3aa6707'). Get this from list_jobs." }
+        },
+        required: ["jobId"]
+      }
+    }
   }
 ];
 
@@ -498,7 +565,8 @@ export function allTools(): ToolCatalogTool[] {
 // names). When set, it intersects with the enabled-toolset filter — a tool
 // passes only if its owning toolset is BOTH globally enabled AND in the
 // agent's whitelist. Always-on tools (web_fetch, read_skill,
-// spawn_subagent, create_job) bypass both filters.
+// spawn_subagent, create_job, list_jobs, update_job, delete_job) bypass
+// both filters.
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
@@ -513,11 +581,18 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // on enable would silently disable delegation on freshly cloned
     // instances. Subagent path itself is depth-capped and audited.
     if (tool.function.name === "spawn_subagent") return true;
-    // Always expose create_job. The "jobs" toolset isn't part of the
-    // legacy defaults; gating on enable would silently hide scheduling
-    // (and chat-reminder delivery) on fresh instances. Low-risk by
-    // design — the user can pause/delete any job from /jobs.
+    // Always expose the full scheduled-job tool surface (create / list /
+    // update / delete). The "jobs" toolset isn't part of the legacy
+    // defaults; gating on enable would silently hide scheduling (and the
+    // chat-reminder delivery loop) on fresh instances. Exposing all four
+    // together also keeps composition coherent — without list_jobs the
+    // agent can't see existing jobs to pick the right id for update or
+    // delete, and that's how duplicates get created. Low-risk by design:
+    // the user can pause/delete any job from /jobs.
     if (tool.function.name === "create_job") return true;
+    if (tool.function.name === "list_jobs") return true;
+    if (tool.function.name === "update_job") return true;
+    if (tool.function.name === "delete_job") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
