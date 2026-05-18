@@ -741,8 +741,8 @@ describe("cron lifecycle", () => {
     expect(cronEntry?.cronExpression).toBe("0 9 * * *");
     expect(cronEntry?.cronTimezone).toBe("America/Los_Angeles");
 
-    // Audit row for the listing call so reviewers can see when the agent
-    // pulled the job inventory.
+    // The listing call writes an audit row so the log records when the
+    // agent pulled the job inventory.
     const audit = readState(config.instance).audit.find(
       (event) => event.action === "job.listed"
     );
@@ -869,8 +869,8 @@ describe("cron lifecycle", () => {
     expect(audit?.evidence?.jobId).toBe(job.id);
     expect(audit?.evidence?.appliedFields).toContain("cronExpression");
     expect(audit?.evidence?.appliedFields).toContain("name");
-    // Previous schedule preserved so a reviewer can see what the patch
-    // replaced.
+    // The audit row pins the prior schedule shape so the change is
+    // reconstructable from the log alone.
     expect((audit?.evidence?.previousSchedule as Record<string, unknown>)?.intervalSeconds).toBe(60);
   });
 
@@ -1079,8 +1079,8 @@ describe("cron lifecycle", () => {
     expect(audit).toBeDefined();
     expect(audit?.evidence?.jobId).toBe(job.id);
     expect(audit?.evidence?.name).toBe("to-delete");
-    // Previous schedule shape captured so a reviewer can reconstruct the
-    // job from the audit row alone.
+    // The audit row pins the prior schedule shape so the deleted job is
+    // reconstructable from the log alone.
     const prev = audit?.evidence?.previousSchedule as Record<string, unknown> | undefined;
     expect(prev?.cronExpression).toBe("0 9 * * *");
     expect(prev?.cronTimezone).toBe("UTC");

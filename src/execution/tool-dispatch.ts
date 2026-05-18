@@ -931,7 +931,8 @@ async function updateJobTool(
   }
 
   // Capture the previous schedule shape for the audit evidence BEFORE we
-  // mutate, so a reviewer can see what the patch replaced.
+  // mutate. The audit row pins the prior fields so the change is
+  // reconstructable from the log alone.
   const before = listJobs(config).find((candidate) => candidate.id === jobId);
   if (!before) throw new Error(`Job not found: ${jobId}`);
   const previousSchedule = {
@@ -1012,8 +1013,9 @@ async function updateJobTool(
 }
 
 // Delete a job and cascade-remove its run history. Low-risk for symmetry
-// with create_job: the user can always re-create. Audit row preserves
-// the prior schedule shape so a reviewer can reconstruct what vanished.
+// with create_job: the user can always re-create. The audit row pins
+// the prior schedule shape so the deleted job is reconstructable from
+// the log alone.
 async function deleteJobTool(
   config: RuntimeConfig,
   taskId: string,
