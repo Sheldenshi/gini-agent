@@ -962,6 +962,54 @@ describe("cron lifecycle", () => {
     ).rejects.toThrow(/Job not found/);
   });
 
+  test("update_job dispatch applies autoApproveCommands and dangerouslyAutoApprove onto the JobRecord", async () => {
+    const config = testConfig("jobs-update-tool-auto-approve");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "approve-me", script: "true", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_auto_approve",
+      JSON.stringify({
+        jobId: job.id,
+        autoApproveCommands: ["ls", "git status"],
+        dangerouslyAutoApprove: true
+      })
+    );
+    expect(result.kind).toBe("sync");
+    const after = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(after?.dangerouslyAutoApprove).toBe(true);
+    expect(after?.autoApproveCommands).toEqual(["ls", "git status"]);
+
+    // Clearing via empty array drops the override entirely.
+    const cleared = await dispatchToolCall(
+      config,
+      taskId,
+      "update_job",
+      "call_auto_approve_clear",
+      JSON.stringify({
+        jobId: job.id,
+        autoApproveCommands: [],
+        dangerouslyAutoApprove: false
+      })
+    );
+    expect(cleared.kind).toBe("sync");
+    const afterClear = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(afterClear?.dangerouslyAutoApprove).toBe(false);
+    expect(afterClear?.autoApproveCommands).toBeUndefined();
+  });
+
   test("update_job dispatch rejects invalid status value", async () => {
     const config = testConfig("jobs-update-tool-bad-status");
     const handler = createHandler(config);

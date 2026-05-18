@@ -669,6 +669,49 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     cronTimezonePatch = input.cronTimezone;
   }
 
+  // Per-job auto-approve envelope. Same validation shape as
+  // `createScheduledJob` above. `undefined` means "no change"; an empty
+  // array on `autoApproveCommands` means "clear the list"; explicit
+  // `null` on either field also means "clear" so callers can drop the
+  // override entirely. See ADR dangerously-auto-approve.md.
+  let dangerouslyAutoApprovePatch: boolean | undefined;
+  let clearDangerouslyAutoApprove = false;
+  if (input.dangerouslyAutoApprove === null) {
+    clearDangerouslyAutoApprove = true;
+  } else if (input.dangerouslyAutoApprove !== undefined) {
+    if (typeof input.dangerouslyAutoApprove !== "boolean") {
+      throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
+    }
+    dangerouslyAutoApprovePatch = input.dangerouslyAutoApprove;
+  }
+  let autoApproveCommandsPatch: string[] | undefined;
+  let clearAutoApproveCommands = false;
+  if (input.autoApproveCommands === null) {
+    clearAutoApproveCommands = true;
+  } else if (input.autoApproveCommands !== undefined) {
+    if (!Array.isArray(input.autoApproveCommands)) {
+      throw new Error(`Invalid input: autoApproveCommands must be an array of strings (got ${typeof input.autoApproveCommands})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.autoApproveCommands) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: autoApproveCommands entries must be strings (got ${typeof entry})`);
+      }
+      if (entry.length === 0) {
+        throw new Error(`Invalid input: autoApproveCommands entries must be non-empty strings`);
+      }
+      cleaned.push(entry);
+    }
+    if (cleaned.length === 0) {
+      // Empty array is a "clear" signal (same as null) — leaving an empty
+      // array on the JobRecord would be functionally equivalent but
+      // misleading next time the job is read.
+      clearAutoApproveCommands = true;
+    } else {
+      autoApproveCommandsPatch = cleaned;
+    }
+  }
+
   return mutateState(config.instance, (state) => {
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
@@ -802,6 +845,20 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     job.cronExpression = newCronExpression;
     job.cronTimezone = newCronTimezone;
     job.intervalSeconds = newIntervalSeconds;
+
+    // Apply auto-approve patch fields. `clear*` is "drop the override
+    // entirely" so the job falls back to the runtime/agent default.
+    if (clearDangerouslyAutoApprove) {
+      job.dangerouslyAutoApprove = undefined;
+    } else if (dangerouslyAutoApprovePatch !== undefined) {
+      job.dangerouslyAutoApprove = dangerouslyAutoApprovePatch;
+    }
+    if (clearAutoApproveCommands) {
+      job.autoApproveCommands = undefined;
+    } else if (autoApproveCommandsPatch !== undefined) {
+      job.autoApproveCommands = autoApproveCommandsPatch;
+    }
+
     job.updatedAt = now();
     addAudit(state, { actor: "user", action: "job.updated", target: job.id, risk: "low" });
     return job;
