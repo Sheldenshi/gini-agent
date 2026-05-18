@@ -122,10 +122,14 @@ function UpdateReminder() {
       if (result.upToDate) {
         toast.success("Gini is already current");
         qc.invalidateQueries({ queryKey: ["status"] });
+        qc.invalidateQueries({ queryKey: ["version", "check"] });
         return;
       }
       toast.success("Gini updated. Restarting...");
-      setTimeout(() => qc.invalidateQueries({ queryKey: ["status"] }), 4000);
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["status"] });
+        qc.invalidateQueries({ queryKey: ["version", "check"] });
+      }, 4000);
     },
     onError: (error: Error) => toast.error(error.message)
   });
