@@ -901,6 +901,13 @@ describe("cron lifecycle", () => {
       (event) => event.action === "job.updated" && event.target === job.id && event.actor === "agent"
     );
     expect(audit?.evidence?.appliedFields).toContain("status");
+    // The return string must not claim a next-fire moment for a paused
+    // job — the scheduler skips it while paused, so "next fires at ..."
+    // would be a lie.
+    if (result.kind === "sync") {
+      expect(result.result).not.toContain("next fires at");
+      expect(result.result).toContain("will not fire until resumed");
+    }
   });
 
   test("update_job dispatch rejects missing jobId", async () => {

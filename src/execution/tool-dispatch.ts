@@ -997,7 +997,18 @@ async function updateJobTool(
     : after.intervalSeconds
       ? `every ${after.intervalSeconds}s`
       : "no schedule";
-  return `Updated job ${after.id} (\"${after.name}\"): ${appliedFields.join(", ")}. Now ${after.status}, ${cadence}, next fires at ${after.nextRunAt}.`;
+  // Only an active job has a meaningful next-fire moment. A paused job's
+  // `nextRunAt` may still be populated (the scheduler simply skips it
+  // while paused), but stating "next fires at ..." would lie to the
+  // caller. Likewise, guard against an unexpectedly absent nextRunAt on
+  // active jobs so the message doesn't read "next fires at undefined".
+  const firingClause =
+    after.status === "paused"
+      ? "will not fire until resumed"
+      : after.nextRunAt
+        ? `next fires at ${after.nextRunAt}`
+        : "next-fire moment pending";
+  return `Updated job ${after.id} (\"${after.name}\"): ${appliedFields.join(", ")}. Now ${after.status}, ${cadence}, ${firingClause}.`;
 }
 
 // Delete a job and cascade-remove its run history. Low-risk for symmetry
