@@ -517,6 +517,73 @@ describe("telegram poller supervisor", () => {
     await supervisor.stopAll();
   });
 
+  test("unpaired DM during a pairing window gets a hint reply instead of silence", async () => {
+    const config = testConfig("poller-pair-hint");
+    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
+    const queue: Pending[] = [];
+    const sendCalls: Array<{ chatId: string | number; text: string }> = [];
+    const client: TelegramClient = {
+      async getMe() { return { id: 1, is_bot: true, username: "gini_agent_bot" }; },
+      async sendMessage(chatId, text) {
+        sendCalls.push({ chatId, text });
+        return { message_id: 60, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      },
+      async sendPhoto(chatId) {
+        return { message_id: 61, date: 0, chat: { id: Number(chatId), type: "private" } };
+      },
+      async sendChatAction() { return true as const; },
+      async getFile(fileId) { return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` }; },
+      async downloadFile() { return new Uint8Array().buffer; },
+      getUpdates(_offset, _timeout, signal) {
+        return new Promise((resolve, reject) => {
+          queue.push({ resolve });
+          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }
+    };
+    setMessagingDeps({ telegramClientFactory: () => client });
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    // Bridge auto-minted a pairing code; we don't claim it. The DM
+    // that arrives is plain "hi" — denied, but should receive a hint
+    // because the pairing window is open.
+
+    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
+    supervisor.reconcile();
+
+    queue.shift()?.resolve([
+      {
+        update_id: 90,
+        message: {
+          message_id: 1,
+          date: 0,
+          chat: { id: 12345, type: "private" },
+          text: "hi",
+          from: { id: 9, is_bot: false, first_name: "Shelden", username: "shelden" }
+        }
+      }
+    ]);
+
+    await waitFor(() => sendCalls.length > 0, "hint reply dispatched", 3000);
+    expect(sendCalls[0]?.chatId).toBe("12345");
+    expect(sendCalls[0]?.text.toLowerCase()).toContain("pairing code");
+
+    // The chat was still denied (not enrolled, no task created), and
+    // the attempt is recorded on recentDeniedChats.
+    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect((live?.metadata?.allowedChatIds ?? []) as number[]).toEqual([]);
+    expect(readState(config.instance).messagingMessages.some(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
+    )).toBe(false);
+
+    await supervisor.stopAll();
+  });
+
   test("disabled bridges have their loop stopped on next reconcile", async () => {
     const config = testConfig("poller-disable");
     setMessagingDeps({ telegramClientFactory: () => deferredClient().client });

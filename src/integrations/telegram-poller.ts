@@ -15,6 +15,7 @@ import { instanceRoot } from "../paths";
 import {
   authorizeTelegramChat,
   findTelegramChatSession,
+  hasActivePairingCode,
   readBridgeBotToken,
   receiveMessagingInput,
   recordDeniedChatAttempt,
@@ -214,6 +215,25 @@ async function runLoop(
             chatType: incoming.chatType,
             sender: incoming.senderHandle
           });
+          // Hint reply during an active pairing window: a denied
+          // private DM is most likely the operator typing "hi" before
+          // they noticed the pairing code, so a one-line nudge saves
+          // them from staring at silence. Outside the window — or for
+          // groups — we stay dark so strangers don't get confirmation
+          // the bot exists.
+          if (incoming.chatType === "private" && hasActivePairingCode(config, bridgeId)) {
+            try {
+              await sendMessagingOutput(config, bridgeId, {
+                text: "Please send your pairing code to enroll this chat.",
+                target: String(incoming.chatId)
+              });
+            } catch (error) {
+              appendLog(config.instance, "messaging.telegram.pair_hint_error", {
+                bridgeId,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            }
+          }
           await advanceOffset(config, bridgeId, update.update_id);
           continue;
         }

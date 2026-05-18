@@ -574,6 +574,23 @@ describe("messaging telegram wiring", () => {
     expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
   });
 
+  test("explicit allowChat closes the pairing window (CLI trust supersedes the code)", async () => {
+    const config = testConfig("telegram-pair-allow-clears");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { allowChat, hasActivePairingCode } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    expect(hasActivePairingCode(config, bridge.id)).toBe(true);
+
+    await allowChat(config, bridge.id, 4242);
+    expect(hasActivePairingCode(config, bridge.id)).toBe(false);
+  });
+
   test("pairMessagingBridge regenerates the code with a fresh expiry", async () => {
     const config = testConfig("telegram-pair-regen");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
