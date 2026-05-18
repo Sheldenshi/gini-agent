@@ -23,13 +23,8 @@ import {
   useWipeBrowserProfile
 } from "@/lib/queries";
 
-// The browser settings surface manages the persistent profile the agent
-// always drives. Sign-ins live in a dedicated profile dir
-// (~/.gini/instances/<inst>/chrome-profile/) that the agent uses headless by
-// default. Connect just opens a window into the same profile so the user can
-// sign in; Disconnect closes the window, but the agent still has access to
-// the same cookies on its next call. Wipe Profile is the only way to actually
-// remove saved sign-ins.
+// Connect opens a visible browser so the user can sign in to sites the agent
+// needs. Disconnect closes the window; saved sign-ins stay available for later.
 export function BrowserSettingsCard() {
   const connect = useConnectBrowser();
   const disconnect = useDisconnectBrowser();
@@ -90,11 +85,11 @@ export function BrowserSettingsCard() {
         <CardHeader>
           <div className="flex items-start justify-between gap-2">
             <div>
-              <CardTitle className="text-sm">Browser connection</CardTitle>
+              <CardTitle className="text-sm">Browser sign-ins</CardTitle>
               <CardDescription>
                 {connected
-                  ? "A Chrome window is attached. Browser tools will see what you see."
-                  : "Headless profile is available. Connect opens a window for sign-in."}
+                  ? "Chrome is open for sign-in."
+                  : "Connect to sign in to sites the agent needs."}
               </CardDescription>
             </div>
             <StatusPill value={connected ? "active" : "disabled"} />
@@ -121,13 +116,9 @@ export function BrowserSettingsCard() {
             </dl>
           ) : (
             <p className="text-xs text-muted-foreground">
-              The agent always drives a persistent profile at{" "}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-                ~/.gini/instances/&lt;instance&gt;/chrome-profile
-              </code>
-              . Connect opens a visible window over that profile so you can sign in;
-              disconnect closes the window but the agent keeps access to the cookies on
-              its next call.
+              Click Connect to open Chrome and sign in to anything the agent needs to use.
+              When you are done, disconnect closes the window. Saved sign-ins stay available
+              for future agent browser tasks.
             </p>
           )}
 
@@ -210,14 +201,14 @@ export function BrowserSettingsCard() {
                 disabled={connected || wipe.isPending}
                 title={
                   connected
-                    ? "Disconnect the visible window before wiping the profile."
+                    ? "Disconnect Chrome before clearing saved sign-ins."
                     : "Permanently delete all saved sign-ins and cookies."
                 }
               >
                 {wipe.isPending ? "Wiping..." : "Wipe Profile"}
               </Button>
               <p className="text-[11px] text-muted-foreground">
-                Removes all cookies and saved logins from the persistent profile.
+                Clears saved sign-ins for this agent.
               </p>
             </div>
             {wipe.error ? (
@@ -229,57 +220,19 @@ export function BrowserSettingsCard() {
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Browser profile</CardTitle>
-          <CardDescription>Persistent profile, visibility toggle</CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-2 text-xs text-muted-foreground">
-          <p>
-            The agent always drives the same per-instance profile at{" "}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-              ~/.gini/instances/&lt;instance&gt;/chrome-profile
-            </code>
-            . By default Chromium runs headless against that profile. Connect relaunches
-            the same profile in a visible window so you can sign in.
-          </p>
-          <p>
-            Disconnect closes the visible window. The agent keeps using the same profile
-            headless, so sign-ins remain accessible on its next tool call and survive
-            runtime restarts. They only go away if you explicitly hit{" "}
-            <strong>Wipe Profile</strong>.
-          </p>
-          <p>
-            Advanced attaches to a Chrome you started yourself by pasting its CDP URL.
-            Managed mode is the recommended option.
-          </p>
-        </CardContent>
-      </Card>
-
       <Dialog open={disconnectOpen} onOpenChange={setDisconnectOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>Disconnect browser?</DialogTitle>
             <DialogDescription>
               {record?.mode === "managed"
-                ? "Closing the Chrome window. Your saved sign-ins remain accessible to the agent."
+                ? "This closes Chrome. Your saved sign-ins stay available to the agent."
                 : "The runtime will drop its CDP attachment but never touch the Chrome process you started."}
             </DialogDescription>
           </DialogHeader>
           <p className="text-xs text-muted-foreground">
             {record?.mode === "managed" ? (
-              <>
-                The per-instance profile at{" "}
-                {record?.dataDir ? (
-                  <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-                    {record.dataDir}
-                  </code>
-                ) : (
-                  <span>your instance profile directory</span>
-                )}{" "}
-                stays on disk and the agent keeps using it headless. Use{" "}
-                <strong>Wipe Profile</strong> if you want to remove your saved sign-ins.
-              </>
+              "Use Wipe Profile if you want to remove the saved sign-ins too."
             ) : (
               "Your Chrome process is left alone."
             )}
@@ -304,17 +257,12 @@ export function BrowserSettingsCard() {
           <DialogHeader>
             <DialogTitle>Wipe browser profile?</DialogTitle>
             <DialogDescription>
-              This permanently deletes all cookies, saved logins, and browsing data in the
-              per-instance profile.
+              This permanently deletes saved sign-ins for this agent.
             </DialogDescription>
           </DialogHeader>
           <p className="text-xs text-muted-foreground">
-            Removes{" "}
-            <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
-              ~/.gini/instances/&lt;instance&gt;/chrome-profile
-            </code>
-            . The agent will see an unauthenticated browser on its next request and you
-            will need to sign back into anything you care about.
+            The next time the agent needs a signed-in site, you will need to connect and sign
+            in again.
           </p>
           <DialogFooter>
             <DialogClose asChild>
