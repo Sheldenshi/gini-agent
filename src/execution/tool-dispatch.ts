@@ -882,6 +882,20 @@ async function updateJobTool(
 ): Promise<string> {
   const jobId = requireString(args, "jobId");
 
+  // Pre-side-effect terminal check. Mirrors the guard pattern in
+  // `create_job`: refuse when the parent task is already terminal so a
+  // late cancel doesn't leak a mutation past the cancellation. The
+  // serialized re-check inside `updateJob` / `updateJobStatus` (via
+  // `parentTaskId`) is the authoritative guard; this early-exit avoids
+  // touching the lock for the common case.
+  {
+    const state = readState(config.instance);
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task && isTerminalTaskStatus(task.status)) {
+      return `Error: update_job skipped because task is already ${task.status}.`;
+    }
+  }
+
   // Collect status separately — `updateJob` handles every other field but
   // status lives in `updateJobStatus` (different audit action vocabulary).
   let statusPatch: "active" | "paused" | undefined;
@@ -943,11 +957,22 @@ async function updateJobTool(
     status: before.status
   };
 
+  // Forward `taskId` as `parentTaskId` so each mutator's own
+  // `mutateState` callback can re-check terminal status atomically. The
+  // earlier lock-free `readState` pre-check is kept as a fast path /
+  // error-message-quality improvement; this is the authoritative
+  // serialization point.
   if (hasFieldPatch && Object.keys(patch).length > 0) {
-    await updateJob(config, jobId, patch);
+    await updateJob(config, jobId, patch, taskId);
   }
   if (oneShotPatch !== undefined) {
+    // The inline oneShot mutation has no shared mutator function, so we
+    // do the same atomic parent-task re-check inline.
     await mutateState(config.instance, (state) => {
+      const parent = state.tasks.find((t) => t.id === taskId);
+      if (parent && isTerminalTaskStatus(parent.status)) {
+        throw new Error(`Cannot update job: parent task ${taskId} is already ${parent.status}.`);
+      }
       const job = state.jobs.find((candidate) => candidate.id === jobId);
       if (!job) throw new Error(`Job not found: ${jobId}`);
       job.oneShot = oneShotPatch;
@@ -955,7 +980,7 @@ async function updateJobTool(
     });
   }
   if (statusPatch !== undefined) {
-    await updateJobStatus(config, jobId, statusPatch);
+    await updateJobStatus(config, jobId, statusPatch, taskId);
   }
 
   const after = listJobs(config).find((candidate) => candidate.id === jobId);
@@ -1022,6 +1047,21 @@ async function deleteJobTool(
   args: Record<string, unknown>
 ): Promise<string> {
   const jobId = requireString(args, "jobId");
+
+  // Pre-side-effect terminal check. Mirrors the guard pattern in
+  // `create_job`: refuse when the parent task is already terminal so a
+  // late cancel doesn't leak a mutation past the cancellation. The
+  // serialized re-check inside `removeJob` (via `parentTaskId`) is the
+  // authoritative guard; this early-exit avoids touching the lock for
+  // the common case.
+  {
+    const state = readState(config.instance);
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (task && isTerminalTaskStatus(task.status)) {
+      return `Error: delete_job skipped because task is already ${task.status}.`;
+    }
+  }
+
   const before = listJobs(config).find((candidate) => candidate.id === jobId);
   if (!before) throw new Error(`Job not found: ${jobId}`);
   const previousSchedule = {
@@ -1033,7 +1073,7 @@ async function deleteJobTool(
     status: before.status,
     chatSessionId: before.chatSessionId
   };
-  const removed = await removeJob(config, jobId);
+  const removed = await removeJob(config, jobId, taskId);
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(state, {
