@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { Boxes, Check, ChevronsUpDown } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -14,8 +15,10 @@ import {
   DropdownMenuTrigger
 } from "@/components/ui/dropdown-menu";
 import type { AgentRow } from "@/app/settings/_components/AgentCard";
+import { CreateAgentDialog } from "@/components/CreateAgentDialog";
 
 export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "mobile" }) {
+  const [createOpen, setCreateOpen] = useState(false);
   const invalidate = useInvalidate();
   const status = useStatus();
   const agentsQuery = useQuery({
@@ -41,6 +44,7 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
   const isMobile = variant === "mobile";
 
   return (
+    <>
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <button
@@ -102,10 +106,17 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
           })
         )}
         <DropdownMenuSeparator />
-        <DropdownMenuItem disabled>
+        <DropdownMenuItem
+          onSelect={(event) => {
+            event.preventDefault();
+            setCreateOpen(true);
+          }}
+        >
           <span>+ New agent</span>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+    <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
+    </>
   );
 }
