@@ -223,11 +223,15 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     //
     // If the parent task came from a messaging-sourced chat session
     // (Discord, Telegram), copy the source descriptor onto the new
-    // dedicated session so finalizeJobRunFromTask can still mirror the
-    // scheduled-fire reply back to the originating chat. Without this
-    // copy, a "remind me in 20s" prompt from Discord would create a
-    // fresh sourceless session, the reminder would land in that hidden
-    // session, and Discord would never see the reply.
+    // dedicated session AS `outboundMirror` (not `source`) so
+    // finalizeJobRunFromTask can still dispatch the scheduled-fire
+    // reply back to the originating chat. Storing the descriptor as
+    // `source` would make findOrCreate{Discord,Telegram}ChatSession
+    // match the dedicated session for inbound on the same channel —
+    // the very next user message could land in the job thread
+    // instead of the live channel thread. `outboundMirror` is
+    // outbound-only by contract and the findOrCreate helpers
+    // explicitly ignore it.
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
       const session = createChatSession(state, createDedicatedSessionTitle);
@@ -238,7 +242,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
         if (parentSession?.source) {
           // Clone so a later mutation on the parent session's source
           // doesn't aliased-mutate the dedicated session's copy.
-          session.source = { ...parentSession.source };
+          session.outboundMirror = { ...parentSession.source };
         }
       }
       resolvedChatSessionId = session.id;

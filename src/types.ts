@@ -356,15 +356,33 @@ export interface ChatSessionRecord {
   // can mirror assistant replies back out to the chat / channel the
   // user started in. `target` is the bridge-specific addressing
   // string passed back to sendMessagingOutput.
+  //
+  // `source` doubles as the routing key for inbound: the poller's
+  // findOrCreate*ChatSession helpers match on (kind, bridgeId,
+  // chatId|channelId), so setting `source` on a session that should
+  // NOT receive inbound (e.g., a dedicated job-spawned session that
+  // only mirrors OUTBOUND back to the originating chat) would cause
+  // the live channel's next inbound to land in the job thread. Use
+  // `outboundMirror` for the outbound-only case.
   source?: ChatSessionSource;
+  // Outbound-only mirror descriptor. Populated on dedicated job
+  // sessions so a scheduled "remind me in 20s" task can dispatch its
+  // reply back through the originating bridge without competing with
+  // the live channel session for inbound routing. finalize.ts reads
+  // `outboundMirror ?? source` so live sessions (where the two are
+  // the same) continue to work unchanged.
+  outboundMirror?: ChatSessionSource;
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the
-// chat session received from the bridge — Telegram's numeric update id
-// or Discord's snowflake string. It's what scheduled-job replies use to
-// thread their delayed dispatch onto the original user message. The
-// field is updated by the poller every time a new inbound lands so a
-// long-running session always threads onto the most recent prompt.
+// chat session received from the bridge — Telegram's numeric
+// `message_id` (the per-chat id used by `reply_to_message_id`, NOT
+// the update id) or Discord's message snowflake string (used by
+// `message_reference.message_id`). It's what scheduled-job replies
+// use to thread their delayed dispatch onto the original user
+// message. The field is updated by the poller every time a new
+// inbound lands so a long-running session always threads onto the
+// most recent prompt.
 export type ChatSessionSource =
   | { kind: "telegram"; bridgeId: string; chatId: number; target: string; lastInboundMessageId?: number }
   | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string };

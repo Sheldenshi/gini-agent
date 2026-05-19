@@ -91,12 +91,23 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
     });
   });
 
-  // Materialize the assistant chat message for jobs created via the agent
-  // tool with a chat session. syncChatTaskResult is idempotent (no-ops if
-  // the message already exists) and only writes for terminal task states,
-  // both of which match our gating. Wrap in try/catch so a vanished
-  // session can't break the finalize hook for everyone else.
+  // Materialize the assistant chat message for jobs created via the
+  // agent tool with a chat session. syncChatTaskResult is idempotent
+  // (no-ops if the message already exists) and only writes for terminal
+  // task states. Validate the session still exists BEFORE the sync so
+  // a deletion mid-flight doesn't land an orphan ChatMessageRecord
+  // (createChatMessage silently skips session linkage when the session
+  // is missing — that path is exactly what we don't want here).
   if (chatSessionIdToSync) {
+    const sessionExists = readState(config.instance).chatSessions.some((s) => s.id === chatSessionIdToSync);
+    if (!sessionExists) {
+      appendLog(config.instance, "job.chat.session.vanished", {
+        jobId: task.jobId,
+        taskId: task.id,
+        sessionId: chatSessionIdToSync
+      });
+      return;
+    }
     try {
       await syncChatTaskResult(config, chatSessionIdToSync, task.id);
     } catch (error) {
@@ -107,18 +118,15 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
         error: error instanceof Error ? error.message : String(error)
       });
     }
-    // When the chat session was opened by a messaging bridge (Discord
-    // or Telegram), mirror the freshly-synced assistant reply out to
-    // the originating chat. Without this, a "remind me in 20s" job
-    // would settle quietly in the chat session record but never reach
-    // Discord/Telegram — the agent's promise to follow up would
-    // silently break. We thread onto `lastInboundMessageId` so the
-    // delayed reply lands as a reply to the user's original prompt
-    // (Discord message_reference / Telegram reply_to_message_id);
-    // bridges without a thread anchor still send unthreaded.
-    if (task.status === "completed") {
-      await dispatchJobReplyToBridge(config, chatSessionIdToSync, task);
-    }
+    // Mirror back to the originating bridge on every terminal status —
+    // a failed scheduled "remind me in 20s" should still surface SOME
+    // signal to the chat the user started in (the agent's error
+    // summary is the best we have), otherwise the user just hears
+    // silence and assumes the bot dropped the ball. The dispatch
+    // helper itself filters out empty / `[SILENT]` content, so the
+    // case where the synced assistant message is genuinely empty
+    // (failed task with no error summary) still mirrors nothing.
+    await dispatchJobReplyToBridge(config, chatSessionIdToSync, task);
   }
 }
 
@@ -129,8 +137,13 @@ async function dispatchJobReplyToBridge(
 ): Promise<void> {
   const state = readState(config.instance);
   const session = state.chatSessions.find((candidate) => candidate.id === chatSessionId);
-  if (!session || !session.source) return;
-  const source = session.source;
+  if (!session) return;
+  // Prefer outboundMirror (set on dedicated job sessions to keep
+  // inbound routing keyed off the live channel session) and fall back
+  // to source (set on live channel sessions where the two are the
+  // same).
+  const dispatchTo = session.outboundMirror ?? session.source;
+  if (!dispatchTo) return;
   // The synced assistant message is the most recent one on the
   // session keyed to this task; pick it up from chatMessages so we
   // never accidentally re-dispatch an older turn.
@@ -143,10 +156,10 @@ async function dispatchJobReplyToBridge(
   if (!replyText || replyText.length === 0) return;
   if (replyText.startsWith("[SILENT]")) return;
   try {
-    const replyToMessageId = source.lastInboundMessageId;
-    await sendMessagingOutput(config, source.bridgeId, {
+    const replyToMessageId = dispatchTo.lastInboundMessageId;
+    await sendMessagingOutput(config, dispatchTo.bridgeId, {
       text: replyText,
-      target: source.target,
+      target: dispatchTo.target,
       ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
     });
   } catch (error) {
@@ -154,8 +167,8 @@ async function dispatchJobReplyToBridge(
       jobId: task.jobId,
       taskId: task.id,
       sessionId: chatSessionId,
-      bridgeId: source.bridgeId,
-      kind: source.kind,
+      bridgeId: dispatchTo.bridgeId,
+      kind: dispatchTo.kind,
       error: error instanceof Error ? error.message : String(error)
     });
   }

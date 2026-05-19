@@ -482,6 +482,67 @@ describe("cron lifecycle", () => {
     expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
+  test("dedicated session stores parent's messaging source on outboundMirror so future inbound stays routed to the live session", async () => {
+    // Regression: when a messaging-sourced parent task creates a
+    // dedicated job session, the descriptor must NOT land on the new
+    // session's `source` field. If it did, both sessions would match
+    // findOrCreate{Discord,Telegram}ChatSession's (bridgeId,
+    // channelId|chatId) routing key and the next inbound on that
+    // channel could attach to the job thread instead of the live one.
+    const config = testConfig("jobs-outbound-mirror-no-routing-conflict");
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    const { findOrCreateDiscordChatSession } = await import("./state");
+    const { createScheduledJob } = await import("./jobs");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    // Live session that the poller would have created on first
+    // inbound. Its `source` is the routing key for chan-1.
+    const liveSession = await mutateState(config.instance, (state) =>
+      findOrCreateDiscordChatSession(state, bridge.id, "chan-1")
+    );
+    expect(liveSession.source?.kind).toBe("discord");
+
+    // Parent task associated with the live session, completed.
+    const parentTaskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "parent", undefined, undefined, undefined, undefined);
+      task.status = "completed";
+      upsertTask(state, task);
+      const session = state.chatSessions.find((s) => s.id === liveSession.id);
+      if (session && !session.taskIds.includes(task.id)) session.taskIds.push(task.id);
+      return task.id;
+    });
+
+    await createScheduledJob(config, {
+      name: "reminder",
+      intervalSeconds: 60,
+      prompt: "remind",
+      createDedicatedSession: { title: "Scheduled: reminder" },
+      parentTaskId
+    });
+
+    const sessions = readState(config.instance).chatSessions;
+    const dedicated = sessions.find((s) => s.id !== liveSession.id);
+    expect(dedicated).toBeDefined();
+    // The architectural invariant: dedicated session has
+    // outboundMirror but NO source.
+    expect(dedicated?.source).toBeUndefined();
+    expect(dedicated?.outboundMirror?.kind).toBe("discord");
+    expect((dedicated?.outboundMirror as { channelId?: string } | undefined)?.channelId).toBe("chan-1");
+
+    // Routing key check: a subsequent inbound on chan-1 must return
+    // the live session, not the dedicated job session.
+    const resolved = await mutateState(config.instance, (state) =>
+      findOrCreateDiscordChatSession(state, bridge.id, "chan-1")
+    );
+    expect(resolved.id).toBe(liveSession.id);
+  });
+
   test("create_job dispatch persists the per-job auto-approve envelope", async () => {
     // The agent passes `autoApproveCommands`, `dangerouslyAutoApprove`, and
     // `timeoutSeconds` through the tool spec to schedule an unattended job.

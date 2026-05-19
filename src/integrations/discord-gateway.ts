@@ -1,15 +1,19 @@
-// Minimal Discord Gateway client — presence only.
+// Minimal Discord Gateway client — presence + push-driven poll wake.
 //
 // The bridge's source of truth for inbound messages is the REST poll
 // loop in `discord-poller.ts`; this file holds a parallel WebSocket
-// connection whose only purpose is making the bot show up as "Online"
-// in Discord's UI. Discord ties the presence indicator to an active
-// Gateway connection, not to REST activity, so without this the bot
-// would stay grey-dotted even while polling and replying every few
-// seconds. The connection requests `intents: 0` — no message events,
-// no presence updates, no member updates — so the Gateway never
-// delivers anything we'd have to act on, and Discord never asks for
-// a privileged-intent gate in the developer portal.
+// connection that serves two roles. First, presence: Discord ties
+// the bot's "Online" badge to an active Gateway connection, not to
+// REST activity, so without this the bot would stay grey-dotted even
+// while polling and replying every few seconds. Second, push wake:
+// the connection requests `intents: GUILD_MESSAGES | DIRECT_MESSAGES`
+// (4608) so Discord pushes a `MESSAGE_CREATE` event the instant a
+// message lands, and the gateway invokes the optional
+// `onMessageCreate` callback which the poller wires to its wake
+// controller — the next REST-poll sleep collapses to ~0ms. The
+// `MESSAGE_CONTENT` privileged intent is deliberately NOT requested
+// (we don't need content here; REST polling reads it), so Discord
+// never asks for a privileged-intent gate in the developer portal.
 //
 // Lifecycle: the Discord poller calls `connectDiscordGateway` once a
 // loop has authenticated its token, and closes the returned handle
@@ -24,6 +28,7 @@
 // shape without opening a real socket to gateway.discord.gg.
 
 import { appendLog } from "../state";
+import { sanitizeBridgeStatusMessage } from "./messaging-poller-helpers";
 import type { Instance } from "../types";
 
 // Discord requires v=10 today; v=9 is deprecated. encoding=json keeps
@@ -143,9 +148,37 @@ export function connectDiscordGateway(options: DiscordGatewayOptions): DiscordGa
   let closed = false;
   let attempt = 0;
 
+  // Scrub the bot token (and any other Discord/Telegram credential
+  // shapes) out of every gateway log payload. The token never travels
+  // in a URL or Authorization header here (it goes in the IDENTIFY
+  // JSON), but a peer-supplied close `reason` or a fetch error
+  // message could in principle echo it; the linear-scan sanitizer
+  // costs nothing on healthy logs and is the only line of defense
+  // for fields we don't own.
+  function scrubLogData(data: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+    if (!data) return data;
+    const out: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(data)) {
+      if (typeof value === "string") {
+        const sanitized = sanitizeBridgeStatusMessage(value);
+        // The shared sanitizer scrubs `Bot <token>`-shaped strings and
+        // `/bot<token>/` URL paths; the gateway also holds the raw
+        // token in this closure, so explicitly redact a direct echo
+        // even though that should never happen organically.
+        out[key] = sanitized.split(token).join("<redacted>");
+      } else {
+        out[key] = value;
+      }
+    }
+    return out;
+  }
+
   function logRow(message: string, data?: Record<string, unknown>): void {
     if (!instance) return;
-    appendLog(instance, message, { ...(bridgeId ? { bridgeId } : {}), ...(data ?? {}) });
+    appendLog(instance, message, {
+      ...(bridgeId ? { bridgeId } : {}),
+      ...(scrubLogData(data) ?? {})
+    });
   }
 
   function stopHeartbeat(): void {
