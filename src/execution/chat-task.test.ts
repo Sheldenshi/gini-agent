@@ -12,12 +12,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   clearEchoToolCallingResponses,
+  getEchoToolCallingCalls,
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
 import { submitTask, decideApproval } from "../agent";
-import { mutateState, readState } from "../state";
-import type { RuntimeConfig, Task } from "../types";
+import {
+  createChatSession,
+  createRun,
+  createSubagentRecord,
+  mutateState,
+  now,
+  readState
+} from "../state";
+import type { JobRecord, RuntimeConfig, Task } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -838,6 +846,182 @@ describe("chat-task loop", () => {
       (t) => t.type === "warning" && /agent\.maxIterations/i.test(String(t.data?.reason ?? ""))
     );
     expect(warning).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Bound-jobs system block: when the chat session backing the current task
+  // has one or more JobRecords whose `chatSessionId` matches, the chat-task
+  // loop must surface them in the system prompt. The model uses that block
+  // to short-circuit list_jobs and call update_job / delete_job directly.
+  test("appends a Bound scheduled jobs block when a job is bound to the session", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-bound-job");
+    const provider = normalizeProvider(config.provider);
+
+    // Stand up a chat session, a job pointing at it, and a run that lives in
+    // the same conversation. The submitted task carries that runId so the
+    // chat-task loop resolves the session id via run.conversationId and
+    // finds the bound job during system-prompt assembly.
+    const { runId, jobId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Daily standup");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Standup turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      const at = now();
+      const job: JobRecord = {
+        id: "job-standup",
+        instance: state.instance,
+        name: "Daily standup",
+        prompt: "Ask the team what they did yesterday and what they will do today.",
+        intervalSeconds: undefined,
+        status: "active",
+        deliveryTargets: [],
+        context: [],
+        retryLimit: 0,
+        timeoutSeconds: 600,
+        chatSessionId: session.id,
+        cronExpression: "0 9 * * *",
+        cronTimezone: "America/Los_Angeles",
+        createdAt: at,
+        updatedAt: at,
+        nextRunAt: at,
+        runCount: 0,
+        missedRuns: 0,
+        taskIds: [],
+        runIds: []
+      };
+      state.jobs.push(job);
+      return { runId: run.id, jobId: job.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Ready.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "remind me what this job does", { mode: "chat", runId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBeGreaterThan(0);
+    const system = calls[0]!.find((m) => m.role === "system");
+    expect(system).toBeDefined();
+    const content = String(system?.content ?? "");
+    expect(content).toContain("Scheduled jobs delivering into this chat:");
+    expect(content).toContain(jobId);
+    expect(content).toContain("Daily standup");
+    expect(content).toContain("cron `0 9 * * *`");
+    expect(content).toContain("America/Los_Angeles");
+    expect(content).toContain("Ask the team what they did yesterday");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("omits the Bound scheduled jobs block when no job is bound to the session", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-bound-job");
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Hi.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    // No runId / no chat session bound — the system context should not
+    // carry the block header and should not pick up stray trailing
+    // whitespace from a `${...}\n\n${empty}` template.
+    const task = await submitTask(config, "say hi", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBeGreaterThan(0);
+    const system = calls[0]!.find((m) => m.role === "system");
+    expect(system).toBeDefined();
+    const content = String(system?.content ?? "");
+    expect(content).not.toContain("Scheduled jobs delivering into this chat:");
+    // No trailing blank lines from optional sections being concatenated.
+    expect(content).toBe(content.trimEnd());
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("subagent path preserves the subagent prompt and still appends the bound-jobs block", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-bound-job-subagent");
+    const provider = normalizeProvider(config.provider);
+
+    const SUBAGENT_PROMPT = "You are a narrow research subagent. Stay terse.";
+    const { runId, subagentId, jobId } = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Research thread");
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Research turn",
+        input: "kick off",
+        conversationId: session.id
+      });
+      const subagent = createSubagentRecord(state, {
+        name: "researcher",
+        prompt: "research subagent",
+        toolsets: ["file"],
+        systemPrompt: SUBAGENT_PROMPT
+      });
+      const at = now();
+      const job: JobRecord = {
+        id: "job-research",
+        instance: state.instance,
+        name: "Weekly research digest",
+        prompt: "Summarize this week's top three industry stories.",
+        intervalSeconds: 604800,
+        status: "active",
+        deliveryTargets: [],
+        context: [],
+        retryLimit: 0,
+        timeoutSeconds: 600,
+        chatSessionId: session.id,
+        createdAt: at,
+        updatedAt: at,
+        nextRunAt: at,
+        runCount: 0,
+        missedRuns: 0,
+        taskIds: [],
+        runIds: []
+      };
+      state.jobs.push(job);
+      return { runId: run.id, subagentId: subagent.id, jobId: job.id };
+    });
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "go", { mode: "chat", runId, subagentId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBeGreaterThan(0);
+    const system = calls[0]!.find((m) => m.role === "system");
+    const content = String(system?.content ?? "");
+    // Subagent prompt preserved verbatim at the top of system context.
+    expect(content.startsWith(SUBAGENT_PROMPT)).toBe(true);
+    // Scheduled-jobs context block still appended after the subagent prompt.
+    expect(content).toContain("Scheduled jobs delivering into this chat:");
+    expect(content).toContain(jobId);
+    expect(content).toContain("Weekly research digest");
+    expect(content).toContain("every 604800s");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

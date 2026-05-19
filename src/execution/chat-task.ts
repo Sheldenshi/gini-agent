@@ -29,9 +29,10 @@ import {
   type ToolCallingMessage,
   type ToolCall
 } from "../provider";
-import { buildAgentSystemContext } from "../system-prompt";
+import { buildAgentSystemContext, buildBoundJobsBlock } from "../system-prompt";
 import type {
   CostRecord,
+  JobRecord,
   PendingToolCall,
   RuntimeConfig,
   RuntimeState,
@@ -187,7 +188,17 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     : buildAgentSystemContext(activeMemory, recalledContext);
   const visibleSkills = filterSkillsForSubagent(state.skills, subagent).filter((skill) => isSkillActive(state, skill));
   const skillsBlock = buildEnabledSkillsBlock(visibleSkills);
-  const systemContext = skillsBlock ? `${baseSystem}\n\n${skillsBlock}` : baseSystem;
+  // Bound-jobs block: if this chat session has one or more JobRecords whose
+  // chatSessionId matches, surface them in the system prompt so the model
+  // can act on "this job" / "the reminder" without first calling list_jobs.
+  // Applies to both the default Gini preamble and the subagent prompt --
+  // the binding is a property of the chat session, not the prompt source.
+  const boundJobs = findBoundJobsForTask(state, task);
+  const boundJobsBlock = buildBoundJobsBlock(boundJobs);
+  const sections = [baseSystem];
+  if (skillsBlock) sections.push(skillsBlock);
+  if (boundJobsBlock) sections.push(boundJobsBlock);
+  const systemContext = sections.join("\n\n");
 
   // Conversation history: include prior turns from the same chat session so
   // the model has multi-turn context (the legacy single-shot path didn't).
@@ -205,6 +216,21 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   });
 
   return runLoop(config, taskId, messages, 0);
+}
+
+// Resolve the chat session id behind this task and scan state.jobs for
+// records whose `chatSessionId` matches. Returns [] when:
+//   - the task has no runId (legacy non-chat path)
+//   - the run isn't found, or has no conversationId (not a chat run)
+//   - no JobRecord points at this session
+// Callers feed the result into buildBoundJobsBlock; an empty array yields
+// an empty string so the systemContext doesn't carry a stray header.
+function findBoundJobsForTask(state: RuntimeState, task: Task): JobRecord[] {
+  if (!task.runId) return [];
+  const run = state.runs.find((r) => r.id === task.runId);
+  if (!run?.conversationId) return [];
+  const sessionId = run.conversationId;
+  return state.jobs.filter((job) => job.chatSessionId === sessionId);
 }
 
 // Pull prior chat messages for multi-turn context. We synthesize an
