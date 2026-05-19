@@ -23,7 +23,8 @@ import {
   awaitTerminalTask,
   createDetachedTracker,
   markBridgeError,
-  sleepUnlessAborted
+  sleepUnlessAborted,
+  sleepUnlessAbortedOrWoken
 } from "./messaging-poller-helpers";
 import {
   createDiscordClient,
@@ -84,8 +85,15 @@ export interface PollerDeps {
   // Override the gateway connector for tests. Production leaves it
   // undefined and we open a real WebSocket to gateway.discord.gg;
   // tests pass a no-op so they don't spawn live sockets every time
-  // they bring up a supervisor.
-  gatewayConnector?: (options: { token: string; instance: string; bridgeId: string }) => DiscordGatewayHandle;
+  // they bring up a supervisor. `onMessageCreate` is the push hook
+  // the poller wires to its wake controller — tests can capture it
+  // to fire a synthetic MESSAGE_CREATE and prove the wake path.
+  gatewayConnector?: (options: {
+    token: string;
+    instance: string;
+    bridgeId: string;
+    onMessageCreate?: (event: { channelId: string }) => void;
+  }) => DiscordGatewayHandle;
 }
 
 interface RunningLoop {
@@ -189,18 +197,44 @@ async function runLoop(
   pollIntervalMs: number,
   typingRefreshMs: number,
   trackDetached: (work: Promise<void>) => void,
-  gatewayConnector: (options: { token: string; instance: string; bridgeId: string }) => DiscordGatewayHandle
+  gatewayConnector: (options: {
+    token: string;
+    instance: string;
+    bridgeId: string;
+    onMessageCreate?: (event: { channelId: string }) => void;
+  }) => DiscordGatewayHandle
 ): Promise<void> {
-  // The Gateway connection runs alongside the REST poll loop for the
-  // sole purpose of making the bot show up as "Online" in Discord's
-  // UI. It outlives a single poll tick (we don't reconnect on every
-  // iteration) and is torn down in `finally` when the loop exits —
-  // SIGTERM, bridge disable, status flip, missing-secret error all
-  // funnel through this finally so the gateway drops cleanly instead
-  // of holding the bot Online after the bridge is supposed to be
-  // gone.
+  // The Gateway connection serves two roles:
+  //   1. Presence — makes the bot show up as "Online" in Discord's
+  //      UI whenever gini is running.
+  //   2. Push-driven poll wake — when Discord emits MESSAGE_CREATE
+  //      for any channel in the bridge's deliveryTargets, the
+  //      gateway pokes `wake()` and the next REST-poll sleep
+  //      collapses to ~0ms instead of waiting out POLL_INTERVAL_MS.
+  //      REST polling stays the source of truth for content +
+  //      watermark + dedupe, so a missed wake (or the gateway
+  //      flapping entirely) just degrades to the 3s baseline — no
+  //      messages get lost.
+  //
+  // The connection outlives a single poll tick (we don't reconnect
+  // on every iteration) and is torn down in `finally` when the loop
+  // exits — SIGTERM, bridge disable, status flip, missing-secret
+  // error all funnel through this finally so the gateway drops
+  // cleanly instead of holding the bot Online after the bridge is
+  // supposed to be gone.
   let gateway: DiscordGatewayHandle | undefined;
   let gatewayToken: string | undefined;
+  // `wakeController` is reset each iteration so an earlier wake
+  // doesn't trip the next sleep before the gateway sees a new event.
+  // `targetSet` is the snapshot of allowed deliveryTargets — the
+  // gateway callback reads it (not `bridge`) so a mid-cycle bridge
+  // mutation doesn't change the comparison set out from under us.
+  let wakeController = new AbortController();
+  let targetSet = new Set<string>();
+  const onMessageCreate = (event: { channelId: string }) => {
+    if (!targetSet.has(event.channelId)) return;
+    wakeController.abort();
+  };
   try {
     while (!signal.aborted) {
       const bridge = readState(config.instance).messagingBridges.find((item) => item.id === bridgeId);
@@ -238,10 +272,15 @@ async function runLoop(
         return;
       }
 
-      // Start (or rotate) the Gateway presence connection. Re-use the
-      // existing connection unless the token rotated — token rotation
-      // is rare (operator recreates the bridge or pastes a new secret)
-      // and reconnecting on rotation is cheaper than tearing down on
+      // Refresh the per-iteration deliveryTarget snapshot the gateway
+      // callback compares against. Done every tick so adding a target
+      // to the bridge takes effect within one reconcile interval.
+      targetSet = new Set(bridge.deliveryTargets);
+
+      // Start (or rotate) the Gateway connection. Re-use the existing
+      // connection unless the token rotated — token rotation is rare
+      // (operator recreates the bridge or pastes a new secret) and
+      // reconnecting on rotation is cheaper than tearing down on
       // every tick.
       if (!gateway || gatewayToken !== token) {
         if (gateway) gateway.close();
@@ -249,7 +288,8 @@ async function runLoop(
         gateway = gatewayConnector({
           token,
           instance: config.instance,
-          bridgeId
+          bridgeId,
+          onMessageCreate
         });
       }
 
@@ -270,7 +310,14 @@ async function runLoop(
         await pollChannel(config, bridgeId, channelId, client, signal, typingRefreshMs, trackDetached);
       }
 
-      await sleepUnlessAborted(pollIntervalMs, signal);
+      // Sleep until the next periodic tick OR a Gateway push wakes
+      // us. Resetting the wake controller AFTER the sleep means a
+      // wake that fires while we were inside pollChannel (rare —
+      // poll is ~100-200ms vs the multi-second sleep) collapses
+      // the very next sleep to zero so we never lose an event
+      // because of an unlucky timing.
+      await sleepUnlessAbortedOrWoken(pollIntervalMs, signal, wakeController.signal);
+      if (wakeController.signal.aborted) wakeController = new AbortController();
     }
   } finally {
     // Always reap the gateway, even on a thrown exception out of the

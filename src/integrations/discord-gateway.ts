@@ -41,6 +41,19 @@ const OP_INVALID_SESSION = 9;
 const OP_HELLO = 10;
 const OP_HEARTBEAT_ACK = 11;
 
+// Gateway intents we subscribe to. Combined with the absence of
+// MESSAGE_CONTENT (1 << 15), MESSAGE_CREATE events arrive with empty
+// `content` strings — exactly what we want: the event is a push
+// notification telling the poller "a message landed in channel X",
+// and the REST poll that fires in response is what reads the actual
+// text. Keeps MESSAGE_CONTENT off the privileged-intent gate in the
+// Discord developer portal.
+//   GUILD_MESSAGES   = 1 << 9   = 512    (channel messages)
+//   DIRECT_MESSAGES  = 1 << 12  = 4096   (DMs to the bot)
+const INTENTS_GUILD_MESSAGES = 1 << 9;
+const INTENTS_DIRECT_MESSAGES = 1 << 12;
+const DEFAULT_INTENTS = INTENTS_GUILD_MESSAGES | INTENTS_DIRECT_MESSAGES;
+
 // Reconnect backoff. We start at 1s and cap at 30s so a flapping
 // Gateway can't hammer Discord, and a genuinely-down service still
 // gets retried often enough that the bot returns to Online inside a
@@ -85,6 +98,15 @@ export interface DiscordGatewayOptions {
   // Override the reconnect timer for tests — the default is the
   // RECONNECT_MIN..MAX backoff window applied across attempts.
   reconnectDelayMs?: number;
+  // Push hook for MESSAGE_CREATE events. The poller wires this to a
+  // wake controller so a Discord-pushed event collapses the next
+  // REST-poll sleep down to ~0ms — REST stays the source of truth
+  // for content + watermark advancement; the gateway is purely an
+  // accelerator that says "go poll now instead of waiting out the
+  // 3s interval". `content` is intentionally NOT delivered (we don't
+  // request the MESSAGE_CONTENT intent), so the event carries the
+  // channelId only.
+  onMessageCreate?: (event: { channelId: string }) => void;
 }
 
 export interface DiscordGatewayHandle {
@@ -105,7 +127,8 @@ export function connectDiscordGateway(options: DiscordGatewayOptions): DiscordGa
     bridgeId,
     statusText = "gini agent",
     webSocketImpl,
-    reconnectDelayMs
+    reconnectDelayMs,
+    onMessageCreate
   } = options;
   const WS = webSocketImpl ?? globalThis.WebSocket;
   if (!WS) {
@@ -231,14 +254,20 @@ export function connectDiscordGateway(options: DiscordGatewayOptions): DiscordGa
         heartbeatTimer = setInterval(() => {
           sendFrame({ op: OP_HEARTBEAT, d: lastSeq });
         }, interval);
-        // IDENTIFY with intents: 0 means Discord delivers no event
-        // dispatches to us beyond READY — exactly what we want for a
-        // presence-only connection.
+        // IDENTIFY with GUILD_MESSAGES | DIRECT_MESSAGES so Discord
+        // pushes a MESSAGE_CREATE event the instant a message lands
+        // in any channel/DM the bot can see. The handler below pokes
+        // the poller's wake controller; REST polling still owns
+        // content + watermark + dedupe so the gateway path is a
+        // pure-latency optimization, not a correctness one. The
+        // MESSAGE_CONTENT intent is intentionally NOT requested —
+        // we don't need content from the event and skipping it
+        // keeps the bot off Discord's privileged-intent gate.
         sendFrame({
           op: OP_IDENTIFY,
           d: {
             token,
-            intents: 0,
+            intents: DEFAULT_INTENTS,
             properties: {
               os: process.platform,
               browser: "gini-agent",
@@ -280,11 +309,26 @@ export function connectDiscordGateway(options: DiscordGatewayOptions): DiscordGa
         break;
       }
       case OP_DISPATCH: {
-        // The only dispatch we expect with intents=0 is READY. Log
-        // it once so an operator can confirm the bot identified
-        // successfully; we don't need to act on it.
         if (payload.t === "READY") {
           logRow("messaging.discord.gateway_ready");
+        } else if (payload.t === "MESSAGE_CREATE" && onMessageCreate) {
+          // Push notification: collapse the next REST-poll sleep so
+          // the message is processed on the order of network latency
+          // instead of waiting out POLL_INTERVAL_MS. The callback is
+          // best-effort — if it throws (e.g. a stale poller wake
+          // controller) we swallow so a bad consumer can't tear
+          // down the Gateway socket. The REST poll's watermark + the
+          // event being delivered repeatedly to multiple clients all
+          // mean a missed wake just degrades to the 3s baseline.
+          const data = payload.d as { channel_id?: unknown } | undefined;
+          const channelId = typeof data?.channel_id === "string" ? data.channel_id : undefined;
+          if (channelId) {
+            try {
+              onMessageCreate({ channelId });
+            } catch {
+              // Intentional swallow — see comment above.
+            }
+          }
         }
         break;
       }

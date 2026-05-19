@@ -195,6 +195,37 @@ export function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<voi
   return promise;
 }
 
+// Same sleep but resolves early if EITHER signal fires. Used by the
+// Discord poller so a Gateway-pushed MESSAGE_CREATE can collapse the
+// next REST-poll sleep down to ~0ms — REST polling stays the source
+// of truth, the gateway just acts as a push notification that says
+// "go poll now". Wake is intentionally non-exclusive: missing a wake
+// just degrades to the full POLL_INTERVAL_MS, no messages get lost.
+export function sleepUnlessAbortedOrWoken(
+  ms: number,
+  signal: AbortSignal,
+  wake: AbortSignal
+): Promise<void> {
+  if (signal.aborted || wake.aborted) return Promise.resolve();
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const cleanup = () => {
+    signal.removeEventListener("abort", finish);
+    wake.removeEventListener("abort", finish);
+  };
+  const finish = () => {
+    clearTimeout(timer);
+    cleanup();
+    resolve();
+  };
+  const timer = setTimeout(() => {
+    cleanup();
+    resolve();
+  }, ms);
+  signal.addEventListener("abort", finish, { once: true });
+  wake.addEventListener("abort", finish, { once: true });
+  return promise;
+}
+
 // Wait for a task to reach a terminal state (completed / failed /
 // cancelled). Used by reply mirrors in both pollers so they don't
 // invoke syncChatTaskResult before the task is ready — that throws

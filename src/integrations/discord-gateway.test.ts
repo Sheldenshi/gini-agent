@@ -58,7 +58,7 @@ function lastInstance(): StubSocket {
 }
 
 describe("discord-gateway", () => {
-  test("connects, sends IDENTIFY with intents:0 and a presence object, then heartbeats on the HELLO interval", async () => {
+  test("connects, sends IDENTIFY with GUILD_MESSAGES|DIRECT_MESSAGES intents and a presence object, then heartbeats on the HELLO interval", async () => {
     StubSocket.reset();
     const handle = connectDiscordGateway({
       token: "TOK",
@@ -83,7 +83,10 @@ describe("discord-gateway", () => {
       .map((raw) => JSON.parse(raw) as { op: number; d: Record<string, unknown> })
       .find((frame) => frame.op === 2)!;
     expect(identify.d.token).toBe("TOK");
-    expect(identify.d.intents).toBe(0);
+    // GUILD_MESSAGES (1 << 9) | DIRECT_MESSAGES (1 << 12) = 4608.
+    // MESSAGE_CONTENT (1 << 15) is intentionally NOT requested:
+    // event content arrives empty and REST polling fills it in.
+    expect(identify.d.intents).toBe(4608);
     const presence = identify.d.presence as {
       activities: Array<{ name: string; type: number }>;
       status: string;
@@ -180,6 +183,99 @@ describe("discord-gateway", () => {
     sock.dispatch("message", { data: JSON.stringify({ op: 11, d: null, s: null, t: null }) });
     // HEARTBEAT_ACK should not provoke any reply.
     expect(sock.sent.length).toBe(before);
+    handle.close();
+    await handle.done;
+  });
+
+  test("MESSAGE_CREATE dispatch invokes onMessageCreate with the channel id (push-driven poll wake)", async () => {
+    // The poller wires this callback to its wake controller so a
+    // Discord-pushed event collapses the next REST-poll sleep down
+    // to ~0ms. The gateway delivers no content (MESSAGE_CONTENT
+    // intent is not requested) — we just need the channelId so the
+    // poller can decide whether the message lives in one of its
+    // delivery targets.
+    StubSocket.reset();
+    const events: Array<{ channelId: string }> = [];
+    const handle = connectDiscordGateway({
+      token: "TOK",
+      webSocketImpl: StubCtor,
+      onMessageCreate: (event) => {
+        events.push(event);
+      }
+    });
+    const sock = lastInstance();
+    sock.dispatch("open", {});
+    sock.dispatch("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 200 }, s: null, t: null }) });
+    sock.dispatch("message", {
+      data: JSON.stringify({
+        op: 0,
+        t: "MESSAGE_CREATE",
+        s: 1,
+        d: { id: "100", channel_id: "chan-1", content: "" }
+      })
+    });
+    expect(events).toEqual([{ channelId: "chan-1" }]);
+    handle.close();
+    await handle.done;
+  });
+
+  test("MESSAGE_CREATE without a channel_id is ignored (no callback fired, no throw)", async () => {
+    // Defensive: a Discord schema drift or unexpected event shape
+    // must not cause the callback to fire with bogus data or take
+    // the gateway down. The poller relies on the callback being
+    // accurate so an undefined channelId would mean a wasted poll
+    // and (worse) a wake on a channel the bridge doesn't own.
+    StubSocket.reset();
+    const events: Array<{ channelId: string }> = [];
+    const handle = connectDiscordGateway({
+      token: "TOK",
+      webSocketImpl: StubCtor,
+      onMessageCreate: (event) => {
+        events.push(event);
+      }
+    });
+    const sock = lastInstance();
+    sock.dispatch("open", {});
+    sock.dispatch("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 200 }, s: null, t: null }) });
+    sock.dispatch("message", {
+      data: JSON.stringify({
+        op: 0,
+        t: "MESSAGE_CREATE",
+        s: 1,
+        d: { id: "100", content: "" }
+      })
+    });
+    expect(events).toEqual([]);
+    expect(sock.readyState).toBe(StubSocket.OPEN);
+    handle.close();
+    await handle.done;
+  });
+
+  test("a throw inside onMessageCreate is swallowed so the socket stays alive", async () => {
+    // A stale poller wake controller calling abort on a closed
+    // signal won't throw, but defense-in-depth — the callback is
+    // best-effort and a single bad consumer can't be allowed to
+    // tear down the gateway socket.
+    StubSocket.reset();
+    const handle = connectDiscordGateway({
+      token: "TOK",
+      webSocketImpl: StubCtor,
+      onMessageCreate: () => {
+        throw new Error("simulated bad consumer");
+      }
+    });
+    const sock = lastInstance();
+    sock.dispatch("open", {});
+    sock.dispatch("message", { data: JSON.stringify({ op: 10, d: { heartbeat_interval: 200 }, s: null, t: null }) });
+    sock.dispatch("message", {
+      data: JSON.stringify({
+        op: 0,
+        t: "MESSAGE_CREATE",
+        s: 1,
+        d: { id: "100", channel_id: "chan-1" }
+      })
+    });
+    expect(sock.readyState).toBe(StubSocket.OPEN);
     handle.close();
     await handle.done;
   });

@@ -15,6 +15,17 @@ function stubGateway(): DiscordGatewayHandle {
   const { promise, resolve } = Promise.withResolvers<void>();
   return { done: promise, close: () => resolve() };
 }
+
+// Gateway connector that captures the `onMessageCreate` callback so
+// a test can simulate a Discord-pushed event and prove the wake
+// collapses the next poll-cycle sleep.
+function capturingGateway(slot: { fire?: (event: { channelId: string }) => void }) {
+  return (options: { onMessageCreate?: (event: { channelId: string }) => void }) => {
+    if (options.onMessageCreate) slot.fire = options.onMessageCreate;
+    const { promise, resolve } = Promise.withResolvers<void>();
+    return { done: promise, close: () => resolve() };
+  };
+}
 import { setMaxTaskWaitMsForTests } from "./messaging-poller-helpers";
 import { mutateState } from "../state";
 import type { ChatSessionRecord } from "../types";
@@ -719,6 +730,92 @@ describe("discord poller supervisor", () => {
     } finally {
       setMaxTaskWaitMsForTests(undefined);
     }
+  });
+
+  test("gateway-pushed MESSAGE_CREATE for a delivery-target channel collapses the next poll sleep", async () => {
+    // Configure the poller with a long pollIntervalMs so the test
+    // doesn't accidentally pass by simply waiting out the periodic
+    // tick. With pollIntervalMs=5000ms and the wake fired ~50ms after
+    // the first poll cycle, the inbound message should land in well
+    // under 1s — proof that the gateway push is what drove the
+    // re-poll, not the periodic timer.
+    const config = testConfig("disc-push-wake");
+    const { client, enqueue, sendCalls } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+    const bridge = await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const slot: { fire?: (event: { channelId: string }) => void } = {};
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      gatewayConnector: capturingGateway(slot),
+      pollIntervalMs: 5000,
+      typingRefreshMs: 20
+    });
+
+    // Seed batch (so first-contact pins the watermark and the next
+    // poll routes real messages).
+    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+    supervisor.reconcile();
+    await waitFor(
+      () => Boolean(readState(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.metadata?.lastInboundExternalIds),
+      "first-contact watermark seed"
+    );
+
+    // Queue the real inbound, then fire the gateway push. The poller
+    // is currently mid-sleep (5s); the wake must collapse it.
+    enqueue("chan-1", [
+      makeMessage({ id: "500", content: "pushed", author: { id: "user-1", username: "lo", bot: false } })
+    ]);
+    const wakeStart = Date.now();
+    slot.fire?.({ channelId: "chan-1" });
+    await waitFor(() => sendCalls.length >= 1, "reply dispatched after gateway-pushed wake");
+    const elapsed = Date.now() - wakeStart;
+    expect(elapsed).toBeLessThan(2500);
+
+    await supervisor.stopAll();
+  });
+
+  test("gateway-pushed MESSAGE_CREATE for an unrelated channel does NOT wake the poller", async () => {
+    // Wake controller filtering: a push for a channel that is NOT
+    // in the bridge's deliveryTargets must be ignored so we don't
+    // burn an extra REST round trip for events we don't care about.
+    const config = testConfig("disc-push-wake-ignore");
+    const { client, enqueue, sendCalls } = programmableClient();
+    setMessagingDeps({ discordClientFactory: () => client });
+    await addMessagingBridge(config, {
+      name: "disc",
+      kind: "discord",
+      deliveryTargets: ["chan-1"],
+      botToken: "TOK"
+    });
+
+    const slot: { fire?: (event: { channelId: string }) => void } = {};
+    const supervisor = createDiscordPollerSupervisor(config, {
+      clientFactory: () => client,
+      gatewayConnector: capturingGateway(slot),
+      pollIntervalMs: 5000,
+      typingRefreshMs: 20
+    });
+    enqueue("chan-1", [makeMessage({ id: "100", content: "older history" })]);
+    supervisor.reconcile();
+    await waitFor(() => slot.fire !== undefined, "gateway connector captured the callback");
+
+    // Queue an inbound for chan-1 but fire a push for an unrelated
+    // channel. The wake must NOT collapse the sleep; the reply
+    // dispatch should NOT arrive in the next ~500ms.
+    enqueue("chan-1", [
+      makeMessage({ id: "500", content: "should not wake", author: { id: "user-1", username: "lo", bot: false } })
+    ]);
+    slot.fire?.({ channelId: "unrelated-9999" });
+    await Bun.sleep(500);
+    expect(sendCalls.length).toBe(0);
+
+    await supervisor.stopAll();
   });
 
   test("markBridgeError flips a configured bridge to 'error' and sanitizes the file path", async () => {

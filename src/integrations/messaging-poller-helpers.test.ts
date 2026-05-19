@@ -8,7 +8,8 @@ import {
   awaitTerminalTask,
   createDetachedTracker,
   sanitizeBridgeStatusMessage,
-  setMaxTaskWaitMsForTests
+  setMaxTaskWaitMsForTests,
+  sleepUnlessAbortedOrWoken
 } from "./messaging-poller-helpers";
 
 function readRuntimeLog(instance: string): Array<Record<string, unknown>> {
@@ -222,6 +223,50 @@ describe("awaitTerminalTask", () => {
     } finally {
       setMaxTaskWaitMsForTests(undefined);
     }
+  });
+});
+
+describe("sleepUnlessAbortedOrWoken", () => {
+  test("resolves on wake before the timer fires", async () => {
+    // The Discord poller uses this to collapse the next REST-poll
+    // sleep down to ~0ms when the gateway pushes a MESSAGE_CREATE
+    // event. A 5s sleep that wakes within ~50ms is the relevant
+    // production scenario; the test compresses both.
+    const signal = new AbortController().signal;
+    const wakeController = new AbortController();
+    const start = Date.now();
+    const sleep = sleepUnlessAbortedOrWoken(2000, signal, wakeController.signal);
+    setTimeout(() => wakeController.abort(), 30);
+    await sleep;
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  test("resolves on abort even if no wake fires", async () => {
+    const controller = new AbortController();
+    const wake = new AbortController().signal;
+    const start = Date.now();
+    const sleep = sleepUnlessAbortedOrWoken(2000, controller.signal, wake);
+    setTimeout(() => controller.abort(), 30);
+    await sleep;
+    expect(Date.now() - start).toBeLessThan(500);
+  });
+
+  test("resolves immediately if abort fired before the call", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const wake = new AbortController().signal;
+    const start = Date.now();
+    await sleepUnlessAbortedOrWoken(2000, controller.signal, wake);
+    expect(Date.now() - start).toBeLessThan(50);
+  });
+
+  test("resolves immediately if wake fired before the call", async () => {
+    const signal = new AbortController().signal;
+    const wakeController = new AbortController();
+    wakeController.abort();
+    const start = Date.now();
+    await sleepUnlessAbortedOrWoken(2000, signal, wakeController.signal);
+    expect(Date.now() - start).toBeLessThan(50);
   });
 });
 
