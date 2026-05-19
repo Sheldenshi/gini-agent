@@ -36,6 +36,7 @@ interface SessionLike {
   createdAt: string;
   updatedAt: string;
   runs?: SessionLikeRun[];
+  origin?: "job";
 }
 
 function activityAt(session: SessionLike): string {

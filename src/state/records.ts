@@ -200,7 +200,8 @@ export function createChatSession(
   state: RuntimeState,
   title: string,
   source?: ChatSessionRecord["source"],
-  agentId?: string
+  agentId?: string,
+  origin?: ChatSessionRecord["origin"]
 ): ChatSessionRecord {
   const at = now();
   const session: ChatSessionRecord = {
@@ -213,7 +214,8 @@ export function createChatSession(
     messageIds: [],
     taskIds: [],
     runIds: [],
-    ...(source ? { source } : {})
+    ...(source ? { source } : {}),
+    ...(origin ? { origin } : {})
   };
   state.chatSessions.unshift(session);
   appendEvent(

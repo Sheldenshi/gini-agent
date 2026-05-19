@@ -431,6 +431,11 @@ export interface ChatSessionRecord {
   // `outboundMirror ?? source` so live sessions (where the two are
   // the same) continue to work unchanged.
   outboundMirror?: ChatSessionSource;
+  // Marks how the session was created. `"job"` indicates a dedicated
+  // session spawned by a scheduled/cron job; the UI uses this to
+  // render a job indicator and to keep these chats unread until a
+  // human opens them.
+  origin?: "job";
 }
 
 // `lastInboundMessageId` is the most recent originating-message id the

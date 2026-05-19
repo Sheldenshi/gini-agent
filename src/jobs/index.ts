@@ -294,7 +294,7 @@ export async function createScheduledJob(
     // explicitly ignore it.
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
-      const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId);
+      const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId, "job");
       if (parentTaskId) {
         const parentSession = state.chatSessions.find((candidate) =>
           candidate.id !== session.id && candidate.taskIds.includes(parentTaskId)
