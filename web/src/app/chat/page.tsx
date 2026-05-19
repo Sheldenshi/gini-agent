@@ -6,6 +6,15 @@ import { useMutation } from "@tanstack/react-query";
 import { Plus } from "lucide-react";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from "@/components/ui/dialog";
 import { ApprovalActions } from "@/components/chat/ApprovalActions";
 import { Avatar } from "@/components/chat/Avatar";
 import { Composer } from "@/components/chat/Composer";
@@ -44,6 +53,7 @@ export default function ChatPage() {
   const initial = params?.get("session") ?? null;
   const [selected, setSelectedState] = useState<string | null>(initial);
   const [text, setText] = useState("");
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const session = useChatSession(selected);
   const invalidate = useInvalidate();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -221,17 +231,27 @@ export default function ChatPage() {
     return null;
   }, [messages, inflightTaskId]);
 
-  const handleDelete = (id: string) => {
+  const confirmDelete = () => {
+    const id = pendingDeleteId;
+    if (!id) return;
     deleteSession.mutate(id, {
       onSuccess: () => {
         if (selected === id) {
           const next = orderedSessions.find((s) => s.id !== id);
           setSelected(next?.id ?? null);
         }
+        setPendingDeleteId(null);
       },
-      onError: (error) => toast.error(error.message)
+      onError: (error) => {
+        toast.error(error.message);
+        setPendingDeleteId(null);
+      }
     });
   };
+
+  const pendingDeleteSession = pendingDeleteId
+    ? orderedSessions.find((s) => s.id === pendingDeleteId) ?? null
+    : null;
 
   const handleRename = (id: string, title: string) => {
     renameSession.mutate(
@@ -265,7 +285,7 @@ export default function ChatPage() {
                     isActive={selected === s.id}
                     isUnread={selected !== s.id && isUnread(s)}
                     onSelect={() => setSelected(s.id)}
-                    onDelete={() => handleDelete(s.id)}
+                    onDelete={() => setPendingDeleteId(s.id)}
                     onRename={(title) => handleRename(s.id, title)}
                   />
                 ))}
@@ -360,6 +380,40 @@ export default function ChatPage() {
           </>
         )}
       </section>
+
+      <Dialog
+        open={pendingDeleteId !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDeleteId(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete chat?</DialogTitle>
+            <DialogDescription>
+              {pendingDeleteSession?.title?.trim()
+                ? `"${pendingDeleteSession.title}" will be permanently deleted. This cannot be undone.`
+                : "This chat will be permanently deleted. This cannot be undone."}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setPendingDeleteId(null)}
+              disabled={deleteSession.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={confirmDelete}
+              disabled={deleteSession.isPending}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
