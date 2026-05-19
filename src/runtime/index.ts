@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
-import { configPath, ensureDir, instanceRoot, instancesRoot } from "../paths";
+import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot } from "../paths";
 import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
 import { addAudit } from "../state/audit";
 import { resolveEffectiveContext } from "../execution/effective-context";
@@ -95,6 +95,12 @@ export function install(config: RuntimeConfig): void {
   if (config.approvalMode === undefined && config.dangerouslyAutoApprove === true) {
     config.approvalMode = "yolo";
   }
+  // Pre-flip migration: `loadConfig` already stamped the merged
+  // default `approvalMode: "auto"` and set a transient marker on
+  // the config. The async audit emit below records the one-time
+  // `config.migrated` event so the trail captures the silent
+  // behavior change from "gate everything" to "auto-approve safe
+  // actions" for this instance.
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   readState(config.instance);
   // Audit + side-effects of the migration. Fire-and-forget; the
@@ -239,12 +245,23 @@ export function updateDangerouslyAutoApprove(config: RuntimeConfig, enabled: boo
   return updateAutoApproveSettings(config, { dangerouslyAutoApprove: enabled }).dangerouslyAutoApprove;
 }
 
-// Load-time migration shim for approval-mode. Detects a legacy
-// config file that carries `dangerouslyAutoApprove: true` aliased
-// (synchronously by `install`) to `approvalMode: "yolo"`, persists
-// the upgraded shape to disk if needed, and emits a one-time
-// `config.migrated` audit row so the trail records the
-// approval-policy change.
+// Load-time migration shim for approval-mode. Covers two cases:
+//
+//   1. Legacy `dangerouslyAutoApprove: true` config: aliased
+//      synchronously by `install` to `approvalMode: "yolo"`. The
+//      audit row records `from: "dangerouslyAutoApprove: true",
+//      to: "yolo"`.
+//   2. Pre-flip existing instance: on-disk config carried neither
+//      `approvalMode` nor `dangerouslyAutoApprove`. The merged
+//      default in `loadConfig` stamps `approvalMode: "auto"`, which
+//      silently changes that instance's effective behavior from
+//      "gate everything" to "auto-approve safe actions". The audit
+//      row records `from: "no-approval-mode", to: "auto"` so the
+//      trail captures the change. Detected via the transient
+//      `PRE_FLIP_MIGRATION_MARKER` symbol stamped by `loadConfig`.
+//
+// A genuinely fresh install (no prior `config.json`) emits no audit
+// row in either branch — there's no behavior to migrate from.
 //
 // Idempotent — the audit row is only written once per instance.
 // Failures are swallowed (startup shouldn't crash because of audit
@@ -252,12 +269,13 @@ export function updateDangerouslyAutoApprove(config: RuntimeConfig, enabled: boo
 // synchronously by `install` so the policy seam sees a coherent mode
 // regardless.
 export async function migrateLegacyApprovalMode(config: RuntimeConfig): Promise<void> {
-  // Trigger condition: the in-memory config has approvalMode "yolo"
-  // AND the legacy flag set true. That combination is what `install`
-  // produces when it aliases a legacy config; a fresh "yolo" install
-  // (set explicitly by the user) won't carry the legacy flag.
-  if (config.approvalMode !== "yolo") return;
-  if (config.dangerouslyAutoApprove !== true) return;
+  const legacyYolo =
+    config.approvalMode === "yolo" && config.dangerouslyAutoApprove === true;
+  const preFlipAuto =
+    hasPreFlipMigrationMarker(config) && config.approvalMode === "auto";
+  if (!legacyYolo && !preFlipAuto) return;
+  const from = legacyYolo ? "dangerouslyAutoApprove: true" : "no-approval-mode";
+  const to = legacyYolo ? "yolo" : "auto";
   try {
     await mutateState(config.instance, (state) => {
       // De-dupe: if a `config.migrated` audit already exists for this
@@ -276,8 +294,8 @@ export async function migrateLegacyApprovalMode(config: RuntimeConfig): Promise<
         risk: "low",
         evidence: {
           field: "approvalMode",
-          from: "dangerouslyAutoApprove: true",
-          to: "yolo"
+          from,
+          to
         }
       });
     });

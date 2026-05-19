@@ -149,6 +149,60 @@ describe("approval-mode migration shim", () => {
     const migrated = state.audit.filter((event) => event.action === "config.migrated");
     expect(migrated).toHaveLength(0);
   });
+
+  test("pre-flip existing instance (no approvalMode, no dangerouslyAutoApprove) emits config.migrated audit", async () => {
+    // An instance whose config.json was written before the default
+    // flip. Effective pre-flip behavior: "gate everything"
+    // (`strict`). Effective post-flip behavior: `"auto"` via the
+    // merged defaults. That's a silent change in approval policy
+    // that operators need to see in the audit trail.
+    const instance = "pre-flip-existing";
+    const legacy = {
+      ...defaultConfig(instance)
+    } as RuntimeConfig;
+    // Strip both fields so the file looks like a pre-flip install.
+    delete (legacy as { approvalMode?: unknown }).approvalMode;
+    delete (legacy as { dangerouslyAutoApprove?: unknown }).dangerouslyAutoApprove;
+    writeConfig(instance, legacy);
+
+    const loaded = loadConfig(instance);
+    install(loaded);
+    await migrateLegacyApprovalMode(loaded);
+
+    expect(loaded.approvalMode).toBe("auto");
+
+    const state = readState(loaded.instance);
+    const migrated = state.audit.filter((event) => event.action === "config.migrated");
+    expect(migrated).toHaveLength(1);
+    expect(migrated[0]?.evidence?.field).toBe("approvalMode");
+    expect(migrated[0]?.evidence?.from).toBe("no-approval-mode");
+    expect(migrated[0]?.evidence?.to).toBe("auto");
+  });
+
+  test("pre-flip migration is idempotent across restarts", async () => {
+    const instance = "pre-flip-idempotent";
+    const legacy = {
+      ...defaultConfig(instance)
+    } as RuntimeConfig;
+    delete (legacy as { approvalMode?: unknown }).approvalMode;
+    delete (legacy as { dangerouslyAutoApprove?: unknown }).dangerouslyAutoApprove;
+    writeConfig(instance, legacy);
+
+    // First boot.
+    let loaded = loadConfig(instance);
+    install(loaded);
+    await migrateLegacyApprovalMode(loaded);
+
+    // Simulate a restart — the on-disk file now has approvalMode set
+    // so the pre-flip marker should not re-fire.
+    loaded = loadConfig(instance);
+    install(loaded);
+    await migrateLegacyApprovalMode(loaded);
+
+    const state = readState(loaded.instance);
+    const migrated = state.audit.filter((event) => event.action === "config.migrated");
+    expect(migrated).toHaveLength(1);
+  });
 });
 
 describe("fresh-instance default approval mode", () => {
