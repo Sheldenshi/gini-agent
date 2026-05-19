@@ -896,7 +896,20 @@ export async function sendMessagingOutput(
       errorMessage = "Discord messages require non-empty text.";
     } else {
       try {
-        await discordClientFor(token).sendMessage(target, text, { signal: options.signal });
+        // Discord uses snowflake strings for message ids. The poller
+        // forwards the inbound message id via input.replyToMessageId so
+        // the agent's reply threads onto the originating message
+        // (`message_reference`); the client also pairs that with
+        // `fail_if_not_exists: false` so a deleted-mid-task original
+        // falls back to an unthreaded send instead of failing.
+        const replyToMessageId =
+          typeof input.replyToMessageId === "string" || typeof input.replyToMessageId === "number"
+            ? String(input.replyToMessageId)
+            : undefined;
+        await discordClientFor(token).sendMessage(target, text, {
+          signal: options.signal,
+          ...(replyToMessageId ? { replyToMessageId } : {})
+        });
       } catch (error) {
         status = "failed";
         errorMessage = sanitizeBridgeError(error instanceof Error ? error.message : String(error));

@@ -417,7 +417,8 @@ async function pollChannel(
           incoming.channelId,
           client,
           signal,
-          typingRefreshMs
+          typingRefreshMs,
+          raw.id
         ).catch((error) => {
           appendLog(config.instance, "messaging.discord.typing_error", {
             bridgeId,
@@ -461,7 +462,12 @@ async function maintainTypingAndMirrorReply(
   channelId: string,
   client: DiscordClient,
   signal: AbortSignal,
-  typingRefreshMs: number
+  typingRefreshMs: number,
+  // Inbound message snowflake — when set, the reply mirror threads the
+  // outbound onto this message via Discord's `message_reference` so the
+  // bot's reply visually attaches to the user's question. Optional so
+  // the test seam (__internalsForTests) doesn't need to fabricate one.
+  inboundMessageId?: string
 ): Promise<void> {
   // Typing pulse runs concurrent with the terminal-wait so a typing
   // failure (revoked channel, network blip) doesn't gate the reply,
@@ -559,7 +565,11 @@ async function maintainTypingAndMirrorReply(
       await sendMessagingOutput(
         config,
         bridgeId,
-        { text: replyText, target: session.source.target },
+        {
+          text: replyText,
+          target: session.source.target,
+          ...(inboundMessageId ? { replyToMessageId: inboundMessageId } : {})
+        },
         { signal }
       );
     } catch (error) {

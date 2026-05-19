@@ -42,13 +42,19 @@ interface DiscordError {
   code?: number;
 }
 
-// Options bag for the outbound send. Today it carries only an optional
-// AbortSignal so the supervisor's stopAll can cancel a hung POST
-// instead of waiting it out — without this a hung Discord
-// `sendMessage` blocks the detached reply-mirror worker, and
-// supervisor.stopAll (which now awaits those workers) deadlocks.
+// Options bag for the outbound send. `signal` lets the supervisor's
+// stopAll cancel a hung POST instead of waiting it out — without
+// this a hung Discord `sendMessage` blocks the detached reply-mirror
+// worker, and supervisor.stopAll (which now awaits those workers)
+// deadlocks. `replyToMessageId` threads the outbound onto a specific
+// inbound message via Discord's `message_reference` object so the
+// bot's reply visually attaches to the user's question; pairs with
+// `fail_if_not_exists: false` so a user deleting their message
+// mid-task lets the reply fall back to an unthreaded send instead of
+// failing the whole call.
 export interface SendMessageOptions {
   signal?: AbortSignal;
+  replyToMessageId?: string;
 }
 
 export interface FetchChannelMessagesOptions {
@@ -152,20 +158,33 @@ export function createDiscordClient(token: string, options: DiscordClientOptions
       // to bite for chat-task summaries, but a long stack trace would
       // otherwise 400 the whole send.
       const trimmed = content.length > CONTENT_LIMIT ? content.slice(0, CONTENT_LIMIT) : content;
+      const payload: Record<string, unknown> = {
+        content: trimmed,
+        // Block @everyone / @here / role / user mentions by default.
+        // The agent's output is untrusted input from a chat-task
+        // model; without this, an "@everyone please help" inside a
+        // summary would notify every server member. Callers that
+        // legitimately need a mention can lift this restriction
+        // explicitly when the runtime grows a mention-aware send
+        // path.
+        allowed_mentions: { parse: [] }
+      };
+      if (options?.replyToMessageId) {
+        // Thread the reply onto the inbound message. `fail_if_not_exists:
+        // false` matches Telegram's allow_sending_without_reply: if the
+        // user deletes the original message before the agent's reply
+        // lands, Discord drops the reference and sends unthreaded
+        // instead of returning 400 and losing the response.
+        payload.message_reference = {
+          message_id: options.replyToMessageId,
+          channel_id: channelId,
+          fail_if_not_exists: false
+        };
+      }
       return call<DiscordMessage>(
         "POST",
         `/channels/${encodeURIComponent(channelId)}/messages`,
-        {
-          content: trimmed,
-          // Block @everyone / @here / role / user mentions by default.
-          // The agent's output is untrusted input from a chat-task
-          // model; without this, an "@everyone please help" inside a
-          // summary would notify every server member. Callers that
-          // legitimately need a mention can lift this restriction
-          // explicitly when the runtime grows a mention-aware send
-          // path.
-          allowed_mentions: { parse: [] }
-        },
+        payload,
         options?.signal
       );
     },

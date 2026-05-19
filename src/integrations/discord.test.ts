@@ -74,6 +74,46 @@ describe("discord client", () => {
     expect(observedContent.length).toBe(2000);
   });
 
+  test("sendMessage threads replyToMessageId via message_reference with fail_if_not_exists:false", async () => {
+    // The reply mirror passes the inbound message snowflake so Discord
+    // visually threads the bot's reply onto the user's question, and we
+    // pair the reference with `fail_if_not_exists: false` so a user who
+    // deletes their original message mid-task gets an unthreaded
+    // fallback instead of the whole reply failing.
+    let body: Record<string, unknown> = {};
+    let observedUrl = "";
+    const client = createDiscordClient("TOK", {
+      fetchImpl: stubFetch((url, init) => {
+        observedUrl = String(url);
+        body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return { id: "201", channel_id: "999", content: "hi" };
+      })
+    });
+    await client.sendMessage("999", "hi", { replyToMessageId: "100" });
+    expect(observedUrl).toContain("/channels/999/messages");
+    expect(body.content).toBe("hi");
+    expect(body.allowed_mentions).toEqual({ parse: [] });
+    expect(body.message_reference).toEqual({
+      message_id: "100",
+      channel_id: "999",
+      fail_if_not_exists: false
+    });
+  });
+
+  test("sendMessage omits message_reference entirely when replyToMessageId is not provided", async () => {
+    // Defensive: without replyToMessageId the payload should NOT carry
+    // a message_reference at all (an empty/null one would 400 the send).
+    let body: Record<string, unknown> = {};
+    const client = createDiscordClient("TOK", {
+      fetchImpl: stubFetch((_url, init) => {
+        body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        return { id: "201", channel_id: "999", content: "hi" };
+      })
+    });
+    await client.sendMessage("999", "hi");
+    expect("message_reference" in body).toBe(false);
+  });
+
   test("triggerTypingIndicator POSTs /typing and accepts the 204 No Content response", async () => {
     let observedUrl = "";
     const client = createDiscordClient("TOK", {
