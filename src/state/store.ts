@@ -372,11 +372,18 @@ function migrateTaskChatSessionId(state: RuntimeState): void {
 // SubagentRecord, Approval, RuntimeEvent, AuditEvent in one pass so the
 // backfill audit doesn't fan out into eight separate rows.
 function migrateRecordAgentIds(state: RuntimeState): void {
+  // When the state file has no agents at all (e.g. a hand-edited or
+  // partially-restored file that lost both the seed pass and the
+  // pre-seed defaults), skip the backfill entirely. Stamping records
+  // with a literal "agent_default" id that no AgentRecord owns would
+  // leave them attributed to a nonexistent agent. The seeding step in
+  // normalizeState above ensures we never reach this branch in
+  // normal operation.
   const defaultAgentId =
     state.activeAgentId
     ?? state.agents.find((agent) => agent.status === "active")?.id
-    ?? state.agents[0]?.id
-    ?? "agent_default";
+    ?? state.agents[0]?.id;
+  if (!defaultAgentId) return;
   const counts: Record<string, number> = {};
   const stamp = <T extends { agentId?: string }>(rows: T[] | undefined, label: string) => {
     if (!Array.isArray(rows)) return;
@@ -539,7 +546,13 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.messagingBridges ??= [];
   state.messagingMessages ??= [];
   state.importReports ??= [];
-  state.agents ??= [defaultAgent(instance, now())];
+  // Seed a default agent when the state file is either missing the field or
+  // carries an empty array. Without the empty-array branch,
+  // migrateRecordAgentIds would fall through its `"agent_default"` literal
+  // and stamp records with an id no AgentRecord actually owns.
+  if (!Array.isArray(state.agents) || state.agents.length === 0) {
+    state.agents = [defaultAgent(instance, now())];
+  }
   state.activeAgentId ??= state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
   // Phase C — per-agent memory isolation backfill. Runs after agents are
   // present so the migration can stamp the right id. Both helpers are
