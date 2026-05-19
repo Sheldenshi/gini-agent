@@ -273,7 +273,10 @@ describe("telegram poller supervisor", () => {
     expect(downloadedPaths).toEqual(["photos/BIG.jpg"]);
     expect(record?.media?.kind).toBe("photo");
     expect(record?.media?.fileId).toBe("BIG");
-    expect(String(record?.media?.path ?? "")).toContain("inbound");
+    // Must land under workspaceRoot/.gini/inbound/<bridgeId>/ so the
+    // agent's file-read tool (workspace-containment-gated) can pick the
+    // attachment up via the [photo: <path>] task-input prefix.
+    expect(String(record?.media?.path ?? "")).toContain(`${config.workspaceRoot}/.gini/inbound/${bridge.id}/`);
     expect(String(record?.media?.path ?? "")).toContain("BIG.jpg");
     expect(record?.text ?? "").toContain("[photo:");
     expect(record?.text ?? "").toContain("look at this");
