@@ -146,6 +146,11 @@ export interface ToolCallingResult {
 // by an optional tag — useful for end-to-end chat-task tests where the
 // loop calls the provider multiple times.
 const echoToolCallingStubs: Array<{ tag?: string; result: ToolCallingResult }> = [];
+// Capture the messages each echo call was invoked with. Tests inspect this
+// to assert that the chat-task loop built the expected system prompt /
+// conversation transcript. The buffer is cleared by
+// clearEchoToolCallingResponses so the per-test setup also resets it.
+const echoToolCallingCalls: ToolCallingMessage[][] = [];
 
 export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: string): void {
   echoToolCallingStubs.push({ tag, result });
@@ -153,6 +158,14 @@ export function setEchoToolCallingResponse(result: ToolCallingResult, tag?: stri
 
 export function clearEchoToolCallingResponses(): void {
   echoToolCallingStubs.length = 0;
+  echoToolCallingCalls.length = 0;
+}
+
+// Test-only accessor: returns the messages array passed to every
+// echo-backed `generateToolCallingResponse` call since the last clear.
+// Each entry is the full transcript at the moment of the call.
+export function getEchoToolCallingCalls(): ToolCallingMessage[][] {
+  return echoToolCallingCalls.map((messages) => messages.slice());
 }
 
 function nextEchoToolCallingResult(provider: ProviderConfig, lastUserText: string): ToolCallingResult {
@@ -195,6 +208,7 @@ export async function generateToolCallingResponse(
   const lastUserText = typeof lastUser?.content === "string" ? lastUser.content : "";
 
   if (provider.name === "echo") {
+    echoToolCallingCalls.push(messages.map((m) => ({ ...m })));
     const result = nextEchoToolCallingResult(provider, lastUserText);
     if (result.text && onDelta) {
       // Synthesize a single streamed delta so callers exercise their
