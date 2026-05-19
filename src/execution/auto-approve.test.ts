@@ -244,10 +244,13 @@ describe("matchDangerousSource", () => {
     expect(matchDangerousSource(`subprocess.run(["rm", "-rf", "/tmp/x"])`)).toBe("rm-rf-dangerous-target");
   });
 
-  test("ignores user-style 'sudo' as a dict key in unrelated code", () => {
-    // Dict-key form. The reviewer accepted this as an acceptable
-    // false-positive trade per spec ("regex like `[\[{]\s*['\"]\s*sudo\b`").
-    // Pin the current behavior so a future tweak is intentional.
+  test("dict-key 'sudo' triggers the structural match (documented edge case)", () => {
+    // The argv-array extractor opens on `[` or `{` and reads the
+    // first string element. A JS/Python dict literal like
+    // `{"sudo": false}` lands in the same shape, so the extractor
+    // emits `"sudo"` as a segment. Pin the current behavior so a
+    // future tweak is intentional — this is an accepted false
+    // positive trade for keeping the extractor cheap.
     expect(matchDangerousSource(`const config = {"sudo": false}`)).toBe("sudo");
   });
 

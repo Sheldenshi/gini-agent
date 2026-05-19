@@ -139,8 +139,10 @@ export interface ProviderConfig {
 //   row and pauses the task for a human decision. Matches the legacy
 //   pre-flip default.
 // - "auto" — the new default. Auto-approve `file.write`, `file.patch`,
-//   `code_exec`, and `browser.upload_file`. For `terminal.exec`, auto-
-//   approve unless the command matches a dangerous-pattern entry (see
+//   and `browser.upload_file` unconditionally. For `terminal.exec` and
+//   `code_exec`, auto-approve unless the command (or, for `code_exec`,
+//   either the shell wrapper OR the raw source — see
+//   `matchDangerousSource`) matches a dangerous-pattern entry (see
 //   `dangerousTerminalPatterns` + `DEFAULT_DANGEROUS_TERMINAL_PATTERNS`
 //   in src/execution/auto-approve.ts). `autoApproveCommands` allowlist
 //   always short-circuits any blocklist match — explicit operator opt-in
@@ -179,11 +181,14 @@ export interface RuntimeConfig {
   // migrated to "yolo" at load time and emit a one-time `config.migrated`
   // audit row. See ADR approval-mode.md.
   approvalMode?: ApprovalMode;
-  // Optional operator-supplied list of shell-glob patterns that should
-  // GATE a `terminal.exec` call even under `approvalMode: "auto"`. When
-  // omitted, only the built-in `DEFAULT_DANGEROUS_TERMINAL_PATTERNS`
-  // apply. The `autoApproveCommands` allowlist still short-circuits this
-  // list — an explicit allow beats the blocklist.
+  // Optional operator-supplied list of substring patterns that should
+  // GATE a `terminal.exec` call even under `approvalMode: "auto"`. Each
+  // entry is matched as a literal substring against the full command
+  // string (see `userDangerousPatterns` in
+  // `src/execution/auto-approve.ts`). When omitted, only the built-in
+  // `DEFAULT_DANGEROUS_TERMINAL_PATTERNS` apply. The
+  // `autoApproveCommands` allowlist still short-circuits this list — an
+  // explicit allow beats the blocklist.
   dangerousTerminalPatterns?: string[];
   // Deprecated alias for `approvalMode === "yolo"`. Kept on the config
   // shape because (a) older `config.json` files on disk reference it,

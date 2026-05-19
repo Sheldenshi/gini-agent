@@ -13,12 +13,14 @@ Replace the binary `dangerouslyAutoApprove` flag with a three-state
   approval row and pauses the task for a human decision. Matches the
   legacy pre-flip default.
 - `"auto"` — **new instance default**. Auto-approve `file.write`,
-  `file.patch`, `code_exec`, and `browser.upload_file`. For
-  `terminal.exec`, auto-approve unless the command matches a
-  dangerous-pattern entry (operator override via
-  `RuntimeConfig.dangerousTerminalPatterns`, or the built-in
-  `DEFAULT_DANGEROUS_TERMINAL_PATTERNS` in
-  `src/execution/auto-approve.ts`). The `autoApproveCommands`
+  `file.patch`, and `browser.upload_file` unconditionally. For
+  `terminal.exec` and `code_exec`, auto-approve unless the command
+  (or, for `code_exec`, either the wrapper command OR the raw
+  source — see `matchDangerousSource`) matches a dangerous-pattern
+  entry. Operator override via
+  `RuntimeConfig.dangerousTerminalPatterns`; built-ins in
+  `DEFAULT_DANGEROUS_TERMINAL_PATTERNS`
+  (`src/execution/auto-approve.ts`). The `autoApproveCommands`
   allowlist always short-circuits the blocklist.
 - `"yolo"` — full bypass for every approval-gated tool. Same audit
   contract as the legacy `dangerouslyAutoApprove: true`: each call
