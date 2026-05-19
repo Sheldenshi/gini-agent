@@ -21,6 +21,7 @@ import type { ApprovalMode, RuntimeConfig } from "../types";
 import {
   DEFAULT_DANGEROUS_TERMINAL_PATTERNS,
   matchAutoApprove,
+  matchDangerousSource,
   matchDangerousTerminal,
   userDangerousPatterns
 } from "./auto-approve";
@@ -140,17 +141,26 @@ export function resolveApprovalPolicy(
       return { mode: "auto", reason: allowMatch };
     }
 
-    // Match against BOTH the wrapper and the raw source. Argv-style
-    // payloads like `Bun.spawn(["sudo", "apt"])` don't contain the
-    // literal `sudo ` substring (no trailing space after `sudo`
-    // before the quote) once wrapped, so a wrapper-only check lets
-    // them slip past every dangerous matcher. Checking the source
-    // directly closes that hole. First-match-wins; wrapper is
-    // checked first since allowlisting / shell-level patterns are
-    // more likely to fire there.
+    // Match against BOTH the wrapper command AND the raw source.
+    //
+    // - Wrapper scan uses the regular `matchDangerousTerminal` set
+    //   (built-ins + user patterns) — the wrapper is a real shell
+    //   command line, so substring-style matching is correct here.
+    //   `os.system("sudo apt update")` is caught at this stage
+    //   because the heredoc-wrapped source flows through the
+    //   wrapper.
+    // - Source scan uses `matchDangerousSource`, which extracts
+    //   argv-like segments structurally (first element of array
+    //   literals, first arg to known exec functions) before applying
+    //   the built-in matcher set. This closes the argv-style
+    //   `Bun.spawn(["sudo", "apt"])` hole without false-positiving
+    //   comments (`# using sudo`) or incidental string literals
+    //   (`print("using sudo for X")`). User-supplied
+    //   `dangerousTerminalPatterns` are intentionally not applied at
+    //   source level — see auto-approve.ts for the rationale.
     const patterns = effectiveDangerousPatterns(config);
     const dangerous =
-      matchDangerousTerminal(patterns, wrapper) ?? matchDangerousTerminal(patterns, source);
+      matchDangerousTerminal(patterns, wrapper) ?? matchDangerousSource(source);
     if (dangerous) {
       return { mode: "gate", reason: `dangerous-pattern: ${dangerous}` };
     }

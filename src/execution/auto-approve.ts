@@ -245,3 +245,158 @@ export function matchDangerousTerminal(
   }
   return undefined;
 }
+
+// ---------------- source-level structural detection ----------------
+//
+// Scanning code_exec SOURCE with the same substring regexes used for
+// shell command lines is too noisy. `# using sudo for X` and
+// `print("using sudo for X")` both contain the literal `sudo` token
+// with shell-style boundaries, so a generic matcher fires on them and
+// gates work that has nothing to do with running sudo. The whole
+// premise of "stop babysitting" is undermined when innocuous comments
+// and log strings turn into approval prompts.
+//
+// The fix is structural: only flag a dangerous binary in source when
+// it appears in an ARGV-LIKE position. Two shapes qualify:
+//   1. The first element of an array literal: `["sudo", ...]`,
+//      `{'sudo', ...}`, `[ "sudo" ]`. (Real code constructing argv
+//      almost always puts the binary first.)
+//   2. The first positional argument to a known exec-style function:
+//      `Bun.spawn(...)`, `child_process.{spawn,exec,execSync,
+//      execFile,execFileSync}(...)`,
+//      `subprocess.{run,Popen,call,check_call,check_output,
+//      getoutput,getstatusoutput}(...)`,
+//      `os.{system,popen,execv,execvp,execve,execvpe,execl,execlp,
+//      execle,execlpe}(...)`.
+//
+// Comments and bare string literals (`x = "sudo"`, `print("...sudo...")`)
+// are NOT extracted — they're not in argv positions and they're the
+// dominant source of false positives.
+//
+// Wrapper-command scanning is unchanged. `os.system("sudo apt
+// update")` is still caught by the wrapper-side matcher because the
+// heredoc-encoded source flows into the wrapper command and the
+// literal `sudo` substring with shell boundaries appears there.
+//
+// User-supplied `dangerousTerminalPatterns` are NOT applied to
+// source. They're already substring-based (operator owns the rule
+// shape); applying them to source would multiply false positives. If
+// an operator wants to gate `docker run` in source they can scope
+// their rule to terminal.exec by writing it for the shell wrapper.
+
+// Known exec-style call sites whose first positional arg becomes the
+// process to launch.  The names are anchored with a word boundary so
+// `mysubprocess.run` doesn't spuriously match.
+const EXEC_CALL_RE =
+  /(?:^|[^.\w])(?:Bun\.spawn|child_process\.(?:spawn|exec|execSync|execFile|execFileSync)|subprocess\.(?:run|Popen|call|check_call|check_output|getoutput|getstatusoutput)|os\.(?:system|popen|execv|execvp|execve|execvpe|execl|execlp|execle|execlpe))\s*\(\s*/g;
+
+// Array-literal first-element opener. The opener can be `[` or `{`
+// followed by optional whitespace and a quote. The captured group is
+// the quote character so we know how to terminate the string.
+const ARRAY_LITERAL_OPENER_RE = /[\[{]\s*(["'])/g;
+
+// Pull the contents of the next string literal starting at `start`.
+// Tolerates `\"` / `\'` escapes inside the string. Returns the inner
+// text plus the index after the closing quote. Returns undefined if
+// there's no opening quote at `start` (skipping leading whitespace).
+function readQuotedString(
+  source: string,
+  start: number
+): { value: string; end: number } | undefined {
+  let i = start;
+  while (i < source.length && /\s/.test(source[i]!)) i++;
+  const quote = source[i];
+  if (quote !== '"' && quote !== "'") return undefined;
+  i++;
+  let out = "";
+  while (i < source.length) {
+    const ch = source[i]!;
+    if (ch === "\\" && i + 1 < source.length) {
+      out += source[i + 1];
+      i += 2;
+      continue;
+    }
+    if (ch === quote) return { value: out, end: i + 1 };
+    out += ch;
+    i++;
+  }
+  return undefined;
+}
+
+// Pull the contents of an array literal whose opening `[`/`{` is at
+// position `openIdx` (the regex match index of the opener). Reads
+// successive quoted strings separated by commas/whitespace until a
+// non-string element or the closing bracket. Returns the joined
+// elements separated by spaces — the synthetic "command line" the
+// generic matcher can scan.
+function readStringArrayElements(source: string, openIdx: number): string {
+  // openIdx points at `[` or `{`. Advance past it.
+  let i = openIdx + 1;
+  const elements: string[] = [];
+  while (i < source.length) {
+    while (i < source.length && /[\s,]/.test(source[i]!)) i++;
+    if (i >= source.length) break;
+    const ch = source[i]!;
+    if (ch === "]" || ch === "}") break;
+    if (ch !== '"' && ch !== "'") break;
+    const read = readQuotedString(source, i);
+    if (!read) break;
+    elements.push(read.value);
+    i = read.end;
+  }
+  return elements.join(" ");
+}
+
+// Extract synthetic command-line strings from source for structural
+// scanning. Each extracted segment is what would actually be passed
+// to a shell / launched as a process — never a comment, never a bare
+// string literal.
+function extractArgvSegments(source: string): string[] {
+  const segments: string[] = [];
+
+  // Exec-style call sites: read whatever comes after the opening `(`.
+  // The first arg can be a string literal (`os.system("sudo apt")`)
+  // or an array literal (`subprocess.run(["sudo", "apt"])`).
+  const execRe = new RegExp(EXEC_CALL_RE);
+  let m: RegExpExecArray | null;
+  while ((m = execRe.exec(source)) !== null) {
+    const after = m.index + m[0].length;
+    // Case A: first arg is an array literal — `( [` or `( {`.
+    // Find the opener (allowing whitespace).
+    let j = after;
+    while (j < source.length && /\s/.test(source[j]!)) j++;
+    if (source[j] === "[" || source[j] === "{") {
+      segments.push(readStringArrayElements(source, j));
+      continue;
+    }
+    // Case B: first arg is a string literal.
+    const read = readQuotedString(source, after);
+    if (read) segments.push(read.value);
+  }
+
+  // Array literals anywhere whose first element is a string. Catches
+  // `const cmd = ["sudo", ...]` even when the exec call site lives in
+  // a different statement.
+  const arrRe = new RegExp(ARRAY_LITERAL_OPENER_RE);
+  while ((m = arrRe.exec(source)) !== null) {
+    // m.index points at the `[` or `{`. The regex consumes through
+    // the quote; rewind so readStringArrayElements sees the bracket.
+    segments.push(readStringArrayElements(source, m.index));
+  }
+
+  return segments;
+}
+
+// Returns the first built-in dangerous pattern that fires on any
+// structural segment extracted from `source`. User patterns are NOT
+// applied — see the rationale block above.
+export function matchDangerousSource(source: string): string | undefined {
+  if (!source) return undefined;
+  const segments = extractArgvSegments(source);
+  if (segments.length === 0) return undefined;
+  for (const segment of segments) {
+    const hit = matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, segment);
+    if (hit) return hit;
+  }
+  return undefined;
+}

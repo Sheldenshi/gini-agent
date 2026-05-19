@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_DANGEROUS_TERMINAL_PATTERNS,
   matchAutoApprove,
+  matchDangerousSource,
   matchDangerousTerminal,
   userDangerousPatterns
 } from "./auto-approve";
@@ -177,6 +178,65 @@ describe("matchDangerousTerminal", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -r build")).toBeUndefined();
     // `rm -rf` against a non-dangerous target shouldn't gate.
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf ./dist")).toBeUndefined();
+  });
+});
+
+describe("matchDangerousSource", () => {
+  // Structural source detection: only fires when a dangerous binary
+  // appears in an ARGV-LIKE position. Comments and incidental string
+  // literals are intentionally not extracted.
+
+  test("ignores comments mentioning sudo", () => {
+    expect(matchDangerousSource("# using sudo for X")).toBeUndefined();
+    expect(matchDangerousSource("// note: sudo is required")).toBeUndefined();
+    expect(matchDangerousSource("/* sudo apt update */")).toBeUndefined();
+  });
+
+  test("ignores incidental string literals mentioning sudo", () => {
+    expect(matchDangerousSource(`print("using sudo for X")`)).toBeUndefined();
+    expect(matchDangerousSource(`const note = "remember to sudo first"`)).toBeUndefined();
+    expect(matchDangerousSource(`log.info("user attempted sudo")`)).toBeUndefined();
+  });
+
+  test("gates argv-style array literals starting with sudo", () => {
+    // The canonical Bun.spawn / subprocess.run shape.
+    expect(matchDangerousSource(`Bun.spawn(["sudo", "apt", "update"])`)).toBe("sudo");
+    expect(matchDangerousSource(`subprocess.run(["sudo", "apt"])`)).toBe("sudo");
+    // Even a bare array assignment with sudo as the first element
+    // counts — almost always argv being built up for an exec call.
+    expect(matchDangerousSource(`const cmd = ["sudo", "rm"]`)).toBe("sudo");
+    // Whitespace tolerance and single quotes.
+    expect(matchDangerousSource(`spawn([ 'sudo', 'rm' ])`)).toBe("sudo");
+  });
+
+  test("gates first-string-arg form of known exec functions", () => {
+    expect(matchDangerousSource(`os.system("sudo apt update")`)).toBe("sudo");
+    expect(matchDangerousSource(`subprocess.run("sudo apt", shell=True)`)).toBe("sudo");
+    expect(matchDangerousSource(`child_process.exec("sudo systemctl restart x")`)).toBe("sudo");
+  });
+
+  test("gates argv-style chmod 777 / rm -rf in source", () => {
+    expect(matchDangerousSource(`Bun.spawn(["chmod", "777", "secret"])`)).toBe("chmod-777");
+    expect(matchDangerousSource(`subprocess.run(["rm", "-rf", "/tmp/x"])`)).toBe("rm-rf-dangerous-target");
+  });
+
+  test("ignores user-style 'sudo' as a dict key in unrelated code", () => {
+    // Dict-key form. The reviewer accepted this as an acceptable
+    // false-positive trade per spec ("regex like `[\[{]\s*['\"]\s*sudo\b`").
+    // Pin the current behavior so a future tweak is intentional.
+    expect(matchDangerousSource(`const config = {"sudo": false}`)).toBe("sudo");
+  });
+
+  test("returns undefined for empty / whitespace source", () => {
+    expect(matchDangerousSource("")).toBeUndefined();
+    expect(matchDangerousSource("   \n\n")).toBeUndefined();
+  });
+
+  test("does not apply user-supplied patterns to source", () => {
+    // matchDangerousSource only runs built-in patterns; this test
+    // pins that contract by checking a source containing a user-ish
+    // substring with no argv-like position does not gate.
+    expect(matchDangerousSource(`print("docker run hello")`)).toBeUndefined();
   });
 });
 
