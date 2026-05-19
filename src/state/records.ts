@@ -28,7 +28,7 @@ import type {
   PlanStepRecord
 } from "../types";
 import { id, now } from "./ids";
-import { addAudit, appendEvent } from "./audit";
+import { addAudit, appendEvent, type AgentContext } from "./audit";
 import { tracePath } from "./trace";
 import { hashSecret, randomPairingCode } from "./security";
 import { expirePairingCodes } from "./store";
@@ -118,36 +118,36 @@ export function createRun(
     const parent = state.runs.find((candidate) => candidate.id === item.parentRunId);
     if (parent && !parent.childRunIds.includes(item.id)) parent.childRunIds.push(item.id);
   }
-  let sessionAgentId: string | undefined;
   if (item.conversationId) {
     const session = state.chatSessions.find((candidate) => candidate.id === item.conversationId);
-    if (session) {
-      sessionAgentId = session.agentId;
-      if (!session.runIds.includes(item.id)) {
-        session.runIds.push(item.id);
-        session.updatedAt = at;
-      }
+    if (session && !session.runIds.includes(item.id)) {
+      session.runIds.push(item.id);
+      session.updatedAt = at;
     }
   }
   // Resolve the originating agent so the run.created event lands under the
   // right inbox even when the run is bound to a chat session or scheduled
   // job whose owning agent isn't the currently active one. taskId resolves
-  // later (via linkRunToTask), so don't rely on it here.
-  const jobAgentId = item.jobId
-    ? state.jobs.find((candidate) => candidate.id === item.jobId)?.agentId
-    : undefined;
-  const runAgentId = sessionAgentId ?? jobAgentId;
-  appendEvent(state, {
-    kind: "run",
-    action: "run.created",
-    target: item.id,
-    runId: item.id,
-    risk: "low",
-    summary: item.title,
-    data: { kind: item.kind, conversationId: item.conversationId, parentRunId: item.parentRunId },
-    agentId: runAgentId,
-    jobId: item.jobId
-  });
+  // later (via linkRunToTask) so don't rely on it here — chain
+  // session → job → system instead.
+  appendEvent(
+    state,
+    {
+      kind: "run",
+      action: "run.created",
+      target: item.id,
+      runId: item.id,
+      risk: "low",
+      summary: item.title,
+      data: { kind: item.kind, conversationId: item.conversationId, parentRunId: item.parentRunId },
+      jobId: item.jobId
+    },
+    item.conversationId
+      ? { sessionId: item.conversationId }
+      : item.jobId
+        ? { jobId: item.jobId }
+        : { system: true }
+  );
   return item;
 }
 
@@ -168,33 +168,31 @@ export function createPlanStep(
   const run = state.runs.find((candidate) => candidate.id === item.runId);
   if (run && !run.planStepIds.includes(item.id)) run.planStepIds.push(item.id);
   // Walk the parent run (conversationId -> session, jobId -> job, taskId
-  // -> task) so the step event inherits the same agent attribution that
-  // run.created already resolved. Without this the step would fall back
-  // to state.activeAgentId.
-  let stepAgentId: string | undefined;
-  if (run) {
-    if (run.conversationId) {
-      stepAgentId = state.chatSessions.find((candidate) => candidate.id === run.conversationId)?.agentId;
-    }
-    if (!stepAgentId && run.jobId) {
-      stepAgentId = state.jobs.find((candidate) => candidate.id === run.jobId)?.agentId;
-    }
-    if (!stepAgentId && run.taskId) {
-      stepAgentId = state.tasks.find((candidate) => candidate.id === run.taskId)?.agentId;
-    }
-  }
-  appendEvent(state, {
-    kind: "run",
-    action: "run.step.created",
-    target: item.runId,
-    runId: item.runId,
-    taskId: item.taskId ?? run?.taskId,
-    risk: "low",
-    summary: item.title,
-    data: { stepId: item.id },
-    agentId: stepAgentId,
-    jobId: run?.jobId
-  });
+  // -> task) so the step event inherits the same agent attribution as
+  // run.created. AgentContext keeps the chain explicit at the call site.
+  const stepTaskId = item.taskId ?? run?.taskId;
+  const stepAgent: AgentContext = run?.conversationId
+    ? { sessionId: run.conversationId }
+    : run?.jobId
+      ? { jobId: run.jobId }
+      : stepTaskId
+        ? { taskId: stepTaskId }
+        : { system: true };
+  appendEvent(
+    state,
+    {
+      kind: "run",
+      action: "run.step.created",
+      target: item.runId,
+      runId: item.runId,
+      taskId: stepTaskId,
+      risk: "low",
+      summary: item.title,
+      data: { stepId: item.id },
+      jobId: run?.jobId
+    },
+    stepAgent
+  );
   return item;
 }
 
@@ -218,14 +216,17 @@ export function createChatSession(
     ...(source ? { source } : {})
   };
   state.chatSessions.unshift(session);
-  appendEvent(state, {
-    kind: "task",
-    action: "chat.session.created",
-    target: session.id,
-    risk: "low",
-    summary: `Chat session created: ${session.title}`,
-    agentId: session.agentId
-  });
+  appendEvent(
+    state,
+    {
+      kind: "task",
+      action: "chat.session.created",
+      target: session.id,
+      risk: "low",
+      summary: `Chat session created: ${session.title}`
+    },
+    { sessionId: session.id }
+  );
   return session;
 }
 
@@ -260,14 +261,19 @@ export function deleteChatSession(state: RuntimeState, id: string): ChatSessionR
   const session = state.chatSessions[index]!;
   state.chatSessions.splice(index, 1);
   state.chatMessages = state.chatMessages.filter((message) => message.sessionId !== id);
-  appendEvent(state, {
-    kind: "task",
-    action: "chat.session.deleted",
-    target: id,
-    risk: "low",
-    summary: `Chat session deleted: ${session.title}`,
-    agentId: session.agentId
-  });
+  // The session record is gone from state.chatSessions; resolve via the
+  // captured agentId so the event still attributes to the owner.
+  appendEvent(
+    state,
+    {
+      kind: "task",
+      action: "chat.session.deleted",
+      target: id,
+      risk: "low",
+      summary: `Chat session deleted: ${session.title}`
+    },
+    session.agentId ? { agentId: session.agentId } : { system: true }
+  );
   return session;
 }
 
@@ -277,14 +283,17 @@ export function renameChatSession(state: RuntimeState, id: string, title: string
   const trimmed = title.trim();
   session.title = (trimmed ? trimmed.slice(0, 80) : "") || "Untitled chat";
   session.updatedAt = now();
-  appendEvent(state, {
-    kind: "task",
-    action: "chat.session.renamed",
-    target: session.id,
-    risk: "low",
-    summary: `Chat session renamed: ${session.title}`,
-    agentId: session.agentId
-  });
+  appendEvent(
+    state,
+    {
+      kind: "task",
+      action: "chat.session.renamed",
+      target: session.id,
+      risk: "low",
+      summary: `Chat session renamed: ${session.title}`
+    },
+    { sessionId: session.id }
+  );
   return session;
 }
 
@@ -331,15 +340,23 @@ export function createApproval(
     agentId: approval.agentId ?? taskAgentId
   };
   state.approvals.unshift(item);
-  addAudit(state, {
-    actor: "runtime",
-    action: "approval.requested",
-    target: item.target,
-    risk: item.risk,
-    taskId: item.taskId,
-    approvalId: item.id,
-    evidence: { action: item.action, reason: item.reason }
-  });
+  addAudit(
+    state,
+    {
+      actor: "runtime",
+      action: "approval.requested",
+      target: item.target,
+      risk: item.risk,
+      taskId: item.taskId,
+      approvalId: item.id,
+      evidence: { action: item.action, reason: item.reason }
+    },
+    item.taskId
+      ? { taskId: item.taskId, agentId: item.agentId }
+      : item.agentId
+        ? { agentId: item.agentId }
+        : { system: true }
+  );
   return item;
 }
 
@@ -421,16 +438,19 @@ export function createJobRun(
     ...run
   };
   state.jobRuns.unshift(item);
-  appendEvent(state, {
-    kind: "job",
-    action: "job.run.started",
-    target: run.jobId,
-    jobId: run.jobId,
-    risk: "low",
-    summary: `Job run started for ${run.jobId}`,
-    data: { runId: item.id, trigger: item.trigger },
-    agentId: run.agentId
-  });
+  appendEvent(
+    state,
+    {
+      kind: "job",
+      action: "job.run.started",
+      target: run.jobId,
+      jobId: run.jobId,
+      risk: "low",
+      summary: `Job run started for ${run.jobId}`,
+      data: { runId: item.id, trigger: item.trigger }
+    },
+    { jobId: run.jobId, agentId: run.agentId }
+  );
   return item;
 }
 
@@ -448,14 +468,18 @@ export function createImprovementProposal(
     ...proposal
   };
   state.improvements.unshift(item);
-  addAudit(state, {
-    actor: "agent",
-    action: "improvement.proposed",
-    target: item.id,
-    risk: "medium",
-    taskId: item.sourceTaskId,
-    evidence: { kind: item.kind, sourceTraceIds: item.sourceTraceIds }
-  });
+  addAudit(
+    state,
+    {
+      actor: "agent",
+      action: "improvement.proposed",
+      target: item.id,
+      risk: "medium",
+      taskId: item.sourceTaskId,
+      evidence: { kind: item.kind, sourceTraceIds: item.sourceTraceIds }
+    },
+    item.sourceTaskId ? { taskId: item.sourceTaskId } : { system: true }
+  );
   return item;
 }
 
@@ -474,13 +498,19 @@ export function createPairingCode(
     expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString()
   };
   state.pairingCodes.unshift(pairing);
-  addAudit(state, {
-    actor: "user",
-    action: "pairing.created",
-    target: pairing.id,
-    risk: "medium",
-    evidence: { expiresAt: pairing.expiresAt }
-  });
+  // Device pairing is instance-scoped (not per-agent); the resulting device
+  // can act under any agent the operator activates next.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "pairing.created",
+      target: pairing.id,
+      risk: "medium",
+      evidence: { expiresAt: pairing.expiresAt }
+    },
+    { system: true }
+  );
   return { pairing, code };
 }
 
@@ -510,13 +540,19 @@ export function claimPairingCode(
   pairing.claimedAt = at;
   pairing.claimedByDeviceId = device.id;
   state.devices.unshift(device);
-  addAudit(state, {
-    actor: "user",
-    action: "device.paired",
-    target: device.id,
-    risk: "medium",
-    evidence: { pairingId: pairing.id, name: device.name, scopes: device.scopes }
-  });
+  // Paired devices are instance-scoped; the operator hasn't picked an
+  // agent for them at pairing time.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "device.paired",
+      target: device.id,
+      risk: "medium",
+      evidence: { pairingId: pairing.id, name: device.name, scopes: device.scopes }
+    },
+    { system: true }
+  );
   return { device, token };
 }
 
@@ -526,13 +562,18 @@ export function revokeDevice(state: RuntimeState, deviceId: string): PairedDevic
   device.status = "revoked" satisfies DeviceStatus;
   device.updatedAt = now();
   device.revokedAt = device.updatedAt;
-  addAudit(state, {
-    actor: "user",
-    action: "device.revoked",
-    target: device.id,
-    risk: "medium",
-    evidence: { name: device.name }
-  });
+  // Devices are instance-scoped, not per-agent.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "device.revoked",
+      target: device.id,
+      risk: "medium",
+      evidence: { name: device.name }
+    },
+    { system: true }
+  );
   return device;
 }
 
@@ -560,13 +601,19 @@ export function createPromotionProposal(
     ...proposal
   };
   state.promotions.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "promotion.proposed",
-    target: item.id,
-    risk: "medium",
-    evidence: { candidateRef: item.candidateRef, evidencePath: item.evidencePath }
-  });
+  // Promotions decide instance-wide runtime upgrades; they don't belong
+  // to a specific agent.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "promotion.proposed",
+      target: item.id,
+      risk: "medium",
+      evidence: { candidateRef: item.candidateRef, evidencePath: item.evidencePath }
+    },
+    { system: true }
+  );
   return item;
 }
 
@@ -581,13 +628,17 @@ export function decidePromotion(
   promotion.status = decision === "approve" ? "approved" : "rejected";
   promotion.decidedAt = now();
   promotion.updatedAt = promotion.decidedAt;
-  addAudit(state, {
-    actor: "user",
-    action: `promotion.${promotion.status}`,
-    target: promotion.id,
-    risk: "medium",
-    evidence: { candidateRef: promotion.candidateRef }
-  });
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: `promotion.${promotion.status}`,
+      target: promotion.id,
+      risk: "medium",
+      evidence: { candidateRef: promotion.candidateRef }
+    },
+    { system: true }
+  );
   return promotion;
 }
 
@@ -604,13 +655,18 @@ export function createSnapshotRecord(
     ...snapshot
   };
   state.snapshots.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "snapshot.created",
-    target: item.id,
-    risk: "medium",
-    evidence: { path: item.path, reason: item.reason }
-  });
+  // Snapshots capture the whole instance, not a single agent's data.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "snapshot.created",
+      target: item.id,
+      risk: "medium",
+      evidence: { path: item.path, reason: item.reason }
+    },
+    { system: true }
+  );
   return item;
 }
 
@@ -628,14 +684,22 @@ export function createSubagentRecord(
     ...subagent
   };
   state.subagents.unshift(item);
-  addAudit(state, {
-    actor: "agent",
-    action: "subagent.created",
-    target: item.id,
-    risk: "medium",
-    taskId: item.parentTaskId,
-    evidence: { name: item.name, toolsets: item.toolsets }
-  });
+  addAudit(
+    state,
+    {
+      actor: "agent",
+      action: "subagent.created",
+      target: item.id,
+      risk: "medium",
+      taskId: item.parentTaskId,
+      evidence: { name: item.name, toolsets: item.toolsets }
+    },
+    item.parentTaskId
+      ? { taskId: item.parentTaskId, agentId: item.agentId }
+      : item.agentId
+        ? { agentId: item.agentId }
+        : { system: true }
+  );
   return item;
 }
 
@@ -653,13 +717,19 @@ export function createMcpServerRecord(
     ...server
   };
   state.mcpServers.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "mcp.configured",
-    target: item.id,
-    risk: "medium",
-    evidence: { name: item.name, exposedTools: item.exposedTools }
-  });
+  // MCP servers are configured at the instance level; tool invocations
+  // later attribute to the calling task.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "mcp.configured",
+      target: item.id,
+      risk: "medium",
+      evidence: { name: item.name, exposedTools: item.exposedTools }
+    },
+    { system: true }
+  );
   return item;
 }
 
@@ -677,13 +747,19 @@ export function createMessagingBridgeRecord(
     ...bridge
   };
   state.messagingBridges.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "messaging.configured",
-    target: item.id,
-    risk: "medium",
-    evidence: { kind: item.kind, deliveryTargets: item.deliveryTargets }
-  });
+  // Messaging bridges live at the instance level; per-agent target
+  // filtering happens at send time.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "messaging.configured",
+      target: item.id,
+      risk: "medium",
+      evidence: { kind: item.kind, deliveryTargets: item.deliveryTargets }
+    },
+    { system: true }
+  );
   return item;
 }
 
@@ -700,15 +776,19 @@ export function createMessagingMessageRecord(
     ...message
   };
   state.messagingMessages.unshift(item);
-  appendEvent(state, {
-    kind: "messaging",
-    action: `messaging.${item.direction}.${item.status}`,
-    target: item.bridgeId,
-    taskId: item.taskId,
-    risk: "low",
-    summary: `${item.direction} message ${item.status}`,
-    data: { messageId: item.id, target: item.target }
-  });
+  appendEvent(
+    state,
+    {
+      kind: "messaging",
+      action: `messaging.${item.direction}.${item.status}`,
+      target: item.bridgeId,
+      taskId: item.taskId,
+      risk: "low",
+      summary: `${item.direction} message ${item.status}`,
+      data: { messageId: item.id, target: item.target }
+    },
+    item.taskId ? { taskId: item.taskId } : { system: true }
+  );
   return item;
 }
 
@@ -723,13 +803,18 @@ export function createImportReport(
     ...report
   };
   state.importReports.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "import.inspected",
-    target: item.id,
-    risk: "low",
-    evidence: { source: item.source, path: item.path, counts: item.counts }
-  });
+  // Imports inspect external state files at the instance level.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "import.inspected",
+      target: item.id,
+      risk: "low",
+      evidence: { source: item.source, path: item.path, counts: item.counts }
+    },
+    { system: true }
+  );
   return item;
 }
 
@@ -747,13 +832,19 @@ export function createAgentRecord(
     ...agent
   };
   state.agents.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "agent.created",
-    target: item.id,
-    risk: "low",
-    evidence: { name: item.name, toolsets: item.toolsets }
-  });
+  // The new agent IS the subject — there's no parent agent to attribute
+  // this to. The agent record itself is the inbox owner from here on.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "agent.created",
+      target: item.id,
+      risk: "low",
+      evidence: { name: item.name, toolsets: item.toolsets }
+    },
+    { agentId: item.id }
+  );
   return item;
 }
 
@@ -771,13 +862,18 @@ export function createRelayRecord(
     ...relay
   };
   state.relays.unshift(item);
-  addAudit(state, {
-    actor: "user",
-    action: "relay.configured",
-    target: item.id,
-    risk: "medium",
-    evidence: { mode: item.mode, endpoint: item.endpoint }
-  });
+  // Relays are instance-level transport endpoints.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "relay.configured",
+      target: item.id,
+      risk: "medium",
+      evidence: { mode: item.mode, endpoint: item.endpoint }
+    },
+    { system: true }
+  );
   return item;
 }
 
@@ -795,14 +891,18 @@ export function createNotificationRecord(
     ...notification
   };
   state.notifications.unshift(item);
-  addAudit(state, {
-    actor: "runtime",
-    action: "notification.queued",
-    target: item.id,
-    risk: "low",
-    taskId: item.taskId,
-    evidence: { kind: item.kind, target: item.target }
-  });
+  addAudit(
+    state,
+    {
+      actor: "runtime",
+      action: "notification.queued",
+      target: item.id,
+      risk: "low",
+      taskId: item.taskId,
+      evidence: { kind: item.kind, target: item.target }
+    },
+    item.taskId ? { taskId: item.taskId } : { system: true }
+  );
   return item;
 }
 
@@ -812,13 +912,19 @@ export function activateAgent(state: RuntimeState, idOrName: string): AgentRecor
   for (const item of state.agents) item.status = item.id === agent.id ? "active" : "inactive";
   agent.updatedAt = now();
   state.activeAgentId = agent.id;
-  addAudit(state, {
-    actor: "user",
-    action: "agent.activated",
-    target: agent.id,
-    risk: "low",
-    evidence: { name: agent.name }
-  });
+  // The just-activated agent owns this audit row — that's the agent the
+  // operator is now switching into.
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "agent.activated",
+      target: agent.id,
+      risk: "low",
+      evidence: { name: agent.name }
+    },
+    { agentId: agent.id }
+  );
   return agent;
 }
 
