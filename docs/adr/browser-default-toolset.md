@@ -6,7 +6,7 @@
 
 ## Decision
 
-The `browser` toolset ships **enabled by default** on every new instance and on the default agent's `toolsets` whitelist. Existing instances pick the addition up on the next runtime boot via a migration helper in `normalizeState`. Seven browser actions that mutate page state — `browser_click`, `browser_type`, `browser_drag`, `browser_select_option`, and `browser_tabs` (open/switch/close) — skip the approval gate; the tool call's *arguments* (URL, element ref, typed text, etc.) are persisted to the durable trace and audit log as post-hoc evidence of what the agent did. `browser_upload_file` remains approval-gated.
+The `browser` toolset ships **enabled by default** on every new instance and on the default agent's `toolsets` whitelist. Existing instances pick the addition up on the next runtime boot via a migration helper in `normalizeState`. Seven browser actions that mutate page state — `browser_click`, `browser_type`, `browser_drag`, `browser_select_option`, and `browser_tabs` (open/switch/close) — skip the approval gate; the tool call's *arguments* (URL, element ref, typed text, etc.) are persisted to the durable trace and audit log as post-hoc evidence of what the agent did. **Two** browser actions are approval-gated: `browser_upload_file` (workspace bytes leave the page) and `browser_connect` (spawns a persistent Chrome profile and surfaces a desktop window — the trust-establishment moment that warrants explicit user consent).
 
 The decision is scoped to:
 
@@ -33,8 +33,10 @@ We considered three shapes:
 `trust-substrate.md:31` codifies "approval first for state-mutating actions." This ADR **refines** that rule for the browser surface rather than superseding it:
 
 - For **file, terminal, code** the rule stands unchanged. Every new approval-gated tool added in those families must route through `pendingOrAuto` and produce an approval row before any side effect.
-- For **browser** the trust currency shifts from "approval row decided ex ante" to "action-argument trail captured post-action." Each tool call writes its arguments (URL, element ref, typed text, key pressed) and outcome to the durable trace and audit log — enough to reconstruct what the agent did after the fact even though the in-turn accessibility snapshot itself is not persisted. Skipping the approval is acceptable *because* the action-argument trail is a reliable audit artifact.
-- `browser_upload_file` is the explicit exception. It can move workspace bytes to a remote endpoint, and the destination is not bounded by what the in-turn snapshot reveals (the upload may complete to a URL that isn't visible in the page tree at all). It stays approval-gated and continues to use `pendingOrAuto`.
+- For **browser** the trust currency shifts from "approval row decided ex ante" to "action-argument trail captured post-action." Each tool call writes its arguments (URL, element ref, typed text, key pressed) and outcome to the durable trace and audit log — enough to reconstruct what the agent did after the fact even though the in-turn accessibility snapshot itself is not persisted. Skipping the approval is acceptable *because* the action-argument trail is a reliable audit artifact, *and* because the action's effect is bounded by the page tree the user already approved opening.
+- **Two explicit exceptions stay approval-gated:**
+  - `browser_upload_file` can move workspace bytes to a remote endpoint, and the destination is not bounded by what the in-turn snapshot reveals (the upload may complete to a URL that isn't visible in the page tree at all). It continues to use `pendingOrAuto`.
+  - `browser_connect` is the moment Gini gains the ability to drive a browser session at all — it spawns a persistent Chrome with a per-instance profile dir, surfaces a desktop window, and creates the trust context every subsequent click/type relies on. Skipping consent at this moment would mean the "user already approved opening this window" predicate the action-argument-trail trust model rests on never gets established. It routes through `pendingOrAuto` with `action: "browser.connect"`; the approval card is rendered with a friendlier label ("Open a browser window") and uses the tool's required `reason` field as the body so the user knows *what* the window is for.
 
 This is the first surface in Gini's tool catalog where a medium-risk side effect lands without an approval row by *design*, rather than via the operator-opt-in `dangerouslyAutoApprove` bypass.
 
@@ -62,13 +64,14 @@ This is the first surface in Gini's tool catalog where a medium-risk side effect
 - `spawn_subagent`'s fallback when no `toolsets` argument is supplied matches.
 - The seven approval-skipping browser actions (`click`, `type`, `drag`, `select_option`, and the three `tabs` actions — open/switch/close) continue to emit accessibility-tree snapshots as their in-turn result payload. The durable audit trail records each action's arguments and outcome via the existing tool-call audit row; no separate `approval.requested` / `approval.approved` rows are produced.
 - `browser_upload_file` keeps the existing `pendingOrAuto` route and produces an approval row with the destination URL surfaced via `peekCurrentBrowserUrl(taskId)`.
+- `browser_connect` routes through `pendingOrAuto` with `action: "browser.connect"`. The policy seam intentionally lets the action fall through to `{ mode: "gate" }` under "auto" mode (rather than the auto-approve treatment given to `file.write` / `browser.upload_file`) so the user always sees the approval card on a fresh connect. Yolo mode still auto-approves, matching its existing semantics. The approval card uses a friendlier label rendered in the web UI; the tool's required `reason` parameter flows onto the approval row's `target` and `payload.reason` and is shown as the card body.
 
 ## Acceptance Checks
 
 - A fresh instance boot writes `state.toolsets[name="browser"].status === "enabled"`, `state.tools[toolset="browser"][*].status === "available"`, and `state.agents[id="agent_default"].toolsets` containing `"browser"`.
 - An instance whose `state.json` was written before this ADR landed boots cleanly, and after the first read `agent_default.toolsets` contains `"browser"`. `GET /api/status.activeAgent.toolsetFilter` includes `"browser"`.
 - A user-authored agent's `toolsets` list is unchanged across the migration (covered by `src/state/store.test.ts` "unions new default toolsets into existing agent_default without touching user-authored agents").
-- `browser_click` and `browser_type` produce a tool-call audit row but no `approval.requested` row; `browser_upload_file` still produces both an approval row and the file-write audit row when the operator approves.
+- `browser_click` and `browser_type` produce a tool-call audit row but no `approval.requested` row; `browser_upload_file` and `browser_connect` still produce both an approval row and a per-action audit row when the operator approves.
 - `POST /api/toolsets/browser/disable` flips `state.toolsets[name="browser"].status` to `"disabled"` and cascades to the tool rows.
 
 ## Consequences For Coding Agents

@@ -102,7 +102,7 @@ describe("normalizeState toolset/tool backfill", () => {
     const after = normalized.toolsets.find((ts) => ts.name === "browser")!;
     // toolNames is now the full default set, in stable order (old names
     // first, new names appended).
-    expect(after.toolNames.length).toBe(16);
+    expect(after.toolNames.length).toBe(17);
     for (const name of newerNames) {
       expect(after.toolNames.includes(name)).toBe(true);
     }
