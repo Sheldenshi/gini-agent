@@ -21,6 +21,7 @@ import {
   useInvalidate,
   useRenameChatSession
 } from "@/lib/queries";
+import { useChatReadState } from "@/lib/use-chat-read-state";
 import type { ChatMessage, ChatSession } from "@/lib/view-types";
 
 // Review P1 #3: waiting_approval is intentionally NOT terminal here. It's
@@ -79,6 +80,19 @@ export default function ChatPage() {
       (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt)
     );
   }, [sessions.data]);
+
+  const { isUnread, markRead } = useChatReadState(orderedSessions);
+
+  // Whenever the selected session's `updatedAt` advances (new message
+  // arrived while we're viewing it), mark it read so the indicator clears
+  // without requiring re-selection.
+  const selectedSession = useMemo(
+    () => orderedSessions.find((s) => s.id === selected) ?? null,
+    [orderedSessions, selected]
+  );
+  useEffect(() => {
+    if (selectedSession) markRead(selectedSession);
+  }, [selectedSession?.id, selectedSession?.updatedAt, selectedSession, markRead]);
 
   useEffect(() => {
     if (!selected && orderedSessions.length > 0) setSelected(orderedSessions[0]!.id);
@@ -245,6 +259,7 @@ export default function ChatPage() {
                     key={s.id}
                     session={s}
                     isActive={selected === s.id}
+                    isUnread={selected !== s.id && isUnread(s)}
                     onSelect={() => setSelected(s.id)}
                     onDelete={() => handleDelete(s.id)}
                     onRename={(title) => handleRename(s.id, title)}
