@@ -378,9 +378,15 @@ function migrateRecordAgentIds(state: RuntimeState): void {
   // with a literal "agent_default" id that no AgentRecord owns would
   // leave them attributed to a nonexistent agent. The seeding step in
   // normalizeState above ensures we never reach this branch in
-  // normal operation.
+  // normal operation. Defense in depth against a stale `activeAgentId`
+  // that the upstream repair missed: only honor it when it points at an
+  // existing agent; otherwise fall back to the first active / first
+  // existing agent rather than the dead id.
+  const knownActive = state.agents.some((agent) => agent.id === state.activeAgentId)
+    ? state.activeAgentId
+    : undefined;
   const defaultAgentId =
-    state.activeAgentId
+    knownActive
     ?? state.agents.find((agent) => agent.status === "active")?.id
     ?? state.agents[0]?.id;
   if (!defaultAgentId) return;
@@ -554,6 +560,14 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     state.agents = [defaultAgent(instance, now())];
   }
   state.activeAgentId ??= state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
+  // Repair: if `activeAgentId` references an agent the state file no longer
+  // contains (hand-edited file, partial restore, deleted-default edge), it
+  // would propagate the dead id through migrateRecordAgentIds. Re-anchor it
+  // to the first active / first existing agent so downstream readers and
+  // backfills see a real id.
+  if (!state.agents.some((agent) => agent.id === state.activeAgentId)) {
+    state.activeAgentId = state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
+  }
   // Phase C — per-agent memory isolation backfill. Runs after agents are
   // present so the migration can stamp the right id. Both helpers are
   // idempotent so a re-read of an already-migrated state file is a no-op.
