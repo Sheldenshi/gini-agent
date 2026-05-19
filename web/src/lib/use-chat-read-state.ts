@@ -4,10 +4,48 @@ import { useCallback, useEffect, useSyncExternalStore } from "react";
 import type { ChatSession } from "./view-types";
 
 // Per-browser tracking of when the user last viewed each chat session.
-// A session is "unread" when its `updatedAt` is newer than `lastReadAt`.
-// State lives in localStorage so it survives reloads but is intentionally
-// per-device — read state on the runtime would require a multi-client sync
-// model the gateway doesn't have yet.
+// A session is "unread" when its activity timestamp is newer than the
+// stored lastRead. State lives in localStorage so it survives reloads
+// but is intentionally per-device — runtime-side read state would
+// require a multi-client sync model the gateway doesn't have yet.
+//
+// Activity timestamp is the max of `session.updatedAt` and the latest
+// terminal-run `updatedAt`. The list endpoint reports session.updatedAt
+// at message-persistence time, but messages are only materialized when
+// the user is actively viewing the chat. A run's updatedAt advances on
+// status transitions (including completion) regardless of who's
+// watching, so checking terminal-run timestamps catches the case where
+// the user clicked away mid-stream and the assistant reply finished
+// while another chat was on screen.
+
+const TERMINAL_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "completed",
+  "failed",
+  "cancelled"
+]);
+
+// The list endpoint enriches each ChatSessionRecord with `runs`. The
+// shared ChatSession type doesn't reflect that, so we narrow locally
+// to just the fields we read.
+interface SessionLikeRun {
+  status: string;
+  updatedAt: string;
+}
+interface SessionLike {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  runs?: SessionLikeRun[];
+}
+
+function activityAt(session: SessionLike): string {
+  let max = session.updatedAt ?? session.createdAt;
+  for (const run of session.runs ?? []) {
+    if (!TERMINAL_RUN_STATUSES.has(run.status)) continue;
+    if (run.updatedAt > max) max = run.updatedAt;
+  }
+  return max;
+}
 
 const STORAGE_KEY = "gini.chat.lastRead";
 const INIT_FLAG_KEY = "gini.chat.lastRead.init";
@@ -82,20 +120,24 @@ export function useChatReadState(sessions: ChatSession[] | undefined) {
   // seed read timestamps for every existing session so they don't all
   // flash unread on first load after the feature ships. Sessions that
   // arrive after init has run will correctly default to unread.
+  //
+  // `sessions === undefined` means the chat-list query hasn't resolved
+  // yet — wait, otherwise we'd flip `initialized` to true with an empty
+  // map and treat every real session that arrives later as unread.
   useEffect(() => {
     if (typeof window === "undefined") return;
-    if (!sessions) return;
+    if (sessions === undefined) return;
     const current = getState();
     if (current.initialized) return;
     const map: ReadMap = { ...current.map };
     for (const s of sessions) {
-      if (!map[s.id]) map[s.id] = s.updatedAt ?? s.createdAt;
+      if (!map[s.id]) map[s.id] = activityAt(s as SessionLike);
     }
     setState({ map, initialized: true });
   }, [sessions]);
 
   const markRead = useCallback((session: ChatSession) => {
-    const at = session.updatedAt ?? session.createdAt;
+    const at = activityAt(session as SessionLike);
     const current = getState();
     if (current.map[session.id] === at) return;
     setState({
@@ -107,7 +149,7 @@ export function useChatReadState(sessions: ChatSession[] | undefined) {
   const isUnread = useCallback(
     (session: ChatSession) => {
       if (!state.initialized) return false;
-      const at = session.updatedAt ?? session.createdAt;
+      const at = activityAt(session as SessionLike);
       const seen = state.map[session.id];
       if (!seen) return true;
       return at > seen;
@@ -115,5 +157,9 @@ export function useChatReadState(sessions: ChatSession[] | undefined) {
     [state]
   );
 
-  return { isUnread, markRead };
+  // Expose activityAt so callers can wire it into effect dependencies —
+  // markRead should re-fire when the selected session's activity
+  // timestamp advances (e.g., its task finishes while it's open),
+  // not just when `session.updatedAt` does.
+  return { isUnread, markRead, activityAt: (session: ChatSession) => activityAt(session as SessionLike) };
 }

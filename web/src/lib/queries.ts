@@ -187,7 +187,11 @@ export function useChatSessions() {
   return useQuery<ChatSession[]>({
     queryKey: ["chat"],
     queryFn: () => api<ChatSession[]>("/chat"),
-    refetchInterval: 60_000
+    // 3s safety net so the sidebar's read/unread indicator picks up
+    // task completions even when an SSE event for the change is missed
+    // or arrives without invalidating ["chat"]. SSE is still the
+    // primary signal — the interval just bounds the worst case.
+    refetchInterval: 3000
   });
 }
 

@@ -81,18 +81,22 @@ export default function ChatPage() {
     );
   }, [sessions.data]);
 
-  const { isUnread, markRead } = useChatReadState(orderedSessions);
+  // Pass the raw query data — `undefined` lets the read-state hook
+  // distinguish "list not loaded yet" from "list loaded with zero
+  // sessions", which matters for the one-time first-run seeding.
+  const { isUnread, markRead, activityAt } = useChatReadState(sessions.data);
 
-  // Whenever the selected session's `updatedAt` advances (new message
-  // arrived while we're viewing it), mark it read so the indicator clears
-  // without requiring re-selection.
+  // Whenever the selected session's activity advances (new message or
+  // a task on the session finishes while we're viewing it), mark it
+  // read so the indicator clears without requiring re-selection.
   const selectedSession = useMemo(
     () => orderedSessions.find((s) => s.id === selected) ?? null,
     [orderedSessions, selected]
   );
+  const selectedActivityAt = selectedSession ? activityAt(selectedSession) : null;
   useEffect(() => {
     if (selectedSession) markRead(selectedSession);
-  }, [selectedSession?.id, selectedSession?.updatedAt, selectedSession, markRead]);
+  }, [selectedSession?.id, selectedActivityAt, selectedSession, markRead]);
 
   useEffect(() => {
     if (!selected && orderedSessions.length > 0) setSelected(orderedSessions[0]!.id);
