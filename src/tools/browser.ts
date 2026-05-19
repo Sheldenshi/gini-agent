@@ -33,7 +33,7 @@ import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types"
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
 // and cookies here; the directory survives Connect/Disconnect cycles and
-// runtime restarts. Wiped only by the explicit wipe-profile action.
+// runtime restarts. Removing it requires deleting the directory manually.
 export function chromeProfileDirFor(instance: Instance): string {
   return join(instanceRoot(instance), "chrome-profile");
 }
@@ -529,8 +529,8 @@ async function closeSession(taskId: string): Promise<void> {
   // zero. The persistent context is cheap to keep alive idle (Chromium
   // sleeps when no pages are active) and re-launching it on the next
   // tool call would be more disruptive than the idle process is.
-  // Explicit Connect/Disconnect and the wipe-profile action are the only
-  // paths that tear down the shared handle.
+  // Explicit Connect/Disconnect is the only path that tears down the
+  // shared handle.
 }
 
 // Drop the in-process Playwright handle without killing the underlying
@@ -626,10 +626,9 @@ export async function disconnectSharedBrowser(): Promise<void> {
 }
 
 // Run `fn` with the disconnect admission gate held closed for the entire
-// duration. Used by browser-connect's launchManaged and wipeBrowserProfile
-// to guarantee that no new agent tool call can land between the
-// disconnect-then-launch (or disconnect-then-rm) steps in their critical
-// section.
+// duration. Used by browser-connect's launchManaged to guarantee that no
+// new agent tool call can land between the disconnect-then-launch steps
+// in its critical section.
 //
 // Without this lock, the disconnectSharedBrowser-internal generation bump
 // only blocks new admissions while disconnect itself is running. As soon
