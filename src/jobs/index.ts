@@ -44,7 +44,27 @@ function assertNonNegativeInt(label: string, value: unknown): number {
   return num;
 }
 
-export async function createScheduledJob(config: RuntimeConfig, input: Record<string, unknown>) {
+export interface CreateScheduledJobOptions {
+  // Trusted attribution override. Only internal callers (the in-task
+  // `create_job` tool, `applyImprovement`) thread the originating agent
+  // here so the new job inherits from the record that requested it rather
+  // than whichever agent happens to be active at this exact tick. The HTTP
+  // path never sets this — public clients must not be able to spoof
+  // `agentId` through the request body.
+  originatingAgentId?: string;
+}
+
+export async function createScheduledJob(
+  config: RuntimeConfig,
+  input: Record<string, unknown>,
+  options: CreateScheduledJobOptions = {}
+) {
+  // Strip any `agentId` the caller pasted into the public input bag. Trust
+  // only the typed `options.originatingAgentId` and the runtime's active
+  // agent fallback below.
+  if ("agentId" in input) {
+    delete (input as Record<string, unknown>).agentId;
+  }
   // Cron-vs-interval mutual exclusion. A job is driven by EITHER a 5-field
   // Unix cron expression (wall-clock + per-job IANA timezone) OR an
   // interval-from-now (`intervalSeconds`). Reject payloads that explicitly
@@ -223,14 +243,13 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     // future fires post into the fresh thread.
     const effective = resolveEffectiveContext(state, config);
     // Callers driven by a record stamped at an earlier moment (e.g. a
-    // running task's `create_job` tool) may override the active-agent
-    // attribution so the new job belongs to the originating agent rather
-    // than whichever agent is active at this exact tick.
-    const overrideAgentId =
-      typeof input.agentId === "string" && input.agentId.length > 0
-        ? input.agentId
-        : undefined;
-    const owningAgentId = overrideAgentId ?? effective.agentId;
+    // running task's `create_job` tool) thread the originating agent
+    // through the trusted `options.originatingAgentId` parameter so the
+    // new job belongs to the originating agent rather than whichever
+    // agent is active at this exact tick. The HTTP path never sets it —
+    // see the input-sanitization guard at the top of the function for
+    // why we can't read `agentId` off the caller-supplied payload.
+    const owningAgentId = options.originatingAgentId ?? effective.agentId;
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
       const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId);
