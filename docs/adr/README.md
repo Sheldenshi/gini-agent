@@ -10,7 +10,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Agent Loop With Native Tool Calling](agent-loop-tool-calling.md)
 - [Subagent Delegation](subagent-delegation.md)
 - [Agents Replace Profiles And Drive Runtime Behavior](agents-replace-profiles.md)
-- [dangerouslyAutoApprove](dangerously-auto-approve.md)
+- [Approval Mode (three-state policy)](approval-mode.md) — supersedes [dangerouslyAutoApprove](dangerously-auto-approve.md)
 - [Per-Agent Memory Isolation](agent-memory-isolation.md)
 - [Connector Secret Storage](connector-secret-storage.md)
 - [Skills As Packages, Connectors As Credentials](skills-and-connectors.md)

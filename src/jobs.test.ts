@@ -567,6 +567,87 @@ describe("cron lifecycle", () => {
     expect(readState(config.instance).jobs).toHaveLength(0);
   });
 
+  test("create_job dispatch accepts approvalMode and persists it", async () => {
+    const config = testConfig("jobs-create-tool-approval-mode");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_mode",
+      JSON.stringify({
+        name: "mode-job",
+        intervalSeconds: 60,
+        prompt: "x",
+        approvalMode: "yolo"
+      })
+    );
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.approvalMode).toBe("yolo");
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "job.created" && event.target === jobs[0]!.id
+    );
+    expect(audit?.evidence?.approvalMode).toBe("yolo");
+  });
+
+  test("create_job dispatch rejects invalid approvalMode value", async () => {
+    const config = testConfig("jobs-create-tool-bad-mode");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "create_job",
+        "call_bad_mode",
+        JSON.stringify({ name: "bad", intervalSeconds: 60, prompt: "x", approvalMode: "loose" })
+      )
+    ).rejects.toThrow(/approvalMode must be one of/);
+    expect(readState(config.instance).jobs).toHaveLength(0);
+  });
+
+  test("create_job dispatch accepts both approvalMode and legacy dangerouslyAutoApprove (alias)", async () => {
+    // Both fields are accepted on the same payload. approvalMode is
+    // the canonical signal; the legacy flag is preserved on the
+    // JobRecord as a deprecated alias.
+    const config = testConfig("jobs-create-tool-both-fields");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "create_job",
+      "call_both",
+      JSON.stringify({
+        name: "both-fields",
+        intervalSeconds: 60,
+        prompt: "x",
+        approvalMode: "yolo",
+        dangerouslyAutoApprove: true
+      })
+    );
+
+    const jobs = readState(config.instance).jobs;
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.approvalMode).toBe("yolo");
+    expect(jobs[0]?.dangerouslyAutoApprove).toBe(true);
+  });
+
   test("create_job dispatch persists cronExpression + cronTimezone", async () => {
     // Happy-path cron creation through the tool dispatch surface. The
     // agent should be able to schedule a wall-clock job by name +

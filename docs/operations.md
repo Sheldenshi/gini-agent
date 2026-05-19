@@ -158,31 +158,39 @@ restart `gini run` (stop the tmux session and re-issue the command).
 
 ## Approval Settings
 
-Two approval-bypass controls live behind the same endpoint
-(`/api/settings/auto-approve`):
+Controls live behind a single endpoint (`/api/settings/auto-approve`):
+
+- **`approvalMode`** — `"strict" | "auto" | "yolo"`. New instances
+  default to `"auto"`. `strict` gates every approval-eligible action
+  (`file_write`, `file_patch`, `terminal_exec`, `code_exec`,
+  `browser_upload_file`) for a human decision. `auto` auto-approves
+  the safe set and gates `terminal_exec` / `code_exec` only when the
+  command matches a dangerous-pattern entry. `yolo` bypasses every
+  gate. See [ADR approval-mode.md](adr/approval-mode.md) for the
+  full contract.
 
 - **`autoApproveCommands` (shell-glob allowlist for `terminal_exec`).**
   Skip the human gate for specific shell commands the agent runs.
   Patterns are anchored on both ends (so `memo *` matches `memo notes
   -a` but NOT `rm -rf / && memo notes`); `*` and `?` use standard glob
-  semantics, everything else is a literal match. Auto-approved
-  commands still write a high-risk `terminal.exec` audit row with
+  semantics, everything else is a literal match. An allowlist match
+  ALWAYS short-circuits the dangerous-pattern blocklist — explicit
+  operator allow beats heuristic block. Auto-approved commands still
+  write a high-risk `terminal.exec` audit row with
   `evidence.autoApproved=true` and
   `evidence.autoApprovedReason=<pattern>`.
 
-- **`dangerouslyAutoApprove` (global bypass for every approval-gated
-  tool).** When `true`, every approval-gated tool —
-  `file_write`, `file_patch`, `terminal_exec`, `code_exec`,
-  `browser_upload_file` — auto-resolves through the same approval and
-  audit pipeline as a human-approved call, with
-  `evidence.autoApprovedReason="dangerouslyAutoApprove"` stamped on
-  both the `approval.approved` audit row and the per-action audit
-  row. Applies to both the chat-task dispatcher (`POST /api/chat/<id>/messages`)
-  and the legacy imperative dispatcher (`POST /api/tasks`, `gini task
-  submit`). Default is `false`. Intended for operator-controlled local dev loops
-  only — there is no human review for any side effect when this is
-  on. See [ADR dangerously-auto-approve.md](adr/dangerously-auto-approve.md) for the
-  full design and audit contract.
+- **`dangerousTerminalPatterns`** — optional operator overlay that
+  EXTENDS the built-in dangerous-pattern blocklist for `approvalMode:
+  "auto"`. The built-ins (`rm -rf /` against system paths, any
+  `sudo`, pipe-to-shell, `chmod 777`, destructive git, writes to
+  `/etc/` and friends) always apply; operator entries add to them.
+  An empty list keeps the built-ins. Only consulted in `"auto"` mode.
+
+- **`dangerouslyAutoApprove`** — deprecated read alias for
+  `approvalMode === "yolo"`. Returned as a derived boolean on GET;
+  accepted on PATCH as a one-shot alias (`true` → `"yolo"`, `false`
+  → `"auto"`). New configuration should prefer `approvalMode`.
 
 Read current settings:
 
@@ -198,16 +206,16 @@ curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/js
   http://127.0.0.1:7337/api/settings/auto-approve
 ```
 
-Toggle the global bypass:
+Switch modes:
 
 ```sh
 curl -X PATCH -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
-  -d '{"dangerouslyAutoApprove": true}' \
+  -d '{"approvalMode": "yolo"}' \
   http://127.0.0.1:7337/api/settings/auto-approve
 ```
 
-Both fields can be set in a single PATCH and either is optional;
-omitted keys keep their current value. The endpoint persists to
+Any subset of fields can be set in a single PATCH; omitted keys keep
+their current value. The endpoint persists to
 `~/.gini/instances/<instance>/config.json` in one write and takes
 effect immediately for new tool dispatches.
 

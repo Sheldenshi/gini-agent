@@ -27,6 +27,7 @@ import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
 import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilities/subagents";
 import { matchAutoApprove } from "./auto-approve";
+import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
 import { riskForAction } from "./tool-risk";
@@ -145,15 +146,20 @@ export async function dispatchToolCall(
       // Uploading a workspace file egresses bytes to a remote site —
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
-      return pendingOrAuto(config, () => requestBrowserUpload(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
     case "file_write":
-      return pendingOrAuto(config, () => requestFileWrite(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.write", undefined, (reason) => requestFileWrite(config, taskId, toolCallId, args, reason));
     case "file_patch":
-      return pendingOrAuto(config, () => requestFilePatch(config, taskId, toolCallId, args));
+      return pendingOrAuto(config, "file.patch", undefined, (reason) => requestFilePatch(config, taskId, toolCallId, args, reason));
     case "terminal_exec":
       return terminalExecDispatch(config, taskId, toolCallId, args);
     case "code_exec":
-      return pendingOrAuto(config, () => requestCodeExec(config, taskId, toolCallId, args));
+      // code_exec compiles to a terminal command. Route through the
+      // policy seam as terminal.exec so dangerous-pattern matching
+      // applies uniformly (a code snippet that shells out to `sudo`
+      // gets gated the same way a terminal_exec would). The
+      // `command` field on the payload is what the policy inspects.
+      return codeExecDispatch(config, taskId, toolCallId, args);
     default:
       throw new Error(`Unknown tool: ${toolName}`);
   }
@@ -668,6 +674,13 @@ async function createJobTool(
     }
     dangerouslyAutoApprove = args.dangerouslyAutoApprove;
   }
+  let approvalMode: "strict" | "auto" | "yolo" | undefined;
+  if (args.approvalMode !== undefined && args.approvalMode !== null) {
+    if (args.approvalMode !== "strict" && args.approvalMode !== "auto" && args.approvalMode !== "yolo") {
+      throw new Error("Invalid input: approvalMode must be one of \"strict\" | \"auto\" | \"yolo\".");
+    }
+    approvalMode = args.approvalMode;
+  }
   let autoApproveCommands: string[] | undefined;
   if (args.autoApproveCommands !== undefined && args.autoApproveCommands !== null) {
     if (!Array.isArray(args.autoApproveCommands)) {
@@ -684,6 +697,23 @@ async function createJobTool(
       cleaned.push(entry);
     }
     autoApproveCommands = cleaned;
+  }
+  let dangerousTerminalPatterns: string[] | undefined;
+  if (args.dangerousTerminalPatterns !== undefined && args.dangerousTerminalPatterns !== null) {
+    if (!Array.isArray(args.dangerousTerminalPatterns)) {
+      throw new Error("Invalid input: dangerousTerminalPatterns must be an array of strings.");
+    }
+    const cleaned: string[] = [];
+    for (const entry of args.dangerousTerminalPatterns) {
+      if (typeof entry !== "string") {
+        throw new Error("Invalid input: dangerousTerminalPatterns entries must be strings.");
+      }
+      if (entry.length === 0) {
+        throw new Error("Invalid input: dangerousTerminalPatterns entries must be non-empty strings.");
+      }
+      cleaned.push(entry);
+    }
+    dangerousTerminalPatterns = cleaned;
   }
   let timeoutSeconds: number | undefined;
   if (args.timeoutSeconds !== undefined && args.timeoutSeconds !== null) {
@@ -750,7 +780,9 @@ async function createJobTool(
       oneShot,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       timeoutSeconds
     });
   } catch (err) {
@@ -781,7 +813,9 @@ async function createJobTool(
         chatSessionId,
         jobId: job.id,
         dangerouslyAutoApprove,
+        approvalMode,
         autoApproveCommands,
+        dangerousTerminalPatterns,
         timeoutSeconds
       }
     });
@@ -799,7 +833,9 @@ async function createJobTool(
       oneShot,
       chatSessionId,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       timeoutSeconds
     }
   });
@@ -1207,7 +1243,8 @@ async function requestFileWrite(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const target = requireString(args, "path");
   const content = requireString(args, "content");
@@ -1228,7 +1265,7 @@ async function requestFileWrite(
       action: "file.write",
       target,
       risk: "high",
-      reason: "File writes are side effects and require explicit approval.",
+      reason: reasonOverride ?? "File writes are side effects and require explicit approval.",
       payload: { path: target, content, toolCallId }
     });
     item.approvalIds.push(approval.id);
@@ -1252,7 +1289,8 @@ async function requestBrowserUpload(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const ref = requireString(args, "ref");
   const userPath = requireString(args, "path");
@@ -1277,7 +1315,7 @@ async function requestBrowserUpload(
       action: "browser.upload_file",
       target: resolved.displayPath,
       risk: "high",
-      reason: "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
+      reason: reasonOverride ?? "Uploading a workspace file to a remote site is a side effect and requires explicit approval.",
       payload: {
         ref,
         path: userPath,
@@ -1301,7 +1339,8 @@ async function requestFilePatch(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  reasonOverride?: string
 ): Promise<string> {
   const target = requireString(args, "path");
   const oldText = requireString(args, "oldText");
@@ -1321,7 +1360,7 @@ async function requestFilePatch(
       action: "file.patch",
       target,
       risk: "high",
-      reason: "File patches are side effects and require explicit approval.",
+      reason: reasonOverride ?? "File patches are side effects and require explicit approval.",
       payload: {
         path: target,
         oldText,
@@ -1343,15 +1382,14 @@ async function requestFilePatch(
   });
 }
 
-// Routes a terminal command to either:
-//   1. Allowlist fast-path: `RuntimeConfig.autoApproveCommands` matched the
-//      command, so we run it via `runTerminalCommand` without an approval
-//      row. The audit trail records `evidence.autoApproved=true,
-//      autoApprovedReason=<matched pattern>` on the side-effect audit row.
-//   2. Standard flow: create a pending approval and let the chat-task loop
-//      pause. `pendingOrAuto` may immediately resolve it through
-//      `resolveApproval` when `RuntimeConfig.dangerouslyAutoApprove` is on,
-//      in which case the full approval row + audit pair is still produced.
+// Routes a terminal command through the approval-policy seam.
+//
+// The allowlist fast-path stays as a no-approval-row optimization for
+// commands matched by `RuntimeConfig.autoApproveCommands`: those
+// execute directly via `runTerminalCommand` with the matched pattern
+// stamped on the side-effect audit row. Everything else goes through
+// `pendingOrAuto`, which consults `resolveApprovalPolicy` to decide
+// auto-approve vs gate per the active approval mode.
 async function terminalExecDispatch(
   config: RuntimeConfig,
   taskId: string,
@@ -1388,7 +1426,38 @@ async function terminalExecDispatch(
     return { kind: "sync", result: result.summary };
   }
 
-  return pendingOrAuto(config, () => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty));
+  return pendingOrAuto(
+    config,
+    "terminal.exec",
+    { command },
+    (reason) => requestTerminalExec(config, taskId, toolCallId, command, timeoutMs, pty, reason)
+  );
+}
+
+// code_exec compiles a snippet to a shell command. Route through the
+// policy seam as `code.exec` so the dangerous-pattern blocklist runs
+// against BOTH the wrapper command AND the raw source. An argv-style
+// payload like `Bun.spawn(["sudo", "apt"])` is invisible to a
+// substring check against the wrapper alone (the wrapper contains
+// `"sudo"` without the trailing space the literal substring needed);
+// checking the source directly closes the hole. The persisted
+// approval row's action stays `terminal.exec` (it really runs as one)
+// — only the policy decision branches separately.
+async function codeExecDispatch(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const language = requireString(args, "language");
+  const code = requireString(args, "code");
+  const command = codeExecutionCommand(language, code);
+  return pendingOrAuto(
+    config,
+    "code.exec",
+    { command, source: code, language },
+    (reason) => requestCodeExecPrebuilt(config, taskId, toolCallId, language, command, code, reason)
+  );
 }
 
 async function requestTerminalExec(
@@ -1397,7 +1466,8 @@ async function requestTerminalExec(
   toolCallId: string,
   command: string,
   timeoutMs: number,
-  pty: boolean
+  pty: boolean,
+  reasonOverride?: string
 ): Promise<string> {
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
@@ -1409,7 +1479,7 @@ async function requestTerminalExec(
       action: "terminal.exec",
       target: command,
       risk: "high",
-      reason: "Terminal execution can change the system and requires explicit approval.",
+      reason: reasonOverride ?? "Terminal execution can change the system and requires explicit approval.",
       payload: { command, timeoutMs, pty, toolCallId }
     });
     item.approvalIds.push(approval.id);
@@ -1423,15 +1493,15 @@ async function requestTerminalExec(
   });
 }
 
-async function requestCodeExec(
+async function requestCodeExecPrebuilt(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  language: string,
+  command: string,
+  source: string,
+  reasonOverride?: string
 ): Promise<string> {
-  const language = requireString(args, "language");
-  const code = requireString(args, "code");
-  const command = codeExecutionCommand(language, code);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -1442,8 +1512,12 @@ async function requestCodeExec(
       action: "terminal.exec",
       target: `code.${language}`,
       risk: "high",
-      reason: "Code execution can change the system and requires explicit approval.",
-      payload: { command, timeoutMs: 10_000, toolCallId, language }
+      reason: reasonOverride ?? "Code execution can change the system and requires explicit approval.",
+      // `source` on the payload is the contract that lets the
+      // policy seam (re-)resolve this as code.exec instead of
+      // terminal.exec — the matcher then scans the raw source so
+      // argv-style payloads can't slip past a wrapper-only check.
+      payload: { command, timeoutMs: 10_000, toolCallId, language, source }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
@@ -1467,23 +1541,34 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 
 // ---------------- pendingOrAuto ----------------
 //
-// Single-point wrapper for every approval-gated tool. When
-// `RuntimeConfig.dangerouslyAutoApprove` is off this is a no-op and we
-// return the pending approval as usual so the chat-task loop pauses for
-// the human gate. When on, the freshly-created approval is immediately
-// resolved through the same `resolveApproval` -> `executeApprovedAction`
-// path that user-driven approvals take, so approval creation, the approve
-// audit row, the per-action side-effect audit, and the tool result string
-// all live in one canonical place (agent.ts) instead of being duplicated
-// here per action. Each side effect still emits a fully populated
-// approval row (status=approved, evidence.autoApproved=true,
-// autoApprovedReason="dangerouslyAutoApprove") and audit row, so the
-// reviewer sees an identical trail to a normal flow except for that
-// marker.
+// Single-point wrapper for every approval-gated tool. Consults
+// `resolveApprovalPolicy(config, action, payload)` to decide whether
+// the approval should pause for a human gate (`mode: "gate"`) or
+// auto-resolve through the same
+// `resolveApproval` -> `executeApprovedAction` pipeline a human
+// approval would take (`mode: "auto"`). Approval creation, the
+// approve audit row, the per-action side-effect audit, and the tool
+// result string all live in one canonical place (agent.ts) instead
+// of being duplicated per action. Each auto-resolved side effect
+// still emits a fully populated approval row (status=approved,
+// evidence.autoApproved=true, autoApprovedReason=<policy reason>)
+// and a side-effect audit row, so the reviewer sees an identical
+// trail to a normal flow except for the marker.
 async function pendingOrAuto(
   config: RuntimeConfig,
-  request: () => Promise<string>
+  action: PolicyAction,
+  payload: { command: string; source?: string; language?: string } | undefined,
+  request: (reasonOverride?: string) => Promise<string>
 ): Promise<DispatchResult> {
+  // Compute the policy decision BEFORE creating the approval so the
+  // gate reason (`dangerous-pattern: <id>`) can flow into the
+  // approval row's `reason` field. Without this, operators see only
+  // the generic per-action copy ("Terminal execution can change the
+  // system...") on the approval card and lose the matched-pattern
+  // signal entirely.
+  const decision = resolveApprovalPolicy(config, action, payload);
+  const reasonOverride = decision.mode === "gate" ? decision.reason : undefined;
+
   // The `await request()` MUST live inside a try/catch so a
   // `TaskAlreadyTerminalError` raised by the request helper
   // (request* helpers refuse to create an approval against an
@@ -1494,7 +1579,7 @@ async function pendingOrAuto(
   // — request* helpers throw the task-terminal variant instead.
   let approvalId: string;
   try {
-    approvalId = await request();
+    approvalId = await request(reasonOverride);
   } catch (err) {
     if (err instanceof TaskAlreadyTerminalError) {
       return { kind: "sync", result: `Action skipped: task was already ${err.status} when the request reached the runtime.` };
@@ -1504,12 +1589,12 @@ async function pendingOrAuto(
     }
     throw err;
   }
-  if (!config.dangerouslyAutoApprove) return { kind: "pending", approvalId };
+  if (decision.mode === "gate") return { kind: "pending", approvalId };
   try {
     const { approval, toolResult } = await resolveApproval(config, approvalId, {
       actor: "runtime",
       resumeChatTask: false,
-      evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
+      evidenceExtra: { autoApproved: true, autoApprovedReason: decision.reason }
     });
     // `executeApprovedAction`'s guard can flip the approval from
     // `approved` back to `denied` (the

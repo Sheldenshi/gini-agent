@@ -236,7 +236,12 @@ export function defaultConfig(instance: Instance): RuntimeConfig {
     },
     workspaceRoot: workspaceDir(instance),
     stateRoot: instanceRoot(instance),
-    logRoot: logDir(instance)
+    logRoot: logDir(instance),
+    // New instances default to "auto": auto-approve safe actions, gate
+    // dangerous terminal patterns. See ADR approval-mode.md. Legacy
+    // configs with `dangerouslyAutoApprove: true` are aliased to "yolo"
+    // at load time by `runtime/index.ts`.
+    approvalMode: "auto"
   };
 }
 
@@ -257,6 +262,30 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   }
 
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
+  // Don't let the `defaultConfig` spread below stamp `approvalMode:
+  // "auto"` onto a legacy config that carries `dangerouslyAutoApprove:
+  // true` without an explicit `approvalMode`. Leaving the field
+  // undefined here is what lets the install-time migration shim
+  // detect "this is a pre-flip config" and alias it to "yolo".
+  // Synthesizing a `defaultConfig` without `approvalMode` for the
+  // legacy case keeps the legacy detection working without changing
+  // any other default.
+  const defaults = defaultConfig(instance);
+  const isLegacyDangerousFile = parsed.approvalMode === undefined && parsed.dangerouslyAutoApprove === true;
+  if (isLegacyDangerousFile) {
+    delete (defaults as { approvalMode?: unknown }).approvalMode;
+  }
+  // Pre-flip existing instance: on-disk config has neither
+  // `approvalMode` nor `dangerouslyAutoApprove`. Pre-flip, this
+  // instance's effective behavior was "gate everything"; post-flip,
+  // the merged defaults stamp `approvalMode: "auto"` and the
+  // effective behavior silently changes to "auto-approve safe
+  // actions". Emit a one-time `config.migrated` audit row marking
+  // that change. We propagate the signal to `install()` via a
+  // Symbol-keyed marker so it survives in-memory but does NOT get
+  // serialized to disk (JSON.stringify skips symbol-keyed props).
+  const isPreFlipExistingFile =
+    parsed.approvalMode === undefined && parsed.dangerouslyAutoApprove === undefined;
   const persistedRoot = parsed.workspaceRoot ? resolve(parsed.workspaceRoot) : "";
   const repoRoot = projectRoot();
   // Detect persisted paths from any pre-`instances/` layout. Three predecessor
@@ -274,13 +303,31 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   const needsRewrite = persistedIsOldBare || persistedIsOldLanes || persistedIsRepoRoot || !persistedRoot;
   const migratedWorkspaceRoot = needsRewrite ? workspaceDir(instance) : persistedRoot;
   const merged: RuntimeConfig = {
-    ...defaultConfig(instance),
+    ...defaults,
     ...parsed,
     instance,
     workspaceRoot: migratedWorkspaceRoot,
     stateRoot: instanceRoot(instance),
     logRoot: logDir(instance)
   };
+  if (isPreFlipExistingFile) {
+    // Symbol key so the marker survives in-memory for `install()` to
+    // consult but is dropped by JSON.stringify (it skips symbol keys)
+    // so it never lands on disk.
+    (merged as unknown as Record<symbol, unknown>)[PRE_FLIP_MIGRATION_MARKER] = true;
+  }
   if (needsRewrite) writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`);
   return merged;
+}
+
+// Transient marker stamped onto a freshly-loaded config when the
+// on-disk file predates the approval-mode default flip (file exists
+// but carries neither `approvalMode` nor `dangerouslyAutoApprove`).
+// `install()` reads this to emit the one-time `config.migrated`
+// audit row. Symbol keys are non-enumerable by default for
+// JSON.stringify so the marker never lands on disk.
+export const PRE_FLIP_MIGRATION_MARKER = Symbol.for("gini.preFlipApprovalMigration");
+
+export function hasPreFlipMigrationMarker(config: RuntimeConfig): boolean {
+  return (config as unknown as Record<symbol, unknown>)[PRE_FLIP_MIGRATION_MARKER] === true;
 }

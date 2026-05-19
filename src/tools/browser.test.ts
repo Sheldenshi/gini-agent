@@ -1765,7 +1765,11 @@ describe("dispatchToolCall(browser_upload_file)", () => {
       provider: { name: "echo", model: "gini-echo-v0" },
       workspaceRoot: WORKSPACE,
       stateRoot: `${ROOT}/instances/${instance}`,
-      logRoot: `${ROOT}-logs/${instance}`
+      logRoot: `${ROOT}-logs/${instance}`,
+      // The test asserts the gated path (kind: "pending"). Force
+      // strict so the new default-auto policy doesn't auto-resolve
+      // the upload approval.
+      approvalMode: "strict"
     };
   }
 

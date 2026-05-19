@@ -444,7 +444,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "create_job",
-      description: "Schedule a recurring or one-shot job that runs a prompt. The job's response is delivered as an assistant message back to this chat session when it fires. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `autoApproveCommands` for the shell patterns it will need to run, or `dangerouslyAutoApprove: true` for tasks that need broad action — otherwise the job will stall at the first approval gate forever. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
+      description: "Schedule a recurring or one-shot job that runs a prompt. The job's response is delivered as an assistant message back to this chat session when it fires. Provide EITHER `intervalSeconds` OR `cronExpression` (with `cronTimezone`), never both. Use `intervalSeconds` for 'in N minutes' or 'every N hours' (from-now timing). Use `cronExpression` + `cronTimezone` for wall-clock or weekday patterns ('daily at 9am', 'weekdays at 8:30'). Set oneShot=true for single-fire reminders. When a scheduled job needs to run UNATTENDED (e.g. recurring with no human present at fire-time), set `approvalMode: \"yolo\"` for tasks that need broad action, or use `autoApproveCommands` for narrow shell-pattern opt-ins — otherwise the job may stall at a gated approval forever (the instance default is \"auto\", which auto-approves file writes and safe shell commands but still gates dangerous patterns like rm -rf, sudo, pipe-to-sh, chmod 777, and destructive git operations). `dangerouslyAutoApprove: true` is a deprecated alias for `approvalMode: \"yolo\"` kept for back-compat. The default `timeoutSeconds` is 600 (10 min) — drop it lower for trivial reminders, or raise it (e.g. 1800+) when the prompt invokes external CLIs like codex or claude-code that can take several minutes.",
       parameters: {
         type: "object",
         properties: {
@@ -463,11 +463,21 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
           autoApproveCommands: {
             type: "array",
             items: { type: "string" },
-            description: "Shell command patterns that auto-approve without asking the user at fire-time. Use when the job must act unattended. Examples: 'git *', 'gh *', 'cd *', 'ls *', 'rg *'. Patterns are matched against the full command string; only add patterns that match the user's stated intent for the job."
+            description: "Shell command patterns that auto-approve without asking the user at fire-time. Always wins over the dangerous-pattern blocklist when matched (explicit operator allow beats heuristic block). Use when the job must act unattended on specific commands. Examples: 'git *', 'gh *', 'cd *', 'ls *', 'rg *'. Patterns are matched against the full command string; only add patterns that match the user's stated intent for the job."
+          },
+          approvalMode: {
+            type: "string",
+            enum: ["strict", "auto", "yolo"],
+            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" (instance default) auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
+          },
+          dangerousTerminalPatterns: {
+            type: "array",
+            items: { type: "string" },
+            description: "Override the dangerous-pattern blocklist for this job's spawned tasks. Each entry is a substring matched against the command string. Only consulted when approvalMode is \"auto\". When omitted, the built-in defaults apply (rm -rf to absolute paths, sudo, pipe-to-sh, chmod 777, destructive git operations, writes to /etc/, ~/.ssh/, ~/.aws/)."
           },
           dangerouslyAutoApprove: {
             type: "boolean",
-            description: "If true, the scheduled task bypasses ALL approval gates (terminal, file write, file patch, code exec, etc.) at fire-time. Use sparingly — prefer specific `autoApproveCommands` when possible. Full audit trail is preserved (each approval row is still written and stamped autoApproved=true)."
+            description: "DEPRECATED alias for approvalMode: \"yolo\". Kept for back-compat; new payloads should use approvalMode instead. If both fields are set, approvalMode wins."
           },
           timeoutSeconds: {
             type: "number",

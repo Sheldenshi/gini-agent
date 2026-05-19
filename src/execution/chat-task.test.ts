@@ -28,7 +28,7 @@ import {
 import type { JobRecord, RuntimeConfig, Task } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 
-function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
+function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
   return {
     instance,
     port: 7338,
@@ -36,7 +36,13 @@ function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
     provider: { name: "echo", model: "" },
     workspaceRoot,
     stateRoot: process.env.GINI_STATE_ROOT ?? "/tmp/gini-chat-task-test",
-    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-chat-task-test-logs"
+    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-chat-task-test-logs",
+    // These tests predate the approvalMode flip and pin the
+    // approval-gated loop behavior. Force "strict" so the chat-task
+    // loop continues to exercise the pause+resume path here; the new
+    // default-auto matrix lives in approval-mode.test.ts.
+    approvalMode: "strict",
+    ...opts
   };
 }
 

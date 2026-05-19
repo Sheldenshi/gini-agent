@@ -808,6 +808,31 @@ describe("runtime api", () => {
     expect(body.error).toMatch(/Invalid cdpUrl/);
   });
 
+  test("PATCH /api/settings/auto-approve rejects out-of-union approvalMode with 400", async () => {
+    // An invalid value previously mapped to undefined and the PATCH
+    // silently no-op'd while returning 200 — the client thought it
+    // succeeded. Mirror job-level strict validation at the HTTP
+    // boundary so misconfigured clients get a loud failure.
+    const config = testConfig("settings-bad-approval-mode");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/settings/auto-approve",
+      {
+        method: "PATCH",
+        body: JSON.stringify({ approvalMode: "bogus" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/approvalMode must be one of/);
+    expect(body.validValues).toEqual(["strict", "auto", "yolo"]);
+    // Original value on the config object must not have changed.
+    expect(config.approvalMode).toBe("strict");
+  });
+
   test("browser connect returns 400 when CDP endpoint is unreachable", async () => {
     const config = testConfig("browser-unreachable");
     const handler = createHandler(config);
@@ -868,7 +893,11 @@ function testConfig(instance: string): RuntimeConfig {
     provider: { name: "echo", model: "gini-echo-v0" },
     workspaceRoot: "/tmp",
     stateRoot: `${root}/instances/${instance}`,
-    logRoot: `${root}-logs/${instance}`
+    logRoot: `${root}-logs/${instance}`,
+    // These tests predate the approval-mode flip and rely on the
+    // gated path. Force "strict" to keep them honest; new defaults
+    // are exercised in approval-mode.test.ts.
+    approvalMode: "strict"
   };
 }
 

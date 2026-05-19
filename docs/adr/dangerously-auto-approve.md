@@ -1,5 +1,19 @@
 # ADR: dangerouslyAutoApprove — sanctioned approval-bypass mode
 
+## Status
+
+Superseded by [approval-mode.md](approval-mode.md). The single boolean
+`dangerouslyAutoApprove` flag has been replaced with a three-state
+`approvalMode: "strict" | "auto" | "yolo"` policy. The legacy flag
+stays on the config shape as a deprecated alias for
+`approvalMode === "yolo"`; legacy configs aliasing
+`dangerouslyAutoApprove: true` are migrated to `approvalMode: "yolo"`
+on next install (one-time `config.migrated` audit row). All new code
+should read `approvalMode` (or, better, route through
+`resolveApprovalPolicy`). See the replacement ADR for the current
+contract, audit-marker semantics, allowlist precedence, and per-job
+overlay rules.
+
 ## Decision
 
 Add an opt-in per-instance flag, `RuntimeConfig.dangerouslyAutoApprove`,
