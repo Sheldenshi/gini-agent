@@ -28,7 +28,7 @@ afterAll(() => {
   rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
-describe("browser-connect helpers", () => {
+describe.serial("browser-connect helpers", () => {
   test("redactUrlCredentials strips user:pass@", () => {
     const result = __test.redactUrlCredentials("ws://alice:secret@127.0.0.1:9222/devtools/browser/abc");
     expect(result).not.toContain("alice");
@@ -80,7 +80,7 @@ describe("browser-connect helpers", () => {
   });
 });
 
-describe("browser-connect API surface", () => {
+describe.serial("browser-connect API surface", () => {
   beforeEach(() => {
     // No-op — each test creates its own config via testConfig() which
     // wipes the per-instance directory.
@@ -162,7 +162,7 @@ describe("browser-connect API surface", () => {
   }, 60_000);
 });
 
-describe("browser-connect round-1 hardening", () => {
+describe.serial("browser-connect CDP validation", () => {
   test("safetyCheck blocks IPv4-mapped IPv6 metadata via ws://", async () => {
     const config = testConfig("safety-mapped-metadata");
     // The SSRF guard converts the ws:// URL to its http:// sibling and
@@ -238,7 +238,7 @@ describe("browser-connect round-1 hardening", () => {
   });
 });
 
-describe("browser-connect round-2 hardening", () => {
+describe.serial("browser-connect mismatch and disconnect teardown", () => {
   test("mismatch-reconnect drops the in-process handle before fresh attempt", async () => {
     const config = testConfig("mismatch-teardown");
     const { mutateState } = await import("../state");
@@ -317,14 +317,13 @@ describe("browser-connect round-2 hardening", () => {
   });
 });
 
-describe("browser-connect round-3 hardening", () => {
+describe.serial("browser-connect input validation before teardown", () => {
   test("blocked replacement cdpUrl does NOT tear down existing managed record", async () => {
     const config = testConfig("blocked-keeps-existing");
     const { mutateState } = await import("../state");
     // Seed a managed record. A bad-input connect must not tear down the
-    // user's Chrome before validation fires — the round-3 fix lifts
-    // validation to the top of connectBrowserInner so the SSRF/safety
-    // check happens BEFORE we even read `existing`.
+    // user's Chrome before validation fires, so the SSRF/safety check must
+    // happen before we even read `existing`.
     const browserMod = await import("../tools/browser");
     let closeCalled = false;
     browserMod.__test.installFakeManagedContextForTest({
@@ -461,8 +460,8 @@ describe("browser-connect round-3 hardening", () => {
     // owns the close path and swallows teardown errors so the user is
     // never left in a half-disconnected state. We can no longer assert
     // that teardown errors propagate (they don't — by design). Instead
-    // verify the round-2 coalescing invariant: concurrent disconnects
-    // share a single in-flight promise, and the slot clears so a
+    // verify the coalescing invariant: concurrent disconnects share a
+    // single in-flight promise, and the slot clears so a
     // subsequent disconnect runs independently.
     const config = testConfig("pending-disconnect-coalesce");
     const { mutateState } = await import("../state");
@@ -519,7 +518,7 @@ describe("browser-connect round-3 hardening", () => {
   });
 });
 
-describe("browser-connect managed launch via playwright", () => {
+describe.serial("browser-connect managed launch via playwright", () => {
   test("launchManaged calls chromium.launchPersistentContext and stores the record", async () => {
     const config = testConfig("playwright-launch");
     const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
@@ -585,12 +584,12 @@ describe("browser-connect managed launch via playwright", () => {
   });
 });
 
-// Round-1 fix 5: realistic coverage that the same per-instance profile
-// dir is used across a Connect → Disconnect → tool-call sequence. We
-// mock playwright-core so launchPersistentContext records the data dir
-// it was invoked with at every step; the assertion is that the dir is
-// identical across the two launches (sign-ins persist on the same dir).
-describe("persistent profile dir is stable across Connect → Disconnect → tool call", () => {
+// Realistic coverage that the same per-instance profile dir is used across
+// a Connect → Disconnect → tool-call sequence. We mock playwright-core so
+// launchPersistentContext records the data dir it was invoked with at every
+// step; the assertion is that the dir is identical across the two launches
+// (sign-ins persist on the same dir).
+describe.serial("persistent profile dir is stable across Connect → Disconnect → tool call", () => {
   test("Connect launches headed against the same dir the default-tool path uses headless", async () => {
     const config = testConfig("profile-stable");
     const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
@@ -651,13 +650,12 @@ describe("persistent profile dir is stable across Connect → Disconnect → too
   });
 });
 
-// Round-1 fix 3: state.browser must be cleared on runtime startup so a
-// stale managed record from a previous run doesn't make GET /api/browser
-// report `connected: true` and trigger an unprompted headed Chrome launch
-// on the next agent tool call. This test exercises the same mutateState
-// shape that src/server.ts runs at startup; the on-disk profile dir is
-// independent and stays put.
-describe("startup clears stale browser connection record", () => {
+// State.browser must be cleared on runtime startup so a stale managed record
+// from a previous run doesn't make GET /api/browser report `connected: true`
+// and trigger an unprompted headed Chrome launch on the next agent tool call.
+// This test exercises the same mutateState shape that src/server.ts runs at
+// startup; the on-disk profile dir is independent and stays put.
+describe.serial("startup clears stale browser connection record", () => {
   test("mutateState(state.browser = null) leaves on-disk profile untouched", async () => {
     const config = testConfig("startup-clear-stale");
     const { mutateState } = await import("../state");
@@ -696,13 +694,13 @@ describe("startup clears stale browser connection record", () => {
   });
 });
 
-// Round-1 fix 1: launchManaged wraps disconnect-then-launch in
-// withTeardownLock so a parallel agent admission can't sneak in between
-// the two awaits and re-acquire the profile lock. We verify the lock by
-// installing a fake launchPersistentContext that, mid-launch, kicks off a
-// browserNavigate admission and asserts it rejects with the standard
-// "Browser disconnecting" sentinel.
-describe("launchManaged holds the teardown lock across the disconnect-then-launch sequence", () => {
+// LaunchManaged wraps disconnect-then-launch in withTeardownLock so a
+// parallel agent admission can't sneak in between the two awaits and
+// re-acquire the profile lock. We verify the lock by installing a fake
+// launchPersistentContext that, mid-launch, kicks off a browserNavigate
+// admission and asserts it rejects with the standard "Browser disconnecting"
+// sentinel.
+describe.serial("launchManaged holds the teardown lock across the disconnect-then-launch sequence", () => {
   test("a browserNavigate admission landing during launch is rejected", async () => {
     const config = testConfig("launch-lock-admission");
     const browserMod = await import("../tools/browser");
@@ -754,4 +752,3 @@ describe("launchManaged holds the teardown lock across the disconnect-then-launc
     }
   });
 });
-
