@@ -318,28 +318,6 @@ POST /api/approvals/<id>/deny
 via `PATCH /api/settings/auto-approve`. `yolo` skips the queue entirely —
 only use it when the user has explicitly asked for that risk profile.
 
-## Logs and Tmux
-
-Per-instance log files (read with `tail`, not the API):
-
-```bash
-INSTANCE=$(basename "$(pwd)")
-tail -n 200 ~/.gini/instances/$INSTANCE/logs/web.log
-tail -n 200 ~/.gini/instances/$INSTANCE/logs/runtime-stdout.log
-tail -n 200 ~/.gini/instances/$INSTANCE/logs/runtime.jsonl
-```
-
-The runtime lives in a tmux session named `gini-<instance>`:
-
-```bash
-SESSION=gini-$(basename "$(pwd)")
-tmux capture-pane -t $SESSION -p -S -2000
-tmux send-keys -t $SESSION C-c
-tmux send-keys -t $SESSION "bun run gini run --instance $(basename "$(pwd)")" Enter
-```
-
-If the session is missing, start it: `tmux new-session -A -d -s "gini-$INSTANCE" "bun run gini run --instance $INSTANCE"`.
-
 ## Rules
 
 1. Do not refuse a capability without first checking this skill and the
