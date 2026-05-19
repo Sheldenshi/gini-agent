@@ -7,7 +7,13 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { bankIdForAgent, closeAllMemoryDbs, countMemoryUnits, ensureDefaultBank, listMemoryUnits, DEFAULT_BANK_ID } from "../state";
-import { setEchoStructuredResponse, clearEchoStructuredResponses } from "../provider";
+import {
+  clearEchoStructuredResponses,
+  clearEchoToolCallingResponses,
+  normalizeProvider,
+  setEchoStructuredResponse,
+  setEchoToolCallingResponse
+} from "../provider";
 import { submitTask } from "../agent";
 import { readState } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -24,6 +30,7 @@ beforeAll(() => {
 afterAll(() => {
   closeAllMemoryDbs();
   clearEchoStructuredResponses();
+  clearEchoToolCallingResponses();
   delete process.env.GINI_EMBEDDING_PROVIDER;
   rmSync(ROOT, { recursive: true, force: true });
 });
@@ -88,6 +95,44 @@ describe("phase 5 — auto-retain on task completion", () => {
     await Bun.sleep(100);
     const after = countMemoryUnits(instance);
     expect(after).toBe(before);
+  });
+});
+
+describe("phase 5 — auto-retain on chat-mode task completion", () => {
+  // Regression: chat-mode tasks (web UI path) historically didn't fire
+  // scheduleAutoRetain because the call only existed on the legacy
+  // runTask code path. Cross-chat recall therefore surfaced nothing for
+  // anything the user said in chat. This test pins the wiring so a
+  // personal-fact disclosure submitted through the chat-task loop lands
+  // in the per-agent memory bank.
+  test("submitting a chat-mode task with a personal fact grows the memory unit count", async () => {
+    const instance = "phase5-chat-retain";
+    ensureDefaultBank(instance);
+    const config = makeConfig(instance);
+    const provider = normalizeProvider(config.provider);
+    // Final answer turn: no tool calls, model just acknowledges. This
+    // sends the loop down the result.toolCalls.length === 0 branch in
+    // runChatTask's runLoop, which is the path that auto-retain wires
+    // into.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Nice to meet you, Shelden.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    setEchoStructuredResponse("fact-extraction", {
+      facts: [
+        { what: "user's name is Shelden", when: "", where: "", who: "user", why: "personal disclosure", fact_type: "world" }
+      ]
+    });
+    const before = countMemoryUnits(instance);
+    const task = await submitTask(config, "my name is Shelden", { mode: "chat" });
+    await waitForCompletion(config, task.id);
+    // Fire-and-forget retain — give it a moment to flush like the
+    // imperative-path tests above.
+    await Bun.sleep(150);
+    const after = countMemoryUnits(instance);
+    expect(after).toBeGreaterThan(before);
   });
 });
 

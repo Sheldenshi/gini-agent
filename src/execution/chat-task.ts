@@ -22,7 +22,7 @@ import {
   readState,
   readTrace
 } from "../state";
-import { ApprovedActionFailedError, findTask } from "../agent";
+import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
 import {
   generateToolCallingResponse,
@@ -504,6 +504,15 @@ async function runLoop(
       // the JobRunRecord stays stuck in `running` and the chat-session
       // delivery never fires. Idempotent — no-op for tasks without jobId.
       if (finished.jobId) await finalizeJobRunFromTask(config, finished);
+      // Hindsight phase 5: auto-retain on chat-task completion. Without
+      // this, anything the user says in chat ("my name is X") never lands
+      // in the per-agent memory bank, so cross-chat recall surfaces
+      // nothing. Fire-and-forget — mirror the legacy `runTask` site. Guard
+      // with the post-mutateState status so a cancel that landed during
+      // the model's text stream doesn't retain a cancelled output.
+      if (finished.status === "completed") {
+        void scheduleAutoRetain(config, finished);
+      }
       return finished;
     }
 

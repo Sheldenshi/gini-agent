@@ -670,7 +670,7 @@ function shouldAutoRetain(task: Task): boolean {
   return true;
 }
 
-function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
+export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
   if (!shouldAutoRetain(task)) return;
   // Phase C — resolve the active agent at retain time so the new units
   // land in the right pool. If no agent is active (degenerate state), skip
