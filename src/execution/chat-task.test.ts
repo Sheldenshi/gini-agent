@@ -908,15 +908,12 @@ describe("chat-task loop", () => {
     const system = calls[0]!.find((m) => m.role === "system");
     expect(system).toBeDefined();
     const content = String(system?.content ?? "");
-    expect(content).toContain("Bound scheduled jobs:");
+    expect(content).toContain("Scheduled jobs delivering into this chat:");
     expect(content).toContain(jobId);
     expect(content).toContain("Daily standup");
     expect(content).toContain("cron `0 9 * * *`");
     expect(content).toContain("America/Los_Angeles");
     expect(content).toContain("Ask the team what they did yesterday");
-    // Intro names the binding without prescribing how the model should
-    // disambiguate user phrasing — that's left to the model.
-    expect(content).toContain("This chat session is bound to the scheduled job listed below.");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -945,7 +942,7 @@ describe("chat-task loop", () => {
     const system = calls[0]!.find((m) => m.role === "system");
     expect(system).toBeDefined();
     const content = String(system?.content ?? "");
-    expect(content).not.toContain("Bound scheduled jobs:");
+    expect(content).not.toContain("Scheduled jobs delivering into this chat:");
     // No trailing blank lines from optional sections being concatenated.
     expect(content).toBe(content.trimEnd());
 
@@ -1014,8 +1011,8 @@ describe("chat-task loop", () => {
     const content = String(system?.content ?? "");
     // Subagent prompt preserved verbatim at the top of system context.
     expect(content.startsWith(SUBAGENT_PROMPT)).toBe(true);
-    // Bound-jobs block still appended after the subagent prompt.
-    expect(content).toContain("Bound scheduled jobs:");
+    // Scheduled-jobs context block still appended after the subagent prompt.
+    expect(content).toContain("Scheduled jobs delivering into this chat:");
     expect(content).toContain(jobId);
     expect(content).toContain("Weekly research digest");
     expect(content).toContain("every 604800s");

@@ -34,22 +34,18 @@ export function buildAgentSystemContext(memories: MemoryRecord[], recalledContex
   return parts.join("\n\n");
 }
 
-// Build a "Bound scheduled jobs" block describing which jobs are attached to
-// the current chat session. The chat-task loop scans `state.jobs` for any
-// record whose `chatSessionId` matches the session backing the current task
-// and passes the matching records here. We present the records as data and
-// let the model infer relevance from conversational cues — explicit
-// "if the user says 'this job'…" directives in the system prompt collided
-// with the base list_jobs guidance and added more noise than they were
-// worth.
+// Build a context block listing scheduled jobs that deliver into the
+// current chat session. The chat-task loop scans `state.jobs` for any
+// record whose `chatSessionId` matches the session backing the current
+// task and passes the matching records here. The block is pure context —
+// no directives about how the model should resolve user phrasing — so the
+// model can infer relevance the same way it does for any other ambient
+// state in the system prompt.
 //
-// Returns an empty string when no jobs are bound — the caller can guard
+// Returns an empty string when no jobs apply — the caller can guard
 // against stray whitespace by checking the empty case before appending.
 export function buildBoundJobsBlock(jobs: JobRecord[]): string {
   if (jobs.length === 0) return "";
-  const intro = jobs.length === 1
-    ? "This chat session is bound to the scheduled job listed below."
-    : `This chat session is bound to the ${jobs.length} scheduled jobs listed below.`;
   const entries = jobs.map((job) => {
     const lines: string[] = [];
     lines.push(`- id: ${job.id}`);
@@ -61,7 +57,7 @@ export function buildBoundJobsBlock(jobs: JobRecord[]): string {
     appendPromptLines(lines, job.prompt);
     return lines.join("\n");
   });
-  return [`Bound scheduled jobs:`, intro, ...entries].join("\n");
+  return [`Scheduled jobs delivering into this chat:`, ...entries].join("\n");
 }
 
 function describeJobSchedule(job: JobRecord): string {
