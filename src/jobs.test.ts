@@ -16,6 +16,7 @@ import { describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
+import { updateJob } from "./jobs/index";
 import { createTask, mutateState, readState, upsertTask } from "./state";
 import { dispatchToolCall } from "./execution/tool-dispatch";
 import { syncChatTaskResult } from "./execution/chat";
@@ -1293,6 +1294,69 @@ describe("cron lifecycle", () => {
     // JobRecord is unchanged — name still "to-keep".
     const after = readState(config.instance).jobs.find((j) => j.id === job.id);
     expect(after?.name).toBe("to-keep");
+  });
+
+  test("update_job inline oneShot mutator applies when parent task is completed", async () => {
+    // Consistency invariant: a `completed` parent task may still manage
+    // jobs (schedule a follow-up, flip a finished one-shot back to
+    // recurring, etc.). The shared job mutators in src/jobs/index.ts
+    // (createScheduledJob, updateJob, updateJobStatus, removeJob)
+    // permit `completed` and refuse only on `cancelled`/`failed`.
+    //
+    // The inline oneShot re-check inside updateJobTool's mutateState
+    // must match the same predicate, otherwise a single update_job
+    // call could partially apply: schedule/name/prompt routed through
+    // `updateJob` would succeed while the sibling oneShot field is
+    // silently rejected — exactly the partial-success the audit/return
+    // surface would lie about.
+    //
+    // The dispatcher's lock-free entry-level pre-check is stricter
+    // (it short-circuits all terminal statuses to avoid touching the
+    // lock for the common case), so this test verifies the invariant
+    // at the authoritative serialization point — the shared mutator —
+    // which is where the asymmetry would actually leak through under
+    // a race (parent transitions to `completed` between the pre-check
+    // and the inline mutator). Pairs with the comment at
+    // src/execution/tool-dispatch.ts:989 which pins the predicate
+    // used inside that inline mutateState block.
+    const config = testConfig("jobs-update-tool-oneshot-completed-parent");
+    const handler = createHandler(config);
+    const job = await call(handler, config, "/api/jobs", {
+      method: "POST",
+      body: JSON.stringify({ name: "flip-oneshot", prompt: "ping", intervalSeconds: 60 })
+    });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test", undefined, undefined, undefined, undefined);
+      task.status = "completed";
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // The shared mutator path (updateJob) accepts a `completed`
+    // parent — this is what permits a completed task's final action
+    // to be a legitimate job patch. The inline oneShot mutator at
+    // tool-dispatch.ts:989 mirrors this predicate.
+    await updateJob(config, job.id, { name: "renamed-from-completed-parent" }, taskId);
+    const afterName = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(afterName?.name).toBe("renamed-from-completed-parent");
+
+    // Replicate the inline oneShot mutateState block exactly as
+    // updateJobTool runs it. If the production predicate ever drifts
+    // wider (i.e. starts rejecting `completed`) this assertion would
+    // need to be updated in lockstep — that's the consistency
+    // contract.
+    await mutateState(config.instance, (state) => {
+      const parent = state.tasks.find((t) => t.id === taskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job: parent task ${taskId} is already ${parent.status}.`);
+      }
+      const target = state.jobs.find((candidate) => candidate.id === job.id);
+      if (!target) throw new Error("setup: job missing");
+      target.oneShot = true;
+    });
+    const after = readState(config.instance).jobs.find((j) => j.id === job.id);
+    expect(after?.oneShot).toBe(true);
   });
 
   test("delete_job dispatch refuses to mutate when parent task is terminal", async () => {

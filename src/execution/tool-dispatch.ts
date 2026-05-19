@@ -986,7 +986,15 @@ async function updateJobTool(
     // do the same atomic parent-task re-check inline.
     await mutateState(config.instance, (state) => {
       const parent = state.tasks.find((t) => t.id === taskId);
-      if (parent && isTerminalTaskStatus(parent.status)) {
+      // Match the narrower predicate used by the shared job mutators in
+      // src/jobs/index.ts (createScheduledJob, updateJob, updateJobStatus,
+      // removeJob): refuse only on `cancelled`/`failed`. `completed`
+      // parents are permitted to manage jobs (e.g. a completed task's
+      // final action may be a job cleanup or follow-up). Using the wider
+      // `isTerminalTaskStatus` predicate here would diverge from the
+      // sibling patches in this same update_job call and silently reject
+      // the oneShot field while the schedule/name/prompt patch landed.
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
         throw new Error(`Cannot update job: parent task ${taskId} is already ${parent.status}.`);
       }
       const job = state.jobs.find((candidate) => candidate.id === jobId);
