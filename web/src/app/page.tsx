@@ -154,6 +154,17 @@ export default function HomePage() {
                   // is the same reason string, so the per-row
                   // rendering stays compact.
                   const isBrowserConnect = approval.action === "browser.connect";
+                  // The user-facing reason for browser.connect lives on
+                  // payload.reason (set by the dispatch); fall back to the
+                  // approval target (same string) if it's missing. We
+                  // surface this instead of `approval.reason` (the policy
+                  // engine's internal "why this needs approval" text)
+                  // because the chat-side ApprovalActions card shows the
+                  // user-facing reason — the home pending list should match.
+                  const browserConnectBody =
+                    (typeof approval.payload.reason === "string"
+                      ? approval.payload.reason
+                      : undefined) ?? approval.target;
                   return (
                   <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
                     <div className="min-w-0 flex-1 space-y-1">
@@ -166,7 +177,9 @@ export default function HomePage() {
                       {isBrowserConnect ? null : (
                         <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
                       )}
-                      <p className="line-clamp-2 text-sm">{approval.reason}</p>
+                      <p className="line-clamp-2 text-sm">
+                        {isBrowserConnect ? browserConnectBody : approval.reason}
+                      </p>
                     </div>
                     <div className="flex shrink-0 gap-2">
                       <Button

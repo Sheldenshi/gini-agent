@@ -131,7 +131,13 @@ function ApprovalCard({
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        <p className="text-sm">{approval.reason}</p>
+        {/*
+          For browser.connect the user-facing reason (payload.reason ?? target)
+          is what we surface in chat and on the home pending list — match that
+          here. For other actions, `approval.reason` is the policy engine's
+          internal text (which is also what the rest of the UI shows).
+         */}
+        <p className="text-sm">{isBrowserConnect ? reasonText : approval.reason}</p>
         {isBrowserConnect ? null : diff ? (
           <pre className="max-h-64 overflow-auto rounded-md border border-border bg-card/50 p-3 font-mono text-[11px]">
             {diff}
