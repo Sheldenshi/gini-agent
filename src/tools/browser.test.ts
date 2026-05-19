@@ -195,9 +195,9 @@ describe("browser disconnect lifecycle", () => {
   });
 
   test("disconnectSharedBrowser also closes the HEADLESS persistent context", async () => {
-    // Same teardown arm regardless of headed flag — when the user calls
-    // wipe-profile, the headless persistent context must come down too so
-    // the rm -rf isn't fighting an open Chromium handle. Tests the
+    // Same teardown arm regardless of headed flag — the headless
+    // persistent context that the default tool path materializes must
+    // come down on Disconnect just like the headed one. Tests the
     // headed=false variant explicitly so we don't regress that branch.
     let contextCloseCalled = false;
     browserTest.installFakeHeadlessPersistentContextForTest({
