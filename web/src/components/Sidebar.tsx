@@ -8,7 +8,6 @@ import {
   AlertTriangle,
   Cog,
   Download,
-  Globe,
   Home,
   Loader2,
   ListTodo,
@@ -48,7 +47,6 @@ const NAV_GROUPS: readonly NavGroup[] = [
     { href: "/skills", label: "Skills", icon: Wrench },
     { href: "/permissions", label: "Permissions", icon: AlertTriangle },
     { href: "/activity", label: "Activity", icon: Activity },
-    { href: "/browser", label: "Browser", icon: Globe },
     { href: "/settings", label: "Settings", icon: Cog }
   ]
 ] as const;
