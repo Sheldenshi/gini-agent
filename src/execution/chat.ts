@@ -138,6 +138,15 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
 
 export async function syncChatTaskResult(config: RuntimeConfig, sessionId: string, taskId: string) {
   return mutateState(config.instance, (state) => {
+    // Reject a missing session INSIDE the same mutateState so a
+    // concurrent chat-session delete can't race past a pre-check
+    // (the finalize-job hook does its own pre-check as a fast-path
+    // optimization, but the atomic invariant lives here).
+    // createChatMessage previously silently skipped the session-
+    // linkage step on a missing session — that would have landed an
+    // orphan ChatMessageRecord with no session pointing at it.
+    const session = state.chatSessions.find((item) => item.id === sessionId);
+    if (!session) throw new Error(`Chat session not found: ${sessionId}`);
     const task = state.tasks.find((item) => item.id === taskId);
     if (!task) throw new Error(`Task not found: ${taskId}`);
     const existing = state.chatMessages.find((message) => message.taskId === taskId && message.role === "assistant");

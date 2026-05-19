@@ -587,7 +587,6 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     }
   }
   expirePairingCodes(state);
-  backfillLegacyTelegramPairing(state);
   return state;
 }
 
@@ -599,15 +598,23 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
 // The mint gives them a pairing code they can DM the bot with to
 // re-enroll without recreating the bridge.
 //
+// Lives OUTSIDE normalizeState by design. normalizeState runs on every
+// read, including pure inspections like `gini messaging chats`. If the
+// backfill ran there, each read would mint a different random code on
+// a legacy bridge until something persisted via mutateState — operators
+// running pre-runtime CLI inspections could see a code that's never
+// actually live. Callers explicitly invoke this from a write path
+// (server startup), so the mint happens exactly once and the code is
+// durable from the first observation onward.
+//
 // Idempotent: only fires when the bridge has NO allowlist AND NO
 // pairing code at all (active or expired). After one mint the second
-// branch sees a present pairingCode and skips. Operators whose
-// minted code expires before they use it can re-mint via
-// `gini messaging pair <bridge>` — same recovery path as today.
+// branch sees a present pairingCode and skips.
 const LEGACY_PAIRING_CODE_BYTES = 4;
 const LEGACY_PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
 const LEGACY_PAIRING_CODE_PREFIX = "pair-";
-function backfillLegacyTelegramPairing(state: RuntimeState): void {
+export function applyLegacyTelegramPairingMigration(state: RuntimeState): boolean {
+  let migrated = false;
   for (const bridge of state.messagingBridges ?? []) {
     if (bridge.kind !== "telegram") continue;
     const meta = (bridge.metadata ?? {}) as Record<string, unknown>;
@@ -640,5 +647,7 @@ function backfillLegacyTelegramPairing(state: RuntimeState): void {
       risk: "low",
       evidence: { reason: "legacy-bridge-allowlist-backfill" }
     });
+    migrated = true;
   }
+  return migrated;
 }

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { createEmptyState, normalizeState } from "./store";
+import { applyLegacyTelegramPairingMigration, createEmptyState, normalizeState } from "./store";
 import type { RuntimeState } from "../types";
 
 // Isolated state root so the test never touches ~/.gini.
@@ -210,7 +210,7 @@ describe("normalizeState toolset/tool backfill", () => {
   });
 });
 
-describe("normalizeState legacy telegram-bridge pairing backfill", () => {
+describe("applyLegacyTelegramPairingMigration", () => {
   test("mints a pairing code for a legacy telegram bridge that polled before the allowlist landed (lastOffset present, no allowedChatIds, no pairingCode)", () => {
     const state = createEmptyState("test-instance-tg-legacy");
     state.messagingBridges = [{
@@ -228,26 +228,50 @@ describe("normalizeState legacy telegram-bridge pairing backfill", () => {
       metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
     }];
 
-    const normalized = normalizeState("test-instance-tg-legacy", state);
-    const live = normalized.messagingBridges.find((b) => b.id === "bridge_legacy_1");
+    const migrated = applyLegacyTelegramPairingMigration(state);
+    expect(migrated).toBe(true);
+
+    const live = state.messagingBridges.find((b) => b.id === "bridge_legacy_1");
     expect(typeof live?.metadata?.pairingCode).toBe("string");
     expect(String(live?.metadata?.pairingCode).startsWith("pair-")).toBe(true);
     expect(typeof live?.metadata?.pairingCodeExpiresAt).toBe("string");
     expect(Date.parse(String(live?.metadata?.pairingCodeExpiresAt))).toBeGreaterThan(Date.now());
 
     // Audit row landed so the migration is traceable.
-    const audit = normalized.audit.find(
+    const audit = state.audit.find(
       (e) => e.action === "messaging.pairing.migrated" && e.target === "bridge_legacy_1"
     );
     expect(audit).toBeDefined();
   });
 
+  test("normalizeState does NOT mint codes on a read-only path (no ephemeral codes per read)", () => {
+    // Architectural invariant: the legacy backfill lives OUTSIDE
+    // normalizeState specifically so that pure read paths (CLI
+    // inspections, status APIs) don't generate ephemeral codes that
+    // never persist. normalizeState is called on every read, the
+    // migration helper is called only from explicit write paths.
+    const state = createEmptyState("test-instance-tg-noop-read");
+    state.messagingBridges = [{
+      id: "bridge_legacy_2",
+      instance: "test-instance-tg-noop-read",
+      name: "legacy-tg-2",
+      kind: "telegram",
+      status: "configured",
+      deliveryTargets: ["42"],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
+      metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
+    }];
+
+    const normalized = normalizeState("test-instance-tg-noop-read", state);
+    const live = normalized.messagingBridges.find((b) => b.id === "bridge_legacy_2");
+    // No code on a pure read.
+    expect(live?.metadata?.pairingCode).toBeUndefined();
+    expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
+  });
+
   test("does NOT mint for a brand-new telegram bridge (no lastOffset)", () => {
-    // A bridge created via addMessagingBridge already got a pairing
-    // code at create time. Even if that code was later claimed and
-    // cleared by tryClaimPairingCode, the bridge has lastOffset
-    // undefined (never polled in tests) — so we skip rather than
-    // re-mint. addMessagingBridge is the source of new codes.
     const state = createEmptyState("test-instance-tg-fresh");
     state.messagingBridges = [{
       id: "bridge_fresh_1",
@@ -262,16 +286,13 @@ describe("normalizeState legacy telegram-bridge pairing backfill", () => {
       metadata: { botUsername: "ginibot", botId: 1 }
     }];
 
-    const normalized = normalizeState("test-instance-tg-fresh", state);
-    const live = normalized.messagingBridges.find((b) => b.id === "bridge_fresh_1");
+    const migrated = applyLegacyTelegramPairingMigration(state);
+    expect(migrated).toBe(false);
+    const live = state.messagingBridges.find((b) => b.id === "bridge_fresh_1");
     expect(live?.metadata?.pairingCode).toBeUndefined();
-    expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
   });
 
   test("does NOT mint when the bridge already has an allowlist or an existing pairing code", () => {
-    // Idempotency: after one mint, the next normalize sees the
-    // pairing code present and skips. Also verifies a bridge with
-    // any existing allowlist is left alone.
     const state = createEmptyState("test-instance-tg-idempotent");
     state.messagingBridges = [
       {
@@ -304,18 +325,15 @@ describe("normalizeState legacy telegram-bridge pairing backfill", () => {
       }
     ];
 
-    const normalized = normalizeState("test-instance-tg-idempotent", state);
-    const paired = normalized.messagingBridges.find((b) => b.id === "already_paired");
-    const allowed = normalized.messagingBridges.find((b) => b.id === "already_allowed");
+    const migrated = applyLegacyTelegramPairingMigration(state);
+    expect(migrated).toBe(false);
+    const paired = state.messagingBridges.find((b) => b.id === "already_paired");
+    const allowed = state.messagingBridges.find((b) => b.id === "already_allowed");
     expect(paired?.metadata?.pairingCode).toBe("pair-deadbeef");
     expect(allowed?.metadata?.pairingCode).toBeUndefined();
   });
 
   test("does NOT touch discord-kind bridges", () => {
-    // Discord uses channel-as-auth and has no pairing flow — see ADR
-    // discord-bridge.md. A Discord bridge with lastOffset set (shouldn't
-    // happen, but defense-in-depth against schema drift) must not get
-    // a Telegram pairing code stamped onto it.
     const state = createEmptyState("test-instance-disc-skip");
     state.messagingBridges = [{
       id: "bridge_disc_1",
@@ -330,8 +348,9 @@ describe("normalizeState legacy telegram-bridge pairing backfill", () => {
       metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
     }];
 
-    const normalized = normalizeState("test-instance-disc-skip", state);
-    const live = normalized.messagingBridges.find((b) => b.id === "bridge_disc_1");
+    const migrated = applyLegacyTelegramPairingMigration(state);
+    expect(migrated).toBe(false);
+    const live = state.messagingBridges.find((b) => b.id === "bridge_disc_1");
     expect(live?.metadata?.pairingCode).toBeUndefined();
   });
 });

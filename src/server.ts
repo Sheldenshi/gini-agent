@@ -7,6 +7,7 @@ import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
+import { applyLegacyTelegramPairingMigration } from "./state/store";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
@@ -64,6 +65,23 @@ setBrowserInstance(config.instance);
       });
   }
 }
+
+// One-shot migration for legacy telegram bridges (pre-allowlist). Runs
+// once per server start; the migration helper is idempotent so a
+// second run is a no-op. Done inside mutateState so the minted
+// pairing code lands on disk immediately — minting in a read-only
+// path (normalizeState) would create ephemeral codes on every
+// inspection.
+void mutateState(config.instance, (state) => {
+  const migrated = applyLegacyTelegramPairingMigration(state);
+  if (migrated) {
+    appendLog(config.instance, "messaging.pairing.migrated.applied", { instance: config.instance });
+  }
+}).catch((error) => {
+  appendLog(config.instance, "messaging.pairing.migration.error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+});
 
 // Hindsight phase 6: opportunistic legacy migration. Runs once per server
 // start; subsequent starts are no-ops because each migrated record carries
