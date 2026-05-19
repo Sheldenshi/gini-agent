@@ -1903,7 +1903,13 @@ async function runApprovedAction(
         // managed Chrome attached, it returns the existing record
         // without relaunching. That's the right shape for an agent
         // calling this after an earlier connect.
-        const status = await connectBrowser(config, {});
+        //
+        // `mode: "managed"` enforces the approval card's contract: the
+        // user just consented to "Open a browser window," so a stale
+        // CDP-mode record (which may be headless or attached to a
+        // browser the user can't see) must be torn down and replaced
+        // with a fresh managed launch — never silently returned as-is.
+        const status = await connectBrowser(config, { mode: "managed" });
         succeeded = status.connected;
         mode = status.record?.mode;
         dataDir = status.record?.dataDir;

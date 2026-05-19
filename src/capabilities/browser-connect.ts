@@ -181,6 +181,16 @@ function validateCdpUrl(raw: string): { ok: true; url: string } | { ok: false; e
 
 interface ConnectInput {
   cdpUrl?: unknown;
+  // When set to "managed", an existing record that is NOT managed (i.e. a
+  // `cdp`-mode record that may be headless or owned by a different Chrome)
+  // is torn down and replaced with a fresh managed launch instead of being
+  // returned as-is. The default behavior (no `mode`) preserves the existing
+  // "vanilla reconnect" semantics used by the CLI and HTTP endpoint —
+  // empty input means "reconnect to whatever exists." The `browser_connect`
+  // tool dispatch sets `mode: "managed"` because its contract (and the
+  // approval card the user just consented to) promises a visible Chrome
+  // window; silently handing back a stale CDP session would violate that.
+  mode?: "managed";
 }
 
 // Serializes concurrent /api/browser/connect calls. The browser-connect
@@ -234,7 +244,16 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
     // stored, don't short-circuit on the old record — fall through to the
     // teardown + fresh attach path.
     const callerCdp = validatedCallerCdp;
-    const targetsSameEndpoint = targetsExistingRecord(existing, callerCdp);
+    // Strict-managed mode: if the caller demands a managed Chrome and the
+    // existing record isn't managed (e.g. it's a `cdp`-mode record left
+    // over from a prior /api/browser/connect with a custom endpoint), the
+    // existing record cannot satisfy the contract. Treat it as a mismatch
+    // so we fall through to teardown + fresh managed launch rather than
+    // silently returning a stale CDP session that may be headless.
+    const strictManagedMismatch =
+      input.mode === "managed" && existing.mode !== "managed";
+    const targetsSameEndpoint =
+      !strictManagedMismatch && targetsExistingRecord(existing, callerCdp);
 
     if (targetsSameEndpoint) {
       if (existing.mode === "managed") {

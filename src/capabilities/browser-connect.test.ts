@@ -755,3 +755,99 @@ describe("launchManaged holds the teardown lock across the disconnect-then-launc
   });
 });
 
+// Strict-managed mode: the `browser_connect` tool dispatch promises a
+// visible managed Chrome to the user (via the approval card). When the
+// caller passes `mode: "managed"` and a non-managed record already exists
+// (typically a `cdp`-mode record from a previous /api/browser/connect),
+// the capability must tear down the stale record and launch a fresh
+// managed Chrome — NOT short-circuit and return the CDP record.
+describe("browser-connect strict managed mode", () => {
+  test("existing reachable cdp record + mode: 'managed' triggers teardown + fresh managed launch", async () => {
+    const config = testConfig("strict-managed-replaces-cdp");
+    // Stand up a real /json/version responder so the cdp record looks
+    // alive on probe. Without `mode: "managed"`, connectBrowser would
+    // happily refresh and return this cdp record — the exact silent-reuse
+    // bug from round-9 finding 1. With `mode: "managed"`, the capability
+    // must instead disconnect the in-process handle, clear state, and
+    // launch a fresh managed Chrome.
+    let server: ReturnType<typeof Bun.serve> | undefined;
+    const browserMod = await import("../tools/browser");
+    let cdpDisconnectCalled = false;
+    let cdpCloseCalled = false;
+    browserMod.__test.installFakeCdpBrowserForTest({
+      disconnect: async () => {
+        cdpDisconnectCalled = true;
+      },
+      close: async () => {
+        // close() over CDP would terminate the user's Chrome — must NOT
+        // be called by the strict-managed teardown path.
+        cdpCloseCalled = true;
+      }
+    });
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    try {
+      server = Bun.serve({
+        port: 0,
+        async fetch(request) {
+          const url = new URL(request.url);
+          if (url.pathname === "/json/version") {
+            return Response.json({
+              Browser: "ExternalChrome/0.0",
+              webSocketDebuggerUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/REACHABLE`
+            });
+          }
+          return new Response("nope", { status: 404 });
+        }
+      });
+      const { mutateState } = await import("../state");
+      await mutateState(config.instance, (state) => {
+        state.browser = {
+          mode: "cdp",
+          cdpUrl: `ws://127.0.0.1:${server!.port}/devtools/browser/EXTERNAL`,
+          pid: null,
+          dataDir: null,
+          chromePath: null,
+          startedAt: new Date().toISOString()
+        };
+      });
+
+      mock.module("playwright-core", () => ({
+        chromium: {
+          executablePath: () => "/fake/path/to/chromium",
+          launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+            launchCalls.push({ dataDir, options });
+            return {
+              browser: () => ({ process: () => ({ pid: 4343 }) }),
+              close: async () => undefined
+            };
+          }
+        }
+      }));
+      browserMod.__test.resetChromiumImportForTest();
+
+      const result = await connectBrowser(config, { mode: "managed" });
+      // Result must be a fresh managed record — not the seeded cdp one.
+      expect(result.connected).toBe(true);
+      expect(result.record?.mode).toBe("managed");
+      expect(result.record?.pid).toBe(4343);
+      expect(result.record?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
+      // Teardown of the existing cdp record happened (disconnect, not close).
+      expect(cdpDisconnectCalled).toBe(true);
+      expect(cdpCloseCalled).toBe(false);
+      // A managed launchPersistentContext fired.
+      expect(launchCalls.length).toBe(1);
+      expect(launchCalls[0]!.options.headless).toBe(false);
+      // Persisted state reflects the new managed record.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.mode).toBe("managed");
+      expect(persisted?.cdpUrl).toBe(__test.MANAGED_CDP_SENTINEL);
+    } finally {
+      server?.stop(true);
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+    }
+  });
+});
+

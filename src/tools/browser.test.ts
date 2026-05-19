@@ -19,6 +19,7 @@ import {
   withTeardownLock
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
+import { resolveApproval } from "../agent";
 import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
 import { createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -1927,6 +1928,93 @@ describe("dispatchToolCall(browser_connect)", () => {
     expect(state.approvals.length).toBe(0);
 
     rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // End-to-end coverage of the dispatch → approval → executor path. The
+  // dispatch must surface a pending approval; once the user approves
+  // (here via decideApproval, the same code path /approvals/<id>/approve
+  // takes), the executor calls connectBrowser with the strict-managed
+  // contract and the result reports `mode: "managed"`. A regression where
+  // the dispatch silently reused a stale CDP record (the round-9 finding 1
+  // bug) would show up here as `mode: "cdp"` in the executor result.
+  test("approving the dispatched approval invokes connectBrowser with mode managed", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-approve");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect approve", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // Seed an existing cdp-mode record so the strict-managed path has
+    // something to tear down. Without the strict-managed gate this is
+    // exactly the shape that would short-circuit and return cdp.
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "cdp",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/STALE",
+        pid: null,
+        dataDir: null,
+        chromePath: null,
+        startedAt: new Date().toISOString()
+      };
+    });
+
+    // Mock playwright-core so the executor's launchManaged path doesn't
+    // actually spawn Chrome. The fake context shape mirrors the one used
+    // in the strict-managed unit test.
+    const browserMod = await import("./browser");
+    browserMod.__test.installFakeCdpBrowserForTest({
+      disconnect: async () => undefined,
+      close: async () => undefined
+    });
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => ({
+          browser: () => ({ process: () => ({ pid: 1212 }) }),
+          close: async () => undefined
+        })
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_connect_approve_1",
+        JSON.stringify({ reason: "Sign in to Google Cloud Console" })
+      );
+      expect(result.kind).toBe("pending");
+      if (result.kind !== "pending") throw new Error("unreachable");
+      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+        actor: "user",
+        resumeChatTask: false
+      });
+      expect(approval.status).toBe("approved");
+      expect(toolResult).toBeDefined();
+      const parsed = JSON.parse(toolResult!) as {
+        success: boolean;
+        connected: boolean;
+        mode?: string;
+      };
+      expect(parsed.success).toBe(true);
+      expect(parsed.connected).toBe(true);
+      // Strict-managed contract — the executor must NOT silently hand back
+      // the cdp record we seeded above.
+      expect(parsed.mode).toBe("managed");
+      // Persisted record matches.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.mode).toBe("managed");
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+      rmSync(ROOT, { recursive: true, force: true });
+    }
   });
 });
 
