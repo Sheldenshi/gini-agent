@@ -62,21 +62,27 @@ through the same loop. So the loop comes first.
 - All tool dispatches still write `audit` and `trace` records — same
   shape as the legacy path, with `(chat-task)` suffixes in trace
   messages so the timeline is unambiguous.
-- Approvals stay the only path to side effects under default
-  configuration: `dispatchToolCall` creates an approval row for
-  high-risk tools and `executeApprovedAction` is the only writer.
-  Two operator-configured bypasses are sanctioned and documented:
+- Approvals are the canonical writer for side effects.
+  `dispatchToolCall` creates an approval row for every
+  approval-eligible tool and `executeApprovedAction` is the only
+  executor. The `approvalMode` policy seam (ADR approval-mode.md)
+  decides whether each row pauses for a human or auto-resolves:
     - The terminal allowlist (`autoApproveCommands`) skips approval-
       row creation entirely for matching commands and stamps the
       matched pattern on the `terminal.exec` audit row's
       `evidence.autoApprovedReason`.
-    - `dangerouslyAutoApprove` (ADR dangerously-auto-approve.md) still creates an approval
-      row and runs through `executeApprovedAction`, but skips the
-      human decision step; both the `approval.approved` audit row and
-      the per-action audit row carry
-      `evidence.autoApprovedReason="dangerouslyAutoApprove"` so
-      reviewers can distinguish auto-approved from human-approved
-      actions.
+    - Under `approvalMode: "auto"` (the default), safe actions
+      (file_write, file_patch, code_exec, browser_upload_file) and
+      non-dangerous terminal commands still create an approval row,
+      but `resolveApprovalPolicy` auto-resolves it through the same
+      `resolveApproval` -> `executeApprovedAction` pipeline a human
+      would take. The `approval.approved` and per-action audit rows
+      carry `evidence.autoApprovedReason="approval-mode-auto"`.
+    - Under `approvalMode: "yolo"`, every approval-eligible action
+      auto-resolves with `evidence.autoApprovedReason="approval-mode-yolo"`.
+    - Dangerous-pattern hits under `"auto"` still gate; the matched
+      pattern id surfaces on the approval row's `reason` field so
+      operators see WHY they're being asked.
 
 ## Deferred
 

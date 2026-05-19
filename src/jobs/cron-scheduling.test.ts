@@ -249,9 +249,10 @@ describe("runDueJobs with a cron-driven job", () => {
     // Anchor overdueAt to a known UTC-hour boundary so the missed-fire
     // count is deterministic regardless of wall-clock minute when this
     // test happens to run. Two whole hours in the past at minute=00 means
-    // the cron walks: consume = (now's-2h):00 + 1h = (now-1h):00, next =
-    // (now's hour):00 which is `≤ now` (because nowMs > thisHour:00), so
-    // missed=1; subsequent next is (now+1h):00 which is `> now`, stop.
+    // the cron walks: next = (now's-2h):00 + 1h = (now-1h):00 which is
+    // `<= now`, so missed=1; next = (now's hour):00 which is also `<= now`
+    // (because nowMs > thisHour:00), so missed=2; next = (now+1h):00
+    // which is `> now`, stop.
     const setupNow = Date.now();
     const nowDate = new Date(setupNow);
     const thisHourStartMs = Date.UTC(
@@ -284,11 +285,11 @@ describe("runDueJobs with a cron-driven job", () => {
     const newNext = new Date(newNextMs);
     expect(newNext.getUTCMinutes()).toBe(0);
     expect(newNext.getUTCSeconds()).toBe(0);
-    // consume = (this-hour - 1h):00. next-after-consume = (this-hour):00,
-    // which is strictly less than `dateNow` (set inside runDueJobs after
-    // we wrote overdueAt). So one extra fire was missed. The next-after
-    // that is (this-hour + 1h):00 which is strictly in the future, so the
-    // walk stops there. missedRuns increments by exactly 1.
-    expect(updated.missedRuns).toBe(1);
+    // First next = (this-hour - 1h):00, which is `<= dateNow` (set inside
+    // runDueJobs after we wrote overdueAt), so one missed fire. Next =
+    // (this-hour):00, also `<= dateNow`, so another missed fire. Next =
+    // (this-hour + 1h):00 which is strictly in the future, so the walk
+    // stops there. missedRuns increments by exactly 2.
+    expect(updated.missedRuns).toBe(2);
   });
 });

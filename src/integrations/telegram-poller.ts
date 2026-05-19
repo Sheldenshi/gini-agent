@@ -11,7 +11,6 @@ import { mkdirSync } from "node:fs";
 import { extname, join } from "node:path";
 import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig, TaskStatus } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
-import { instanceRoot } from "../paths";
 import {
   authorizeTelegramChat,
   findTelegramChatSession,
@@ -527,11 +526,13 @@ async function maintainTypingIndicator(
   }
 }
 
-// Resolve an inbound photo's file_id to a local path under the instance
-// inbound directory. The path is stable across restarts (keyed on
+// Resolve an inbound photo's file_id to a local path under the workspace's
+// .gini/inbound/ directory. The path is stable across restarts (keyed on
 // bridge + update_id + file_id), and the media descriptor records both
 // the local path and the Telegram file_id so the agent can re-fetch via
-// sendPhoto if it needs to echo the image back.
+// sendPhoto if it needs to echo the image back. Landing under
+// workspaceRoot keeps the file inside the agent's file-tool boundary so
+// `[photo: <path>]` in the task input is actually readable.
 async function downloadIncomingPhoto(
   config: RuntimeConfig,
   bridgeId: string,
@@ -546,7 +547,7 @@ async function downloadIncomingPhoto(
   }
   const bytes = await client.downloadFile(file.file_path);
   const ext = (extname(file.file_path) || ".jpg").toLowerCase();
-  const dir = join(instanceRoot(config.instance), "inbound", bridgeId);
+  const dir = join(config.workspaceRoot, ".gini", "inbound", bridgeId);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${updateId}-${incoming.photo.file_id}${ext}`);
   await Bun.write(path, bytes);

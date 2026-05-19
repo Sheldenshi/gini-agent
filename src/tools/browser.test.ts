@@ -195,9 +195,9 @@ describe("browser disconnect lifecycle", () => {
   });
 
   test("disconnectSharedBrowser also closes the HEADLESS persistent context", async () => {
-    // Same teardown arm regardless of headed flag — when the user calls
-    // wipe-profile, the headless persistent context must come down too so
-    // the rm -rf isn't fighting an open Chromium handle. Tests the
+    // Same teardown arm regardless of headed flag — the headless
+    // persistent context that the default tool path materializes must
+    // come down on Disconnect just like the headed one. Tests the
     // headed=false variant explicitly so we don't regress that branch.
     let contextCloseCalled = false;
     browserTest.installFakeHeadlessPersistentContextForTest({
@@ -1765,7 +1765,11 @@ describe("dispatchToolCall(browser_upload_file)", () => {
       provider: { name: "echo", model: "gini-echo-v0" },
       workspaceRoot: WORKSPACE,
       stateRoot: `${ROOT}/instances/${instance}`,
-      logRoot: `${ROOT}-logs/${instance}`
+      logRoot: `${ROOT}-logs/${instance}`,
+      // The test asserts the gated path (kind: "pending"). Force
+      // strict so the new default-auto policy doesn't auto-resolve
+      // the upload approval.
+      approvalMode: "strict"
     };
   }
 

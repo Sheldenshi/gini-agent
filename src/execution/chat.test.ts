@@ -42,7 +42,10 @@ function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
     provider: { name: "echo", model: "" },
     workspaceRoot,
     stateRoot: process.env.GINI_STATE_ROOT ?? "/tmp/gini-chat-test",
-    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-chat-test-logs"
+    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-chat-test-logs",
+    // Pin the gated path so these waiting-approval placeholder tests
+    // remain meaningful under the new default-auto approval policy.
+    approvalMode: "strict"
   };
 }
 

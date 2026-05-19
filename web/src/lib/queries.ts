@@ -187,7 +187,11 @@ export function useChatSessions() {
   return useQuery<ChatSession[]>({
     queryKey: ["chat"],
     queryFn: () => api<ChatSession[]>("/chat"),
-    refetchInterval: 60_000
+    // 3s safety net so the sidebar's read/unread indicator picks up
+    // task completions even when an SSE event for the change is missed
+    // or arrives without invalidating ["chat"]. SSE is still the
+    // primary signal — the interval just bounds the worst case.
+    refetchInterval: 3000
   });
 }
 
@@ -299,28 +303,6 @@ export function useDisconnectBrowser() {
   return useMutation<BrowserConnectionStatus, Error, void>({
     mutationFn: () =>
       api<BrowserConnectionStatus>("/browser/disconnect", { method: "POST" }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["browser"] });
-      qc.invalidateQueries({ queryKey: ["events"] });
-      qc.invalidateQueries({ queryKey: ["audit"] });
-    }
-  });
-}
-
-// Wipe the per-instance Chrome profile dir. Destructive — removes all
-// saved cookies / sign-ins / browsing data. The gateway rejects this
-// while a visible window is connected (the user must disconnect first),
-// so the caller surfaces a tooltip on the disabled state.
-export interface WipeProfileResult {
-  wiped: boolean;
-  dataDir: string;
-}
-
-export function useWipeBrowserProfile() {
-  const qc = useQueryClient();
-  return useMutation<WipeProfileResult, Error, void>({
-    mutationFn: () =>
-      api<WipeProfileResult>("/browser/wipe-profile", { method: "POST" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["browser"] });
       qc.invalidateQueries({ queryKey: ["events"] });

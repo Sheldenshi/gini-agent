@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import type { RuntimeConfig } from "./types";
+import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
@@ -25,7 +25,7 @@ import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { connectBrowser, disconnectBrowser, getBrowserConnection, wipeBrowserProfile } from "./capabilities/browser-connect";
+import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
@@ -52,20 +52,58 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/state$/, () => json(publicState(config))],
     // Settings: auto-approve controls.
     //   - `patterns`: shell-glob allowlist for terminal_exec only.
-    //   - `dangerouslyAutoApprove`: global bypass for every
-    //     approval-gated tool in the chat-task dispatcher (also the
-    //     legacy imperative path; see RuntimeConfig.dangerouslyAutoApprove
-    //     for scope).
-    // PATCH accepts either field individually or both together; omitted
-    // keys are left at their current value.
-    ["GET", /^\/api\/settings\/auto-approve$/, () => json({
-      patterns: config.autoApproveCommands ?? [],
-      dangerouslyAutoApprove: Boolean(config.dangerouslyAutoApprove),
-    })],
+    //     Allowlist match short-circuits the dangerous-pattern blocklist.
+    //   - `approvalMode`: "strict" | "auto" | "yolo". See ADR
+    //     approval-mode.md for the contract. Fresh instances default
+    //     to "auto".
+    //   - `dangerousTerminalPatterns`: optional operator overlay for
+    //     the built-in dangerous-pattern blocklist; only consulted when
+    //     `approvalMode === "auto"`.
+    //   - `dangerouslyAutoApprove`: deprecated read alias for
+    //     `approvalMode === "yolo"`. Accepted as a write alias too —
+    //     setting it true is equivalent to `approvalMode: "yolo"`.
+    // PATCH accepts any subset of fields together; omitted keys are
+    // left at their current value.
+    ["GET", /^\/api\/settings\/auto-approve$/, () => {
+      const approvalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
+      return json({
+        patterns: config.autoApproveCommands ?? [],
+        approvalMode,
+        dangerousTerminalPatterns: config.dangerousTerminalPatterns ?? [],
+        // Derived read-only alias kept for legacy clients.
+        dangerouslyAutoApprove: approvalMode === "yolo",
+      });
+    }],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
+      // Validate strictly. Previously an out-of-union value was mapped
+      // to undefined and the PATCH silently no-op'd that field while
+      // returning 200 — the client thought it succeeded. Job-level
+      // approvalMode validation already rejects unknown values; mirror
+      // that contract at the HTTP boundary too.
+      let approvalMode: ApprovalMode | undefined;
+      if (payload.approvalMode !== undefined && payload.approvalMode !== null) {
+        if (
+          payload.approvalMode !== "strict" &&
+          payload.approvalMode !== "auto" &&
+          payload.approvalMode !== "yolo"
+        ) {
+          return json(
+            {
+              error: `approvalMode must be one of "strict" | "auto" | "yolo" (got ${JSON.stringify(payload.approvalMode)})`,
+              validValues: ["strict", "auto", "yolo"]
+            },
+            400
+          );
+        }
+        approvalMode = payload.approvalMode;
+      }
       return json(updateAutoApproveSettings(config, {
         patterns: Array.isArray(payload.patterns) ? payload.patterns.map(String) : undefined,
+        approvalMode,
+        dangerousTerminalPatterns: Array.isArray(payload.dangerousTerminalPatterns)
+          ? payload.dangerousTerminalPatterns.map(String)
+          : undefined,
         dangerouslyAutoApprove: typeof payload.dangerouslyAutoApprove === "boolean" ? payload.dangerouslyAutoApprove : undefined
       }));
     }],
@@ -361,7 +399,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(await connectBrowser(config, payload), 201);
     }],
     ["POST", /^\/api\/browser\/disconnect$/, async () => json(await disconnectBrowser(config))],
-    ["POST", /^\/api\/browser\/wipe-profile$/, async () => json(await wipeBrowserProfile(config))],
     ["GET", /^\/api\/toolsets$/, () => json(listToolsets(config))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/enable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "enabled"))],
     ["POST", /^\/api\/toolsets\/([^/]+)\/disable$/, async (_request, params) => json(await setToolsetStatus(config, params[0], "disabled"))],

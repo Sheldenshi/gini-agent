@@ -167,15 +167,22 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     }
     oneShot = input.oneShot;
   }
-  // Per-job auto-approve envelope. Both fields are optional; reject malformed
+  // Per-job auto-approve envelope. All fields are optional; reject malformed
   // payloads up-front so a typo doesn't silently fall back to legacy behavior.
-  // See ADR dangerously-auto-approve.md ("Per-job scope") for the approval model.
+  // See ADR approval-mode.md ("Per-job scope") for the approval model.
   let dangerouslyAutoApprove: boolean | undefined;
   if (input.dangerouslyAutoApprove !== undefined && input.dangerouslyAutoApprove !== null) {
     if (typeof input.dangerouslyAutoApprove !== "boolean") {
       throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
     }
     dangerouslyAutoApprove = input.dangerouslyAutoApprove;
+  }
+  let approvalMode: "strict" | "auto" | "yolo" | undefined;
+  if (input.approvalMode !== undefined && input.approvalMode !== null) {
+    if (input.approvalMode !== "strict" && input.approvalMode !== "auto" && input.approvalMode !== "yolo") {
+      throw new Error(`Invalid input: approvalMode must be one of "strict" | "auto" | "yolo" (got ${String(input.approvalMode)})`);
+    }
+    approvalMode = input.approvalMode;
   }
   let autoApproveCommands: string[] | undefined;
   if (input.autoApproveCommands !== undefined && input.autoApproveCommands !== null) {
@@ -193,6 +200,29 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       cleaned.push(entry);
     }
     autoApproveCommands = cleaned;
+  }
+  let dangerousTerminalPatterns: string[] | undefined;
+  if (input.dangerousTerminalPatterns !== undefined && input.dangerousTerminalPatterns !== null) {
+    if (!Array.isArray(input.dangerousTerminalPatterns)) {
+      throw new Error(`Invalid input: dangerousTerminalPatterns must be an array of strings (got ${typeof input.dangerousTerminalPatterns})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.dangerousTerminalPatterns) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: dangerousTerminalPatterns entries must be strings (got ${typeof entry})`);
+      }
+      // Trim before persisting so a padded entry like " docker run "
+      // is stored as "docker run". The matcher uses substring
+      // semantics, so a padded entry would never match a real command
+      // — silently disabling the rule the operator thought they
+      // added.
+      const trimmed = entry.trim();
+      if (trimmed.length === 0) {
+        throw new Error(`Invalid input: dangerousTerminalPatterns entries must be non-empty strings`);
+      }
+      cleaned.push(trimmed);
+    }
+    dangerousTerminalPatterns = cleaned;
   }
   // A parent task that has already transitioned terminal must not
   // create a durable scheduled job. Without this, a `cancelTask`
@@ -273,7 +303,9 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       chatSessionId: resolvedChatSessionId,
       oneShot,
       dangerouslyAutoApprove,
-      autoApproveCommands
+      approvalMode,
+      autoApproveCommands,
+      dangerousTerminalPatterns
     });
   });
 }
@@ -299,28 +331,25 @@ function advanceNextRunAt(prevNextRunAtMs: number, intervalSeconds: number, nowM
   return { nextRunAtMs: next, missed };
 }
 
-// Cron-driven equivalent of advanceNextRunAt. Walks forward through cron-
-// matched moments starting at the run we just claimed: the first advance
-// consumes that run, each subsequent advance is a missed cron-fire that
-// has already drifted into the past (e.g. the runtime was offline). Mirrors
-// the interval helper's contract — the cron version delegates the "what's
-// the next match?" math to croner so DST transitions, leap years, and
-// month-end edge cases are handled natively. Returns the new nextRunAt
-// (ms) and the count of EXTRA missed cron fires (>= 0).
-function advanceCronNextRunAt(
+// Cron-driven equivalent of advanceNextRunAt. Returns the next cron-matched
+// moment strictly after the run we just claimed, walking past any matches
+// that have already drifted into the past (e.g. the runtime was offline).
+// Delegates the "what's the next match?" math to croner so DST transitions,
+// leap years, and month-end edge cases are handled natively. Returns the
+// new nextRunAt (ms) and the count of EXTRA missed cron fires (>= 0).
+export function advanceCronNextRunAt(
   cronExpression: string,
   cronTimezone: string,
   prevNextRunAtMs: number,
   nowMs: number
 ): { nextRunAtMs: number; missed: number } {
   const cron = new Cron(cronExpression, { timezone: cronTimezone });
-  // Mirror the interval helper's contract: starting from the run we just
-  // claimed (`prevNextRunAtMs`), `consume` is the first cron-matched
-  // moment strictly after that — analogous to `prev + step` for intervals.
-  // The loop then walks subsequent matches and counts each that's still
-  // in the past as a missed fire.
-  const consume = cron.nextRun(new Date(prevNextRunAtMs));
-  if (!consume) {
+  // `cron.nextRun(prev)` returns the first cron-matched moment strictly
+  // after `prev`, so it already IS the next scheduled fire — no extra
+  // "consume" step needed. The loop then walks subsequent matches and
+  // counts each that's still in the past as a missed fire.
+  let next = cron.nextRun(new Date(prevNextRunAtMs));
+  if (!next) {
     // Defensive: a pathological pattern that returns null. We treat it
     // as a fallback to "stay where we are" so the scheduler doesn't
     // crash. createScheduledJob's validation already rejected unfire-able
@@ -328,13 +357,7 @@ function advanceCronNextRunAt(
     // skew or a truly degenerate edge.
     return { nextRunAtMs: prevNextRunAtMs, missed: 0 };
   }
-  let next = cron.nextRun(consume);
   let missed = 0;
-  if (!next) {
-    // Same defensive fallback — but `consume` is a valid future-ish
-    // anchor, so use it as the new nextRunAt.
-    return { nextRunAtMs: consume.getTime(), missed: 0 };
-  }
   while (next.getTime() <= nowMs) {
     const after = cron.nextRun(next);
     if (!after) break;
@@ -418,14 +441,16 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
 // operator's global config object. When the job carries no per-job
 // envelope, the clone is byte-identical to the input and the spawned task
 // inherits current behavior. When the job opts in, we overlay:
-//   - `dangerouslyAutoApprove=true` (full bypass for this job only)
+//   - `approvalMode` (per-job override of the operator default)
 //   - `autoApproveCommands` merged onto the cloned array (operator's
 //     allowlist still applies; the job widens it for its own task)
-// Audit rows on the spawned task's side effects automatically pick up the
-// usual `autoApprovedReason` markers (matched pattern, or
-// "dangerouslyAutoApprove") via the existing tool-dispatch path — the
-// only thing that changes per-job is which config object the spawned
-// task sees.
+//   - `dangerousTerminalPatterns` for the per-job blocklist
+// Audit rows on the spawned task's side effects automatically pick up
+// the usual `autoApprovedReason` markers (matched pattern,
+// "approval-mode-auto", or "approval-mode-yolo") via the existing
+// tool-dispatch path — the only thing that changes per-job is which
+// config object the spawned task sees. See ADR approval-mode.md
+// ("Per-Job Scope").
 function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
   const clone: RuntimeConfig = {
     ...config,
@@ -433,12 +458,21 @@ function buildTaskConfig(config: RuntimeConfig, job: JobRecord): RuntimeConfig {
       ? [...config.autoApproveCommands]
       : undefined
   };
-  if (job.dangerouslyAutoApprove === true) {
-    clone.dangerouslyAutoApprove = true;
+  // approvalMode overlay. The job's explicit `approvalMode` always
+  // wins over the operator instance default. For back-compat, the
+  // legacy `dangerouslyAutoApprove: true` field on a job aliases to
+  // `approvalMode: "yolo"` when no approvalMode is set on the job.
+  if (job.approvalMode) {
+    clone.approvalMode = job.approvalMode;
+  } else if (job.dangerouslyAutoApprove === true) {
+    clone.approvalMode = "yolo";
   }
   if (Array.isArray(job.autoApproveCommands) && job.autoApproveCommands.length > 0) {
     const base = clone.autoApproveCommands ?? [];
     clone.autoApproveCommands = [...base, ...job.autoApproveCommands];
+  }
+  if (Array.isArray(job.dangerousTerminalPatterns)) {
+    clone.dangerousTerminalPatterns = [...job.dangerousTerminalPatterns];
   }
   return clone;
 }
@@ -465,12 +499,12 @@ async function dispatchPromptRun(
   trigger: "schedule" | "manual" | "replay"
 ): Promise<{ jobId: string; runId: string; taskId: string }> {
   const prompt = withCronHint(job.prompt, job.context);
-  // Per-job auto-approve envelope: clone the RuntimeConfig (NEVER mutate the
+  // Per-job approval envelope: clone the RuntimeConfig (NEVER mutate the
   // original — it's the per-instance runtime-wide config) and overlay the
   // job's opt-in fields before handing it to submitTask. The spawned task
   // and every approval-gated dispatch inside it see the cloned config; the
   // operator's global RuntimeConfig stays untouched. See ADR
-  // dangerously-auto-approve.md ("Per-job scope") for the approval model.
+  // approval-mode.md ("Per-Job Scope") for the approval model.
   const taskConfig: RuntimeConfig = buildTaskConfig(config, job);
 
   // Resolve session linkage up-front. If the job points at a session that

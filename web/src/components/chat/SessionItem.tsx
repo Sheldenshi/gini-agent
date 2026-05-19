@@ -9,6 +9,7 @@ import { formatRelativeTime } from "./relative-time";
 export interface SessionItemProps {
   session: ChatSession;
   isActive: boolean;
+  isUnread?: boolean;
   onSelect: () => void;
   onDelete: () => void;
   onRename: (title: string) => void;
@@ -17,6 +18,7 @@ export interface SessionItemProps {
 export function SessionItem({
   session,
   isActive,
+  isUnread = false,
   onSelect,
   onDelete,
   onRename
@@ -87,8 +89,17 @@ export function SessionItem({
             onClick={onSelect}
             onDoubleClick={startEdit}
             className="flex min-w-0 flex-1 items-center gap-2 truncate text-left"
+            aria-label={isUnread ? `${label} (unread)` : label}
           >
-            <span className="truncate">{label}</span>
+            {isUnread ? (
+              <span
+                aria-hidden="true"
+                className="size-1.5 shrink-0 rounded-full bg-primary"
+              />
+            ) : null}
+            <span className={cn("truncate", isUnread && "font-semibold")}>
+              {label}
+            </span>
           </button>
         )}
         {!editing && time ? (

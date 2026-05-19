@@ -38,6 +38,7 @@ import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
 import { approvalToolCallId } from "./execution/tool-dispatch";
+import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
 import {
@@ -354,31 +355,63 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     if (matchesShape(task.input, prefix, shape)) {
       await markWorking(config, taskId);
       const next = await tool(config, task);
-      // dangerouslyAutoApprove also applies to the legacy imperative
-      // path: each `request*` helper above creates exactly one
-      // approval and leaves the task in `waiting_approval`. When the
-      // flag is on, immediately resolve that approval through the same
-      // resolveApproval pipeline the chat-task dispatcher uses, so
-      // `gini task submit "write foo :: bar"` and `POST /api/tasks`
-      // honor the bypass too. Errors here propagate up so submitTask's
-      // `.catch(failTask)` records the side-effect failure.
-      if (config.dangerouslyAutoApprove && next.status === "waiting_approval" && next.approvalIds.length > 0) {
+      // Imperative path also routes through the central approval-policy
+      // seam. Each `request*` helper above creates exactly one approval
+      // and leaves the task in `waiting_approval`; we then resolve the
+      // policy decision off the just-created approval row (its action
+      // and payload.command) and either auto-resolve through the same
+      // resolveApproval pipeline the chat-task dispatcher uses, or
+      // leave the task paused for the human gate. Errors propagate to
+      // submitTask's `.catch(failTask)` so a side-effect failure is
+      // recorded on the task.
+      if (next.status === "waiting_approval" && next.approvalIds.length > 0) {
         const approvalId = next.approvalIds[next.approvalIds.length - 1]!;
-        try {
-          await resolveApproval(config, approvalId, {
-            actor: "runtime",
-            resumeChatTask: false,
-            evidenceExtra: { autoApproved: true, autoApprovedReason: "dangerouslyAutoApprove" }
-          });
-        } catch (err) {
-          // Race-loss is benign on the imperative path too: another
-          // caller decided the approval first and owns the task's
-          // terminal transition. Anything else propagates to
-          // submitTask's outer .catch(failTask).
-          if (!(err instanceof ApprovalRaceLostError)) throw err;
+        const approval = readState(config.instance).approvals.find((a) => a.id === approvalId);
+        const policyAction = approval
+          ? mapApprovalToPolicyAction(approval.action, approval.payload)
+          : undefined;
+        if (policyAction) {
+          // Forward the full shape the policy needs. For code.exec we
+          // MUST pass `source` (and `language` for symmetry) so the
+          // matcher scans the raw snippet and an argv-style payload
+          // like `Bun.spawn(["sudo", "apt"])` doesn't slip past the
+          // wrapper-only check. For plain terminal.exec the wrapper
+          // command is the whole shape.
+          const payload =
+            approval && typeof approval.payload.command === "string"
+              ? policyAction === "code.exec"
+                ? {
+                    command: approval.payload.command,
+                    source:
+                      typeof approval.payload.source === "string"
+                        ? approval.payload.source
+                        : "",
+                    language:
+                      typeof approval.payload.language === "string"
+                        ? approval.payload.language
+                        : undefined
+                  }
+                : { command: approval.payload.command }
+              : undefined;
+          const decision = resolveApprovalPolicy(config, policyAction, payload);
+          if (decision.mode === "auto") {
+            try {
+              await resolveApproval(config, approvalId, {
+                actor: "runtime",
+                resumeChatTask: false,
+                evidenceExtra: { autoApproved: true, autoApprovedReason: decision.reason }
+              });
+            } catch (err) {
+              // Race-loss is benign on the imperative path too:
+              // another caller decided the approval first and owns
+              // the task's terminal transition. Anything else
+              // propagates to submitTask's outer .catch(failTask).
+              if (!(err instanceof ApprovalRaceLostError)) throw err;
+            }
+            const refreshed = readState(config.instance).tasks.find((t) => t.id === taskId);
+            return finishTaskTransition(config, refreshed ?? next);
+          }
         }
-        const refreshed = readState(config.instance).tasks.find((t) => t.id === taskId);
-        return finishTaskTransition(config, refreshed ?? next);
       }
       return finishTaskTransition(config, next);
     }
@@ -831,10 +864,55 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
 // approval.approved and side-effect audit rows. Narrow on purpose — the
 // runtime owns the canonical evidence (beforeBytes/exitCode/diff/etc.)
 // and merges those AFTER this bag so caller markers can't overwrite
-// them. Add new keys here as new auto-approve reasons appear.
+// them.
+//
+// `autoApprovedReason` values produced by the runtime:
+//   - "approval-mode-auto"   — approvalMode "auto" auto-approved a
+//                              safe action (file.write, file.patch,
+//                              browser.upload_file, or a safe
+//                              terminal.exec / code_exec).
+//   - "approval-mode-yolo"   — approvalMode "yolo" auto-approved
+//                              everything (legacy
+//                              `dangerouslyAutoApprove: true` aliases
+//                              to this).
+//   - "<allowlist pattern>"  — `RuntimeConfig.autoApproveCommands`
+//                              matched the command (terminal.exec
+//                              fast path; the matched pattern is the
+//                              reason).
+// Add new keys here as new auto-approve reasons appear.
 export interface AutoApproveMarkers {
   autoApproved?: boolean;
   autoApprovedReason?: string;
+}
+
+// Translate an approval row's `action` field into the corresponding
+// `PolicyAction` the approval-policy seam understands. Returns
+// undefined for actions that aren't approval-eligible at the policy
+// layer (memory.activate, skill.enable, connector.enable — those are
+// audit labels, not policy-gated tools). Imperative dispatch uses
+// this to look up the right policy decision after the request* helper
+// has already created the approval row.
+//
+// code.exec is persisted on the approval row as action:"terminal.exec"
+// (since the eventual side effect is a shell exec), but the POLICY
+// decision must branch on the code.exec rule so the matcher scans
+// BOTH the wrapper command AND the raw source. We disambiguate by
+// looking for `source` on the payload — both request paths
+// (chat-task `requestCodeExecPrebuilt`, imperative
+// `requestCodeExecution`) persist `source` on the payload exactly so
+// this re-resolution can find it.
+export function mapApprovalToPolicyAction(
+  action: Approval["action"],
+  payload?: Record<string, unknown>
+): PolicyAction | undefined {
+  if (action === "terminal.exec") {
+    if (payload && typeof payload.source === "string") return "code.exec";
+    return "terminal.exec";
+  }
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+    return action;
+  }
+  return undefined;
 }
 
 // Thrown when an approved side effect itself fails (writeFileSync

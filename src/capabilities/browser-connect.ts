@@ -1,10 +1,9 @@
-// Headed-browser connect/disconnect capability. The runtime exposes four
+// Headed-browser connect/disconnect capability. The runtime exposes three
 // HTTP routes that delegate to the functions in this module:
 //
 //   GET  /api/browser                 -> getBrowserConnection
 //   POST /api/browser/connect         -> connectBrowser
 //   POST /api/browser/disconnect      -> disconnectBrowser
-//   POST /api/browser/wipe-profile    -> wipeBrowserProfile
 //
 // Profile persistence shape:
 //
@@ -14,9 +13,7 @@
 //   - Connect/Disconnect cycles (visibility toggle only)
 //   - Runtime restarts
 //   - Idle teardown
-// The only ways to lose them are:
-//   - The user explicitly hits Wipe Profile (or `gini browser wipe-profile`)
-//   - The user manually rm -rf the profile dir
+// The only way to lose them is to manually rm -rf the profile dir.
 //
 // Two connection modes (the third "headless" state is "no record"):
 //
@@ -38,7 +35,6 @@
 // render a uniform status card.
 
 import { existsSync, mkdirSync } from "node:fs";
-import { rm } from "node:fs/promises";
 import { addAudit, mutateState, now, readState } from "../state";
 import { findChromePath } from "../tools/chrome-discovery";
 import {
@@ -537,54 +533,6 @@ async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   await disconnectSharedBrowser();
 
   return { connected: false };
-}
-
-// Wipe the per-instance Chrome profile directory. Permanently removes all
-// cookies, saved logins, and browsing data the agent has accumulated.
-// Two-step UX: the user must disconnect the visible browser first so we
-// don't yank the profile out from under a live Chromium child. Once
-// disconnected, this tears down any lingering headless persistent context
-// (so the next browser tool call relaunches against an empty profile) and
-// rm -rf's the directory. Emits a medium-risk audit row.
-export interface WipeResult {
-  wiped: boolean;
-  dataDir: string;
-}
-
-export async function wipeBrowserProfile(config: RuntimeConfig): Promise<WipeResult> {
-  const existing = readState(config.instance).browser ?? null;
-  if (existing) {
-    // Refuse to wipe while a visible window is connected — the user must
-    // hit Disconnect first. This is the same "Invalid input" prefix the
-    // gateway maps to 400 in statusFromErrorMessage.
-    throw new Error("Invalid input: disconnect before wiping the profile.");
-  }
-  const dataDir = chromeProfileDirFor(config.instance);
-  // Drop any cached headless persistent context BEFORE rm-ing the dir.
-  // Chromium would otherwise hold open file handles inside the dir; on
-  // macOS rm -rf still succeeds (unlink-while-open semantics) but Chromium
-  // would then write to ghost inodes on its way out, which is messier than
-  // necessary. Tearing down first is the clean order.
-  //
-  // withTeardownLock holds the admission gate CLOSED across the whole
-  // disconnect-then-rm sequence so a new agent tool call can't sneak in
-  // between the two awaits, materialize a fresh headless persistent
-  // context against the same dir, and either lock the rm out or fight us
-  // for the inodes mid-delete.
-  await withTeardownLock(async () => {
-    await disconnectSharedBrowser();
-    await rm(dataDir, { recursive: true, force: true });
-  });
-  await mutateState(config.instance, (state) => {
-    addAudit(state, {
-      actor: "user",
-      action: "browser.wipe-profile",
-      target: dataDir,
-      risk: "medium",
-      evidence: { dataDir }
-    });
-  });
-  return { wiped: true, dataDir };
 }
 
 // Internal helpers exported only for unit tests.

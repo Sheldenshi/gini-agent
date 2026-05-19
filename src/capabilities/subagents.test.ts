@@ -24,7 +24,10 @@ function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
     provider: { name: "echo", model: "" },
     workspaceRoot,
     stateRoot: process.env.GINI_STATE_ROOT ?? "/tmp/gini-subagent-test",
-    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-subagent-test-logs"
+    logRoot: process.env.GINI_LOG_ROOT ?? "/tmp/gini-subagent-test-logs",
+    // Keep these tests on the gated path; they assert pause + cascade
+    // behavior that needs an approval row to land.
+    approvalMode: "strict"
   };
 }
 

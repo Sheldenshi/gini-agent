@@ -5,7 +5,7 @@
 // and the chat-task agent loop in execution/ pull from here so they ship
 // the same instructions to the model.
 
-import type { MemoryRecord } from "./types";
+import type { JobRecord, MemoryRecord } from "./types";
 
 const INSTRUCTIONS = [
   "You are Gini, a local-first personal agent.",
@@ -32,4 +32,60 @@ export function buildAgentSystemContext(memories: MemoryRecord[], recalledContex
     parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);
   }
   return parts.join("\n\n");
+}
+
+// Build a context block listing scheduled jobs that deliver into the
+// current chat session. The chat-task loop scans `state.jobs` for any
+// record whose `chatSessionId` matches the session backing the current
+// task and passes the matching records here. The block is pure context —
+// no directives about how the model should resolve user phrasing — so the
+// model can infer relevance the same way it does for any other ambient
+// state in the system prompt.
+//
+// Returns an empty string when no jobs apply — the caller can guard
+// against stray whitespace by checking the empty case before appending.
+export function buildBoundJobsBlock(jobs: JobRecord[]): string {
+  if (jobs.length === 0) return "";
+  const entries = jobs.map((job) => {
+    const lines: string[] = [];
+    lines.push(`- id: ${job.id}`);
+    lines.push(`  name: ${job.name}`);
+    lines.push(`  schedule: ${describeJobSchedule(job)}`);
+    // Prompts are user-authored content, not untrusted external data, so we
+    // include the full text. The model needs it to reason about edits like
+    // "change the topic from X to Y" or "make it remind me about Z instead".
+    appendPromptLines(lines, job.prompt);
+    return lines.join("\n");
+  });
+  return [`Scheduled jobs delivering into this chat:`, ...entries].join("\n");
+}
+
+function describeJobSchedule(job: JobRecord): string {
+  if (job.cronExpression) {
+    const tz = job.cronTimezone ?? "UTC";
+    return `cron \`${job.cronExpression}\` (${tz})`;
+  }
+  if (typeof job.intervalSeconds === "number") {
+    return `every ${job.intervalSeconds}s`;
+  }
+  return "(no schedule)";
+}
+
+// Render the job's prompt onto `lines`. Single-line prompts (and the empty
+// placeholder) sit inline after `prompt:`; multi-line prompts break onto
+// their own indented block under a bare `prompt:` label so the inline
+// branch never leaves a trailing space after the colon.
+function appendPromptLines(lines: string[], prompt: string): void {
+  if (!prompt) {
+    lines.push(`  prompt: (empty)`);
+    return;
+  }
+  if (!prompt.includes("\n")) {
+    lines.push(`  prompt: ${prompt}`);
+    return;
+  }
+  lines.push(`  prompt:`);
+  for (const promptLine of prompt.split("\n")) {
+    lines.push(`    ${promptLine}`);
+  }
 }
