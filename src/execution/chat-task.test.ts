@@ -914,8 +914,9 @@ describe("chat-task loop", () => {
     expect(content).toContain("cron `0 9 * * *`");
     expect(content).toContain("America/Los_Angeles");
     expect(content).toContain("Ask the team what they did yesterday");
-    // Single-bound-job intro tells the model to skip list_jobs.
-    expect(content).toMatch(/do NOT call list_jobs first/);
+    // Intro names the binding without prescribing how the model should
+    // disambiguate user phrasing — that's left to the model.
+    expect(content).toContain("This chat session is bound to the scheduled job listed below.");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

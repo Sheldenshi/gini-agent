@@ -37,19 +37,19 @@ export function buildAgentSystemContext(memories: MemoryRecord[], recalledContex
 // Build a "Bound scheduled jobs" block describing which jobs are attached to
 // the current chat session. The chat-task loop scans `state.jobs` for any
 // record whose `chatSessionId` matches the session backing the current task
-// and passes the matching records here. The block tells the model that
-// "this job" / "this reminder" in user prose refers to a known id below,
-// so it can call `update_job` / `delete_job` directly without first calling
-// `list_jobs`. When more than one job is bound the model is told to ask
-// for disambiguation before mutating.
+// and passes the matching records here. We present the records as data and
+// let the model infer relevance from conversational cues — explicit
+// "if the user says 'this job'…" directives in the system prompt collided
+// with the base list_jobs guidance and added more noise than they were
+// worth.
 //
 // Returns an empty string when no jobs are bound — the caller can guard
 // against stray whitespace by checking the empty case before appending.
 export function buildBoundJobsBlock(jobs: JobRecord[]): string {
   if (jobs.length === 0) return "";
   const intro = jobs.length === 1
-    ? "This chat session is bound to the scheduled job listed below. When the user refers to \"this job\", \"this reminder\", \"the schedule\", or similar, use the id below directly with update_job / delete_job — do NOT call list_jobs first."
-    : `This chat session is bound to ${jobs.length} scheduled jobs listed below. When the user refers to "this job" / "this reminder" / "the schedule", these are the candidates. If the request unambiguously matches one (e.g. by name or schedule), use its id directly with update_job / delete_job. If it is ambiguous, ask the user which one they mean before mutating. You only need to call list_jobs if the user clearly means a job NOT in this list.`;
+    ? "This chat session is bound to the scheduled job listed below."
+    : `This chat session is bound to the ${jobs.length} scheduled jobs listed below.`;
   const entries = jobs.map((job) => {
     const lines: string[] = [];
     lines.push(`- id: ${job.id}`);
@@ -58,7 +58,7 @@ export function buildBoundJobsBlock(jobs: JobRecord[]): string {
     // Prompts are user-authored content, not untrusted external data, so we
     // include the full text. The model needs it to reason about edits like
     // "change the topic from X to Y" or "make it remind me about Z instead".
-    lines.push(`  prompt: ${formatPromptForBlock(job.prompt)}`);
+    appendPromptLines(lines, job.prompt);
     return lines.join("\n");
   });
   return [`Bound scheduled jobs:`, intro, ...entries].join("\n");
@@ -75,12 +75,21 @@ function describeJobSchedule(job: JobRecord): string {
   return "(no schedule)";
 }
 
-// Keep multi-line prompts readable inside the block while staying within a
-// single bullet entry. A blank `prompt:` line stays empty rather than
-// collapsing into the next entry's `- id:` line.
-function formatPromptForBlock(prompt: string): string {
-  if (!prompt) return "(empty)";
-  if (!prompt.includes("\n")) return prompt;
-  const indented = prompt.split("\n").map((line) => `    ${line}`).join("\n");
-  return `\n${indented}`;
+// Render the job's prompt onto `lines`. Single-line prompts (and the empty
+// placeholder) sit inline after `prompt:`; multi-line prompts break onto
+// their own indented block under a bare `prompt:` label so the inline
+// branch never leaves a trailing space after the colon.
+function appendPromptLines(lines: string[], prompt: string): void {
+  if (!prompt) {
+    lines.push(`  prompt: (empty)`);
+    return;
+  }
+  if (!prompt.includes("\n")) {
+    lines.push(`  prompt: ${prompt}`);
+    return;
+  }
+  lines.push(`  prompt:`);
+  for (const promptLine of prompt.split("\n")) {
+    lines.push(`    ${promptLine}`);
+  }
 }
