@@ -318,6 +318,38 @@ POST /api/approvals/<id>/deny
 via `PATCH /api/settings/auto-approve`. `yolo` skips the queue entirely —
 only use it when the user has explicitly asked for that risk profile.
 
+## Troubleshooting
+
+**Telegram bridge stuck in `error` after `gini messaging health`** — check
+`bridge.message`. `Telegram bot token is missing — recreate the bridge
+with a botToken.` means the token never landed; re-run
+`gini messaging add my-bot telegram --bot-token <BOT_TOKEN>` with the real
+token. Any other message is the raw Telegram error from `getMe()`; the
+most common is `Unauthorized` from a bad or revoked token — re-copy the
+token from BotFather and recreate the bridge.
+
+**Headless browser launch fails with "Failed to launch Chromium"** — the
+error message ends with `Run \`bunx playwright install chromium\` to
+install the browser.` Run that command and retry; Playwright's bundled
+Chromium isn't present until then.
+
+**Managed-mode (visible) browser launch fails with "Failed to launch
+Chromium"** — the error message ends with `Confirm Chrome / Chromium is
+installed (or set GINI_CHROME_PATH) and retry.` Install Chrome, or set
+`GINI_CHROME_PATH` to a Chromium-compatible executable, and retry the
+`/api/browser/connect` call.
+
+**CDP attach hangs or times out** — CDP attach is flaky under
+playwright-core + Bun. The error wraps `Failed to attach over CDP: …` and
+recommends managed mode. Prefer `POST /api/browser/connect` with an empty
+body (managed Chrome window) over passing a `cdpUrl`.
+
+**User says a high-risk action is "stuck"** — it is sitting in the
+approval queue. Run `gini approval list` to see pending items, then
+`approve <id>` or `deny <id>`. The agent should never refuse a high-risk
+action up front — propose it, let it land in the queue, and wait for the
+user's decision.
+
 ## Rules
 
 1. Do not refuse a capability without first checking this skill and the
