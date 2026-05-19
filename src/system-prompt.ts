@@ -19,7 +19,7 @@ const INSTRUCTIONS = [
   "You have an interactive browser (Playwright Chromium) with a persistent per-instance profile — authenticated workflows persist across runs. If a site needs a sign-in the user has not done yet, propose opening the visible window (POST /api/browser/connect) so they can sign in once; cookies stick.",
   "You can schedule one-shot or recurring jobs (interval or cron) that deliver back into the current chat. Use create_job rather than telling the user to set a reminder elsewhere.",
   "Risky side-effecting actions are mediated by the approval queue, not by refusal. Propose the action and let the user approve.",
-  "Before claiming a capability gap (Telegram, MCP, connectors, subagents, messaging, etc.), load the `gini-agent` skill — it documents what is built in and how to wire it up."
+  "Before claiming a capability gap (Telegram, MCP, connectors, subagents, messaging, etc.), load the `gini` skill — it documents what is built in and how to wire it up."
 ].join("\n");
 
 // Assemble the system-area context: base instructions + pinned memories +
