@@ -495,6 +495,7 @@ async function dispatchPromptRun(
           action: "job.session.missing",
           target: job.id,
           risk: "low",
+          agentId: job.agentId,
           evidence: { jobId: job.id, runId: run.id, chatSessionId: job.chatSessionId }
         });
         return undefined;
@@ -595,6 +596,7 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
         action: "job.run.skipped_overlap",
         target: jobId,
         risk: "low",
+        agentId: item.agentId,
         evidence: { reason: "previous run still running" }
       });
       return undefined;
@@ -653,7 +655,8 @@ export async function updateJobStatus(config: RuntimeConfig, jobId: string, stat
       actor: "user",
       action: `job.${statusValue}`,
       target: jobId,
-      risk: "low"
+      risk: "low",
+      agentId: job.agentId
     });
     return job;
   });
@@ -841,7 +844,13 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     job.cronTimezone = newCronTimezone;
     job.intervalSeconds = newIntervalSeconds;
     job.updatedAt = now();
-    addAudit(state, { actor: "user", action: "job.updated", target: job.id, risk: "low" });
+    addAudit(state, {
+      actor: "user",
+      action: "job.updated",
+      target: job.id,
+      risk: "low",
+      agentId: job.agentId
+    });
     return job;
   });
 }
@@ -866,6 +875,7 @@ export async function removeJob(config: RuntimeConfig, jobId: string) {
       action: "job.removed",
       target: job.id,
       risk: "medium",
+      agentId: job.agentId,
       evidence: { removedRuns }
     });
     return job;

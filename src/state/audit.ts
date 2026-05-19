@@ -44,16 +44,22 @@ export function appendEvent(
   return item;
 }
 
+// addAudit accepts an optional `jobId` in its parameter shape (not persisted
+// on AuditEvent — see AuditEvent type). The id is consulted only as a
+// last-resort fallback in inferAgentId for job-lifecycle audits whose call
+// site doesn't already pass an explicit `agentId`. Existing call sites that
+// stamp `agentId` directly continue to take precedence.
 export function addAudit(
   state: RuntimeState,
-  event: Omit<AuditEvent, "id" | "instance" | "at">
+  event: Omit<AuditEvent, "id" | "instance" | "at"> & { jobId?: string }
 ): AuditEvent {
+  const { jobId: jobIdFallback, ...persisted } = event;
   const audit: AuditEvent = {
     id: id("audit"),
     instance: state.instance,
     at: now(),
-    ...event,
-    agentId: inferAgentId(state, event.agentId, event.taskId, undefined)
+    ...persisted,
+    agentId: inferAgentId(state, persisted.agentId, persisted.taskId, jobIdFallback)
   };
   state.audit.unshift(audit);
   appendEvent(state, {
@@ -65,7 +71,8 @@ export function addAudit(
     risk: audit.risk,
     summary: audit.action,
     data: audit.evidence,
-    agentId: audit.agentId
+    agentId: audit.agentId,
+    jobId: jobIdFallback
   });
   return audit;
 }
