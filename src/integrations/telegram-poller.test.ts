@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import type { RuntimeConfig } from "../types";
-import { readState } from "../state";
+import { assertInsideWorkspace, readState } from "../state";
 import { addMessagingBridge, resetMessagingDeps, setMessagingDeps } from "./messaging";
 import { createTelegramPollerSupervisor } from "./telegram-poller";
 import type { TelegramClient, TelegramUpdate } from "./telegram";
@@ -207,6 +207,15 @@ describe("telegram poller supervisor", () => {
 
   test("inbound photo updates are downloaded to disk and the saved path is folded into the task input", async () => {
     const config = testConfig("poller-photo");
+    // Pin workspaceRoot to a narrow per-test directory (NOT /tmp) so the
+    // photo path's containment check matches production semantics. In
+    // production, workspaceRoot is <instanceRoot>/workspace and the
+    // legacy <instanceRoot>/inbound/ path was a sibling outside the
+    // workspace — that's what made the file-read tool reject it. See
+    // issue #69.
+    const isolatedWorkspace = `/tmp/gini-telegram-poller-tests/instances/poller-photo/workspace`;
+    rmSync(isolatedWorkspace, { recursive: true, force: true });
+    config.workspaceRoot = isolatedWorkspace;
     const downloadedBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
     type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
     const queue: Pending[] = [];
@@ -284,6 +293,17 @@ describe("telegram poller supervisor", () => {
     // The bytes really landed on disk.
     const onDisk = await Bun.file(record!.media!.path!).arrayBuffer();
     expect(new Uint8Array(onDisk)).toEqual(downloadedBytes);
+
+    // The injected `[photo: <path>]` prefix must survive the file-read
+    // tool's workspace-containment gate (issue #69). Parse the path out
+    // of the task input the same way the agent would, then run it
+    // through `assertInsideWorkspace` — the exact check `fileRead`
+    // performs before reading bytes.
+    const photoMatch = /\[photo: ([^\]]+)\]/.exec(record!.text ?? "");
+    expect(photoMatch).not.toBeNull();
+    const injectedPath = photoMatch![1];
+    expect(injectedPath).toBe(record!.media!.path!);
+    expect(() => assertInsideWorkspace(config.workspaceRoot, injectedPath)).not.toThrow();
 
     await supervisor.stopAll();
   });
