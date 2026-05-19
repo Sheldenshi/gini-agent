@@ -1,6 +1,7 @@
 "use client";
 
-import { useMutation } from "@tanstack/react-query";
+import { useMemo } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,10 +11,20 @@ import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate } from "@/lib/queries";
 import type { Approval } from "@runtime/types";
+import type { AgentRow } from "@/lib/view-types";
 
 export default function PermissionsPage() {
   const approvals = useApprovals();
   const invalidate = useInvalidate();
+  const agentsQuery = useQuery({
+    queryKey: ["agents"],
+    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
+  });
+  const agentNamesById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const agent of agentsQuery.data?.agents ?? []) map.set(agent.id, agent.name);
+    return map;
+  }, [agentsQuery.data?.agents]);
   const decide = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "approve" | "deny" }) =>
       api<Approval>(`/approvals/${id}/${op}`, { method: "POST" }),
@@ -26,6 +37,10 @@ export default function PermissionsPage() {
 
   const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
   const decided = (approvals.data ?? []).filter((a) => a.status !== "pending").slice().reverse();
+  const agentLabelFor = (approval: Approval): string | undefined => {
+    if (!approval.agentId) return undefined;
+    return agentNamesById.get(approval.agentId) ?? approval.agentId;
+  };
 
   return (
     <>
@@ -42,7 +57,13 @@ export default function PermissionsPage() {
             ) : (
               <div className="grid gap-3 lg:grid-cols-2">
                 {pending.map((approval) => (
-                  <ApprovalCard key={approval.id} approval={approval} onDecide={(op) => decide.mutate({ id: approval.id, op })} pending={decide.isPending} />
+                  <ApprovalCard
+                    key={approval.id}
+                    approval={approval}
+                    agentLabel={agentLabelFor(approval)}
+                    onDecide={(op) => decide.mutate({ id: approval.id, op })}
+                    pending={decide.isPending}
+                  />
                 ))}
               </div>
             )}
@@ -53,7 +74,7 @@ export default function PermissionsPage() {
             ) : (
               <div className="grid gap-3 lg:grid-cols-2">
                 {decided.map((approval) => (
-                  <ApprovalCard key={approval.id} approval={approval} />
+                  <ApprovalCard key={approval.id} approval={approval} agentLabel={agentLabelFor(approval)} />
                 ))}
               </div>
             )}
@@ -64,7 +85,17 @@ export default function PermissionsPage() {
   );
 }
 
-function ApprovalCard({ approval, onDecide, pending }: { approval: Approval; onDecide?: (op: "approve" | "deny") => void; pending?: boolean }) {
+function ApprovalCard({
+  approval,
+  agentLabel,
+  onDecide,
+  pending
+}: {
+  approval: Approval;
+  agentLabel?: string;
+  onDecide?: (op: "approve" | "deny") => void;
+  pending?: boolean;
+}) {
   const diff = typeof approval.payload?.diff === "string" ? approval.payload.diff : null;
   return (
     <Card>
@@ -75,6 +106,14 @@ function ApprovalCard({ approval, onDecide, pending }: { approval: Approval; onD
             <CardDescription className="line-clamp-1 font-mono text-[11px]">{approval.target}</CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
+            {agentLabel ? (
+              <span
+                className="rounded-md border border-border bg-card px-2 py-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground"
+                title={`Requesting agent: ${agentLabel}`}
+              >
+                {agentLabel}
+              </span>
+            ) : null}
             <RiskPill value={approval.risk} />
             <StatusPill value={approval.status} />
           </div>
