@@ -182,8 +182,10 @@ describe("normalizeState toolset/tool backfill", () => {
     const state = createEmptyState("test-instance-6");
     const browser = state.toolsets.find((ts) => ts.name === "browser");
     expect(browser).toBeDefined();
-    // Reduce to the old 9-tool roster and leave the toolset disabled
-    // (the on-disk default for the browser toolset).
+    // Simulate an instance whose operator has explicitly disabled the
+    // browser toolset, then trim its tool roster to the historical 9-tool
+    // shape so the backfill below has work to do.
+    browser!.status = "disabled";
     browser!.toolNames = [
       "browser.navigate",
       "browser.snapshot",
@@ -195,7 +197,6 @@ describe("normalizeState toolset/tool backfill", () => {
       "browser.console",
       "browser.close"
     ];
-    expect(browser!.status).toBe("disabled");
     const newerNames = ["browser.vision", "browser.hover"];
     state.tools = state.tools.filter(
       (tool) => tool.toolset !== "browser" || !newerNames.includes(tool.name)

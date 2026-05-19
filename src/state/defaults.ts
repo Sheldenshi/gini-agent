@@ -85,7 +85,7 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       instance,
       name: "browser",
       description: "Browser automation: navigate, snapshot, click, type, and inspect web pages.",
-      status: "disabled",
+      status: "enabled",
       toolNames: [
         "browser.navigate",
         "browser.snapshot",
@@ -149,7 +149,7 @@ export function defaultAgent(instance: Instance, at: string): AgentRecord {
     // the active agent doesn't silently gate them out via the per-agent
     // intersection. The kill switch then lives where it should: on the
     // toolset's enabled/disabled status.
-    toolsets: ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"],
+    toolsets: ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser"],
     messagingTargets: [],
     createdAt: at,
     updatedAt: at
