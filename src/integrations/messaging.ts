@@ -361,7 +361,6 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   // chat. demo / generic bridges keep the standalone-task path for
   // tests and CLI parity.
   let taskId: string;
-  let sessionId: string | undefined;
   let target: string;
   if (bridge.kind === "telegram") {
     // Strict integer parse: `Number.parseInt("123abc", 10)` returns 123
@@ -393,7 +392,6 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
     });
     const result = await submitChatMessage(config, session.id, { content: text });
     taskId = result.taskId;
-    sessionId = session.id;
   } else if (bridge.kind === "discord") {
     const channelId = rawTarget.trim();
     if (!channelId) {
@@ -414,17 +412,16 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
     });
     const result = await submitChatMessage(config, session.id, { content: text });
     taskId = result.taskId;
-    sessionId = session.id;
   } else {
     target = rawTarget || "local";
     const task = await submitTask(config, text);
     taskId = task.id;
   }
 
-  // The chat session id is preserved on the message record itself —
-  // see notificationId field reuse below would be wrong, so we just
-  // re-resolve via taskId when the reply mirror needs it.
-  void sessionId;
+  // Note: the chat session id is intentionally NOT persisted on the
+  // MessagingMessageRecord. Callers that need it look it up via the
+  // task's session linkage (or via findTelegram/DiscordChatSession on
+  // the bridge + chat coordinate).
   return mutateState(config.instance, (state) =>
     createMessagingMessageRecord(state, {
       bridgeId: bridge.id,

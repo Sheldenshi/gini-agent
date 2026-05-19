@@ -1671,6 +1671,10 @@ describe("cron lifecycle", () => {
           timeoutSeconds: 600,
           chatSessionId: sessionId,
           runIds: [],
+          taskIds: [],
+          runCount: 0,
+          missedRuns: 0,
+          nextRunAt: new Date().toISOString(),
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
@@ -1680,6 +1684,8 @@ describe("cron lifecycle", () => {
           jobId: "job_x",
           status: "running",
           taskId: t.id,
+          attempt: 1,
+          trigger: "schedule",
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
@@ -1706,6 +1712,8 @@ describe("cron lifecycle", () => {
           jobId: "job_x",
           status: "running",
           taskId: t.id,
+          attempt: 1,
+          trigger: "schedule",
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString()
         });
