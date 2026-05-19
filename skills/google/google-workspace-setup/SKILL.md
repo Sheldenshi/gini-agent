@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.2.0
+    version: 1.2.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -91,8 +91,11 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:<port>/api/browser
 
 Decision rule on the JSON response:
 
-- `{ "connected": true, "record": { "mode": "managed", ... } }` → a visible managed Chrome is already attached. Proceed to Milestone A.
-- `{ "connected": true, "record": { "mode": "cdp", ... } }` → the agent is attached to a user-supplied Chrome via CDP. That window is the user's, and they can drive sign-in there. Proceed.
+- `{ "connected": true, "record": { "mode": "managed", ... } }` → a visible Chrome that Gini itself spawned via `gini browser connect` (with no `--url`). This is the only state that guarantees a window the user can see. Proceed to Milestone A.
+- `{ "connected": true, "record": { "mode": "cdp", ... } }` → the agent is attached to a user-supplied Chrome via the Chrome DevTools Protocol. That endpoint *might* be a headed window the user can drive, or it might be a headless Chrome the user happens to have running — `GET /api/browser` only checks that the CDP endpoint exists, not whether it has a visible window. Ask the user explicitly in chat:
+  > Looks like you're connected via CDP. Is your Chrome window visible on screen right now? Reply **"yes"** if you can see it — I need to be able to hand sign-in off to you. If you can't see it, run `gini browser connect` (no `--url`) in another terminal and I'll attach to that instead.
+
+  Wait for their answer. If they reply yes, proceed to Milestone A. If they reply no, are unsure, or ask to defer, treat the state as "no visible window" (next bullet).
 - `{ "connected": false }` (or `connected: true` with no `record`) → no visible window. Stop and ask the user to connect one (next paragraph), then re-check before continuing.
 
 When not connected, tell the user, in chat:
