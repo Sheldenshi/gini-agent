@@ -91,18 +91,24 @@ export async function runConnectorDetection(config: RuntimeConfig): Promise<Dete
       if (!provider.probe) {
         updateConnectorHealth(connector);
       }
-      addAudit(state, {
-        actor: "runtime",
-        action: "connector.auto_create",
-        target: connector.id,
-        risk: "low",
-        evidence: {
-          provider: connector.provider,
-          name: connector.name,
-          source: connector.source,
-          message: result.message
-        }
-      });
+      // Connectors live at the instance level; auto-detection happens
+      // before any agent has been activated for this read.
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "connector.auto_create",
+          target: connector.id,
+          risk: "low",
+          evidence: {
+            provider: connector.provider,
+            name: connector.name,
+            source: connector.source,
+            message: result.message
+          }
+        },
+        { system: true }
+      );
       return connector;
     });
 

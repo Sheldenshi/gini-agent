@@ -49,13 +49,19 @@ export async function runConnectorReprobe(config: RuntimeConfig): Promise<Reprob
       // `health: "unhealthy"` with the error message. A throw here would be
       // an unexpected internal error — log it once via audit and continue.
       await mutateState(config.instance, (s) => {
-        addAudit(s, {
-          actor: "runtime",
-          action: "connector.reprobe.error",
-          target: connector.id,
-          risk: "low",
-          evidence: { provider: connector.provider }
-        });
+        // Periodic connector re-probe is instance-scoped maintenance, not
+        // attributable to any one agent's actions.
+        addAudit(
+          s,
+          {
+            actor: "runtime",
+            action: "connector.reprobe.error",
+            target: connector.id,
+            risk: "low",
+            evidence: { provider: connector.provider }
+          },
+          { system: true }
+        );
       });
       continue;
     }
@@ -67,18 +73,22 @@ export async function runConnectorReprobe(config: RuntimeConfig): Promise<Reprob
         provider: connector.provider
       });
       await mutateState(config.instance, (s) => {
-        addAudit(s, {
-          actor: "runtime",
-          action: "connector.health.transition",
-          target: connector.id,
-          risk: probedRecord.health === "unhealthy" ? "medium" : "low",
-          evidence: {
-            provider: connector.provider,
-            from: before,
-            to: probedRecord.health,
-            message: probedRecord.message
-          }
-        });
+        addAudit(
+          s,
+          {
+            actor: "runtime",
+            action: "connector.health.transition",
+            target: connector.id,
+            risk: probedRecord.health === "unhealthy" ? "medium" : "low",
+            evidence: {
+              provider: connector.provider,
+              from: before,
+              to: probedRecord.health,
+              message: probedRecord.message
+            }
+          },
+          { system: true }
+        );
       });
     }
   }

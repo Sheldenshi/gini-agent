@@ -62,16 +62,18 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
       if (job.oneShot === true && job.status === "active") {
         job.status = "paused";
         job.updatedAt = completedAt;
-        addAudit(state, {
-          actor: "runtime",
-          action: "job.oneshot.completed",
-          target: job.id,
-          risk: "low",
-          taskId: task.id,
-          jobId: job.id,
-          agentId: job.agentId,
-          evidence: { runId: run.id, runStatus: run.status }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "job.oneshot.completed",
+            target: job.id,
+            risk: "low",
+            taskId: task.id,
+            evidence: { runId: run.id, runStatus: run.status }
+          },
+          { jobId: job.id, agentId: job.agentId }
+        );
       }
       // Stage the chat sync for after the write closes — calling another
       // mutateState (which syncChatTaskResult does) inside this one would
@@ -80,16 +82,20 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
         chatSessionIdToSync = job.chatSessionId;
       }
     }
-    appendEvent(state, {
-      kind: "job",
-      action: run.status === "completed" ? "job.run.completed" : "job.run.failed",
-      target: task.jobId!,
-      jobId: task.jobId,
-      taskId: task.id,
-      risk: "low",
-      summary: run.status === "completed" ? "Prompt job run completed." : "Prompt job run failed.",
-      data: { runId: run.id, taskStatus: task.status }
-    });
+    appendEvent(
+      state,
+      {
+        kind: "job",
+        action: run.status === "completed" ? "job.run.completed" : "job.run.failed",
+        target: task.jobId!,
+        jobId: task.jobId,
+        taskId: task.id,
+        risk: "low",
+        summary: run.status === "completed" ? "Prompt job run completed." : "Prompt job run failed.",
+        data: { runId: run.id, taskStatus: task.status }
+      },
+      { taskId: task.id, agentId: task.agentId ?? job?.agentId ?? run.agentId }
+    );
   });
 
   // Materialize the assistant chat message for jobs created via the agent

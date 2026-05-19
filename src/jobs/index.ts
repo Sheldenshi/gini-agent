@@ -490,14 +490,17 @@ async function dispatchPromptRun(
     const sessionRunId = await mutateState(config.instance, (state) => {
       const session = state.chatSessions.find((candidate) => candidate.id === job.chatSessionId);
       if (!session) {
-        addAudit(state, {
-          actor: "runtime",
-          action: "job.session.missing",
-          target: job.id,
-          risk: "low",
-          agentId: job.agentId,
-          evidence: { jobId: job.id, runId: run.id, chatSessionId: job.chatSessionId }
-        });
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "job.session.missing",
+            target: job.id,
+            risk: "low",
+            evidence: { jobId: job.id, runId: run.id, chatSessionId: job.chatSessionId }
+          },
+          { jobId: job.id, agentId: job.agentId }
+        );
         return undefined;
       }
       const chatRun = createRun(state, {
@@ -546,16 +549,19 @@ async function dispatchPromptRun(
         // failures should leave the configured status untouched.
         if (trigger === "schedule") jobItem.status = "failed";
       }
-      appendEvent(state, {
-        kind: "job",
-        action: "job.run.failed",
-        target: job.id,
-        jobId: job.id,
-        risk: "low",
-        summary: "Prompt job dispatch failed.",
-        data: { runId: run.id, error: message },
-        agentId: job.agentId
-      });
+      appendEvent(
+        state,
+        {
+          kind: "job",
+          action: "job.run.failed",
+          target: job.id,
+          jobId: job.id,
+          risk: "low",
+          summary: "Prompt job dispatch failed.",
+          data: { runId: run.id, error: message }
+        },
+        { jobId: job.id, agentId: job.agentId }
+      );
     });
     throw error;
   }
@@ -591,14 +597,17 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
     // run while another is in-flight. Manual/replay are explicit user
     // actions and may run alongside an in-flight run.
     if (trigger === "schedule" && findRunningRun(state, jobId)) {
-      addAudit(state, {
-        actor: "runtime",
-        action: "job.run.skipped_overlap",
-        target: jobId,
-        risk: "low",
-        agentId: item.agentId,
-        evidence: { reason: "previous run still running" }
-      });
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "job.run.skipped_overlap",
+          target: jobId,
+          risk: "low",
+          evidence: { reason: "previous run still running" }
+        },
+        { jobId, agentId: item.agentId }
+      );
       return undefined;
     }
     item.lastRunAt = now();
@@ -651,13 +660,16 @@ export async function updateJobStatus(config: RuntimeConfig, jobId: string, stat
     if (!job) throw new Error(`Job not found: ${jobId}`);
     job.status = statusValue;
     job.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: `job.${statusValue}`,
-      target: jobId,
-      risk: "low",
-      agentId: job.agentId
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: `job.${statusValue}`,
+        target: jobId,
+        risk: "low"
+      },
+      { jobId, agentId: job.agentId }
+    );
     return job;
   });
 }
@@ -844,13 +856,16 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     job.cronTimezone = newCronTimezone;
     job.intervalSeconds = newIntervalSeconds;
     job.updatedAt = now();
-    addAudit(state, {
-      actor: "user",
-      action: "job.updated",
-      target: job.id,
-      risk: "low",
-      agentId: job.agentId
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "job.updated",
+        target: job.id,
+        risk: "low"
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
     return job;
   });
 }
@@ -870,14 +885,17 @@ export async function removeJob(config: RuntimeConfig, jobId: string) {
         removedRuns += 1;
       }
     }
-    addAudit(state, {
-      actor: "user",
-      action: "job.removed",
-      target: job.id,
-      risk: "medium",
-      agentId: job.agentId,
-      evidence: { removedRuns }
-    });
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "job.removed",
+        target: job.id,
+        risk: "medium",
+        evidence: { removedRuns }
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
     return job;
   });
 }
@@ -940,24 +958,30 @@ async function executeScriptJob(
           if (trigger === "schedule") job.status = "failed";
         }
       }
-      appendEvent(state, {
-        kind: "job",
-        action: exitCode === 0 ? "job.run.completed" : "job.run.failed",
-        target: jobId,
-        jobId,
-        risk: "low",
-        summary: exitCode === 0 ? "Script job completed." : "Script job failed.",
-        data: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) },
-        agentId: job?.agentId ?? run.agentId
-      });
-      addAudit(state, {
-        actor: "runtime",
-        action: "job.script.executed",
-        target: jobId,
-        risk: "medium",
-        evidence: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) },
-        agentId: job?.agentId ?? run.agentId
-      });
+      appendEvent(
+        state,
+        {
+          kind: "job",
+          action: exitCode === 0 ? "job.run.completed" : "job.run.failed",
+          target: jobId,
+          jobId,
+          risk: "low",
+          summary: exitCode === 0 ? "Script job completed." : "Script job failed.",
+          data: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
+        },
+        { jobId, agentId: job?.agentId ?? run.agentId }
+      );
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "job.script.executed",
+          target: jobId,
+          risk: "medium",
+          evidence: { runId, exitCode, stdout: stdout.slice(0, 1000), stderr: stderr.slice(0, 1000) }
+        },
+        { jobId, agentId: job?.agentId ?? run.agentId }
+      );
       return { jobId, runId, exitCode, stdout: stdout.slice(0, 4000), stderr: stderr.slice(0, 4000) };
     });
   } catch (error) {
@@ -976,16 +1000,19 @@ async function executeScriptJob(
         job.lastError = message;
         if (trigger === "schedule") job.status = "failed";
       }
-      appendEvent(state, {
-        kind: "job",
-        action: "job.run.failed",
-        target: jobId,
-        jobId,
-        risk: "low",
-        summary: "Script job crashed.",
-        data: { runId, error: message },
-        agentId: job?.agentId ?? run.agentId
-      });
+      appendEvent(
+        state,
+        {
+          kind: "job",
+          action: "job.run.failed",
+          target: jobId,
+          jobId,
+          risk: "low",
+          summary: "Script job crashed.",
+          data: { runId, error: message }
+        },
+        { jobId, agentId: job?.agentId ?? run.agentId }
+      );
     });
     return { jobId, runId, exitCode: -1, stdout: "", stderr: message };
   }
