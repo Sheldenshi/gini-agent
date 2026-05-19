@@ -397,7 +397,9 @@ describe("discord poller supervisor", () => {
 
     const state = readState(config.instance);
     const inbound = state.messagingMessages.find((m) => m.direction === "inbound");
-    expect(inbound?.text).toBe("hi gini");
+    // The poller prefixes the author handle so multi-user channels
+    // don't blend turns. `lo` is the test author's username.
+    expect(inbound?.text).toBe("lo: hi gini");
     expect(inbound?.target).toBe("chan-1");
 
     const live = state.messagingBridges.find((b) => b.id === bridge.id);
@@ -586,7 +588,8 @@ describe("discord poller supervisor", () => {
     const inbound = readState(config.instance).messagingMessages.find(
       (m) => m.direction === "inbound" && m.target === "chan-1"
     );
-    expect(inbound?.text).toBe("first real message");
+    // Author-handle prefix; the test fixture's author is `lo`.
+    expect(inbound?.text).toBe("lo: first real message");
   });
 
   test("pagination catches up when more than FETCH_BATCH_LIMIT messages land between polls", async () => {
@@ -660,7 +663,7 @@ describe("discord poller supervisor", () => {
       // 50 messages (which are all bot-authored above id 1025).
       await waitFor(
         () => readState(config.instance).messagingMessages.some(
-          (m) => m.direction === "inbound" && m.text === "user-in-older-page"
+          (m) => m.direction === "inbound" && m.text === "lo: user-in-older-page"
         ),
         "user-authored message in the older page to land via pagination catch-up"
       );

@@ -209,3 +209,129 @@ describe("normalizeState toolset/tool backfill", () => {
     }
   });
 });
+
+describe("normalizeState legacy telegram-bridge pairing backfill", () => {
+  test("mints a pairing code for a legacy telegram bridge that polled before the allowlist landed (lastOffset present, no allowedChatIds, no pairingCode)", () => {
+    const state = createEmptyState("test-instance-tg-legacy");
+    state.messagingBridges = [{
+      id: "bridge_legacy_1",
+      instance: "test-instance-tg-legacy",
+      name: "legacy-tg",
+      kind: "telegram",
+      status: "configured",
+      deliveryTargets: ["42"],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
+      // lastOffset present → legacy bridge that actually polled before
+      // the allowlist landed. No allowedChatIds, no pairingCode.
+      metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
+    }];
+
+    const normalized = normalizeState("test-instance-tg-legacy", state);
+    const live = normalized.messagingBridges.find((b) => b.id === "bridge_legacy_1");
+    expect(typeof live?.metadata?.pairingCode).toBe("string");
+    expect(String(live?.metadata?.pairingCode).startsWith("pair-")).toBe(true);
+    expect(typeof live?.metadata?.pairingCodeExpiresAt).toBe("string");
+    expect(Date.parse(String(live?.metadata?.pairingCodeExpiresAt))).toBeGreaterThan(Date.now());
+
+    // Audit row landed so the migration is traceable.
+    const audit = normalized.audit.find(
+      (e) => e.action === "messaging.pairing.migrated" && e.target === "bridge_legacy_1"
+    );
+    expect(audit).toBeDefined();
+  });
+
+  test("does NOT mint for a brand-new telegram bridge (no lastOffset)", () => {
+    // A bridge created via addMessagingBridge already got a pairing
+    // code at create time. Even if that code was later claimed and
+    // cleared by tryClaimPairingCode, the bridge has lastOffset
+    // undefined (never polled in tests) — so we skip rather than
+    // re-mint. addMessagingBridge is the source of new codes.
+    const state = createEmptyState("test-instance-tg-fresh");
+    state.messagingBridges = [{
+      id: "bridge_fresh_1",
+      instance: "test-instance-tg-fresh",
+      name: "fresh-tg",
+      kind: "telegram",
+      status: "configured",
+      deliveryTargets: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
+      metadata: { botUsername: "ginibot", botId: 1 }
+    }];
+
+    const normalized = normalizeState("test-instance-tg-fresh", state);
+    const live = normalized.messagingBridges.find((b) => b.id === "bridge_fresh_1");
+    expect(live?.metadata?.pairingCode).toBeUndefined();
+    expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
+  });
+
+  test("does NOT mint when the bridge already has an allowlist or an existing pairing code", () => {
+    // Idempotency: after one mint, the next normalize sees the
+    // pairing code present and skips. Also verifies a bridge with
+    // any existing allowlist is left alone.
+    const state = createEmptyState("test-instance-tg-idempotent");
+    state.messagingBridges = [
+      {
+        id: "already_paired",
+        instance: "test-instance-tg-idempotent",
+        name: "tg-paired",
+        kind: "telegram",
+        status: "configured",
+        deliveryTargets: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token-1" }],
+        metadata: {
+          lastOffset: 999,
+          pairingCode: "pair-deadbeef",
+          pairingCodeExpiresAt: new Date(Date.now() + 60_000).toISOString()
+        }
+      },
+      {
+        id: "already_allowed",
+        instance: "test-instance-tg-idempotent",
+        name: "tg-allowed",
+        kind: "telegram",
+        status: "configured",
+        deliveryTargets: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token-2" }],
+        metadata: { lastOffset: 999, allowedChatIds: [4242] }
+      }
+    ];
+
+    const normalized = normalizeState("test-instance-tg-idempotent", state);
+    const paired = normalized.messagingBridges.find((b) => b.id === "already_paired");
+    const allowed = normalized.messagingBridges.find((b) => b.id === "already_allowed");
+    expect(paired?.metadata?.pairingCode).toBe("pair-deadbeef");
+    expect(allowed?.metadata?.pairingCode).toBeUndefined();
+  });
+
+  test("does NOT touch discord-kind bridges", () => {
+    // Discord uses channel-as-auth and has no pairing flow — see ADR
+    // discord-bridge.md. A Discord bridge with lastOffset set (shouldn't
+    // happen, but defense-in-depth against schema drift) must not get
+    // a Telegram pairing code stamped onto it.
+    const state = createEmptyState("test-instance-disc-skip");
+    state.messagingBridges = [{
+      id: "bridge_disc_1",
+      instance: "test-instance-disc-skip",
+      name: "disc",
+      kind: "discord",
+      status: "configured",
+      deliveryTargets: ["channel-1"],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
+      metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
+    }];
+
+    const normalized = normalizeState("test-instance-disc-skip", state);
+    const live = normalized.messagingBridges.find((b) => b.id === "bridge_disc_1");
+    expect(live?.metadata?.pairingCode).toBeUndefined();
+  });
+});

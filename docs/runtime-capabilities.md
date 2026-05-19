@@ -43,7 +43,7 @@ bun run gini evidence
 | Runtime updates | `gini update`, `/api/version`, `/api/update/check`, `/api/update`; installer-managed web runtimes show the current package/git version and can trigger an update |
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
-| Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks |
+| Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable`; inbound messages create tasks. Telegram bridges support per-chat enrollment via `gini messaging pair/allow/deny/chats` (no trust-on-first-use; every chat denied until enrolled or pairing-code claimed). Discord uses channel-as-auth — every non-bot poster in a configured `deliveryTargets` channel can submit, see [Discord bridge ADR](adr/discord-bridge.md) for the Message Content Intent setup step |
 | Agents/config | `gini agents list/create/use/delete`, instance-aware config |
 | Import inspection | `gini import inspect openclaw <path>`, read-only by default |
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
@@ -586,5 +587,59 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
     }
   }
   expirePairingCodes(state);
+  backfillLegacyTelegramPairing(state);
   return state;
+}
+
+// One-shot migration for telegram bridges created before the chat
+// allowlist + pairing-code surface landed (commits f306488 / 8672499 /
+// f268fbc / f6e7884 on main). Without this, a legacy bridge upgrades
+// into `metadata.allowedChatIds === undefined`, the poller's
+// `authorizeTelegramChat` denies every inbound, and the operator sees
+// total silence on a bridge that previously worked. The mint gives
+// them a pairing code they can DM the bot with to re-enroll without
+// recreating the bridge.
+//
+// Idempotent: only fires when the bridge has NO allowlist AND NO
+// pairing code at all (active or expired). After one mint the second
+// branch sees a present pairingCode and skips. Operators whose
+// minted code expires before they use it can re-mint via
+// `gini messaging pair <bridge>` — same recovery path as today.
+const LEGACY_PAIRING_CODE_BYTES = 4;
+const LEGACY_PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
+const LEGACY_PAIRING_CODE_PREFIX = "pair-";
+function backfillLegacyTelegramPairing(state: RuntimeState): void {
+  for (const bridge of state.messagingBridges ?? []) {
+    if (bridge.kind !== "telegram") continue;
+    const meta = (bridge.metadata ?? {}) as Record<string, unknown>;
+    const allowed = meta.allowedChatIds;
+    const hasAllowlist = Array.isArray(allowed) && allowed.length > 0;
+    const hasAnyCode = typeof meta.pairingCode === "string";
+    if (hasAllowlist || hasAnyCode) continue;
+    // The migration only targets bridges that ACTUALLY polled before
+    // the allowlist landed — those have `lastOffset` set on metadata
+    // from their pre-allowlist runtime. A bridge with no `lastOffset`
+    // is either brand-new (addMessagingBridge already minted a code
+    // for it) or one whose code was deliberately cleared by
+    // tryClaimPairingCode after a failed/expired claim; in either
+    // case minting another code would be surprising. The strict
+    // `typeof === "number"` guard also avoids ambiguity from a
+    // legacy `0` sentinel or a malformed serialization.
+    const lastOffset = meta.lastOffset;
+    if (typeof lastOffset !== "number") continue;
+    const code = LEGACY_PAIRING_CODE_PREFIX + randomBytes(LEGACY_PAIRING_CODE_BYTES).toString("hex");
+    bridge.metadata = {
+      ...meta,
+      pairingCode: code,
+      pairingCodeExpiresAt: new Date(Date.now() + LEGACY_PAIRING_CODE_TTL_MS).toISOString()
+    };
+    bridge.updatedAt = now();
+    addAudit(state, {
+      actor: "runtime",
+      action: "messaging.pairing.migrated",
+      target: bridge.id,
+      risk: "low",
+      evidence: { reason: "legacy-bridge-allowlist-backfill" }
+    });
+  }
 }

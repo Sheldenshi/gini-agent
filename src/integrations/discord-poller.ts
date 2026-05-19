@@ -371,6 +371,15 @@ async function pollChannel(
 ): Promise<void> {
   const initialWatermark = readChannelWatermark(config, bridgeId, channelId);
 
+  // Capture the wall-clock seed snowflake BEFORE issuing the first
+  // fetch. If we computed it after the fetch returned (as we used to
+  // briefly), a multi-second Discord REST latency could consume the
+  // 5s safety margin: a user message arriving during the fetch could
+  // be older than (response_time - 5s) and silently drop. Capturing
+  // pre-fetch keeps the margin doing what it was sized for —
+  // absorbing clock skew, not server latency.
+  const firstContactSeed = initialWatermark === undefined ? snowflakeFromNow() : undefined;
+
   // Pagination loop. Discord's `after=X&limit=N` returns the NEWEST N
   // messages with id > X (sorted newest-first), NOT the oldest N. A
   // burst of >FETCH_BATCH_LIMIT messages between polls would silently
@@ -498,19 +507,13 @@ async function pollChannel(
   // would mis-order without this).
   const ordered = [...collected].sort((a, b) => snowflakeCompare(a.id, b.id));
 
-  // Non-empty first poll: pin the watermark to a snowflake derived
-  // from wall-clock NOW (minus a small safety margin) so a fresh
-  // bridge attaching to an active channel doesn't backfill history
-  // AND doesn't accidentally consume a message that arrived during
-  // this very fetch. Seeding to the newest observed snowflake was
-  // racy: a user who posted during the fetch window would have
-  // their message included in the response, get pinned as the seed,
-  // and never get routed (the next poll with afterId=<their_id>
-  // would find nothing). Using a wall-clock seed makes any real
-  // "now" message strictly newer than the watermark, so it routes
-  // on the next poll instead of being seized as the seed.
+  // Non-empty first poll: pin the watermark to the snowflake we
+  // captured pre-fetch so any real-time message that arrived during
+  // the fetch is strictly newer than the seed and routes on the
+  // next poll. See the firstContactSeed comment at the top of
+  // pollChannel for why capturing pre-fetch matters.
   if (initialWatermark === undefined) {
-    await advanceWatermark(config, bridgeId, channelId, snowflakeFromNow());
+    await advanceWatermark(config, bridgeId, channelId, firstContactSeed!);
     return;
   }
 
@@ -526,8 +529,21 @@ async function pollChannel(
     }
 
     try {
+      // Prefix the message with the author handle so multi-user
+      // channels don't blend turns together. Discord channels are
+      // explicitly multi-user (per ADR discord-bridge.md): every
+      // non-bot poster in a configured channel can submit, so the
+      // agent needs sender attribution to address the right person
+      // and not confuse one user's question with another's reply.
+      // This mirrors Telegram's `buildTaskInput` for group/supergroup
+      // chats. Unconditional prefixing keeps the contract simple —
+      // even a single-author DM-like channel gets the prefix, which
+      // is harmless context.
+      const decoratedText = incoming.authorHandle
+        ? `${incoming.authorHandle}: ${incoming.text}`
+        : incoming.text;
       const record = await receiveMessagingInput(config, bridgeId, {
-        text: incoming.text,
+        text: decoratedText,
         target: incoming.channelId,
         // Stamp the inbound snowflake on the chat session source so
         // scheduled-job replies that fire later can thread back onto
