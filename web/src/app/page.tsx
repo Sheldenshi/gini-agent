@@ -148,14 +148,24 @@ export default function HomePage() {
             </CardHeader>
             <CardContent>
               <ul className="divide-y divide-border">
-                {pendingVisible.map((approval) => (
+                {pendingVisible.map((approval) => {
+                  // browser.connect uses the reason as the body and a
+                  // friendlier label as the title — the raw target
+                  // is the same reason string, so the per-row
+                  // rendering stays compact.
+                  const isBrowserConnect = approval.action === "browser.connect";
+                  return (
                   <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-mono text-[11px]">{approval.action}</span>
+                        <span className="font-mono text-[11px]">
+                          {isBrowserConnect ? "Open a browser window" : approval.action}
+                        </span>
                         <RiskPill value={approval.risk} />
                       </div>
-                      <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
+                      {isBrowserConnect ? null : (
+                        <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
+                      )}
                       <p className="line-clamp-2 text-sm">{approval.reason}</p>
                     </div>
                     <div className="flex shrink-0 gap-2">
@@ -176,7 +186,8 @@ export default function HomePage() {
                       </Button>
                     </div>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             </CardContent>
           </Card>

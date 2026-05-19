@@ -100,31 +100,52 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
               ? approval.payload.providerLabel
               : String(approval.payload?.provider ?? "provider"))
           : "";
+        // `browser.connect` is a special case: the action's
+        // "command" is just opening a Chrome window — there is no
+        // raw command line to audit, and surfacing the connect
+        // endpoint / bearer token in a "Show command" panel would
+        // be more confusing than useful. Render a friendlier label
+        // and use the reason (carried on the approval's target /
+        // payload.reason) as the body.
+        const isBrowserConnect = approval.action === "browser.connect";
+        const reasonText =
+          (typeof approval.payload.reason === "string" ? approval.payload.reason : undefined) ??
+          approval.target;
         return (
           <div
             key={approval.id}
             className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
           >
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono text-xs text-foreground">{approval.action}</span>
+              <span className="font-mono text-xs text-foreground">
+                {isBrowserConnect ? "Open a browser window" : approval.action}
+              </span>
               <RiskPill value={approval.risk} />
-              <button
-                type="button"
-                className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-                onClick={() => setExpanded((v) => !v)}
-              >
-                {expanded ? "Hide details" : "Show details"}
-              </button>
+              {isBrowserConnect ? null : (
+                <button
+                  type="button"
+                  className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                  onClick={() => setExpanded((v) => !v)}
+                >
+                  {expanded ? "Hide details" : "Show details"}
+                </button>
+              )}
             </div>
-            <p className="mt-1 text-xs text-muted-foreground">{approval.reason}</p>
-            <p className="mt-1 break-all font-mono text-[11px] text-foreground/90">
-              {truncate(approval.target, expanded ? 4000 : 200)}
-            </p>
-            {expanded ? (
-              <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
-                {JSON.stringify(approval.payload, null, 2)}
-              </pre>
-            ) : null}
+            {isBrowserConnect ? (
+              <p className="mt-1 text-xs text-foreground/90">{reasonText}</p>
+            ) : (
+              <>
+                <p className="mt-1 text-xs text-muted-foreground">{approval.reason}</p>
+                <p className="mt-1 break-all font-mono text-[11px] text-foreground/90">
+                  {truncate(approval.target, expanded ? 4000 : 200)}
+                </p>
+                {expanded ? (
+                  <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
+                    {JSON.stringify(approval.payload, null, 2)}
+                  </pre>
+                ) : null}
+              </>
+            )}
             <div className="mt-2 flex gap-2">
               {isConnectorRequest ? (
                 <>

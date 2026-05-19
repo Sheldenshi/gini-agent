@@ -97,13 +97,24 @@ function ApprovalCard({
   pending?: boolean;
 }) {
   const diff = typeof approval.payload?.diff === "string" ? approval.payload.diff : null;
+  // `browser.connect` is a special case: there's no raw command to
+  // audit, so render a friendlier label and use the reason as the
+  // description instead of leaking the connect-endpoint internals.
+  const isBrowserConnect = approval.action === "browser.connect";
+  const reasonText =
+    (typeof approval.payload?.reason === "string" ? approval.payload.reason : undefined) ??
+    approval.target;
   return (
     <Card>
       <CardHeader>
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
-            <CardTitle className="font-mono text-sm">{approval.action}</CardTitle>
-            <CardDescription className="line-clamp-1 font-mono text-[11px]">{approval.target}</CardDescription>
+            <CardTitle className="font-mono text-sm">
+              {isBrowserConnect ? "Open a browser window" : approval.action}
+            </CardTitle>
+            <CardDescription className="line-clamp-1 font-mono text-[11px]">
+              {isBrowserConnect ? reasonText : approval.target}
+            </CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {agentLabel ? (
@@ -121,7 +132,7 @@ function ApprovalCard({
       </CardHeader>
       <CardContent className="space-y-3">
         <p className="text-sm">{approval.reason}</p>
-        {diff ? (
+        {isBrowserConnect ? null : diff ? (
           <pre className="max-h-64 overflow-auto rounded-md border border-border bg-card/50 p-3 font-mono text-[11px]">
             {diff}
           </pre>
