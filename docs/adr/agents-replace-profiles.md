@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-13
-- **See also:** [Per-Agent Memory Isolation](./agent-memory-isolation.md)
+- **See also:** [Per-Agent Memory Isolation](./agent-memory-isolation.md), [Agent Attribution Invariant](./agent-attribution-invariant.md)
 
 ## Decision
 
