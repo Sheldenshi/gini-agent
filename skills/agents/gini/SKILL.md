@@ -66,8 +66,9 @@ For CDP attach (rare; flaky under Playwright + Bun), pass
 ## Scheduled Jobs
 
 Jobs run on an interval or a cron expression. When created from inside a
-chat, the runtime auto-binds `chatSessionId` so the run output lands back
-in the current conversation.
+chat, the runtime mints a dedicated chat session named after the job and
+binds `chatSessionId` to it, so each fire lands in its own thread rather
+than burying the originating conversation.
 
 Create an interval job:
 
@@ -331,6 +332,7 @@ If the session is missing, start it: `tmux new-session -A -d -s "gini-$INSTANCE"
 3. Never read `~/.gini/instances/<inst>/*.json` directly — call `/api/*`.
 4. Persistent browser cookies are a feature. For sign-in, open managed
    mode once; do not ask the user to re-authenticate on every run.
-5. Bind scheduled jobs to the current chat when the user asks Gini to
-   remember to do something later — the runtime handles delivery.
+5. When the user asks Gini to remember to do something later, create a
+   scheduled job — the runtime auto-binds it to a dedicated thread so
+   future fires don't bury the current conversation.
 6. Keep pinned memories short; offload depth to recall.
