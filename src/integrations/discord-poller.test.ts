@@ -602,9 +602,9 @@ describe("discord poller supervisor", () => {
     // Direct exercise of maintainTypingAndMirrorReply: pre-populate a
     // stuck task + chat session, run the mirror with a 50ms cap, and
     // confirm that
-    //   1. the skip log fires (previously unreachable because
-    //      `await typingDone` blocked forever on a task whose typing
-    //      kept succeeding); and
+    //   1. the skip log fires (without the typingController + finally
+    //      pattern, `await typingDone` would block forever on a task
+    //      whose typing kept succeeding); and
     //   2. typing calls stop the moment the cap fires (no further
     //      triggerTypingIndicator calls after the function returns).
     const config = testConfig("disc-skip-non-terminal");

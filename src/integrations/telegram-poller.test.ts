@@ -593,8 +593,9 @@ describe("telegram poller supervisor", () => {
   test("reply mirror logs reply_skip_non_terminal and threads abort into sendChatAction when the task wait cap fires", async () => {
     // Pre-populate a stuck task + chat session, run the mirror with a
     // 50ms cap, and confirm
-    //   1. the skip log fires (previously unreachable because
-    //      `await typingDone` blocked forever);
+    //   1. the skip log fires (without the typingController + finally
+    //      pattern, `await typingDone` would block forever on a task
+    //      whose typing kept succeeding);
     //   2. the typing pulse stops the moment the cap fires;
     //   3. sendChatAction observed the abort signal end-to-end, so a
     //      hung Telegram fetch could be cancelled.
