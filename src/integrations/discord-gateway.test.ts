@@ -151,6 +151,31 @@ describe("discord-gateway", () => {
     expect(StubSocket.instances[1]?.readyState).toBe(StubSocket.CLOSED);
   });
 
+  test("non-reconnectable close codes (4004 auth-failed, 4014 disallowed-intents) give up instead of looping forever", async () => {
+    // Discord's gateway returns close codes 4004 / 4010-4014 for
+    // setup-level failures: bad token, invalid intents, etc. A naive
+    // reconnect on every close would loop forever against an
+    // un-fixable error. The handle should mark itself closed and
+    // resolve done so the supervisor can move on.
+    StubSocket.reset();
+    const handle = connectDiscordGateway({
+      token: "BAD-TOKEN",
+      webSocketImpl: StubCtor,
+      reconnectDelayMs: 5
+    });
+    const first = lastInstance();
+    first.dispatch("open", {});
+    const beforeCount = StubSocket.instances.length;
+    // Server rejects auth.
+    first.close(4004, "Authentication failed");
+    // Give the reconnect timer plenty of room to fire IF the code is
+    // buggy — but we expect NO new socket to be created.
+    await Bun.sleep(40);
+    expect(StubSocket.instances.length).toBe(beforeCount);
+    // The handle's done promise resolves on terminal teardown.
+    await handle.done;
+  });
+
   test("op 7 RECONNECT triggers a clean socket close so the reconnect loop can re-identify", async () => {
     StubSocket.reset();
     const handle = connectDiscordGateway({

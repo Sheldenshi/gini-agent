@@ -8,12 +8,26 @@
 // The transport differs from Telegram. Discord exposes no long-poll —
 // the runtime uses REST history with `?after=<snowflake>` and the
 // per-target watermark lives on `bridge.metadata.lastInboundExternalIds`.
-// First contact seeds the watermark from the newest visible message so
-// a fresh bridge doesn't backfill history into the agent. Typing
-// indicators piggy-back on Discord's `POST /channels/:id/typing` which
-// auto-clears after ~10 seconds; the pulse refreshes on a tighter
-// cadence so long-running tasks stay visible without piling up
-// requests.
+// First contact on a non-empty channel seeds the watermark from a
+// wall-clock-derived snowflake (DISCORD_EPOCH-shifted Date.now() minus
+// a small safety margin) rather than the newest observed snowflake, so
+// a fresh bridge doesn't backfill history AND doesn't race with a
+// user who posts during the very first fetch (the previous "seed to
+// newest observed" path could pin a mid-fetch message as the
+// watermark and silently drop it). Empty channels seed to the "0"
+// sentinel via the same one-shot path.
+//
+// Alongside the REST poll loop the runtime opens a Gateway WebSocket
+// (`./discord-gateway.ts`) for presence + push-driven poll wake: a
+// MESSAGE_CREATE event collapses the next REST sleep to ~0ms via a
+// per-iteration wake controller. REST polling stays the source of
+// truth for content, watermark, dedupe, and pagination — a missed
+// wake just degrades to the periodic-tick baseline.
+//
+// Typing indicators piggy-back on Discord's `POST /channels/:id/typing`
+// which auto-clears after ~10 seconds; the pulse refreshes on a
+// tighter cadence so long-running tasks stay visible without piling
+// up requests.
 
 import type { MessagingBridgeRecord, RuntimeConfig, TaskStatus } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";

@@ -501,8 +501,18 @@ export interface MessagingBridgeRecord {
   // Bridge-kind-specific non-secret state. Kept as a free-form record
   // so each kind can evolve without forcing a schema migration on the
   // others. Current shapes:
-  //   telegram: { botUsername, botId, lastOffset }
-  //   discord:  { botUsername, botId, globalName?, lastInboundExternalIds: Record<channelId, snowflake> }
+  //   telegram: {
+  //     botUsername, botId, lastOffset,
+  //     allowedChatIds: number[],           // per-chat allowlist (no TOFU)
+  //     ownerChatId?: number,               // first-enrolled chat for audit history
+  //     recentDeniedChats?: DeniedChatAttempt[],
+  //     pairingCode?: string,               // one-shot enroll-via-DM code
+  //     pairingCodeExpiresAt?: string       // ISO timestamp; 15-minute TTL
+  //   }
+  //   discord: {
+  //     botUsername, botId, globalName?,
+  //     lastInboundExternalIds: Record<channelId, snowflake>  // per-channel watermark
+  //   }
   metadata?: Record<string, unknown>;
 }
 

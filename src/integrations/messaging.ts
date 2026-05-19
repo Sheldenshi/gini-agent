@@ -364,8 +364,15 @@ export async function receiveMessagingInput(config: RuntimeConfig, idOrName: str
   let sessionId: string | undefined;
   let target: string;
   if (bridge.kind === "telegram") {
+    // Strict integer parse: `Number.parseInt("123abc", 10)` returns 123
+    // (the leading-numeric prefix), which would silently route a
+    // malformed target to chat 123. Require the entire string to be a
+    // signed integer with no trailing garbage.
+    if (!/^-?\d+$/.test(rawTarget)) {
+      throw new Error(`Telegram inbound target must be a numeric chat_id (got '${rawTarget}').`);
+    }
     const chatId = Number.parseInt(rawTarget, 10);
-    if (!Number.isFinite(chatId)) {
+    if (!Number.isFinite(chatId) || !Number.isSafeInteger(chatId)) {
       throw new Error(`Telegram inbound target must be a numeric chat_id (got '${rawTarget}').`);
     }
     target = String(chatId);

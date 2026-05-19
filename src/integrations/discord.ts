@@ -5,9 +5,14 @@
 // adopts. Outbound calls are short request/response (sendMessage,
 // triggerTypingIndicator, getMe). Inbound is a REST poll
 // (fetchChannelMessages with `?after=<snowflake>`) — Discord does not
-// expose long-poll, and the gateway WebSocket would force a runtime
-// dependency on the gateway library plus a persistent socket the
-// loopback HTTP server has no use for.
+// expose long-poll, so REST stays the source of truth for inbound
+// content, watermark advancement, dedupe, and pagination. The bridge
+// also opens a Gateway WebSocket (see `./discord-gateway.ts`) for two
+// purposes: presence (flips the bot's Online badge) and push-driven
+// poll wake (collapses the next REST sleep to ~0ms on a MESSAGE_CREATE
+// event so typical inbound latency drops from 0-3s to one REST round
+// trip). REST polling stays in charge of correctness; gateway is a
+// pure-latency optimization.
 
 const DISCORD_API_BASE = "https://discord.com/api/v10";
 

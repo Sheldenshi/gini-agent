@@ -263,6 +263,25 @@ export function connectDiscordGateway(options: DiscordGatewayOptions): DiscordGa
         resolveDone();
         return;
       }
+      // Non-recoverable close codes: reconnecting would just produce
+      // the same close. Per Discord's Gateway docs:
+      //   4004 Authentication failed (bad token)
+      //   4010 Invalid shard
+      //   4011 Sharding required
+      //   4012 Invalid API version
+      //   4013 Invalid intent(s)
+      //   4014 Disallowed intent(s) — privileged intent not enabled
+      // Tear the handle down instead of looping. The operator has to
+      // recreate the bridge (and fix the underlying setup) for the
+      // gateway to come back up. logRow above captured the close
+      // code/reason so the failure is diagnosable.
+      const NON_RECONNECTABLE = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+      if (NON_RECONNECTABLE.has(ce.code)) {
+        logRow("messaging.discord.gateway_giveup", { code: ce.code });
+        closed = true;
+        resolveDone();
+        return;
+      }
       scheduleReconnect();
     });
 

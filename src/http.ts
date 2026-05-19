@@ -388,11 +388,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/messaging\/([^/]+)\/chats$/, (_request, params) => json(listAllowedChats(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/allow$/, async (request, params) => {
       const payload = await body(request);
-      return json(await allowChat(config, params[0], Number(payload.chatId)));
+      const chatId = parseChatIdStrict(payload.chatId);
+      return json(await allowChat(config, params[0], chatId));
     }],
     ["POST", /^\/api\/messaging\/([^/]+)\/deny$/, async (request, params) => {
       const payload = await body(request);
-      return json(await denyChat(config, params[0], Number(payload.chatId)));
+      const chatId = parseChatIdStrict(payload.chatId);
+      return json(await denyChat(config, params[0], chatId));
     }],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
@@ -464,6 +466,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }
     return json({ error: "Not found" }, 404);
   };
+}
+
+// Strict parse for Telegram chat_id values on the allow/deny endpoints.
+// `Number(null)` / `Number("")` / `Number(undefined)` all coerce to 0 (or
+// NaN), so without this guard a malformed payload would either enroll
+// chat 0 (which is the JSON sentinel allowed-everyone, NOT what the
+// caller intended) or throw deep in mutateState — neither is what an
+// API caller should get back. Accept only finite safe integers
+// (including negatives — Telegram group chat_ids are negative).
+function parseChatIdStrict(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && Number.isSafeInteger(raw)) return raw;
+  if (typeof raw === "string" && /^-?\d+$/.test(raw)) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && Number.isSafeInteger(parsed)) return parsed;
+  }
+  throw new Error(`chatId must be a finite integer (got ${JSON.stringify(raw)}).`);
 }
 
 async function body(request: Request): Promise<Record<string, unknown>> {
