@@ -13,21 +13,84 @@ import type { ChatMessageRecord, RuntimeConfig, TaskStatus } from "../types";
 import { createConversationRun, linkRunToTask } from "./runs";
 import { resolveEffectiveContext } from "./effective-context";
 
+const AUTO_RENAME_USER_TURN_THRESHOLD = 2;
+const MAX_AUTO_RENAME_TITLE_LENGTH = 80;
+const DEFAULT_RENAMEABLE_TITLES = new Set(["", "new chat", "untitled chat"]);
+
 // Statuses where a task is no longer producing partial text. Once a task
 // reaches one of these, the synthesized streaming message is dropped in
 // favor of the synced assistant message (or task error).
 //
-// Note (Review P1 #3): waiting_approval is intentionally NOT in this set.
-// Earlier, we persisted a real ChatMessageRecord for waiting_approval and
-// the syncChatTaskResult short-circuit (`if (existing) return existing`)
-// meant the placeholder text never updated even after the task completed.
-// We now treat waiting_approval as in-flight and synthesize the placeholder
-// ephemerally so it auto-replaces with the real summary on completion.
+// waiting_approval is intentionally NOT in this set. Persisting a real
+// ChatMessageRecord for that state would make syncChatTaskResult's existing
+// message guard freeze the placeholder even after the task completes.
+// Treat it as in-flight and synthesize the placeholder ephemerally instead.
 const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   "completed",
   "failed",
   "cancelled"
 ]);
+
+function isDefaultRenameableTitle(title: string): boolean {
+  return DEFAULT_RENAMEABLE_TITLES.has(title.trim().toLowerCase());
+}
+
+function stripTitleLeadIn(text: string): string {
+  let title = text;
+  for (const pattern of [
+    /^(please|hey|hi|hello)[,\s]+/i,
+    /^(can|could|would) you\s+/i,
+    /^help me\s+/i
+  ]) {
+    title = title.replace(pattern, "");
+  }
+  return title.trim();
+}
+
+function truncateTitle(title: string): string {
+  const trimmed = title.trim().replace(/[.!?,;:]+$/g, "");
+  if (trimmed.length <= MAX_AUTO_RENAME_TITLE_LENGTH) return trimmed;
+
+  const clipped = trimmed.slice(0, MAX_AUTO_RENAME_TITLE_LENGTH - 3);
+  const boundary = clipped.lastIndexOf(" ");
+  const safe = boundary >= 24 ? clipped.slice(0, boundary) : clipped;
+  return `${safe.trimEnd()}...`;
+}
+
+function deriveAutoTitle(messages: ChatMessageRecord[]): string | undefined {
+  const cleaned = messages
+    .map((message) => message.content)
+    .join(" ")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/https?:\/\/\S+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return undefined;
+
+  const candidate = stripTitleLeadIn(cleaned) || cleaned;
+  const title = truncateTitle(candidate);
+  if (!title) return undefined;
+  return `${title[0]!.toUpperCase()}${title.slice(1)}`;
+}
+
+function maybeAutoRenameChatSession(config: RuntimeConfig, sessionId: string) {
+  return mutateState(config.instance, (state) => {
+    const session = state.chatSessions.find((item) => item.id === sessionId);
+    if (!session) return;
+    if (!isDefaultRenameableTitle(session.title)) return;
+    if (state.jobs.some((job) => job.chatSessionId === session.id)) return;
+
+    const userMessages = state.chatMessages
+      .filter((message) => message.sessionId === session.id && message.role === "user")
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    if (userMessages.length < AUTO_RENAME_USER_TURN_THRESHOLD) return;
+
+    const title = deriveAutoTitle(userMessages);
+    if (!title || title === session.title) return;
+    renameChatSession(state, session.id, title);
+  });
+}
 
 export function listChatSessions(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -54,10 +117,10 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   // synthesized one disappears — the caller never sees both for the same
   // task.
   //
-  // Review P1 #3: waiting_approval is included here so the placeholder
-  // updates automatically when approval grants and the task completes;
-  // previously we persisted a real ChatMessageRecord for waiting_approval
-  // and the sync short-circuit froze the UI at "Waiting for approval".
+  // waiting_approval is included here so the placeholder updates
+  // automatically when approval grants and the task completes; persisting
+  // a real message before terminal sync would freeze the UI at the earlier
+  // "Waiting for approval" text.
   const syncedAssistantTaskIds = new Set(
     stored.filter((m) => m.role === "assistant" && m.taskId).map((m) => m.taskId as string)
   );
@@ -144,6 +207,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       runRecord.updatedAt = message.createdAt;
     }
   });
+  await maybeAutoRenameChatSession(config, sessionId);
   return { sessionId, runId: run.id, taskId: task.id, status: task.status };
 }
 
@@ -162,10 +226,10 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     if (!task) throw new Error(`Task not found: ${taskId}`);
     const existing = state.chatMessages.find((message) => message.taskId === taskId && message.role === "assistant");
     if (existing) return existing;
-    // Review P1 #3: only sync truly terminal task results into a real
-    // ChatMessageRecord. waiting_approval is in-flight — the synthetic
-    // placeholder rendered by getChatSession swaps out automatically once
-    // approval grants and the task finishes.
+    // Only sync truly terminal task results into a real ChatMessageRecord.
+    // waiting_approval is in-flight: the synthetic placeholder rendered by
+    // getChatSession swaps out automatically once approval grants and the
+    // task finishes.
     if (!isTerminalTaskStatus(task.status)) {
       throw new Error(`Task is not ready for chat sync: ${task.status}`);
     }

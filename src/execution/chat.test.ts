@@ -1,19 +1,8 @@
-// Integration tests for the chat session view, focused on the
-// waiting-approval placeholder behavior (Review P1 #3).
-//
-// Before the fix, syncChatTaskResult accepted waiting_approval as a sync
-// trigger and persisted a real ChatMessageRecord with content like
-// "Waiting for approval". A short-circuit then prevented updates, so the
-// placeholder text never refreshed once the approval was granted and the
-// task completed.
-//
-// After the fix:
-//   - syncChatTaskResult only writes a real assistant message for
-//     completed / failed / cancelled.
-//   - waiting_approval is rendered as a synthetic (ephemeral) assistant
-//     message synthesized in getChatSession; once the task transitions to
-//     completed and the real synced message lands, the synthetic one
-//     disappears and the UI shows the final summary.
+// Integration tests for chat session behavior:
+//   - waiting_approval renders as an ephemeral assistant placeholder until
+//     the task reaches a terminal state.
+//   - default-titled chats are renamed only after enough user turns.
+//   - scheduled-job delivery chats keep their dedicated job title.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -25,7 +14,7 @@ import {
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
-import { mutateState, readState } from "../state";
+import { createJob, mutateState, readState } from "../state";
 import {
   getChatSession,
   submitChatMessage,
@@ -65,7 +54,14 @@ async function waitForStatus(
   throw new Error(`Task ${taskId} did not reach the expected state within ${timeoutMs}ms`);
 }
 
-describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
+async function submitAndSync(config: RuntimeConfig, sessionId: string, content: string) {
+  const submission = await submitChatMessage(config, sessionId, { content });
+  await waitForStatus(config, submission.taskId, (t) => t.status === "completed");
+  await syncChatTaskResult(config, sessionId, submission.taskId);
+  return getChatSession(config, sessionId);
+}
+
+describe("chat session behavior", () => {
   let root: string;
   let workspaceRoot: string;
   let prevState: string | undefined;
@@ -202,5 +198,48 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     expect(message).not.toBeNull();
     expect(message?.role).toBe("assistant");
     expect(message?.content).toContain("Approval denied");
+  });
+
+  test("auto-renames a default-titled chat after the second user turn", async () => {
+    const config = buildConfig(workspaceRoot, "chat-auto-rename");
+    const session = await createChat(config, { title: "" });
+
+    let detail = await submitAndSync(config, session.id, "plan a small garden");
+    expect(detail.title).toBe("Untitled chat");
+
+    detail = await submitAndSync(config, session.id, "make it lower maintenance");
+
+    expect(detail.title).toBe("Plan a small garden make it lower maintenance");
+  });
+
+  test("does not auto-rename manually titled chats", async () => {
+    const config = buildConfig(workspaceRoot, "chat-auto-rename-manual");
+    const session = await createChat(config, { title: "Garden notes" });
+
+    await submitAndSync(config, session.id, "plan a small garden");
+    const detail = await submitAndSync(config, session.id, "make it lower maintenance");
+
+    expect(detail.title).toBe("Garden notes");
+  });
+
+  test("does not auto-rename chats used for scheduled-job delivery", async () => {
+    const config = buildConfig(workspaceRoot, "chat-auto-rename-job-delivery");
+    const session = await createChat(config, { title: "" });
+    await mutateState(config.instance, (state) => createJob(state, {
+      name: "Daily garden report",
+      prompt: "Send the daily garden report.",
+      intervalSeconds: 60,
+      nextRunAt: new Date(Date.now() + 60_000).toISOString(),
+      deliveryTargets: [],
+      context: [],
+      retryLimit: 0,
+      timeoutSeconds: 600,
+      chatSessionId: session.id
+    }));
+
+    await submitAndSync(config, session.id, "plan a small garden");
+    const detail = await submitAndSync(config, session.id, "make it lower maintenance");
+
+    expect(detail.title).toBe("Untitled chat");
   });
 });
