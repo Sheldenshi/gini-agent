@@ -668,6 +668,13 @@ async function createJobTool(
     }
     dangerouslyAutoApprove = args.dangerouslyAutoApprove;
   }
+  let approvalMode: "strict" | "auto" | "yolo" | undefined;
+  if (args.approvalMode !== undefined && args.approvalMode !== null) {
+    if (args.approvalMode !== "strict" && args.approvalMode !== "auto" && args.approvalMode !== "yolo") {
+      throw new Error("Invalid input: approvalMode must be one of \"strict\" | \"auto\" | \"yolo\".");
+    }
+    approvalMode = args.approvalMode;
+  }
   let autoApproveCommands: string[] | undefined;
   if (args.autoApproveCommands !== undefined && args.autoApproveCommands !== null) {
     if (!Array.isArray(args.autoApproveCommands)) {
@@ -684,6 +691,23 @@ async function createJobTool(
       cleaned.push(entry);
     }
     autoApproveCommands = cleaned;
+  }
+  let dangerousTerminalPatterns: string[] | undefined;
+  if (args.dangerousTerminalPatterns !== undefined && args.dangerousTerminalPatterns !== null) {
+    if (!Array.isArray(args.dangerousTerminalPatterns)) {
+      throw new Error("Invalid input: dangerousTerminalPatterns must be an array of strings.");
+    }
+    const cleaned: string[] = [];
+    for (const entry of args.dangerousTerminalPatterns) {
+      if (typeof entry !== "string") {
+        throw new Error("Invalid input: dangerousTerminalPatterns entries must be strings.");
+      }
+      if (entry.length === 0) {
+        throw new Error("Invalid input: dangerousTerminalPatterns entries must be non-empty strings.");
+      }
+      cleaned.push(entry);
+    }
+    dangerousTerminalPatterns = cleaned;
   }
   let timeoutSeconds: number | undefined;
   if (args.timeoutSeconds !== undefined && args.timeoutSeconds !== null) {
@@ -750,7 +774,9 @@ async function createJobTool(
       oneShot,
       parentTaskId: taskId,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       timeoutSeconds
     });
   } catch (err) {
@@ -781,7 +807,9 @@ async function createJobTool(
         chatSessionId,
         jobId: job.id,
         dangerouslyAutoApprove,
+        approvalMode,
         autoApproveCommands,
+        dangerousTerminalPatterns,
         timeoutSeconds
       }
     });
@@ -799,7 +827,9 @@ async function createJobTool(
       oneShot,
       chatSessionId,
       dangerouslyAutoApprove,
+      approvalMode,
       autoApproveCommands,
+      dangerousTerminalPatterns,
       timeoutSeconds
     }
   });
