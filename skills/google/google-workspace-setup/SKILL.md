@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.2.1
+    version: 1.2.2
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -93,21 +93,27 @@ Decision rule on the JSON response:
 
 - `{ "connected": true, "record": { "mode": "managed", ... } }` → a visible Chrome that Gini itself spawned via `gini browser connect` (with no `--url`). This is the only state that guarantees a window the user can see. Proceed to Milestone A.
 - `{ "connected": true, "record": { "mode": "cdp", ... } }` → the agent is attached to a user-supplied Chrome via the Chrome DevTools Protocol. That endpoint *might* be a headed window the user can drive, or it might be a headless Chrome the user happens to have running — `GET /api/browser` only checks that the CDP endpoint exists, not whether it has a visible window. Ask the user explicitly in chat:
-  > Looks like you're connected via CDP. Is your Chrome window visible on screen right now? Reply **"yes"** if you can see it — I need to be able to hand sign-in off to you. If you can't see it, run `gini browser connect` (no `--url`) in another terminal and I'll attach to that instead.
+  > Looks like you're connected via CDP. Is your Chrome window visible on screen right now? Reply **"yes"** if you can see it — I need to be able to hand sign-in off to you.
 
-  Wait for their answer. If they reply yes, proceed to Milestone A. If they reply no, are unsure, or ask to defer, treat the state as "no visible window" (next bullet).
-- `{ "connected": false }` (or `connected: true` with no `record`) → no visible window. Stop and ask the user to connect one (next paragraph), then re-check before continuing.
+  Wait for their answer. If they reply yes, proceed to Milestone A. If they reply no, are unsure, or ask to defer, treat the state as "no visible window" (next bullet) — fall through to the auto-spawn path below.
+- `{ "connected": false }` (or `connected: true` with no `record`, or the CDP path above fell through) → no visible window. **Spawn a managed Chrome on the user's behalf — do NOT ask the user to run a CLI command or navigate to a webapp page.** Tell them what's about to happen, then invoke the connect API directly via `terminal_exec`:
 
-When not connected, tell the user, in chat:
+  > I'll open a visible Chrome window so you can sign in to Google in the next step. Approve the terminal command when prompted.
 
-> Before I drive the Google Cloud Console, I need a visible Chrome window — Google blocks automated sign-in, so you'll need to sign in yourself. Pick one of these:
->
-> 1. In another terminal: `gini browser connect`
-> 2. Or in the Gini webapp, open `/browser` and click **Connect**.
->
-> Either path will pop a Chrome window. Reply **"done"** once it's open.
+  Then call `terminal_exec` with:
 
-Wait for the user to confirm. Re-run the `GET /api/browser` check; only proceed when the response shows `connected: true` with a `record`. Do **not** start `browser_navigate` against a headless context — the user has no window to act on and the milestone below will stall.
+  ```bash
+  curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:$PORT/api/browser/connect
+  ```
+
+  Read `$TOKEN` and `$PORT` from `~/.gini/instances/<instance>/config.json` (`apiToken` and `port` fields). An empty POST body triggers **managed** mode — the runtime spawns a visible Chrome with a per-instance profile dir. The user approves the terminal command once; Chrome pops up; no further user action needed before Milestone A.
+
+  After the POST returns, re-check `GET /api/browser` once. Expect `connected: true` with `record.mode === "managed"`, then proceed to Milestone A.
+
+  If the POST fails (non-2xx, network error, or the re-check still shows `connected: false`), THEN fall back to the manual path: "Open `/browser` in the Gini webapp and click **Connect**, then reply 'done'." Only surface this fallback after the automated path has failed — do not lead with it.
+
+Do **not** start `browser_navigate` against a headless context — the user has no window to act on and the milestone below will stall.
 
 #### Milestone A — Sign in to Cloud Console (user handover)
 
