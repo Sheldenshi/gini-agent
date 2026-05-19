@@ -57,7 +57,10 @@ label.
     `generateToolCallingResponse`.
   - `toolsetFilter?: Set<string>` — agent's toolset names. Intersected
     with the globally-enabled set; always-on tools (`web_fetch`,
-    `read_skill`, `spawn_subagent`, `create_job`) bypass.
+    `read_skill`, `spawn_subagent`, `create_job`, `list_jobs`,
+    `update_job`, `delete_job`) bypass. The four job tools are always
+    on as a set so the agent can compose them (e.g. list-then-update,
+    delete-then-create) without modal approval friction.
   - `messagingTargetFilter?: Set<string>` — caller-supplied targets are
     intersected; explicit out-of-set targets are rejected with a typed
     error.

@@ -648,8 +648,24 @@ export async function runJobNow(config: RuntimeConfig, jobId: string, trigger: "
   return dispatchPromptRun(config, job, run, trigger);
 }
 
-export async function updateJobStatus(config: RuntimeConfig, jobId: string, statusValue: "active" | "paused") {
+export async function updateJobStatus(
+  config: RuntimeConfig,
+  jobId: string,
+  statusValue: "active" | "paused",
+  parentTaskId?: string
+) {
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to mutate if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job status: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     job.status = statusValue;
@@ -664,7 +680,12 @@ export async function updateJobStatus(config: RuntimeConfig, jobId: string, stat
   });
 }
 
-export async function updateJob(config: RuntimeConfig, jobId: string, input: Record<string, unknown>) {
+export async function updateJob(
+  config: RuntimeConfig,
+  jobId: string,
+  input: Record<string, unknown>,
+  parentTaskId?: string
+) {
   // Validate up-front so 400-class errors come back as `Invalid input: ...`
   // before we open a mutateState write. Only validate fields the caller
   // actually supplied.
@@ -692,6 +713,24 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
   if (input.timeoutSeconds !== undefined) assertPositiveInt("timeoutSeconds", input.timeoutSeconds);
   if (input.retryLimit !== undefined) assertNonNegativeInt("retryLimit", input.retryLimit);
 
+  // `name` and `prompt` are both string-typed on the JobRecord; throw on
+  // type/empty-string mismatches up-front so a bad patch surfaces as
+  // `Invalid input: …` instead of being silently no-op'd at the
+  // assignment below. Without this, dishonest reporting bugs creep in:
+  // dispatchers built appliedFields from `Object.keys(patch)` and would
+  // claim a name/prompt change happened even when the underlying
+  // assignment was skipped.
+  if (input.name !== undefined) {
+    if (typeof input.name !== "string" || input.name.length === 0) {
+      throw new Error(`Invalid input: name must be a non-empty string (got ${String(input.name)})`);
+    }
+  }
+  if (input.prompt !== undefined) {
+    if (typeof input.prompt !== "string" || input.prompt.length === 0) {
+      throw new Error(`Invalid input: prompt must be a non-empty string (got ${String(input.prompt)})`);
+    }
+  }
+
   // Validate the cron fields' shape (but not the expression semantics yet —
   // that requires the existing job to compute the effective timezone, so we
   // defer to inside mutateState).
@@ -712,7 +751,61 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     cronTimezonePatch = input.cronTimezone;
   }
 
+  // Per-job auto-approve envelope. Same validation shape as
+  // `createScheduledJob` above. `undefined` means "no change"; an empty
+  // array on `autoApproveCommands` means "clear the list"; explicit
+  // `null` on either field also means "clear" so callers can drop the
+  // override entirely. See ADR dangerously-auto-approve.md.
+  let dangerouslyAutoApprovePatch: boolean | undefined;
+  let clearDangerouslyAutoApprove = false;
+  if (input.dangerouslyAutoApprove === null) {
+    clearDangerouslyAutoApprove = true;
+  } else if (input.dangerouslyAutoApprove !== undefined) {
+    if (typeof input.dangerouslyAutoApprove !== "boolean") {
+      throw new Error(`Invalid input: dangerouslyAutoApprove must be a boolean (got ${String(input.dangerouslyAutoApprove)})`);
+    }
+    dangerouslyAutoApprovePatch = input.dangerouslyAutoApprove;
+  }
+  let autoApproveCommandsPatch: string[] | undefined;
+  let clearAutoApproveCommands = false;
+  if (input.autoApproveCommands === null) {
+    clearAutoApproveCommands = true;
+  } else if (input.autoApproveCommands !== undefined) {
+    if (!Array.isArray(input.autoApproveCommands)) {
+      throw new Error(`Invalid input: autoApproveCommands must be an array of strings (got ${typeof input.autoApproveCommands})`);
+    }
+    const cleaned: string[] = [];
+    for (const entry of input.autoApproveCommands) {
+      if (typeof entry !== "string") {
+        throw new Error(`Invalid input: autoApproveCommands entries must be strings (got ${typeof entry})`);
+      }
+      if (entry.length === 0) {
+        throw new Error(`Invalid input: autoApproveCommands entries must be non-empty strings`);
+      }
+      cleaned.push(entry);
+    }
+    if (cleaned.length === 0) {
+      // Empty array is a "clear" signal (same as null) — leaving an empty
+      // array on the JobRecord would be functionally equivalent but
+      // misleading next time the job is read.
+      clearAutoApproveCommands = true;
+    } else {
+      autoApproveCommandsPatch = cleaned;
+    }
+  }
+
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to mutate if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot update job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const job = state.jobs.find((candidate) => candidate.id === jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
     if (typeof input.name === "string") job.name = input.name;
@@ -845,14 +938,39 @@ export async function updateJob(config: RuntimeConfig, jobId: string, input: Rec
     job.cronExpression = newCronExpression;
     job.cronTimezone = newCronTimezone;
     job.intervalSeconds = newIntervalSeconds;
+
+    // Apply auto-approve patch fields. `clear*` is "drop the override
+    // entirely" so the job falls back to the runtime/agent default.
+    if (clearDangerouslyAutoApprove) {
+      job.dangerouslyAutoApprove = undefined;
+    } else if (dangerouslyAutoApprovePatch !== undefined) {
+      job.dangerouslyAutoApprove = dangerouslyAutoApprovePatch;
+    }
+    if (clearAutoApproveCommands) {
+      job.autoApproveCommands = undefined;
+    } else if (autoApproveCommandsPatch !== undefined) {
+      job.autoApproveCommands = autoApproveCommandsPatch;
+    }
+
     job.updatedAt = now();
     addAudit(state, { actor: "user", action: "job.updated", target: job.id, risk: "low" });
     return job;
   });
 }
 
-export async function removeJob(config: RuntimeConfig, jobId: string) {
+export async function removeJob(config: RuntimeConfig, jobId: string, parentTaskId?: string) {
   return mutateState(config.instance, (state) => {
+    // When invoked from the agent tool path with a `parentTaskId`, refuse
+    // to delete if the parent task has gone terminal. The lock-free
+    // pre-check in the tool handler is the fast path; this serialized
+    // re-check is the authoritative guard against a `cancelTask` landing
+    // between the pre-check and our write.
+    if (parentTaskId) {
+      const parent = state.tasks.find((t) => t.id === parentTaskId);
+      if (parent && (parent.status === "cancelled" || parent.status === "failed")) {
+        throw new Error(`Cannot delete job: parent task ${parentTaskId} is already ${parent.status}.`);
+      }
+    }
     const index = state.jobs.findIndex((candidate) => candidate.id === jobId);
     if (index < 0) throw new Error(`Job not found: ${jobId}`);
     const [job] = state.jobs.splice(index, 1);
@@ -875,6 +993,10 @@ export async function removeJob(config: RuntimeConfig, jobId: string) {
     });
     return job;
   });
+}
+
+export function listJobs(config: RuntimeConfig) {
+  return readState(config.instance).jobs;
 }
 
 export function listJobRuns(config: RuntimeConfig, jobId?: string) {

@@ -20,7 +20,7 @@ import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
-import { addMessagingBridge, checkMessagingBridge, disableMessagingBridge, listMessagingMessages, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
+import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, pairMessagingBridge, receiveMessagingInput, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
@@ -422,6 +422,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/send$/, async (request, params) => json(await sendMessagingOutput(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/pair$/, async (_request, params) => json(await pairMessagingBridge(config, params[0]))],
+    ["GET", /^\/api\/messaging\/([^/]+)\/chats$/, (_request, params) => json(listAllowedChats(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/allow$/, async (request, params) => {
+      const payload = await body(request);
+      return json(await allowChat(config, params[0], Number(payload.chatId)));
+    }],
+    ["POST", /^\/api\/messaging\/([^/]+)\/deny$/, async (request, params) => {
+      const payload = await body(request);
+      return json(await denyChat(config, params[0], Number(payload.chatId)));
+    }],
     ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
     // /api/setup/status to decide whether to render the form, and POSTs

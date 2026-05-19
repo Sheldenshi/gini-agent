@@ -210,12 +210,25 @@ describe("getFile / downloadFile", () => {
 });
 
 describe("extractIncomingPayload", () => {
-  test("returns text-only payloads unchanged", () => {
+  test("returns text-only payloads with chatType + messageId", () => {
     const out = extractIncomingPayload({
       update_id: 1,
-      message: { message_id: 1, date: 0, chat: { id: 9, type: "private" }, text: "hi" }
+      message: {
+        message_id: 17,
+        date: 0,
+        chat: { id: 9, type: "private" },
+        text: "hi",
+        from: { id: 1, is_bot: false, first_name: "Shelden", username: "shelden" }
+      }
     });
-    expect(out).toEqual({ chatId: 9, text: "hi", photo: undefined });
+    expect(out).toEqual({
+      chatId: 9,
+      chatType: "private",
+      messageId: 17,
+      text: "hi",
+      photo: undefined,
+      senderHandle: "@shelden"
+    });
   });
 
   test("picks the largest PhotoSize for photo updates", () => {
@@ -230,10 +243,74 @@ describe("extractIncomingPayload", () => {
     });
     expect(out?.photo?.file_id).toBe("l");
     expect(out?.text).toBe("look");
+    expect(out?.chatType).toBe("private");
   });
 
   test("returns undefined for empty updates", () => {
     expect(extractIncomingPayload({ update_id: 3 })).toBeUndefined();
+  });
+
+  test("strips a leading bot mention so the agent sees clean text", () => {
+    const out = extractIncomingPayload(
+      {
+        update_id: 4,
+        message: {
+          message_id: 1,
+          date: 0,
+          chat: { id: -1, type: "supergroup", title: "team" },
+          text: "@gini_agent_bot what's the weather?"
+        }
+      },
+      { botUsername: "gini_agent_bot" }
+    );
+    expect(out?.text).toBe("what's the weather?");
+    expect(out?.chatType).toBe("supergroup");
+  });
+
+  test("strips the /cmd@botname suffix common in group chats", () => {
+    const out = extractIncomingPayload(
+      {
+        update_id: 5,
+        message: {
+          message_id: 1,
+          date: 0,
+          chat: { id: -1, type: "group" },
+          text: "/start@gini_agent_bot please"
+        }
+      },
+      { botUsername: "gini_agent_bot" }
+    );
+    expect(out?.text).toBe("/start please");
+  });
+
+  test("leaves other users' mentions intact — only the bot's handle is stripped", () => {
+    const out = extractIncomingPayload(
+      {
+        update_id: 6,
+        message: {
+          message_id: 1,
+          date: 0,
+          chat: { id: -1, type: "supergroup" },
+          text: "@gini_agent_bot ping @alice about the deploy"
+        }
+      },
+      { botUsername: "gini_agent_bot" }
+    );
+    expect(out?.text).toBe("ping @alice about the deploy");
+  });
+
+  test("falls back to first_name when sender has no @username", () => {
+    const out = extractIncomingPayload({
+      update_id: 7,
+      message: {
+        message_id: 1,
+        date: 0,
+        chat: { id: -1, type: "group" },
+        text: "hello",
+        from: { id: 2, is_bot: false, first_name: "Alex" }
+      }
+    });
+    expect(out?.senderHandle).toBe("Alex");
   });
 });
 

@@ -2,9 +2,10 @@
 //
 // state.toolsets (enabled set) is the global "this toolset is on" filter.
 // agentToolsetFilter narrows that further to an active-agent whitelist.
-// Always-on tools (web_fetch, read_skill, spawn_subagent, create_job)
-// bypass both filters so freshly cloned instances and tightly scoped
-// agents can still schedule reminders, read skills, and delegate.
+// Always-on tools (web_fetch, read_skill, spawn_subagent, create_job,
+// list_jobs, update_job, delete_job) bypass both filters so freshly
+// cloned instances and tightly scoped agents can still schedule, list,
+// update, and delete reminders, read skills, and delegate.
 
 import { describe, expect, test } from "bun:test";
 import { buildToolCatalog } from "./tool-catalog";
@@ -40,7 +41,15 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
   };
 }
 
-const ALWAYS_ON = new Set(["web_fetch", "read_skill", "spawn_subagent", "create_job"]);
+const ALWAYS_ON = new Set([
+  "web_fetch",
+  "read_skill",
+  "spawn_subagent",
+  "create_job",
+  "list_jobs",
+  "update_job",
+  "delete_job"
+]);
 
 describe("buildToolCatalog", () => {
   test("includes only always-on tools when no toolsets are enabled", () => {
@@ -49,12 +58,15 @@ describe("buildToolCatalog", () => {
     for (const tool of catalog) {
       expect(ALWAYS_ON.has(tool.function.name)).toBe(true);
     }
-    // Sanity: all four always-on tools are present.
+    // Sanity: all always-on tools are present.
     const names = new Set(catalog.map((t) => t.function.name));
     expect(names.has("web_fetch")).toBe(true);
     expect(names.has("read_skill")).toBe(true);
     expect(names.has("spawn_subagent")).toBe(true);
     expect(names.has("create_job")).toBe(true);
+    expect(names.has("list_jobs")).toBe(true);
+    expect(names.has("update_job")).toBe(true);
+    expect(names.has("delete_job")).toBe(true);
   });
 
   test("agent toolset filter narrows the catalog to file + always-on", () => {
@@ -73,6 +85,9 @@ describe("buildToolCatalog", () => {
     expect(names.has("read_skill")).toBe(true);
     expect(names.has("spawn_subagent")).toBe(true);
     expect(names.has("create_job")).toBe(true);
+    expect(names.has("list_jobs")).toBe(true);
+    expect(names.has("update_job")).toBe(true);
+    expect(names.has("delete_job")).toBe(true);
   });
 
   test("agent filter for a globally-disabled toolset still produces an empty (non-always-on) catalog", () => {

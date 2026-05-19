@@ -87,6 +87,12 @@ export type TelegramParseMode = "MarkdownV2" | "Markdown" | "HTML";
 export interface SendMessageOptions {
   parseMode?: TelegramParseMode;
   disableWebPagePreview?: boolean;
+  // Thread the outbound reply onto a specific inbound message. Useful in
+  // group chats so the bot's response visually attaches to the user's
+  // question. Telegram silently ignores this if the referenced message
+  // was deleted, so it's safe to set unconditionally for inbound-mirror
+  // replies.
+  replyToMessageId?: number;
 }
 
 // Photo source variants. The first two go out as JSON; `bytes` and
@@ -102,6 +108,7 @@ export type TelegramPhotoSource =
 export interface SendPhotoOptions {
   caption?: string;
   parseMode?: TelegramParseMode;
+  replyToMessageId?: number;
 }
 
 export interface TelegramClient {
@@ -174,7 +181,8 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
         chat_id: chatId,
         text,
         ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
-        ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {})
+        ...(opts?.disableWebPagePreview ? { disable_web_page_preview: true } : {}),
+        ...(opts?.replyToMessageId !== undefined ? { reply_to_message_id: opts.replyToMessageId } : {})
       }),
     sendChatAction: (chatId, action) => call<true>("sendChatAction", { chat_id: chatId, action }),
     getFile: (fileId) => call<TelegramFile>("getFile", { file_id: fileId }),
@@ -189,7 +197,8 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
     sendPhoto: async (chatId, source, opts) => {
       const captionFields = {
         ...(opts?.caption !== undefined ? { caption: opts.caption } : {}),
-        ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {})
+        ...(opts?.parseMode ? { parse_mode: opts.parseMode } : {}),
+        ...(opts?.replyToMessageId !== undefined ? { reply_to_message_id: opts.replyToMessageId } : {})
       };
       if (source.kind === "url") {
         return call<TelegramMessage>("sendPhoto", { chat_id: chatId, photo: source.url, ...captionFields });
@@ -201,6 +210,9 @@ export function createTelegramClient(token: string, options: TelegramClientOptio
       form.append("chat_id", String(chatId));
       if (captionFields.caption !== undefined) form.append("caption", captionFields.caption);
       if (captionFields.parse_mode) form.append("parse_mode", captionFields.parse_mode);
+      if (captionFields.reply_to_message_id !== undefined) {
+        form.append("reply_to_message_id", String(captionFields.reply_to_message_id));
+      }
       if (source.kind === "bytes") {
         const blob =
           source.bytes instanceof Blob
@@ -244,23 +256,75 @@ export function extractIncomingText(update: TelegramUpdate): { chatId: number; t
 
 export interface IncomingPayload {
   chatId: number;
+  // Telegram chat type. Private chats route the message directly to the
+  // agent; group/supergroup chats need sender attribution and reply
+  // threading so the conversation stays readable.
+  chatType: TelegramChat["type"];
+  // The originating message id, used as reply_to_message_id on the
+  // mirrored assistant reply so Telegram threads the response visually.
+  messageId: number;
   // Plain-text body of the message. For photo-only messages this is the
-  // caption (or "" if neither caption nor text is set).
+  // caption (or "" if neither caption nor text is set). The bot's own
+  // @mention and trailing `@botname` suffix on slash-commands are
+  // stripped here so the agent sees natural language.
   text: string;
   // Largest available PhotoSize when the message is a photo. The poller
   // resolves this via getFile + downloadFile and saves the bytes locally.
   photo?: TelegramPhotoSize;
+  // Display handle for the sender — `@username` when set, otherwise the
+  // first_name. The poller prefixes this onto the task input for group
+  // chats so the agent knows who's speaking.
+  senderHandle?: string;
+}
+
+export interface ExtractOptions {
+  // The bot's own @username (no leading @). When supplied the extractor
+  // strips bare `@botname` mentions and `/cmd@botname` suffixes from the
+  // message text so the agent's prompt isn't polluted with the address.
+  botUsername?: string;
 }
 
 // Surface the routable payload from an update — text or photo. Returns
 // undefined when the update carries nothing we can act on.
-export function extractIncomingPayload(update: TelegramUpdate): IncomingPayload | undefined {
+export function extractIncomingPayload(
+  update: TelegramUpdate,
+  options: ExtractOptions = {}
+): IncomingPayload | undefined {
   const message = update.message ?? update.edited_message;
   if (!message) return undefined;
   const photo = pickLargestPhoto(message.photo);
-  const text = message.text ?? message.caption ?? "";
+  const rawText = message.text ?? message.caption ?? "";
+  const text = stripBotMention(rawText, options.botUsername);
   if (!photo && !text) return undefined;
-  return { chatId: message.chat.id, text, photo };
+  const from = message.from;
+  const senderHandle = from
+    ? from.username
+      ? `@${from.username}`
+      : from.first_name
+    : undefined;
+  return {
+    chatId: message.chat.id,
+    chatType: message.chat.type,
+    messageId: message.message_id,
+    text,
+    photo,
+    senderHandle
+  };
+}
+
+function stripBotMention(text: string, botUsername: string | undefined): string {
+  if (!botUsername || !text) return text;
+  const handle = botUsername.replace(/^@+/, "");
+  if (!handle) return text;
+  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Drop `/cmd@bot` → `/cmd` first so the bare-mention pass below
+  // doesn't see a leftover `@bot` glued to the command word.
+  let cleaned = text.replace(new RegExp(`(^|\\s)(/\\w+)@${escaped}\\b`, "gi"), "$1$2");
+  // Drop bare `@botname` mentions surrounded by whitespace or at the
+  // string boundary. We only strip the bot's own handle — other @ user
+  // mentions in the message stay intact so the agent can still see them.
+  cleaned = cleaned.replace(new RegExp(`(^|\\s)@${escaped}(?=\\s|$|[.,!?:;])`, "gi"), "$1");
+  return cleaned.trim();
 }
 
 function pickLargestPhoto(sizes: TelegramPhotoSize[] | undefined): TelegramPhotoSize | undefined {

@@ -12,7 +12,16 @@ import { extname, join } from "node:path";
 import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig } from "../types";
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { instanceRoot } from "../paths";
-import { findTelegramChatSession, readBridgeBotToken, receiveMessagingInput, sendMessagingOutput } from "./messaging";
+import {
+  authorizeTelegramChat,
+  findTelegramChatSession,
+  hasActivePairingCode,
+  readBridgeBotToken,
+  receiveMessagingInput,
+  recordDeniedChatAttempt,
+  sendMessagingOutput,
+  tryClaimPairingCode
+} from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
 import {
   createTelegramClient,
@@ -148,10 +157,86 @@ async function runLoop(
 
     if (updates.length === 0) continue;
 
+    const botUsername =
+      typeof bridge.metadata?.botUsername === "string" ? bridge.metadata.botUsername : undefined;
+
     for (const update of updates) {
       if (signal.aborted) return;
-      const incoming = extractIncomingPayload(update);
+      const incoming = extractIncomingPayload(update, { botUsername });
       if (incoming) {
+        // Allowlist gate: every chat — including the operator's first
+        // DM — is denied until explicitly enrolled. A private chat can
+        // also enroll itself by sending the bridge's pairing code as
+        // its first message; that's the only shortcut around the
+        // explicit `allow` call. Denied updates are dropped silently
+        // (no acknowledgement to strangers), but the attempt lands on
+        // `bridge.metadata.recentDeniedChats` so the operator can
+        // discover their chat_id via `gini messaging chats <bridge>`
+        // without tailing the log. The offset still advances so the
+        // same denied update doesn't get re-fetched on the next poll.
+        const allowed = await authorizeTelegramChat(config, bridgeId, incoming.chatId);
+        if (!allowed) {
+          const paired = await tryClaimPairingCode(config, bridgeId, {
+            chatId: incoming.chatId,
+            chatType: incoming.chatType,
+            text: incoming.text
+          });
+          if (paired) {
+            appendLog(config.instance, "messaging.telegram.chat_paired", {
+              bridgeId,
+              chatId: incoming.chatId,
+              senderHandle: incoming.senderHandle
+            });
+            // Confirm the pair back to the user. The pairing message
+            // itself is consumed (not turned into a task) so the
+            // operator's first "real" turn comes next.
+            try {
+              await sendMessagingOutput(config, bridgeId, {
+                text: "Paired. You can chat with the bot now.",
+                target: String(incoming.chatId)
+              });
+            } catch (error) {
+              appendLog(config.instance, "messaging.telegram.pair_confirm_error", {
+                bridgeId,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            }
+            await advanceOffset(config, bridgeId, update.update_id);
+            continue;
+          }
+          appendLog(config.instance, "messaging.telegram.chat_denied", {
+            bridgeId,
+            chatId: incoming.chatId,
+            chatType: incoming.chatType,
+            senderHandle: incoming.senderHandle
+          });
+          await recordDeniedChatAttempt(config, bridgeId, {
+            chatId: incoming.chatId,
+            chatType: incoming.chatType,
+            sender: incoming.senderHandle
+          });
+          // Hint reply during an active pairing window: a denied
+          // private DM is most likely the operator typing "hi" before
+          // they noticed the pairing code, so a one-line nudge saves
+          // them from staring at silence. Outside the window — or for
+          // groups — we stay dark so strangers don't get confirmation
+          // the bot exists.
+          if (incoming.chatType === "private" && hasActivePairingCode(config, bridgeId)) {
+            try {
+              await sendMessagingOutput(config, bridgeId, {
+                text: "Please send your pairing code to enroll this chat.",
+                target: String(incoming.chatId)
+              });
+            } catch (error) {
+              appendLog(config.instance, "messaging.telegram.pair_hint_error", {
+                bridgeId,
+                error: error instanceof Error ? error.message : String(error)
+              });
+            }
+          }
+          await advanceOffset(config, bridgeId, update.update_id);
+          continue;
+        }
         // Resolve photo bytes to a local file before submitting the
         // task. A download failure logs and continues with whatever
         // text/caption we already have so a transient network blip
@@ -185,7 +270,8 @@ async function runLoop(
               record.taskId,
               incoming.chatId,
               client,
-              signal
+              signal,
+              incoming.messageId
             ).catch((error) => {
               appendLog(config.instance, "messaging.telegram.typing_error", {
                 bridgeId,
@@ -200,17 +286,22 @@ async function runLoop(
           });
         }
       }
-      // Persist the offset *after* each update so a crash mid-batch
-      // doesn't replay messages that already produced tasks. Telegram's
-      // contract is "next offset = highest update_id + 1".
-      await mutateState(config.instance, (state) => {
-        const live = state.messagingBridges.find((item) => item.id === bridgeId);
-        if (!live) return;
-        live.metadata = { ...(live.metadata ?? {}), lastOffset: update.update_id + 1 };
-        live.updatedAt = now();
-      });
+      await advanceOffset(config, bridgeId, update.update_id);
     }
   }
+}
+
+// Persist the offset *after* each update so a crash mid-batch doesn't
+// replay messages that already produced tasks. Telegram's contract is
+// "next offset = highest update_id + 1". The denied-chat branch calls
+// this directly so silently-dropped updates don't accumulate.
+async function advanceOffset(config: RuntimeConfig, bridgeId: string, updateId: number): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((item) => item.id === bridgeId);
+    if (!live) return;
+    live.metadata = { ...(live.metadata ?? {}), lastOffset: updateId + 1 };
+    live.updatedAt = now();
+  });
 }
 
 function readLastOffset(bridge: MessagingBridgeRecord): number | undefined {
@@ -230,7 +321,8 @@ async function maintainTypingAndMirrorReply(
   taskId: string,
   chatId: number,
   client: TelegramClient,
-  signal: AbortSignal
+  signal: AbortSignal,
+  replyToMessageId?: number
 ): Promise<void> {
   await maintainTypingIndicator(config, taskId, chatId, client, signal);
   if (signal.aborted) return;
@@ -261,7 +353,8 @@ async function maintainTypingAndMirrorReply(
   try {
     await sendMessagingOutput(config, bridgeId, {
       text: replyText,
-      target: session.source.target
+      target: session.source.target,
+      ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
     });
   } catch (error) {
     appendLog(config.instance, "messaging.telegram.reply_error", {
@@ -326,15 +419,24 @@ async function downloadIncomingPhoto(
   };
 }
 
-// Compose the input string handed to submitTask. When a photo arrives
-// we prefix the caption (or empty body) with a single line pointing at
-// the saved file, so an agent inspecting `task.input` can pick up the
-// attachment via the file toolset without changing how task inputs
-// flow through the runtime.
+// Compose the input string handed to submitTask. Two prefixes can land
+// on the message before the body:
+//   - `[photo: <path>]` when an inbound photo was captured to disk, so
+//     the agent's file toolset can inspect the attachment without any
+//     changes to how task inputs flow through the runtime.
+//   - `<sender>:` for group/supergroup chats where multiple people can
+//     speak. The agent needs to know whose turn it is so it can address
+//     the right person (and not confuse one user's question with
+//     another's reply).
 function buildTaskInput(incoming: IncomingPayload, savedPath: string | undefined): string {
-  if (!savedPath) return incoming.text;
-  const header = `[photo: ${savedPath}]`;
-  return incoming.text ? `${header}\n${incoming.text}` : header;
+  const parts: string[] = [];
+  if (savedPath) parts.push(`[photo: ${savedPath}]`);
+  const isGroupChat = incoming.chatType === "group" || incoming.chatType === "supergroup";
+  const body = isGroupChat && incoming.senderHandle
+    ? `${incoming.senderHandle}: ${incoming.text}`
+    : incoming.text;
+  if (body) parts.push(body);
+  return parts.join("\n");
 }
 
 async function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {

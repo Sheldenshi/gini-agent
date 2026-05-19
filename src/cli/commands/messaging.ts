@@ -19,16 +19,26 @@ export async function messaging(ctx: CliContext): Promise<void> {
     }
     const body: Record<string, unknown> = { name, kind, deliveryTargets: targets };
     if (parsed.flags["--bot-token"]) body.botToken = parsed.flags["--bot-token"];
-    print(await api(config, "/api/messaging", {
+    const bridge = await api(config, "/api/messaging", {
       method: "POST",
       body: JSON.stringify(body)
-    }));
+    });
+    print(bridge);
+    printPairingHint(bridge);
     return;
   }
   if (sub === "health" || sub === "disable") {
     const id = restAfter(cliArgs, sub)[0];
     if (!id) throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name>`);
     print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, { method: "POST" }));
+    return;
+  }
+  if (sub === "pair") {
+    const id = restAfter(cliArgs, sub)[0];
+    if (!id) throw new Error("Usage: gini messaging pair <bridge-id-or-name>");
+    const bridge = await api(config, `/api/messaging/${encodeURIComponent(id)}/pair`, { method: "POST" });
+    print(bridge);
+    printPairingHint(bridge);
     return;
   }
   if (sub === "receive" || sub === "send") {
@@ -45,5 +55,45 @@ export async function messaging(ctx: CliContext): Promise<void> {
     print(await api(config, id ? `/api/messaging/${encodeURIComponent(id)}/messages` : "/api/messaging/messages"));
     return;
   }
+  if (sub === "allow" || sub === "deny") {
+    const [id, chatIdStr] = restAfter(cliArgs, sub);
+    if (!id || !chatIdStr) {
+      throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name> <chat-id>`);
+    }
+    const chatId = Number(chatIdStr);
+    if (!Number.isFinite(chatId)) {
+      throw new Error(`chat-id must be a number (got '${chatIdStr}'). Negative ids are valid for groups.`);
+    }
+    print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, {
+      method: "POST",
+      body: JSON.stringify({ chatId })
+    }));
+    return;
+  }
+  if (sub === "chats") {
+    const id = restAfter(cliArgs, sub)[0];
+    if (!id) throw new Error("Usage: gini messaging chats <bridge-id-or-name>");
+    print(await api(config, `/api/messaging/${encodeURIComponent(id)}/chats`));
+    return;
+  }
   print(await api(config, "/api/messaging"));
+}
+
+// Surfaced after `gini messaging add` (telegram-kind) and `gini
+// messaging pair`. The bridge record already carries the code, but
+// users skim the JSON output — a separate line with the code and a
+// short instruction makes the next step obvious.
+function printPairingHint(bridge: unknown): void {
+  if (!bridge || typeof bridge !== "object") return;
+  const meta = (bridge as { metadata?: { pairingCode?: unknown; pairingCodeExpiresAt?: unknown; botUsername?: unknown } }).metadata;
+  if (!meta || typeof meta !== "object") return;
+  const code = typeof meta.pairingCode === "string" ? meta.pairingCode : undefined;
+  if (!code) return;
+  const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
+  const handle = typeof meta.botUsername === "string" ? `@${meta.botUsername}` : "your bot";
+  const expiresHint = expiresRaw
+    ? ` Expires at ${expiresRaw}.`
+    : "";
+  // eslint-disable-next-line no-console
+  console.log(`\nPairing code: ${code}\nDM ${handle} on Telegram with that message to enroll your chat.${expiresHint}`);
 }

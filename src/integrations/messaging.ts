@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import type { ChatSessionRecord, ConnectorSecretRef, MessagingBridgeRecord, RuntimeConfig } from "../types";
 import { submitTask } from "../agent";
 import {
@@ -104,7 +105,12 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
 
   if (kind === "telegram") {
     const ref = writeSecret(config.instance, bridgeSecretNamespace(bridge.id), "bot-token", botToken);
-    return mutateState(config.instance, (state) => attachSecretRef(state.messagingBridges, bridge.id, ref));
+    await mutateState(config.instance, (state) => attachSecretRef(state.messagingBridges, bridge.id, ref));
+    // Auto-mint a pairing code so the operator can DM the bot and
+    // enroll their chat in one paste, without ever needing to look up
+    // their own chat_id. The whitelist remains the source of truth —
+    // pairing just consumes a one-shot token to populate it.
+    return mutateState(config.instance, (state) => regeneratePairingCodeInState(state.messagingBridges, bridge.id));
   }
 
   return bridge;
@@ -250,6 +256,320 @@ export function findTelegramChatSession(
   );
 }
 
+// Chat allowlist + explicit enrollment.
+//
+// Telegram bots are addressable by anyone who finds the @username, so
+// without an allowlist a stranger can add the bot to their group and
+// drive the runtime — burning the owner's provider tokens and
+// potentially reaching workspace tools. The bridge stores a list of
+// permitted chat_ids on `metadata.allowedChatIds`; the poller silently
+// drops updates from anyone not on the list. There is NO trust-on-
+// first-use: even the first DM from the bridge owner is denied until
+// they explicitly run `gini messaging allow <bridge> <chat-id>` on
+// their own machine.
+//
+// To make chat-id discovery painless (the owner doesn't typically
+// know their own Telegram user_id off the top of their head), the
+// poller records the last few denied attempts on
+// `metadata.recentDeniedChats`. The owner runs `gini messaging chats
+// <bridge>` and sees both the allowlist and a list of pending
+// attempts, including their own — they pick out the right chat_id and
+// enroll it. The list is bounded so a flood of stranger pings can't
+// blow up the state record.
+
+const MAX_RECENT_DENIED_CHATS = 10;
+
+// Pairing code parameters. Telegram chat_ids are not visible in the
+// Telegram UI, so a fresh operator can't easily run `allow <chat-id>`
+// without first discovering their own id. The pairing code is a one-
+// shot, time-bounded token printed only on the runtime's local stdout
+// when the bridge is created. The operator pastes it into Telegram as
+// their first DM; the poller validates it, enrolls the originating
+// chat, and consumes the code. Codes are scoped to private chats
+// only — groups always require explicit `allow` so a stranger who
+// adds the bot to their group can never accidentally trip pairing.
+const PAIRING_CODE_BYTES = 4; // 32 bits → 4.3B combos, plenty against the 15-min window
+const PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
+const PAIRING_CODE_PREFIX = "pair-";
+
+export interface DeniedChatAttempt {
+  chatId: number;
+  chatType: "private" | "group" | "supergroup" | "channel" | string;
+  // Telegram @handle when available, otherwise first_name. Omitted if
+  // the update carried no `from` field (rare — typically channel posts).
+  sender?: string;
+  // Last time we saw an attempt from this chat. Newer attempts from
+  // the same chat just bump the timestamp instead of stacking entries.
+  lastAttemptAt: string;
+}
+
+export interface ChatAllowlistView {
+  allowedChatIds: number[];
+  ownerChatId?: number;
+  recentDeniedChats: DeniedChatAttempt[];
+}
+
+function readAllowedChatIds(bridge: MessagingBridgeRecord): number[] {
+  const raw = bridge.metadata?.allowedChatIds;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((value) => Number(value)).filter((n) => Number.isFinite(n));
+}
+
+function readOwnerChatId(bridge: MessagingBridgeRecord): number | undefined {
+  const raw = bridge.metadata?.ownerChatId;
+  return typeof raw === "number" && Number.isFinite(raw) ? raw : undefined;
+}
+
+export function isChatAllowed(bridge: MessagingBridgeRecord, chatId: number): boolean {
+  return readAllowedChatIds(bridge).includes(chatId);
+}
+
+// Atomically check whether an inbound chat is on the bridge's
+// allowlist. Returns `true` when the message should be processed,
+// `false` when the poller should drop it silently. No trust-on-first-
+// use: every chat (including the owner's first DM) starts denied,
+// and the owner enrolls themselves via `gini messaging allow` after
+// finding their chat_id in the recent-denied list.
+export async function authorizeTelegramChat(
+  config: RuntimeConfig,
+  bridgeId: string,
+  chatId: number
+): Promise<boolean> {
+  const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
+  if (!bridge) return false;
+  return isChatAllowed(bridge, chatId);
+}
+
+// Record a denied chat attempt on the bridge so the owner can find
+// their own chat_id via `gini messaging chats <bridge>` without
+// tailing the runtime log. Dedupes by chatId — repeated attempts from
+// the same stranger just refresh the timestamp instead of stacking
+// entries. Bounded at MAX_RECENT_DENIED_CHATS to keep the state record
+// small if a public-known bridge gets pinged at scale.
+export async function recordDeniedChatAttempt(
+  config: RuntimeConfig,
+  bridgeId: string,
+  attempt: { chatId: number; chatType: string; sender?: string }
+): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (!live) return;
+    const meta = { ...(live.metadata ?? {}) };
+    const existing = readRecentDeniedChats(live).filter((entry) => entry.chatId !== attempt.chatId);
+    const entry: DeniedChatAttempt = {
+      chatId: attempt.chatId,
+      chatType: attempt.chatType,
+      ...(attempt.sender ? { sender: attempt.sender } : {}),
+      lastAttemptAt: now()
+    };
+    // Newest first; cap at MAX so an attacker pinging in a loop can't
+    // bloat the state record.
+    meta.recentDeniedChats = [entry, ...existing].slice(0, MAX_RECENT_DENIED_CHATS);
+    live.metadata = meta;
+    live.updatedAt = entry.lastAttemptAt;
+  });
+}
+
+function readRecentDeniedChats(bridge: MessagingBridgeRecord): DeniedChatAttempt[] {
+  const raw = bridge.metadata?.recentDeniedChats;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((entry) => entry as DeniedChatAttempt)
+    .filter((entry) => entry && typeof entry.chatId === "number");
+}
+
+function generatePairingCode(): string {
+  return PAIRING_CODE_PREFIX + randomBytes(PAIRING_CODE_BYTES).toString("hex");
+}
+
+// Mint (or rotate) a pairing code on the bridge. Called from
+// addMessagingBridge so a freshly-created telegram bridge already has
+// a valid code, and from pairMessagingBridge when the operator wants
+// a new window after the previous code expired.
+function regeneratePairingCodeInState(
+  bridges: MessagingBridgeRecord[],
+  bridgeId: string
+): MessagingBridgeRecord {
+  const live = bridges.find((b) => b.id === bridgeId);
+  if (!live) throw new Error(`Messaging bridge not found: ${bridgeId}`);
+  const meta = { ...(live.metadata ?? {}) };
+  meta.pairingCode = generatePairingCode();
+  meta.pairingCodeExpiresAt = new Date(Date.now() + PAIRING_CODE_TTL_MS).toISOString();
+  live.metadata = meta;
+  live.updatedAt = now();
+  return live;
+}
+
+export async function pairMessagingBridge(config: RuntimeConfig, idOrName: string) {
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    if (live.kind !== "telegram") {
+      throw new Error(`Pairing codes only apply to telegram bridges (got '${live.kind}').`);
+    }
+    const refreshed = regeneratePairingCodeInState(state.messagingBridges, live.id);
+    addAudit(state, {
+      actor: "user",
+      action: "messaging.pairing.minted",
+      target: refreshed.id,
+      risk: "medium",
+      evidence: { expiresAt: refreshed.metadata?.pairingCodeExpiresAt }
+    });
+    return refreshed;
+  });
+}
+
+// True when the bridge currently has a valid (non-expired) pairing
+// code. The poller calls this to decide whether to nudge a denied
+// chat with a "send your pairing code" hint instead of going silent —
+// outside a pairing window the bot stays dark so strangers don't get
+// confirmation that it's running.
+export function hasActivePairingCode(config: RuntimeConfig, bridgeId: string): boolean {
+  const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
+  if (!bridge) return false;
+  const meta = bridge.metadata;
+  if (!meta) return false;
+  if (typeof meta.pairingCode !== "string") return false;
+  const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
+  if (!expiresRaw) return false;
+  const expiresAt = Date.parse(expiresRaw);
+  return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
+
+// Atomically validate and consume a pairing attempt. Returns true when
+// the message text matches the bridge's active pairing code AND the
+// chat is private AND the code hasn't expired — in which case the
+// originating chat is enrolled (as if `allow` were called) and the
+// code is cleared. Wrong codes / expired codes / group chats return
+// false; the poller's normal deny path takes over from there.
+export async function tryClaimPairingCode(
+  config: RuntimeConfig,
+  bridgeId: string,
+  payload: { chatId: number; chatType: string; text: string }
+): Promise<boolean> {
+  if (payload.chatType !== "private") return false;
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === bridgeId);
+    if (!live) return false;
+    const meta = { ...(live.metadata ?? {}) };
+    const code = typeof meta.pairingCode === "string" ? meta.pairingCode : undefined;
+    const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
+    if (!code || !expiresRaw) return false;
+    const expiresAt = Date.parse(expiresRaw);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      // Stale code — clear it so the field doesn't linger on metadata
+      // and the operator can re-mint cleanly.
+      delete meta.pairingCode;
+      delete meta.pairingCodeExpiresAt;
+      live.metadata = meta;
+      live.updatedAt = now();
+      return false;
+    }
+    if (payload.text.trim().toLowerCase() !== code.toLowerCase()) return false;
+
+    // Code matched — consume it and enroll the chat. The whitelist is
+    // still the source of truth; we just populated it via pairing
+    // instead of a direct CLI call.
+    delete meta.pairingCode;
+    delete meta.pairingCodeExpiresAt;
+    const allowed = readAllowedChatIds(live);
+    if (!allowed.includes(payload.chatId)) allowed.push(payload.chatId);
+    meta.allowedChatIds = allowed;
+    if (readOwnerChatId(live) === undefined) meta.ownerChatId = payload.chatId;
+    meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== payload.chatId);
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(state, {
+      actor: "runtime",
+      action: "messaging.pairing.claimed",
+      target: live.id,
+      risk: "medium",
+      evidence: { chatId: payload.chatId }
+    });
+    return true;
+  });
+}
+
+export async function allowChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+  if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    const meta = { ...(live.metadata ?? {}) };
+    const allowed = readAllowedChatIds(live);
+    if (!allowed.includes(chatId)) allowed.push(chatId);
+    meta.allowedChatIds = allowed;
+    // First enrollment also becomes the recorded owner. After that the
+    // field stays stable — `allow` of additional chats doesn't change
+    // who originally claimed the bridge.
+    if (readOwnerChatId(live) === undefined) {
+      meta.ownerChatId = chatId;
+    }
+    // Drop the enrolled chat from the pending-attempts list so the
+    // owner's view stays clean.
+    meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
+    // An explicit allow closes any active pairing window — the
+    // operator just established trust through the CLI, so the
+    // pairing-window hint becomes noise. They can mint a fresh code
+    // with `gini messaging pair` whenever they want to onboard a
+    // new chat via the shortcut path.
+    delete meta.pairingCode;
+    delete meta.pairingCodeExpiresAt;
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(state, {
+      actor: "user",
+      action: "messaging.chat.allowed",
+      target: live.id,
+      risk: "medium",
+      evidence: { chatId }
+    });
+    return chatAllowlistView(live);
+  });
+}
+
+export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+  if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    const meta = { ...(live.metadata ?? {}) };
+    const allowed = readAllowedChatIds(live).filter((id) => id !== chatId);
+    meta.allowedChatIds = allowed;
+    // Removing the owner chat doesn't clear ownerChatId — keep the
+    // historical record so an audit reader can see who originally
+    // paired the bridge. The bridge stops responding to that chat
+    // either way because it's no longer on the allowlist.
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(state, {
+      actor: "user",
+      action: "messaging.chat.denied",
+      target: live.id,
+      risk: "medium",
+      evidence: { chatId }
+    });
+    return chatAllowlistView(live);
+  });
+}
+
+export function listAllowedChats(config: RuntimeConfig, idOrName: string): ChatAllowlistView {
+  const bridge = readState(config.instance).messagingBridges.find(
+    (b) => b.id === idOrName || b.name === idOrName
+  );
+  if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  return chatAllowlistView(bridge);
+}
+
+function chatAllowlistView(bridge: MessagingBridgeRecord): ChatAllowlistView {
+  const owner = readOwnerChatId(bridge);
+  return {
+    allowedChatIds: readAllowedChatIds(bridge),
+    ...(owner !== undefined ? { ownerChatId: owner } : {}),
+    recentDeniedChats: readRecentDeniedChats(bridge)
+  };
+}
+
 function parseInboundMedia(raw: unknown): MessagingMessageMedia | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const value = raw as MessagingMessageMedia;
@@ -317,15 +637,30 @@ export async function sendMessagingOutput(config: RuntimeConfig, idOrName: strin
       const parseModeRaw = typeof input.parseMode === "string" ? input.parseMode : undefined;
       const useMdv2 = parseModeRaw !== "none";
       const formatted = useMdv2 ? formatTelegramMarkdownV2(text) : text;
+      // Thread the reply onto a specific inbound message when supplied
+      // (group chats use this so the bot's response visually attaches to
+      // the user's question). Telegram silently ignores the field when
+      // the referenced message is gone, so it's safe to forward
+      // unconditionally.
+      const replyToMessageId =
+        typeof input.replyToMessageId === "number" ? input.replyToMessageId : undefined;
       try {
         const client = telegramClientFor(token);
         if (photoSource) {
           await client.sendPhoto(target, photoSource, {
             caption: formatted || undefined,
-            parseMode: useMdv2 && formatted ? "MarkdownV2" : undefined
+            parseMode: useMdv2 && formatted ? "MarkdownV2" : undefined,
+            ...(replyToMessageId !== undefined ? { replyToMessageId } : {})
           });
         } else {
-          await client.sendMessage(target, formatted, useMdv2 ? { parseMode: "MarkdownV2" } : undefined);
+          const sendOpts: import("./telegram").SendMessageOptions = {};
+          if (useMdv2) sendOpts.parseMode = "MarkdownV2";
+          if (replyToMessageId !== undefined) sendOpts.replyToMessageId = replyToMessageId;
+          await client.sendMessage(
+            target,
+            formatted,
+            Object.keys(sendOpts).length > 0 ? sendOpts : undefined
+          );
         }
       } catch (error) {
         status = "failed";
