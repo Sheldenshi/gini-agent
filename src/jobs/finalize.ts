@@ -68,6 +68,8 @@ export async function finalizeJobRunFromTask(config: RuntimeConfig, task: Task):
           target: job.id,
           risk: "low",
           taskId: task.id,
+          jobId: job.id,
+          agentId: job.agentId,
           evidence: { runId: run.id, runStatus: run.status }
         });
       }
