@@ -86,11 +86,20 @@ function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited
   }
 
   const intervalSeconds = Math.max(1, Number(proposal.payload.intervalSeconds ?? 3600));
+  // Carry the originating task's owning agent onto the created job so the
+  // first scheduler fire doesn't reattribute it to whatever happens to be
+  // active right now. Falls back to state.activeAgentId when the proposal
+  // pre-dates per-agent stamping.
+  const sourceTask = proposal.sourceTaskId
+    ? state.tasks.find((task) => task.id === proposal.sourceTaskId)
+    : undefined;
+  const agentId = sourceTask?.agentId ?? state.activeAgentId;
   const job = createJob(state, {
     name: String(proposal.payload.name ?? proposal.title),
     prompt: String(proposal.payload.prompt ?? proposal.rationale),
     intervalSeconds,
-    nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString()
+    nextRunAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
+    agentId
   });
   return job.id;
 }

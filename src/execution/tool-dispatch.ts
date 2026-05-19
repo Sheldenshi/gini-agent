@@ -745,7 +745,11 @@ async function createJobTool(
       parentTaskId: taskId,
       dangerouslyAutoApprove,
       autoApproveCommands,
-      timeoutSeconds
+      timeoutSeconds,
+      // Inherit the originating task's owning agent so a scheduler tick
+      // doesn't reattribute the job to whichever agent happens to be
+      // active at fire time.
+      agentId: task?.agentId
     });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith("Cannot create scheduled job: parent task ")) {

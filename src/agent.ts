@@ -75,6 +75,12 @@ export interface SubmitTaskOptions {
   // "imperative" preserves the legacy CLI prefix-dispatch behavior. Defaults
   // to "imperative" for back-compat with the CLI; chat callers pass "chat".
   mode?: "chat" | "imperative";
+  // Explicit owning agent id. Overrides the runtime's active agent at
+  // submission time. Required for callers whose execution context originates
+  // from a record stamped at an earlier moment (scheduled jobs, subagent
+  // spawns, in-task create_job) so the new task inherits the originating
+  // agent rather than whichever agent happens to be active right now.
+  agentId?: string;
 }
 
 export async function submitTask(
@@ -98,7 +104,7 @@ export async function submitTask(
     options.parentTaskId,
     options.subagentId,
     options.runId,
-    effective.agentId
+    options.agentId ?? effective.agentId
   );
   if (options.mode) created.mode = options.mode;
   // When a parentTaskId is set, the upsert + the parent-status

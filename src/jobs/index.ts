@@ -222,9 +222,18 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
     // session's id replaces any caller-supplied chatSessionId so the job's
     // future fires post into the fresh thread.
     const effective = resolveEffectiveContext(state, config);
+    // Callers driven by a record stamped at an earlier moment (e.g. a
+    // running task's `create_job` tool) may override the active-agent
+    // attribution so the new job belongs to the originating agent rather
+    // than whichever agent is active at this exact tick.
+    const overrideAgentId =
+      typeof input.agentId === "string" && input.agentId.length > 0
+        ? input.agentId
+        : undefined;
+    const owningAgentId = overrideAgentId ?? effective.agentId;
     let resolvedChatSessionId = chatSessionId;
     if (createDedicatedSessionTitle !== undefined) {
-      const session = createChatSession(state, createDedicatedSessionTitle, undefined, effective.agentId);
+      const session = createChatSession(state, createDedicatedSessionTitle, undefined, owningAgentId);
       resolvedChatSessionId = session.id;
     }
     // Initial nextRunAt: cron-driven jobs anchor to the next cron-matched
@@ -254,7 +263,7 @@ export async function createScheduledJob(config: RuntimeConfig, input: Record<st
       oneShot,
       dangerouslyAutoApprove,
       autoApproveCommands,
-      agentId: effective.agentId
+      agentId: owningAgentId
     });
   });
 }
@@ -489,9 +498,9 @@ async function dispatchPromptRun(
   let task;
   try {
     if (chatRunId) {
-      task = await submitTask(taskConfig, prompt, { jobId: job.id, runId: chatRunId, mode: "chat" });
+      task = await submitTask(taskConfig, prompt, { jobId: job.id, runId: chatRunId, mode: "chat", agentId: job.agentId });
     } else {
-      task = await submitTask(taskConfig, prompt, job.id);
+      task = await submitTask(taskConfig, prompt, { jobId: job.id, agentId: job.agentId });
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

@@ -114,6 +114,7 @@ export async function spawnSubagent(
   // record (and its subsequent task) running under a cancelled
   // parent. We throw a structured error the dispatcher catches and
   // converts to a "skipped" tool result.
+  let parentAgentId: string | undefined;
   const subagent = await mutateState(config.instance, (state) => {
     if (parentTaskId) {
       const parent = state.tasks.find((t) => t.id === parentTaskId);
@@ -129,6 +130,7 @@ export async function spawnSubagent(
       }
     }
     const effective = resolveEffectiveContext(state, config);
+    parentAgentId = effective.agentId;
     return createSubagentRecord(state, {
       name,
       prompt,
@@ -153,7 +155,8 @@ export async function spawnSubagent(
     task = await submitTask(config, prompt, {
       mode: "chat",
       parentTaskId,
-      subagentId: subagent.id
+      subagentId: subagent.id,
+      agentId: parentAgentId
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
