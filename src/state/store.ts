@@ -431,8 +431,14 @@ function migrateRecordAgentIds(state: RuntimeState): void {
   stamp(state.jobRuns, "jobRuns");
   stamp(state.subagents, "subagents");
   stamp(state.approvals, "approvals");
-  stamp(state.events, "events");
-  stamp(state.audit, "audit");
+  // Events and audits are deliberately NOT backfilled here. After the
+  // AgentContext refactor, a missing agentId on an event/audit is a
+  // first-class signal that the row is system-attributed (instance boot,
+  // agent-lifecycle, instance-level config). Stamping those legacy-style
+  // would erase that distinction and re-pollute every read with a
+  // backfill audit row. Legacy events from before agentId existed simply
+  // stay unattributed — the UI's "All agents" view shows them; per-agent
+  // filters skip them, which matches the system-event contract.
   if (Object.keys(counts).length > 0) {
     addAudit(
       state,
