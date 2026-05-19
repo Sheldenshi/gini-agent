@@ -122,6 +122,28 @@ describe("matchDangerousTerminal", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "echo hi | tee -a ~/.ssh/foo")).toBe("write-system-path");
   });
 
+  test("blocks rm -rf via alias-bypass and absolute-path binary forms", () => {
+    // Backslash-escape (`\rm`) bypasses any shell alias for `rm` like
+    // `alias rm='rm -i'`. Must still gate.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "\\rm -rf /")).toBe("rm-rf-dangerous-target");
+    // Absolute path to the binary skips $PATH lookup.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "/bin/rm -rf /")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "/usr/bin/rm -rf /etc")).toBe("rm-rf-dangerous-target");
+  });
+
+  test("blocks rm -rf with uppercase recursive flag and non-system absolute targets", () => {
+    // Uppercase R is the BSD/macOS spelling of recursive.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -fRr /tmp/x")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -Rf /tmp/foo")).toBe("rm-rf-dangerous-target");
+    // ANY absolute path target gates — restricting to system prefixes
+    // is too narrow when `/tmp/x` can still nuke real work.
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf /tmp/x")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf /Users/me/work")).toBe("rm-rf-dangerous-target");
+    // `.` and `*` as the target are dangerous (current dir / glob).
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf .")).toBe("rm-rf-dangerous-target");
+    expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "rm -rf *")).toBe("rm-rf-dangerous-target");
+  });
+
   test("passes safe commands through", () => {
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "ls -la")).toBeUndefined();
     expect(matchDangerousTerminal(DEFAULT_DANGEROUS_TERMINAL_PATTERNS, "git status")).toBeUndefined();

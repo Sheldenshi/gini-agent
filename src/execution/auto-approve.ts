@@ -91,38 +91,50 @@ export type DangerousPattern = {
 const BOUNDARY = "(?:^|[\\s;&|`(\\[,])";
 
 // Detects `rm -rf` / `rm -fr` / `rm -r -f` / `rm --recursive --force`
-// shapes (flags in any order, combined or split) followed by a
-// dangerous target argument (root, $HOME, ~, /etc, /usr, /var, /bin).
-// The flag detection is permissive on whitespace and order; the target
-// detection looks for the dangerous-root tokens anywhere in the rest of
-// the command line (since `rm -rf foo /` is just as catastrophic as
-// `rm -rf /`).
+// shapes (flags in any order, combined or split, case-insensitive on
+// r/R for the recursive flag) followed by a dangerous target argument.
+// The `rm` token can be bare (`rm`), backslash-escaped to bypass a
+// shell alias (`\rm`), or an absolute path (`/bin/rm`,
+// `/usr/bin/rm`). Dangerous targets are any absolute path, a glob
+// `*`, the current directory `.`, `~`, `$HOME`, or anything under
+// `~`/`$HOME`. The bias is intentional — recursive force-delete
+// against ANY real filesystem target deserves the human gate. Local
+// names like `node_modules` or `./dist` still pass through.
 function testDangerousRm(command: string): boolean {
-  // Must start with an `rm` invocation (boundary-tokenized so `myrm` /
-  // `librm` don't match).
-  const rmMatch = command.match(/(?:^|[\s;&|`(])rm(\s|$)/);
+  // Match the `rm` invocation: optional leading backslash (alias
+  // bypass), optional absolute path prefix (`/bin/rm`), then bare
+  // `rm`. Boundary on the left is start-of-string or a shell command
+  // separator so `myrm` / `librm` don't trip it.
+  const rmMatch = command.match(/(?:^|[\s;&|`(])(\\?(?:\/[^\s]*\/)?rm)(\s|$)/);
   if (!rmMatch) return false;
   // Pull the argv-ish tail after the `rm` token for flag + target
   // analysis. Newlines are intentionally allowed since multi-line
   // shell strings still execute as one command.
   const tail = command.slice(rmMatch.index! + rmMatch[0].length);
   const hasRecursive =
-    /(?:^|\s)-(?:[a-zA-Z]*r[a-zA-Z]*)(?=\s|$)/.test(tail) ||
+    /(?:^|\s)-(?:[a-zA-Z]*[rR][a-zA-Z]*)(?=\s|$)/.test(tail) ||
     /(?:^|\s)--recursive\b/.test(tail);
   const hasForce =
     /(?:^|\s)-(?:[a-zA-Z]*f[a-zA-Z]*)(?=\s|$)/.test(tail) ||
     /(?:^|\s)--force\b/.test(tail);
   if (!hasRecursive || !hasForce) return false;
-  // Dangerous target detection: a token equal to `/`, `~`, `$HOME`,
-  // `"$HOME"`, `'$HOME'`, or one starting with a system root prefix.
-  // We split on whitespace and check each token to avoid matching
-  // `/etc` as a substring of an innocent path like `./etc`.
+  // Dangerous target detection: a token that is an absolute path, a
+  // glob, the current directory, `~`, `$HOME`, or anything under
+  // `~/`/`$HOME/`. We split on whitespace and check each token to
+  // avoid matching `/etc` as a substring of an innocent path like
+  // `./etc-helper`.
   const tokens = tail.split(/\s+/).filter(Boolean);
   for (const raw of tokens) {
+    // Skip flag-shaped tokens — `--recursive`, `-rf`, etc. should not
+    // count as a dangerous target.
+    if (raw.startsWith("-")) continue;
     // Strip surrounding single/double quotes once for the comparison.
     const t = raw.replace(/^["']|["']$/g, "");
-    if (t === "/" || t === "~" || t === "$HOME" || t.startsWith("$HOME/") || t.startsWith("~/")) return true;
-    if (/^\/(etc|usr|var|bin|sbin|lib|boot|root|home|opt)(\/|$)/.test(t)) return true;
+    if (t.length === 0) continue;
+    if (t === "*" || t === ".") return true;
+    if (t === "~" || t === "$HOME") return true;
+    if (t.startsWith("~/") || t.startsWith("$HOME/")) return true;
+    if (t.startsWith("/")) return true;
   }
   return false;
 }
