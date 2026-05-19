@@ -144,11 +144,27 @@ instance behind NAT works the same as one on a public host.
    }
    ```
 
-   The response carries a `metadata.pairingCode` and the bot's username.
-   The CLI prints a follow-up line: "DM @<bot> on Telegram with that
-   message to enroll your chat."
+   The response carries a `metadata.pairingCode`. The bot's username is
+   not resolved yet, so the CLI prints "DM your bot on Telegram with
+   that message…" — run the health probe next to learn the actual
+   handle.
 
-3. **Pair the user's chat.** The user DMs the bot the pairing code from
+3. **Probe health to resolve the bot handle.** This calls Telegram's
+   `getMe` and writes `metadata.botUsername` onto the bridge so later
+   prompts can say `@<bot>` instead of "your bot":
+
+   ```bash
+   gini messaging health my-bot
+   ```
+
+   ```http
+   POST /api/messaging/my-bot/health
+   ```
+
+   A successful response reports `Connected as @<bot>.` and the bridge
+   status flips to `configured`. Fix any token error before continuing.
+
+4. **Pair the user's chat.** The user DMs the bot the pairing code from
    their personal Telegram account. The bridge records the chat ID. To
    request a fresh code:
 
@@ -160,7 +176,7 @@ instance behind NAT works the same as one on a public host.
    POST /api/messaging/my-bot/pair
    ```
 
-4. **Allow-list the chat ID** so the bridge will deliver messages there:
+5. **Allow-list the chat ID** so the bridge will deliver messages there:
 
    ```bash
    gini messaging allow my-bot <chatId>
@@ -174,7 +190,7 @@ instance behind NAT works the same as one on a public host.
 
    Group chat IDs are negative integers — that is correct, not an error.
 
-5. **Send a message** to confirm round-trip:
+6. **Send a message** to confirm round-trip:
 
    ```bash
    gini messaging send my-bot "Hello from Gini."
