@@ -1,5 +1,5 @@
 import { writeFileSync } from "node:fs";
-import type { RuntimeConfig } from "./types";
+import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
@@ -76,10 +76,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["PATCH", /^\/api\/settings\/auto-approve$/, async (request) => {
       const payload = await body(request);
-      const approvalMode =
-        payload.approvalMode === "strict" || payload.approvalMode === "auto" || payload.approvalMode === "yolo"
-          ? payload.approvalMode
-          : undefined;
+      // Validate strictly. Previously an out-of-union value was mapped
+      // to undefined and the PATCH silently no-op'd that field while
+      // returning 200 — the client thought it succeeded. Job-level
+      // approvalMode validation already rejects unknown values; mirror
+      // that contract at the HTTP boundary too.
+      let approvalMode: ApprovalMode | undefined;
+      if (payload.approvalMode !== undefined && payload.approvalMode !== null) {
+        if (
+          payload.approvalMode !== "strict" &&
+          payload.approvalMode !== "auto" &&
+          payload.approvalMode !== "yolo"
+        ) {
+          return json(
+            {
+              error: `approvalMode must be one of "strict" | "auto" | "yolo" (got ${JSON.stringify(payload.approvalMode)})`,
+              validValues: ["strict", "auto", "yolo"]
+            },
+            400
+          );
+        }
+        approvalMode = payload.approvalMode;
+      }
       return json(updateAutoApproveSettings(config, {
         patterns: Array.isArray(payload.patterns) ? payload.patterns.map(String) : undefined,
         approvalMode,
