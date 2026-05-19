@@ -105,7 +105,7 @@ export async function spawnSubagent(
   // back-compat. We persist it on the record as the *advertised* toolsets;
   // the chat-task loop's filtering is governed by `toolsetIds` (which may
   // be undefined to mean "inherit").
-  const advertisedToolsets = toolsetIds ?? ["file", "terminal", "memory", "session_search"];
+  const advertisedToolsets = toolsetIds ?? ["file", "terminal", "memory", "session_search", "browser"];
 
   // Re-check the parent task's terminal status atomically with
   // subagent record creation. Without this serialization, a cancel
