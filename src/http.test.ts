@@ -828,6 +828,48 @@ describe("runtime api", () => {
     const body = await response.json();
     expect(body.error).toMatch(/Could not reach CDP endpoint/);
   }, 30_000);
+
+  test("stamps the active agent on records and filters listings by agentId", async () => {
+    const config = testConfig("records-agentid");
+    const handler = createHandler(config);
+
+    // Two agents — submit a task under each so we have heterogeneous rows.
+    const initial = await call(handler, config, "/api/agents");
+    const defaultAgentId = initial.activeAgentId as string;
+    const second = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "scout" })
+    });
+
+    // Task under the default agent.
+    const defaultTask = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "noop" })
+    });
+    expect(defaultTask.agentId).toBe(defaultAgentId);
+
+    await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
+    const scoutTask = await call(handler, config, "/api/tasks", {
+      method: "POST",
+      body: JSON.stringify({ input: "noop" })
+    });
+    expect(scoutTask.agentId).toBe(second.id);
+
+    // Unfiltered listing includes both rows.
+    const all = await call(handler, config, "/api/tasks");
+    expect(all.some((task: { id: string }) => task.id === defaultTask.id)).toBe(true);
+    expect(all.some((task: { id: string }) => task.id === scoutTask.id)).toBe(true);
+
+    // Filtered listing returns only the matching agent's rows.
+    const scoutOnly = await call(handler, config, `/api/tasks?agentId=${encodeURIComponent(second.id)}`);
+    expect(scoutOnly.every((task: { agentId?: string }) => task.agentId === second.id)).toBe(true);
+    expect(scoutOnly.some((task: { id: string }) => task.id === scoutTask.id)).toBe(true);
+    expect(scoutOnly.some((task: { id: string }) => task.id === defaultTask.id)).toBe(false);
+
+    // Empty string is treated as "no filter" — preserves legacy behavior.
+    const empty = await call(handler, config, "/api/tasks?agentId=");
+    expect(empty.length).toBe(all.length);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
