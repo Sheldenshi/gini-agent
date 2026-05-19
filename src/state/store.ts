@@ -331,9 +331,14 @@ function migrateMemoryAgentId(state: RuntimeState): void {
     ?? state.agents.find((agent) => agent.status === "active")?.id
     ?? state.agents[0]?.id
     ?? "agent_default";
+  // Treat stale agentIds (pointing at a deleted/unknown agent) the same as
+  // missing — leaving them stamped to a dead id strands the memory under
+  // an unselectable bucket in the UI. Mirrors the predicate in
+  // migrateRecordAgentIds.
+  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
   let stamped = 0;
   for (const memory of state.memories) {
-    if (memory.agentId) continue;
+    if (memory.agentId && validAgentIds.has(memory.agentId)) continue;
     memory.agentId = defaultAgentId;
     stamped += 1;
   }
@@ -390,12 +395,18 @@ function migrateRecordAgentIds(state: RuntimeState): void {
     ?? state.agents.find((agent) => agent.status === "active")?.id
     ?? state.agents[0]?.id;
   if (!defaultAgentId) return;
+  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
   const counts: Record<string, number> = {};
+  // Re-stamp rows whose agentId is missing OR points at an agent that no
+  // longer exists (deleted agent, stale id from an old import). The latter
+  // would otherwise leave records stranded under an unselectable id and
+  // invisible to the UI which filters by `state.agents`. Idempotent: once
+  // every row resolves to a valid id, subsequent runs are no-ops.
   const stamp = <T extends { agentId?: string }>(rows: T[] | undefined, label: string) => {
     if (!Array.isArray(rows)) return;
     let n = 0;
     for (const row of rows) {
-      if (row.agentId) continue;
+      if (row.agentId && validAgentIds.has(row.agentId)) continue;
       row.agentId = defaultAgentId;
       n += 1;
     }

@@ -10,6 +10,14 @@ import { id, now } from "./ids";
 // run outside the active-agent context (a scheduled fire after the user
 // switches agents would otherwise be misattributed). The owning job carries
 // the stamp; this fallback honors it without each call site re-resolving.
+//
+// CALLER CONTRACT: every call into appendEvent / addAudit must either pass
+// an explicit `agentId`, or a source id (`taskId` / `jobId`) that resolves
+// to one. Falling back to `state.activeAgentId` is a last resort and is
+// wrong for any event tied to a record whose owning agent isn't the
+// currently active one (chat replies, scheduled jobs, subagents, retries).
+// We keep this as a runtime inference for now; a future refactor would
+// lift the invariant into a discriminated type at the call sites.
 function inferAgentId(
   state: RuntimeState,
   explicit: string | undefined,
