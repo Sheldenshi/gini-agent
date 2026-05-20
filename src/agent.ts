@@ -60,6 +60,8 @@ import {
 } from "./execution/approval-execution";
 import { syncSubagentFromTask } from "./capabilities/subagents";
 import { resolveActiveSkillsEnv } from "./integrations/connectors";
+import { sendMessagingOutput } from "./integrations/messaging";
+import { invokeMcpTool } from "./integrations/mcp";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
 // JobRunRecord from "running" to a terminal status when a Task with a
@@ -1005,6 +1007,9 @@ export function mapApprovalToPolicyAction(
   if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
     return action;
   }
+  if (action === "messaging.send" || action === "mcp.invoke") {
+    return action;
+  }
   return undefined;
 }
 
@@ -1760,6 +1765,138 @@ async function runApprovedAction(
     }
     return result;
   }
+
+  if (approval.action === "messaging.send") {
+    const bridgeId = String(approval.payload.bridgeId ?? "");
+    const text = String(approval.payload.text ?? "");
+    const target = typeof approval.payload.target === "string" ? approval.payload.target : undefined;
+    if (signal.aborted) {
+      const aborted = JSON.stringify({ success: false, aborted: true, error: "messaging.send aborted: task was cancelled." });
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "messaging.send aborted by task cancellation",
+          data: { bridgeId, target, aborted: true }
+        });
+      }
+      return aborted;
+    }
+    let resultPayload: { ok: boolean; messageId?: string; status?: string; error?: string };
+    try {
+      const message = await sendMessagingOutput(config, bridgeId, { text, target, taskId: approval.taskId });
+      resultPayload = { ok: message.status === "sent", messageId: message.id, status: message.status, error: message.error ?? undefined };
+    } catch (error) {
+      resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "messaging.send",
+          target: bridgeId,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: {
+            ...extraEvidence,
+            bridgeId,
+            target: target ?? null,
+            textBytes: text.length,
+            ok: resultPayload.ok,
+            messageId: resultPayload.messageId ?? null,
+            error: resultPayload.error ?? null
+          }
+        },
+        approvalAgentContext(approval)
+      );
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "messaging.send completed",
+        data: { bridgeId, target, ok: resultPayload.ok, messageId: resultPayload.messageId, error: resultPayload.error }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    const resultStr = JSON.stringify(resultPayload);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
+    }
+    return resultStr;
+  }
+
+  if (approval.action === "mcp.invoke") {
+    const serverId = String(approval.payload.serverId ?? "");
+    const toolName = String(approval.payload.toolName ?? "");
+    const input = (approval.payload.input && typeof approval.payload.input === "object")
+      ? approval.payload.input as Record<string, unknown>
+      : {};
+    if (signal.aborted) {
+      const aborted = JSON.stringify({ success: false, aborted: true, error: "mcp.invoke aborted: task was cancelled." });
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "mcp.invoke aborted by task cancellation",
+          data: { serverId, toolName, aborted: true }
+        });
+      }
+      return aborted;
+    }
+    let resultPayload: { ok: boolean; exitCode?: number; stdout?: string; stderr?: string; message?: string; error?: string };
+    try {
+      const invoke = await invokeMcpTool(config, serverId, toolName, input);
+      resultPayload = {
+        ok: invoke.ok,
+        exitCode: invoke.exitCode,
+        stdout: invoke.stdout?.slice(0, 4000),
+        stderr: invoke.stderr?.slice(0, 4000),
+        message: invoke.message
+      };
+    } catch (error) {
+      resultPayload = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "mcp.invoke",
+          target: serverId,
+          risk: "high",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          evidence: {
+            ...extraEvidence,
+            serverId,
+            toolName,
+            ok: resultPayload.ok,
+            exitCode: resultPayload.exitCode,
+            error: resultPayload.error ?? null
+          }
+        },
+        approvalAgentContext(approval)
+      );
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "mcp.invoke completed",
+        data: { serverId, toolName, ok: resultPayload.ok, exitCode: resultPayload.exitCode, error: resultPayload.error }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    const resultStr = JSON.stringify(resultPayload);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
+    }
+    return resultStr;
+  }
+
   return undefined;
 }
 

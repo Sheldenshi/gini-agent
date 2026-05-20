@@ -557,6 +557,27 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Outbound messaging via a configured bridge. High-risk: contains
+    // "send" → routed through the approval queue. In "auto" mode the
+    // policy seam auto-approves; "strict" gates every call. The user
+    // can pre-approve specific bridges or flip approvalMode at runtime.
+    toolset: "messaging",
+    type: "function",
+    function: {
+      name: "send_message",
+      description: "Send a message through a configured messaging bridge (Telegram, Discord, etc.). Approval-gated by default — the operator's approvalMode controls whether each call is auto-approved or queued. Pass `target` to choose a specific allow-listed chat; omit it to use the bridge's first allowed target. Use sparingly and only when the user has asked the agent to relay something to a chat — don't send a message just because one came in.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridgeId: { type: "string", description: "Id or name of the messaging bridge (e.g. 'msg_abc123' or 'my-bot')." },
+          text: { type: "string", description: "Message body. Keep it concise — Telegram caps inbound text at 4096 chars." },
+          target: { type: "string", description: "Optional delivery target (chat id) on the bridge's allow-list. When omitted the bridge's first allowed target is used." }
+        },
+        required: ["bridgeId", "text"]
+      }
+    }
+  },
+  {
     // Cross-session lookup. Scans past tasks, traces, memories, skills,
     // and audit rows for a substring match. Low-risk; read-only.
     toolset: "session_search",

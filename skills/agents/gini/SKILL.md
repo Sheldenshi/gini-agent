@@ -236,6 +236,11 @@ instance behind NAT works the same as one on a public host.
 Bridge `kind` supports `telegram` and `demo` today; future messengers
 slot into the same `/api/messaging` shape.
 
+The agent's tool for sending is `send_message` — it goes through the
+approval queue by default. The operator's `approvalMode` decides
+whether each call auto-approves (`auto`/`yolo`) or queues for explicit
+review (`strict`).
+
 ### Inspecting state
 
 API: `GET /api/messaging`, `GET /api/messaging/<id>/{chats,messages}`,

@@ -44,7 +44,9 @@ export type PolicyAction =
   | "file.patch"
   | "terminal.exec"
   | "code.exec"
-  | "browser.upload_file";
+  | "browser.upload_file"
+  | "messaging.send"
+  | "mcp.invoke";
 
 export interface TerminalExecPayload {
   command: string;
@@ -100,6 +102,15 @@ export function resolveApprovalPolicy(
 
   // mode === "auto"
   if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+    return { mode: "auto", reason: "approval-mode-auto" };
+  }
+
+  // messaging.send and mcp.invoke egress data / run external code. In
+  // "auto" mode we let them through so the agent can drive normal
+  // automations (a Telegram reply, an MCP fetch) without prompting;
+  // "strict" still gates each call. Operators who want stricter
+  // messaging/MCP control can flip to "strict" globally.
+  if (action === "messaging.send" || action === "mcp.invoke") {
     return { mode: "auto", reason: "approval-mode-auto" };
   }
 

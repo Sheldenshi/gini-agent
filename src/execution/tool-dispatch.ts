@@ -106,6 +106,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await updateMemoryTool(config, taskId, args) };
     case "search_history":
       return { kind: "sync", result: await searchHistoryTool(config, taskId, args) };
+    case "send_message":
+      return pendingOrAuto(config, "messaging.send", undefined, (reason) => requestSendMessage(config, taskId, toolCallId, args, reason));
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -1735,6 +1737,61 @@ async function requestFilePatch(
       type: "approval",
       message: "Approval requested for file patch (chat-task)",
       data: { approvalId: approval.id, target, diff: approval.payload.diff, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated send_message. Validates the bridge id and message body
+// before opening the approval row so the approval card reflects a real
+// target. The actual `sendMessagingOutput` call runs in
+// `agent.executeApprovedAction`'s `messaging.send` branch.
+async function requestSendMessage(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const bridgeId = requireString(args, "bridgeId");
+  const text = requireString(args, "text");
+  let target: string | undefined;
+  if (args.target !== undefined && args.target !== null) {
+    if (typeof args.target !== "string" || args.target.length === 0) {
+      throw new Error("Invalid input: target must be a non-empty string.");
+    }
+    target = args.target;
+  }
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    // Resolve the bridge inside the lock so a concurrent disable can't
+    // sneak between our validation and the approval write.
+    const bridge = state.messagingBridges.find(
+      (candidate) => candidate.id === bridgeId || candidate.name === bridgeId
+    );
+    if (!bridge) throw new Error(`Messaging bridge not found: ${bridgeId}`);
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "messaging.send",
+      target: bridge.id,
+      risk: "high",
+      reason: reasonOverride ?? "Outbound messaging egresses data and requires explicit approval.",
+      payload: {
+        bridgeId: bridge.id,
+        text,
+        target,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging send (chat-task)",
+      data: { approvalId: approval.id, bridgeId: bridge.id, target, textBytes: text.length, toolCallId }
     });
     return approval.id;
   });
