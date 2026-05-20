@@ -563,6 +563,15 @@ export interface SubagentRecord {
   resultError?: string;
 }
 
+// Cached `tools/list` entry from an HTTP MCP server. Populated on the
+// health probe so the agent loop and the /mcp page can surface what tools
+// each server exposes without re-querying on every call.
+export interface McpToolSpec {
+  name: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+}
+
 export interface McpServerRecord {
   id: string;
   instance: Instance;
@@ -576,6 +585,20 @@ export interface McpServerRecord {
   message?: string;
   createdAt: string;
   updatedAt: string;
+  // Transport selector. Defaults to "stdio" when omitted to keep the
+  // pre-existing CLI-spawn behavior intact for older records. "http"
+  // routes invocations through src/integrations/mcp-http.ts.
+  transport?: "stdio" | "http";
+  // Required when transport === "http". The server's MCP streamable-HTTP
+  // endpoint (e.g. https://mcp.linear.app/mcp).
+  url?: string;
+  // Static or `${ENV}`-placeholder header map applied to each HTTP MCP
+  // request. Placeholders are resolved at invoke time against the
+  // active-skill env binding map so connector tokens stay encrypted at rest.
+  headers?: Record<string, string>;
+  // Cached tools/list result from the last successful health probe. Empty
+  // until the server has been health-checked.
+  tools?: McpToolSpec[];
 }
 
 export interface MessagingBridgeRecord {
