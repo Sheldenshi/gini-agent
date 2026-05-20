@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
-import { cancelTask, decideApproval, retryTask, submitTask } from "./agent";
+import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { readState, readTrace } from "./state";
 import { mobileBootstrap, publicState } from "./runtime/views";
@@ -143,6 +143,59 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
+    // Connect endpoint for `connector.request` approvals. The chat UI's
+    // Connect button POSTs here with the user-entered secrets. The
+    // endpoint:
+    //   1. Validates the approval exists, is pending, and was raised by
+    //      the `request_connector` tool (`action === "connector.request"`).
+    //   2. Calls createConnector with the secret payload.
+    //   3. Probes via checkConnector. On failure, returns 200 + ok:false so
+    //      the dialog can keep itself open and let the user retry without
+    //      tearing down the approval row.
+    //   4. On success, resolves the approval through resolveApproval —
+    //      that path fires executeApprovedAction (a no-op for
+    //      `connector.request`) and resumes the chat-task loop with the
+    //      synthesized "Connected to X. Proceed" tool result.
+    ["POST", /^\/api\/approvals\/([^/]+)\/connect$/, async (request, params) => {
+      const approvalId = params[0];
+      const state = readState(config.instance);
+      const approval = state.approvals.find((a) => a.id === approvalId);
+      if (!approval) return json({ error: "Approval not found" }, 404);
+      if (approval.action !== "connector.request") {
+        return json({ error: `Approval ${approvalId} is not a connector.request (${approval.action})` }, 400);
+      }
+      if (approval.status !== "pending") {
+        return json({ error: `Approval is already ${approval.status}` }, 410);
+      }
+      const payload = await body(request);
+      const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
+        ? payload.secrets as Record<string, string>
+        : {};
+      const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
+      const providerId = String(approval.payload.provider ?? "");
+      const providerLabel = typeof approval.payload.providerLabel === "string"
+        ? approval.payload.providerLabel
+        : providerId;
+      const overrideName = typeof payload.name === "string" && payload.name.trim().length > 0
+        ? payload.name.trim()
+        : providerLabel;
+      const connector = await createConnector(config, {
+        name: overrideName,
+        provider: providerId,
+        scopes,
+        secrets
+      });
+      const probed = await checkConnector(config, connector.id);
+      if (probed.health !== "healthy") {
+        return json({
+          ok: false,
+          connector: probed,
+          message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
+        });
+      }
+      await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
+      return json({ ok: true, connector: probed });
+    }],
     ["GET", /^\/api\/audit$/, (request) => {
       const agentId = agentIdFilter(request);
       const audit = readState(config.instance).audit;

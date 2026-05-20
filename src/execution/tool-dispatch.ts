@@ -30,6 +30,8 @@ import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, updateJob, updateJobStatus } from "../jobs";
 import { isSkillActive } from "../integrations/connectors";
+import { getProvider } from "../integrations/connectors/registry";
+import { invokeMcpTool } from "../integrations/mcp";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -93,6 +95,10 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await updateJobTool(config, taskId, args) };
     case "delete_job":
       return { kind: "sync", result: await deleteJobTool(config, taskId, args) };
+    case "mcp_call":
+      return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
+    case "request_connector":
+      return await requestConnectorTool(config, taskId, toolCallId, args);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -469,6 +475,59 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
     allowedTools: skill.allowedTools
   });
   return skill.body || "(skill body is empty)";
+}
+
+// Generic MCP tool dispatch. Routes (server, tool, arguments) to the
+// matching McpServerRecord and returns the flattened text content the
+// tool produced. Errors come back as a JSON envelope rather than thrown
+// exceptions so the model can read the failure and recover (e.g. retry
+// with corrected arguments) instead of seeing a generic tool-error.
+//
+// Result text is capped at 12000 chars to bound prompt growth; Linear's
+// list_issues can return many pages of issue blobs.
+async function mcpCallTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const serverName = requireString(args, "server");
+  const toolName = requireString(args, "tool");
+  const toolArgs = (args.arguments && typeof args.arguments === "object" && !Array.isArray(args.arguments))
+    ? args.arguments as Record<string, unknown>
+    : {};
+  const state = readState(config.instance);
+  const server = state.mcpServers.find(
+    (item) => item.name.toLowerCase() === serverName.toLowerCase() || item.id === serverName
+  );
+  if (!server) {
+    return JSON.stringify({ ok: false, error: `Unknown MCP server: ${serverName}. Configured servers: ${state.mcpServers.map((s) => s.name).join(", ") || "(none)"}` });
+  }
+  if (server.status !== "configured") {
+    return JSON.stringify({ ok: false, error: `MCP server ${server.name} is not configured (status: ${server.status}). Ask the user to run 'gini mcp health ${server.name}' or re-add credentials.` });
+  }
+  if (server.transport === "http" && !server.url) {
+    return JSON.stringify({ ok: false, error: `MCP server ${server.name} is http transport but has no url.` });
+  }
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: `MCP tool ${server.name}/${toolName}`,
+    data: { server: server.name, tool: toolName, argBytes: JSON.stringify(toolArgs).length }
+  });
+  let result: { ok: boolean; stdout?: string; message?: string };
+  try {
+    result = await invokeMcpTool(config, server.id, toolName, toolArgs, { taskId });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+  if (!result.ok) {
+    return JSON.stringify({ ok: false, error: result.message ?? "MCP tool failed.", content: truncate(result.stdout ?? "", 12_000) });
+  }
+  return truncate(result.stdout ?? "", 12_000);
+}
+
+function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n... (truncated)`;
 }
 
 // Spawn a constrained subagent and wait for its terminal state. The model
@@ -1401,6 +1460,82 @@ async function requestFilePatch(
     });
     return approval.id;
   });
+}
+
+// Request that the user connect an external provider. Routed through the
+// approval state machine so the chat-task loop pauses naturally — the
+// task moves to waiting_approval, the chat UI renders a Connect card
+// (branched on `action === "connector.request"`), and the loop resumes
+// when the user finishes the secret entry via POST /api/approvals/<id>/connect.
+//
+// The side effect happens in the connect endpoint, NOT in
+// executeApprovedAction: the endpoint calls createConnector + checkConnector,
+// then resolves the approval. The corresponding executeApprovedAction
+// branch is a no-op string that simply tells the model "connected, proceed".
+async function requestConnectorTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const providerId = requireString(args, "provider");
+  const reason = requireString(args, "reason");
+  const provider = getProvider(providerId);
+  if (!provider) {
+    // Synchronous error so the model can recover (it picked a bogus
+    // provider id). Matches how mcp_call surfaces unknown servers.
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Unknown provider: ${providerId}. The user has no path to connect this.`
+      })
+    };
+  }
+  // Fast path: if a healthy + configured connector already exists for
+  // this provider, the model is calling defensively. Tell it to proceed
+  // and skip the round-trip through the approval UI.
+  const state = readState(config.instance);
+  const existing = state.connectors.find(
+    (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
+  );
+  if (existing) {
+    return {
+      kind: "sync",
+      result: `${provider.label} is already connected. Proceed with the original request.`
+    };
+  }
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "connector.request",
+      target: provider.id,
+      risk: "low",
+      reason,
+      payload: {
+        provider: provider.id,
+        providerLabel: provider.label,
+        providerDescription: provider.description,
+        reason,
+        fields: provider.fields,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for connector connect (chat-task)",
+      data: { approvalId: approval.id, provider: provider.id, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
 }
 
 // Routes a terminal command through the approval-policy seam.

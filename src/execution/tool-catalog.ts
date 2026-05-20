@@ -433,6 +433,54 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Connector-request affordance. When a skill is enabled but inactive
+    // because its required connector is missing, the model calls this tool
+    // to surface a "Connect <provider>" card in chat. The task pauses on
+    // the resulting approval and resumes automatically once the user
+    // completes the secret entry. Always-on (like read_skill / mcp_call):
+    // the model needs this path even on a fresh instance with no toolsets
+    // toggled.
+    toolset: "connectors",
+    type: "function",
+    function: {
+      name: "request_connector",
+      description: "Ask the user to connect an external provider (e.g. linear, github). Use this when a skill is available but inactive because the required connector is not configured. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
+          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request." }
+        },
+        required: ["provider", "reason"]
+      }
+    }
+  },
+  {
+    // Generic MCP tool invocation. The agent loop sees this as a single
+    // tool entry; the dispatcher routes (server, tool, arguments) to the
+    // matching McpServerRecord via src/integrations/mcp.ts. Each
+    // configured http MCP server is advertised separately in the system
+    // prompt so the model knows which tools belong to which server.
+    // TODO: gate side-effecting MCP tools through the approval policy
+    // based on the tool's `annotations.destructiveHint`; for v0 every call
+    // auto-executes.
+    toolset: "mcp",
+    type: "function",
+    function: {
+      name: "mcp_call",
+      description: "Invoke a tool on a configured MCP server. Use list_skills/read_skill first to discover what tools each MCP server exposes (e.g. read_skill name='linear' for Linear).",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name (e.g. 'linear')." },
+          tool: { type: "string", description: "Tool name as advertised by the MCP server (e.g. 'list_issues')." },
+          arguments: { type: "object", description: "Arguments object the MCP tool expects. Shape varies per tool — read the skill for details.", additionalProperties: true }
+        },
+        required: ["server", "tool"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -604,6 +652,18 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "list_jobs") return true;
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
+    // mcp_call is a runtime capability not bound to a legacy toolset row.
+    // Gating it on the "mcp" toolset would silently hide MCP usage on
+    // fresh instances even when a user has configured a server, so it
+    // mirrors read_skill / spawn_subagent's always-on stance.
+    if (tool.function.name === "mcp_call") return true;
+    // request_connector is the in-chat affordance that lets the agent
+    // ask the user to wire up a missing connector. Same always-on
+    // rationale: a fresh instance with no toolsets toggled still needs
+    // to be able to surface "connect linear" when the linear skill is
+    // inactive — gating on a legacy toolset would silently disable the
+    // onboarding path.
+    if (tool.function.name === "request_connector") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;

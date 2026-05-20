@@ -226,8 +226,17 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
     : buildAgentSystemContext(activeMemory, recalledContext, identityBlock);
-  const visibleSkills = filterSkillsForSubagent(state.skills, subagent).filter((skill) => isSkillActive(state, skill));
+  const filteredSkills = filterSkillsForSubagent(state.skills, subagent);
+  const visibleSkills = filteredSkills.filter((skill) => isSkillActive(state, skill));
   const skillsBlock = buildEnabledSkillsBlock(visibleSkills);
+  // Inactive-but-available skills (enabled, but a required connector is
+  // missing). Surfaced so the model knows it can call request_connector
+  // to ask the user to wire things up instead of erroring out or
+  // hallucinating an answer.
+  const inactiveSkills = filteredSkills.filter(
+    (skill) => skill.status === "enabled" && !isSkillActive(state, skill)
+  );
+  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills);
   // Bound-jobs block: if this chat session has one or more JobRecords whose
   // chatSessionId matches, surface them in the system prompt so the model
   // can act on "this job" / "the reminder" without first calling list_jobs.
@@ -235,8 +244,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the binding is a property of the chat session, not the prompt source.
   const boundJobs = findBoundJobsForTask(state, task);
   const boundJobsBlock = buildBoundJobsBlock(boundJobs);
+  // Advertise configured http MCP servers so the model knows mcp_call is
+  // wired up against this server and can locate the matching skill before
+  // invoking. Only "configured" status surfaces; disabled/error servers
+  // stay hidden the same way disabled skills do.
+  const mcpServersBlock = buildMcpServersBlock(state);
   const sections = [baseSystem];
   if (skillsBlock) sections.push(skillsBlock);
+  if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
+  if (mcpServersBlock) sections.push(mcpServersBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
 
@@ -400,6 +416,72 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
     });
   return [
     "Available skills (call read_skill with the skill name to load full instructions):",
+    ...lines
+  ].join("\n");
+}
+
+// Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
+// these skills are turned on but unusable because a required connector is
+// missing. We tell the model exactly which provider needs connecting so it
+// can call `request_connector` instead of refusing or hallucinating.
+//
+// Skills with `requiredConnectors` undefined / empty are skipped: those are
+// inactive for some other reason (validation status, etc.) and there's no
+// connector affordance to offer.
+function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+  const candidates = skills.filter(
+    (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
+  );
+  if (candidates.length === 0) return "";
+  // Same dedupe rule as buildEnabledSkillsBlock so the same skill name
+  // doesn't show up twice when bundled + user copies coexist.
+  const byName = new Map<string, SkillRecord>();
+  for (const skill of candidates) {
+    const existing = byName.get(skill.name);
+    if (!existing) {
+      byName.set(skill.name, skill);
+      continue;
+    }
+    const existingSource = existing.source ?? "user";
+    const candidateSource = skill.source ?? "user";
+    if (existingSource !== "bundled" && candidateSource === "bundled") {
+      byName.set(skill.name, skill);
+    }
+  }
+  const lines = Array.from(byName.values())
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const desc = s.description.trim() || "(no description)";
+      const providers = (s.requiredConnectors ?? []).map((r) => r.provider).join(", ");
+      return `- ${s.name}: ${desc} — needs connector: ${providers}.`;
+    });
+  return [
+    "Available skills that need connection (call `request_connector` with the provider id to ask the user to connect):",
+    ...lines
+  ].join("\n");
+}
+
+// Advertise configured http MCP servers in the system prompt. The model
+// reads this block to know which servers are available to mcp_call and
+// which skill body to load for the per-server tool reference. Stdio
+// servers are intentionally omitted — the v0 stdio path is a stub and
+// surfacing it would invite the model to call something that can't
+// actually serve MCP traffic.
+function buildMcpServersBlock(state: RuntimeState): string {
+  const servers = state.mcpServers.filter(
+    (s) => s.status === "configured" && s.transport === "http"
+  );
+  if (servers.length === 0) return "";
+  const lines = servers
+    .slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((s) => {
+      const count = s.tools?.length ?? 0;
+      const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
+      return `- ${s.name}${suffix} — call read_skill name='${s.name}' for the curated tool reference.`;
+    });
+  return [
+    "Configured MCP servers (use the `mcp_call` tool to invoke):",
     ...lines
   ].join("\n");
 }
