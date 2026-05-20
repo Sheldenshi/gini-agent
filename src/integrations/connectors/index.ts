@@ -331,7 +331,7 @@ export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean 
 // hardcoded global map. Callers can ask "which env vars do these providers
 // expose, and which purpose holds the secret for each?" without
 // per-provider knowledge.
-function envBindingsForProviders(providers: string[]): Record<string, { provider: string; purpose: string }> {
+export function envBindingsForProviders(providers: string[]): Record<string, { provider: string; purpose: string }> {
   const result: Record<string, { provider: string; purpose: string }> = {};
   for (const providerId of providers) {
     const module = getProvider(providerId);
