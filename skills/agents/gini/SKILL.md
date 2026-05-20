@@ -273,6 +273,10 @@ Listing: `GET /api/mcp`.
 `exposedTools` defaults to `[]`, which exposes everything the server
 advertises.
 
+The agent's tool for calling registered MCP tools is `invoke_mcp` — it
+goes through the approval queue by default (the operator's
+`approvalMode` decides whether each invocation auto-approves or queues).
+
 Human-operator CLI mirror:
 
 ```bash

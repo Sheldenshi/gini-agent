@@ -108,6 +108,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await searchHistoryTool(config, taskId, args) };
     case "send_message":
       return pendingOrAuto(config, "messaging.send", undefined, (reason) => requestSendMessage(config, taskId, toolCallId, args, reason));
+    case "invoke_mcp":
+      return pendingOrAuto(config, "mcp.invoke", undefined, (reason) => requestInvokeMcp(config, taskId, toolCallId, args, reason));
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -1792,6 +1794,64 @@ async function requestSendMessage(
       type: "approval",
       message: "Approval requested for messaging send (chat-task)",
       data: { approvalId: approval.id, bridgeId: bridge.id, target, textBytes: text.length, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// Approval-gated invoke_mcp. Validates the server + tool before opening
+// the approval row so the approval card reflects a real target. The
+// actual `invokeMcpTool` call runs in `agent.executeApprovedAction`'s
+// `mcp.invoke` branch.
+async function requestInvokeMcp(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const serverId = requireString(args, "serverId");
+  const toolName = requireString(args, "toolName");
+  let input: Record<string, unknown> = {};
+  if (args.input !== undefined && args.input !== null) {
+    if (typeof args.input !== "object" || Array.isArray(args.input)) {
+      throw new Error("Invalid input: input must be a JSON object.");
+    }
+    input = args.input as Record<string, unknown>;
+  }
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    // Resolve the server inside the lock so a concurrent disable can't
+    // sneak between validation and the approval write.
+    const server = state.mcpServers.find(
+      (candidate) => candidate.id === serverId || candidate.name === serverId
+    );
+    if (!server) throw new Error(`MCP server not found: ${serverId}`);
+    if (server.exposedTools.length > 0 && !server.exposedTools.includes(toolName)) {
+      throw new Error(`MCP tool is not exposed: ${toolName}`);
+    }
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "mcp.invoke",
+      target: server.id,
+      risk: "high",
+      reason: reasonOverride ?? "Invoking an MCP tool runs external code and requires explicit approval.",
+      payload: {
+        serverId: server.id,
+        toolName,
+        input,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for MCP invoke (chat-task)",
+      data: { approvalId: approval.id, serverId: server.id, toolName, toolCallId }
     });
     return approval.id;
   });

@@ -557,6 +557,28 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Invoke a tool exposed by a registered MCP server. High-risk:
+    // contains "invoke" → routed through the approval queue. The MCP
+    // server itself is operator-registered (so the agent can't reach
+    // arbitrary code), and per-call approval gives the user visibility
+    // into the specific tool + args being invoked.
+    toolset: "mcp",
+    type: "function",
+    function: {
+      name: "invoke_mcp",
+      description: "Invoke a tool on a registered MCP server. Approval-gated by default — the operator's approvalMode decides whether each invocation auto-approves or queues. Use only when the user asks for an MCP-backed action and the server has been registered ahead of time. Returns the MCP tool's stdout/stderr/exitCode.",
+      parameters: {
+        type: "object",
+        properties: {
+          serverId: { type: "string", description: "Id or name of the MCP server (e.g. 'mcp_abc123' or 'fs-mcp')." },
+          toolName: { type: "string", description: "Name of the tool the MCP server exposes." },
+          input: { type: "object", description: "Optional JSON arguments to pass through to the MCP tool. Default: {}.", additionalProperties: true }
+        },
+        required: ["serverId", "toolName"]
+      }
+    }
+  },
+  {
     // Outbound messaging via a configured bridge. High-risk: contains
     // "send" → routed through the approval queue. In "auto" mode the
     // policy seam auto-approves; "strict" gates every call. The user
