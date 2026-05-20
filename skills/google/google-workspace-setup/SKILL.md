@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.5.0
+    version: 1.5.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -299,18 +299,23 @@ Tell the user: "The OAuth Desktop client is created and the JSON has been downlo
 
 #### Milestone F — Move the JSON into place
 
-Use `terminal_exec`:
+Gini's managed Chrome saves downloads under the **per-instance state dir** (`~/.gini/instances/<instance>/downloads/`), not `~/Downloads`. macOS sandboxes `~/Downloads` so the agent can't read files saved there; the per-instance dir is owned by Gini and immediately readable. Resolve `<instance>` from `gini status` or the runtime API (`GET /api/status` → `instance`) — it's typically the project directory name.
+
+Use `terminal_exec` (substitute the resolved instance name; do not leave `<instance>` literal):
 
 ```bash
+INSTANCE_DOWNLOADS=~/.gini/instances/<instance>/downloads
 mkdir -p ~/.config/gws
-mv "$(ls -t ~/Downloads/client_secret_*.apps.googleusercontent.com.json | head -n 1)" ~/.config/gws/client_secret.json
+mv "$(ls -t "$INSTANCE_DOWNLOADS"/client_secret_*.apps.googleusercontent.com.json | head -n 1)" ~/.config/gws/client_secret.json
 ```
 
-The glob picks up the most recent download in case the user has older credential files in `~/Downloads` from a prior attempt. After moving, verify:
+The glob picks up the most recent download in case earlier credential files from a prior attempt are still in the dir. After moving, verify:
 
 ```bash
 ls -la ~/.config/gws/client_secret.json
 ```
+
+If the file is missing (the glob expanded to nothing), the user may be on an older Gini build that didn't route downloads to the instance dir — fall back to `~/Downloads/client_secret_*.apps.googleusercontent.com.json` and tell the user once that they're on an older runtime.
 
 Close the browser session:
 

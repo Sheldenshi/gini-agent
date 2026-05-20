@@ -549,6 +549,14 @@ describe("browser-connect managed launch via playwright", () => {
       expect(launchCalls[0]!.dataDir).toContain("chrome-profile");
       expect(launchCalls[0]!.options.headless).toBe(false);
       expect(Array.isArray(launchCalls[0]!.options.args)).toBe(true);
+      // Downloads land in the per-instance state dir, not ~/Downloads —
+      // macOS sandboxes ~/Downloads so the agent can't read files saved
+      // there. Saving under the instance dir keeps any download
+      // immediately accessible to Gini.
+      expect(launchCalls[0]!.options.acceptDownloads).toBe(true);
+      expect(typeof launchCalls[0]!.options.downloadsPath).toBe("string");
+      expect(launchCalls[0]!.options.downloadsPath as string).toMatch(/\/downloads$/);
+      expect(launchCalls[0]!.options.downloadsPath as string).toContain(config.instance);
     } finally {
       mock.restore();
       const browserMod = await import("../tools/browser");

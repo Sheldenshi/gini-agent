@@ -35,6 +35,8 @@
 // render a uniform status card.
 
 import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { instanceRoot } from "../paths";
 import { addAudit, mutateState, now, readState } from "../state";
 import { findChromePath } from "../tools/chrome-discovery";
 import {
@@ -485,6 +487,19 @@ async function launchManaged(
   const dataDir = profileDirFor(config);
   mkdirSync(dataDir, { recursive: true });
 
+  // Route downloads from the managed Chrome into a directory Gini can
+  // read. macOS sandboxes ~/Downloads so the agent (running as a Bun
+  // process without Files-and-Folders entitlement) can't open files
+  // saved there — the Workspace setup skill in particular was getting
+  // stuck because the OAuth client_secret.json landed in ~/Downloads and
+  // had to be moved by a manual terminal command. Saving under the
+  // per-instance state dir (which Gini already owns) makes any download
+  // immediately readable. CDP mode (existing user Chrome) is unaffected:
+  // Playwright cannot override a remote Chrome's user-configured
+  // downloads dir; the setup skill explains that fallback.
+  const downloadsPath = join(instanceRoot(config.instance), "downloads");
+  mkdirSync(downloadsPath, { recursive: true });
+
   // CRITICAL: tear down any existing shared handle BEFORE we attempt to
   // launch the visible Chrome. The headless persistent context the agent
   // may already be using is rooted at the same profile dir, and Chromium
@@ -534,6 +549,8 @@ async function launchManaged(
       return await chromium.launchPersistentContext(dataDir, {
         headless: false,
         executablePath: chromePath ?? undefined,
+        acceptDownloads: true,
+        downloadsPath,
         args: [
           "--no-first-run",
           "--no-default-browser-check",
