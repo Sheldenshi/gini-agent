@@ -144,7 +144,12 @@ export function defaultAgent(instance: Instance, at: string): AgentRecord {
     status: "active",
     providerName: undefined,
     model: undefined,
-    toolsets: ["file", "terminal", "memory", "session_search", "delegation"],
+    // `messaging` and `mcp` are in the whitelist so that when an operator
+    // enables those toolsets (they ship disabled in `defaultToolsets`),
+    // the active agent doesn't silently gate them out via the per-agent
+    // intersection. The kill switch then lives where it should: on the
+    // toolset's enabled/disabled status.
+    toolsets: ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"],
     messagingTargets: [],
     createdAt: at,
     updatedAt: at

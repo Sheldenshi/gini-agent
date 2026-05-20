@@ -6,9 +6,11 @@
 // tightly scoped agents can still reach the core agent capability surface:
 // web_fetch, read_skill, spawn_subagent, the scheduled-job tools
 // (create_job, list_jobs, update_job, delete_job, run_job), and the
-// agent-capability tools whose toolsets aren't in the defaults or ship
-// disabled (cancel_task, install_skill, enable_skill, disable_skill,
-// send_message, invoke_mcp).
+// agent-capability meta-tools whose toolsets aren't in the defaults
+// (cancel_task, install_skill, enable_skill, disable_skill).
+// Surface-gateway tools `send_message` (toolset `messaging`) and
+// `invoke_mcp` (toolset `mcp`) are deliberately NOT always-on so the
+// operator's toolset enable/disable kill switch keeps working.
 
 import { describe, expect, test } from "bun:test";
 import { buildToolCatalog } from "./tool-catalog";
@@ -57,9 +59,7 @@ const ALWAYS_ON = new Set([
   "cancel_task",
   "install_skill",
   "enable_skill",
-  "disable_skill",
-  "send_message",
-  "invoke_mcp"
+  "disable_skill"
 ]);
 
 describe("buildToolCatalog", () => {
@@ -76,31 +76,75 @@ describe("buildToolCatalog", () => {
     }
   });
 
-  test("fresh-default toolsets surface every agent-capability tool", () => {
+  test("fresh-default toolsets surface the always-on agent-capability tools but hide send_message/invoke_mcp", () => {
     // Pin the contract that a freshly cloned instance's default toolset
-    // state advertises the full agent-capability surface. Six of these
-    // (cancel_task, install_skill, enable_skill, disable_skill,
-    // send_message, invoke_mcp) live under toolsets that aren't in the
-    // defaults (`subagents`, `skills`) or ship disabled (`messaging`,
-    // `mcp`); the always-on bypass is what keeps them reachable. If a
-    // future refactor accidentally drops the bypass, this test catches it.
+    // state advertises the agent-capability meta-tools (cancel_task,
+    // install_skill, enable_skill, disable_skill) plus the
+    // memory/session_search tools whose toolsets ship enabled. The
+    // surface-gateway tools `send_message` and `invoke_mcp` live under
+    // toolsets that ship disabled — they should NOT appear until the
+    // operator enables `messaging` / `mcp`.
     const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
     const catalog = buildToolCatalog(state);
     const names = new Set(catalog.map((t) => t.function.name));
-    const newTier1And2 = [
+    const expectedVisible = [
       "recall_memory",
       "add_memory",
       "update_memory",
       "search_history",
-      "send_message",
-      "invoke_mcp",
       "cancel_task",
       "install_skill",
       "enable_skill",
       "disable_skill"
     ];
-    for (const tool of newTier1And2) {
+    for (const tool of expectedVisible) {
       expect(names.has(tool)).toBe(true);
+    }
+    // Kill switch contract: messaging + mcp toolsets default disabled,
+    // so the surface-gateway tools stay hidden in a fresh catalog.
+    expect(names.has("send_message")).toBe(false);
+    expect(names.has("invoke_mcp")).toBe(false);
+  });
+
+  test("enabling the messaging toolset exposes send_message", () => {
+    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) =>
+      t.name === "messaging" ? { ...t, status: "enabled" as const } : t
+    ));
+    const catalog = buildToolCatalog(state);
+    const names = new Set(catalog.map((t) => t.function.name));
+    expect(names.has("send_message")).toBe(true);
+  });
+
+  test("enabling the mcp toolset exposes invoke_mcp", () => {
+    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) =>
+      t.name === "mcp" ? { ...t, status: "enabled" as const } : t
+    ));
+    const catalog = buildToolCatalog(state);
+    const names = new Set(catalog.map((t) => t.function.name));
+    expect(names.has("invoke_mcp")).toBe(true);
+  });
+
+  test("disabling messaging toolset hides send_message (kill switch works)", () => {
+    // Both messaging and mcp default disabled. This assertion is the
+    // negative half of the kill-switch contract.
+    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
+    const catalog = buildToolCatalog(state);
+    const names = new Set(catalog.map((t) => t.function.name));
+    expect(names.has("send_message")).toBe(false);
+    expect(names.has("invoke_mcp")).toBe(false);
+  });
+
+  test("core meta-tools remain visible regardless of toolset state", () => {
+    // cancel_task, install_skill, enable_skill, disable_skill have no
+    // separate toolset to gate them — they ride alongside spawn_subagent
+    // and read_skill and stay always-on.
+    const stateEmpty = stateWithToolsets([]);
+    const stateAllDisabled = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) => ({ ...t, status: "disabled" as const })));
+    for (const state of [stateEmpty, stateAllDisabled]) {
+      const names = new Set(buildToolCatalog(state).map((t) => t.function.name));
+      for (const tool of ["cancel_task", "install_skill", "enable_skill", "disable_skill"]) {
+        expect(names.has(tool)).toBe(true);
+      }
     }
   });
 
