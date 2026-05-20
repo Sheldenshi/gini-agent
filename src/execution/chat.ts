@@ -38,7 +38,6 @@ const DEFAULT_CHAT_TITLES: ReadonlySet<string> = new Set([
 
 const AUTO_RENAME_USER_TURNS = 2;
 const AUTO_RENAME_ASSISTANT_TURNS = 2;
-const AUTO_RENAME_MAX_TITLE_LENGTH = 80;
 
 export function listChatSessions(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -287,7 +286,7 @@ async function generateChatTitle(
         "You write concise sidebar titles for chat conversations.",
         "Choose the title from the conversation's actual topic and intent.",
         "Return JSON with one field: title.",
-        "Use 2 to 7 words. No quotes, emojis, markdown, trailing punctuation, or prefixes like \"Chat about\"."
+        "Use 2 to 7 words. No quotes, emojis, markdown, punctuation padding, or prefixes like \"Chat about\"."
       ].join(" "),
       user: `Conversation transcript:\n${transcript}`,
       validator: {
@@ -307,10 +306,10 @@ function sanitizeGeneratedChatTitle(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const title = value
     .replace(/[\r\n\t]+/g, " ")
-    .replace(/^["'`*_#\s]+|["'`*_#\s.?!:;,-]+$/g, "")
+    .replace(/^["'`*_#\s.?!:;,-]+|["'`*_#\s.?!:;,-]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
   if (!title) return undefined;
   if (isDefaultChatTitle(title)) return undefined;
-  return title.slice(0, AUTO_RENAME_MAX_TITLE_LENGTH);
+  return title;
 }
