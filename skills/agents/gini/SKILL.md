@@ -1,6 +1,6 @@
 ---
 name: gini
-description: "Gini's self-knowledge: how Gini configures, extends, and operates on its own state via /api/* and the CLI. Load when the user asks Gini about its own capabilities or asks Gini to modify its own configuration."
+description: "Gini's self-knowledge: how Gini configures, extends, and operates on its own state via /api/* and registered tools. Load when the user asks Gini about its own capabilities or asks Gini to modify its own configuration."
 license: MIT
 metadata:
   gini:
@@ -11,10 +11,12 @@ metadata:
 # Gini Agent
 
 Gini is a local-first personal agent. The gateway owns durable state and
-tool execution; the CLI, Next.js BFF, mobile clients, and other front-ends
-are clients of the same `/api/*` contract. Anything Gini does at runtime is
-already reachable via API or CLI — this skill is a recipe book for the most
-common configuration tasks.
+tool execution. **Gini itself operates through `/api/*` and its registered
+tool catalog.** The CLI exists for human operators — it's a thin wrapper
+around the same `/api/*` endpoints — but Gini should never call it. The
+Next.js BFF, mobile clients, and other front-ends are also `/api/*`
+consumers. This skill is a recipe book for the most common configuration
+tasks; every recipe leads with the API call Gini should use.
 
 Load this skill before claiming a limitation. Common false denials to
 inoculate against: the interactive browser (Playwright with persistent
@@ -387,13 +389,17 @@ only use it when the user has explicitly asked for that risk profile.
 
 ## Troubleshooting
 
-**Telegram bridge stuck in `error` after `gini messaging health`** — check
-`bridge.message`. `Telegram bot token is missing — recreate the bridge
-with a botToken.` means the token never landed; re-run
-`gini messaging add my-bot telegram --bot-token <BOT_TOKEN>` with the real
-token. Any other message is the raw Telegram error from `getMe()`; the
-most common is `Unauthorized` from a bad or revoked token — re-copy the
-token from BotFather and recreate the bridge.
+**Telegram bridge stuck in `error` after health probe** — inspect
+`bridge.message` on the bridge record returned by
+`GET /api/messaging/<id>` (or via `POST /api/messaging/<id>/health` to
+re-probe). `Telegram bot token is missing — recreate the bridge with a
+botToken.` means the token never landed; recreate the bridge with the
+real token via `POST /api/messaging` (`{ name, type: "telegram",
+config: { botToken: "<BOT_TOKEN>" } }`). Any other message is the raw
+Telegram error from `getMe()`; the most common is `Unauthorized` from a
+bad or revoked token — re-copy the token from BotFather and recreate the
+bridge. (Human-operator CLI mirror: `gini messaging health`, then
+`gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.)
 
 **Headless browser launch fails with "Failed to launch Chromium"** — the
 error message ends with `Run \`bunx playwright install chromium\` to
