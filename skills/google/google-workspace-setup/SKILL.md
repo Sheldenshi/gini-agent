@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 1.3.0
+    version: 1.4.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -66,6 +66,41 @@ Verify:
 ```bash
 gws --version
 ```
+
+### 1.5. Existing OAuth client (optional shortcut)
+
+Many users already have a Google OAuth **Desktop** client lying around from another project — there's no reason to drive Cloud Console again if a working `client_secret.json` already exists on disk. Before starting Step 2, ask the user:
+
+> Do you already have a Google OAuth Desktop `client_secret.json` from another project? If yes, paste the path and I'll move it into place — we'll skip the Cloud Console setup. If no, I'll drive Cloud Console for you (~5 minutes).
+
+The OAuth client still lives in **the user's own** Google Cloud project either way; this branch just reuses a project they already have instead of creating a new one. The privacy property (Gini never sees the OAuth credentials in transit; every API call goes user → Google over an access token Gini doesn't issue) is identical.
+
+Branch on the answer:
+
+- **User pastes a path.** Verify the file is a Desktop client, then drop it into `~/.config/gws/`:
+
+  ```bash
+  # 1. Confirm the file is readable.
+  test -r "<PATH>" || echo "MISSING: <PATH> is not readable"
+
+  # 2. Confirm it's a Desktop client (has the `installed` key, not `web`).
+  jq -e '.installed.client_id' "<PATH>" > /dev/null && echo "OK: Desktop client" \
+    || (jq -e '.web.client_id' "<PATH>" > /dev/null \
+        && echo "WRONG TYPE: this is a Web client, not a Desktop client" \
+        || echo "INVALID: not a recognizable OAuth client_secret.json")
+
+  # 3. If OK, move it into place.
+  mkdir -p ~/.config/gws && cp "<PATH>" ~/.config/gws/client_secret.json
+  ```
+
+  Run all three through `terminal_exec`. Interpret the output:
+  - `OK: Desktop client` → copy in place, **skip Step 2 entirely**, jump to Step 3 (`gws auth login`).
+  - `WRONG TYPE: ...` → the file is a Web OAuth client, which won't work with the `gws` CLI's localhost-loopback redirect. Tell the user: "That's a Web OAuth client — `gws` needs a Desktop client. Want me to drive Cloud Console for a new Desktop client (~5 minutes)?" If yes, fall through to Step 2.
+  - `INVALID: ...` or `MISSING: ...` → tell the user what's wrong and ask whether they want to re-paste a different path or have Gini drive Cloud Console.
+
+- **User says no, doesn't have one, or asks Gini to do it.** Fall through to Step 2.
+
+Skip this branch entirely if the user already invoked this skill before and `~/.config/gws/client_secret.json` exists — they're past first-time setup; just go straight to Step 3.
 
 ### 2. Create the OAuth Desktop client (browser-driven)
 
