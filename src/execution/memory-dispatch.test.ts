@@ -275,7 +275,7 @@ describe("add_memory dispatch", () => {
 });
 
 describe("update_memory dispatch", () => {
-  test("edits content and emits memory.edited audit", async () => {
+  test("edits content and emits the canonical memory.edited audit", async () => {
     const instance = "memory-update-happy";
     const config = makeConfig(instance);
     await seedAgent(config);
@@ -308,11 +308,19 @@ describe("update_memory dispatch", () => {
     const memoryAfter = readState(instance).memories.find((m) => m.id === memoryBefore!.id);
     expect(memoryAfter?.content).toBe("Updated content");
 
-    const audit = readState(instance).audit.find(
-      (event) => event.action === "memory.edited" && event.actor === "agent" && event.target === memoryBefore!.id
+    // editMemory writes the canonical row (actor=user, risk=medium). The
+    // update_memory tool wrapper does NOT layer a second agent-attributed
+    // row — the medium-risk row is the safeguard; a low-risk agent row
+    // would just obscure it. Pin both: at least one canonical row exists,
+    // and no agent-attributed `memory.edited` row exists for this target.
+    const audits = readState(instance).audit.filter(
+      (event) => event.action === "memory.edited" && event.target === memoryBefore!.id
     );
-    expect(audit).toBeDefined();
-    expect(audit?.evidence?.appliedFields).toContain("content");
+    expect(audits.length).toBeGreaterThan(0);
+    const canonical = audits.find((event) => event.actor === "user" && event.risk === "medium");
+    expect(canonical).toBeDefined();
+    const agentDuplicate = audits.find((event) => event.actor === "agent");
+    expect(agentDuplicate).toBeUndefined();
   });
 
   test("rejects missing memoryId", async () => {

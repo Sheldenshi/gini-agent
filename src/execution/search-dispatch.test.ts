@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { dispatchToolCall } from "./tool-dispatch";
 import { buildToolCatalog } from "./tool-catalog";
-import { createTask, mutateState, readState, upsertTask } from "../state";
+import { createTask, mutateState, upsertTask } from "../state";
 import type { RuntimeConfig, RuntimeState, ToolsetRecord } from "../types";
 
 const ROOT = "/tmp/gini-search-dispatch-test";
@@ -79,8 +79,7 @@ describe("search_history registration", () => {
 
 describe("search_history dispatch", () => {
   test("returns hits for a seeded task title", async () => {
-    const instance = "search-history-happy";
-    const config = makeConfig(instance);
+    const config = makeConfig("search-history-happy");
     const taskId = await seedTask(config, "investigate the rosetta-stone bug in the parser");
     const callerId = await seedTask(config, "test caller");
 
@@ -102,9 +101,6 @@ describe("search_history dispatch", () => {
       expect(hit).toBeDefined();
       expect(hit?.kind).toBe("task");
     }
-
-    const audit = readState(instance).audit.find((event) => event.action === "history.searched");
-    expect(audit).toBeDefined();
   });
 
   test("rejects missing query", async () => {

@@ -1463,28 +1463,12 @@ async function updateMemoryTool(
   if (Object.keys(input).length === 0) {
     throw new Error("Invalid input: update_memory requires at least one field to change.");
   }
+  // `editMemory` already writes the canonical `memory.edited` audit row
+  // (medium risk, actor user) — that's the safeguard the memory module
+  // owns. Writing a second row from the tool wrapper would just obscure
+  // the medium-risk gate with low-risk agent noise. The per-task trace
+  // below carries the agent's narrative.
   const memory = await editMemory(config, memoryId, input);
-  await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    addAudit(
-      state,
-      {
-        actor: "agent",
-        action: "memory.edited",
-        target: memoryId,
-        risk: "low",
-        taskId: item.id,
-        runId: item.runId,
-        evidence: {
-          memoryId,
-          appliedFields: Object.keys(input),
-          sensitivity: memory.sensitivity
-        }
-      },
-      { taskId: item.id }
-    );
-    item.updatedAt = now();
-  });
   appendTrace(config.instance, taskId, {
     type: "memory",
     message: "Edited memory",
@@ -1494,8 +1478,10 @@ async function updateMemoryTool(
 }
 
 // Cross-session lookup wrapping `searchSessions`. Returns up to `limit`
-// (default 20, capped at 100) snippets matching the query. Low-risk;
-// read-only.
+// (default 20, capped at 100) snippets matching the query. Low-risk and
+// read-only — no audit row, matching the sibling read-only meta tools
+// (`file_read`, `file_search`, `read_skill`). The per-task trace below
+// is the right narrative seam for "the agent searched X".
 async function searchHistoryTool(
   config: RuntimeConfig,
   taskId: string,
@@ -1514,10 +1500,6 @@ async function searchHistoryTool(
     type: "tool",
     message: "Searched session history",
     data: { query, limit, hits: results.length }
-  });
-  await recordLowRiskAudit(config, taskId, "history.searched", query, {
-    limit,
-    hits: results.length
   });
   return JSON.stringify({
     count: results.length,
