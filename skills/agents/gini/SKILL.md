@@ -236,10 +236,11 @@ instance behind NAT works the same as one on a public host.
 Bridge `kind` supports `telegram` and `demo` today; future messengers
 slot into the same `/api/messaging` shape.
 
-The agent's tool for sending is `send_message` — it goes through the
-approval queue by default. The operator's `approvalMode` decides
-whether each call auto-approves (`auto`/`yolo`) or queues for explicit
-review (`strict`).
+The agent's tool for sending is `send_message`. `messaging.send` is
+high-risk by classification, so it flows through the approval seam
+exactly like `file.write` and `terminal.exec` — see the Approvals
+section below for the three-mode contract (`strict` blocks, `auto`
+auto-approves with a full audit trail, `yolo` skips the queue).
 
 ### Inspecting state
 
@@ -273,9 +274,10 @@ Listing: `GET /api/mcp`.
 `exposedTools` defaults to `[]`, which exposes everything the server
 advertises.
 
-The agent's tool for calling registered MCP tools is `invoke_mcp` — it
-goes through the approval queue by default (the operator's
-`approvalMode` decides whether each invocation auto-approves or queues).
+The agent's tool for calling registered MCP tools is `invoke_mcp`.
+`mcp.invoke` is high-risk by classification and flows through the same
+approval seam as the other high-risk actions — see the Approvals section
+below for the three-mode contract.
 
 Human-operator CLI mirror:
 
@@ -377,16 +379,28 @@ To draft a new SKILL.md interactively, use `meta/create-skill`.
 
 ## Approvals
 
-The runtime gates anything classified `high` risk through the approval
-queue when `approvalMode` is `strict` or `auto`. `high` covers
-`browser.upload_file` (hard-coded) plus any tool whose name contains
-`write`, `exec`, `invoke`, or `send` — so `file.write`, `terminal.exec`,
-MCP `invoke` calls, messaging `send`, and similar all queue by default.
-Browser interactive actions (`browser.click`, `browser.type`,
-`browser.drag`, `browser.select_option`, `browser.tabs.{new,switch,close}`)
-are `medium` and trace via snapshot evidence — they do not block on
-approval. **The agent should propose `high`-risk actions and surface them
-to the queue — not refuse them.**
+The runtime classifies `browser.upload_file` (hard-coded) plus any tool
+whose name contains `write`, `exec`, `invoke`, or `send` as `high` risk.
+`file.write`, `terminal.exec`, `mcp.invoke`, `messaging.send`, and
+similar all run through the approval seam. Browser interactive actions
+(`browser.click`, `browser.type`, `browser.drag`, `browser.select_option`,
+`browser.tabs.{new,switch,close}`) are `medium` and trace via snapshot
+evidence — they do not block on approval. **The agent should propose
+`high`-risk actions and surface them to the queue — not refuse them.**
+
+`approvalMode` lives on the runtime config and decides how the seam
+treats each `high`-risk call: `strict | auto | yolo`. Set via
+`PATCH /api/settings/auto-approve`.
+
+- **strict** — the side effect blocks until a human approves the row
+  via `POST /api/approvals/<id>/approve` (or denies it). Default.
+- **auto** — the approval row is still created, then immediately
+  auto-resolved as approved and the side effect runs without waiting
+  for a human. The audit trail is complete: the row exists, marked
+  `autoApproved: true`. The side effect doesn't block on a human.
+- **yolo** — the side effect runs straight through; no approval row is
+  created. Only use when the user has explicitly asked for that risk
+  profile.
 
 ```http
 GET  /api/approvals
@@ -401,10 +415,6 @@ gini approval list
 gini approval approve <id>
 gini approval deny <id>
 ```
-
-`approvalMode` lives on the runtime config: `strict | auto | yolo`. Set
-via `PATCH /api/settings/auto-approve`. `yolo` skips the queue entirely —
-only use it when the user has explicitly asked for that risk profile.
 
 ## Troubleshooting
 
