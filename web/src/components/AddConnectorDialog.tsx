@@ -100,9 +100,22 @@ export function AddConnectorDialog({
 
   const selectedProvider = providers.find((p) => p.id === provider);
 
+  // Secret-only providers (linear, claude-code, codex, demo) need just
+  // an API token from the user — Name is decorative since we only support
+  // one connection per provider in practice, Provider is locked when
+  // launched from a skill row, and Scopes are encoded inside the secret
+  // itself. The `generic` provider is the one exception: it always renders
+  // the full form because the user has to declare custom fields.
+  const minimal =
+    mode === "create"
+      && provider !== "generic"
+      && !!selectedProvider
+      && selectedProvider.fields.length > 0
+      && selectedProvider.fields.every((f) => f.secret);
+
   const submit = () => {
     setError(null);
-    if (mode === "create" && !name.trim()) {
+    if (mode === "create" && !minimal && !name.trim()) {
       setError("Name is required.");
       return;
     }
@@ -152,11 +165,18 @@ export function AddConnectorDialog({
     // promises name and scopes stay the same. Sending an empty `scopes`
     // array would have updateConnector treat it as a full replacement and
     // wipe the stored scopes. Omit the field entirely on rotate so only
-    // the new secrets land.
+    // the new secrets land. In minimal create mode, default name to the
+    // provider label and skip scopes entirely (secret encodes scope).
+    const resolvedName =
+      mode === "rotate"
+        ? (defaultName ?? name).trim()
+        : minimal
+          ? (name.trim() || selectedProvider.label)
+          : name.trim();
     onSubmit({
       provider,
-      name: (mode === "rotate" ? defaultName ?? name : name).trim(),
-      ...(mode === "create"
+      name: resolvedName,
+      ...(mode === "create" && !minimal
         ? { scopes: scopes.split(",").map((s) => s.trim()).filter(Boolean) }
         : {}),
       secrets,
@@ -176,7 +196,7 @@ export function AddConnectorDialog({
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
-          {mode === "create" ? (
+          {mode === "create" && !minimal ? (
             <>
               <div className="space-y-1">
                 <Label htmlFor="connector-name">Name</Label>
@@ -223,7 +243,17 @@ export function AddConnectorDialog({
         </div>
         <DialogFooter>
           <Button onClick={submit} disabled={pending}>
-            {pending ? (mode === "rotate" ? "Saving…" : "Adding…") : mode === "rotate" ? "Save" : "Add"}
+            {pending
+              ? mode === "rotate"
+                ? "Saving…"
+                : minimal
+                  ? "Connecting…"
+                  : "Adding…"
+              : mode === "rotate"
+                ? "Save"
+                : minimal
+                  ? "Connect"
+                  : "Add"}
           </Button>
         </DialogFooter>
       </DialogContent>
