@@ -67,6 +67,13 @@ export interface BrowserConnectionRecord {
   chromePath: string | null;
   // ISO timestamp of when the connection record was created/updated.
   startedAt: string;
+  // True when the managed Chrome was launched with headless: true (no
+  // window). Defaults to false / absent for visible managed launches and
+  // for cdp mode. Tracked on the record so an idempotent reconnect can
+  // detect a headed/headless visibility mismatch and tear down + relaunch
+  // when the caller asks for a different visibility than the current
+  // record has.
+  headless?: boolean;
 }
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";

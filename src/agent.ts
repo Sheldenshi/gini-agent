@@ -1891,10 +1891,16 @@ async function runApprovedAction(
     // a `gini browser connect` CLI call uses, so the lifecycle is
     // identical from the runtime's perspective.
     const reason = typeof approval.payload.reason === "string" ? approval.payload.reason : "(no reason given)";
+    // Headless rides on the approval payload, captured at request time
+    // by requestBrowserConnect. Only an explicit boolean true unlocks
+    // the windowless launch — any other value (undefined, false,
+    // non-boolean) falls back to the visible default.
+    const headless = approval.payload.headless === true;
     let result: string;
     let succeeded = false;
     let mode: string | undefined;
     let dataDir: string | null | undefined;
+    let recordHeadless: boolean | undefined;
     try {
       if (signal.aborted) {
         result = JSON.stringify({ success: false, aborted: true, error: "Browser connect aborted: task was cancelled." });
@@ -1910,6 +1916,12 @@ async function runApprovedAction(
         // browser the user can't see) must be torn down and replaced
         // with a fresh managed launch — never silently returned as-is.
         //
+        // `headless` is passed through verbatim from the approval
+        // payload. When true, Playwright launches the same per-instance
+        // profile dir with headless: true — cookies from a prior
+        // visible session replay so the new context is already signed
+        // in.
+        //
         // `skipAudit: true` because this dispatch already records a
         // richer browser.connect audit row below (with the user-facing
         // `reason` and the `approvalId`); letting the capability also
@@ -1918,15 +1930,17 @@ async function runApprovedAction(
         // third (internal) argument — NOT on the public `ConnectInput` —
         // so an HTTP caller hitting `POST /api/browser/connect` with body
         // `{"skipAudit": true}` cannot suppress its own audit row.
-        const status = await connectBrowser(config, { mode: "managed" }, { skipAudit: true });
+        const status = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
         succeeded = status.connected;
         mode = status.record?.mode;
         dataDir = status.record?.dataDir;
+        recordHeadless = status.record?.headless;
         result = JSON.stringify({
           success: succeeded,
           connected: status.connected,
           mode,
-          dataDir
+          dataDir,
+          headless: recordHeadless
         });
       }
     } catch (error) {
@@ -1947,7 +1961,7 @@ async function runApprovedAction(
           // Spread caller markers FIRST so canonical runtime fields can't
           // be overwritten by smuggled keys. The side-effect audit
           // mirrors the per-action shape of file.write / browser.upload_file.
-          evidence: { ...extraEvidence, reason, success: succeeded, mode, dataDir }
+          evidence: { ...extraEvidence, reason, success: succeeded, mode, dataDir, headless: recordHeadless }
         },
         approvalAgentContext(approval)
       );
@@ -1965,7 +1979,7 @@ async function runApprovedAction(
       appendTrace(config.instance, approval.taskId, {
         type: succeeded ? "tool" : "error",
         message: "Browser connect approved",
-        data: { reason, success: succeeded, mode }
+        data: { reason, success: succeeded, mode, headless: recordHeadless }
       });
     }
     if (task) await updateRunFromTask(config, task);

@@ -201,6 +201,14 @@ export interface ConnectInput {
   // approval card the user just consented to) promises a visible Chrome
   // window; silently handing back a stale CDP session would violate that.
   mode?: "managed";
+  // When true AND mode === "managed", the managed Chrome is launched with
+  // headless: true so no window appears. The per-instance profile dir is
+  // unchanged from the headed launch, so cookies from a prior visible
+  // sign-in replay — the headless session is already signed in. Use this
+  // AFTER sign-in to continue Cloud Console / OAuth work invisibly. Only
+  // takes effect on managed mode; cdp mode is unaffected (the user owns
+  // that Chrome's visibility).
+  headless?: boolean;
 }
 
 // INTERNAL options — never plumbed from network input. Lives as a separate
@@ -274,6 +282,7 @@ async function connectBrowserInner(
     validatedCallerCdp = validated.url;
   }
 
+  const wantHeadless = input.headless === true;
   const existing = readState(config.instance).browser ?? null;
   if (existing) {
     // If the caller explicitly asked for a *different* endpoint than what's
@@ -288,8 +297,17 @@ async function connectBrowserInner(
     // silently returning a stale CDP session that may be headless.
     const strictManagedMismatch =
       input.mode === "managed" && existing.mode !== "managed";
+    // Visibility mismatch: caller asked for headless when current is
+    // headed (or vice versa). Even if the mode matches, the launch
+    // option differs so we cannot short-circuit — Chromium must be
+    // relaunched with the new headless flag against the same profile
+    // dir. Only relevant when both sides are managed.
+    const headlessMismatch =
+      input.mode === "managed" &&
+      existing.mode === "managed" &&
+      (existing.headless === true) !== wantHeadless;
     const targetsSameEndpoint =
-      !strictManagedMismatch && targetsExistingRecord(existing, callerCdp);
+      !strictManagedMismatch && !headlessMismatch && targetsExistingRecord(existing, callerCdp);
 
     if (targetsSameEndpoint) {
       if (existing.mode === "managed") {
@@ -357,7 +375,7 @@ async function connectBrowserInner(
     await disconnectSharedBrowser();
     return result;
   }
-  return await launchManaged(config, { skipAudit });
+  return await launchManaged(config, { skipAudit, headless: wantHeadless });
 }
 
 // Full teardown of an existing connection record. Sends SIGTERM to the
@@ -472,8 +490,15 @@ async function connectExisting(
 
 async function launchManaged(
   config: RuntimeConfig,
-  opts: { skipAudit?: boolean } = {}
+  opts: { skipAudit?: boolean; headless?: boolean } = {}
 ): Promise<Status> {
+  // Headless-after-signin support: when the caller asks for a headless
+  // managed launch, Playwright is invoked with `headless: true` against
+  // the SAME per-instance profile dir as the visible launch would use.
+  // Cookies + storage persisted by the prior visible session replay, so
+  // the headless context is already signed in. Falls back to visible
+  // (`headless: false`) for any other value.
+  const wantHeadless = opts.headless === true;
   // findChromePath honors GINI_CHROME_PATH first, then falls back to
   // Playwright's bundled Chromium, then system browsers. For the
   // launchPersistentContext path we pass the resolved path through to
@@ -547,7 +572,7 @@ async function launchManaged(
 
     try {
       return await chromium.launchPersistentContext(dataDir, {
-        headless: false,
+        headless: wantHeadless,
         executablePath: chromePath ?? undefined,
         acceptDownloads: true,
         downloadsPath,
@@ -599,7 +624,8 @@ async function launchManaged(
     pid,
     dataDir,
     chromePath: resolvedChromePath ?? null,
-    startedAt: now()
+    startedAt: now(),
+    headless: wantHeadless
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
@@ -615,7 +641,7 @@ async function launchManaged(
           action: "browser.connect",
           target: dataDir,
           risk: "medium",
-          evidence: { mode: "managed", pid }
+          evidence: { mode: "managed", pid, headless: wantHeadless }
         },
         { system: true }
       );

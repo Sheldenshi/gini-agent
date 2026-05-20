@@ -1912,6 +1912,13 @@ async function requestBrowserConnect(
   reasonOverride?: string
 ): Promise<string> {
   const reason = requireString(args, "reason");
+  // Headless is opt-in: only honor an explicit boolean true. Anything else
+  // (undefined, false, non-boolean) maps to the existing visible default
+  // so legacy callers that never set the field keep getting a headed
+  // managed Chrome. The flag rides on the approval payload so the
+  // executor in agent.ts can pass it through to connectBrowser when the
+  // user approves.
+  const headless = args.headless === true;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -1926,14 +1933,14 @@ async function requestBrowserConnect(
       target: reason,
       risk: "medium",
       reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
-      payload: { reason, toolCallId }
+      payload: { reason, toolCallId, headless }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId }
+      data: { approvalId: approval.id, reason, toolCallId, headless }
     });
     return approval.id;
   });

@@ -859,6 +859,131 @@ describe("browser-connect strict managed mode", () => {
   });
 });
 
+// Headless-after-signin support: the Google Workspace setup skill
+// pivots from a visible Chrome (user signs in) to a headless one
+// (Gini continues the rest of Cloud Console invisibly) reusing the
+// SAME per-instance profile dir so cookies replay. This test exercises
+// the round-trip:
+//   1. connectBrowser({ mode: "managed" }) → headed launch, headless=false
+//   2. disconnectBrowser → close visible context, profile dir stays
+//   3. connectBrowser({ mode: "managed", headless: true }) → headless
+//      launch against the IDENTICAL data dir; persisted record stays
+//      mode === "managed" but carries headless: true.
+describe("browser-connect headless reuses signed-in profile", () => {
+  test("headed → close → headless relaunch hits same profile dir with headless: true", async () => {
+    const config = testConfig("headless-after-signin");
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    const browserMod = await import("../tools/browser");
+    let contextCloseCount = 0;
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            browser: () => ({ process: () => ({ pid: 4242 }) }),
+            close: async () => {
+              contextCloseCount++;
+            }
+          };
+        }
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      // Step 1: visible managed connect (the "user signs in" step).
+      const headed = await connectBrowser(config, { mode: "managed" });
+      expect(headed.connected).toBe(true);
+      expect(headed.record?.mode).toBe("managed");
+      expect(headed.record?.headless ?? false).toBe(false);
+      expect(launchCalls.length).toBe(1);
+      expect(launchCalls[0]!.options.headless).toBe(false);
+
+      // Step 2: disconnect — closes the visible window, profile dir is
+      // untouched on disk.
+      const disconnect = await disconnectBrowser(config);
+      expect(disconnect.connected).toBe(false);
+      expect(contextCloseCount).toBe(1);
+
+      // Step 3: reconnect with headless: true and the SAME mode.
+      const headlessResult = await connectBrowser(config, { mode: "managed", headless: true });
+      expect(headlessResult.connected).toBe(true);
+      // Still managed mode — headless is a launch-time flag on the
+      // SAME managed lifecycle, not a distinct connection mode.
+      expect(headlessResult.record?.mode).toBe("managed");
+      expect(headlessResult.record?.headless).toBe(true);
+
+      // Two launches total, both against the IDENTICAL data dir (this
+      // is what makes cookie replay work — Chromium read the cookies
+      // the visible session wrote to that profile).
+      expect(launchCalls.length).toBe(2);
+      expect(launchCalls[1]!.dataDir).toBe(launchCalls[0]!.dataDir);
+      expect(launchCalls[1]!.dataDir).toContain("chrome-profile");
+      expect(launchCalls[1]!.dataDir).toContain(config.instance);
+      // The headless flag landed on the second launch's Playwright
+      // options.
+      expect(launchCalls[1]!.options.headless).toBe(true);
+      // downloadsPath stays set on the headless launch too — downloads
+      // from headless still need a readable destination.
+      expect(launchCalls[1]!.options.acceptDownloads).toBe(true);
+      expect(typeof launchCalls[1]!.options.downloadsPath).toBe("string");
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+    }
+  });
+
+  test("visibility mismatch on idempotent connect triggers teardown + fresh launch", async () => {
+    // When a headed managed record already exists and the caller asks
+    // for headless (or vice versa), the capability cannot short-circuit
+    // — it must tear down the live context and relaunch with the new
+    // visibility flag. Otherwise the caller's "I want this to be
+    // invisible now" intent is silently dropped.
+    const config = testConfig("headless-mismatch");
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    const browserMod = await import("../tools/browser");
+    let contextCloseCount = 0;
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            browser: () => ({ process: () => ({ pid: 5252 }) }),
+            close: async () => {
+              contextCloseCount++;
+            }
+          };
+        }
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      // First: a headed managed launch lives on disk + in-process.
+      const headed = await connectBrowser(config, { mode: "managed" });
+      expect(headed.record?.headless ?? false).toBe(false);
+      expect(launchCalls.length).toBe(1);
+
+      // Second: ask for headless WITHOUT a disconnect in between. The
+      // visibility mismatch must force teardown and a fresh launch.
+      const headlessResult = await connectBrowser(config, { mode: "managed", headless: true });
+      expect(headlessResult.record?.headless).toBe(true);
+      expect(launchCalls.length).toBe(2);
+      expect(launchCalls[1]!.options.headless).toBe(true);
+      // The headed context was closed before the headless launch (so
+      // Chromium's profile-dir lock is free).
+      expect(contextCloseCount).toBeGreaterThanOrEqual(1);
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+    }
+  });
+});
+
 // Defense-in-depth: even if an authenticated HTTP caller sends
 // `{"skipAudit": true}` in the POST /api/browser/connect body, the
 // capability MUST still write its browser.connect audit row. The HTTP

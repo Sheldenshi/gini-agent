@@ -425,7 +425,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Google Cloud Console')." }
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Google Cloud Console')." },
+          headless: { type: "boolean", description: "Set `true` to relaunch as a headless (windowless) Chrome session using the same profile dir as the prior managed connect. Cookies from the visible session replay, so the headless session is already signed in. Use this AFTER sign-in to continue automation invisibly.", default: false }
         },
         required: ["reason"]
       }

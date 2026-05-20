@@ -2028,6 +2028,84 @@ describe("dispatchToolCall(browser_connect)", () => {
       rmSync(ROOT, { recursive: true, force: true });
     }
   });
+
+  // Headless-after-signin: the Workspace setup skill calls
+  // browser_connect { headless: true } AFTER the user signs in
+  // (and after a browser_close) so the rest of Cloud Console runs
+  // invisibly. The dispatch must accept the headless flag from the
+  // tool args, carry it through the approval payload, and pass it
+  // to connectBrowser when the user approves.
+  test("dispatch with headless: true forwards the flag through approval to launchManaged", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-headless");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect headless", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const browserMod = await import("./browser");
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            browser: () => ({ process: () => ({ pid: 3232 }) }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_connect_headless_1",
+        JSON.stringify({
+          reason: "Continue Cloud Console setup invisibly",
+          headless: true
+        })
+      );
+      expect(result.kind).toBe("pending");
+      if (result.kind !== "pending") throw new Error("unreachable");
+      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+        actor: "user",
+        resumeChatTask: false
+      });
+      expect(approval.status).toBe("approved");
+      // Flag rode the approval payload from request → executor.
+      expect(approval.payload.headless).toBe(true);
+      expect(toolResult).toBeDefined();
+      const parsed = JSON.parse(toolResult!) as {
+        success: boolean;
+        connected: boolean;
+        mode?: string;
+        headless?: boolean;
+      };
+      expect(parsed.success).toBe(true);
+      expect(parsed.connected).toBe(true);
+      expect(parsed.mode).toBe("managed");
+      expect(parsed.headless).toBe(true);
+      // Playwright was invoked with headless: true.
+      expect(launchCalls.length).toBe(1);
+      expect(launchCalls[0]!.options.headless).toBe(true);
+      // Persisted record carries the flag for future reconnects.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.mode).toBe("managed");
+      expect(persisted?.headless).toBe(true);
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+      rmSync(ROOT, { recursive: true, force: true });
+    }
+  });
 });
 
 // dispatchToolCall(browser_vision) must accumulate the vision provider's
