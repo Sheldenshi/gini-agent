@@ -2,14 +2,17 @@
 //
 // state.toolsets (enabled set) is the global "this toolset is on" filter.
 // agentToolsetFilter narrows that further to an active-agent whitelist.
-// Always-on tools (web_fetch, read_skill, spawn_subagent, create_job,
-// list_jobs, update_job, delete_job, run_job) bypass both filters so
-// freshly cloned instances and tightly scoped agents can still schedule,
-// list, update, delete, and manually fire reminders, read skills, and
-// delegate.
+// Always-on tools bypass both filters so freshly cloned instances and
+// tightly scoped agents can still reach the core agent capability surface:
+// web_fetch, read_skill, spawn_subagent, the scheduled-job tools
+// (create_job, list_jobs, update_job, delete_job, run_job), and the
+// agent-capability tools whose toolsets aren't in the defaults or ship
+// disabled (cancel_task, install_skill, enable_skill, disable_skill,
+// send_message, invoke_mcp).
 
 import { describe, expect, test } from "bun:test";
 import { buildToolCatalog } from "./tool-catalog";
+import { defaultToolsets } from "../state/defaults";
 import type { RuntimeState, ToolsetRecord } from "../types";
 
 function ts(name: string, status: ToolsetRecord["status"] = "enabled"): ToolsetRecord {
@@ -50,7 +53,13 @@ const ALWAYS_ON = new Set([
   "list_jobs",
   "update_job",
   "delete_job",
-  "run_job"
+  "run_job",
+  "cancel_task",
+  "install_skill",
+  "enable_skill",
+  "disable_skill",
+  "send_message",
+  "invoke_mcp"
 ]);
 
 describe("buildToolCatalog", () => {
@@ -60,16 +69,39 @@ describe("buildToolCatalog", () => {
     for (const tool of catalog) {
       expect(ALWAYS_ON.has(tool.function.name)).toBe(true);
     }
-    // Sanity: all always-on tools are present.
+    // Sanity: every always-on tool surfaces.
     const names = new Set(catalog.map((t) => t.function.name));
-    expect(names.has("web_fetch")).toBe(true);
-    expect(names.has("read_skill")).toBe(true);
-    expect(names.has("spawn_subagent")).toBe(true);
-    expect(names.has("create_job")).toBe(true);
-    expect(names.has("list_jobs")).toBe(true);
-    expect(names.has("update_job")).toBe(true);
-    expect(names.has("delete_job")).toBe(true);
-    expect(names.has("run_job")).toBe(true);
+    for (const expected of ALWAYS_ON) {
+      expect(names.has(expected)).toBe(true);
+    }
+  });
+
+  test("fresh-default toolsets surface every agent-capability tool", () => {
+    // Pin the contract that a freshly cloned instance's default toolset
+    // state advertises the full agent-capability surface. Six of these
+    // (cancel_task, install_skill, enable_skill, disable_skill,
+    // send_message, invoke_mcp) live under toolsets that aren't in the
+    // defaults (`subagents`, `skills`) or ship disabled (`messaging`,
+    // `mcp`); the always-on bypass is what keeps them reachable. If a
+    // future refactor accidentally drops the bypass, this test catches it.
+    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
+    const catalog = buildToolCatalog(state);
+    const names = new Set(catalog.map((t) => t.function.name));
+    const newTier1And2 = [
+      "recall_memory",
+      "add_memory",
+      "update_memory",
+      "search_history",
+      "send_message",
+      "invoke_mcp",
+      "cancel_task",
+      "install_skill",
+      "enable_skill",
+      "disable_skill"
+    ];
+    for (const tool of newTier1And2) {
+      expect(names.has(tool)).toBe(true);
+    }
   });
 
   test("agent toolset filter narrows the catalog to file + always-on", () => {
@@ -85,13 +117,9 @@ describe("buildToolCatalog", () => {
     expect(names.has("file_read")).toBe(true);
     expect(names.has("terminal_exec")).toBe(false);
     // Always-on tools survive even when not listed in the agent filter.
-    expect(names.has("read_skill")).toBe(true);
-    expect(names.has("spawn_subagent")).toBe(true);
-    expect(names.has("create_job")).toBe(true);
-    expect(names.has("list_jobs")).toBe(true);
-    expect(names.has("update_job")).toBe(true);
-    expect(names.has("delete_job")).toBe(true);
-    expect(names.has("run_job")).toBe(true);
+    for (const expected of ALWAYS_ON) {
+      expect(names.has(expected)).toBe(true);
+    }
   });
 
   test("run_job is always-on with toolset 'jobs' and requires jobId", () => {

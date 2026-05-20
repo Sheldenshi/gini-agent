@@ -155,4 +155,31 @@ describe("send_message dispatch", () => {
       )
     ).rejects.toThrow(/Messaging bridge not found/);
   });
+
+  test("refuses target that's not on the bridge's allow-list", async () => {
+    // Pin the catalog promise: the description tells the model `target`
+    // must come from the bridge's allow-list. Without this gate the
+    // request would create an approval row that fails post-approval,
+    // which is a worse failure mode than rejecting at tool-call time.
+    const config = makeConfig("send-message-bad-target", "strict");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "demo",
+      deliveryTargets: ["chat-A"]
+    });
+    const taskId = await seedTask(config);
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "send_message",
+        "call_bad_t",
+        JSON.stringify({ bridgeId: bridge.id, text: "ping", target: "chat-B" })
+      )
+    ).rejects.toThrow(/allow-list/);
+    // No approval row should land for a refused target.
+    const approvals = readState(config.instance).approvals;
+    const created = approvals.filter((a) => a.action === "messaging.send");
+    expect(created.length).toBe(0);
+  });
 });

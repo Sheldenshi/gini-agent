@@ -814,9 +814,12 @@ export function allTools(): ToolCatalogTool[] {
 // `agentToolsetFilter` is the optional active-agent whitelist (toolset
 // names). When set, it intersects with the enabled-toolset filter — a tool
 // passes only if its owning toolset is BOTH globally enabled AND in the
-// agent's whitelist. Always-on tools (web_fetch, read_skill,
-// spawn_subagent, create_job, list_jobs, update_job, delete_job, run_job)
-// bypass both filters.
+// agent's whitelist. Always-on tools bypass both filters: web_fetch,
+// read_skill, spawn_subagent, the scheduled-job surface (create_job,
+// list_jobs, update_job, delete_job, run_job), and the core agent-capability
+// surface whose toolsets aren't in the defaults or ship disabled
+// (cancel_task, install_skill, enable_skill, disable_skill, send_message,
+// invoke_mcp).
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
@@ -845,6 +848,24 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "update_job") return true;
     if (tool.function.name === "delete_job") return true;
     if (tool.function.name === "run_job") return true;
+    // Always expose the core agent-capability tools whose owning toolsets
+    // either aren't in the legacy defaults (`skills`, `subagents`) or ship
+    // disabled (`messaging`, `mcp`). Gating these on a toolset toggle would
+    // mean a fresh instance literally can't see them, even though they're
+    // the right path for common asks ("cancel that subagent", "install this
+    // skill", "send a message via my bridge", "invoke MCP tool X"). When
+    // the underlying resource isn't configured (no bridge / no MCP server
+    // / no such skill), the tool handler surfaces a clear error — that's
+    // the correct UX, not "tool didn't exist". Side-effecting members
+    // (`send_message`, `invoke_mcp`) still flow through the high-risk
+    // approval queue per their name classification; the bypass only
+    // affects catalog visibility, not the approval envelope.
+    if (tool.function.name === "cancel_task") return true;
+    if (tool.function.name === "install_skill") return true;
+    if (tool.function.name === "enable_skill") return true;
+    if (tool.function.name === "disable_skill") return true;
+    if (tool.function.name === "send_message") return true;
+    if (tool.function.name === "invoke_mcp") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;

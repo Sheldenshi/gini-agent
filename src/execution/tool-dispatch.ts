@@ -1923,6 +1923,22 @@ async function requestSendMessage(
       (candidate) => candidate.id === bridgeId || candidate.name === bridgeId
     );
     if (!bridge) throw new Error(`Messaging bridge not found: ${bridgeId}`);
+    // Tool-handler gate for the per-bridge target allow-list. The catalog
+    // description promises this enforcement ("Optional delivery target
+    // (chat id) on the bridge's allow-list"). `sendMessagingOutput` does
+    // its own active-agent target filter, but that's a separate envelope
+    // (the agent's allowed targets, not the bridge's) — without this
+    // check an explicit target the bridge doesn't recognize would land
+    // an approval row and surface as a runtime failure post-approval.
+    // Keeping the check here makes the failure mode loud at tool-call
+    // time so the model can correct itself. When `target` is omitted,
+    // sendMessagingOutput falls back to the first allowed target (see
+    // `bridge.deliveryTargets[0]`), which is the documented behavior.
+    if (target !== undefined && !bridge.deliveryTargets.includes(target)) {
+      throw new Error(
+        `Invalid input: target '${target}' is not on bridge '${bridge.id}' allow-list (delivery targets: ${bridge.deliveryTargets.join(", ") || "<none>"})`
+      );
+    }
     const approval = createApproval(state, {
       taskId: item.id,
       action: "messaging.send",
