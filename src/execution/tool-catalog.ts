@@ -433,6 +433,29 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
+    // Connector-request affordance. When a skill is enabled but inactive
+    // because its required connector is missing, the model calls this tool
+    // to surface a "Connect <provider>" card in chat. The task pauses on
+    // the resulting approval and resumes automatically once the user
+    // completes the secret entry. Always-on (like read_skill / mcp_call):
+    // the model needs this path even on a fresh instance with no toolsets
+    // toggled.
+    toolset: "connectors",
+    type: "function",
+    function: {
+      name: "request_connector",
+      description: "Ask the user to connect an external provider (e.g. linear, github). Use this when a skill is available but inactive because the required connector is not configured. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
+          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request." }
+        },
+        required: ["provider", "reason"]
+      }
+    }
+  },
+  {
     // Generic MCP tool invocation. The agent loop sees this as a single
     // tool entry; the dispatcher routes (server, tool, arguments) to the
     // matching McpServerRecord via src/integrations/mcp.ts. Each
@@ -634,6 +657,13 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
+    // request_connector is the in-chat affordance that lets the agent
+    // ask the user to wire up a missing connector. Same always-on
+    // rationale: a fresh instance with no toolsets toggled still needs
+    // to be able to surface "connect linear" when the linear skill is
+    // inactive — gating on a legacy toolset would silently disable the
+    // onboarding path.
+    if (tool.function.name === "request_connector") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;

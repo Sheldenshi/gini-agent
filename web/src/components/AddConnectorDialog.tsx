@@ -60,8 +60,16 @@ export interface AddConnectorDialogProps {
   // opens a Rotate Credential dialog with the same field UI but skips the
   // name/scopes inputs (we're not replacing those, just the secret) and
   // changes the title/button label so the user knows they're updating an
-  // existing record. The caller still owns the actual API call via onSubmit.
-  mode?: "create" | "rotate";
+  // existing record. "request" is the in-chat Connect flow triggered by
+  // an `action === "connector.request"` approval: same minimal UI as a
+  // secret-only create, but the caller wires the submit to the
+  // approval connect endpoint instead of the normal POST /api/connectors.
+  // The caller still owns the actual API call via onSubmit.
+  mode?: "create" | "rotate" | "request";
+  // Optional inline error string the caller can pass back when a probe
+  // fails on the connect endpoint. Surfaces under the secret inputs so
+  // the user can correct the token without the dialog closing.
+  externalError?: string | null;
 }
 
 export function AddConnectorDialog({
@@ -73,7 +81,8 @@ export function AddConnectorDialog({
   defaultProvider,
   defaultName,
   lockProvider = false,
-  mode = "create"
+  mode = "create",
+  externalError = null
 }: AddConnectorDialogProps) {
   const initialProvider = useMemo(() => {
     if (defaultProvider && providers.some((p) => p.id === defaultProvider)) return defaultProvider;
@@ -106,12 +115,17 @@ export function AddConnectorDialog({
   // launched from a skill row, and Scopes are encoded inside the secret
   // itself. The `generic` provider is the one exception: it always renders
   // the full form because the user has to declare custom fields.
+  // "request" mode (in-chat Connect button) is always minimal: it never
+  // surfaces name/provider/scopes regardless of provider shape, because
+  // the approval payload already pins the provider and there is no use
+  // case for connecting `generic` via this path.
   const minimal =
-    mode === "create"
+    mode === "request"
+    || (mode === "create"
       && provider !== "generic"
       && !!selectedProvider
       && selectedProvider.fields.length > 0
-      && selectedProvider.fields.every((f) => f.secret);
+      && selectedProvider.fields.every((f) => f.secret));
 
   const submit = () => {
     setError(null);
@@ -145,7 +159,7 @@ export function AddConnectorDialog({
         // In rotate mode the user is replacing secrets only; non-secret
         // metadata fields keep their stored values, so don't block the
         // submission on them being empty.
-        const requiredHere = field.required && (mode === "create" || field.secret);
+        const requiredHere = field.required && (mode !== "rotate" || field.secret);
         if (requiredHere && !raw.trim()) {
           setError(`${field.label} is required.`);
           return;
@@ -188,7 +202,13 @@ export function AddConnectorDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{mode === "rotate" ? `Rotate ${defaultName ?? "credential"}` : "Add connector"}</DialogTitle>
+          <DialogTitle>
+            {mode === "rotate"
+              ? `Rotate ${defaultName ?? "credential"}`
+              : mode === "request"
+                ? `Connect ${selectedProvider?.label ?? "provider"}`
+                : "Add connector"}
+          </DialogTitle>
           <DialogDescription>
             {mode === "rotate"
               ? "Replace the stored secret(s). The connector record, name, and scopes stay the same."
@@ -240,6 +260,7 @@ export function AddConnectorDialog({
           )}
 
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
+          {externalError ? <p className="text-xs text-destructive">{externalError}</p> : null}
         </div>
         <DialogFooter>
           <Button onClick={submit} disabled={pending}>

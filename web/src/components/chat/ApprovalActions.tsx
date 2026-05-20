@@ -5,8 +5,9 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { RiskPill } from "@/components/StatusPill";
+import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { api } from "@/lib/api";
-import { useApprovals, useInvalidate } from "@/lib/queries";
+import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
 import type { Approval } from "@runtime/types";
 
 // Inline Approve / Deny actions rendered under the synthetic
@@ -21,10 +22,20 @@ import type { Approval } from "@runtime/types";
 //   - The "Show command" disclosure is collapsed by default to keep the
 //     bubble compact; opening it shows the full payload so the user can
 //     audit before deciding.
+//   - When `approval.action === "connector.request"` (raised by the
+//     `request_connector` tool) we swap the default Approve/Deny pair
+//     for a "Connect <provider>" button that opens AddConnectorDialog in
+//     `request` mode. Submitting the dialog calls
+//     POST /api/approvals/<id>/connect, which creates the connector,
+//     probes it, and resolves the approval on success — that drives the
+//     existing resume flow without any extra chat plumbing.
 export function ApprovalActions({ taskId }: { taskId: string }) {
   const approvals = useApprovals();
+  const providers = useProviders();
   const invalidate = useInvalidate();
   const [expanded, setExpanded] = useState(false);
+  const [connectFor, setConnectFor] = useState<Approval | null>(null);
+  const [connectError, setConnectError] = useState<string | null>(null);
 
   const pending = (approvals.data ?? []).filter(
     (a) => a.taskId === taskId && a.status === "pending"
@@ -41,54 +52,142 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  // POSTs the user-entered secrets to the approval connect endpoint. On
+  // probe failure we keep the dialog open with the inline error message
+  // so the user can correct the credential without losing context. On
+  // success the endpoint resolves the approval — invalidating the chat
+  // surface lets the resumed task's running/summary message render.
+  const connect = useMutation({
+    mutationFn: async ({ approvalId, body }: { approvalId: string; body: CreateConnectorBody }) => {
+      const response = await api<{ ok: boolean; message?: string; connector?: unknown }>(
+        `/approvals/${approvalId}/connect`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            secrets: body.secrets,
+            scopes: body.scopes,
+            name: body.name
+          })
+        }
+      );
+      return response;
+    },
+    onSuccess: (result) => {
+      if (result.ok) {
+        setConnectFor(null);
+        setConnectError(null);
+        invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
+      } else {
+        setConnectError(result.message ?? "Could not connect. Please verify the credentials and try again.");
+        // The unhealthy connector row was still created; refresh the list
+        // so the Connectors page reflects reality if the user opens it.
+        invalidate(["connectors"]);
+      }
+    },
+    onError: (error: Error) => {
+      setConnectError(error.message);
+    }
+  });
+
   if (pending.length === 0) return null;
 
   return (
     <div className="mt-2 space-y-2">
-      {pending.map((approval) => (
-        <div
-          key={approval.id}
-          className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
-        >
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="font-mono text-xs text-foreground">{approval.action}</span>
-            <RiskPill value={approval.risk} />
-            <button
-              type="button"
-              className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
-              onClick={() => setExpanded((v) => !v)}
-            >
-              {expanded ? "Hide command" : "Show command"}
-            </button>
+      {pending.map((approval) => {
+        const isConnectorRequest = approval.action === "connector.request";
+        const providerLabel = isConnectorRequest
+          ? (typeof approval.payload?.providerLabel === "string"
+              ? approval.payload.providerLabel
+              : String(approval.payload?.provider ?? "provider"))
+          : "";
+        return (
+          <div
+            key={approval.id}
+            className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-mono text-xs text-foreground">{approval.action}</span>
+              <RiskPill value={approval.risk} />
+              <button
+                type="button"
+                className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+                onClick={() => setExpanded((v) => !v)}
+              >
+                {expanded ? "Hide details" : "Show details"}
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-muted-foreground">{approval.reason}</p>
+            <p className="mt-1 break-all font-mono text-[11px] text-foreground/90">
+              {truncate(approval.target, expanded ? 4000 : 200)}
+            </p>
+            {expanded ? (
+              <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
+                {JSON.stringify(approval.payload, null, 2)}
+              </pre>
+            ) : null}
+            <div className="mt-2 flex gap-2">
+              {isConnectorRequest ? (
+                <>
+                  <Button
+                    size="sm"
+                    disabled={connect.isPending}
+                    onClick={() => {
+                      setConnectError(null);
+                      setConnectFor(approval);
+                    }}
+                  >
+                    Connect {providerLabel}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={decide.isPending}
+                    onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                  >
+                    Cancel
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    size="sm"
+                    disabled={decide.isPending}
+                    onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
+                  >
+                    Approve
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={decide.isPending}
+                    onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                  >
+                    Deny
+                  </Button>
+                </>
+              )}
+            </div>
           </div>
-          <p className="mt-1 text-xs text-muted-foreground">{approval.reason}</p>
-          <p className="mt-1 break-all font-mono text-[11px] text-foreground/90">
-            {truncate(approval.target, expanded ? 4000 : 200)}
-          </p>
-          {expanded ? (
-            <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
-              {JSON.stringify(approval.payload, null, 2)}
-            </pre>
-          ) : null}
-          <div className="mt-2 flex gap-2">
-            <Button
-              size="sm"
-              disabled={decide.isPending}
-              onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
-            >
-              Approve
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={decide.isPending}
-              onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-            >
-              Deny
-            </Button>
-          </div>
-        </div>
-      ))}
+        );
+      })}
+      {connectFor ? (
+        <AddConnectorDialog
+          open={!!connectFor}
+          onOpenChange={(open) => {
+            if (!open) {
+              setConnectFor(null);
+              setConnectError(null);
+            }
+          }}
+          providers={providers.data ?? []}
+          defaultProvider={String(connectFor.payload?.provider ?? "")}
+          lockProvider
+          mode="request"
+          pending={connect.isPending}
+          externalError={connectError}
+          onSubmit={(body) => connect.mutate({ approvalId: connectFor.id, body })}
+        />
+      ) : null}
     </div>
   );
 }

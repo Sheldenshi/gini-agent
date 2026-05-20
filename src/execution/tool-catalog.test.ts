@@ -49,7 +49,8 @@ const ALWAYS_ON = new Set([
   "list_jobs",
   "update_job",
   "delete_job",
-  "mcp_call"
+  "mcp_call",
+  "request_connector"
 ]);
 
 describe("buildToolCatalog", () => {

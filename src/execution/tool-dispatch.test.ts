@@ -12,7 +12,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:te
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mutateState, createMcpServerRecord, createTask, upsertTask } from "../state";
+import { mutateState, createMcpServerRecord, createTask, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 import { dispatchToolCall } from "./tool-dispatch";
 
@@ -145,6 +145,90 @@ describe("mcp_call dispatch", () => {
       const parsed = JSON.parse(result.result);
       expect(parsed.ok).toBe(false);
       expect(parsed.error).toContain("not configured");
+    }
+  });
+});
+
+describe("request_connector dispatch", () => {
+  test("returns structured error for unknown provider", async () => {
+    const instance = `req-connector-unknown-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_1",
+      JSON.stringify({ provider: "not-a-real-provider", reason: "test" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("Unknown provider");
+    }
+  });
+
+  test("fast-path returns proceed message when provider already healthy", async () => {
+    const instance = `req-connector-existing-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Seed a healthy linear connector directly on state.
+    await mutateState(instance, (state) => {
+      const at = new Date().toISOString();
+      state.connectors.push({
+        id: "id_linear_existing",
+        instance: state.instance,
+        name: "Linear",
+        provider: "linear",
+        status: "configured",
+        scopes: [],
+        secretRefs: [],
+        createdAt: at,
+        updatedAt: at,
+        health: "healthy",
+        source: "user"
+      });
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_1",
+      JSON.stringify({ provider: "linear", reason: "list issues" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toContain("already connected");
+    }
+    // No approval should have been created.
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("creates a pending connector.request approval when no connector exists", async () => {
+    const instance = `req-connector-pending-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_42",
+      JSON.stringify({ provider: "linear", reason: "list my open issues" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("connector.request");
+      expect(approval!.target).toBe("linear");
+      expect(approval!.status).toBe("pending");
+      expect(approval!.payload.provider).toBe("linear");
+      expect(approval!.payload.providerLabel).toBe("Linear");
+      expect(approval!.payload.toolCallId).toBe("call_42");
+      expect(approval!.payload.reason).toBe("list my open issues");
     }
   });
 });

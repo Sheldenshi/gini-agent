@@ -1299,6 +1299,35 @@ async function runApprovedAction(
 ): Promise<string | undefined> {
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
 
+  if (approval.action === "connector.request") {
+    // The side effect (createConnector + checkConnector) already ran
+    // inside POST /api/approvals/<id>/connect — that endpoint only
+    // resolves the approval after the connector probes healthy. There's
+    // nothing for us to do here except feed back a synthesized tool
+    // result that tells the chat-task loop to resume from the
+    // request_connector tool call. `extraEvidence` is intentionally
+    // dropped: the auto-approve path never reaches this branch (the
+    // connect endpoint is the only resolver), so there's no marker to
+    // stamp on a side-effect audit row that doesn't exist.
+    void extraEvidence;
+    const providerLabel =
+      typeof approval.payload.providerLabel === "string"
+        ? approval.payload.providerLabel
+        : String(approval.payload.provider ?? "provider");
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "Connector connected via connect endpoint",
+        data: { provider: approval.payload.provider, approvalId: approval.id }
+      });
+    }
+    const result = `Connected to ${providerLabel}. Proceed with the original request.`;
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
+  }
+
   if (approval.action === "file.write") {
     // Do the abort check, path validation, file I/O, and audit-row
     // write all INSIDE the same `mutateState` callback so the

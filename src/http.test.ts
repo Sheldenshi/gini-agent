@@ -773,6 +773,110 @@ describe("runtime api", () => {
     expect(ids).toContain("codex");
   });
 
+  test("POST /api/approvals/<id>/connect creates a connector and resolves the approval on probe success", async () => {
+    const config = testConfig("approvals-connect-happy");
+    const handler = createHandler(config);
+    // Stage a connector.request approval row directly. Demo provider has no
+    // probe, so checkConnector falls back to presence-only ⇒ healthy without
+    // any network mocking.
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "connector.request",
+        target: "demo",
+        risk: "low",
+        reason: "test connect",
+        payload: {
+          provider: "demo",
+          providerLabel: "Demo",
+          providerDescription: "Demo provider",
+          reason: "test connect",
+          fields: [],
+          toolCallId: "call_demo_1"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: {}, scopes: [] })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.connector.provider).toBe("demo");
+    expect(response.connector.health).toBe("healthy");
+
+    const state = readState(config.instance);
+    const resolved = state.approvals.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("approved");
+    expect(state.connectors.some((c) => c.provider === "demo" && c.health === "healthy")).toBe(true);
+  });
+
+  test("POST /api/approvals/<id>/connect returns ok:false and leaves the approval pending on probe failure", async () => {
+    const config = testConfig("approvals-connect-probe-fail");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "connector.request",
+        target: "linear",
+        risk: "low",
+        reason: "fetch issues",
+        payload: {
+          provider: "linear",
+          providerLabel: "Linear",
+          providerDescription: "Linear",
+          reason: "fetch issues",
+          fields: [],
+          toolCallId: "call_linear_fail"
+        }
+      })
+    );
+    // Stub the Linear GraphQL probe with a 401 so the probe fails.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response("{\"errors\":[{\"message\":\"Unauthorized\"}]}", {
+      status: 401,
+      headers: { "content-type": "application/json" }
+    })) as unknown as typeof fetch;
+    try {
+      const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { token: "not-a-real-token" } })
+      });
+      expect(response.ok).toBe(false);
+      expect(response.message).toBeString();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    const state = readState(config.instance);
+    const after = state.approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect rejects approvals whose action is not connector.request", async () => {
+    const config = testConfig("approvals-connect-wrong-action");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "file.write",
+        target: "/tmp/x",
+        risk: "high",
+        reason: "stub",
+        payload: { path: "/tmp/x", content: "hi" }
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      { method: "POST", body: JSON.stringify({ secrets: {} }) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("not a connector.request");
+  });
+
   // Round-1 review fix: browser-connect throws with prefixes that the
   // gateway's catch-all previously mapped to 500. The webapp needs them as
   // 4xx so it can render the original message instead of "internal error".
