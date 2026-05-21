@@ -100,6 +100,7 @@ import {
   DEFAULT_BANK_ID,
   ensureAgentBank,
   ensureDefaultBank,
+  getMemoryDb,
   id,
   insertMemoryUnit,
   mutateState,
@@ -1892,8 +1893,26 @@ export async function applyMigration(
   // to a crawl. After insertion we re-stamp createdAt/updatedAt on the
   // session + each message so the UI's "recent chats" sort reflects
   // the original openclaw transcript date, not migration day.
+  //
+  // Idempotency: the migrator's documented contract is "create what is
+  // missing, leave what exists alone." Sessions are deduped by the
+  // deterministic title prefix `Openclaw <openclawId>/<short-id>`
+  // (openclaw session ids are UUIDs, so the 8-char slice is
+  // collision-safe in practice). Re-running apply against the same
+  // source produces zero new sessions and zero new messages. The
+  // existing-titles set is built once up front so the lookup stays
+  // O(1) per step and survives a tens-of-thousands-of-existing-
+  // sessions instance without a per-step scan.
+  const existingSessionTitles = new Set(
+    readState(config.instance).chatSessions.map((session) => session.title)
+  );
   for (const step of plan.steps) {
     if (step.kind !== "session") continue;
+    const title = `Openclaw ${step.openclawId}/${step.sessionId.slice(0, 8)}`;
+    if (existingSessionTitles.has(title)) {
+      warnings.push(`Skipped openclaw session ${step.sessionId}: already imported as '${title}'.`);
+      continue;
+    }
     try {
       const transcript = parseOpenclawSessionTranscript(step.sourcePath);
       if (transcript.messages.length === 0) {
@@ -1904,24 +1923,10 @@ export async function applyMigration(
       }
       await guardedMutate((state: RuntimeState) => {
         const owner = state.agents.find((agent) => agent.name === step.openclawId);
-        const session = createChatSession(
-          state,
-          `Openclaw ${step.openclawId}/${step.sessionId.slice(0, 8)}`,
-          undefined,
-          owner?.id
-        );
+        const session = createChatSession(state, title, undefined, owner?.id);
         const firstAt = transcript.messages[0]!.createdAt;
         const lastAt = transcript.messages[transcript.messages.length - 1]!.createdAt;
         session.createdAt = transcript.headerTimestamp ?? firstAt;
-        // Preserve the openclaw session id on the gini record so the
-        // operator can correlate the migrated chat with the archive
-        // zip's `agents/<id>/sessions/<openclawSessionId>.jsonl` file
-        // without grep-matching titles. Lives under `summary` because
-        // gini's ChatSessionRecord has no free-form metadata slot
-        // today; the UI ignores summary on non-assistant-last sessions
-        // and createChatMessage overwrites it from the last assistant
-        // reply below, so this is a transient breadcrumb the import
-        // report's findings carries permanently.
         for (const message of transcript.messages) {
           const inserted = createChatMessage(state, {
             sessionId: session.id,
@@ -1935,6 +1940,10 @@ export async function applyMigration(
         // Re-set it from the last openclaw timestamp after the loop.
         session.updatedAt = lastAt;
       });
+      // Track the just-created title so a malformed plan with the same
+      // openclaw session listed twice doesn't accidentally bypass dedup
+      // and create the second copy.
+      existingSessionTitles.add(title);
       sessionsCreated += 1;
       sessionMessagesCreated += transcript.messages.length;
     } catch (error) {
@@ -1988,11 +1997,31 @@ export async function applyMigration(
     // don't pound the state.json reader for every memory row.
     const stateSnapshot = readState(config.instance);
     const agentByName = new Map(stateSnapshot.agents.map((agent) => [agent.name, agent] as const));
+    // Idempotency: build the set of openclaw unit ids already imported
+    // in a previous apply so a re-run skips them instead of inserting
+    // duplicate rows that explode the recall candidate pool. We tag
+    // every migrated unit with `metadata.openclawUnitId` on insert
+    // (see the metadata block below); `json_extract` lets the lookup
+    // stay O(1) per step against a pre-built Set rather than O(N)
+    // LIKE-scanning per step.
+    const importedDb = getMemoryDb(config.instance);
+    const existingOpenclawIds = new Set(
+      importedDb
+        .query<{ openclaw_id: string }, []>(
+          "SELECT json_extract(metadata, '$.openclawUnitId') AS openclaw_id FROM memory_units WHERE json_extract(metadata, '$.openclawUnitId') IS NOT NULL"
+        )
+        .all()
+        .map((row) => row.openclaw_id)
+    );
     // Track which fallbacks we've warned about so a Hindsight DB
     // with 10000 orphan units doesn't produce 10000 identical
     // warnings.
     const warnedOrphanBanks = new Set<string>();
     for (const step of memorySteps) {
+      if (existingOpenclawIds.has(step.openclawId)) {
+        // Re-apply against the same Hindsight source — already imported.
+        continue;
+      }
       const targetAgent = agentByName.get(step.sourceBank);
       let bankId: string;
       let agentId: string | null;
@@ -2025,6 +2054,7 @@ export async function applyMigration(
           },
           mentionedAt: step.mentionedAt
         });
+        existingOpenclawIds.add(step.openclawId);
         memoryUnitsCreated += 1;
       } catch (error) {
         warnings.push(

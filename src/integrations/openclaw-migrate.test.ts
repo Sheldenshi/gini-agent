@@ -2136,6 +2136,36 @@ describe("applyMigration sessions", () => {
     expect(session?.agentId).toBe(workAgent!.id);
   });
 
+  test("re-apply skips sessions already imported by deterministic title", async () => {
+    // The migrator's documented contract is "create what is missing,
+    // leave what exists alone." A second `applyMigration` against the
+    // same openclaw source must NOT duplicate ChatSessionRecords or
+    // double the chat-message volume. Sessions are deduped by the
+    // deterministic `Openclaw <agent>/<short-id>` title.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "sess-idempotent", [
+      { role: "user", text: "first", timestamp: "2026-03-04T22:20:00.000Z" },
+      { role: "assistant", text: "second", timestamp: "2026-03-04T22:20:05.000Z" }
+    ]);
+    const config = loadConfig("session-idempotent");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.sessionsCreated).toBe(1);
+    expect(first.sessionMessagesCreated).toBe(2);
+    const second = await applyMigration(config, discovery, planMigration(discovery));
+    expect(second.sessionsCreated).toBe(0);
+    expect(second.sessionMessagesCreated).toBe(0);
+    expect(second.warnings.some((warning) => warning.includes("already imported"))).toBe(true);
+    const state = readState("session-idempotent");
+    // Exactly one Openclaw-titled session, exactly two messages.
+    const migrated = state.chatSessions.filter((session) => session.title.startsWith("Openclaw"));
+    expect(migrated).toHaveLength(1);
+    const messages = state.chatMessages.filter(
+      (message) => message.sessionId === migrated[0]!.id
+    );
+    expect(messages).toHaveLength(2);
+  });
+
   test("warns and skips a session whose only content is non-text blocks", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     const sessionDir = join(OPENCLAW_ROOT, "agents", "main", "sessions");
@@ -2346,6 +2376,33 @@ describe("applyMigration memory units", () => {
     const networkRow = rows.find((row) => row.text === "weird network")!;
     expect(statusRow.status).toBe("active");
     expect(networkRow.network).toBe("experience");
+  });
+
+  test("re-apply skips memory units already imported (dedup on openclawUnitId metadata)", async () => {
+    // Same idempotency contract as sessions/agents. Memory units are
+    // deduped by their openclaw unit id (stamped into
+    // `metadata.openclawUnitId` on insert) so a second apply against
+    // the same Hindsight SQLite is a no-op.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "main.sqlite", [
+      { id: "u1", text: "alpha", network: "world" },
+      { id: "u2", text: "beta", network: "experience" }
+    ]);
+    const config = loadConfig("memory-idempotent");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.memoryUnitsCreated).toBe(2);
+    const second = await applyMigration(config, discovery, planMigration(discovery));
+    expect(second.memoryUnitsCreated).toBe(0);
+    // Verify the SQLite still has exactly 2 rows tagged with our
+    // openclaw unit ids — no duplicates.
+    const memDb = getMemoryDb("memory-idempotent");
+    const totalForOpenclaw = memDb
+      .query<{ c: number }, []>(
+        "SELECT COUNT(*) AS c FROM memory_units WHERE json_extract(metadata, '$.openclawUnitId') IS NOT NULL"
+      )
+      .get();
+    expect(totalForOpenclaw?.c).toBe(2);
   });
 
   test("empty memory directory produces no migration step and no unsupported note", async () => {
