@@ -2145,6 +2145,63 @@ describe("applyMigration sessions", () => {
     expect(messages[2]!.createdAt).toBe("2026-03-04T22:20:10.000Z");
   });
 
+  test("plan messageCount matches apply sessionMessagesCreated when tool blocks filter messages out", async () => {
+    // Previously the plan-time counter counted ALL `type: "message"`
+    // lines regardless of content shape, while the apply-time parser
+    // filtered out messages with only tool_use / tool_result blocks
+    // and no text. An e2e against the real backup reported 73 on the
+    // plan but only 61 on apply — operator-visible misinformation.
+    // The fix is to share the filter; this test pins the agreement.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const sessionDir = join(OPENCLAW_ROOT, "agents", "main", "sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      join(sessionDir, "mixed.jsonl"),
+      `${[
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "mixed",
+          timestamp: "2026-03-04T22:20:00.000Z"
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "m1",
+          timestamp: "2026-03-04T22:20:05.000Z",
+          message: { role: "user", content: [{ type: "text", text: "hi" }] }
+        }),
+        // Tool-only assistant turn — apply drops it, plan must drop it too.
+        JSON.stringify({
+          type: "message",
+          id: "m2",
+          timestamp: "2026-03-04T22:20:06.000Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "t1", name: "fake", input: {} }]
+          }
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "m3",
+          timestamp: "2026-03-04T22:20:07.000Z",
+          message: { role: "assistant", content: [{ type: "text", text: "reply" }] }
+        })
+      ].join("\n")}\n`
+    );
+    const config = loadConfig("session-plan-apply-agreement");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const sessionStep = plan.steps.find(
+      (step) => step.kind === "session"
+    ) as Extract<typeof plan.steps[number], { kind: "session" }> | undefined;
+    expect(sessionStep).toBeDefined();
+    // 3 source `type:"message"` lines but only 2 produce ChatMessageRecord
+    // rows. Plan must report the filtered count.
+    expect(sessionStep!.messageCount).toBe(2);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.sessionMessagesCreated).toBe(2);
+  });
+
   test("drops tool_use blocks from migrated message text", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "sess-tools", [
@@ -2214,7 +2271,7 @@ describe("applyMigration sessions", () => {
     expect(messages).toHaveLength(2);
   });
 
-  test("warns and skips a session whose only content is non-text blocks", async () => {
+  test("session with only non-text content is dropped at plan time as unsupported", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
     const sessionDir = join(OPENCLAW_ROOT, "agents", "main", "sessions");
     mkdirSync(sessionDir, { recursive: true });
@@ -2240,11 +2297,20 @@ describe("applyMigration sessions", () => {
     );
     const config = loadConfig("session-tool-only");
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
-    const result = await applyMigration(config, discovery, planMigration(discovery));
+    const plan = planMigration(discovery);
+    // The planner's countSessionMessages now applies the same content
+    // filter the apply parser uses, so a tool-only transcript reports
+    // 0 messages and the planner drops it from the steps list entirely.
+    // It surfaces on the unsupported list instead so the operator sees
+    // the file was scanned and intentionally skipped.
+    expect(plan.steps.some((step) => step.kind === "session")).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) => entry.kind.startsWith("session:main/") && entry.detail.includes("tool-only")
+      )
+    ).toBe(true);
+    const result = await applyMigration(config, discovery, plan);
     expect(result.sessionsCreated).toBe(0);
-    expect(result.warnings.some((warning) => warning.includes("no replayable messages"))).toBe(
-      true
-    );
   });
 });
 

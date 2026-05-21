@@ -626,26 +626,19 @@ function describeSecretRef(ref: OpenclawSecretRefLike): string {
   return "unknown SecretRef shape";
 }
 
-// Cheaply count the message-type lines in an openclaw session JSONL
-// so the plan summary can show a meaningful messageCount up front
-// without forcing apply to re-read every file. Skips header + non-
-// message records.
+// Count the messages an openclaw session JSONL will actually produce
+// as ChatMessageRecord rows in gini. Critically this MUST agree with
+// the apply-time filter in `parseOpenclawSessionTranscript`: that
+// function drops `type: "message"` lines whose content array
+// contains zero text blocks (e.g., tool_use / tool_result-only
+// messages). A divergent count surfaces as a plan summary that lies
+// to the operator — they're told the migration will produce 73
+// messages and apply produces 61. We pay for the extra parse work
+// here (a few more JSON.parse calls per file) in exchange for an
+// honest plan count.
 function countSessionMessages(sessionPath: string): number {
   try {
-    const raw = readFileSync(sessionPath, "utf8");
-    let count = 0;
-    for (const line of raw.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const parsed = JSON.parse(trimmed) as { type?: string };
-        if (parsed.type === "message") count += 1;
-      } catch {
-        // Skip malformed JSONL lines silently — the apply path will
-        // emit a per-line warning if needed.
-      }
-    }
-    return count;
+    return parseOpenclawSessionTranscript(sessionPath).messages.length;
   } catch {
     return 0;
   }
@@ -1276,8 +1269,20 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       if (!entry.endsWith(".jsonl")) continue;
       const sessionPath = join(sessionDir, entry);
       const sessionId = entry.slice(0, -".jsonl".length);
+      // `countSessionMessages` now applies the same content filter as
+      // the apply-time parser (text-only blocks survive), so a tool-
+      // only transcript reports 0 here and we drop it from the plan
+      // entirely. Surface it as an `unsupported` entry so the
+      // operator still sees the file was scanned and intentionally
+      // skipped, instead of silently disappearing from the report.
       const messageCount = countSessionMessages(sessionPath);
-      if (messageCount === 0) continue;
+      if (messageCount === 0) {
+        unsupported.push({
+          kind: `session:${agentId}/${sessionId}`,
+          detail: `Openclaw session ${sessionId} has no text-bearing messages (tool-only transcript or malformed JSONL); not migrated. Inspect the source JSONL in the archive zip if you need the original tool-call detail.`
+        });
+        continue;
+      }
       steps.push({
         kind: "session",
         openclawId: agentId,
