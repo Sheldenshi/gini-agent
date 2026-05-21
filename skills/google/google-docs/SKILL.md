@@ -5,11 +5,17 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Docs scopes."
 metadata:
   gini:
-    version: 1.0.0
+    version: 1.0.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
       commands: [gws]
+      env:
+        - GOOGLE_WORKSPACE_CLI_CLIENT_ID
+        - GOOGLE_WORKSPACE_CLI_CLIENT_SECRET
+    requires:
+      connectors:
+        - provider: google-oauth-desktop
 ---
 
 # Google Docs
