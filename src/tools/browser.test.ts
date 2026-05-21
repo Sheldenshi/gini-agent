@@ -19,6 +19,7 @@ import {
   withTeardownLock
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
+import { resolveApproval } from "../agent";
 import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
 import { createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -1837,6 +1838,273 @@ describe("dispatchToolCall(browser_upload_file)", () => {
     expect(state.approvals.length).toBe(0);
 
     rmSync(ROOT, { recursive: true, force: true });
+  });
+});
+
+// browser_connect dispatched through the chat-task tool dispatcher must
+// route through the approval gate (spawning a visible Chrome with a
+// per-instance profile is a trust-establishment moment that always
+// warrants explicit user consent under "auto" mode; only "yolo" auto-
+// approves and "strict" gates everything).
+describe("dispatchToolCall(browser_connect)", () => {
+  const ROOT = "/tmp/gini-browser-connect-dispatch-tests";
+  const WORKSPACE = join(ROOT, "workspace");
+
+  function dispatchConfig(instance: string): RuntimeConfig {
+    process.env.GINI_STATE_ROOT = ROOT;
+    process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
+    rmSync(`${ROOT}/instances/${instance}`, { recursive: true, force: true });
+    return {
+      instance,
+      port: 7339,
+      token: "test-token",
+      provider: { name: "echo", model: "gini-echo-v0" },
+      workspaceRoot: WORKSPACE,
+      stateRoot: `${ROOT}/instances/${instance}`,
+      logRoot: `${ROOT}-logs/${instance}`,
+      // Default ("auto") mode is the user-facing default. The policy
+      // seam routes browser.connect through gate under auto, so this
+      // is the expected production shape — no override needed.
+      approvalMode: "auto"
+    };
+  }
+
+  test("returns kind:'pending' with an approval row at risk 'medium' and action 'browser.connect'", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect test", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_1",
+      JSON.stringify({ reason: "Sign in to Google Cloud Console" })
+    );
+    expect(result.kind).toBe("pending");
+
+    const state = readState(config.instance);
+    const approval = state.approvals.find((a) =>
+      result.kind === "pending" && a.id === result.approvalId
+    );
+    expect(approval).toBeDefined();
+    expect(approval!.risk).toBe("medium");
+    expect(approval!.action).toBe("browser.connect");
+    // The reason flows onto the approval target so the UI surfaces it
+    // prominently in the approval card.
+    expect(approval!.target).toBe("Sign in to Google Cloud Console");
+    expect(approval!.payload.reason).toBe("Sign in to Google Cloud Console");
+    expect(approval!.payload.toolCallId).toBe("call_connect_1");
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  test("missing reason rejects without creating an approval row", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-missing-reason");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect missing reason", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    await expect(
+      dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_connect_missing_1",
+        JSON.stringify({})
+      )
+    ).rejects.toThrow(/reason/);
+    // No approval row should exist.
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // End-to-end coverage of the dispatch → approval → executor path. The
+  // dispatch must surface a pending approval; once the user approves
+  // (here via decideApproval, the same code path /approvals/<id>/approve
+  // takes), the executor calls connectBrowser with the strict-managed
+  // contract and the result reports `mode: "managed"`. A regression where
+  // the dispatch silently reused a stale CDP record (the round-9 finding 1
+  // bug) would show up here as `mode: "cdp"` in the executor result.
+  test("approving the dispatched approval invokes connectBrowser with mode managed", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-approve");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect approve", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // Seed an existing cdp-mode record so the strict-managed path has
+    // something to tear down. Without the strict-managed gate this is
+    // exactly the shape that would short-circuit and return cdp.
+    await mutateState(config.instance, (state) => {
+      state.browser = {
+        mode: "cdp",
+        cdpUrl: "ws://127.0.0.1:9222/devtools/browser/STALE",
+        pid: null,
+        dataDir: null,
+        chromePath: null,
+        startedAt: new Date().toISOString()
+      };
+    });
+
+    // Mock playwright-core so the executor's launchManaged path doesn't
+    // actually spawn Chrome. The fake context shape mirrors the one used
+    // in the strict-managed unit test.
+    const browserMod = await import("./browser");
+    browserMod.__test.installFakeCdpBrowserForTest({
+      disconnect: async () => undefined,
+      close: async () => undefined
+    });
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async () => ({
+          browser: () => ({ process: () => ({ pid: 1212 }) }),
+          close: async () => undefined
+        })
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_connect_approve_1",
+        JSON.stringify({ reason: "Sign in to Google Cloud Console" })
+      );
+      expect(result.kind).toBe("pending");
+      if (result.kind !== "pending") throw new Error("unreachable");
+      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+        actor: "user",
+        resumeChatTask: false
+      });
+      expect(approval.status).toBe("approved");
+      expect(toolResult).toBeDefined();
+      const parsed = JSON.parse(toolResult!) as {
+        success: boolean;
+        connected: boolean;
+        mode?: string;
+      };
+      expect(parsed.success).toBe(true);
+      expect(parsed.connected).toBe(true);
+      // Strict-managed contract — the executor must NOT silently hand back
+      // the cdp record we seeded above.
+      expect(parsed.mode).toBe("managed");
+      // Persisted record matches.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.mode).toBe("managed");
+      // Exactly one browser.connect audit row — the dispatch path passes
+      // skipAudit: true so the capability does not write its own row.
+      // Two rows would mean the capability's reasonless row leaked
+      // alongside the dispatch's richer row (round-9 finding 2).
+      const connectRows = readState(config.instance).audit.filter(
+        (row) => row.action === "browser.connect"
+      );
+      expect(connectRows.length).toBe(1);
+      // The single row is the dispatch's row — carries the user-facing
+      // reason and the approval id.
+      expect(connectRows[0]!.approvalId).toBe(result.approvalId);
+      expect(connectRows[0]!.target).toBe("Sign in to Google Cloud Console");
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+      rmSync(ROOT, { recursive: true, force: true });
+    }
+  });
+
+  // Headless-after-signin: the Workspace setup skill calls
+  // browser_connect { headless: true } AFTER the user signs in
+  // (and after a browser_close) so the rest of Cloud Console runs
+  // invisibly. The dispatch must accept the headless flag from the
+  // tool args, carry it through the approval payload, and pass it
+  // to connectBrowser when the user approves.
+  test("dispatch with headless: true forwards the flag through approval to launchManaged", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-headless");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect headless", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const browserMod = await import("./browser");
+    const launchCalls: Array<{ dataDir: string; options: Record<string, unknown> }> = [];
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string, options: Record<string, unknown>) => {
+          launchCalls.push({ dataDir, options });
+          return {
+            browser: () => ({ process: () => ({ pid: 3232 }) }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    browserMod.__test.resetChromiumImportForTest();
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "browser_connect",
+        "call_connect_headless_1",
+        JSON.stringify({
+          reason: "Continue Cloud Console setup invisibly",
+          headless: true
+        })
+      );
+      expect(result.kind).toBe("pending");
+      if (result.kind !== "pending") throw new Error("unreachable");
+      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+        actor: "user",
+        resumeChatTask: false
+      });
+      expect(approval.status).toBe("approved");
+      // Flag rode the approval payload from request → executor.
+      expect(approval.payload.headless).toBe(true);
+      expect(toolResult).toBeDefined();
+      const parsed = JSON.parse(toolResult!) as {
+        success: boolean;
+        connected: boolean;
+        mode?: string;
+        headless?: boolean;
+      };
+      expect(parsed.success).toBe(true);
+      expect(parsed.connected).toBe(true);
+      expect(parsed.mode).toBe("managed");
+      expect(parsed.headless).toBe(true);
+      // Playwright was invoked with headless: true.
+      expect(launchCalls.length).toBe(1);
+      expect(launchCalls[0]!.options.headless).toBe(true);
+      // Persisted record carries the flag for future reconnects.
+      const persisted = readState(config.instance).browser;
+      expect(persisted?.mode).toBe("managed");
+      expect(persisted?.headless).toBe(true);
+    } finally {
+      mock.restore();
+      browserMod.__test.uninstallFakeBrowserForTest();
+      browserMod.__test.clearFakeSessionsForTest();
+      browserMod.__test.resetChromiumImportForTest();
+      rmSync(ROOT, { recursive: true, force: true });
+    }
   });
 });
 

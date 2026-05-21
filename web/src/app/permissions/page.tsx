@@ -97,13 +97,28 @@ function ApprovalCard({
   pending?: boolean;
 }) {
   const diff = typeof approval.payload?.diff === "string" ? approval.payload.diff : null;
+  // `browser.connect` is a special case: there's no raw command to
+  // audit, so render a friendlier label and use the reason as the
+  // description instead of leaking the connect-endpoint internals.
+  const isBrowserConnect = approval.action === "browser.connect";
+  // `||` (not `??`) so an empty-string reason also falls back to the
+  // approval target. `??` only fires for null/undefined; a payload that
+  // carried `reason: ""` would otherwise render a blank card body.
+  const reasonText =
+    (typeof approval.payload?.reason === "string" && approval.payload.reason.length > 0
+      ? approval.payload.reason
+      : undefined) || approval.target;
   return (
     <Card>
       <CardHeader>
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
-            <CardTitle className="font-mono text-sm">{approval.action}</CardTitle>
-            <CardDescription className="line-clamp-1 font-mono text-[11px]">{approval.target}</CardDescription>
+            <CardTitle className="font-mono text-sm">
+              {isBrowserConnect ? "Open a browser window" : approval.action}
+            </CardTitle>
+            <CardDescription className="line-clamp-1 font-mono text-[11px]">
+              {isBrowserConnect ? reasonText : approval.target}
+            </CardDescription>
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
             {agentLabel ? (
@@ -114,14 +129,27 @@ function ApprovalCard({
                 {agentLabel}
               </span>
             ) : null}
-            <RiskPill value={approval.risk} />
+            {/*
+              Suppress the MEDIUM-RISK badge for `browser.connect`. The action
+              is still gated (the user still has to click Connect to consent)
+              but the visual framing is softer because this is a benign
+              sign-in step, not a destructive action. All other approvals
+              keep the badge.
+            */}
+            {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
             <StatusPill value={approval.status} />
           </div>
         </div>
       </CardHeader>
       <CardContent className="space-y-3">
-        <p className="text-sm">{approval.reason}</p>
-        {diff ? (
+        {/*
+          For browser.connect the user-facing reason (payload.reason ?? target)
+          is what we surface in chat and on the home pending list — match that
+          here. For other actions, `approval.reason` is the policy engine's
+          internal text (which is also what the rest of the UI shows).
+         */}
+        <p className="text-sm">{isBrowserConnect ? reasonText : approval.reason}</p>
+        {isBrowserConnect ? null : diff ? (
           <pre className="max-h-64 overflow-auto rounded-md border border-border bg-card/50 p-3 font-mono text-[11px]">
             {diff}
           </pre>
@@ -132,8 +160,12 @@ function ApprovalCard({
         )}
         {onDecide ? (
           <div className="flex gap-2">
-            <Button size="sm" disabled={pending} onClick={() => onDecide("approve")}>Approve</Button>
-            <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>Deny</Button>
+            <Button size="sm" disabled={pending} onClick={() => onDecide("approve")}>
+              {isBrowserConnect ? "Connect" : "Approve"}
+            </Button>
+            <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+              {isBrowserConnect ? "Cancel" : "Deny"}
+            </Button>
           </div>
         ) : null}
         <p className="font-mono text-[10px] text-muted-foreground">

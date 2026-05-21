@@ -78,7 +78,16 @@ describe("createAgent", () => {
     const created = await createAgent(config, { name: "inherited" });
     expect(created.providerName).toBe("codex");
     expect(created.model).toBe("gpt-5.5");
-    expect(created.toolsets).toEqual(["file", "terminal"]);
+    // Inherits the default agent's existing toolsets and also unions in
+    // the current desired defaults so a sibling created on an old instance
+    // (whose default-agent toolsets pre-date a new addition like `browser`)
+    // doesn't silently miss the new tool family.
+    expect(created.toolsets).toContain("file");
+    expect(created.toolsets).toContain("terminal");
+    expect(created.toolsets).toContain("memory");
+    expect(created.toolsets).toContain("session_search");
+    expect(created.toolsets).toContain("delegation");
+    expect(created.toolsets).toContain("browser");
     expect(created.messagingTargets).toEqual(["local"]);
   });
 

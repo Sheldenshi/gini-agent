@@ -52,6 +52,7 @@ import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
+import { connectBrowser } from "./capabilities/browser-connect";
 import {
   abortApprovalsForTask,
   claimApproval,
@@ -1019,7 +1020,7 @@ export function mapApprovalToPolicyAction(
     if (payload && typeof payload.source === "string") return "code.exec";
     return "terminal.exec";
   }
-  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file" || action === "browser.connect") {
     return action;
   }
   if (action === "messaging.send") {
@@ -1880,6 +1881,112 @@ async function runApprovedAction(
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
     }
     return resultStr;
+  }
+
+  if (approval.action === "browser.connect") {
+    // Reason is captured at request time so the audit row preserves
+    // WHY the user was asked to consent (e.g. "Sign in to Google
+    // Cloud Console"). The actual side effect — spawning a managed
+    // Chrome — runs through the same `connectBrowser` capability
+    // a `gini browser connect` CLI call uses, so the lifecycle is
+    // identical from the runtime's perspective.
+    const reason = typeof approval.payload.reason === "string" ? approval.payload.reason : "(no reason given)";
+    // Headless rides on the approval payload, captured at request time
+    // by requestBrowserConnect. Only an explicit boolean true unlocks
+    // the windowless launch — any other value (undefined, false,
+    // non-boolean) falls back to the visible default.
+    const headless = approval.payload.headless === true;
+    let result: string;
+    let succeeded = false;
+    let mode: string | undefined;
+    let dataDir: string | null | undefined;
+    let recordHeadless: boolean | undefined;
+    try {
+      if (signal.aborted) {
+        result = JSON.stringify({ success: false, aborted: true, error: "Browser connect aborted: task was cancelled." });
+      } else {
+        // connectBrowser is idempotent — if the user already has a
+        // managed Chrome attached, it returns the existing record
+        // without relaunching. That's the right shape for an agent
+        // calling this after an earlier connect.
+        //
+        // `mode: "managed"` enforces the approval card's contract: the
+        // user just consented to "Open a browser window," so a stale
+        // CDP-mode record (which may be headless or attached to a
+        // browser the user can't see) must be torn down and replaced
+        // with a fresh managed launch — never silently returned as-is.
+        //
+        // `headless` is passed through verbatim from the approval
+        // payload. When true, Playwright launches the same per-instance
+        // profile dir with headless: true — cookies from a prior
+        // visible session replay so the new context is already signed
+        // in.
+        //
+        // `skipAudit: true` because this dispatch already records a
+        // richer browser.connect audit row below (with the user-facing
+        // `reason` and the `approvalId`); letting the capability also
+        // write its own row would double-count the action and leave a
+        // reasonless row in the activity log. `skipAudit` lives on the
+        // third (internal) argument — NOT on the public `ConnectInput` —
+        // so an HTTP caller hitting `POST /api/browser/connect` with body
+        // `{"skipAudit": true}` cannot suppress its own audit row.
+        const status = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
+        succeeded = status.connected;
+        mode = status.record?.mode;
+        dataDir = status.record?.dataDir;
+        recordHeadless = status.record?.headless;
+        result = JSON.stringify({
+          success: succeeded,
+          connected: status.connected,
+          mode,
+          dataDir,
+          headless: recordHeadless
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result = JSON.stringify({ success: false, error: message });
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.connect",
+          target: reason,
+          risk: "medium",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          // Spread caller markers FIRST so canonical runtime fields can't
+          // be overwritten by smuggled keys. The side-effect audit
+          // mirrors the per-action shape of file.write / browser.upload_file.
+          evidence: { ...extraEvidence, reason, success: succeeded, mode, dataDir, headless: recordHeadless }
+        },
+        approvalAgentContext(approval)
+      );
+      if (approval.taskId && !chatToolCallId) {
+        completeApprovedTask(
+          state,
+          approval.taskId,
+          succeeded ? "Browser connect completed." : "Browser connect failed.",
+          succeeded ? undefined : "Browser connect failed."
+        );
+      }
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: succeeded ? "tool" : "error",
+        message: "Browser connect approved",
+        data: { reason, success: succeeded, mode, headless: recordHeadless }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
   }
 
   return undefined;

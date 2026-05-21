@@ -85,7 +85,7 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       instance,
       name: "browser",
       description: "Browser automation: navigate, snapshot, click, type, and inspect web pages.",
-      status: "disabled",
+      status: "enabled",
       toolNames: [
         "browser.navigate",
         "browser.snapshot",
@@ -102,7 +102,8 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
         "browser.select_option",
         "browser.wait_for",
         "browser.tabs",
-        "browser.upload_file"
+        "browser.upload_file",
+        "browser.connect"
       ],
       scopes: ["task", "job", "skill", "subagent"],
       createdAt: at,
@@ -139,6 +140,11 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
 // the active agent doesn't silently gate them out via the per-agent
 // intersection. The kill switch then lives where it should: on the
 // toolset's enabled/disabled status.
+//
+// `browser` is included so new agents can drive the headless Chrome
+// surface (navigate/snapshot/click/type/upload/etc.) on day one.
+// A migration in store.ts widens existing agent_default rows whose
+// toolsets predate this addition.
 export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "file",
   "terminal",
@@ -146,7 +152,8 @@ export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "session_search",
   "delegation",
   "messaging",
-  "mcp"
+  "mcp",
+  "browser"
 ];
 
 export function defaultAgent(instance: Instance, at: string): AgentRecord {

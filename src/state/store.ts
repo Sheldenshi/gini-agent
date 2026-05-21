@@ -569,6 +569,81 @@ function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState)
   }
 }
 
+// Union the desired default-agent toolsets list into existing
+// `agent_default` (and the legacy `profile_default`) records on disk.
+// Without this, an instance created before a new default toolset (e.g.
+// `browser`) was added still carries the old toolsets array, and
+// `resolveEffectiveContext` filters the tool catalog by that stale list —
+// so even though the toolset row itself is enabled by the global
+// backfill, the agent's whitelist still excludes the new tool family.
+//
+// Only touches the default agent records. User-authored agents keep
+// whatever toolsets they have; they were explicit picks.
+// Historical snapshots of the default-agent toolsets list. The migration
+// only fires when the agent's current toolsets exactly matches one of
+// these — that's the "user never customized" signal. If the user removed
+// or rearranged anything, we leave the list alone (they made an
+// explicit pick). Each snapshot represents a stable point in the
+// default's evolution before a new toolset was added.
+const HISTORICAL_DEFAULT_AGENT_TOOLSETS: ReadonlyArray<ReadonlyArray<string>> = [
+  // Pre-delegation, pre-messaging/mcp, pre-browser.
+  ["file", "terminal", "memory", "session_search"],
+  // Pre-messaging/mcp, pre-browser (handled by backfillDefaultAgentToolsets above).
+  ["file", "terminal", "memory", "session_search", "delegation"],
+  // Post-messaging/mcp, pre-browser. This is what backfillDefaultAgentToolsets
+  // produces when it fires on the prior-default snapshot.
+  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"]
+];
+
+function migrateDefaultAgentToolsets(state: RuntimeState, instance: Instance): void {
+  if (!Array.isArray(state.agents) || state.agents.length === 0) return;
+  const at = now();
+  const desired = defaultAgent(instance, at).toolsets;
+  if (!Array.isArray(desired) || desired.length === 0) return;
+  for (const agent of state.agents) {
+    if (agent.id !== "agent_default" && agent.id !== "profile_default") continue;
+    const existing = Array.isArray(agent.toolsets) ? agent.toolsets : null;
+    if (existing === null) {
+      agent.toolsets = [...desired];
+      agent.updatedAt = at;
+      continue;
+    }
+    // `profile_default` is the legacy agent id (renamed to
+    // `agent_default`). Anyone still on it has a stale config — always
+    // migrate it up to the current default without the customization
+    // check applied to `agent_default`.
+    const isLegacyDefault = agent.id === "profile_default";
+    const existingSet = new Set(existing);
+    if (!isLegacyDefault) {
+      // For `agent_default`, only union when the current toolsets exactly
+      // matches one of the historical snapshots OR the current desired
+      // default. Any divergence (user added/removed something) is treated
+      // as customization and left alone.
+      const matchesSnapshot = (snapshot: ReadonlyArray<string>): boolean => {
+        if (snapshot.length !== existing.length) return false;
+        for (const name of snapshot) {
+          if (!existingSet.has(name)) return false;
+        }
+        return true;
+      };
+      const isHistorical = HISTORICAL_DEFAULT_AGENT_TOOLSETS.some(matchesSnapshot);
+      const isCurrent = matchesSnapshot(desired);
+      if (!isHistorical && !isCurrent) continue;
+    }
+    let mutated = false;
+    for (const name of desired) {
+      if (!existingSet.has(name)) {
+        existing.push(name);
+        existingSet.add(name);
+        mutated = true;
+      }
+    }
+    if (mutated) {
+      agent.updatedAt = at;
+    }
+  }
+}
+
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
   migrateProfileFieldsToAgent(state);
   migrateLaneFieldToInstance(state);
@@ -667,6 +742,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // Runs after the default-agent seed branch above so the migration sees
   // a real `agent_default` row when one was just synthesized. Idempotent.
   backfillDefaultAgentToolsets(state);
+  // Union new default toolsets (e.g. `browser` after Phase 2) into the
+  // existing `agent_default` record. Runs after agents are populated;
+  // idempotent.
+  migrateDefaultAgentToolsets(state, instance);
   // Phase C — per-agent memory isolation backfill. Runs after agents are
   // present so the migration can stamp the right id. Both helpers are
   // idempotent so a re-read of an already-migrated state file is a no-op.

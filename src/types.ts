@@ -67,6 +67,13 @@ export interface BrowserConnectionRecord {
   chromePath: string | null;
   // ISO timestamp of when the connection record was created/updated.
   startedAt: string;
+  // True when the managed Chrome was launched with headless: true (no
+  // window). Defaults to false / absent for visible managed launches and
+  // for cdp mode. Tracked on the record so an idempotent reconnect can
+  // detect a headed/headless visibility mismatch and tear down + relaunch
+  // when the caller asks for a different visibility than the current
+  // record has.
+  headless?: boolean;
 }
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
@@ -517,6 +524,16 @@ export interface ChatMessageRecord {
   createdAt: string;
   taskId?: string;
   runId?: string;
+  // Optional tag used to distinguish multiple assistant messages emitted by
+  // the same task. Today only "approval_reason" is set — when an approval
+  // (e.g. connector.request) is created, the runtime persists its `reason`
+  // as a durable assistant bubble before the task pauses, so the user can
+  // scroll back and see what they were asked. Without this tag, the
+  // single-assistant-message-per-task assumption in syncChatTaskResult and
+  // getChatSession would either drop the reason or block the final summary
+  // from landing. Untagged assistant messages (the default) are the
+  // task's terminal summary.
+  kind?: string;
 }
 
 export interface TraceRecord {
@@ -810,7 +827,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "messaging.send";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "messaging.send";
   target: string;
   risk: RiskLevel;
   reason: string;

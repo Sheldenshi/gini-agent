@@ -420,6 +420,22 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     toolset: "browser",
     type: "function",
     function: {
+      name: "browser_connect",
+      description: "Spawn a visible managed Chrome window so the user can sign in to a third-party service (Google Cloud Console, Slack, etc). The user is prompted to approve. Use this BEFORE browser_navigate when the user needs to interact with a sign-in / OAuth page — Google blocks automated sign-in and a headless window cannot accept credentials. Requires `reason`: one short user-facing sentence shown on the approval card so the user knows why a browser is opening.",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Google Cloud Console')." },
+          headless: { type: "boolean", description: "Set `true` to relaunch as a headless (windowless) Chrome session using the same profile dir as the prior managed connect. Cookies from the visible session replay, so the headless session is already signed in. Use this AFTER sign-in to continue automation invisibly.", default: false }
+        },
+        required: ["reason"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
       name: "browser_vision",
       description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
       parameters: {
@@ -449,7 +465,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         type: "object",
         properties: {
           provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
-          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request." }
+          reason: { type: "string", description: "The full user-visible message shown above the inline Connect form. You are responsible for producing the complete text — including any URLs, project IDs, click instructions, or step-by-step guidance the user needs. Substitute any real values (project ids, etc.) directly into the string; do not leave `${...}` placeholders. The skill body (when one applies) shows the exact format to follow; copy it line-for-line, fill in the real values, and pass the result here verbatim." }
         },
         required: ["provider", "reason"]
       }
