@@ -459,6 +459,11 @@ export function readStateDotenv(stateRoot: string): Record<string, string> {
     ) {
       value = value.slice(1, -1);
     }
+    // Empty values are dropped for the same reason collectOpenclawEnv
+    // drops them: the Telegram/Discord token selection uses `?? ` and
+    // would otherwise treat an empty placeholder as a real value,
+    // shadowing the real token in a later tier of the chain.
+    if (value.length === 0) continue;
     out[name] = value;
   }
   return out;
@@ -470,17 +475,25 @@ export function readStateDotenv(stateRoot: string): Record<string, string> {
 // `env`, skipping only the structured `shellEnv` and `vars` slots.
 // Returns string values only — non-string entries are dropped because
 // they cannot land in a shell-sourced secrets.env.
+//
+// Empty strings are also dropped. The Telegram / Discord token
+// selection later uses `?? ` to fall through to the dotenv-file and
+// inline channel-config tiers; nullish coalescing only falls through
+// for null/undefined, so an empty placeholder at this tier
+// (e.g. openclaw.json carries `env: { vars: { TELEGRAM_BOT_TOKEN: "" } }`
+// and the real token lives in `<state>/.env`) would otherwise shadow
+// the real value and the bridge migration would silently fail.
 function collectOpenclawEnv(env: OpenclawConfig["env"]): Record<string, string> {
   const out: Record<string, string> = {};
   if (!env) return out;
   const direct = env as Record<string, unknown>;
   for (const [key, value] of Object.entries(direct)) {
     if (key === "shellEnv" || key === "vars") continue;
-    if (typeof value === "string") out[key] = value;
+    if (typeof value === "string" && value.length > 0) out[key] = value;
   }
   if (env.vars && typeof env.vars === "object") {
     for (const [key, value] of Object.entries(env.vars)) {
-      if (typeof value === "string") out[key] = value;
+      if (typeof value === "string" && value.length > 0) out[key] = value;
     }
   }
   return out;

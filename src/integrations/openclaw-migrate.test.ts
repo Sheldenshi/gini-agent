@@ -1377,6 +1377,49 @@ describe("planMigration", () => {
     expect(telegram?.tokenValue).toBe("tg-from-vars");
   });
 
+  test("empty TELEGRAM_BOT_TOKEN in env.vars falls through to the .env file", () => {
+    // The token selection uses `?? ` to fall back to dotenv/inline.
+    // Nullish coalescing only triggers on null/undefined, so without
+    // filtering, an empty placeholder in `env.vars` would shadow the
+    // real token in `.env`. collectOpenclawEnv / readStateDotenv must
+    // drop empties so the chain can reach the real value.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, ".env"),
+      `export TELEGRAM_BOT_TOKEN='tg-real-from-dotenv'\n`
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        channels: { telegram: { dmPolicy: "pairing" } },
+        env: { vars: { TELEGRAM_BOT_TOKEN: "" } }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find((step) => step.kind === "bridge") as {
+      tokenValue: string;
+    } | undefined;
+    expect(telegram?.tokenValue).toBe("tg-real-from-dotenv");
+  });
+
+  test("empty DISCORD_BOT_TOKEN in env.vars falls through to the inline channel token", () => {
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        channels: { discord: { botToken: "discord-real-inline" } },
+        env: { vars: { DISCORD_BOT_TOKEN: "" } }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const discord = plan.steps.find((step) => step.kind === "bridge") as {
+      tokenValue: string;
+    } | undefined;
+    expect(discord?.tokenValue).toBe("discord-real-inline");
+  });
+
   test("falls back to state-dir .env when config.env.vars omits the token", () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false, withDotenv: true });
     writeFileSync(
