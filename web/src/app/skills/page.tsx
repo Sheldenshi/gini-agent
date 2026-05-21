@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,6 +14,7 @@ import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
 import { useConnectors, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
+import type { ChatSession } from "@/lib/view-types";
 import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 
 type ReloadReport = {
@@ -41,6 +43,7 @@ interface InlineDialogState {
 }
 
 export default function SkillsPage() {
+  const router = useRouter();
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
@@ -133,6 +136,33 @@ export default function SkillsPage() {
     onSuccess: (result) => {
       toast.success(result.tombstoned ? "Disconnected (kept as tombstone)" : "Connector removed");
       invalidate(["connectors", "events", "skills"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  // "Set up via chat": some skills (notably the Google Workspace family)
+  // can't be wired up by entering a credential into a connector dialog —
+  // setup is an interactive CLI flow the agent walks the user through.
+  // For those, the right UX is to hand the user off to a fresh chat with
+  // a pre-sent prompt so the agent can drive the install + auth from
+  // there. We POST the session, send the seed message, then navigate.
+  const setupViaChat = useMutation({
+    mutationFn: async (skill: SkillRecord) => {
+      const session = await api<ChatSession>("/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: `Set up ${skill.name}` })
+      });
+      await api(`/chat/${session.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({
+          content: `Please help me set up the ${skill.name} skill.`
+        })
+      });
+      return session;
+    },
+    onSuccess: (session) => {
+      invalidate(["chat", "tasks"]);
+      router.push(`/chat?session=${session.id}`);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -261,6 +291,15 @@ export default function SkillsPage() {
                   providersById={providersById}
                 />
                 <div className="flex flex-wrap gap-2">
+                  {deriveActivation(detail, connectorsByProv, providersById).label === "needs setup" ? (
+                    <Button
+                      size="sm"
+                      disabled={setupViaChat.isPending}
+                      onClick={() => setupViaChat.mutate(detail)}
+                    >
+                      {setupViaChat.isPending ? "Opening chat…" : "Set up via chat"}
+                    </Button>
+                  ) : null}
                   <Button size="sm" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "test" })}>Test</Button>
                   {detail.status === "enabled" ? (
                     <Button size="sm" variant="outline" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>
