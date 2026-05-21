@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.2.2
+    version: 3.3.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -190,13 +190,52 @@ On Save, the connector is created with env bindings (`GOOGLE_WORKSPACE_CLI_CLIEN
 
 ## Step 6 — Run `gws auth login`
 
-```bash
-gws auth login -s drive,gmail,calendar,docs,meet,forms
+`gws` reads the Client ID and Client Secret from the env vars Gini binds (`GOOGLE_WORKSPACE_CLI_CLIENT_ID`, `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`) and starts a local HTTP server on a random port to receive the OAuth callback. It then prints a URL like:
+
+```text
+Open this URL in your browser to authenticate:
+
+  https://accounts.google.com/o/oauth2/auth?...&redirect_uri=http://localhost:NNNN&...
 ```
 
-`gws` reads the Client ID and Client Secret from the env vars Gini binds, opens the user's **default browser** for OAuth consent, and prompts them to pick scopes. The `-s` list picks default scopes for each service (read + write but not permanent delete or admin).
+and blocks waiting for the user to complete consent. **It does NOT spawn the browser itself** — despite what `gws auth login --help` claims. If you just run `gws auth login` from `terminal_exec`, the URL goes into Gini's captured stdout and the user never sees it.
 
-If `gws auth login` exits with an OAuth client error, the Client ID or Client Secret entered in Step 5 was wrong — re-run `request_connector` for `google-oauth-desktop` to capture the correct pair.
+To actually pop the browser, run gws in the background, scrape the URL out of its log, hand it to `open`, then wait for gws to finish. One `terminal_exec` call, single shell pipeline:
+
+```bash
+LOG=$(mktemp -t gws-auth.XXXXXX.log)
+gws auth login -s drive,gmail,calendar,docs,meet,forms > "$LOG" 2>&1 &
+GWS_PID=$!
+# Poll for the URL (gws prints it within a second of starting).
+URL=""
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  URL=$(grep -o 'https://accounts.google.com[^[:space:]]*' "$LOG" 2>/dev/null | head -1)
+  [ -n "$URL" ] && break
+  sleep 1
+done
+if [ -n "$URL" ]; then
+  open "$URL"
+else
+  echo "gws never printed the consent URL — aborting."
+  kill $GWS_PID 2>/dev/null
+  exit 1
+fi
+# Wait for the user to complete OAuth consent in the browser; gws exits when
+# its local callback server receives the code.
+wait $GWS_PID
+GWS_EXIT=$?
+cat "$LOG"
+rm -f "$LOG"
+exit $GWS_EXIT
+```
+
+The user's default browser pops to Google's consent page, they pick scopes and approve, gws receives the callback, the command exits. `terminal_exec`'s timeout should be generous (≥ 3 min) — most users take 20-60 s, but a forgotten 2FA prompt can stretch it.
+
+If `wait $GWS_PID` returns non-zero, gws's exit reason is in `$LOG` (printed before exit). Common cases:
+
+- "Token exchange failed: invalid_client" → Client ID or Client Secret entered in Step 5 was wrong; re-run `request_connector` for `google-oauth-desktop`.
+- "redirect_uri mismatch" → the Cloud Console OAuth client was created as Web type, not Desktop. Re-create as Desktop and re-paste.
+- The user closed the browser without approving → just re-run the same block. Idempotent.
 
 ### Picking scopes if the user wants narrower
 
