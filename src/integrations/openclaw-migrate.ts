@@ -82,7 +82,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import type {
   ChatMessageRecord,
   ChatSessionRecord,
@@ -1523,6 +1523,41 @@ export async function applyMigration(
     throw new Error(
       `\`zip\` exited with status ${zipResult.status} while archiving ${source.stateRoot} → ${archivePath}: ${stderr}`
     );
+  }
+  // Append the openclaw config file when it lives OUTSIDE the state
+  // root (e.g., the operator pointed OPENCLAW_CONFIG_PATH at a
+  // dedicated config dir). The recursive zip above captures only
+  // `source.stateRoot`; without this second pass, restoring from the
+  // archive would land an openclaw state with no `openclaw.json`,
+  // and the planner's `!source.configPath` guard would short-circuit
+  // with "No openclaw config found". `zip -j` strips the source path
+  // so the file lands at the archive root with just its basename
+  // (typically `openclaw.json`), matching the location the planner
+  // expects on restore.
+  if (source.configPath) {
+    const relativeConfig = relative(source.stateRoot, source.configPath);
+    const configOutsideStateRoot =
+      relativeConfig === "" || relativeConfig.startsWith("..");
+    if (configOutsideStateRoot) {
+      const appendResult = spawnSync(
+        "zip",
+        ["-jqg", archivePath, source.configPath],
+        { stdio: ["ignore", "pipe", "pipe"] }
+      );
+      if (appendResult.error) {
+        warnings.push(
+          `Failed to append external openclaw config ${source.configPath} to archive (${appendResult.error.message}). Restore would need the config copied separately.`
+        );
+      } else if (typeof appendResult.status === "number" && appendResult.status !== 0) {
+        const stderr =
+          appendResult.stderr && appendResult.stderr.length > 0
+            ? appendResult.stderr.toString("utf8").trim()
+            : "(no stderr)";
+        warnings.push(
+          `\`zip\` exited with status ${appendResult.status} appending external openclaw config to archive: ${stderr}. Restore would need the config copied separately.`
+        );
+      }
+    }
   }
   chmodSync(archivePath, 0o600);
 

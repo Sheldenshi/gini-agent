@@ -1937,6 +1937,49 @@ describe("applyMigration archive", () => {
     expect(existsSync(helperTarget)).toBe(true);
   });
 
+  test("archive captures external config when OPENCLAW_CONFIG_PATH points outside stateRoot", async () => {
+    // discoverOpenclawState honors OPENCLAW_CONFIG_PATH as a config-
+    // location override, but only when no explicit pathArg was passed
+    // (the explicit arg is the more specific operator gesture). The
+    // recursive zip only captures source.stateRoot, so without an
+    // explicit append the archive would silently drop the externally-
+    // located config and a restore would fail with the planner's
+    // "No openclaw config found" guard.
+    const externalConfigDir = `${ROOT}/external-config`;
+    rmSync(externalConfigDir, { recursive: true, force: true });
+    mkdirSync(externalConfigDir, { recursive: true });
+    const externalConfigPath = join(externalConfigDir, "openclaw.json");
+    writeFileSync(
+      externalConfigPath,
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    // No config inside stateRoot — the OPENCLAW_CONFIG_PATH override is
+    // the only place the config exists.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(join(OPENCLAW_ROOT, "marker.txt"), "outside-config");
+    process.env.OPENCLAW_STATE_DIR = OPENCLAW_ROOT;
+    process.env.OPENCLAW_CONFIG_PATH = externalConfigPath;
+    try {
+      const config = loadConfig("archive-external-config");
+      // No pathArg → env overrides apply: state from OPENCLAW_STATE_DIR,
+      // config from OPENCLAW_CONFIG_PATH.
+      const discovery = discoverOpenclawState();
+      expect(discovery.configPath).toBe(externalConfigPath);
+      expect(discovery.stateRoot).toBe(OPENCLAW_ROOT);
+      const result = await applyMigration(config, discovery, planMigration(discovery));
+      expect(result.applied).toBe(true);
+      // Archive must contain BOTH the state-root marker and the external
+      // config's basename at the archive root.
+      const listing = execFileSync("unzip", ["-l", result.archivePath!], { encoding: "utf8" });
+      expect(listing).toContain("marker.txt");
+      expect(listing).toContain("openclaw.json");
+    } finally {
+      delete process.env.OPENCLAW_STATE_DIR;
+      delete process.env.OPENCLAW_CONFIG_PATH;
+    }
+  });
+
   test("archive directory + file land at owner-only modes (0700 / 0600)", async () => {
     // The archive carries a verbatim copy of every plaintext credential
     // the openclaw state held; per-instance secrets elsewhere in gini
