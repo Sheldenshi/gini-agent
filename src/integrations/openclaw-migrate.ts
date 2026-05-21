@@ -1304,6 +1304,21 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       // in ~/.gini/secrets.env but the runtime would never read it.
       const envVar = canonicalApiKeyEnv(giniProvider);
       if (!envVar) continue;
+      // Run the apply-time header-safe gate at plan time too. Otherwise
+      // a malformed FIRST profile (newline in the key, control byte,
+      // etc.) would claim the env-var slot in `seenSecretEnv` here,
+      // and any later valid profile for the same provider would be
+      // dropped into the unsupported list as a "duplicate" — even
+      // though the first profile gets rejected at apply time and the
+      // operator ends up with no migrated key at all. Doing the
+      // check here lets a valid later profile take the slot.
+      if (!isHeaderSafeApiKey(plaintext)) {
+        unsupported.push({
+          kind: `provider:${profile.provider ?? giniProvider}:malformed`,
+          detail: `Openclaw auth profile for '${envVar}' carries a value with characters that aren't header-safe printable ASCII (newline, control byte, etc.) and would never reach the runtime via secrets.env. Skipped; a later valid profile for the same provider, if any, can take the slot.`
+        });
+        continue;
+      }
       if (seenSecretEnv.has(envVar)) {
         // Openclaw lets operators store multiple auth profiles per
         // provider for rotation/failover; gini's secrets.env stores

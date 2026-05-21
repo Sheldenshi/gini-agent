@@ -1673,6 +1673,53 @@ describe("summarizePlan", () => {
     expect(summary.counts.sessionMessages).toBe(3);
     expect(summary.counts.memoryUnits).toBe(2);
   });
+
+  test("malformed first provider key doesn't block a valid duplicate from taking the slot", () => {
+    // Previously a header-unsafe first profile claimed the env-var
+    // slot in seenSecretEnv at plan time; the apply-time header check
+    // then rejected it, but the second profile had already been
+    // dropped as "duplicate", so the operator ended up with no
+    // migrated key. Running the header-safe gate at plan time lets
+    // the valid second profile take the slot.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const agentDir = join(OPENCLAW_ROOT, "agents", "main", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(
+      join(agentDir, "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-first": {
+            type: "api_key",
+            provider: "openai",
+            // Header-unsafe: embedded newline.
+            key: "sk-malformed\nexport EVIL=oops"
+          },
+          "openai-second": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-valid-second-key"
+          }
+        }
+      })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const secret = plan.steps.find((step) => step.kind === "secret") as
+      | { envVar: string; valueFrom: string }
+      | undefined;
+    expect(secret?.envVar).toBe("OPENAI_API_KEY");
+    expect(secret?.valueFrom).toBe("sk-valid-second-key");
+    expect(
+      plan.unsupported.some(
+        (entry) => entry.kind.endsWith(":malformed") && entry.detail.includes("header-safe")
+      )
+    ).toBe(true);
+  });
 });
 
 describe("applyMigration", () => {
@@ -2092,14 +2139,21 @@ describe("applyMigration", () => {
     );
     const config = loadConfig("malformed-api-key");
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
-    const result = await applyMigration(config, discovery, planMigration(discovery));
-    expect(result.secretsWritten).toBe(0);
+    const plan = planMigration(discovery);
+    // The header-safe gate now runs at plan time, so the malformed
+    // key never becomes a `secret` step in the first place and lands
+    // on the unsupported list with a `:malformed` kind.
+    expect(plan.steps.some((step) => step.kind === "secret")).toBe(false);
     expect(
-      result.warnings.some(
-        (warning) =>
-          warning.includes("OPENAI_API_KEY") && warning.includes("header-safe")
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind.endsWith(":malformed") &&
+          entry.detail.includes("OPENAI_API_KEY") &&
+          entry.detail.includes("header-safe")
       )
     ).toBe(true);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.secretsWritten).toBe(0);
   });
 
   test("rejects malformed bot tokens before they reach the encrypted store", async () => {
