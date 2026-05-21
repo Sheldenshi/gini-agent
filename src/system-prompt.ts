@@ -18,7 +18,12 @@ export const IDENTITY_FULL_REFRESH_INTERVAL = 10;
 const IDENTITY_HEADER = "Your runtime identity:";
 const IDENTITY_DELTA_HEADER = "Runtime identity changes since last turn:";
 
-const INSTRUCTIONS = [
+// Baseline operating-rules preamble. Lives in source so a fresh instance
+// has a working preamble without any filesystem setup. When
+// ~/.gini/instances/<inst>/INSTRUCTIONS.md is present, the chat-task /
+// provider call sites pass its content in as `instructionsOverride` and
+// the override wins. See ADR runtime-identity-files.md.
+export const DEFAULT_GINI_INSTRUCTIONS = [
   "You are Gini, a local-first personal agent.",
   "Reply directly and concisely.",
   "When the user asks for an action you have a tool for, execute it; do not narrate what you would do.",
@@ -32,24 +37,60 @@ const INSTRUCTIONS = [
   "Before claiming a capability gap (Telegram, MCP, connectors, subagents, messaging, etc.), load the `gini` skill — it documents what is built in and how to wire it up."
 ].join("\n");
 
-// Assemble the system-area context: base instructions + identity block +
-// pinned memories + long-term recalled memory. Placing memory in the system
-// channel (rather than the user message) gives it higher-priority placement
-// without talking the model into believing it. The identity block sits
-// directly after INSTRUCTIONS so the model encounters self-context before
-// any user/world facts.
+export interface AgentSystemContextOptions {
+  // When set, replaces DEFAULT_GINI_INSTRUCTIONS as the operating-rules
+  // preamble. Sourced from ~/.gini/instances/<inst>/INSTRUCTIONS.md by
+  // the call sites; absent files fall back to the default.
+  instructionsOverride?: string;
+  // Per-agent persona body sourced from
+  // ~/.gini/instances/<inst>/agents/<agentId>/SOUL.md. Sits between
+  // instructions and the identity block.
+  soul?: string;
+  // Instance-scoped user profile body sourced from
+  // ~/.gini/instances/<inst>/USER.md. Sits between pinned memories and
+  // recalled long-term memory so the model encounters "who am I talking
+  // to" right before "what do I remember about prior conversations".
+  userProfile?: string;
+}
+
+// Assemble the system-area context. The block order encodes a stable
+// "agent → persona → self → user-curated facts → recalled memory"
+// progression so the model encounters its own identity before any
+// user/world facts.
+//
+// Order (each block elided when empty):
+//   1. INSTRUCTIONS — operating rules (file override or default).
+//   2. SOUL.md      — per-agent persona.
+//   3. identity     — runtime identity block (instance/agent/provider/...).
+//   4. pinned       — legacy MemoryRecord rows (always relevant facts).
+//   5. USER.md      — instance-scoped user profile.
+//   6. recalled     — Hindsight long-term memory.
+//
+// Placing memory in the system channel (rather than the user message)
+// gives it higher-priority placement without talking the model into
+// believing it. See ADR runtime-identity-files.md.
 export function buildAgentSystemContext(
   memories: MemoryRecord[],
   recalledContext?: string,
-  identityBlock?: string
+  identityBlock?: string,
+  options?: AgentSystemContextOptions
 ): string {
-  const parts = [INSTRUCTIONS];
+  const instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
+    ? options.instructionsOverride
+    : DEFAULT_GINI_INSTRUCTIONS;
+  const parts: string[] = [instructions];
+  if (options?.soul && options.soul.trim().length > 0) {
+    parts.push(options.soul);
+  }
   if (identityBlock && identityBlock.length > 0) {
     parts.push(identityBlock);
   }
   if (memories.length > 0) {
     const pinned = memories.map((memory) => `- ${memory.content}`).join("\n");
     parts.push(`Pinned memories about this user (curated, always relevant):\n${pinned}`);
+  }
+  if (options?.userProfile && options.userProfile.trim().length > 0) {
+    parts.push(options.userProfile);
   }
   if (recalledContext && recalledContext.trim().length > 0) {
     parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);

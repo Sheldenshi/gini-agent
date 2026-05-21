@@ -5,12 +5,29 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  DEFAULT_GINI_INSTRUCTIONS,
   IDENTITY_FULL_REFRESH_INTERVAL,
+  buildAgentSystemContext,
   decideIdentityEmission,
   renderFullIdentity,
   renderIdentityDelta
 } from "./system-prompt";
-import type { AgentIdentity, IdentitySnapshotRecord } from "./types";
+import type { AgentIdentity, IdentitySnapshotRecord, MemoryRecord } from "./types";
+
+function makeMemory(content: string, id = "mem_x"): MemoryRecord {
+  return {
+    id,
+    instance: "test",
+    agentId: "agent_test",
+    content,
+    confidence: 1,
+    sensitivity: "normal",
+    provenance: "test",
+    status: "active",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  } as MemoryRecord;
+}
 
 function makeIdentity(overrides: Partial<AgentIdentity> = {}): AgentIdentity {
   return {
@@ -136,5 +153,74 @@ describe("decideIdentityEmission", () => {
     const snapshot: IdentitySnapshotRecord = { identity: current, lastFullTurn: 1 };
     const decision = decideIdentityEmission(current, snapshot, 1 + IDENTITY_FULL_REFRESH_INTERVAL);
     expect(decision.content).toContain("Your runtime identity:");
+  });
+});
+
+describe("buildAgentSystemContext", () => {
+  test("uses DEFAULT_GINI_INSTRUCTIONS when no override is provided", () => {
+    const out = buildAgentSystemContext([], undefined, undefined);
+    expect(out).toBe(DEFAULT_GINI_INSTRUCTIONS);
+  });
+
+  test("instructionsOverride wins over the default constant", () => {
+    const out = buildAgentSystemContext([], undefined, undefined, {
+      instructionsOverride: "Custom rules only."
+    });
+    expect(out).toBe("Custom rules only.");
+    expect(out).not.toContain("local-first personal agent");
+  });
+
+  test("blank instructionsOverride falls back to the default", () => {
+    // Whitespace-only override should not silently empty the preamble.
+    const out = buildAgentSystemContext([], undefined, undefined, {
+      instructionsOverride: "   \n"
+    });
+    expect(out).toBe(DEFAULT_GINI_INSTRUCTIONS);
+  });
+
+  test("assembles blocks in the documented order: instructions, soul, identity, pinned, user, recalled", () => {
+    const identityBlock = "Your runtime identity:\n- instance: test";
+    const out = buildAgentSystemContext(
+      [makeMemory("Pinned fact A", "mem_a"), makeMemory("Pinned fact B", "mem_b")],
+      "1. (semantic) recalled snippet",
+      identityBlock,
+      {
+        instructionsOverride: "RULES",
+        soul: "SOUL persona body",
+        userProfile: "USER profile body"
+      }
+    );
+    const rulesIdx = out.indexOf("RULES");
+    const soulIdx = out.indexOf("SOUL persona body");
+    const identityIdx = out.indexOf("Your runtime identity:");
+    const pinnedIdx = out.indexOf("Pinned memories about this user");
+    const userIdx = out.indexOf("USER profile body");
+    const recalledIdx = out.indexOf("Long-term memory");
+    expect(rulesIdx).toBe(0);
+    expect(rulesIdx).toBeLessThan(soulIdx);
+    expect(soulIdx).toBeLessThan(identityIdx);
+    expect(identityIdx).toBeLessThan(pinnedIdx);
+    expect(pinnedIdx).toBeLessThan(userIdx);
+    expect(userIdx).toBeLessThan(recalledIdx);
+  });
+
+  test("elides soul and userProfile blocks when blank or absent", () => {
+    const out = buildAgentSystemContext([], undefined, "ID-BLOCK", {
+      instructionsOverride: "RULES",
+      soul: "   ",
+      userProfile: ""
+    });
+    expect(out).toBe(["RULES", "ID-BLOCK"].join("\n\n"));
+  });
+
+  test("preserves prior contract: memories+recalled with no override or files", () => {
+    // Existing callers that don't pass the new options object must keep
+    // producing the same block shape as before.
+    const out = buildAgentSystemContext([makeMemory("Fact one")], "1. (semantic) snip");
+    expect(out).toContain(DEFAULT_GINI_INSTRUCTIONS);
+    expect(out).toContain("Pinned memories about this user");
+    expect(out).toContain("Long-term memory of prior conversations");
+    expect(out).not.toContain("SOUL");
+    expect(out).not.toContain("USER profile");
   });
 });

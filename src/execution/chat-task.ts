@@ -35,6 +35,7 @@ import {
   decideIdentityEmission,
   renderFullIdentity
 } from "../system-prompt";
+import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity-files";
 import type {
   AgentIdentity,
   CostRecord,
@@ -223,9 +224,32 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
       identityBlock = renderFullIdentity(identity);
     }
   }
+  // Runtime identity files (INSTRUCTIONS.md / SOUL.md / USER.md). The
+  // subagent path opts out — subagents already get an override prompt.
+  // Blocked files emit a runtime trace warning but never crash the
+  // gateway. See ADR runtime-identity-files.md.
+  let instructionsOverride: string | undefined;
+  let soulBlock: string | undefined;
+  let userProfileBlock: string | undefined;
+  if (!subagent) {
+    const onBlocked = (filename: string, findings: string[]): void => {
+      appendTrace(config.instance, taskId, {
+        type: "model",
+        message: `identity file blocked: ${filename}`,
+        data: { filename, findings }
+      });
+    };
+    instructionsOverride = loadInstructions(config.instance, { onBlocked }) ?? undefined;
+    soulBlock = loadSoul(config.instance, effectiveForAgent.agentId, { onBlocked }) ?? undefined;
+    userProfileBlock = loadUserProfile(config.instance, { onBlocked }) ?? undefined;
+  }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
-    : buildAgentSystemContext(activeMemory, recalledContext, identityBlock);
+    : buildAgentSystemContext(activeMemory, recalledContext, identityBlock, {
+        instructionsOverride,
+        soul: soulBlock,
+        userProfile: userProfileBlock
+      });
   const filteredSkills = filterSkillsForSubagent(state.skills, subagent);
   const visibleSkills = filteredSkills.filter((skill) => isSkillActive(state, skill));
   const skillsBlock = buildEnabledSkillsBlock(visibleSkills);

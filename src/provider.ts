@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildAgentSystemContext } from "./system-prompt";
+import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
+import { readState } from "./state";
 import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -834,11 +836,36 @@ export async function generateTaskSummary(
     };
   }
 
-  const systemContext = buildAgentSystemContext(memories, recalledContext);
+  // Runtime identity files. The legacy single-shot path doesn't carry
+  // the chat-task identity block, but it still benefits from a
+  // user-curated INSTRUCTIONS.md / USER.md and the active agent's
+  // SOUL.md. Active-agent lookup is best-effort — when no agent is
+  // active the SOUL.md block is elided. See ADR runtime-identity-files.md.
+  const activeAgentId = resolveActiveAgentId(config);
+  const instructionsOverride = loadInstructions(config.instance) ?? undefined;
+  const soulBlock = loadSoul(config.instance, activeAgentId) ?? undefined;
+  const userProfileBlock = loadUserProfile(config.instance) ?? undefined;
+  const systemContext = buildAgentSystemContext(memories, recalledContext, undefined, {
+    instructionsOverride,
+    soul: soulBlock,
+    userProfile: userProfileBlock
+  });
   if (provider.name === "openrouter" || provider.name === "local") {
     return callChatCompletions(provider, input, systemContext);
   }
   return callOpenAIResponses(provider, input, systemContext, onDelta);
+}
+
+// Best-effort active-agent resolution for the legacy single-shot path.
+// Reads state once; failures (missing state file in tests, etc.) leave
+// the SOUL.md block elided. The modern chat-task path threads the
+// agent through resolveEffectiveContext and never falls back to this.
+function resolveActiveAgentId(config: RuntimeConfig): string | undefined {
+  try {
+    return readState(config.instance).activeAgentId;
+  } catch {
+    return undefined;
+  }
 }
 
 // Hindsight phase 2 — structured-output helper.
