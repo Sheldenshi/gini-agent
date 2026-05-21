@@ -69,6 +69,7 @@
 // in-process apply path sees plaintexts.
 
 import {
+  chmodSync,
   copyFileSync,
   cpSync,
   existsSync,
@@ -1458,8 +1459,24 @@ export async function applyMigration(
   // because the safety net is non-optional — the operator explicitly
   // asked for it ("migrations should not delete data, so we will
   // still need the originals once things are moved over").
+  // Mirror the per-instance secret store's mode contract: imports dir
+  // 0700, archive file 0600. The archive carries a verbatim copy of
+  // every plaintext credential the openclaw state held (provider keys
+  // in auth-profiles.json, bot tokens in .env / inline channel config)
+  // — the same material the migrator otherwise tightens via
+  // writeKeyToSecretsEnv (0600 chmod) and writeSecret (FILE_MODE=0o600,
+  // DIR_MODE=0o700). Writing the archive at the umask default (typically
+  // 0644 file / 0755 dir) would create an exfiltration surface the rest
+  // of gini explicitly avoids: anyone with read on the imports
+  // directory (other local users, untrusted backup processes, an
+  // accidental upload) would get every key the migrator just locked
+  // down. mkdirSync's mode is only honored on initial create, so we
+  // chmod after to cover the recursive=true re-create case; chmod on
+  // the archive file runs after zip writes it so the result is owner-
+  // read-only even if the operator's umask was permissive.
   const importsDir = join(instanceRoot(config.instance), "imports");
-  mkdirSync(importsDir, { recursive: true });
+  mkdirSync(importsDir, { recursive: true, mode: 0o700 });
+  chmodSync(importsDir, 0o700);
   const archiveStamp = now().replace(/[:.]/g, "-");
   archivePath = join(importsDir, `openclaw-${archiveStamp}.zip`);
   const zipResult = spawnSync("zip", ["-rqy", archivePath, "."], {
@@ -1480,6 +1497,7 @@ export async function applyMigration(
       `\`zip\` exited with status ${zipResult.status} while archiving ${source.stateRoot} → ${archivePath}: ${stderr}`
     );
   }
+  chmodSync(archivePath, 0o600);
 
   // 1) Provider secrets to ~/.gini/secrets.env. Done first so a freshly
   // installed gini picks them up on the next `gini run`. Mirror the

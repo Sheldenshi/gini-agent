@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -1853,6 +1853,23 @@ describe("applyMigration archive", () => {
     const listing = execFileSync("unzip", ["-l", archive], { encoding: "utf8" });
     expect(listing).toContain("marker.txt");
     expect(listing).toContain("openclaw.json");
+  });
+
+  test("archive directory + file land at owner-only modes (0700 / 0600)", async () => {
+    // The archive carries a verbatim copy of every plaintext credential
+    // the openclaw state held; per-instance secrets elsewhere in gini
+    // use mode 0700/0600, so the archive must match to avoid an
+    // exfiltration surface that the rest of the codebase explicitly
+    // avoids. mkdirSync(mode: 0o700) handles the first-create case;
+    // chmodSync after handles the recursive-re-create case where mode
+    // is silently ignored.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withAuthProfile: true });
+    const config = loadConfig("archive-perms");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    const importsDir = join(GINI_STATE, "instances", "archive-perms", "imports");
+    expect(statSync(importsDir).mode & 0o777).toBe(0o700);
+    expect(statSync(result.archivePath!).mode & 0o777).toBe(0o600);
   });
 
   test("apply records the archive path in the import-report findings", async () => {
