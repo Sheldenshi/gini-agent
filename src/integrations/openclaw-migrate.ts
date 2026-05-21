@@ -94,11 +94,12 @@ export interface OpenclawDiscovery {
   agentsDir: string;
 }
 
-// Openclaw's AgentModelConfig (cribbed verbatim from
-// `/tmp/openclaw/src/config/types.agents-shared.ts:8-15`): either a
-// "provider/model" string or an object with `primary` plus optional
-// `fallbacks`. We only need the primary slot for the migration since
-// gini stores a single provider+model per agent today.
+// Openclaw's AgentModelConfig, mirrored from the upstream schema at
+// https://github.com/openclaw/openclaw/blob/v2026.5.19/src/config/types.agents-shared.ts
+// (lines 8-15): either a "provider/model" string or an object with
+// `primary` plus optional `fallbacks`. We only need the primary slot
+// for the migration since gini stores a single provider+model per
+// agent today.
 type OpenclawAgentModelConfig = string | { primary?: string; fallbacks?: string[] };
 
 interface OpenclawAgentConfig {
@@ -837,9 +838,9 @@ export async function applyMigration(
   // can lose updates even though the atomic tmp+rename prevents torn
   // writes. Refuse to mutate while a gateway is up on this instance —
   // the user runs `gini stop --instance <x>` first, applies, then
-  // restarts. No --force override here on purpose: foot-gunning the
-  // running gateway's own writes is exactly the failure mode the
-  // validator surfaced.
+  // restarts. No --force override here on purpose: silently losing the
+  // running gateway's writes is the failure mode the gate exists to
+  // prevent, and an override would invite the exact foot-gun.
   const running = detectRunningGateway(config.instance);
   if (running) {
     throw new Error(
@@ -1051,8 +1052,10 @@ export async function applyMigration(
     // need the bridge id (and existence flag) out of state here; we
     // intentionally do NOT keep a reference to the bridge object,
     // because the second mutateState below re-reads state from disk and
-    // returns a different object graph. Mutating the stale object would
-    // be silently dropped — exactly the bug the validator confirmed.
+    // returns a different object graph. Mutating an object reference
+    // from the first call would land on a stale snapshot that gets
+    // discarded before the next write, so the rotation appears to
+    // succeed (no error) while the metadata never persists.
     const decision = await mutateState(config.instance, (state) => {
       const found = state.messagingBridges.find(
         (bridge) => bridge.kind === step.bridgeKind
