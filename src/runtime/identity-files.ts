@@ -273,3 +273,99 @@ function promote(proposedPath: string, approvedPath: string): boolean {
   renameSync(proposedPath, approvedPath);
   return true;
 }
+
+// ---------------------------------------------------------------------------
+// Remove path. Drop a paragraph (block delimited by blank lines) that
+// contains a substring from the approved file body. Writes the result
+// through the same propose/approve gate as `writeSoul` / `writeUserProfile`,
+// so a remove never reaches the prompt until the user approves it.
+// ---------------------------------------------------------------------------
+
+// Discriminated success/failure result. On success the caller gets the
+// usual write result (path + status + scanFindings); on failure the
+// reason is enumerated so the dispatch layer can surface a clean message
+// to the model instead of guessing at why nothing changed.
+export type IdentityFileRemoveResult =
+  | ({ ok: true } & IdentityFileWriteResult)
+  | { ok: false; reason: "no source" | "no match" };
+
+// Split the body on blank lines, drop the first paragraph that contains
+// the needle, and rejoin. The needle match is a plain substring check
+// (no regex) so callers don't have to escape user input. A "paragraph"
+// is one or more non-blank lines bounded by blank lines or the file
+// edges — the same unit the `append` action separates with `\n\n`.
+function dropParagraphContaining(body: string, needle: string): { changed: boolean; result: string } {
+  if (needle.length === 0) return { changed: false, result: body };
+  // Normalize line endings so we can scan paragraph blocks without
+  // worrying about CRLF mixed input from a user edit on Windows.
+  const normalized = body.replace(/\r\n/g, "\n");
+  const paragraphs = normalized.split(/\n{2,}/);
+  let dropped = false;
+  const kept: string[] = [];
+  for (const para of paragraphs) {
+    if (!dropped && para.includes(needle)) {
+      dropped = true;
+      continue;
+    }
+    kept.push(para);
+  }
+  if (!dropped) return { changed: false, result: body };
+  return { changed: true, result: kept.join("\n\n").trim() };
+}
+
+function removeIdentityFileSection(
+  approvedPath: string,
+  proposedPath: string,
+  needle: string,
+  status: IdentityFileStatus,
+  displayName: string
+): IdentityFileRemoveResult {
+  if (!existsSync(approvedPath)) {
+    return { ok: false, reason: "no source" };
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(approvedPath, "utf8");
+  } catch {
+    // Treat an unreadable approved file the same as a missing one. The
+    // gateway must not crash on a transient filesystem error.
+    return { ok: false, reason: "no source" };
+  }
+  const { changed, result } = dropParagraphContaining(raw, needle);
+  if (!changed) {
+    return { ok: false, reason: "no match" };
+  }
+  const scan = scanForInjection(result, displayName);
+  const targetPath = status === "approved" ? approvedPath : proposedPath;
+  writeFileSafe(targetPath, result);
+  return { ok: true, path: targetPath, status, scanFindings: scan.findings };
+}
+
+export function removeSoulSection(
+  instance: Instance,
+  agentId: string,
+  needle: string,
+  status: IdentityFileStatus
+): IdentityFileRemoveResult {
+  return removeIdentityFileSection(
+    soulPath(instance, agentId),
+    soulProposedPath(instance, agentId),
+    needle,
+    status,
+    "SOUL.md"
+  );
+}
+
+export function removeUserProfileSection(
+  instance: Instance,
+  needle: string,
+  status: IdentityFileStatus
+): IdentityFileRemoveResult {
+  return removeIdentityFileSection(
+    userProfilePath(instance),
+    userProfileProposedPath(instance),
+    needle,
+    status,
+    "USER.md"
+  );
+}

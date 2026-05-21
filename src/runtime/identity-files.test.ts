@@ -12,6 +12,8 @@ import {
   loadInstructions,
   loadSoul,
   loadUserProfile,
+  removeSoulSection,
+  removeUserProfileSection,
   scanForInjection,
   soulPath,
   soulProposedPath,
@@ -198,6 +200,53 @@ describe("identity-files", () => {
 
     test("returns false when no proposal exists", () => {
       expect(approveUserProfile(INSTANCE)).toBe(false);
+    });
+  });
+
+  describe("removeSoulSection + removeUserProfileSection", () => {
+    test("drops the paragraph containing the needle and writes the proposal", () => {
+      writeSoul(INSTANCE, AGENT, "Persona one.\n\nFavorite color: blue.\n\nPersona three.", "approved");
+      const result = removeSoulSection(INSTANCE, AGENT, "Favorite color", "proposed");
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.path).toBe(soulProposedPath(INSTANCE, AGENT));
+        // Approved file is untouched — propose-vs-approve gate.
+        expect(readFileSync(soulPath(INSTANCE, AGENT), "utf8")).toContain("Favorite color");
+        // Proposed body drops the matched paragraph.
+        const proposed = readFileSync(soulProposedPath(INSTANCE, AGENT), "utf8");
+        expect(proposed).toContain("Persona one.");
+        expect(proposed).toContain("Persona three.");
+        expect(proposed).not.toContain("Favorite color");
+      }
+    });
+
+    test("returns { ok: false, reason: 'no match' } when needle isn't found", () => {
+      writeUserProfile(INSTANCE, "Likes coffee.\n\nDislikes commute traffic.", "approved");
+      const result = removeUserProfileSection(INSTANCE, "favorite movie", "proposed");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("no match");
+      }
+      // No proposal was written.
+      expect(existsSync(userProfileProposedPath(INSTANCE))).toBe(false);
+      // Approved file is untouched.
+      expect(readFileSync(userProfilePath(INSTANCE), "utf8")).toContain("Likes coffee.");
+    });
+
+    test("returns { ok: false, reason: 'no source' } when no approved file exists", () => {
+      const result = removeSoulSection(INSTANCE, AGENT, "anything", "proposed");
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe("no source");
+      }
+    });
+
+    test("works on a single-paragraph body (drops the only paragraph)", () => {
+      writeUserProfile(INSTANCE, "Solo paragraph mentioning a fact.", "approved");
+      const result = removeUserProfileSection(INSTANCE, "fact", "proposed");
+      expect(result.ok).toBe(true);
+      const proposed = readFileSync(userProfileProposedPath(INSTANCE), "utf8");
+      expect(proposed.trim()).toBe("");
     });
   });
 });

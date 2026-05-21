@@ -54,6 +54,10 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 - `src/execution/chat-task.ts` (modern agent loop) and `src/provider.ts::generateTaskSummary` (legacy single-shot path) load the three files via `identity-files.ts` and pass them through `buildAgentSystemContext`.
 - `src/execution/tool-catalog.ts` adds `edit_soul` and `edit_user_profile` tools (toolset `identity`, always exposed alongside `add_memory`). Both tools propose a new file body; the body lands as `<file>.proposed` and is reflected in the audit + trace stream.
 - `src/execution/tool-dispatch.ts` routes `edit_soul` / `edit_user_profile` to handlers that call into `identity-files.ts`. The handlers are sync (no approval gate at dispatch time) and rely on the proposed-vs-approved file split to keep unreviewed content out of the prompt.
+- Both `edit_soul` and `edit_user_profile` accept an `action` field with three values:
+  - `set` — replace the whole file body with `content` (default).
+  - `append` — layer a new section under the existing approved body, separated by a blank line. Takes `content`. Earlier design notes used `add`; the shipped surface is `append` because it describes the operation precisely (the new section is appended; it does not insert at an arbitrary position).
+  - `remove` — drop the first paragraph (block delimited by blank lines) of the existing approved body that contains the `needle` substring. Takes `needle`. Returns a clean failure to the model when the file is absent or the needle is unmatched, leaving the proposed file untouched.
 
 ## Boundary
 

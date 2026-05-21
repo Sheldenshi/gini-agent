@@ -952,7 +952,7 @@ describe("provider", () => {
     const originalFetch = globalThis.fetch;
     process.env.GINI_STATE_ROOT = stateRoot;
     process.env.OPENROUTER_API_KEY = "test-or-key";
-    globalThis.fetch = (() => Promise.resolve(new Response(JSON.stringify({
+    globalThis.fetch = ((_input: RequestInfo | URL, _init: RequestInit = {}) => Promise.resolve(new Response(JSON.stringify({
       id: "resp_or_blocked",
       choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok." } }]
     }), { status: 200, headers: { "content-type": "application/json" } }))) as typeof fetch;

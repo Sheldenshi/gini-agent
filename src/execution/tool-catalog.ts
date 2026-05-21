@@ -834,19 +834,20 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "edit_soul",
-      description: "Propose an edit to the active agent's SOUL.md (per-agent persona). The proposed body lands as SOUL.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/soul/approve`. Use sparingly — SOUL.md is the agent's voice and values; pin only stable persona facts that should outlast a single conversation. `action: \"set\"` replaces the whole file. `action: \"append\"` adds a new section (separated by a blank line) below the existing content (or the existing approved SOUL.md if no proposal exists yet). Requires an active agent — there is no per-instance SOUL.",
+      description: "Propose an edit to the active agent's SOUL.md (per-agent persona). The proposed body lands as SOUL.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/soul/approve`. Use sparingly — SOUL.md is the agent's voice and values; pin only stable persona facts that should outlast a single conversation. `action: \"set\"` replaces the whole file. `action: \"append\"` adds a new section (separated by a blank line) below the existing content (or the existing approved SOUL.md if no proposal exists yet). `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing approved body; requires `needle`. Requires an active agent — there is no per-instance SOUL.",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
-            enum: ["set", "append"],
-            description: "Whether to replace the whole SOUL.md body or append a new section below the existing approved content.",
+            enum: ["set", "append", "remove"],
+            description: "Whether to replace the whole SOUL.md body (set), append a new section below the existing approved content (append), or drop the first paragraph containing `needle` from the existing approved content (remove).",
             default: "set"
           },
-          content: { type: "string", description: "The new SOUL.md body (action=set) or the section to append (action=append). Keep it concise — every turn pays for this in tokens." }
+          content: { type: "string", description: "The new SOUL.md body (action=set) or the section to append (action=append). Keep it concise — every turn pays for this in tokens. Not required for action=remove." },
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing approved SOUL.md that contains this substring is dropped." }
         },
-        required: ["content"]
+        required: []
       }
     }
   },
@@ -858,19 +859,20 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "edit_user_profile",
-      description: "Propose an edit to the instance-scoped USER.md (user profile). The proposed body lands as USER.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/user/approve`. Use when the user shares a stable identity fact you should remember about THEM (preferences, role, recurring goals). Distinct from add_memory: USER.md is a single curated profile block that rides the system prompt every turn; add_memory pins short discrete facts. `action: \"set\"` replaces the whole file; `action: \"append\"` adds a new section.",
+      description: "Propose an edit to the instance-scoped USER.md (user profile). The proposed body lands as USER.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/user/approve`. Use when the user shares a stable identity fact you should remember about THEM (preferences, role, recurring goals). Distinct from add_memory: USER.md is a single curated profile block that rides the system prompt every turn; add_memory pins short discrete facts. `action: \"set\"` replaces the whole file; `action: \"append\"` adds a new section; `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing approved body (requires `needle`).",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
-            enum: ["set", "append"],
-            description: "Whether to replace the whole USER.md body or append a new section below the existing approved content.",
+            enum: ["set", "append", "remove"],
+            description: "Whether to replace the whole USER.md body (set), append a new section below the existing approved content (append), or drop the first paragraph containing `needle` from the existing approved content (remove).",
             default: "set"
           },
-          content: { type: "string", description: "The new USER.md body (action=set) or the section to append (action=append)." }
+          content: { type: "string", description: "The new USER.md body (action=set) or the section to append (action=append). Not required for action=remove." },
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing approved USER.md that contains this substring is dropped." }
         },
-        required: ["content"]
+        required: []
       }
     }
   }

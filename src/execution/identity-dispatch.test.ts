@@ -164,6 +164,68 @@ describe("edit_soul dispatch", () => {
       )
     ).rejects.toThrow(/action/);
   });
+
+  test("remove drops a matching paragraph from the approved SOUL.md as a proposal", async () => {
+    const instance = "soul-propose-remove";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    // Pre-seed an approved SOUL.md with three paragraphs; remove the middle one.
+    const approvedPath = soulPath(instance, TEST_AGENT);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Persona one.\n\nFavorite color: blue.\n\nPersona three.");
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_soul",
+      "call_soul_remove",
+      JSON.stringify({ action: "remove", needle: "Favorite color" })
+    );
+
+    expect(result.kind).toBe("sync");
+    // Proposal landed.
+    const proposed = readFileSync(soulProposedPath(instance, TEST_AGENT), "utf8");
+    expect(proposed).toContain("Persona one.");
+    expect(proposed).toContain("Persona three.");
+    expect(proposed).not.toContain("Favorite color");
+    // Approved file is untouched until the user runs the approve API.
+    expect(readFileSync(approvedPath, "utf8")).toContain("Favorite color");
+
+    const audit = readState(instance).audit.find(
+      (event) => event.action === "identity.soul.proposed" && event.evidence?.action === "remove"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.needle).toBe("Favorite color");
+  });
+
+  test("remove returns a clean failure message when the needle does not match", async () => {
+    const instance = "soul-propose-remove-miss";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = soulPath(instance, TEST_AGENT);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "A single paragraph mentioning blue.");
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_soul",
+      "call_soul_remove_miss",
+      JSON.stringify({ action: "remove", needle: "absent-marker" })
+    );
+
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/no paragraph matched needle/);
+    }
+    // No proposal was written; approved file unchanged.
+    expect(existsSync(soulProposedPath(instance, TEST_AGENT))).toBe(false);
+    expect(readFileSync(approvedPath, "utf8")).toBe("A single paragraph mentioning blue.");
+  });
 });
 
 describe("edit_user_profile dispatch", () => {
@@ -219,5 +281,83 @@ describe("edit_user_profile dispatch", () => {
       (event) => event.action === "identity.user_profile.proposed"
     );
     expect((audit?.evidence?.scanFindings as string[] | undefined) ?? []).toContain("prompt_injection");
+  });
+
+  test("remove drops a matching paragraph from the approved USER.md as a proposal", async () => {
+    const instance = "user-propose-remove";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = userProfilePath(instance);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Likes coffee.\n\nDislikes commute traffic.\n\nPrefers async.");
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_user_profile",
+      "call_user_remove",
+      JSON.stringify({ action: "remove", needle: "commute traffic" })
+    );
+
+    expect(result.kind).toBe("sync");
+    const proposed = readFileSync(userProfileProposedPath(instance), "utf8");
+    expect(proposed).toContain("Likes coffee.");
+    expect(proposed).toContain("Prefers async.");
+    expect(proposed).not.toContain("commute traffic");
+    expect(readFileSync(approvedPath, "utf8")).toContain("commute traffic");
+
+    const audit = readState(instance).audit.find(
+      (event) => event.action === "identity.user_profile.proposed" && event.evidence?.action === "remove"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.needle).toBe("commute traffic");
+  });
+
+  test("remove returns a clean failure when the needle does not match", async () => {
+    const instance = "user-propose-remove-miss";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const approvedPath = userProfilePath(instance);
+    mkdirSync(dirname(approvedPath), { recursive: true });
+    writeFileSync(approvedPath, "Likes coffee.");
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_user_profile",
+      "call_user_remove_miss",
+      JSON.stringify({ action: "remove", needle: "tea" })
+    );
+
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/no paragraph matched needle/);
+    }
+    expect(existsSync(userProfileProposedPath(instance))).toBe(false);
+    expect(readFileSync(approvedPath, "utf8")).toBe("Likes coffee.");
+  });
+
+  test("remove returns 'no source' when no approved USER.md exists", async () => {
+    const instance = "user-propose-remove-no-source";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "edit_user_profile",
+      "call_user_remove_no_source",
+      JSON.stringify({ action: "remove", needle: "anything" })
+    );
+
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      expect(result.result).toMatch(/no approved USER\.md exists/);
+    }
   });
 });

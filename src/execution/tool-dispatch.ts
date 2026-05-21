@@ -33,6 +33,8 @@ import { createMemoryFromInput, editMemory, recall } from "../memory";
 import {
   loadSoul,
   loadUserProfile,
+  removeSoulSection,
+  removeUserProfileSection,
   writeSoul,
   writeUserProfile
 } from "../runtime/identity-files";
@@ -1547,16 +1549,19 @@ async function updateMemoryTool(
 // Propose an edit to the active agent's SOUL.md. The body always lands
 // as SOUL.md.proposed; the user approves via the identity-files
 // approval API before the new content rides the next system prompt.
+// `set` replaces the body; `append` layers a new section under the
+// existing approved body; `remove` drops the first paragraph containing
+// a substring (`needle`) from the existing approved body. All three
+// route through the same propose-vs-approve gate.
 // See ADR runtime-identity-files.md.
 async function editSoulTool(
   config: RuntimeConfig,
   taskId: string,
   args: Record<string, unknown>
 ): Promise<string> {
-  const content = requireString(args, "content");
   const action = optionalString(args, "action", "set");
-  if (action !== "set" && action !== "append") {
-    throw new Error("Invalid input: action must be 'set' or 'append'.");
+  if (action !== "set" && action !== "append" && action !== "remove") {
+    throw new Error("Invalid input: action must be 'set', 'append', or 'remove'.");
   }
   const state = readState(config.instance);
   const effective = resolveEffectiveContext(state, config);
@@ -1564,6 +1569,50 @@ async function editSoulTool(
   if (!agentId) {
     throw new Error("Cannot edit SOUL.md: no active agent.");
   }
+  if (action === "remove") {
+    const needle = requireString(args, "needle");
+    const removeResult = removeSoulSection(config.instance, agentId, needle, "proposed");
+    if (!removeResult.ok) {
+      // No mutation hit disk — surface a clean failure to the model so
+      // it can retry with a different needle instead of assuming the
+      // proposal landed. We deliberately do NOT throw: an invalid input
+      // should leave the conversation intact.
+      const reason = removeResult.reason === "no source"
+        ? "no approved SOUL.md exists to remove from"
+        : `no paragraph matched needle "${needle}"`;
+      return `Could not remove SOUL.md section: ${reason}.`;
+    }
+    await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "identity.soul.proposed",
+          target: removeResult.path,
+          risk: "low",
+          taskId: item.id,
+          runId: item.runId,
+          evidence: {
+            agentId,
+            action,
+            needle,
+            path: removeResult.path,
+            scanFindings: removeResult.scanFindings
+          }
+        },
+        { taskId: item.id }
+      );
+      item.updatedAt = now();
+    });
+    appendTrace(config.instance, taskId, {
+      type: "model",
+      message: "Proposed SOUL.md remove",
+      data: { agentId, action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings }
+    });
+    return `Proposed SOUL.md edit at ${removeResult.path} (removed paragraph matching "${needle}"). Awaiting user approval via POST /api/identity-files/soul/approve.`;
+  }
+  const content = requireString(args, "content");
   // For 'append', the new proposal carries the existing approved body
   // followed by a blank line and the new content. The approved file
   // stays the source of truth — proposals are not chained on top of
@@ -1618,11 +1667,49 @@ async function editUserProfileTool(
   taskId: string,
   args: Record<string, unknown>
 ): Promise<string> {
-  const content = requireString(args, "content");
   const action = optionalString(args, "action", "set");
-  if (action !== "set" && action !== "append") {
-    throw new Error("Invalid input: action must be 'set' or 'append'.");
+  if (action !== "set" && action !== "append" && action !== "remove") {
+    throw new Error("Invalid input: action must be 'set', 'append', or 'remove'.");
   }
+  if (action === "remove") {
+    const needle = requireString(args, "needle");
+    const removeResult = removeUserProfileSection(config.instance, needle, "proposed");
+    if (!removeResult.ok) {
+      const reason = removeResult.reason === "no source"
+        ? "no approved USER.md exists to remove from"
+        : `no paragraph matched needle "${needle}"`;
+      return `Could not remove USER.md section: ${reason}.`;
+    }
+    await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "identity.user_profile.proposed",
+          target: removeResult.path,
+          risk: "low",
+          taskId: item.id,
+          runId: item.runId,
+          evidence: {
+            action,
+            needle,
+            path: removeResult.path,
+            scanFindings: removeResult.scanFindings
+          }
+        },
+        { taskId: item.id }
+      );
+      item.updatedAt = now();
+    });
+    appendTrace(config.instance, taskId, {
+      type: "model",
+      message: "Proposed USER.md remove",
+      data: { action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings }
+    });
+    return `Proposed USER.md edit at ${removeResult.path} (removed paragraph matching "${needle}"). Awaiting user approval via POST /api/identity-files/user/approve.`;
+  }
+  const content = requireString(args, "content");
   let body = content;
   if (action === "append") {
     const existing = loadUserProfile(config.instance);
