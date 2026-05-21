@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { DEFAULT_GINI_INSTRUCTIONS, buildAgentSystemContext } from "../system-prompt";
 import {
   approveSoul,
   approveUserProfile,
@@ -253,15 +254,21 @@ describe("identity-files", () => {
   });
 
   describe("scaffoldInstanceIdentityFiles", () => {
-    test("creates INSTRUCTIONS.md and USER.md as zero-byte files when neither exists", () => {
+    test("seeds INSTRUCTIONS.md with default rules and USER.md as zero-byte when neither exists", () => {
       const result = scaffoldInstanceIdentityFiles(INSTANCE);
       // Both files materialize on disk.
       expect(existsSync(instructionsPath(INSTANCE))).toBe(true);
       expect(existsSync(userProfilePath(INSTANCE))).toBe(true);
-      // Truly zero-byte — no placeholder content. The load path treats
-      // empty files as absent, so the default-instructions fallback stays
-      // authoritative until the user writes something specific.
-      expect(statSync(instructionsPath(INSTANCE)).size).toBe(0);
+      // INSTRUCTIONS.md is seeded with the current defaults verbatim — no
+      // header comment or other meta text, because every byte in the file
+      // is spliced into the system prompt. The user opens the file to a
+      // working baseline they can edit against.
+      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      // Size in bytes — the constant contains multi-byte characters
+      // (em-dash, curly quotes), so disk-byte count != JS string length.
+      expect(statSync(instructionsPath(INSTANCE)).size).toBe(Buffer.byteLength(DEFAULT_GINI_INSTRUCTIONS, "utf8"));
+      // USER.md genuinely has no defaults — it's a personal profile, only
+      // the user knows what belongs in it. Stays zero-byte.
       expect(statSync(userProfilePath(INSTANCE)).size).toBe(0);
       // Both paths are in the `created` list.
       expect(result.created).toContain(instructionsPath(INSTANCE));
@@ -269,7 +276,51 @@ describe("identity-files", () => {
       expect(result.created.length).toBe(2);
     });
 
-    test("does not overwrite a pre-existing file with content", () => {
+    test("seeded INSTRUCTIONS.md round-trips through load → scan → render unchanged", () => {
+      // The seeded content has to flow through the same load+scan
+      // pipeline as a hand-edited file. If the default rules happened to
+      // trip a threat pattern (or trimming dropped meaningful bytes) the
+      // fresh-install system prompt would diverge from the pre-scaffold
+      // behavior — this test pins that they don't.
+      scaffoldInstanceIdentityFiles(INSTANCE);
+      const loaded = loadInstructions(INSTANCE);
+      expect(loaded).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      // The full system prompt for a fresh install (seeded file + no
+      // SOUL/USER) matches the pre-scaffold default — the seed is purely
+      // surface, not behavioral.
+      const assembled = buildAgentSystemContext([], undefined, undefined, {
+        instructionsOverride: loaded ?? undefined
+      });
+      expect(assembled).toBe(DEFAULT_GINI_INSTRUCTIONS);
+    });
+
+    test("backfills a missing INSTRUCTIONS.md on an existing instance (USER.md already present)", () => {
+      // Pre-existing instance where the user created USER.md by hand but
+      // INSTRUCTIONS.md was never materialized. Scaffold should seed
+      // INSTRUCTIONS.md with defaults and leave USER.md alone.
+      const userPath = userProfilePath(INSTANCE);
+      mkdirSync(dirname(userPath), { recursive: true });
+      writeFileSync(userPath, "Existing user notes.");
+      const result = scaffoldInstanceIdentityFiles(INSTANCE);
+      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(DEFAULT_GINI_INSTRUCTIONS);
+      expect(readFileSync(userPath, "utf8")).toBe("Existing user notes.");
+      expect(result.created).toEqual([instructionsPath(INSTANCE)]);
+    });
+
+    test("does not overwrite a pre-existing INSTRUCTIONS.md the user has customized", () => {
+      // The user has already populated INSTRUCTIONS.md with their own
+      // rules. Subsequent scaffold calls must NOT clobber that body with
+      // the defaults — the seed is a first-write-wins materialization.
+      const path = instructionsPath(INSTANCE);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "Be terse. Never explain.");
+      const result = scaffoldInstanceIdentityFiles(INSTANCE);
+      expect(readFileSync(path, "utf8")).toBe("Be terse. Never explain.");
+      // Only USER.md should appear in the created list.
+      expect(result.created).toEqual([userProfilePath(INSTANCE)]);
+    });
+
+    test("does not overwrite a pre-existing USER.md with content", () => {
       const path = userProfilePath(INSTANCE);
       mkdirSync(dirname(path), { recursive: true });
       writeFileSync(path, "Existing user notes.");
@@ -286,8 +337,9 @@ describe("identity-files", () => {
       const second = scaffoldInstanceIdentityFiles(INSTANCE);
       // Second call sees both files already present and creates nothing.
       expect(second.created).toEqual([]);
-      // Files are still zero-byte — re-touching cannot clobber content.
-      expect(statSync(instructionsPath(INSTANCE)).size).toBe(0);
+      // INSTRUCTIONS.md still holds the seeded defaults; USER.md still
+      // zero-byte. Re-running scaffold can never clobber content.
+      expect(readFileSync(instructionsPath(INSTANCE), "utf8")).toBe(DEFAULT_GINI_INSTRUCTIONS);
       expect(statSync(userProfilePath(INSTANCE)).size).toBe(0);
     });
 
@@ -351,14 +403,15 @@ describe("identity-files", () => {
       }
     });
 
-    test("scaffolded empty file loads as null (fallback path stays authoritative)", () => {
-      // The whole point of scaffolding zero-byte files: they must not
-      // change prompt behavior. The load path trims and treats empty as
-      // absent, so the system-prompt assembler falls back to its
-      // default-instructions constant / elides the block as before.
+    test("scaffolded zero-byte USER.md and SOUL.md load as null (fallback stays authoritative)", () => {
+      // Scaffolded zero-byte files must not change prompt behavior. The
+      // load path trims and treats empty as absent, so the system-prompt
+      // assembler elides the USER and SOUL blocks as before. INSTRUCTIONS.md
+      // is seeded with the defaults and is asserted separately — see the
+      // "round-trips through load → scan → render" test in the
+      // scaffoldInstanceIdentityFiles block.
       scaffoldInstanceIdentityFiles(INSTANCE);
       scaffoldAgentSoulFile(INSTANCE, AGENT);
-      expect(loadInstructions(INSTANCE)).toBeNull();
       expect(loadUserProfile(INSTANCE)).toBeNull();
       expect(loadSoul(INSTANCE, AGENT)).toBeNull();
     });

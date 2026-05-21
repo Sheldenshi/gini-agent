@@ -32,6 +32,7 @@ import {
 import { dirname, join } from "node:path";
 import { instanceRoot } from "../paths";
 import { appendLog } from "../state/trace";
+import { DEFAULT_GINI_INSTRUCTIONS } from "../system-prompt";
 import type { Instance } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -66,12 +67,17 @@ export function soulProposedPath(instance: Instance, agentId: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Scaffold path. Touches the three identity files as zero-byte placeholders
-// at instance / agent creation so users see them in the filesystem before
-// they have anything specific to write. Reads still go through the
-// load-and-scan helpers, which treat a zero-byte (or whitespace-only) file
-// as absent and fall back to defaults — so scaffolded empty files do not
-// change prompt behavior.
+// Scaffold path. Materializes the three identity files at instance / agent
+// creation so users see them on disk before they have anything specific to
+// write. INSTRUCTIONS.md is seeded with the current DEFAULT_GINI_INSTRUCTIONS
+// content so a user opening the file has a working preamble to edit against;
+// the seed has no header comment or other meta text because any byte in the
+// file goes verbatim into the system prompt. USER.md and per-agent SOUL.md
+// stay zero-byte — no defaults exist for them.
+//
+// Reads still go through the load-and-scan helpers, which treat a zero-byte
+// (or whitespace-only) file as absent and fall back to defaults — so a
+// zero-byte USER.md or SOUL.md does not change prompt behavior.
 //
 // Both helpers are best-effort: any filesystem error is swallowed and
 // logged through `appendLog` so a permission glitch can never crash the
@@ -101,35 +107,79 @@ function touchIfMissing(path: string): boolean {
   return true;
 }
 
+// Create a file at `path` seeded with `content` iff it does not already
+// exist. Same atomic O_CREAT|O_EXCL semantics as touchIfMissing — a
+// concurrent writer that wins the race leaves their content intact and
+// this call reports false. Used to seed INSTRUCTIONS.md with the current
+// DEFAULT_GINI_INSTRUCTIONS content so a fresh-install user can see what
+// the defaults are and edit against them.
+function writeIfMissing(path: string, content: string): boolean {
+  if (existsSync(path)) return false;
+  ensureDir(dirname(path));
+  let fd: number;
+  try {
+    fd = openSync(path, "wx");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EEXIST") return false;
+    throw error;
+  }
+  try {
+    writeFileSync(fd, content);
+  } finally {
+    closeSync(fd);
+  }
+  return true;
+}
+
 export interface ScaffoldInstanceResult {
   created: string[];
 }
 
-// Touch INSTRUCTIONS.md and USER.md at the instance root if absent.
-// Never overwrites. Returns the list of paths created (possibly empty).
-// All filesystem errors are caught and logged; the gateway must not crash
-// because a placeholder file failed to materialize.
+// Materialize INSTRUCTIONS.md and USER.md at the instance root if absent.
+// INSTRUCTIONS.md is seeded with DEFAULT_GINI_INSTRUCTIONS; USER.md stays
+// zero-byte. Never overwrites. Returns the list of paths created (possibly
+// empty). All filesystem errors are caught and logged; the gateway must not
+// crash because a placeholder file failed to materialize.
 export function scaffoldInstanceIdentityFiles(instance: Instance): ScaffoldInstanceResult {
   const created: string[] = [];
-  const targets: Array<{ path: string; name: string }> = [
-    { path: instructionsPath(instance), name: "INSTRUCTIONS.md" },
-    { path: userProfilePath(instance), name: "USER.md" }
-  ];
-  for (const { path, name } of targets) {
+  // INSTRUCTIONS.md gets seeded with the current default rules so the user
+  // has a concrete baseline to edit against. The constant itself stays the
+  // in-code fallback for callers that run before install() (unit tests,
+  // freshly-uninstalled instance) and for the "delete the file to reset"
+  // escape hatch.
+  const instructionsTarget = instructionsPath(instance);
+  try {
+    if (writeIfMissing(instructionsTarget, DEFAULT_GINI_INSTRUCTIONS)) {
+      created.push(instructionsTarget);
+    }
+  } catch (error) {
     try {
-      if (touchIfMissing(path)) created.push(path);
-    } catch (error) {
-      try {
-        appendLog(instance, "identity.scaffold.error", {
-          file: name,
-          path,
-          error: error instanceof Error ? error.message : String(error)
-        });
-      } catch {
-        // Logging itself failed (state root unwritable etc.). Swallow —
-        // scaffolding is purely opportunistic, the load path tolerates
-        // missing files.
-      }
+      appendLog(instance, "identity.scaffold.error", {
+        file: "INSTRUCTIONS.md",
+        path: instructionsTarget,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Logging itself failed (state root unwritable etc.). Swallow —
+      // scaffolding is purely opportunistic, the load path tolerates
+      // missing files.
+    }
+  }
+  // USER.md has no defaults — it's a personal profile the user fills in.
+  // Zero-byte placeholder so it's discoverable on disk.
+  const userTarget = userProfilePath(instance);
+  try {
+    if (touchIfMissing(userTarget)) created.push(userTarget);
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.scaffold.error", {
+        file: "USER.md",
+        path: userTarget,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // See the INSTRUCTIONS.md branch above — best-effort logging only.
     }
   }
   return { created };
