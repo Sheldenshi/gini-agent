@@ -901,6 +901,71 @@ describe("planMigration", () => {
     expect(secret?.valueFrom).toBe("sk-from-override-dir");
   });
 
+  test("refuses leaf-symlinked openclaw.json that escapes source.stateRoot", () => {
+    // A `<state>/openclaw.json` symlink to `~/.openclaw/openclaw.json`
+    // (or any other openclaw.json on the system) would redirect the
+    // whole plan — agent ids, agentDir overrides, channel tokens —
+    // through a config the operator didn't choose with --path. Refuse
+    // the read up front; the operator can either replace the symlink
+    // with a real file or set OPENCLAW_CONFIG_PATH explicitly to opt
+    // into the env-override case.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const externalConfig = `${ROOT}/external-openclaw.json`;
+    rmSync(externalConfig, { force: true });
+    writeFileSync(
+      externalConfig,
+      JSON.stringify({ agents: { list: [{ id: "external-only", default: true }] } })
+    );
+    symlinkSync(externalConfig, join(OPENCLAW_ROOT, "openclaw.json"));
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    // No agent from the external config should appear in the plan.
+    expect(
+      plan.steps.some(
+        (step) => step.kind === "agent" && step.openclawId === "external-only"
+      )
+    ).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "openclaw-state" &&
+          entry.detail.includes("outside the openclaw state root")
+      )
+    ).toBe(true);
+  });
+
+  test("honors OPENCLAW_CONFIG_PATH even when the env config lives outside stateRoot", () => {
+    // The env-override case is by design outside stateRoot. The
+    // realpath containment check must skip it explicitly, otherwise
+    // the migrator would refuse every operator using the env to
+    // relocate openclaw.json (a documented openclaw feature).
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const externalConfig = `${ROOT}/env-override-openclaw.json`;
+    rmSync(externalConfig, { force: true });
+    writeFileSync(
+      externalConfig,
+      JSON.stringify({ agents: { list: [{ id: "env-main", default: true }] } })
+    );
+    process.env.OPENCLAW_STATE_DIR = OPENCLAW_ROOT;
+    process.env.OPENCLAW_CONFIG_PATH = externalConfig;
+    try {
+      const discovery = discoverOpenclawState();
+      const plan = planMigration(discovery);
+      expect(
+        plan.steps.some(
+          (step) => step.kind === "agent" && step.openclawId === "env-main"
+        )
+      ).toBe(true);
+      expect(
+        plan.unsupported.some((entry) => entry.kind === "openclaw-state")
+      ).toBe(false);
+    } finally {
+      delete process.env.OPENCLAW_STATE_DIR;
+      delete process.env.OPENCLAW_CONFIG_PATH;
+    }
+  });
+
   test("refuses leaf-symlinked auth-profiles.json that escapes source.stateRoot", () => {
     // A hostile state with a legitimate agentDir inside the source
     // root but the leaf `auth-profiles.json` symlinked at

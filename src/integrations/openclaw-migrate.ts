@@ -1041,6 +1041,33 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     };
   }
 
+  // Realpath-contain the in-stateRoot openclaw.json. The
+  // OPENCLAW_CONFIG_PATH env case (env override → configPath legitimately
+  // lives outside stateRoot by design) is exempt — we detect it by
+  // comparing the resolved configPath against the env value. Without
+  // this check a hostile `<stateRoot>/openclaw.json` symlinked at
+  // `~/.openclaw/openclaw.json` (or any other openclaw.json on the
+  // system) would be silently followed, breaking the operator's
+  // "everything came from --path" mental model and routing every
+  // downstream decision (agent ids, agentDir overrides, channel
+  // tokens) through a config they didn't choose.
+  const envConfigOverride = process.env.OPENCLAW_CONFIG_PATH
+    ? resolve(process.env.OPENCLAW_CONFIG_PATH)
+    : null;
+  const isEnvOverride =
+    envConfigOverride !== null && resolve(source.configPath) === envConfigOverride;
+  if (!isEnvOverride && escapesSourceRoot(source.stateRoot, source.configPath)) {
+    unsupported.push({
+      kind: "openclaw-state",
+      detail: `openclaw.json at ${source.configPath} resolves outside the openclaw state root (likely a symlink). Migration refused — replace the symlink with a real config inside --path, or point OPENCLAW_CONFIG_PATH at the external file explicitly.`
+    });
+    return {
+      source: { stateRoot: source.stateRoot, configExists: false },
+      steps,
+      unsupported
+    };
+  }
+
   const config: OpenclawConfig = parseOpenclawJson(readFileSync(source.configPath, "utf8"));
 
   // Agents
