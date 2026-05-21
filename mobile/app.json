@@ -6,7 +6,6 @@
     "orientation": "portrait",
     "scheme": "gini",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "ai.lilaclabs.gini.mobile"
