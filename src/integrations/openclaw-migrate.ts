@@ -113,7 +113,7 @@ import type { MemoryUnitStatus, Network } from "../state/memory-db";
 import { writeSecret } from "../state/secrets";
 import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { instanceRoot, pidPath, skillsDir } from "../paths";
-import { assertHeaderSafeToken } from "./messaging";
+import { assertHeaderSafeToken, mintTelegramPairingCodeInState } from "./messaging";
 import { normalizeProvider } from "../provider";
 import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
@@ -2272,6 +2272,22 @@ export async function applyMigration(
             : metadata;
         target.status = "configured";
         target.updatedAt = at;
+        // Auto-mint a pairing code on telegram bridges that came
+        // across with no allowlist. Without it the poller runs but
+        // silently denies every inbound (no allowlist match, no
+        // pairing code to enroll one) — the operator sees a
+        // configured bridge that doesn't work. This mirrors what the
+        // canonical addMessagingBridge path does for fresh creates.
+        // We only auto-mint on the NEW branch; rotation against an
+        // existing bridge that already has a pairing code shouldn't
+        // clobber it (operator may have intentionally not paired).
+        if (
+          step.bridgeKind === "telegram" &&
+          decision.kind === "new" &&
+          (step.allowedChatIds?.length ?? 0) === 0
+        ) {
+          mintTelegramPairingCodeInState(state.messagingBridges, decision.id);
+        }
       }
       addAudit(
         state,
@@ -2290,6 +2306,15 @@ export async function applyMigration(
         { system: true }
       );
     });
+    if (
+      step.bridgeKind === "telegram" &&
+      decision.kind === "new" &&
+      (step.allowedChatIds?.length ?? 0) === 0
+    ) {
+      warnings.push(
+        `Telegram bridge migrated with empty allow-list; auto-minted a one-shot pairing code. DM the bot the code (visible via \`gini messaging pair <bridge-id>\`) within 15 minutes to enroll your chat — otherwise re-run \`gini messaging pair <bridge-id>\` to mint a new code.`
+      );
+    }
     if (decision.kind === "existing") {
       bridgesRotated += 1;
     } else {

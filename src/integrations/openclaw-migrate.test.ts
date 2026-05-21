@@ -1892,6 +1892,57 @@ describe("applyMigration", () => {
     expect(readFileSync(helperPath, "utf8")).toContain("refreshed");
   });
 
+  test("telegram migration auto-mints a pairing code when allow-list is empty", async () => {
+    // Without auto-minting, an openclaw config that ships a bot
+    // token but no allowFrom (operator was using openclaw's
+    // dmPolicy="pairing" pattern) lands a configured-looking
+    // bridge that silently denies every inbound. The migrator
+    // should mirror addMessagingBridge and mint a pairing code so
+    // the bridge is immediately usable via DM-and-paste.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true
+      // Intentionally no withTelegramAllowFrom — empty allow-list.
+    });
+    const config = loadConfig("telegram-pair-automint");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.bridgesCreated).toBe(1);
+    const state = readState("telegram-pair-automint");
+    const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
+    const metadata = bridge.metadata as { pairingCode?: string; pairingCodeExpiresAt?: string };
+    expect(typeof metadata.pairingCode).toBe("string");
+    expect(metadata.pairingCode!.length).toBeGreaterThan(0);
+    expect(typeof metadata.pairingCodeExpiresAt).toBe("string");
+    // Operator-facing warning tells them to run `gini messaging pair`.
+    expect(
+      result.warnings.some((warning) =>
+        warning.includes("Telegram bridge migrated with empty allow-list") &&
+        warning.includes("gini messaging pair")
+      )
+    ).toBe(true);
+  });
+
+  test("telegram migration does NOT auto-mint when allow-list is non-empty", async () => {
+    // Operators with a populated allowFrom already have a working
+    // bridge; minting a pairing code would just clutter the
+    // metadata with an unused token.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const config = loadConfig("telegram-no-automint");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.bridgesCreated).toBe(1);
+    const state = readState("telegram-no-automint");
+    const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
+    const metadata = bridge.metadata as { pairingCode?: string; allowedChatIds: number[] };
+    expect(metadata.allowedChatIds.length).toBeGreaterThan(0);
+    expect(metadata.pairingCode).toBeUndefined();
+  });
+
   test("--force rotates a bot token on an existing bridge", async () => {
     seedOpenclawTree(OPENCLAW_ROOT, {
       withConfig: true,
