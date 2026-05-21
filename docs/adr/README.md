@@ -21,3 +21,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Telegram Messaging Bridge](telegram-bridge.md)
 - [Discord Messaging Bridge](discord-bridge.md)
 - [Runtime Identity Injection With Tell-Once + Delta + Periodic Refresh](runtime-identity-injection.md)
+- [Openclaw Migration](openclaw-migration.md)

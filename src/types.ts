@@ -479,7 +479,15 @@ export interface ChatSessionRecord {
 // most recent prompt.
 export type ChatSessionSource =
   | { kind: "telegram"; bridgeId: string; chatId: number; target: string; lastInboundMessageId?: number }
-  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string };
+  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string }
+  // Openclaw migration provenance. The poller-side
+  // findOrCreate*ChatSession helpers only match on the telegram and
+  // discord kinds, so an "openclaw"-sourced session never receives
+  // live inbound — it just carries the original openclaw session id
+  // so the openclaw migrator can dedup re-apply against the
+  // structured field instead of string-matching the title (which the
+  // operator can rename via `gini chat rename`).
+  | { kind: "openclaw"; openclawSessionId: string; openclawAgentId: string };
 
 export interface ChatMessageRecord {
   id: string;
@@ -667,7 +675,12 @@ export interface ImportReport {
   instance: Instance;
   source: ImportSource;
   path: string;
-  mode: "inspect";
+  // `inspect` reports walk a source path without touching it (the historical
+  // `gini import inspect` surface). `applied` reports record a migration
+  // that actually mutated gini state — produced by `gini import apply
+  // openclaw`. The two share storage so the activity feed and audit trail
+  // surface every import attempt uniformly.
+  mode: "inspect" | "applied";
   status: "completed" | "failed";
   counts: Record<string, number>;
   findings: string[];

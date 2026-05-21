@@ -764,19 +764,34 @@ export function createMcpServerRecord(
   return item;
 }
 
-export function createMessagingBridgeRecord(
+// Field-default builder shared between the runtime helper and the
+// openclaw migrator. The migrator needs to pre-mint a bridge id
+// before it writes the encrypted bot-token file (the secret path is
+// `messaging.<bridgeId>.bot-token.json`, so the id has to be known
+// up front), and it emits a richer audit row tagged with the
+// migration source. Extracting the field-default shape here keeps
+// the migrator from drifting when fields are added to
+// MessagingBridgeRecord — both callers inherit the new defaults
+// instead of one branch silently producing a record missing them.
+export function buildMessagingBridgeRecord(
   state: RuntimeState,
-  bridge: Omit<MessagingBridgeRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  bridge: Omit<MessagingBridgeRecord, "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
 ): MessagingBridgeRecord {
   const at = now();
-  const item: MessagingBridgeRecord = {
-    id: id("bridge"),
+  return {
     instance: state.instance,
     status: "configured",
     createdAt: at,
     updatedAt: at,
     ...bridge
   };
+}
+
+export function createMessagingBridgeRecord(
+  state: RuntimeState,
+  bridge: Omit<MessagingBridgeRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+): MessagingBridgeRecord {
+  const item = buildMessagingBridgeRecord(state, { id: id("bridge"), ...bridge });
   state.messagingBridges.unshift(item);
   // Messaging bridges live at the instance level; per-agent target
   // filtering happens at send time.
@@ -834,15 +849,22 @@ export function createImportReport(
     ...report
   };
   state.importReports.unshift(item);
-  // Imports inspect external state files at the instance level.
+  // Audit action mirrors the report mode so a state-mutating apply
+  // doesn't pretend to be a read-only inspection in the activity feed.
   addAudit(
     state,
     {
       actor: "user",
-      action: "import.inspected",
+      action: item.mode === "applied" ? "import.applied" : "import.inspected",
       target: item.id,
-      risk: "low",
-      evidence: { source: item.source, path: item.path, counts: item.counts }
+      risk: item.mode === "applied" ? "medium" : "low",
+      evidence: {
+        source: item.source,
+        path: item.path,
+        mode: item.mode,
+        status: item.status,
+        counts: item.counts
+      }
     },
     { system: true }
   );

@@ -32,7 +32,7 @@ The web app is stateless. Restarting it does not lose runtime data because all s
 
 The CLI entrypoint is `src/cli.ts`, which delegates to the modular command tree under `src/cli/`. CLI commands read the selected instance config, attach the bearer token, and call the same gateway API used by other clients.
 
-Some local harness operations, such as smoke setup and evidence bundle generation, can use domain helpers directly when they need to manage a runtime process or local files.
+Some local harness operations, such as smoke setup and evidence bundle generation, can use domain helpers directly when they need to manage a runtime process or local files. The `gini import apply openclaw` command is the load-bearing exception: it requires the gateway stopped for the target instance and mutates `state.json`, `secrets.env`, workspace files, skills, and `memory.db` in-process. See [Openclaw Migration](./adr/openclaw-migration.md) for the lock model.
 
 ## Instances
 
@@ -62,6 +62,7 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 │       ├── snapshots/
 │       ├── skills/
 │       ├── workspace/
+│       ├── imports/
 │       └── logs/
 └── models/
 ```

@@ -1707,6 +1707,30 @@ describe("runtime api", () => {
       expect(body.error).toMatch(/chatId must be a finite integer/);
     }
   });
+
+  test("rejects /api/embedding/reembed payloads that pass both allBanks and bankId", async () => {
+    // The CLI throws when both --all-banks and --bank are supplied
+    // (src/cli/commands/embedding.ts). The HTTP API has to mirror
+    // that contract: silently ignoring bankId when allBanks=true
+    // would let a caller think they were reembedding a single bank
+    // and instead trigger a full-instance reembed — a destructive,
+    // irreversible operation against every bank in the instance.
+    const config = testConfig("embedding-reembed-conflict");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/embedding/reembed",
+      {
+        method: "POST",
+        body: JSON.stringify({ allBanks: true, bankId: "bank_default" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/mutually exclusive/);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

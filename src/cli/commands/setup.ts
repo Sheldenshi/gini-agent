@@ -12,7 +12,12 @@ import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { configPath } from "../../paths";
 import { normalizeProvider } from "../../provider";
-import { ensureSecretsEnvPerms, secretsEnvPath, writeKeyToSecretsEnv } from "../../state/secrets-env";
+import {
+  ensureSecretsEnvPerms,
+  secretsEnvPath,
+  unquoteSecretsValue,
+  writeKeyToSecretsEnv
+} from "../../state/secrets-env";
 import type { RuntimeConfig } from "../../types";
 
 export interface SetupIO {
@@ -37,22 +42,6 @@ const COLOR = COLOR_ENABLED
   ? { cyan: "\x1b[36m", bold: "\x1b[1m", reset: "\x1b[0m", dim: "\x1b[2m" }
   : { cyan: "", bold: "", reset: "", dim: "" };
 
-// Undo single-quote escaping written by writeKeyToSecretsEnv. Inverse of
-// the writer's POSIX ANSI-C quoting: strip surrounding quotes, replace
-// each `'\''` with `'`. Stays here (not in src/state/secrets-env.ts)
-// because it's only consumed by the CLI's "do we already have a key?"
-// readback.
-function unquoteSecretsValue(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return "";
-  if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/'\\''/g, "'");
-  }
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
-  }
-  return trimmed;
-}
 
 // Match `export NAME=value` and bare `NAME=value` — `set -a` exports either
 // form, so accepting both keeps us compatible with hand-edited files.

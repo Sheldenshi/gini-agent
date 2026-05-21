@@ -73,6 +73,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - Command implementation: `src/cli/`.
 - Reads instance config and calls the gateway API.
 - Also owns local process management for install/start/run/stop/smoke workflows.
+- The `gini import apply openclaw` migrator is the one documented exception to "all writes go through the gateway." It refuses to run while the instance's gateway is alive (see [Openclaw Migration](./adr/openclaw-migration.md)) and writes directly to `state.json`, `secrets.env`, workspace files, skills, and `memory.db` through the in-process `mutateState` path. Single-process serialization is what makes the offline-only constraint necessary.
 
 ### Future Clients
 
@@ -102,9 +103,12 @@ Mobile, MCP, messaging bridges, and scripts should connect through the gateway c
 │       ├── snapshots/
 │       ├── skills/
 │       ├── workspace/
+│       ├── imports/
 │       └── logs/
 └── models/
 ```
+
+`<instance>/imports/` holds verbatim archives of source state taken before any importer (currently only `gini import apply openclaw`) mutates the destination instance. The archives can contain plaintext provider keys, bot tokens, session transcripts, and memory units — they are retained as a manual restore path and never auto-purged. Treat them with the same care as the active state. See [Openclaw Migration](./adr/openclaw-migration.md) for the format.
 
 ## API Surface
 

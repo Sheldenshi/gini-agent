@@ -36,13 +36,14 @@ OpenRouter routing fields (`provider`, `models`, `route`, `transforms`) are inte
 
 When you add a runtime-owned chat-completions request field anywhere in `src/provider.ts`, add it to `RESERVED_EXTRA_BODY_KEYS`. The denylist is the single source of truth — if a maintainer adds a new field but forgets the denylist entry, the protection silently weakens. This rule is also documented inline above the constant.
 
-## Agent Override Inheritance (Temporary)
+## Agent Override Inheritance
 
-`AgentRecord` currently stores only `providerName` and `model`. `resolveEffectiveContext()` builds an agent's effective provider by spreading the instance `config.provider` and overwriting only those two fields. As a result, `baseUrl`, `apiKeyEnv`, and `extraBody` are inherited from the instance config when an agent overrides its provider.
+`AgentRecord` stores only `providerName` and `model`. `resolveEffectiveContext()` in `src/execution/effective-context.ts` decides whether an agent's override inherits the instance's transport config (`baseUrl`, `apiKeyEnv`, `extraBody`) by comparing `agent.providerName` to `config.provider.name`:
 
-This is acceptable as long as agent provider overrides are limited to scenarios where the underlying transport (URL, auth, server-specific fields) is shared. It becomes incorrect if an agent overrides to a different provider family (e.g. instance is local/oMLX but agent overrides to openai with no transport fields) — the local-only `chat_template_kwargs` in `extraBody` would then be sent to OpenAI, which would reject it.
+- **Same-provider override** (agent overrides to the same provider family as the instance): the resolver spreads `config.provider` first and overwrites only `name` + `model`. Local-only transport (e.g. an `oMLX` base URL + `chat_template_kwargs` `extraBody`) is preserved across model swaps so an operator can keep their existing endpoint when swapping models on the same agent.
+- **Cross-provider override** (agent overrides to a different provider family): the resolver does NOT spread `config.provider`. Instead `normalizeProvider` supplies the per-provider defaults for `baseUrl` and `apiKeyEnv`, and `extraBody` defaults to undefined. Local-only fields like `chat_template_kwargs` therefore stay on the local instance and never leak into an OpenAI / OpenRouter call.
 
-This ADR fences the current behavior. A follow-up ADR will extend `AgentRecord` to carry full transport config (or define explicit inheritance rules) before agent provider overrides ship to end users.
+This is the load-bearing invariant for the openclaw migration path (`docs/adr/openclaw-migration.md`): a migrated openrouter agent on an openai instance won't accidentally inherit the openai endpoint or auth env. Tests pin both branches in `src/execution/effective-context.test.ts` ("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv" + "same-provider agent override still inherits instance baseUrl/apiKeyEnv").
 
 ## Security Boundary
 

@@ -10,7 +10,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { secretsEnvPath, writeKeyToSecretsEnv } from "./secrets-env";
+import {
+  secretsEnvHasKey,
+  secretsEnvPath,
+  unquoteSecretsValue,
+  writeKeyToSecretsEnv
+} from "./secrets-env";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -96,5 +101,82 @@ describe("writeKeyToSecretsEnv", () => {
 
     const body = readFileSync(path, "utf8");
     expect(body).toBe("FIRST_KEY=value\nexport OPENAI_API_KEY='sk-second'\n");
+  });
+});
+
+describe("secretsEnvHasKey", () => {
+  let scratchHome: string;
+  let savedHome: string | undefined;
+
+  beforeEach(() => {
+    savedHome = process.env.HOME;
+    scratchHome = join("/tmp", `gini-secrets-env-haskey-${tag()}`);
+    rmSync(scratchHome, { recursive: true, force: true });
+    mkdirSync(scratchHome, { recursive: true });
+    process.env.HOME = scratchHome;
+  });
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(scratchHome, { recursive: true, force: true });
+  });
+
+  test("returns false when the file doesn't exist", () => {
+    expect(secretsEnvHasKey("OPENAI_API_KEY")).toBe(false);
+  });
+
+  test("returns true when the key has a non-empty value", () => {
+    mkdirSync(join(scratchHome, ".gini"), { recursive: true });
+    writeFileSync(secretsEnvPath(), `export OPENAI_API_KEY='sk-real-key'\n`);
+    expect(secretsEnvHasKey("OPENAI_API_KEY")).toBe(true);
+  });
+
+  test("returns FALSE for an empty value — placeholder is treated as missing", () => {
+    // The openclaw migrator's skip-existing check used to fire for
+    // empty placeholders, which meant `gini setup` writing
+    // `OPENAI_API_KEY=""` would block a later openclaw migration
+    // from overwriting it with the real key. Aligning the
+    // semantics with `hasKeyInSecretsFile` in setup.ts (which
+    // already treats empty as missing) closes that gap.
+    mkdirSync(join(scratchHome, ".gini"), { recursive: true });
+    writeFileSync(secretsEnvPath(), `OPENAI_API_KEY=""\n`);
+    expect(secretsEnvHasKey("OPENAI_API_KEY")).toBe(false);
+  });
+
+  test("returns false for a single-quoted empty value", () => {
+    mkdirSync(join(scratchHome, ".gini"), { recursive: true });
+    writeFileSync(secretsEnvPath(), `export OPENAI_API_KEY=''\n`);
+    expect(secretsEnvHasKey("OPENAI_API_KEY")).toBe(false);
+  });
+
+  test("returns false for whitespace-only value", () => {
+    mkdirSync(join(scratchHome, ".gini"), { recursive: true });
+    writeFileSync(secretsEnvPath(), `OPENAI_API_KEY=   \n`);
+    expect(secretsEnvHasKey("OPENAI_API_KEY")).toBe(false);
+  });
+
+  test("returns true for a bare (unquoted) non-empty value", () => {
+    mkdirSync(join(scratchHome, ".gini"), { recursive: true });
+    writeFileSync(secretsEnvPath(), `OPENAI_API_KEY=sk-bare\n`);
+    expect(secretsEnvHasKey("OPENAI_API_KEY")).toBe(true);
+  });
+});
+
+describe("unquoteSecretsValue", () => {
+  test("returns empty string for empty input", () => {
+    expect(unquoteSecretsValue("")).toBe("");
+  });
+
+  test("strips single-quoted wrapping and decodes POSIX `'\\''` escapes", () => {
+    expect(unquoteSecretsValue("'sk-it'\\''s-here'")).toBe("sk-it's-here");
+  });
+
+  test("strips double-quoted wrapping and decodes escaped quotes / dollars", () => {
+    expect(unquoteSecretsValue(`"sk-\\"quoted\\""`)).toBe(`sk-"quoted"`);
+  });
+
+  test("passes through unquoted values verbatim (trimmed)", () => {
+    expect(unquoteSecretsValue("  sk-bare  ")).toBe("sk-bare");
   });
 });

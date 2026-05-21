@@ -9,6 +9,7 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
+import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -39,7 +40,7 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
         : defaultAgent?.model,
       toolsets: Array.isArray(input.toolsets)
         ? input.toolsets.map(String)
-        : (defaultAgent?.toolsets ?? ["file", "terminal", "memory", "session_search"]),
+        : (defaultAgent?.toolsets ?? [...DEFAULT_AGENT_TOOLSETS]),
       messagingTargets: Array.isArray(input.messagingTargets)
         ? input.messagingTargets.map(String)
         : (defaultAgent?.messagingTargets ?? [])

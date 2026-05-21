@@ -129,6 +129,26 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
   }));
 }
 
+// Baseline toolset whitelist for any newly-created agent. Exported so
+// the openclaw migrator (and any future agent-bootstrap path) can
+// mirror the canonical list rather than duplicating it inline and
+// drifting silently when this list grows.
+//
+// `messaging` and `mcp` are in the whitelist so that when an operator
+// enables those toolsets (they ship disabled in `defaultToolsets`),
+// the active agent doesn't silently gate them out via the per-agent
+// intersection. The kill switch then lives where it should: on the
+// toolset's enabled/disabled status.
+export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
+  "file",
+  "terminal",
+  "memory",
+  "session_search",
+  "delegation",
+  "messaging",
+  "mcp"
+];
+
 export function defaultAgent(instance: Instance, at: string): AgentRecord {
   // providerName/model intentionally left undefined here. The seeding
   // step in createEmptyState / normalizeState populates them from
@@ -144,12 +164,7 @@ export function defaultAgent(instance: Instance, at: string): AgentRecord {
     status: "active",
     providerName: undefined,
     model: undefined,
-    // `messaging` and `mcp` are in the whitelist so that when an operator
-    // enables those toolsets (they ship disabled in `defaultToolsets`),
-    // the active agent doesn't silently gate them out via the per-agent
-    // intersection. The kill switch then lives where it should: on the
-    // toolset's enabled/disabled status.
-    toolsets: ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"],
+    toolsets: [...DEFAULT_AGENT_TOOLSETS],
     messagingTargets: [],
     createdAt: at,
     updatedAt: at

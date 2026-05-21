@@ -45,7 +45,7 @@ function bridgeSecretNamespace(bridgeId: string): string {
 // `GET /api/messaging`. Rejecting at create time stops the leak at
 // the source.
 const HEADER_SAFE_TOKEN = /^[\x21-\x7E]+$/;
-function assertHeaderSafeToken(kind: string, raw: string): void {
+export function assertHeaderSafeToken(kind: string, raw: string): void {
   if (!HEADER_SAFE_TOKEN.test(raw)) {
     throw new Error(
       `${kind === "telegram" ? "Telegram" : "Discord"} bot token contains invalid characters — header-safe printable ASCII only.`
@@ -602,7 +602,11 @@ function generatePairingCode(): string {
 // Mint (or rotate) a pairing code on the bridge. Called from
 // addMessagingBridge so a freshly-created telegram bridge already has
 // a valid code, and from pairMessagingBridge when the operator wants
-// a new window after the previous code expired.
+// a new window after the previous code expired. Also exported under
+// `mintTelegramPairingCodeInState` so the openclaw migrator can mint
+// a code on a migrated bridge that came across with no allowlist —
+// otherwise the poller silently denies every inbound and the bridge
+// looks "configured" but does nothing.
 function regeneratePairingCodeInState(
   bridges: MessagingBridgeRecord[],
   bridgeId: string
@@ -616,6 +620,8 @@ function regeneratePairingCodeInState(
   live.updatedAt = now();
   return live;
 }
+
+export const mintTelegramPairingCodeInState = regeneratePairingCodeInState;
 
 export async function pairMessagingBridge(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.instance, (state) => {
