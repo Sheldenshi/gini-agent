@@ -83,6 +83,7 @@ import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { pidPath, skillsDir } from "../paths";
 import { assertHeaderSafeToken } from "./messaging";
 import { normalizeProvider } from "../provider";
+import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 // --- Public types ---
 
@@ -1132,11 +1133,11 @@ export async function applyMigration(
         name: step.name,
         providerName: giniProvider ?? undefined,
         model: step.model,
-        // The gini default agent ships with these toolsets enabled
-        // (per `defaultAgent` in `src/state/defaults.ts`). Mirror that
-        // baseline so an imported agent is usable without further
-        // toolset wiring.
-        toolsets: ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"],
+        // Pull the canonical default-agent toolset whitelist from
+        // src/state/defaults so the migrator can't drift if the gini
+        // baseline ever changes. New toolsets added there will land
+        // on imported agents automatically.
+        toolsets: [...DEFAULT_AGENT_TOOLSETS],
         messagingTargets: []
       });
       agentsCreated += 1;
