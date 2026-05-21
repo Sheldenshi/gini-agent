@@ -69,7 +69,16 @@ export async function dispatchToolCall(
   taskId: string,
   toolName: string,
   toolCallId: string,
-  rawArgs: string
+  rawArgs: string,
+  // Current chat-task turn's in-flight message buffer. Only the loop in
+  // chat-task.ts owns this — it accumulates assistant tool_calls and tool
+  // results across iterations of the same task run, none of which land on
+  // `task.toolCallState.messages` until the task pauses for approval. Gates
+  // that need to inspect the current turn's tool history (e.g. the
+  // setup-skill gate inside request_connector) must look here too, not
+  // only at the persisted snapshot. Optional so test callers that bypass
+  // the loop keep working.
+  messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
   let args: Record<string, unknown>;
   try {
@@ -122,7 +131,7 @@ export async function dispatchToolCall(
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "request_connector":
-      return await requestConnectorTool(config, taskId, toolCallId, args);
+      return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -2078,7 +2087,8 @@ async function requestConnectorTool(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
   const providerId = requireString(args, "provider");
   const reason = requireString(args, "reason");
@@ -2125,10 +2135,19 @@ async function requestConnectorTool(
   // skill body itself calls request_connector at the end, and the
   // resumed call passes this same gate naturally because the
   // intervening read_skill is now in the message history.
+  //
+  // Look in BOTH the in-flight workingMessages (current turn's tool
+  // history, only available via the chat-task loop's messageHistory
+  // arg) AND the persisted snapshot on task.toolCallState. The
+  // snapshot is only written when a task pauses for approval, so the
+  // first time the model calls request_connector inside the same turn
+  // it just called read_skill, only messageHistory has the evidence.
   if (provider.setupSkill) {
     const task = state.tasks.find((t) => t.id === taskId);
-    const messages = task?.toolCallState?.messages ?? [];
-    const hasReadSetup = messages.some((m) => {
+    const persisted = task?.toolCallState?.messages ?? [];
+    const inFlight = messageHistory ?? [];
+    const allMessages: readonly unknown[] = [...persisted, ...inFlight];
+    const hasReadSetup = allMessages.some((m) => {
       if (!m || typeof m !== "object") return false;
       const msg = m as { role?: unknown; tool_calls?: unknown };
       if (msg.role !== "assistant") return false;

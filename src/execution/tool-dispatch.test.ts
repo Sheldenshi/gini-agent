@@ -317,6 +317,57 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("setupSkill provider: proceeds when read_skill is in this turn's in-flight workingMessages (not yet persisted)", async () => {
+    // The chat-task loop only writes `task.toolCallState.messages` when
+    // pausing for approval. Within a single task run, an earlier
+    // read_skill call lives only in the loop's local workingMessages
+    // until then. The gate must consult workingMessages (passed via
+    // the messageHistory arg) so the model isn't told to re-read the
+    // skill it just read in the same turn.
+    const instance = `req-connector-inflight-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Deliberately do NOT seed task.toolCallState — the read_skill
+    // evidence only exists in the in-flight buffer the loop passes in.
+    const inflight = [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "rs_inflight",
+            type: "function",
+            function: {
+              name: "read_skill",
+              arguments: JSON.stringify({ name: "google-workspace-setup" })
+            }
+          }
+        ]
+      },
+      {
+        role: "tool",
+        tool_call_id: "rs_inflight",
+        content: "(skill body)"
+      }
+    ];
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_inflight",
+      JSON.stringify({ provider: "google-oauth-desktop", reason: "Paste OAuth Desktop credentials for project gini-456" }),
+      inflight
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("connector.request");
+      expect(approval!.target).toBe("google-oauth-desktop");
+    }
+  });
+
   test("non-setupSkill provider: gate does not apply regardless of read_skill history", async () => {
     // Back-compat: providers without `setupSkill` (linear, generic, etc.)
     // must keep the existing direct-approval shape. The gate only fires

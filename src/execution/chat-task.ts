@@ -843,7 +843,8 @@ async function runLoop(
           taskId,
           call.function.name,
           call.id,
-          call.function.arguments
+          call.function.arguments,
+          workingMessages
         );
         if (dispatch.kind === "sync") {
           toolResultMessages.push({
