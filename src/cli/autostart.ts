@@ -45,6 +45,10 @@ import {
   serviceTarget,
   type PlistKind
 } from "../integrations/launchd";
+// Shared with the openclaw migrator and the CLI setup readback so all
+// three call sites agree on how to decode the value half of a
+// secrets.env line.
+import { unquoteSecretsValue } from "../state/secrets-env";
 
 // Re-export the shared launchd primitives so existing imports against
 // src/cli/autostart keep resolving (CLI commands, tests). New runtime
@@ -368,17 +372,6 @@ export function parseSecretsEnv(body: string): Record<string, string> {
   return out;
 }
 
-function unquoteSecretsValue(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return "";
-  if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/'\\''/g, "'");
-  }
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
-  }
-  return trimmed;
-}
 
 function isGiniAgentCheckout(dir: string, fileExists: (path: string) => boolean): boolean {
   const pkg = join(dir, "package.json");

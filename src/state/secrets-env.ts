@@ -75,19 +75,44 @@ export function ensureSecretsEnvPerms(): void {
   try { chmodSync(path, 0o600); } catch { /* best-effort */ }
 }
 
-// Predicate: does ~/.gini/secrets.env already carry a line for this
-// env-var name? Used by callers that want to avoid silently clobbering
-// an existing key — `gini import apply openclaw` notably wants to skip
-// a provider key the operator has already configured, unless --force
-// is set, since the openclaw value may be stale or wrong.
+// Undo the single-quote escaping written by writeKeyToSecretsEnv. Inverse
+// of the POSIX ANSI-C quoting the writer uses; also accepts double-quoted
+// values for compatibility with hand-edited files. Exported so the CLI's
+// readback (`gini setup` / `gini provider set`) and the autostart plist
+// installer share one implementation instead of three subtly different
+// ones.
+export function unquoteSecretsValue(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return "";
+  if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
+    return trimmed.slice(1, -1).replace(/'\\''/g, "'");
+  }
+  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
+    return trimmed.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
+  }
+  return trimmed;
+}
+
+// Predicate: does ~/.gini/secrets.env already carry a NON-EMPTY value
+// for this env-var name? Used by callers that want to avoid silently
+// clobbering an existing key — `gini import apply openclaw` notably
+// wants to skip a provider key the operator has already configured,
+// unless --force is set, since the openclaw value may be stale or
+// wrong.
 //
-// Matches the same `export NAME=…` / bare `NAME=…` forms writeKeyToSecretsEnv
-// recognizes, so callers see "exists" exactly when a future write would
-// overwrite it.
+// "Has key" means there is a `KEY=value` line AND the value (after
+// unquoting) is non-empty. An entry like `OPENAI_API_KEY=""` is
+// treated as MISSING — the operator either set up a placeholder
+// before configuring or hand-cleared a stale value, and the migrator
+// should fill it instead of treating the placeholder as a real key.
+// This matches `hasKeyInSecretsFile` in `src/cli/commands/setup.ts`,
+// so `gini setup` and `gini import apply openclaw` agree on what
+// counts as "the operator has configured this key."
 export function secretsEnvHasKey(name: string): boolean {
   const path = secretsEnvPath();
   if (!existsSync(path)) return false;
   const contents = readFileSync(path, "utf8");
-  const pattern = new RegExp(`^\\s*(?:export\\s+)?${name}=`, "m");
-  return pattern.test(contents);
+  const match = new RegExp(`^\\s*(?:export\\s+)?${name}=(.*)$`, "m").exec(contents);
+  if (!match) return false;
+  return unquoteSecretsValue(match[1] ?? "").length > 0;
 }
