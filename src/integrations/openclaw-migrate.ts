@@ -112,7 +112,7 @@ import {
 } from "../state";
 import type { MemoryUnitStatus, Network } from "../state/memory-db";
 import { writeSecret } from "../state/secrets";
-import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
+import { ensureSecretsEnvPerms, secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { instanceRoot, pidPath, skillsDir } from "../paths";
 import { assertHeaderSafeToken, mintTelegramPairingCodeInState } from "./messaging";
 import { normalizeProvider } from "../provider";
@@ -2148,6 +2148,15 @@ export async function applyMigration(
   // replacing it with whatever openclaw stored (which may be stale or
   // a dev key) is a hard-to-debug footgun. --force is the explicit
   // opt-in for rotation.
+  //
+  // Tighten ~/.gini/secrets.env to mode 0600 before the loop runs.
+  // The skip path below (existing key + no --force) never invokes
+  // writeKeyToSecretsEnv, so a pre-existing file the operator created
+  // under their default umask (0644 on most shells) would stay
+  // world-readable on every other line. Calling ensureSecretsEnvPerms
+  // unconditionally means a migration always leaves the file at 0600
+  // regardless of how many secrets were actually written.
+  ensureSecretsEnvPerms();
   for (const step of plan.steps) {
     if (step.kind !== "secret") continue;
     // Mirror the messaging path's header-safe gate on the api-key

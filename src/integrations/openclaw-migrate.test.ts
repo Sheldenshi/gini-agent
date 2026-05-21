@@ -2354,6 +2354,29 @@ describe("applyMigration", () => {
     );
   });
 
+  test("tightens ~/.gini/secrets.env to 0600 even when every secret is skipped", async () => {
+    // Skipping existing-key writes (no --force) used to leave a
+    // pre-existing 0644 secrets.env world-readable. The migrator must
+    // chmod the file to 0600 on every apply, independent of whether
+    // any individual key was written, so the operator's hand-created
+    // file inherits the same posture as a freshly-written one.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withAuthProfile: true });
+    const dotGini = join(GINI_HOME, ".gini");
+    mkdirSync(dotGini, { recursive: true });
+    const secretsPath = join(dotGini, "secrets.env");
+    writeFileSync(secretsPath, `export OPENAI_API_KEY='sk-real-existing-key'\n`, { mode: 0o644 });
+    expect(statSync(secretsPath).mode & 0o777).toBe(0o644);
+
+    const config = loadConfig("tighten-secrets-perms");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+    // No secret was written — every step was skipped.
+    expect(result.secretsWritten).toBe(0);
+    // But the file ends up at 0600 anyway.
+    expect(statSync(secretsPath).mode & 0o777).toBe(0o600);
+  });
+
   test("rejects malformed provider API keys before writing secrets.env", async () => {
     // Same defense-in-depth the messaging path applies on bot tokens.
     // A newline-laced value would survive secrets.env's single-quoted

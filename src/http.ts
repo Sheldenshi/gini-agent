@@ -313,8 +313,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // and reembeds each — the canonical workflow after `gini import
       // apply openclaw`, which routes Hindsight units into per-agent
       // banks (`bank_<agentId>`) that the default single-bank reembed
-      // path would otherwise miss. `bankId` is ignored when allBanks
-      // is set since they conflict semantically.
+      // path would otherwise miss. The two flags are mutually
+      // exclusive at the CLI (src/cli/commands/embedding.ts throws on
+      // both); the API must mirror that contract so an HTTP caller
+      // doesn't think they targeted a single bank and instead trigger
+      // a full-instance reembed.
+      if (payload.allBanks === true && typeof payload.bankId === "string") {
+        return json(
+          {
+            error:
+              "`allBanks` and `bankId` are mutually exclusive. Pass one or the other; passing both is rejected to match the CLI."
+          },
+          400
+        );
+      }
       if (payload.allBanks === true) {
         return json(await reembedAllBanks(config, { dryRun: payload.dryRun === true }));
       }
