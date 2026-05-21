@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 3.1.0
+    version: 3.1.1
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -191,12 +191,41 @@ If it errors with `PERMISSION_DENIED`, the user doesn't own the project — ask 
 
 #### Last step — OAuth client setup
 
-Call `request_connector` with the project id from Milestone B. The runtime fills in the URL instructions from the provider's declared template; the user sees them in the chat bubble above the form.
+Call `request_connector` with the project id from Milestone B. Pass the markdown block below as the `reason` field **exactly as written** — leave `${project_id}` as a literal placeholder, the runtime substitutes it from your `params` argument at dispatch time. Do NOT summarize, shorten, or rephrase the instruction text; the user sees it verbatim in the chat bubble above the form.
+
+The exact `reason` string to copy:
+
+```text
+**Last step.** Complete the two Cloud Console pages below, then paste the credentials.
+
+**Step 1 — OAuth consent screen** (skip if already configured)
+
+https://console.cloud.google.com/apis/credentials/consent?project=${project_id}
+
+- User Type: **External**
+- App name: **Gini Workspace**
+- Your email for support contact and developer contact
+- Save through Scopes (no scopes to add)
+- Add yourself as a **Test user**
+
+**Step 2 — Create an OAuth client**
+
+https://console.cloud.google.com/apis/credentials?project=${project_id}
+
+- Click **Create Credentials → OAuth client ID**
+- Application type: **Desktop app**
+- Name it whatever (e.g. "Gini")
+- Click **Create**
+
+Then paste the **Client ID** and **Client Secret** below.
+```
+
+The full tool call:
 
 ```text
 request_connector {
   provider: "google-oauth-desktop",
-  reason: "Set up your Google OAuth Desktop client.",
+  reason: "<paste the markdown block above verbatim>",
   params: {
     project_id: "<actual project id from gcloud, e.g. gini-workspace-1234567>"
   }

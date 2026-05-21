@@ -2108,12 +2108,28 @@ async function requestConnectorTool(
     }
   }
 
-  // When a provider declares `requestInstructions`, the runtime owns the
-  // user-visible message — we substitute `${name}` placeholders with values
-  // from `templateParams` deterministically, so the model can't drop URLs
-  // or collapse multi-line instructions. Required params declared in
-  // `requestParams` must be present; missing ones surface as a sync error
-  // so the model can retry the call with the right shape.
+  // Three branches for assembling the user-visible message:
+  //   1. Provider declares `requestInstructions` — the runtime owns the
+  //      template and substitutes `${name}` from `templateParams`. Required
+  //      `requestParams` must be present; missing ones surface as a sync
+  //      error so the model can retry with the right shape. Back-compat for
+  //      any provider that ships a built-in default.
+  //   2. Provider declares no template, but the model passed `params` — run
+  //      `${var}` substitution against the model's `reason` string. The skill
+  //      body owns the instruction text and tells the model to leave
+  //      `${var}` placeholders literal; the runtime fills them in here so the
+  //      model never has to interpolate URLs.
+  //   3. Neither — pass `reason` verbatim (today's default).
+  //
+  // Substitution semantics in (1) and (2) are identical: same regex, same
+  // verbatim fall-through for unknown placeholders.
+  const substitute = (template: string): string =>
+    template.replace(/\$\{([a-zA-Z0-9_]+)\}/g, (match, name: string) => {
+      // Leave unknown placeholders verbatim — better to surface `${foo}`
+      // in chat than to silently delete it; the user can flag the broken
+      // template and we can fix the skill or provider.
+      return name in templateParams ? templateParams[name] : match;
+    });
   let effectiveReason = modelReason;
   if (typeof provider.requestInstructions === "string" && provider.requestInstructions.length > 0) {
     const required = (provider.requestParams ?? []).filter((p) => p.required).map((p) => p.name);
@@ -2127,12 +2143,9 @@ async function requestConnectorTool(
         })
       };
     }
-    effectiveReason = provider.requestInstructions.replace(/\$\{([a-zA-Z0-9_]+)\}/g, (match, name: string) => {
-      // Leave unknown placeholders verbatim — better to surface `${foo}`
-      // in chat than to silently delete it; the user can flag the broken
-      // template and we can fix the provider module.
-      return name in templateParams ? templateParams[name] : match;
-    });
+    effectiveReason = substitute(provider.requestInstructions);
+  } else if (Object.keys(templateParams).length > 0) {
+    effectiveReason = substitute(modelReason);
   }
 
   // Fast path: if a healthy + configured connector already exists for

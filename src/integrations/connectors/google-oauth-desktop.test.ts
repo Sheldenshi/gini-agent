@@ -54,37 +54,13 @@ describe("googleOauthDesktopProvider", () => {
     expect(found!.label).toBe(googleOauthDesktopProvider.label);
   });
 
-  test("declares a project_id requestParam and a multi-step requestInstructions template", () => {
-    // The template owns the user-visible instructions for the
-    // `request_connector` flow — the model was unreliable about embedding
-    // URLs in its `reason` field, so the runtime substitutes here instead.
-    expect(googleOauthDesktopProvider.requestParams).toBeDefined();
-    const projectIdParam = googleOauthDesktopProvider.requestParams!.find((p) => p.name === "project_id");
-    expect(projectIdParam).toBeDefined();
-    expect(projectIdParam!.required).toBe(true);
-
-    expect(typeof googleOauthDesktopProvider.requestInstructions).toBe("string");
-    const template = googleOauthDesktopProvider.requestInstructions!;
-    // The placeholder must be a literal `${project_id}` so the runtime
-    // substitutor can find it (i.e. no JS-side interpolation crept in).
-    expect(template).toContain("${project_id}");
-    // Both Cloud Console URLs must be present in the template.
-    expect(template).toContain("https://console.cloud.google.com/apis/credentials/consent?project=${project_id}");
-    expect(template).toContain("https://console.cloud.google.com/apis/credentials?project=${project_id}");
-  });
-
-  test("requestInstructions template substitutes project_id deterministically", () => {
-    // Mirror the runtime's substitution loop so the provider unit test pins
-    // the contract end-to-end: same regex, same replacement semantics.
-    const template = googleOauthDesktopProvider.requestInstructions!;
-    const rendered = template.replace(/\$\{([a-zA-Z0-9_]+)\}/g, (match, name: string) => {
-      const params: Record<string, string> = { project_id: "gini-workspace-1234567" };
-      return name in params ? params[name] : match;
-    });
-    expect(rendered).not.toContain("${project_id}");
-    expect(rendered).toContain("project=gini-workspace-1234567");
-    // Two URLs → two substitutions.
-    const occurrences = rendered.match(/project=gini-workspace-1234567/g) ?? [];
-    expect(occurrences.length).toBe(2);
+  test("declares no provider-owned request instructions or params", () => {
+    // Skill-specific instruction text (Cloud Console URLs, multi-step
+    // walkthroughs) belongs in the skill body, not the provider module.
+    // The provider is a generic OAuth Desktop client descriptor; the
+    // dispatcher substitutes `${var}` from the model's `reason` field at
+    // call time when the skill passes `params`.
+    expect(googleOauthDesktopProvider.requestInstructions).toBeUndefined();
+    expect(googleOauthDesktopProvider.requestParams).toBeUndefined();
   });
 });
