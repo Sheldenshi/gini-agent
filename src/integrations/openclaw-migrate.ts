@@ -367,7 +367,34 @@ export function discoverOpenclawState(pathArg?: string): OpenclawDiscovery {
   if (!explicitStateRoot) {
     workspaceCandidates.push(join(home, ".openclaw", "workspace"));
   }
-  const workspaceRoot = workspaceCandidates.find((candidate) => existsSync(candidate)) ?? null;
+  // Default workspace candidates (the unsuffixed `<state>/workspace`
+  // and the `~/.openclaw/workspace` fallback) are accepted only when
+  // they are not symlinks. A hostile or accidental
+  // `<state>/workspace -> /etc` symlink would otherwise pass the
+  // workspaceRoot-bounded containment check (the realpath becomes
+  // the new boundary) and let the migrator copy the closed allowlist
+  // of bootstrap filenames (AGENTS.md, SOUL.md, etc.) from anywhere
+  // on disk into `<instance>/workspace/`. The
+  // `OPENCLAW_WORKSPACE_DIR` and `OPENCLAW_PROFILE`-derived
+  // candidates are deliberately exempt — those are explicit
+  // operator-set overrides whose entire purpose is pointing outside
+  // `<state>/`; refusing a symlink there would defeat the override.
+  const defaultWorkspaceLeaves = new Set<string>([
+    join(stateRoot, "workspace"),
+    ...(!explicitStateRoot ? [join(home, ".openclaw", "workspace")] : [])
+  ]);
+  const workspaceRoot =
+    workspaceCandidates.find((candidate) => {
+      if (!existsSync(candidate)) return false;
+      if (defaultWorkspaceLeaves.has(candidate)) {
+        try {
+          if (lstatSync(candidate).isSymbolicLink()) return false;
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    }) ?? null;
   return {
     stateRoot,
     configPath,

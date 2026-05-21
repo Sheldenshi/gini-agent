@@ -74,6 +74,14 @@ beforeAll(() => {
 });
 
 afterAll(() => {
+  // Mirror the beforeEach safeguard: dbCache (src/state/memory-db.ts)
+  // is module-level and survives across test files in the same Bun
+  // process. rmSync'ing ROOT without closing cached handles first
+  // would leave dangling Database refs pointing at unlinked files,
+  // and any subsequent test file that touches memory.db on the same
+  // path would hit SQLITE_IOERR_VNODE. Closing here is symmetric
+  // with the per-beforeEach close call.
+  closeAllMemoryDbs();
   rmSync(ROOT, { recursive: true, force: true });
   for (const name of TRACKED_ENV) restoreEnv(name, SAVED_ENV[name]);
 });
@@ -1203,6 +1211,38 @@ describe("planMigration", () => {
     expect(ref).toBeDefined();
     expect(ref?.detail).toContain("MY_OPENAI");
     expect(ref?.detail).toContain("OPENAI_API_KEY");
+  });
+
+  test("rejects a default <state>/workspace that is itself a symlink", () => {
+    // Hostile tarball plants `<state>/workspace` as a symlink to a
+    // sibling directory the operator didn't intend to copy from.
+    // The leaf-symlink check at apply-time passes (e.g.
+    // <leak>/SOUL.md is a regular file) and the workspaceRoot
+    // containment check passes (the realpath becomes the boundary),
+    // so without this guard the migrator copies the closed list of
+    // bootstrap filenames out of the redirected target. Symlinks
+    // are only refused for the unsuffixed default path — the
+    // OPENCLAW_WORKSPACE_DIR / OPENCLAW_PROFILE overrides are the
+    // operator's explicit intent and can point anywhere.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    // Plant the redirected target with a bootstrap filename so the
+    // copy would happen if the symlink were honored.
+    const leakDir = join(ROOT, "workspace-leak");
+    mkdirSync(leakDir, { recursive: true });
+    writeFileSync(join(leakDir, "SOUL.md"), "secret-content");
+    // Replace `<state>/workspace` with a symlink to the leak dir.
+    const { symlinkSync } = require("node:fs");
+    symlinkSync(leakDir, join(OPENCLAW_ROOT, "workspace"));
+    // Discovery should refuse the symlinked default.
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    expect(discovery.workspaceRoot).toBeNull();
+    const plan = planMigration(discovery);
+    expect(plan.steps.some((step) => step.kind === "workspaceFile")).toBe(false);
   });
 
   test("surfaces on-disk agent session dirs that aren't in agents.list as orphan-sessions", () => {
