@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Calendar scopes."
 metadata:
   gini:
-    version: 1.0.1
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -167,7 +167,7 @@ gws calendar acl insert --params '{"calendarId":"primary"}' \
 ## Rules
 
 1. Calendar events are **time-bound things on a schedule** — meetings, appointments, focus blocks. For personal to-dos that should appear on the user's iPhone, prefer `apple-reminders`. For agent-internal alerts ("remind me in 2 hours"), use the cronjob tool. Confirm intent before deciding which.
-2. Every `events.insert`, `events.patch`, `events.delete`, `+insert` is a write. Confirm summary, start/end (with timezone), attendees, and whether to send notifications before invoking, even when `gws *` is auto-approved.
+2. Don't add a redundant text confirmation before `events.insert`, `events.patch`, `events.delete`, or `+insert`. The runtime's `terminal_exec` approval gate is the user's safety net — if `gws *` isn't auto-approved they'll see the gate per-command; if it is, they've opted in to "just do it." When the user's command is clear ("remove dinner," "decline the 2pm"), execute. Do ask one clarifying question when the command is ambiguous — multiple events match the description, the user didn't specify which calendar, or `sendUpdates` would email attendees the user might not want notified.
 3. When the user says "accept" / "decline" / "tentative" on a meeting, confirm **which event** and **which response status** before patching. Resolve the user's own email via `gws auth status | jq -r '.user'` (or read it from the event's `attendees` array) so the patch updates the right attendee, and re-send the full `attendees` array so other invitees aren't dropped. RSVP changes email-notify the organizer when `sendUpdates` is `"all"`.
 4. Use RFC 3339 times with an explicit offset on `+insert` and `events.insert`. Naked local times silently drift across DST boundaries.
 5. Prefer `+insert` over hand-rolling `events.insert --json` when the user just wants a normal event. The helper sets sane defaults (visibility, reminders) without forcing the agent to learn the full body schema.

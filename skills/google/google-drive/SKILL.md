@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Drive scopes."
 metadata:
   gini:
-    version: 1.0.1
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -158,7 +158,7 @@ gws drive drives create --params '{"requestId":"<REQUEST_ID>"}' --json '{"name":
 ## Rules
 
 1. Drive **folder IDs and file IDs look identical** but behave differently. A folder is just a file with `mimeType: application/vnd.google-apps.folder`. Always confirm the mimeType before treating an ID as a container.
-2. Every `files.create`, `+upload`, `files.update`, `files.delete`, `permissions.create`, and `permissions.delete` is a write. Confirm filename, target folder, and (for sharing) the exact recipient and role before invoking, even when `gws *` is auto-approved.
+2. Don't add a redundant text confirmation before `files.create`, `+upload`, `files.update`, `files.delete`, `permissions.create`, or `permissions.delete`. The runtime's `terminal_exec` approval gate is the user's safety net. When the user's command is clear ("upload report.pdf to Drive," "share Q4-plan with alice@acme.com as editor"), execute. Do ask one clarifying question when the command is ambiguous — multiple files match a name, the user didn't specify a target folder, or the user didn't name a `reader`/`writer`/`owner` role.
 3. Be conservative with permissions. `type: anyone` exposes a file to the public internet — always confirm with the user before creating an "anyone with the link" share, and prefer `type: user` with a specific `emailAddress` when possible.
 4. To delete: prefer trashing first (`files.update` with `{"trashed": true}`) over `files.delete`, which is permanent and bypasses the trash. Only use `files.delete` if the user explicitly said "permanently delete".
 5. For editing **the content** of a Google Doc, do not download-then-re-upload — that breaks revision history and concurrent editing. Use `google-docs` to call the Docs API directly. Drive is the file/permissions surface; Docs/Sheets/Slides own content edits.

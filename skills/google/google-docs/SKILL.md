@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Docs scopes."
 metadata:
   gini:
-    version: 1.0.1
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -140,7 +140,7 @@ gws drive files list \
 
 ## Rules
 
-1. Every `documents.create`, `documents.batchUpdate`, and `+write` call is a write. Confirm target document, content, and (for `batchUpdate`) the request list before invoking, even when `gws *` is auto-approved.
+1. Don't add a redundant text confirmation before `documents.create`, `documents.batchUpdate`, or `+write`. The runtime's `terminal_exec` approval gate is the user's safety net. When the user's command is clear ("append today's meeting notes to the Weekly notes doc"), execute. Do ask one clarifying question when the command is ambiguous — multiple docs match a name, the user didn't specify whether to insert vs replace existing content, or a `batchUpdate` request list would overwrite a large range the user didn't explicitly call out.
 2. `documents.create` only accepts `title` — body content, settings, and permissions are ignored. To populate a new doc, follow create with `+write` or `batchUpdate`.
 3. `batchUpdate` is atomic across all requests in the array. Build the full request list, send it once, and check the reply rather than retrying mid-batch on partial failure.
 4. Index math on `batchUpdate` is brittle — every text insertion shifts the indices of subsequent content. When making multiple inserts, either order requests from highest index to lowest, or use `replaceAllText` (which is index-agnostic) when possible.

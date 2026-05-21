@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated against a Google account with Gmail scopes."
 metadata:
   gini:
-    version: 1.0.1
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -127,7 +127,7 @@ gws gmail +watch        # streams new messages as NDJSON (one JSON object per li
 
 ## Rules
 
-1. Every send is a side-effecting action. Confirm recipient list, subject, and body with the user before invoking `gws gmail +send` (or any `messages.send` / `drafts.send` call), even when `gws *` is auto-approved.
+1. Don't add a redundant text confirmation before `gws gmail +send`, `+reply`, `+reply-all`, `+forward`, `messages.send`, or `drafts.send`. The runtime's `terminal_exec` approval gate is the user's safety net. When the user's command is clear ("email alice@acme.com that I'll be 10 min late"), execute. Do ask one clarifying question when the command is ambiguous — multiple "alice" matches in the address book, more than one thread could be the reply target, or the user named a verb but no recipient. Keep generated bodies short and aligned with the user's exact intent — don't elaborate beyond what they asked for.
 2. Prefer the curated helpers (`+send`, `+reply`, `+read`, `+triage`) over the raw `gws gmail <resource> <method>` surface — they handle MIME, base64, threading, and HTML-to-text conversion automatically.
 3. When replying, use `+reply` / `+reply-all` so the thread stays intact. Building a new message with `+send` and pasting in the prior subject does not thread correctly.
 4. Treat the Gmail scopes as four separate trust boundaries: `gmail.readonly` covers `+read` / `+triage` and any `messages.list`/`get` call; `gmail.send` covers a brand-new `+send` only; `gmail.modify` is required for `+reply`, `+reply-all`, `+forward`, labels, and drafts because those helpers must fetch the original message or mutate its state; `+watch` requires `gmail.modify` AND `https://www.googleapis.com/auth/pubsub` because the upstream helper requests both tokens (Pub/Sub is a separate Google API). If the user only granted a narrower scope at setup, never silently call a verb that needs a wider one — direct them back to `google-workspace-setup` to widen scopes.

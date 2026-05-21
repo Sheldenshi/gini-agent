@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Sheets scopes."
 metadata:
   gini:
-    version: 1.0.0
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -180,7 +180,7 @@ gws drive files list \
 
 ## Rules
 
-1. Every `spreadsheets.create`, `values.update`, `values.append`, `values.clear`, `values.batchUpdate`, and `spreadsheets.batchUpdate` (plus the `+append` helper) is a write. Confirm the target spreadsheet, range, and payload before invoking, even when `gws *` is auto-approved.
+1. Don't add a redundant text confirmation before `spreadsheets.create`, `values.update`, `values.append`, `values.clear`, `values.batchUpdate`, `spreadsheets.batchUpdate`, or `+append`. The runtime's `terminal_exec` approval gate is the user's safety net. When the user's command is clear ("append a row 'Alice, 100' to my tracker"), execute. Do ask one clarifying question when the command is ambiguous — multiple spreadsheets match a name, the user didn't specify which tab to write to, or `clear` would wipe a range larger than what they named.
 2. `valueInputOption` is required for any values write. Default to `USER_ENTERED` unless the user specifically asks to skip formula/number parsing; only use `RAW` for opaque strings the user wants stored verbatim.
 3. `spreadsheets.batchUpdate` and `values.batchUpdate` are atomic across the whole `requests` / `data` array. Build the full list, send once, and check the reply rather than retrying mid-batch on partial failure.
 4. A1 notation is sheet-name-then-range — `'Sheet1!A1:D10'`. Range-only (e.g. `A1:D10`) implicitly uses the first sheet. When the user's spreadsheet has multiple tabs, always qualify the sheet name to avoid silently writing to the wrong tab.

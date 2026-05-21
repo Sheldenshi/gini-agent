@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Meet scopes."
 metadata:
   gini:
-    version: 1.0.1
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -132,7 +132,7 @@ Use `gws meet spaces create` only when there is no associated event (a persisten
 ## Rules
 
 1. Prefer Calendar `+insert --meet` over a standalone `gws meet spaces create` whenever a meeting has a scheduled time and attendees. The Calendar invite carries the Meet link and notifies attendees automatically; a standalone space does neither.
-2. `spaces.create` and `endActiveConference` are write/side-effecting actions. Confirm intent with the user before running either, even when `gws *` is auto-approved. Ending an active conference disconnects everyone currently in the call.
+2. Don't add a redundant text confirmation before `spaces.create` or `endActiveConference`. The runtime's `terminal_exec` approval gate is the user's safety net. When the user's command is clear ("end the call I'm in"), execute. Do ask one clarifying question when the command is ambiguous — the user owns multiple active conferences, or `endActiveConference` would disconnect attendees the user might not realize are in the call (mention that side effect, then proceed unless they redirect).
 3. Treat a Meet `meetingUri` like a credential to the room. Anyone with the link (and the configured `accessType`) can join. Confirm access settings before sharing in public channels.
 4. Recordings, transcripts, and smart notes are not available on every account. If `conferenceRecords transcripts entries list` returns an empty list or a 403, fall back to asking the user to enable recording in Workspace admin or to summarize the meeting another way. (`transcripts list` only tells you whether a transcript object exists; the entries call tells you whether there is any captured text to read.)
 5. For agent automations that need to know "did the meeting happen?" or "who showed up?", poll `conferenceRecords list` filtered by space — do not try to scrape Calendar.

@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires the `gws` CLI authenticated with Forms scopes."
 metadata:
   gini:
-    version: 1.0.1
+    version: 1.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -159,7 +159,7 @@ Watches deliver to Pub/Sub. For most agent workflows, polling `responses.list` o
 ## Rules
 
 1. `forms.create` is two-step by design: create the empty shell, then `batchUpdate` to add items. Trying to embed `items[]` in the create call is silently dropped.
-2. Every `forms.create`, `forms.batchUpdate`, and `forms.setPublishSettings` is a write. Confirm form title, item list, and publish state with the user before invoking, even when `gws *` is auto-approved.
+2. Don't add a redundant text confirmation before `forms.create`, `forms.batchUpdate`, or `forms.setPublishSettings`. The runtime's `terminal_exec` approval gate is the user's safety net. When the user's command is clear ("create a feedback form with these three questions"), execute. Do ask one clarifying question when the command is ambiguous — the user named items but no title, multiple forms match a name they want to edit, or `setPublishSettings` would flip a form from draft to public.
 3. `batchUpdate` is atomic across all `requests`. Build the full sequence (createItem, updateItem, deleteItem, …) and send once; do not loop one-request-at-a-time, which doubles round trips and risks half-applied state.
 4. The `responderUri` returned by `forms.get` is a public URL. Anyone with the link who is allowed by the form's access settings can submit. Be explicit when sharing it.
 5. To map answers back to question text, fetch the form structure once with `forms.get` and keep the `questionId → title` map locally — do not refetch the structure on every response. This requires `forms.body.readonly` (or `forms.body`) in addition to `forms.responses.readonly`; `forms.get` rejects a responses-only scope.
