@@ -364,6 +364,44 @@ describe("rewriteSkillFrontmatter", () => {
     expect(out).toContain("bins: [gh]");
   });
 
+  test("emits ambiguous string scalars as quoted YAML so they round-trip as strings", async () => {
+    // Without quoting, "false"/"true"/"null" would re-parse as
+    // booleans/null, numeric-looking strings would re-parse as
+    // numbers, and strings containing commas inside inline arrays
+    // would be split — silent data corruption on every migration.
+    const raw = [
+      "---",
+      "name: edgey",
+      "description: Pins parser edge cases.",
+      "metadata:",
+      "  {",
+      '    "openclaw":',
+      "      {",
+      '        "flag": "false",',
+      '        "version": "42",',
+      '        "missing": "null",',
+      '        "tildey": "~",',
+      '        "tags": ["a,b", "ok"]',
+      "      }",
+      "  }",
+      "---",
+      "body"
+    ].join("\n");
+    const rewritten = rewriteSkillFrontmatter(raw);
+    const { parseFrontmatter } = await import("../capabilities/skill-loader");
+    const fmText = /^---\r?\n([\s\S]*?)\r?\n---/.exec(rewritten)![1]!;
+    const fm = parseFrontmatter(fmText) as {
+      metadata?: { gini?: { flag?: unknown; version?: unknown; missing?: unknown; tildey?: unknown; tags?: unknown } };
+    };
+    // Strings must survive as strings, never coerced to scalar types.
+    expect(fm.metadata?.gini?.flag).toBe("false");
+    expect(fm.metadata?.gini?.version).toBe("42");
+    expect(fm.metadata?.gini?.missing).toBe("null");
+    expect(fm.metadata?.gini?.tildey).toBe("~");
+    // Comma-bearing strings in inline arrays must not be split.
+    expect(fm.metadata?.gini?.tags).toEqual(["a,b", "ok"]);
+  });
+
   test("migrated skill metadata is round-trippable through the gini skill-loader frontmatter parser", async () => {
     // Anchor the fix end-to-end: rewrite the openclaw flow-style
     // frontmatter, then feed it through the same parseFrontmatter the

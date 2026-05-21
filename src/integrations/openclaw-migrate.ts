@@ -1510,8 +1510,28 @@ function emitBlockYaml(obj: Record<string, unknown>, indent: string): string {
           typeof entry === "number" ||
           typeof entry === "boolean"
       );
+      // Gini's inline-array parser does `inner.split(",")` without
+      // quote awareness, so a comma inside any element would be split
+      // even when the element is quoted. When any string entry would
+      // contain a comma, fall back to block style (`- value` per line)
+      // which the parser handles correctly. Otherwise emit inline for
+      // readability.
+      const hasCommaString = value.some(
+        (entry) => typeof entry === "string" && entry.includes(",")
+      );
+      if (allScalar && !hasCommaString) {
+        lines.push(
+          `${indent}${key}: [${value
+            .map((entry) => yamlScalar(entry, { inInlineArray: true }))
+            .join(", ")}]`
+        );
+        continue;
+      }
       if (allScalar) {
-        lines.push(`${indent}${key}: [${value.map(yamlScalar).join(", ")}]`);
+        lines.push(`${indent}${key}:`);
+        for (const entry of value) {
+          lines.push(`${indent}  - ${yamlScalar(entry)}`);
+        }
         continue;
       }
       lines.push(`${indent}${key}:`);
@@ -1537,17 +1557,32 @@ function emitBlockYaml(obj: Record<string, unknown>, indent: string): string {
   return lines.join("\n");
 }
 
-// Format a scalar for block-style YAML. Strings are quoted only when
-// they contain whitespace, leading dashes, colons, or other characters
-// the loader's parser would misread; plain identifiers and numbers
-// pass through bare so the output stays human-readable.
-function yamlScalar(value: unknown): string {
+// Format a scalar for block-style YAML. Strings get quoted when they
+// would otherwise re-parse as a non-string scalar through gini's
+// `parseScalar` (true/false/null/~/integer/decimal), when they contain
+// characters the parser misreads (`:#\n\r\t"'\\` or leading
+// indicators), or — when emitted inside an inline array — when they
+// contain a comma (the inline parser splits on `,`). Numbers and
+// booleans go through `String()` unchanged because their textual form
+// is their own representation.
+function yamlScalar(value: unknown, options: { inInlineArray?: boolean } = {}): string {
   if (value === null) return "null";
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   const str = String(value);
   if (str === "") return '""';
-  const needsQuotes = /[:#\n\r\t"'\\]|^[-?!&*|>%@`]|^\s|\s$/.test(str);
-  if (!needsQuotes) return str;
+  // Strings that would coerce to a non-string scalar must be quoted to
+  // round-trip as a string. Matches the predicates in
+  // src/capabilities/skill-loader.ts parseScalar.
+  const reparsesAsScalar =
+    str === "true" ||
+    str === "false" ||
+    str === "null" ||
+    str === "~" ||
+    /^-?\d+$/.test(str) ||
+    /^-?\d+\.\d+$/.test(str);
+  const hasParserSpecials = /[:#\n\r\t"'\\]|^[-?!&*|>%@`]|^\s|\s$/.test(str);
+  const hasArrayComma = Boolean(options.inInlineArray) && str.includes(",");
+  if (!reparsesAsScalar && !hasParserSpecials && !hasArrayComma) return str;
   return JSON.stringify(str);
 }
 
