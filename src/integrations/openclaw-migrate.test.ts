@@ -901,6 +901,65 @@ describe("planMigration", () => {
     expect(secret?.valueFrom).toBe("sk-from-override-dir");
   });
 
+  test("refuses leaf-symlinked auth-profiles.json that escapes source.stateRoot", () => {
+    // A hostile state with a legitimate agentDir inside the source
+    // root but the leaf `auth-profiles.json` symlinked at
+    // `~/.aws/credentials.json` would dereference the symlink and
+    // exfil credentials from the operator's other tools into
+    // `~/.gini/secrets.env`. The leaf must be containment-checked
+    // even when the parent agentDir is safe.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const externalCreds = `${ROOT}/external-creds.json`;
+    rmSync(externalCreds, { force: true });
+    writeFileSync(
+      externalCreds,
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-default": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-would-be-exfiltrated"
+          }
+        }
+      })
+    );
+    const agentDir = join(OPENCLAW_ROOT, "agents", "main", "agent");
+    mkdirSync(agentDir, { recursive: true });
+    symlinkSync(externalCreds, join(agentDir, "auth-profiles.json"));
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    // The migrator agent is created (agentDir itself is inside the
+    // root), but the credential read is refused.
+    expect(plan.steps.some((step) => step.kind === "secret")).toBe(false);
+    expect(
+      plan.unsupported.some(
+        (entry) =>
+          entry.kind === "auth-profiles:main" &&
+          entry.detail.includes("outside the openclaw state root")
+      )
+    ).toBe(true);
+  });
+
+  test("refuses leaf-symlinked .env that escapes source.stateRoot (returns empty map)", () => {
+    // `<state>/.env` symlinked at e.g. `~/.zsh_history` would
+    // parse any UPPER_CASE=value lines as openclaw config env vars,
+    // potentially picking up TELEGRAM_BOT_TOKEN / DISCORD_BOT_TOKEN
+    // assignments from unrelated shell exports.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const externalEnv = `${ROOT}/external-env`;
+    rmSync(externalEnv, { force: true });
+    writeFileSync(externalEnv, `TELEGRAM_BOT_TOKEN=stolen-from-outside\n`);
+    symlinkSync(externalEnv, join(OPENCLAW_ROOT, ".env"));
+    const env = readStateDotenv(OPENCLAW_ROOT);
+    expect(env).toEqual({});
+  });
+
   test("refuses external agents.list[].agentDir that escapes source.stateRoot", () => {
     // A crafted openclaw.json (e.g., from a coworker's backup
     // tarball) with `agentDir: "~/.aws"` or any absolute path
@@ -2725,6 +2784,42 @@ describe("applyMigration memory units", () => {
     // bad memory file to take the whole import down.
     const result = await applyMigration(config, discovery, plan);
     expect(result.applied).toBe(true);
+    expect(result.memoryUnitsCreated).toBe(0);
+  });
+
+  test("refuses memory sqlite that symlinks outside source.stateRoot", async () => {
+    // A `<state>/memory/main.sqlite` symlinked at e.g.
+    // `~/.config/Firefox/cookies.sqlite` would be opened as a valid
+    // SQLite DB and the "unknown table layout (...)" unsupported
+    // note would leak the table list of the operator's browser
+    // cookies / password store. Refuse symlinked leafs at plan
+    // time so the file is never opened.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const memoryDir = join(OPENCLAW_ROOT, "memory");
+    mkdirSync(memoryDir, { recursive: true });
+    const externalDb = `${ROOT}/external-cookies.sqlite`;
+    rmSync(externalDb, { force: true });
+    // Seed a real SQLite DB at the external path so the leak path
+    // would actually fire if containment weren't enforced.
+    const db = new Database(externalDb);
+    try {
+      db.exec("CREATE TABLE cookies (name TEXT, value TEXT)");
+    } finally {
+      db.close();
+    }
+    symlinkSync(externalDb, join(memoryDir, "main.sqlite"));
+    const config = loadConfig("memory-leaf-symlink-refused");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    // No memory step landed in the plan.
+    expect(plan.steps.some((step) => step.kind === "memoryUnit")).toBe(false);
+    const memoryNote = plan.unsupported.find((entry) => entry.kind === "memory");
+    expect(memoryNote).toBeDefined();
+    expect(memoryNote!.detail).toContain("outside the openclaw state root");
+    // The "unknown table layout" leak path must NOT have fired —
+    // the table name `cookies` should be nowhere in the plan.
+    expect(JSON.stringify(plan)).not.toContain("cookies");
+    const result = await applyMigration(config, discovery, plan);
     expect(result.memoryUnitsCreated).toBe(0);
   });
 

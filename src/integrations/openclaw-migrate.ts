@@ -435,9 +435,18 @@ function stripCommentsAndTrailingCommas(input: string): string {
 // them up without the user re-exporting on every restart. We parse the
 // same KEY=value (with optional `export` prefix and optional quotes)
 // shape gini's own `secrets.env` uses.
+//
+// Leaf-symlink defense: refuse to read when `<state>/.env` resolves
+// outside the supplied stateRoot. A hostile state could link
+// `<state>/.env` at `~/.zsh_history` (or any KEY=value file the
+// operator owns) and the matched UPPER_CASE assignments would flow
+// straight into the migrated bridge secrets via collectOpenclawEnv.
+// Returns an empty map on escape so the caller treats the file as
+// absent — equivalent to the no-dotenv-file path.
 export function readStateDotenv(stateRoot: string): Record<string, string> {
   const path = join(stateRoot, ".env");
   if (!existsSync(path)) return {};
+  if (escapesSourceRoot(stateRoot, path)) return {};
   const out: Record<string, string> = {};
   for (const line of readFileSync(path, "utf8").split("\n")) {
     const match = /^\s*(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(.*)$/.exec(line);
@@ -658,12 +667,25 @@ interface MemoryUnitPlanShape {
 // no gini target). Returns extracted Hindsight units plus an optional
 // note that lands on the unsupported list so the operator sees what
 // was actually present.
-function inspectOpenclawMemory(memoryDir: string): {
+//
+// `stateRoot` is required so the function can refuse symlinked
+// memory directories and individual `*.sqlite` symlinks that
+// resolve outside the operator's chosen source root. Without the
+// containment check the `unknown table layout (...)` note path in
+// scanMemorySqlite leaks the table list of arbitrary SQLite files
+// (browser cookies, password stores, etc.) into the import report.
+function inspectOpenclawMemory(stateRoot: string, memoryDir: string): {
   hindsightUnits: MemoryUnitPlanShape[];
   note?: string;
 } {
   if (!existsSync(memoryDir)) {
     return { hindsightUnits: [] };
+  }
+  if (escapesSourceRoot(stateRoot, memoryDir)) {
+    return {
+      hindsightUnits: [],
+      note: `Openclaw memory/ directory resolves outside the openclaw state root (likely a parent-directory symlink); not migrated.`
+    };
   }
   let entries: string[];
   try {
@@ -679,6 +701,14 @@ function inspectOpenclawMemory(memoryDir: string): {
   const notes: string[] = [];
   for (const entry of entries) {
     const dbPath = join(memoryDir, entry);
+    // Same leaf-symlink defense: a `<state>/memory/main.sqlite`
+    // symlinked to `~/.Cookies` would otherwise open the browser's
+    // cookie DB and surface its table names via the "unknown table
+    // layout" unsupported note.
+    if (escapesSourceRoot(stateRoot, dbPath)) {
+      notes.push(`${entry}: resolves outside the openclaw state root (likely a symlink); skipped.`);
+      continue;
+    }
     const bankLabel = entry.replace(/\.(sqlite|db)$/i, "");
     const inspection = scanMemorySqlite(dbPath, bankLabel);
     hindsightUnits.push(...inspection.units);
@@ -1143,6 +1173,19 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       "auth-profiles.json"
     );
     if (!existsSync(authPath)) continue;
+    // Leaf-symlink defense. We already containment-check `agentDir`
+    // at the agents loop, but a hostile state could leave `agentDir`
+    // pointing at a legitimate path inside the source root while
+    // making the leaf `auth-profiles.json` a symlink to
+    // `~/.aws/credentials.json` — same exfiltration shape via a
+    // different vector. realpath the leaf and refuse if it escapes.
+    if (escapesSourceRoot(source.stateRoot, authPath)) {
+      unsupported.push({
+        kind: `auth-profiles:${agentId}`,
+        detail: `Skipped auth-profiles.json for agent '${agentId}': leaf resolves outside the openclaw state root (likely a symlink). The migrator only reads credential files that physically live under --path.`
+      });
+      continue;
+    }
     let parsed: AuthProfileFile;
     try {
       parsed = JSON.parse(readFileSync(authPath, "utf8")) as AuthProfileFile;
@@ -1404,7 +1447,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   // (tables `chunks` / `files` / `embedding_cache`) — a wholly
   // different model with no clean gini target. Detect the schema and
   // surface what we found so the operator knows which path applied.
-  const memoryReport = inspectOpenclawMemory(join(source.stateRoot, "memory"));
+  const memoryReport = inspectOpenclawMemory(source.stateRoot, join(source.stateRoot, "memory"));
   for (const unit of memoryReport.hindsightUnits) {
     steps.push({ kind: "memoryUnit", ...unit });
   }
