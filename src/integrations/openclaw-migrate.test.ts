@@ -1213,14 +1213,56 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("rejects non-integer Telegram allow-list entries instead of coercing to 0", () => {
+    // openclaw's allowFrom string serialization is the surface area
+    // an operator-supplied openclaw config touches. The migrator
+    // must refuse anything Number() would silently coerce: empty
+    // strings and whitespace become 0 (the JSON sentinel that
+    // would enroll chat 0), decimals lose precision, hex/scientific
+    // notation parse to surprising integers. Mirror the HTTP
+    // allow/deny endpoint's strict integer contract.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    mkdirSync(join(OPENCLAW_ROOT, "credentials"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main", default: true }] },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: ["", "  ", "0x10", "1.5", "1e9", "abc", "12345", "tg:67890"]
+          }
+        }
+      })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: [""] })
+    );
+    // Bot token so the bridge step survives header-safe filtering.
+    writeFileSync(
+      join(OPENCLAW_ROOT, ".env"),
+      "TELEGRAM_BOT_TOKEN=tg-token-for-strict-parse\n"
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const bridge = plan.steps.find((step) => step.kind === "bridge") as
+      | { allowedChatIds: number[] }
+      | undefined;
+    expect(bridge).toBeDefined();
+    // Only the two valid integer entries survive — everything else
+    // (empty, whitespace, hex, decimal, scientific, alpha) drops.
+    expect(bridge!.allowedChatIds.sort((a, b) => a - b)).toEqual([12345, 67890]);
+  });
+
   test("apply surfaces persisted Telegram allow-list ids in result + audit row", async () => {
-    // The plan summary already shows the ids (R9.S1), but a script
-    // that skips `gini import plan` and runs apply directly used to
-    // see only a scalar count in the apply output, and the audit
-    // row also recorded only the count. Operators inspecting an
-    // audit trail post-fact had no way to recover which chats had
-    // been authorized. The apply result now carries the explicit
-    // list, and the audit evidence includes it too.
+    // A workflow that skips `gini import plan` and runs apply
+    // directly must still see which chat ids the bridge will
+    // authorize. The audit row is the only durable record of an
+    // apply; reporting only a scalar count there would hide a
+    // smuggled-id incident from anyone reading the audit trail
+    // post-fact. Both the apply result and the audit evidence
+    // carry the explicit list.
     seedOpenclawTree(OPENCLAW_ROOT, {
       withConfig: true,
       withTelegramChannel: true,

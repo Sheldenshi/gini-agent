@@ -298,10 +298,11 @@ export interface MigrationResult {
   // misreported as a brand-new bridge creation.
   bridgesRotated: number;
   // Per-bridge allow-list snapshot the apply just persisted. The
-  // plan summary already exposes these (R9.S1); echoing them in the
-  // apply result lets a workflow that skips `gini import plan`
-  // still see which chat IDs are being authorized, and gives the
-  // CLI a place to print them after apply finishes.
+  // plan summary's `bridgesAuthorized` field exposes the same shape;
+  // echoing them in the apply result lets a workflow that skips
+  // `gini import plan` still see which chat IDs are being
+  // authorized, and gives the CLI a place to print them after
+  // apply finishes.
   bridgesAuthorized: Array<{ kind: "telegram" | "discord"; allowedChatIds: number[] }>;
   skillsCopied: number;
   secretsWritten: number;
@@ -644,9 +645,24 @@ function stripTelegramAllowPrefix(value: string): string {
   return value.replace(/^(telegram|tg):/i, "");
 }
 
+// Strict integer parse aligned with the HTTP allow/deny endpoint's
+// `parseChatIdStrict`. `Number()` accepts whitespace as 0, hex
+// literals, decimals, and scientific notation — `Number("  ")` is
+// 0, which would silently enroll chat 0 (the JSON sentinel for
+// allow-everyone). Refuse anything that isn't an integer string,
+// matching the runtime contract that Telegram chat ids are
+// integers (negative for groups, positive for users) and the
+// migrated allow-list should never contain a value the HTTP
+// endpoint would reject after the fact.
 function parseChatIdEntry(entry: unknown): number | null {
-  const raw = typeof entry === "number" ? entry : Number(stripTelegramAllowPrefix(String(entry)));
-  return Number.isFinite(raw) ? raw : null;
+  if (typeof entry === "number") {
+    return Number.isFinite(entry) && Number.isSafeInteger(entry) ? entry : null;
+  }
+  if (typeof entry !== "string") return null;
+  const stripped = stripTelegramAllowPrefix(entry);
+  if (!/^-?\d+$/.test(stripped)) return null;
+  const parsed = Number.parseInt(stripped, 10);
+  return Number.isFinite(parsed) && Number.isSafeInteger(parsed) ? parsed : null;
 }
 
 function readAllowFromAsNumbers(stateRoot: string, path: string): number[] | undefined {
@@ -2101,12 +2117,12 @@ export async function applyMigration(
   let archivePath: string | undefined;
   try {
 
-  // Short-circuit when there's no openclaw config to read. Otherwise
-  // apply would write an "applied" ImportReport with all-zero counts
-  // and (pre-fix) a phantom main agent — both of which lie to the
-  // operator about what happened. We still emit a report so the
-  // activity feed records the attempt; the failed status makes the
-  // outcome unambiguous.
+  // Short-circuit when there's no openclaw config to read. Without
+  // this guard the apply path would write an "applied" ImportReport
+  // with all-zero counts and synthesize a phantom main agent —
+  // both lie to the operator about what happened. We still emit a
+  // report so the activity feed records the attempt; the failed
+  // status makes the outcome unambiguous.
   if (!plan.source.configExists) {
     const failedReport = await guardedMutate((state: RuntimeState) =>
       createImportReport(state, {
@@ -2507,6 +2523,15 @@ export async function applyMigration(
       "bot-token",
       step.tokenValue
     );
+    // Captured inside the closure after the metadata merge so the
+    // audit row and the apply result report the SAME persisted set
+    // the bridge will actually enforce. On `--force` rotation the
+    // merge unions the incoming allow-list with the existing one
+    // (`mergeBridgeMetadata`), so reporting only `step.allowedChatIds`
+    // would under-count by exactly the operator's post-migration
+    // enrollments. The empty-array fallback is for the discord
+    // branch where allow-list isn't a concept.
+    let persistedAllowedChatIds: number[] = [];
     await guardedMutate((state: RuntimeState) => {
       const at = now();
       const metadata: Record<string, unknown> =
@@ -2539,6 +2564,14 @@ export async function applyMigration(
             : metadata;
         target.status = "configured";
         target.updatedAt = at;
+        // Pull the post-merge ids straight off the persisted
+        // metadata. For telegram on the rotate path this is the
+        // union of existing + imported; on the new path it's just
+        // the imported list; for discord it's an empty array.
+        const ids = (target.metadata as { allowedChatIds?: unknown }).allowedChatIds;
+        persistedAllowedChatIds = Array.isArray(ids)
+          ? ids.filter((id): id is number => typeof id === "number")
+          : [];
         // Auto-mint a pairing code on telegram bridges that came
         // across with no allowlist. Without it the poller runs but
         // silently denies every inbound (no allowlist match, no
@@ -2567,16 +2600,13 @@ export async function applyMigration(
             kind: step.bridgeKind,
             source: "openclaw-migration",
             rotated: decision.kind === "existing",
-            allowedChatCount: step.allowedChatIds?.length ?? 0,
-            // Include the explicit ids in the audit evidence (in
-            // addition to the scalar count) so post-fact forensics
-            // can recover which chats were authorized at apply time.
-            // The plan summary already exposes these via R9.S1; the
-            // audit row would otherwise be the only durable record
-            // of the apply and a stale-but-counted list would hide
-            // a smuggled-id incident from anyone reading the audit
-            // trail rather than the original plan output.
-            allowedChatIds: step.allowedChatIds ?? []
+            // Report the persisted set (post-merge union on
+            // --force) rather than only the imported ids — the
+            // bridge actually enforces the union, and an audit
+            // reader expecting "what does this bridge accept now"
+            // would otherwise see a stale subset.
+            allowedChatCount: persistedAllowedChatIds.length,
+            allowedChatIds: persistedAllowedChatIds
           }
         },
         { system: true }
@@ -2597,12 +2627,14 @@ export async function applyMigration(
       bridgesCreated += 1;
     }
     // Capture the persisted allow-list so the CLI apply output and
-    // ImportReport carry the same ids the plan summary showed. A
-    // workflow that skips plan would otherwise have no visibility
-    // into the chat ids being authorized.
+    // the audit trail carry the same ids the bridge actually
+    // enforces. On --force rotation that's the union of existing
+    // and imported; on the new branch it's just imported. A
+    // workflow that skips `gini import plan` otherwise has no
+    // visibility into the chat ids being authorized.
     bridgesAuthorized.push({
       kind: step.bridgeKind,
-      allowedChatIds: [...(step.allowedChatIds ?? [])]
+      allowedChatIds: [...persistedAllowedChatIds]
     });
   }
 
