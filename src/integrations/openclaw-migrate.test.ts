@@ -754,6 +754,29 @@ describe("applyMigration", () => {
     expect(allowed.sort((a, b) => a - b)).toEqual([12345, 67890, 77766, 99988]);
   });
 
+  test("bails with a failed report when there's no openclaw config to read", async () => {
+    // Apply must NOT synthesize a phantom main agent or claim a
+    // successful migration when there's nothing on disk to migrate.
+    const emptyPath = `${ROOT}/no-openclaw-here`;
+    rmSync(emptyPath, { recursive: true, force: true });
+    mkdirSync(emptyPath, { recursive: true });
+    const config = loadConfig("no-openclaw");
+    const discovery = discoverOpenclawState(emptyPath);
+    const plan = planMigration(discovery);
+    expect(plan.steps).toEqual([]);
+    expect(plan.unsupported.some((entry) => entry.kind === "openclaw-state")).toBe(true);
+
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.applied).toBe(false);
+    expect(result.agentsCreated).toBe(0);
+    expect(result.report.status).toBe("failed");
+    expect(result.report.error).toContain("No openclaw config");
+
+    // No phantom agent must land in state.
+    const state = readState("no-openclaw");
+    expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
+  });
+
   test("skips telegram channel with no token and records the gap", async () => {
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     mkdirSync(OPENCLAW_ROOT, { recursive: true });

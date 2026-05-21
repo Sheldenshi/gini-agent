@@ -448,9 +448,25 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   const steps: MigrationStep[] = [];
   const unsupported: UnsupportedItem[] = [];
 
-  const config: OpenclawConfig = source.configPath
-    ? parseOpenclawJson(readFileSync(source.configPath, "utf8"))
-    : {};
+  // No openclaw config means there's nothing to migrate. Returning an
+  // empty plan with a clear unsupported marker keeps apply() from
+  // synthesizing a phantom `main` agent + an "applied" report against a
+  // fresh gini install that never had openclaw installed in the first
+  // place. The CLI surfaces the unsupported list verbatim so the user
+  // sees why nothing happened.
+  if (!source.configPath) {
+    unsupported.push({
+      kind: "openclaw-state",
+      detail: `No openclaw config found under ${source.stateRoot}. Migration skipped — install openclaw and run \`openclaw onboard\` first, or point --path at a copy of an openclaw state root.`
+    });
+    return {
+      source: { stateRoot: source.stateRoot, configExists: false },
+      steps,
+      unsupported
+    };
+  }
+
+  const config: OpenclawConfig = parseOpenclawJson(readFileSync(source.configPath, "utf8"));
 
   // Agents
   const agentList = config.agents?.list ?? [];
@@ -714,6 +730,37 @@ export async function applyMigration(
   let skillsCopied = 0;
   let secretsWritten = 0;
   let workspaceFilesCopied = 0;
+
+  // Short-circuit when there's no openclaw config to read. Otherwise
+  // apply would write an "applied" ImportReport with all-zero counts
+  // and (pre-fix) a phantom main agent — both of which lie to the
+  // operator about what happened. We still emit a report so the
+  // activity feed records the attempt; the failed status makes the
+  // outcome unambiguous.
+  if (!plan.source.configExists) {
+    const failedReport = await mutateState(config.instance, (state) =>
+      createImportReport(state, {
+        source: "openclaw",
+        path: source.stateRoot,
+        mode: "applied",
+        status: "failed",
+        counts: {},
+        findings: plan.unsupported.map((entry) => `Unsupported: ${entry.kind} — ${entry.detail}`),
+        error: `No openclaw config found under ${source.stateRoot}.`
+      })
+    );
+    return {
+      applied: false,
+      report: failedReport,
+      agentsCreated,
+      bridgesCreated,
+      skillsCopied,
+      secretsWritten,
+      workspaceFilesCopied,
+      unsupported: plan.unsupported,
+      warnings
+    };
+  }
 
   // 1) Provider secrets to ~/.gini/secrets.env. Done first so a freshly
   // installed gini picks them up on the next `gini run`.
