@@ -1725,7 +1725,19 @@ function acquireImportLock(instance: string): ImportLockHandle {
   // unlink it, and proceed in parallel. Combining open + write keeps
   // the empty-file window to libc-internal microseconds (instead of
   // a userspace function call between two separate syscalls).
-  const lockContent = `pid=${process.pid}\nat=${now()}\ncmd=gini import apply openclaw\n`;
+  //
+  // The `token=<uuid>` line is the additional defense against the
+  // two-process cleanup race. Process B might decide a stale lock
+  // (pid=A) needs cleanup at time T1, then UNLINK + writeFileSync to
+  // claim a fresh lock with B's token. Process C, started just
+  // before B's cleanup, made the SAME decision against pid=A. C's
+  // subsequent unlink targets the file at `lockPath` — which is now
+  // B's freshly-acquired lock with a DIFFERENT token than the one C
+  // observed when it made the cleanup decision. The release path
+  // and the cleanup path both re-read the token and refuse to touch
+  // a lock whose token doesn't match the one they observed earlier.
+  const ownToken = crypto.randomUUID();
+  const lockContent = `pid=${process.pid}\ntoken=${ownToken}\nat=${now()}\ncmd=gini import apply openclaw\n`;
   try {
     writeFileSync(lockPath, lockContent, { flag: "wx", mode: 0o600 });
   } catch (error) {
@@ -1745,15 +1757,29 @@ function acquireImportLock(instance: string): ImportLockHandle {
     // open and write — vanishingly rare. Conservative refuse-when-
     // uncertain is the right trade: case (b) requires manual lock
     // cleanup; case (a) preserves correctness.
-    const existingPid = readImportLockPid(lockPath);
-    if (existingPid === null) {
+    const existingMeta = readImportLockMeta(lockPath);
+    if (!existingMeta || existingMeta.pid === null) {
       throw new Error(
         `Import lock at ${lockPath} exists but has no recorded PID — a peer process is mid-acquisition. Retry shortly; if the lock persists with no PID after several seconds, remove it manually after confirming no migration is in progress.`
       );
     }
-    if (isProcessAlive(existingPid)) {
+    if (isProcessAlive(existingMeta.pid)) {
       throw new Error(
-        `Another gini import is running for instance '${instance}' (PID ${existingPid}, lock at ${lockPath}). Wait for it to finish, or stop that process and retry.`
+        `Another gini import is running for instance '${instance}' (PID ${existingMeta.pid}, lock at ${lockPath}). Wait for it to finish, or stop that process and retry.`
+      );
+    }
+    // Re-read just before unlink to verify the lock content still
+    // matches the stale token we decided to clean up. If a peer
+    // cleanup raced us and replaced the lock with a fresh one,
+    // abort rather than delete a live lock. The window between this
+    // re-read and the unlink is still microseconds — POSIX has no
+    // atomic compare-and-unlink — but tight enough that a third
+    // party would need to clean+acquire inside that window, which
+    // requires extreme scheduling pressure.
+    const recheckMeta = readImportLockMeta(lockPath);
+    if (!recheckMeta || recheckMeta.token !== existingMeta.token) {
+      throw new Error(
+        `Import lock at ${lockPath} changed between stale-detection and cleanup (peer raced into cleanup). Retry shortly.`
       );
     }
     try {
@@ -1774,22 +1800,47 @@ function acquireImportLock(instance: string): ImportLockHandle {
   return {
     path: lockPath,
     release: () => {
+      // Only unlink if the lock still holds OUR token. Without this,
+      // a peer that successfully raced through the cleanup race
+      // above (replacing our lock with theirs) would have its live
+      // lock nuked on our release.
       try {
-        unlinkSync(lockPath);
+        const meta = readImportLockMeta(lockPath);
+        if (!meta || meta.token === ownToken) {
+          try {
+            unlinkSync(lockPath);
+          } catch {
+            // unlink failure (e.g., someone already removed it) is non-fatal.
+          }
+        }
       } catch {
-        // unlink failure (e.g., someone already removed it) is non-fatal.
+        // Read failure → best-effort unlink, matching prior behavior.
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          /* fine */
+        }
       }
     }
   };
 }
 
-function readImportLockPid(lockPath: string): number | null {
+interface ImportLockMeta {
+  pid: number | null;
+  token: string | null;
+}
+
+function readImportLockMeta(lockPath: string): ImportLockMeta | null {
   try {
     const content = readFileSync(lockPath, "utf8");
-    const match = /^pid=(\d+)/m.exec(content);
-    if (!match) return null;
-    const pid = Number(match[1]);
-    return Number.isFinite(pid) && pid > 0 ? pid : null;
+    const pidMatch = /^pid=(\d+)/m.exec(content);
+    const pid =
+      pidMatch && Number.isFinite(Number(pidMatch[1])) && Number(pidMatch[1]) > 0
+        ? Number(pidMatch[1])
+        : null;
+    const tokenMatch = /^token=([0-9a-f-]+)/m.exec(content);
+    const token = tokenMatch ? tokenMatch[1] ?? null : null;
+    return { pid, token };
   } catch {
     return null;
   }

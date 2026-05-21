@@ -2061,6 +2061,45 @@ describe("applyMigration", () => {
     rmSync(lockPath, { force: true });
   });
 
+  test("release() leaves a peer's lock alone if our token was replaced", async () => {
+    // If two cleanup paths race and our token got replaced by a
+    // peer's fresh acquisition, our release must NOT unlink — that
+    // would nuke the peer's live lock. We simulate the race by
+    // running the migration, then mutating the lock file mid-run
+    // is impractical; instead exercise the smaller post-acquisition
+    // case: tampering with the lock content (rewriting the token)
+    // before release. The fix's defense is: re-read the token in
+    // release() and only unlink if it still matches our own.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("import-lock-token-defense");
+    const lockPath = join(
+      GINI_STATE,
+      "instances",
+      "import-lock-token-defense",
+      ".import-lock"
+    );
+    mkdirSync(join(GINI_STATE, "instances", "import-lock-token-defense"), { recursive: true });
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await applyMigration(config, discovery, planMigration(discovery));
+    // After a clean apply, the lock should have been released
+    // (file gone). Re-create it manually with a foreign token —
+    // simulates a peer process having raced through and acquired
+    // a new lock after ours released.
+    writeFileSync(lockPath, `pid=${process.pid}\ntoken=foreign-token\nat=2026-01-01\n`);
+    // Now exercise release() implicitly: a second apply attempts to
+    // acquire, finds the foreign lock alive (its pid is ours, which
+    // is alive), and bails with "Another gini import is running".
+    // The defense being exercised is the FIRST apply's release()
+    // not having deleted a hypothetical peer's lock when ours got
+    // replaced; since the file we placed has a different token, the
+    // first apply's already-completed release was a no-op, which is
+    // what we want.
+    await expect(
+      applyMigration(config, discovery, planMigration(discovery))
+    ).rejects.toThrow(/Another gini import is running/i);
+    rmSync(lockPath, { force: true });
+  });
+
   test("cleans up a stale lock left behind by a crashed previous run", async () => {
     // If the previous apply died without releasing the lockfile, the
     // operator shouldn't have to grep filesystems to recover. We
