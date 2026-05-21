@@ -221,6 +221,7 @@ export interface MigrationPlanSummary {
         bridgeKind: "telegram" | "discord";
         tokenEnv: string;
         allowedChatCount: number;
+        allowedChatIds: number[];
       }
     | { kind: "skill"; name: string; sourcePath: string }
     | { kind: "workspaceFile"; name: string; sourcePath: string }
@@ -1642,11 +1643,20 @@ export function summarizePlan(plan: MigrationPlan): MigrationPlanSummary {
     }
     if (step.kind === "bridge") {
       counts.bridges += 1;
+      // Surface the actual allowed chat ids in the plan summary so
+      // the operator can sanity-check who gets task-submission access
+      // before apply locks them in. The list is small (one integer
+      // per authorized chat), bounded, and printable. Hiding it
+      // behind a scalar count let a tampered openclaw backup smuggle
+      // foreign chat ids into the operator's bridge without the plan
+      // output ever revealing them; restoring the full list trades a
+      // few extra lines of output for an auditable diff.
       return {
         kind: "bridge",
         bridgeKind: step.bridgeKind,
         tokenEnv: step.tokenEnv,
-        allowedChatCount: step.allowedChatIds?.length ?? 0
+        allowedChatCount: step.allowedChatIds?.length ?? 0,
+        allowedChatIds: step.allowedChatIds ?? []
       };
     }
     if (step.kind === "skill") {

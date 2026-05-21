@@ -1303,6 +1303,28 @@ describe("planMigration", () => {
     expect((telegram as { tokenValue: string }).tokenValue).toBe("tg-token-from-config");
   });
 
+  test("summarizePlan exposes the actual Telegram allowedChatIds to the operator", () => {
+    // The CLI prints summarizePlan(plan) so the operator can review
+    // before apply. The bridge summary used to scrub allowedChatIds
+    // down to a scalar count, which let a tampered backup smuggle
+    // foreign chat ids past the operator's eye — the IDs only became
+    // visible after `gini messaging list` post-apply, by which time
+    // the bridge was already accepting their messages. The full list
+    // must round-trip into the summary so a plan diff catches an
+    // unexpected ID.
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const summary = summarizePlan(plan);
+    const bridgeSummary = summary.steps.find((step) => step.kind === "bridge");
+    expect(bridgeSummary).toBeDefined();
+    expect((bridgeSummary as { allowedChatIds: number[] }).allowedChatIds).toEqual([12345, 67890]);
+    expect((bridgeSummary as { allowedChatCount: number }).allowedChatCount).toBe(2);
+  });
+
   test("unions telegram allow-list from credentials file AND inline config", () => {
     // Operators using dmPolicy="allowlist" carry their allow-list inline in
     // openclaw.json (the modern surface). Configs that pre-date that move
