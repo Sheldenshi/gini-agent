@@ -1128,6 +1128,31 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       detail: `Agent '${agentLabel}' uses openclaw provider '${providerName}'; gini has no native mapping and the imported agent will fall back to the instance provider until you wire one.`
     });
   };
+  // Track local-flavor providers (lmstudio / vllm) that we collapse
+  // onto gini's "local" provider. Gini's local provider defaults to
+  // Ollama's URL (127.0.0.1:11434/v1); LMStudio listens at
+  // 127.0.0.1:1234/v1 and vLLM at localhost:8000/v1. The migrator
+  // doesn't carry baseUrl on per-agent overrides today, so the
+  // collapsed agent inherits whatever baseUrl the instance config
+  // has — Ollama by default, which silently misroutes LMStudio /
+  // vLLM users to the wrong port. Surface the mismatch as an
+  // unsupported entry so the operator either changes the instance
+  // baseUrl or manually sets the right URL after migrating.
+  const flaggedLocalFlavors = new Set<string>();
+  const flagLocalFlavorMismatch = (providerName: string | undefined, agentLabel: string) => {
+    if (!providerName) return;
+    const normalized = providerName.toLowerCase();
+    if (normalized !== "lmstudio" && normalized !== "vllm") return;
+    if (flaggedLocalFlavors.has(normalized)) return;
+    flaggedLocalFlavors.add(normalized);
+    const defaultUrl = normalized === "lmstudio"
+      ? "http://127.0.0.1:1234/v1"
+      : "http://localhost:8000/v1";
+    unsupported.push({
+      kind: `provider:${normalized}`,
+      detail: `Agent '${agentLabel}' uses openclaw provider '${normalized}'. Gini collapses it onto the 'local' provider, but the migrated agent will inherit your instance's local baseUrl (Ollama default 127.0.0.1:11434/v1). ${normalized.toUpperCase()} listens at ${defaultUrl} by default — update the gini instance config (or the migrated agent) before running it, or requests will hit the wrong port.`
+    });
+  };
   if (agentList.length === 0) {
     // Openclaw treats `main` as the implicit default when no list is
     // configured. We mirror that so users with the simplest config still
@@ -1135,6 +1160,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     // branch below — model-only routing is dropped because the gini
     // runtime AND-guards on (providerName, model).
     flagUnsupportedProvider(defaultRouting.providerName, "main");
+    flagLocalFlavorMismatch(defaultRouting.providerName, "main");
     if (defaultRouting.model && !defaultRouting.providerName) {
       unsupported.push({
         kind: "agent",
@@ -1172,6 +1198,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       const resolvedProvider = routing.providerName ?? defaultRouting.providerName;
       const resolvedModel = routing.model ?? defaultRouting.model;
       flagUnsupportedProvider(resolvedProvider, openclawId);
+      flagLocalFlavorMismatch(resolvedProvider, openclawId);
       // resolveEffectiveContext only honors a per-agent provider
       // override when BOTH providerName and model are populated. A
       // bare `model: "gpt-5-mini"` (no slash, no defaults-provider)

@@ -1674,6 +1674,39 @@ describe("summarizePlan", () => {
     expect(summary.counts.memoryUnits).toBe(2);
   });
 
+  test("lmstudio / vllm openclaw agents surface a baseUrl mismatch warning", () => {
+    // mapProviderToGini collapses lmstudio/vllm/ollama onto "local",
+    // but each listens on a different default port (1234 / 8000 /
+    // 11434). The migrated agent inherits the instance's local
+    // baseUrl, which is Ollama's by default — silently misrouting
+    // LMStudio/vLLM users to port 11434 if they don't notice.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [
+            { id: "main", default: true, model: "lmstudio/gemma-7b" },
+            { id: "secondary", model: "vllm/llama3-8b" }
+          ]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const lmstudioNote = plan.unsupported.find(
+      (entry) => entry.kind === "provider:lmstudio"
+    );
+    const vllmNote = plan.unsupported.find(
+      (entry) => entry.kind === "provider:vllm"
+    );
+    expect(lmstudioNote).toBeDefined();
+    expect(lmstudioNote!.detail).toContain("1234");
+    expect(lmstudioNote!.detail).toContain("11434");
+    expect(vllmNote).toBeDefined();
+    expect(vllmNote!.detail).toContain("8000");
+  });
+
   test("malformed first provider key doesn't block a valid duplicate from taking the slot", () => {
     // Previously a header-unsafe first profile claimed the env-var
     // slot in seenSecretEnv at plan time; the apply-time header check
