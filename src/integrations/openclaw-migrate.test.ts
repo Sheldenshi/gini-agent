@@ -610,6 +610,43 @@ describe("planMigration", () => {
     expect(secret.provider).toBe("local");
   });
 
+  test("surfaces SecretRef profiles on the unsupported list", async () => {
+    // Openclaw's ApiKeyCredential and TokenCredential support keyRef /
+    // tokenRef indirection where the actual secret lives in an env var,
+    // file, or exec command. The migrator can't dereference those (env
+    // might not be set under the gini gateway, paths may be machine-
+    // specific, exec may not be safe to run), so it must at least
+    // surface what was skipped rather than silently continuing.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-via-env": {
+            type: "api_key",
+            provider: "openai",
+            keyRef: { source: "env", id: "MY_OPENAI" }
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    expect(plan.steps.some((step) => step.kind === "secret")).toBe(false);
+    const ref = plan.unsupported.find(
+      (entry) =>
+        entry.kind === "provider:openai" && entry.detail.includes("SecretRef")
+    );
+    expect(ref).toBeDefined();
+    expect(ref?.detail).toContain("MY_OPENAI");
+    expect(ref?.detail).toContain("OPENAI_API_KEY");
+  });
+
   test("skips codex secret writes and points the operator at codex --login", () => {
     // Gini's codex provider reads OAuth from ~/.codex/auth.json, the
     // same file openclaw uses. There's no bearer env to migrate, so

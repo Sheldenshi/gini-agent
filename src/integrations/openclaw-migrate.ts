@@ -450,6 +450,17 @@ export function parseOpenclawModelRouting(
   };
 }
 
+// Build a short human-readable description of an openclaw SecretRef so
+// the unsupported-entry message tells the operator where the
+// credential lives without leaking the value itself.
+function describeSecretRef(ref: OpenclawSecretRefLike): string {
+  if (ref.source === "env" && ref.id) return `source=env, var=${ref.id}`;
+  if (ref.source === "file" && ref.path) return `source=file, path=${ref.path}`;
+  if (ref.source === "exec" && ref.command) return `source=exec, command=${ref.command}`;
+  if (ref.source) return `source=${ref.source}`;
+  return "unknown SecretRef shape";
+}
+
 // Openclaw's own agent-id validator (`normalizeAgentId` at
 // src/routing/session-key.ts upstream) accepts `[a-z0-9][a-z0-9_-]{0,63}`
 // case-insensitively. We mirror that here and additionally allow `.` so
@@ -514,12 +525,29 @@ const WORKSPACE_BOOTSTRAP_FILES = [
   "MEMORY.md"
 ] as const;
 
+// Openclaw's AuthProfile shapes carry either the plaintext credential
+// (`key`/`token`/`access`) or a SecretRef indirection (`keyRef` /
+// `tokenRef`) pointing at an env var, file, or exec command. The
+// migrator can only carry the plaintext over directly; SecretRef
+// profiles need operator action on the gini side, so the loop has to
+// recognize them and surface an explicit unsupported entry rather
+// than silently treating them as "no credential."
+interface OpenclawSecretRefLike {
+  source?: string;
+  provider?: string;
+  id?: string;
+  path?: string;
+  command?: string;
+}
+
 interface AuthProfileLike {
   type?: string;
   provider?: string;
   key?: string;
   token?: string;
   access?: string;
+  keyRef?: OpenclawSecretRefLike;
+  tokenRef?: OpenclawSecretRefLike;
 }
 
 interface AuthProfileFile {
@@ -645,7 +673,25 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         continue;
       }
       const plaintext = profile.key ?? profile.token ?? profile.access;
-      if (!plaintext) continue;
+      if (!plaintext) {
+        // The profile may still carry a SecretRef indirection (keyRef
+        // / tokenRef) where the real value lives in an env var, a
+        // file, or an exec command. We can't dereference those during
+        // migration — the env var might not be set in the gini gateway
+        // process, the file might be a different absolute path on a
+        // different machine, the exec might not be safe to run. Push
+        // an unsupported entry so the operator knows their key wasn't
+        // migrated and what to do instead.
+        const ref = profile.keyRef ?? profile.tokenRef;
+        if (ref && typeof ref === "object") {
+          const refDescription = describeSecretRef(ref);
+          unsupported.push({
+            kind: `provider:${profile.provider ?? giniProvider}`,
+            detail: `Profile uses a SecretRef indirection (${refDescription}); migrator cannot dereference it. Set ${canonicalApiKeyEnv(giniProvider) ?? "the provider API key env var"} in ~/.gini/secrets.env manually.`
+          });
+        }
+        continue;
+      }
       // Source the canonical env var name from the provider layer
       // rather than hand-rolling `${PROVIDER}_API_KEY`. The local
       // provider uses `GINI_LOCAL_API_KEY` (per `normalizeProvider` in
