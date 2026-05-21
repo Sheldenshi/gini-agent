@@ -295,7 +295,11 @@ describe("mapProviderToGini", () => {
 });
 
 describe("rewriteSkillFrontmatter", () => {
-  test("rewrites flow-style metadata.openclaw → metadata.gini", () => {
+  test("rewrites flow-style metadata.openclaw into loader-readable block-style metadata.gini", () => {
+    // The skill loader is a hand-rolled YAML-ish parser that doesn't
+    // handle JSON flow-style. The migrator must therefore convert the
+    // whole flow block into block-style YAML or the migrated skill's
+    // metadata silently disappears (loader falls through to defaults).
     const raw = [
       "---",
       "name: github",
@@ -312,9 +316,46 @@ describe("rewriteSkillFrontmatter", () => {
       "body"
     ].join("\n");
     const out = rewriteSkillFrontmatter(raw);
-    expect(out).toContain('"gini":');
+    // The output must be block-style under metadata.gini and the
+    // original openclaw key shouldn't survive anywhere in frontmatter.
+    expect(out).toMatch(/metadata:\n[ \t]+gini:\n/);
     expect(out).not.toContain('"openclaw"');
-    expect(out).toContain('"emoji": "🐙"');
+    expect(out).not.toContain("openclaw:");
+    expect(out).toContain("emoji: 🐙");
+    expect(out).toContain("bins: [gh]");
+  });
+
+  test("migrated skill metadata is round-trippable through the gini skill-loader frontmatter parser", async () => {
+    // Anchor the fix end-to-end: rewrite the openclaw flow-style
+    // frontmatter, then feed it through the same parseFrontmatter the
+    // loader uses and assert metadata.gini comes out as a real object
+    // with the expected keys.
+    const raw = [
+      "---",
+      "name: github",
+      'description: "GitHub CLI."',
+      "metadata:",
+      "  {",
+      '    "openclaw":',
+      "      {",
+      '        "emoji": "🐙",',
+      '        "os": ["darwin", "linux"],',
+      '        "requires": { "bins": ["gh"] }',
+      "      }",
+      "  }",
+      "---",
+      "body"
+    ].join("\n");
+    const rewritten = rewriteSkillFrontmatter(raw);
+    const { parseFrontmatter } = await import("../capabilities/skill-loader");
+    const fmText = /^---\r?\n([\s\S]*?)\r?\n---/.exec(rewritten)![1]!;
+    const fm = parseFrontmatter(fmText) as {
+      metadata?: { gini?: { emoji?: string; os?: unknown; requires?: { bins?: unknown } } };
+    };
+    expect(fm.metadata?.gini).toBeDefined();
+    expect(fm.metadata?.gini?.emoji).toBe("🐙");
+    expect(fm.metadata?.gini?.os).toEqual(["darwin", "linux"]);
+    expect(fm.metadata?.gini?.requires?.bins).toEqual(["gh"]);
   });
 
   test("rewrites block-style nested metadata.openclaw → metadata.gini", () => {

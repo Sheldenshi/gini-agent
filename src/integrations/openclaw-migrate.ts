@@ -1142,8 +1142,12 @@ export function rewriteSkillFrontmatter(raw: string): string {
 
 function rewriteFrontmatterBody(body: string): string {
   let out = body;
-  // Shape 1: flow-style quoted key.
-  out = out.replace(/"openclaw"/g, '"gini"');
+  // Shape 1 (dominant bundled form): flow-style metadata block. The gini
+  // skill loader is a hand-rolled YAML-ish parser that does not handle
+  // JSON flow-style, so a plain "openclaw" → "gini" key swap leaves the
+  // block unreadable. Convert the whole flow-style block to block-style
+  // YAML under metadata.gini so the loader actually picks it up.
+  out = convertFlowStyleMetadata(out);
   // Shape 2: block-style nested key (any indentation).
   out = out.replace(/^([ \t]+)openclaw:(\s*)$/gm, "$1gini:$2");
   // Shape 3: legacy top-level block. Promote to metadata.gini with
@@ -1159,6 +1163,140 @@ function rewriteFrontmatterBody(body: string): string {
     out = `${out.slice(0, legacy.index)}metadata:\n  gini:\n${reindented}${trailingNewline.length > 0 && !reindented.endsWith("\n") ? "\n" : ""}${out.slice(legacy.index + legacy[0].length)}`;
   }
   return out;
+}
+
+// Locate `metadata:\n  {...}` (with the brace block possibly spanning
+// multiple lines and containing nested braces) and rewrite it as
+// `metadata:\n  gini:\n    key: value\n...` so gini's skill loader can
+// read it. The conversion parses the JSON block with the same tolerant
+// parser used for openclaw.json itself (comments + trailing commas) and
+// reuses the namespace contents — anything under `"openclaw"` becomes
+// the body of `metadata.gini`. Unknown shapes fall through unchanged.
+function convertFlowStyleMetadata(body: string): string {
+  const header = /^metadata:[ \t]*\r?\n/m.exec(body);
+  if (!header) return body;
+  const blockStart = body.indexOf("{", header.index + header[0].length);
+  if (blockStart < 0) return body;
+  // Walk forward tracking brace depth and string state so we find the
+  // matching closing brace even with nested objects.
+  const blockEnd = findMatchingBrace(body, blockStart);
+  if (blockEnd < 0) return body;
+  const flowBlock = body.slice(blockStart, blockEnd + 1);
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = parseOpenclawJson(flowBlock) as Record<string, unknown>;
+  } catch {
+    return body;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return body;
+  const inner =
+    (parsed.openclaw && typeof parsed.openclaw === "object" && parsed.openclaw) ||
+    (parsed.gini && typeof parsed.gini === "object" && parsed.gini) ||
+    null;
+  if (!inner) return body;
+
+  // Find the indentation we should land block-style content at. Look at
+  // the existing block's leading whitespace.
+  const leadingMatch = /^[ \t]*/.exec(body.slice(header.index + header[0].length));
+  const baseIndent = (leadingMatch?.[0] ?? "  ").length === 0 ? "  " : leadingMatch![0];
+  const giniBody = emitBlockYaml(inner as Record<string, unknown>, `${baseIndent}  `);
+  const replacement = `metadata:\n${baseIndent}gini:\n${giniBody}\n`;
+  return `${body.slice(0, header.index)}${replacement}${body.slice(blockEnd + 1).replace(/^\r?\n/, "")}`;
+}
+
+// Walk `text` from `openIdx` (which must point at `{`) until the
+// matching `}`, ignoring braces inside string literals. Returns the
+// index of the matching `}` or -1 if unbalanced.
+function findMatchingBrace(text: string, openIdx: number): number {
+  let depth = 0;
+  let inString = false;
+  let stringChar = "";
+  for (let i = openIdx; i < text.length; i += 1) {
+    const c = text[i]!;
+    if (inString) {
+      if (c === "\\") { i += 1; continue; }
+      if (c === stringChar) inString = false;
+      continue;
+    }
+    if (c === '"' || c === "'") { inString = true; stringChar = c; continue; }
+    if (c === "{") depth += 1;
+    else if (c === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+// Render a parsed JSON-ish object tree as block-style YAML at the
+// given indent. Only the shapes we see in openclaw skill metadata
+// (strings, numbers, booleans, arrays of scalars, arrays of objects,
+// nested objects) are emitted; anything else stringifies to a JSON
+// inline scalar so we never silently drop a field.
+function emitBlockYaml(obj: Record<string, unknown>, indent: string): string {
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(obj)) {
+    if (value === undefined) continue;
+    if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      lines.push(`${indent}${key}: ${yamlScalar(value)}`);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        lines.push(`${indent}${key}: []`);
+        continue;
+      }
+      const allScalar = value.every(
+        (entry) =>
+          entry === null ||
+          typeof entry === "string" ||
+          typeof entry === "number" ||
+          typeof entry === "boolean"
+      );
+      if (allScalar) {
+        lines.push(`${indent}${key}: [${value.map(yamlScalar).join(", ")}]`);
+        continue;
+      }
+      lines.push(`${indent}${key}:`);
+      for (const entry of value) {
+        if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+          const nested = emitBlockYaml(entry as Record<string, unknown>, `${indent}    `);
+          const [first, ...rest] = nested.split("\n");
+          if (first) lines.push(`${indent}  - ${first.trimStart()}`);
+          else lines.push(`${indent}  -`);
+          for (const line of rest) if (line.length > 0) lines.push(line);
+        } else {
+          lines.push(`${indent}  - ${yamlScalar(entry)}`);
+        }
+      }
+      continue;
+    }
+    if (typeof value === "object") {
+      lines.push(`${indent}${key}:`);
+      lines.push(emitBlockYaml(value as Record<string, unknown>, `${indent}  `));
+      continue;
+    }
+  }
+  return lines.join("\n");
+}
+
+// Format a scalar for block-style YAML. Strings are quoted only when
+// they contain whitespace, leading dashes, colons, or other characters
+// the loader's parser would misread; plain identifiers and numbers
+// pass through bare so the output stays human-readable.
+function yamlScalar(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  const str = String(value);
+  if (str === "") return '""';
+  const needsQuotes = /[:#\n\r\t"'\\]|^[-?!&*|>%@`]|^\s|\s$/.test(str);
+  if (!needsQuotes) return str;
+  return JSON.stringify(str);
 }
 
 function copyDirShallow(srcDir: string, dstDir: string, exclude: Set<string>): void {
