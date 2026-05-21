@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -446,10 +446,27 @@ describe("rewriteSkillFrontmatter", () => {
 });
 
 describe("discoverOpenclawState", () => {
+  const saved: Record<string, string | undefined> = {};
+
   beforeEach(() => {
+    // Snapshot the three openclaw-side env vars before this describe
+    // block clears them, then restore on teardown. Without the
+    // afterEach, a developer with any of these set in their shell
+    // would have them stripped permanently for the remainder of the
+    // bun test invocation, affecting any later test file in the same
+    // process.
+    saved.OPENCLAW_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
+    saved.OPENCLAW_WORKSPACE_DIR = process.env.OPENCLAW_WORKSPACE_DIR;
+    saved.OPENCLAW_PROFILE = process.env.OPENCLAW_PROFILE;
     delete process.env.OPENCLAW_STATE_DIR;
     delete process.env.OPENCLAW_WORKSPACE_DIR;
     delete process.env.OPENCLAW_PROFILE;
+  });
+
+  afterEach(() => {
+    restoreEnv("OPENCLAW_STATE_DIR", saved.OPENCLAW_STATE_DIR);
+    restoreEnv("OPENCLAW_WORKSPACE_DIR", saved.OPENCLAW_WORKSPACE_DIR);
+    restoreEnv("OPENCLAW_PROFILE", saved.OPENCLAW_PROFILE);
   });
 
   test("honors an explicit path argument", () => {
@@ -1194,6 +1211,43 @@ describe("applyMigration", () => {
     expect(readFileSync(join(dotGini, "secrets.env"), "utf8")).not.toContain(
       "sk-real-existing-key"
     );
+  });
+
+  test("rejects malformed provider API keys before writing secrets.env", async () => {
+    // Same defense-in-depth the messaging path applies on bot tokens.
+    // A newline-laced value would survive secrets.env's single-quoted
+    // shell escaping at source time, but the launchd plist installer
+    // splits the file by newlines and copies each KEY=VALUE into
+    // EnvironmentVariables — `sk-foo\\nexport EVIL=...` injects EVIL.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "main", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({ agents: { list: [{ id: "main", default: true }] } })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "agents", "main", "agent", "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-malformed": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-foo\nexport EVIL=injected"
+          }
+        }
+      })
+    );
+    const config = loadConfig("malformed-api-key");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.secretsWritten).toBe(0);
+    expect(
+      result.warnings.some(
+        (warning) =>
+          warning.includes("OPENAI_API_KEY") && warning.includes("header-safe")
+      )
+    ).toBe(true);
   });
 
   test("rejects malformed bot tokens before they reach the encrypted store", async () => {

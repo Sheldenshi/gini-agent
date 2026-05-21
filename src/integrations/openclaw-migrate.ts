@@ -450,6 +450,15 @@ export function parseOpenclawModelRouting(
   };
 }
 
+// Same gate the messaging path uses on bot tokens: header-safe
+// printable ASCII (\x21-\x7E) only. Rejects newlines, control bytes,
+// and spaces — all of which would break either shell sourcing or
+// launchd EnvironmentVariables splitting.
+const HEADER_SAFE_API_KEY = /^[\x21-\x7E]+$/;
+function isHeaderSafeApiKey(value: string): boolean {
+  return HEADER_SAFE_API_KEY.test(value);
+}
+
 // Build a short human-readable description of an openclaw SecretRef so
 // the unsupported-entry message tells the operator where the
 // credential lives without leaking the value itself.
@@ -979,6 +988,22 @@ export async function applyMigration(
   // opt-in for rotation.
   for (const step of plan.steps) {
     if (step.kind !== "secret") continue;
+    // Mirror the messaging path's header-safe gate on the api-key
+    // string. shell-quoting in writeKeyToSecretsEnv keeps a newline-
+    // laced value from breaking `set -a; . ~/.gini/secrets.env` at
+    // source time, but the launchd plist installer (autostart.ts)
+    // splits the file by newlines and copies each KEY=VALUE into
+    // EnvironmentVariables — a value containing a literal newline
+    // followed by `export EVIL=...` injects EVIL into the gateway's
+    // launchd env. Real `sk-...` keys are header-safe printable
+    // ASCII, so the gate is pure defense-in-depth with no false
+    // positives.
+    if (!isHeaderSafeApiKey(step.valueFrom)) {
+      warnings.push(
+        `Skipped secret ${step.envVar}: value contains characters that aren't header-safe printable ASCII.`
+      );
+      continue;
+    }
     if (secretsEnvHasKey(step.envVar) && !options.force) {
       warnings.push(
         `Skipped existing secret: ${step.envVar} (use --force to overwrite with the openclaw value)`

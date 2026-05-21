@@ -7,6 +7,7 @@ This guide moves an existing [openclaw](https://github.com/openclaw/openclaw) in
 - A working openclaw install you no longer want as your primary agent. The state must live on the same machine you are running gini on; the migrator does not transfer state across hosts.
 - A gini install (`bun run gini install`). The migrator does not bootstrap gini; it only adds to an existing instance.
 - Stop openclaw's gateway before migrating so the migrator reads a consistent snapshot. `openclaw stop` (or its daemon equivalent) is enough — the migrator never writes back into openclaw's state root.
+- Stop the gini gateway for the target instance before running `apply`. `gini import apply openclaw` refuses to run while a gateway is alive for the same instance because the in-process `mutateState` lock cannot serialize writes across separate OS processes. Run `gini stop --instance <name>` first, apply, then `gini start --instance <name>`.
 
 ## Resolving the openclaw state root
 
