@@ -232,8 +232,12 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // --kind gateway` after an OpenAI key change) start with $SHELL set
   // and can re-read the same shell PATH. Without this, refresh
   // regenerates the plist with the bare launchd PATH and silently
-  // wipes the nvm/asdf merge we did at first enable.
-  const shell = options.loginShell ?? process.env.SHELL ?? "";
+  // wipes the nvm/asdf merge we did at first enable. We only persist
+  // it when the path resolves to an existing file on disk — a stale
+  // or garbage $SHELL would otherwise survive in launchd's
+  // EnvironmentVariables and confuse every future child process.
+  const shellRaw = options.loginShell ?? process.env.SHELL ?? "";
+  const shell = shellRaw && fileExists(shellRaw) ? shellRaw : "";
   const baseEnv: Record<string, string> = {
     PATH: buildLaunchAgentPath(bunPath, home, {
       loginShellReader: options.loginShellReader,
@@ -321,7 +325,7 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // default-by-instance hash from sh, so we read the file the gateway
   // writes; until it appears (cold boot), we fall back to the default
   // gateway port for instance 'main' and to a 30s timeout overall.
-  const shim = buildWebShim(options.instance);
+  const shim = buildWebShim(options.instance, bunPath);
   const web: LaunchSpec = {
     programArguments: ["/bin/sh", "-c", shim],
     workingDirectory,
@@ -434,7 +438,7 @@ function isGiniAgentCheckout(dir: string, fileExists: (path: string) => boolean)
 // HOME is set by launchd from EnvironmentVariables; we expand it inline so
 // the script doesn't depend on a parent process env. The instance dir
 // path matches `src/paths.ts` (instances/<inst>/runtime.port).
-function buildWebShim(instance: Instance): string {
+function buildWebShim(instance: Instance, bunPath: string): string {
   // Reject suspicious instance names defensively. CLI validation (and the
   // dir-name layout) already restricts instances to alphanumerics, dashes,
   // and underscores, but we'd rather fail at write time than emit a shim
@@ -443,6 +447,12 @@ function buildWebShim(instance: Instance): string {
   // break out via `$(...)` or `${...}`; we forbid those characters.
   if (!/^[A-Za-z0-9._-]+$/.test(instance)) {
     throw new Error(`autostart: refusing to embed instance name '${instance}' in launchd shim — name must match [A-Za-z0-9._-]+`);
+  }
+  // Same constraint applies to bunPath — it gets embedded in the shim and
+  // exec'd. Reject paths with shell-meaningful characters so a malformed
+  // override can't break out of the exec line.
+  if (!/^[A-Za-z0-9._\/-]+$/.test(bunPath)) {
+    throw new Error(`autostart: refusing to embed bunPath '${bunPath}' in launchd shim — path must match [A-Za-z0-9._/-]+`);
   }
   // GINI_STATE_ROOT is propagated into the env via the plist when --test-root
   // is passed; absent that, the runtime uses ~/.gini. We honor the same
@@ -457,8 +467,12 @@ function buildWebShim(instance: Instance): string {
     // the sleep, walk to the next iteration, and only exit when the
     // overall loop completes. Trapping → exit 0 makes the polling phase
     // honor KeepAlive.SuccessfulExit:false the same way the runtime does.
-    // Once `exec bun run dev` runs, the shell is gone and bun handles
-    // SIGTERM directly.
+    // Once `exec <bunPath> run dev` runs, the shell is gone and bun
+    // handles SIGTERM directly. We exec the absolute bunPath (the
+    // same one the gateway's programArguments uses) instead of bare
+    // `bun` so the gateway and the web dev server always run under
+    // the same Bun even if the launchd PATH starts with a different
+    // bun (e.g. one provided by the user's interactive shell PATH).
     `trap 'exit 0' TERM INT`,
     `cd web 2>/dev/null || true`,
     `state_root="\${GINI_STATE_ROOT:-$HOME/.gini}"`,
@@ -494,7 +508,7 @@ function buildWebShim(instance: Instance): string {
     `echo $$ > "$instance_root/web.pid"`,
     `if [ -n "$PORT" ]; then echo "$PORT" > "$instance_root/web.port"; fi`,
     // 4) Hand off to Next.js. exec so launchd tracks dev server PID.
-    `exec bun run dev`
+    `exec "${bunPath}" run dev`
   ].join("\n");
 }
 
@@ -561,12 +575,19 @@ function buildLaunchAgentPath(
   const read = options.loginShellReader ?? readLoginShellPath;
   let shellPath: string | null;
   try {
-    shellPath = read(shell);
+    shellPath = read(shell, { home });
   } catch {
     shellPath = null;
   }
   if (!shellPath) return base;
-  return mergeShellPath(base, shellPath).merged;
+  // pinFirst: 1 keeps bunDir at the head of PATH even when the user's
+  // shell provides a different bun. Without this, a shell-provided bun
+  // could shadow the launchd-baked bunDir and the web shim's
+  // `exec <bunPath> run dev` would still execute the right bun (we
+  // pass the absolute bunPath) but any other PATH-relative `bun` would
+  // not. Treating the first base entry (bunDir) as fixed avoids that
+  // class of surprise.
+  return mergeShellPath(base, shellPath, { pinFirst: 1 }).merged;
 }
 
 function isTestEnv(): boolean {

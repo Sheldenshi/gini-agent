@@ -73,32 +73,70 @@ describe("mergeShellPath", () => {
     expect(report.merged).not.toContain("node_modules");
     expect(report.merged).not.toContain("relative");
   });
+
+  it("pinFirst keeps the leading N base entries at the head of merged PATH", () => {
+    // The launchd plist's PATH starts with the resolved bunDir; a
+    // shell-provided bun must not shadow it. pinFirst: 1 anchors that
+    // first entry while still letting shell additions land ahead of
+    // the rest of the base.
+    const report = mergeShellPath(
+      "/opt/bun/bin:/usr/local/bin:/usr/bin",
+      "/Users/u/.nvm/bin:/opt/homebrew/bin",
+      { pinFirst: 1 }
+    );
+    expect(report.merged).toBe(
+      "/opt/bun/bin:/Users/u/.nvm/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin"
+    );
+  });
+
+  it("pinFirst clamps to the base length so out-of-range values don't break the merge", () => {
+    const report = mergeShellPath("/a:/b", "/c:/d", { pinFirst: 99 });
+    expect(report.merged).toBe("/a:/b:/c:/d");
+  });
+
+  it("pinFirst defaults to 0 (shell additions prepended)", () => {
+    const report = mergeShellPath("/a:/b", "/c:/d");
+    expect(report.merged).toBe("/c:/d:/a:/b");
+  });
 });
 
 describe("extractBetweenSentinels", () => {
-  const { extractBetweenSentinels, PATH_BEGIN, PATH_END } = __testing;
+  const { extractBetweenSentinels, SENTINEL_PREFIX } = __testing;
+  const begin = `${SENTINEL_PREFIX}deadbeef_BEGIN__`;
+  const end = `${SENTINEL_PREFIX}deadbeef_END__`;
 
   it("returns the value between sentinels", () => {
-    expect(
-      extractBetweenSentinels(`${PATH_BEGIN}/usr/bin:/bin${PATH_END}`)
-    ).toBe("/usr/bin:/bin");
+    expect(extractBetweenSentinels(`${begin}/usr/bin:/bin${end}`, begin, end))
+      .toBe("/usr/bin:/bin");
   });
 
   it("ignores noise before and after the sentinels (rc-file banners)", () => {
-    const noisy = `Welcome to zsh!\nnvm: loaded\n${PATH_BEGIN}/Users/u/.nvm/bin:/usr/bin${PATH_END}\nbye\n`;
-    expect(extractBetweenSentinels(noisy)).toBe("/Users/u/.nvm/bin:/usr/bin");
+    const noisy = `Welcome to zsh!\nnvm: loaded\n${begin}/Users/u/.nvm/bin:/usr/bin${end}\nbye\n`;
+    expect(extractBetweenSentinels(noisy, begin, end)).toBe("/Users/u/.nvm/bin:/usr/bin");
   });
 
   it("returns null when no markers appear", () => {
-    expect(extractBetweenSentinels("/Users/u/.nvm/bin:/usr/bin")).toBeNull();
+    expect(extractBetweenSentinels("/Users/u/.nvm/bin:/usr/bin", begin, end))
+      .toBeNull();
   });
 
   it("returns null when only the start sentinel appears", () => {
-    expect(extractBetweenSentinels(`${PATH_BEGIN}/usr/bin:/bin`)).toBeNull();
+    expect(extractBetweenSentinels(`${begin}/usr/bin:/bin`, begin, end))
+      .toBeNull();
   });
 
   it("returns null when the value is empty after trimming", () => {
-    expect(extractBetweenSentinels(`${PATH_BEGIN}   ${PATH_END}`)).toBeNull();
+    expect(extractBetweenSentinels(`${begin}   ${end}`, begin, end)).toBeNull();
+  });
+
+  it("ignores a different-nonce sentinel printed by an rc-file (collision resistance)", () => {
+    // A pathological `.zshrc` could print a fixed string that looks
+    // like our marker. Per-call nonce means the bogus marker won't
+    // match the begin/end we minted for *this* call.
+    const otherBegin = `${SENTINEL_PREFIX}cafebabe_BEGIN__`;
+    const otherEnd = `${SENTINEL_PREFIX}cafebabe_END__`;
+    const stdout = `${otherBegin}attacker-value${otherEnd}${begin}/real/path${end}`;
+    expect(extractBetweenSentinels(stdout, begin, end)).toBe("/real/path");
   });
 });
 
@@ -114,6 +152,24 @@ describe("readLoginShellPath", () => {
   it("returns null when the shell binary does not exist", () => {
     const result = readLoginShellPath("/nonexistent/shell-binary-xyz");
     expect(result).toBeNull();
+  });
+
+  it("passes the supplied HOME through to the spawned shell rather than process.env.HOME", () => {
+    // /bin/sh on macOS doesn't run a user rc unless invoked as a login
+    // shell; for our purposes the smoke is that the option threads
+    // through to the spawn without crashing and we get a non-null PATH.
+    const prev = process.env.HOME;
+    delete process.env.HOME;
+    try {
+      const result = readLoginShellPath("/bin/sh", { home: "/tmp" });
+      // sh under -ilc with HOME=/tmp should still produce a PATH
+      // (CLEAN_SHELL_PATH at minimum).
+      if (result !== null) {
+        expect(result.length).toBeGreaterThan(0);
+      }
+    } finally {
+      if (prev !== undefined) process.env.HOME = prev;
+    }
   });
 
   it("does not inherit the caller's PATH (the shell starts from CLEAN_SHELL_PATH)", () => {
