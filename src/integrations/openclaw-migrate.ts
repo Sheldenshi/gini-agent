@@ -734,17 +734,32 @@ export async function applyMigration(
   // underlying file but doesn't fork the bridge.
   for (const step of plan.steps) {
     if (step.kind !== "bridge") continue;
-    const existing = await mutateState(config.instance, (state) =>
-      state.messagingBridges.find((bridge) => bridge.kind === step.bridgeKind)
-    );
-    if (existing && !options.force) {
+    // First pass: decide whether we are creating or rotating. We only
+    // need the bridge id (and existence flag) out of state here; we
+    // intentionally do NOT keep a reference to the bridge object,
+    // because the second mutateState below re-reads state from disk and
+    // returns a different object graph. Mutating the stale object would
+    // be silently dropped — exactly the bug the validator confirmed.
+    const decision = await mutateState(config.instance, (state) => {
+      const found = state.messagingBridges.find(
+        (bridge) => bridge.kind === step.bridgeKind
+      );
+      return found
+        ? { kind: "existing" as const, id: found.id }
+        : { kind: "new" as const, id: id("bridge") };
+    });
+    if (decision.kind === "existing" && !options.force) {
       warnings.push(
-        `Skipped ${step.bridgeKind} bridge: one already exists (use --force to rotate token)`
+        `Skipped ${step.bridgeKind} bridge: one already exists (use --force to rotate token and merge allow-list)`
       );
       continue;
     }
-    const bridgeId = existing?.id ?? id("bridge");
-    const ref = writeSecret(config.instance, `messaging.${bridgeId}`, "bot-token", step.tokenValue);
+    const ref = writeSecret(
+      config.instance,
+      `messaging.${decision.id}`,
+      "bot-token",
+      step.tokenValue
+    );
     await mutateState(config.instance, (state) => {
       const at = now();
       const metadata: Record<string, unknown> =
@@ -754,14 +769,26 @@ export async function applyMigration(
               lastOffset: 0
             }
           : { lastInboundExternalIds: {} };
-      if (existing) {
-        existing.secretRefs = [ref];
-        existing.metadata = { ...(existing.metadata ?? {}), ...metadata };
-        existing.status = "configured";
-        existing.updatedAt = at;
+      if (decision.kind === "existing") {
+        // Re-find the bridge inside THIS mutateState call so the mutation
+        // lands on the fresh state graph that writeState will serialize.
+        const target = state.messagingBridges.find(
+          (bridge) => bridge.id === decision.id
+        );
+        if (target) {
+          target.secretRefs = [ref];
+          // Merge telegram allowedChatIds (union, deduplicated) so an
+          // operator who's enrolled extra chats post-migration doesn't
+          // lose them on a token rotation. lastOffset/lastInboundExternalIds
+          // are preserved from the existing metadata so the poller doesn't
+          // replay old updates.
+          target.metadata = mergeBridgeMetadata(target.metadata, metadata, step.bridgeKind);
+          target.status = "configured";
+          target.updatedAt = at;
+        }
       } else {
         const item: MessagingBridgeRecord = {
-          id: bridgeId,
+          id: decision.id,
           instance: state.instance,
           name: `${step.bridgeKind} (migrated from openclaw)`,
           kind: step.bridgeKind,
@@ -779,11 +806,12 @@ export async function applyMigration(
         {
           actor: "user",
           action: "messaging.configured",
-          target: bridgeId,
+          target: decision.id,
           risk: "medium",
           evidence: {
             kind: step.bridgeKind,
             source: "openclaw-migration",
+            rotated: decision.kind === "existing",
             allowedChatCount: step.allowedChatIds?.length ?? 0
           }
         },
@@ -832,6 +860,41 @@ export async function applyMigration(
     unsupported: plan.unsupported,
     warnings
   };
+}
+
+// Merge bridge.metadata across a --force rotation. For Telegram, union
+// the existing and incoming allowedChatIds so an operator who enrolled
+// extra chats via `gini messaging allow` doesn't lose them when a token
+// rotates from a fresh openclaw export. lastOffset / lastInboundExternalIds
+// are preserved from the existing record so the poller doesn't replay
+// the entire backlog after rotation.
+function mergeBridgeMetadata(
+  previous: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown>,
+  bridgeKind: "telegram" | "discord"
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...(previous ?? {}), ...incoming };
+  if (bridgeKind === "telegram") {
+    const previousIds = Array.isArray(previous?.allowedChatIds)
+      ? (previous!.allowedChatIds as unknown[]).filter(
+          (value): value is number => typeof value === "number" && Number.isFinite(value)
+        )
+      : [];
+    const incomingIds = Array.isArray(incoming.allowedChatIds)
+      ? (incoming.allowedChatIds as unknown[]).filter(
+          (value): value is number => typeof value === "number" && Number.isFinite(value)
+        )
+      : [];
+    merged.allowedChatIds = Array.from(new Set([...previousIds, ...incomingIds]));
+    if (typeof previous?.lastOffset === "number") {
+      merged.lastOffset = previous.lastOffset;
+    }
+  } else {
+    if (previous?.lastInboundExternalIds && typeof previous.lastInboundExternalIds === "object") {
+      merged.lastInboundExternalIds = previous.lastInboundExternalIds;
+    }
+  }
+  return merged;
 }
 
 // Rewrite an openclaw SKILL.md frontmatter so the `openclaw` metadata

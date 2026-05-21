@@ -596,23 +596,53 @@ describe("applyMigration", () => {
   });
 
   test("--force rotates a bot token on an existing bridge", async () => {
-    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withTelegramChannel: true });
+    seedOpenclawTree(OPENCLAW_ROOT, {
+      withConfig: true,
+      withTelegramChannel: true,
+      withTelegramAllowFrom: true
+    });
     const config = loadConfig("rotate");
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
     await applyMigration(config, discovery, planMigration(discovery));
-    // Rewrite config to point at a new token, then re-apply with force.
+
+    // Capture the bridge before rotation so we can assert specific
+    // fields actually change (not just any-write).
+    const stateBefore = readState("rotate");
+    const bridgeBefore = stateBefore.messagingBridges.find(
+      (entry) => entry.kind === "telegram"
+    )!;
+    const updatedAtBefore = bridgeBefore.updatedAt;
+
+    // Rewrite config to point at a new token AND a new allow-list so the
+    // merge path has something to verify.
     const cfg = JSON.parse(readFileSync(join(OPENCLAW_ROOT, "openclaw.json"), "utf8")) as {
       env: { vars: Record<string, string> };
     };
     cfg.env.vars.TELEGRAM_BOT_TOKEN = "tg-token-rotated";
     writeFileSync(join(OPENCLAW_ROOT, "openclaw.json"), JSON.stringify(cfg));
+    writeFileSync(
+      join(OPENCLAW_ROOT, "credentials", "telegram-allowFrom.json"),
+      JSON.stringify({ version: 1, allowFrom: ["99988", "77766"] })
+    );
+
     const second = await applyMigration(config, discovery, planMigration(discovery), {
       force: true
     });
     expect(second.bridgesCreated).toBe(1);
+
     const state = readState("rotate");
     const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
     expect(readSecret("rotate", bridge.secretRefs![0]!)).toBe("tg-token-rotated");
+
+    // The bridge record itself must have changed — proves the second
+    // mutateState block actually wrote to the persisted state graph
+    // rather than mutating a stale snapshot.
+    expect(bridge.updatedAt).not.toBe(updatedAtBefore);
+    // Allow-list is the union of pre-rotation [12345, 67890] and
+    // post-rotation [99988, 77766]; we never want a rotation to drop
+    // an enrolled chat.
+    const allowed = (bridge.metadata as { allowedChatIds: number[] }).allowedChatIds;
+    expect(allowed.sort((a, b) => a - b)).toEqual([12345, 67890, 77766, 99988]);
   });
 
   test("skips telegram channel with no token and records the gap", async () => {
