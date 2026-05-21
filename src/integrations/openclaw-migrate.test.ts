@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import {
   applyMigration,
   canonicalApiKeyEnv,
@@ -15,6 +17,7 @@ import {
 } from "./openclaw-migrate";
 import { loadConfig } from "../paths";
 import { mutateState, readState } from "../state";
+import { getMemoryDb } from "../state/memory-db";
 import { readSecret } from "../state/secrets";
 
 // Isolated roots so the tests never touch ~/.gini or ~/.openclaw on the
@@ -186,6 +189,155 @@ function seedOpenclawTree(stateRoot: string, options: {
     mkdirSync(join(stateRoot, "plugins"), { recursive: true });
     mkdirSync(join(stateRoot, "devices"), { recursive: true });
   }
+}
+
+// Write a synthetic openclaw session JSONL under
+// `<stateRoot>/agents/<agentId>/sessions/<sessionId>.jsonl`. Each
+// supplied message becomes a `type: "message"` line whose content
+// holds one text block plus `toolBlocks` extra tool_use blocks —
+// the migrator must drop tool blocks from the migrated chat content
+// because gini's ChatMessageRecord.content is a flat string.
+function writeOpenclawSessionJsonl(
+  stateRoot: string,
+  agentId: string,
+  sessionId: string,
+  messages: Array<{
+    role: "user" | "assistant";
+    text: string;
+    timestamp: string;
+    toolBlocks?: number;
+  }>
+): string {
+  const dir = join(stateRoot, "agents", agentId, "sessions");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${sessionId}.jsonl`);
+  const headerTimestamp = messages[0]?.timestamp ?? "2026-03-04T22:20:00.000Z";
+  const lines: string[] = [
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: sessionId,
+      timestamp: headerTimestamp,
+      cwd: "/synthetic/openclaw/workspace"
+    })
+  ];
+  let parentId = "header";
+  let counter = 0;
+  for (const message of messages) {
+    counter += 1;
+    const messageId = `msg_${counter.toString(16).padStart(8, "0")}`;
+    const content: Array<Record<string, unknown>> = [{ type: "text", text: message.text }];
+    for (let i = 0; i < (message.toolBlocks ?? 0); i += 1) {
+      content.push({
+        type: "tool_use",
+        id: `tool_${counter}_${i}`,
+        name: "synthetic_tool",
+        input: { stub: true }
+      });
+    }
+    lines.push(
+      JSON.stringify({
+        type: "message",
+        id: messageId,
+        parentId,
+        timestamp: message.timestamp,
+        message: { role: message.role, content, timestamp: Date.parse(message.timestamp) }
+      })
+    );
+    parentId = messageId;
+  }
+  writeFileSync(path, `${lines.join("\n")}\n`);
+  return path;
+}
+
+// Write a minimal Hindsight-shape SQLite under `<memoryDir>/<filename>`.
+// We mirror openclaw's column set (memory_banks + memory_units) closely
+// enough that scanMemorySqlite recognizes the schema and extracts each
+// row. Extra columns gini doesn't read are omitted on purpose — the
+// migration only reads id/text/network/status/confidence/metadata/
+// mentioned_at.
+function writeHindsightMemorySqlite(
+  memoryDir: string,
+  filename: string,
+  units: Array<{
+    id: string;
+    text: string;
+    network: string;
+    status?: string;
+    confidence?: number;
+    metadata?: Record<string, unknown>;
+    mentionedAt?: string;
+  }>
+): string {
+  mkdirSync(memoryDir, { recursive: true });
+  const path = join(memoryDir, filename);
+  const db = new Database(path);
+  try {
+    db.exec(`
+      CREATE TABLE memory_banks (id TEXT PRIMARY KEY, name TEXT, created_at TEXT);
+      CREATE TABLE memory_units (
+        id TEXT PRIMARY KEY,
+        bank_id TEXT,
+        text TEXT,
+        network TEXT,
+        status TEXT,
+        confidence REAL,
+        metadata TEXT,
+        mentioned_at TEXT
+      );
+    `);
+    db.run(
+      "INSERT INTO memory_banks (id, name, created_at) VALUES (?, ?, ?)",
+      ["bank_default", "default", "2026-01-01T00:00:00.000Z"]
+    );
+    for (const unit of units) {
+      db.run(
+        `INSERT INTO memory_units (id, bank_id, text, network, status, confidence, metadata, mentioned_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          unit.id,
+          "bank_default",
+          unit.text,
+          unit.network,
+          unit.status ?? "active",
+          unit.confidence ?? 0.5,
+          JSON.stringify(unit.metadata ?? {}),
+          unit.mentionedAt ?? "2026-01-01T00:00:00.000Z"
+        ]
+      );
+    }
+  } finally {
+    db.close();
+  }
+  return path;
+}
+
+// Write a SQLite under `<memoryDir>/<filename>` shaped like openclaw's
+// alternative file-chunk RAG store (chunks + files + embedding_cache).
+// scanMemorySqlite must recognize this layout and emit an unsupported
+// entry rather than a migration step.
+function writeFileChunkMemorySqlite(memoryDir: string, filename: string, chunkCount = 2): string {
+  mkdirSync(memoryDir, { recursive: true });
+  const path = join(memoryDir, filename);
+  const db = new Database(path);
+  try {
+    db.exec(`
+      CREATE TABLE chunks (id TEXT PRIMARY KEY, file_id TEXT, content TEXT);
+      CREATE TABLE files (id TEXT PRIMARY KEY, path TEXT);
+      CREATE TABLE embedding_cache (id TEXT PRIMARY KEY, embedding BLOB);
+    `);
+    db.run("INSERT INTO files (id, path) VALUES (?, ?)", ["file-1", "/tmp/x.md"]);
+    for (let i = 0; i < chunkCount; i += 1) {
+      db.run("INSERT INTO chunks (id, file_id, content) VALUES (?, ?, ?)", [
+        `chunk-${i}`,
+        "file-1",
+        `chunk content ${i}`
+      ]);
+    }
+  } finally {
+    db.close();
+  }
+  return path;
 }
 
 describe("parseOpenclawJson", () => {
@@ -1243,6 +1395,32 @@ describe("summarizePlan", () => {
     expect(summary.counts.bridges).toBe(1);
     expect(summary.counts.skills).toBe(1);
     expect(summary.counts.workspaceFiles).toBe(2);
+    // Session / memory inputs are absent so their counters stay zero
+    // — the summary surface includes them unconditionally because the
+    // CLI prints the full counts shape for every migration.
+    expect(summary.counts.sessions).toBe(0);
+    expect(summary.counts.sessionMessages).toBe(0);
+    expect(summary.counts.memoryUnits).toBe(0);
+  });
+
+  test("counts session messages by step and totals memoryUnit rows", () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "sess-1", [
+      { role: "user", text: "hi", timestamp: "2026-03-04T22:20:00.000Z" },
+      { role: "assistant", text: "hi back", timestamp: "2026-03-04T22:20:05.000Z" }
+    ]);
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "sess-2", [
+      { role: "user", text: "again", timestamp: "2026-03-05T01:00:00.000Z" }
+    ]);
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "main.sqlite", [
+      { id: "u1", text: "alpha", network: "world" },
+      { id: "u2", text: "beta", network: "experience" }
+    ]);
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const summary = summarizePlan(plan);
+    expect(summary.counts.sessions).toBe(2);
+    expect(summary.counts.sessionMessages).toBe(3);
+    expect(summary.counts.memoryUnits).toBe(2);
   });
 });
 
@@ -1639,5 +1817,311 @@ describe("applyMigration", () => {
     const result = await applyMigration(config, discovery, plan);
     expect(result.bridgesCreated).toBe(0);
     expect(result.unsupported.some((entry) => entry.kind === "telegram")).toBe(true);
+  });
+});
+
+// The archive + session + memory paths use the same /tmp roots and
+// loadConfig pattern as the existing applyMigration block, but live
+// in their own describe blocks so the file stays browsable. The
+// beforeEach wipes both /tmp roots so each test starts from a clean
+// slate; the file-level afterAll restores HOME / GINI_* env so the
+// test file can't poison subsequent tests in the same Bun process.
+
+describe("applyMigration archive", () => {
+  beforeEach(() => {
+    rmSync(GINI_STATE, { recursive: true, force: true });
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
+  });
+
+  test("writes a zip of the entire openclaw state to <instance>/imports", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeFileSync(join(OPENCLAW_ROOT, "marker.txt"), "preserve-me");
+    const config = loadConfig("archive-write");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.applied).toBe(true);
+    expect(result.archivePath).toBeDefined();
+    const archive = result.archivePath!;
+    expect(existsSync(archive)).toBe(true);
+    expect(archive.startsWith(join(GINI_STATE, "instances", "archive-write", "imports"))).toBe(
+      true
+    );
+    // The zip listing must include the recognizable marker and the
+    // openclaw.json — the archive captures the whole state root, not
+    // just config.
+    const listing = execFileSync("unzip", ["-l", archive], { encoding: "utf8" });
+    expect(listing).toContain("marker.txt");
+    expect(listing).toContain("openclaw.json");
+  });
+
+  test("apply records the archive path in the import-report findings", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("archive-report");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.report.findings.some((line) => line.includes("Archived openclaw state to"))).toBe(
+      true
+    );
+    expect(
+      result.report.findings.some(
+        (line) => line.includes("imports") && line.endsWith(".zip")
+      )
+    ).toBe(true);
+  });
+
+  test("archive write failure aborts the migration before state mutates", async () => {
+    // The safety net is non-optional. We simulate a failure by
+    // pre-creating <instance>/imports as a regular file, so the
+    // `mkdirSync(importsDir, { recursive: true })` call inside
+    // applyMigration throws before zip even runs. This proves the
+    // archive failure aborts the migration without writing any
+    // agents into state.json. (We don't rely on PATH manipulation
+    // here because Bun's spawnSync caches the absolute path of
+    // common binaries and ignores a mid-process PATH change, which
+    // would let zip still resolve and the test would no longer
+    // exercise the failure branch.)
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const config = loadConfig("archive-fail");
+    const blockedImportsParent = join(GINI_STATE, "instances", "archive-fail");
+    mkdirSync(blockedImportsParent, { recursive: true });
+    writeFileSync(join(blockedImportsParent, "imports"), "blocking-file");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await expect(
+      applyMigration(config, discovery, planMigration(discovery))
+    ).rejects.toThrow();
+    // No agents must land in state.json — apply aborted before step 4.
+    const state = readState("archive-fail");
+    expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
+  });
+});
+
+describe("applyMigration sessions", () => {
+  beforeEach(() => {
+    rmSync(GINI_STATE, { recursive: true, force: true });
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
+  });
+
+  test("migrates JSONL transcript into ChatSession + ordered ChatMessages", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "sess-basic", [
+      { role: "user", text: "hello", timestamp: "2026-03-04T22:20:00.000Z" },
+      { role: "assistant", text: "hi there", timestamp: "2026-03-04T22:20:05.000Z" },
+      { role: "user", text: "follow-up", timestamp: "2026-03-04T22:20:10.000Z" }
+    ]);
+    const config = loadConfig("session-basic");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const sessionStep = plan.steps.find((step) => step.kind === "session");
+    expect(sessionStep).toBeDefined();
+    expect((sessionStep as { messageCount: number }).messageCount).toBe(3);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.sessionsCreated).toBe(1);
+    expect(result.sessionMessagesCreated).toBe(3);
+    const state = readState("session-basic");
+    const migrated = state.chatSessions.find((session) => session.title.startsWith("Openclaw"));
+    expect(migrated).toBeDefined();
+    // Session createdAt/updatedAt must reflect the openclaw timestamps,
+    // not migration day — otherwise every migrated chat sorts to the
+    // top of the UI's recent-chats list and crowds out current work.
+    expect(migrated!.createdAt.startsWith("2026-03-04T22:20")).toBe(true);
+    expect(migrated!.updatedAt).toBe("2026-03-04T22:20:10.000Z");
+    const messages = state.chatMessages.filter(
+      (message) => message.sessionId === migrated!.id
+    );
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(messages.map((m) => m.content)).toEqual(["hello", "hi there", "follow-up"]);
+    expect(messages[0]!.createdAt).toBe("2026-03-04T22:20:00.000Z");
+    expect(messages[2]!.createdAt).toBe("2026-03-04T22:20:10.000Z");
+  });
+
+  test("drops tool_use blocks from migrated message text", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "sess-tools", [
+      { role: "user", text: "real prompt", timestamp: "2026-03-04T22:20:00.000Z" },
+      {
+        role: "assistant",
+        text: "real reply",
+        timestamp: "2026-03-04T22:20:05.000Z",
+        toolBlocks: 3
+      }
+    ]);
+    const config = loadConfig("session-tools");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.sessionMessagesCreated).toBe(2);
+    const state = readState("session-tools");
+    expect(state.chatMessages.find((m) => m.content === "real reply")).toBeDefined();
+    // Tool block payloads must NEVER survive into ChatMessageRecord.content.
+    // The verbatim transcript lives in the archive zip for anyone who
+    // needs the original tool-call detail.
+    expect(state.chatMessages.some((m) => m.content.includes("tool_use"))).toBe(false);
+    expect(state.chatMessages.some((m) => m.content.includes("synthetic_tool"))).toBe(false);
+  });
+
+  test("binds each migrated session to the gini agent matching its openclaw id", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "work", "sess-w", [
+      { role: "user", text: "morning standup", timestamp: "2026-03-04T22:20:00.000Z" }
+    ]);
+    const config = loadConfig("session-agent-binding");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    await applyMigration(config, discovery, planMigration(discovery));
+    const state = readState("session-agent-binding");
+    const workAgent = state.agents.find((agent) => agent.name === "work");
+    expect(workAgent).toBeDefined();
+    const session = state.chatSessions.find((entry) => entry.title.includes("Openclaw work"));
+    expect(session?.agentId).toBe(workAgent!.id);
+  });
+
+  test("warns and skips a session whose only content is non-text blocks", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    const sessionDir = join(OPENCLAW_ROOT, "agents", "main", "sessions");
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      join(sessionDir, "tool-only.jsonl"),
+      `${[
+        JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "tool-only",
+          timestamp: "2026-03-04T22:20:00.000Z"
+        }),
+        JSON.stringify({
+          type: "message",
+          id: "m1",
+          timestamp: "2026-03-04T22:20:05.000Z",
+          message: {
+            role: "assistant",
+            content: [{ type: "tool_use", id: "t1", name: "x", input: {} }]
+          }
+        })
+      ].join("\n")}\n`
+    );
+    const config = loadConfig("session-tool-only");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.sessionsCreated).toBe(0);
+    expect(result.warnings.some((warning) => warning.includes("no replayable messages"))).toBe(
+      true
+    );
+  });
+});
+
+describe("applyMigration memory units", () => {
+  beforeEach(() => {
+    rmSync(GINI_STATE, { recursive: true, force: true });
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    rmSync(join(GINI_HOME, ".gini"), { recursive: true, force: true });
+  });
+
+  test("inserts every Hindsight memory_units row into gini memory.db", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "main.sqlite", [
+      { id: "u1", text: "alpha", network: "world", confidence: 0.4 },
+      { id: "u2", text: "beta", network: "experience", confidence: 0.7 },
+      { id: "u3", text: "gamma", network: "opinion", status: "archived" }
+    ]);
+    const config = loadConfig("memory-hindsight");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    expect(plan.steps.filter((step) => step.kind === "memoryUnit")).toHaveLength(3);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.memoryUnitsCreated).toBe(3);
+
+    const memDb = getMemoryDb("memory-hindsight");
+    const rows = memDb
+      .query<{ text: string; network: string; status: string; confidence: number | null }, []>(
+        "SELECT text, network, status, confidence FROM memory_units ORDER BY text"
+      )
+      .all();
+    expect(rows.map((row) => row.text)).toEqual(["alpha", "beta", "gamma"]);
+    expect(rows.map((row) => row.network)).toEqual(["world", "experience", "opinion"]);
+    // archived status survives the round-trip; gini's MemoryUnitStatus
+    // shares the openclaw set so no coercion is needed.
+    expect(rows[2]!.status).toBe("archived");
+  });
+
+  test("preserves openclaw metadata + records source-bank + openclaw id", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "secondary.sqlite", [
+      {
+        id: "u-meta",
+        text: "Bob likes coffee",
+        network: "experience",
+        metadata: { topic: "preferences", subject: "Bob" }
+      }
+    ]);
+    const config = loadConfig("memory-metadata");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.memoryUnitsCreated).toBe(1);
+    const memDb = getMemoryDb("memory-metadata");
+    const row = memDb
+      .query<{ metadata: string }, []>("SELECT metadata FROM memory_units LIMIT 1")
+      .get();
+    const metadata = JSON.parse(row!.metadata) as Record<string, unknown>;
+    expect(metadata.topic).toBe("preferences");
+    expect(metadata.subject).toBe("Bob");
+    expect(metadata.openclawBank).toBe("secondary");
+    expect(metadata.openclawUnitId).toBe("u-meta");
+  });
+
+  test("file-chunk RAG schema lands on the unsupported list with no migration step", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeFileChunkMemorySqlite(join(OPENCLAW_ROOT, "memory"), "main.sqlite", 5);
+    const config = loadConfig("memory-rag");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    expect(plan.steps.some((step) => step.kind === "memoryUnit")).toBe(false);
+    const unsupportedMemory = plan.unsupported.find((entry) => entry.kind === "memory");
+    expect(unsupportedMemory).toBeDefined();
+    expect(unsupportedMemory!.detail).toContain("file-chunk RAG");
+    expect(unsupportedMemory!.detail).toContain("5 chunks");
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.memoryUnitsCreated).toBe(0);
+  });
+
+  test("coerces unknown openclaw status / network to safe gini defaults", async () => {
+    // An openclaw schema drift could surface an unknown status or
+    // network value. The migrator must fall back to a value gini's
+    // runtime accepts on read rather than poisoning the memory store
+    // with rows recall and the UI can't render.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeHindsightMemorySqlite(join(OPENCLAW_ROOT, "memory"), "main.sqlite", [
+      { id: "weird-1", text: "weird status", network: "world", status: "weird-status" },
+      { id: "weird-2", text: "weird network", network: "mystery-net" }
+    ]);
+    const config = loadConfig("memory-coerce");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const result = await applyMigration(config, discovery, planMigration(discovery));
+    expect(result.memoryUnitsCreated).toBe(2);
+    const memDb = getMemoryDb("memory-coerce");
+    const rows = memDb
+      .query<{ text: string; network: string; status: string }, []>(
+        "SELECT text, network, status FROM memory_units ORDER BY text"
+      )
+      .all();
+    const statusRow = rows.find((row) => row.text === "weird status")!;
+    const networkRow = rows.find((row) => row.text === "weird network")!;
+    expect(statusRow.status).toBe("active");
+    expect(networkRow.network).toBe("experience");
+  });
+
+  test("empty memory directory produces no migration step and no unsupported note", async () => {
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    // memory/ exists but no .sqlite files inside. Hooks for memory
+    // inspection should not surface anything that confuses an operator
+    // who never used openclaw memory.
+    mkdirSync(join(OPENCLAW_ROOT, "memory"), { recursive: true });
+    const config = loadConfig("memory-empty-dir");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    expect(plan.steps.some((step) => step.kind === "memoryUnit")).toBe(false);
+    const memoryNote = plan.unsupported.find((entry) => entry.kind === "memory");
+    expect(memoryNote?.detail).toContain("contains no .sqlite files");
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.memoryUnitsCreated).toBe(0);
   });
 });

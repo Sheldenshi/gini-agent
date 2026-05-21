@@ -44,12 +44,15 @@ The migrator walks the openclaw state and synthesizes equivalent gini records fo
 
 | Openclaw artifact | Gini destination | Notes |
 | --- | --- | --- |
+| Entire `<state>/` directory | `<instance>/imports/openclaw-<timestamp>.zip` | Written before any other step. The migration never deletes openclaw data, but the archive is your insurance policy in case you later wipe `~/.openclaw` thinking the migration moved it. The archive failing to write aborts the migration before any state mutation lands; the safety net is non-optional. |
 | `cfg.agents.list[]` | New `AgentRecord` per agent | Agent name carries the openclaw id. The default openclaw agent maps to a new gini agent — the seeded `agent_default` is left alone so your existing defaults aren't disturbed. |
 | `agents/<id>/agent/auth-profiles.json` (api_key / token) | `~/.gini/secrets.env` line `<PROVIDER>_API_KEY=…` | Only providers gini supports natively (`openai`, `codex`, `openrouter`, `local`). Anthropic, Google, and similar are listed in `unsupported` so you can wire them manually. |
 | `channels.telegram` + state-dir `.env` `TELEGRAM_BOT_TOKEN` + `credentials/telegram-allowFrom.json` | `MessagingBridgeRecord` (kind `telegram`) with encrypted bot token and per-chat allowlist | Allowlist string ids are coerced to numbers. See [Telegram Messaging Bridge](adr/telegram-bridge.md). |
 | `channels.discord` + `DISCORD_BOT_TOKEN` | `MessagingBridgeRecord` (kind `discord`) with encrypted bot token | See [Discord Messaging Bridge](adr/discord-bridge.md). **The supervisor won't poll the bridge until you add at least one delivery channel.** Openclaw stores a per-sender allowlist while gini stores per-channel snowflakes, so the migrator cannot derive the channel list. The migration warning instructs the operator to disable the migrated bridge with `gini messaging disable <id>` and re-create it via `gini messaging add <name> discord <channel-id>... --bot-token <token>` (re-supplying the original openclaw bot token). An in-place edit verb is a known follow-up. |
 | `<state>/skills/<name>/SKILL.md` | `<instance>/skills/<name>/SKILL.md` | Top-level `openclaw:` frontmatter block is rewritten to `metadata:\n  gini:`. Sibling files in the skill dir (scripts, references) are copied verbatim. |
 | `<state>/workspace/{AGENTS,SOUL,TOOLS,IDENTITY,USER,HEARTBEAT,BOOTSTRAP,MEMORY}.md` | `<instance>/workspace/<file>` | Same-named files are skipped unless `--force` is passed. The migrator looks for the workspace dir at `<state>/workspace/` first, then `<openclaw-home>/.openclaw/workspace/` as a fallback. |
+| `<state>/agents/<id>/sessions/*.jsonl` | One `ChatSessionRecord` per JSONL plus one `ChatMessageRecord` per `type: "message"` line | Tool_use and tool_result blocks are dropped from migrated message content (`ChatMessageRecord.content` is a flat string). The full verbatim transcript stays in the archive zip. Session createdAt/updatedAt are rebased to the openclaw timestamps so recent-chats sort reflects the original transcript date, not migration day. |
+| `<state>/memory/<id>.sqlite` (Hindsight schema: `memory_banks` + `memory_units`) | One `memory_units` row per source row in `<instance>/memory.db` | Migrated with embedding NULL; run `gini embedding reembed` after migration to populate vectors with your configured embedding provider. Unknown statuses/networks are coerced to `active`/`experience` so a schema drift can't poison recall. The legacy file-chunk RAG schema (`chunks` + `files` + `embedding_cache`) has no direct gini target and lands on the `unsupported` list with a `Re-index via /api/memory/retain` hint. |
 
 Provider keys land in `~/.gini/secrets.env` because the installed `gini` wrapper sources that file with `set -a` on every invocation. Connector tokens go through the per-instance encrypted secret store described in [Connector Secret Storage](adr/connector-secret-storage.md) — they are never logged or echoed.
 
@@ -57,10 +60,9 @@ Provider keys land in `~/.gini/secrets.env` because the installed `gini` wrapper
 
 The migrator surfaces every unmigrated subsystem in the `unsupported` field so you know what is left on the openclaw side:
 
-- **Hindsight memory** (`<state>/memory/<id>.sqlite`). The openclaw and gini memory schemas don't align; rebuilding memory from scratch is safer than a lossy translation.
-- **Session transcripts** (`<state>/agents/<id>/sessions/`). Openclaw's Claude-CLI handoff doesn't have a gini equivalent.
 - **Tasks and cron registries**, **plugin installs**, **device-pair tokens**. Either the feature doesn't exist on the gini side yet or the state is safer to re-establish (devices in particular — openclaw device tokens cannot be reused under gini; re-pair via `gini pair` once you're on gini).
 - **Non-Telegram, non-Discord channels** (WhatsApp, Signal, Slack, etc.). Gini has no bridge implementation for those yet; the migrator lists each unsupported channel by name.
+- **Openclaw file-chunk RAG memory** (`<state>/memory/*.sqlite` with the `chunks` + `files` + `embedding_cache` schema). The chunk shape doesn't map cleanly to gini's `MemoryUnit` model; re-index relevant files via `/api/memory/retain` if you still need them.
 
 ## Idempotency and re-runs
 
@@ -91,17 +93,35 @@ bun run gini agents list
 # Confirm the bridge is configured and healthy.
 bun run gini messaging list
 
+# Inspect migrated chat history.
+bun run gini chat list
+
 # Smoke test the runtime end-to-end.
 bun run gini smoke
 ```
 
-After the smoke passes, start gini:
+After the smoke passes, populate the migrated memory unit embeddings with the active embedding provider, then start gini:
 
 ```bash
+# Re-embed every migrated memory unit so semantic recall returns them.
+# The migrator stores units with embedding NULL; this pass fills them in
+# using the configured embedding provider.
+bun run gini embedding reembed
+
 bun run gini start
 ```
 
 The newly-imported provider keys are picked up automatically because the installed `gini` wrapper sources `~/.gini/secrets.env` on every invocation.
+
+## Where the openclaw archive lives
+
+Every applied migration writes a verbatim zip of your openclaw state root to:
+
+```
+<instance>/imports/openclaw-<timestamp>.zip
+```
+
+You can find the instance root with `gini status` (it prints the active instance dir). Restore from the archive by unzipping into a fresh path and pointing `gini import apply openclaw --path <unzipped-dir>` at it. The archive is intentionally kept on disk indefinitely — delete it manually only after you've confirmed the migration result is what you want.
 
 ## Common questions
 
@@ -115,4 +135,7 @@ Run `openclaw doctor` — it prints the active state root. Or check `OPENCLAW_ST
 The migrator creates the agent record but skips the API key (Anthropic isn't in gini's native provider list yet). The `unsupported` array in the report lists `provider:anthropic`. Add the key manually via `gini provider set` once gini supports Anthropic, or point the agent at OpenRouter as an interim alternative.
 
 **Will my chat history come over?**
-No. Sessions live in JSONL transcripts under `<state>/agents/<id>/sessions/`, written for Claude-CLI's handoff model. Gini's `ChatSessionRecord` model is structurally different. History migration is a follow-up question and is intentionally out of scope for v1.
+Yes. Each `<state>/agents/<id>/sessions/<sessionId>.jsonl` becomes one `ChatSessionRecord` plus one `ChatMessageRecord` per `type: "message"` line under the matching gini agent. Tool_use and tool_result blocks are dropped from the migrated message text (`ChatMessageRecord.content` is a single string), but the full verbatim transcript stays in `<instance>/imports/openclaw-<timestamp>.zip` for anyone who needs the original tool-call detail. Session timestamps are rebased to the openclaw values so recent-chats sort matches what you remember from openclaw.
+
+**Will my Hindsight memory come over?**
+If your `<state>/memory/<id>.sqlite` carries the Hindsight schema (`memory_banks` + `memory_units`), yes — each unit lands in `<instance>/memory.db` verbatim with embedding NULL. Run `gini embedding reembed` after migration to populate the vectors so semantic recall returns them. If your memory store instead carries the legacy file-chunk RAG schema (`chunks` + `files` + `embedding_cache`), it lands on the `unsupported` list — there's no clean target for that shape in gini today; re-index the underlying files via `/api/memory/retain` if you still need them.

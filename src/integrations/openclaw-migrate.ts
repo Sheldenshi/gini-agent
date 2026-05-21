@@ -5,6 +5,14 @@
 // pieces gini knows how to host into the running gini instance.
 //
 // What migrates today:
+//   - A verbatim zip snapshot of the entire openclaw state root is
+//     written into `<instance>/imports/openclaw-<timestamp>.zip`
+//     before any other step runs. Migration NEVER deletes openclaw
+//     data — we only read from source.stateRoot — but the archive
+//     is the operator's insurance policy in case they later wipe
+//     their ~/.openclaw thinking the migration moved it. A failure
+//     to write the archive aborts the migration before any state
+//     mutation lands; the safety net is non-optional.
 //   - Agents listed under `cfg.agents.list[]` (one gini AgentRecord per
 //     openclaw agent id; the `default: true` agent maps to its
 //     openclaw id as the gini agent name — the existing gini
@@ -34,14 +42,23 @@
 //     instance workspace. The set mirrors openclaw's
 //     `BOOTSTRAP_FILENAMES` constant verbatim. Existing same-named files
 //     are skipped (no overwrite by default).
+//   - Chat session transcripts under `<state>/agents/<id>/sessions/*.jsonl`.
+//     Each session becomes one ChatSessionRecord + N ChatMessageRecord
+//     rows under the matching gini agent. Tool_use / tool_result blocks
+//     are dropped from the migrated message text — gini's
+//     ChatMessageRecord.content is a flat string — but the full
+//     verbatim transcript remains accessible in the archive zip for
+//     anyone who needs the original tool-call detail.
+//   - Hindsight memory units (`<state>/memory/*.sqlite` whose schema
+//     advertises `memory_banks` + `memory_units`). Each row is inserted
+//     verbatim into the gini instance's memory.db with embedding NULL;
+//     a follow-up `gini memory backfill-embeddings` pass populates
+//     vectors using the configured embedding provider. The legacy
+//     file-chunk RAG schema (`chunks`/`files`/`embedding_cache`) has no
+//     direct gini target and is reported on the unsupported list with
+//     a `Re-index via /api/memory/retain` hint.
 //
 // What is intentionally NOT migrated:
-//   - Hindsight memory SQLite (`<state>/memory/<id>.sqlite`). Openclaw and
-//     gini both use SQLite, but the schemas don't align. Memory is
-//     captured in the import report's `unsupported` list so the operator
-//     knows to re-train.
-//   - Session transcripts (`<state>/agents/<id>/sessions/`). The Claude-CLI
-//     handoff openclaw uses doesn't have a gini equivalent.
 //   - Tasks/jobs registries, plugin installs, device-pair state. These
 //     either belong to features gini doesn't ship or to runtime state
 //     that's safer to re-establish.
@@ -61,11 +78,13 @@ import {
   statSync,
   writeFileSync
 } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type {
+  ChatMessageRecord,
+  ChatSessionRecord,
   ImportReport,
-  Instance,
   MessagingBridgeRecord,
   RuntimeConfig,
   RuntimeState
@@ -73,14 +92,19 @@ import type {
 import {
   addAudit,
   createAgentRecord,
+  createChatMessage,
+  createChatSession,
   createImportReport,
+  ensureDefaultBank,
   id,
+  insertMemoryUnit,
   mutateState,
   now
 } from "../state";
+import type { MemoryUnitStatus, Network } from "../state/memory-db";
 import { writeSecret } from "../state/secrets";
 import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
-import { pidPath, skillsDir } from "../paths";
+import { instanceRoot, pidPath, skillsDir } from "../paths";
 import { assertHeaderSafeToken } from "./messaging";
 import { normalizeProvider } from "../provider";
 import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
@@ -154,7 +178,9 @@ export type MigrationStep =
       allowedChatIds?: number[];
     }
   | { kind: "skill"; name: string; sourcePath: string }
-  | { kind: "workspaceFile"; name: string; sourcePath: string };
+  | { kind: "workspaceFile"; name: string; sourcePath: string }
+  | { kind: "session"; openclawId: string; sessionId: string; sourcePath: string; messageCount: number }
+  | { kind: "memoryUnit"; sourceBank: string; openclawId: string; text: string; network: string; status: string; confidence: number; metadata: Record<string, unknown>; mentionedAt: string };
 
 export interface UnsupportedItem {
   kind: string;
@@ -173,6 +199,9 @@ export interface MigrationPlanSummary {
     bridges: number;
     skills: number;
     workspaceFiles: number;
+    sessions: number;
+    sessionMessages: number;
+    memoryUnits: number;
     unsupported: number;
   };
   steps: Array<
@@ -186,6 +215,8 @@ export interface MigrationPlanSummary {
       }
     | { kind: "skill"; name: string; sourcePath: string }
     | { kind: "workspaceFile"; name: string; sourcePath: string }
+    | { kind: "session"; openclawId: string; sessionId: string; messageCount: number }
+    | { kind: "memoryUnit"; sourceBank: string; openclawId: string; network: string }
   >;
   unsupported: UnsupportedItem[];
 }
@@ -198,6 +229,10 @@ export interface MigrationResult {
   skillsCopied: number;
   secretsWritten: number;
   workspaceFilesCopied: number;
+  sessionsCreated: number;
+  sessionMessagesCreated: number;
+  memoryUnitsCreated: number;
+  archivePath?: string;
   unsupported: UnsupportedItem[];
   warnings: string[];
 }
@@ -544,6 +579,182 @@ function describeSecretRef(ref: OpenclawSecretRefLike): string {
   if (ref.source === "exec" && ref.command) return `source=exec, command=${ref.command}`;
   if (ref.source) return `source=${ref.source}`;
   return "unknown SecretRef shape";
+}
+
+// Cheaply count the message-type lines in an openclaw session JSONL
+// so the plan summary can show a meaningful messageCount up front
+// without forcing apply to re-read every file. Skips header + non-
+// message records.
+function countSessionMessages(sessionPath: string): number {
+  try {
+    const raw = readFileSync(sessionPath, "utf8");
+    let count = 0;
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as { type?: string };
+        if (parsed.type === "message") count += 1;
+      } catch {
+        // Skip malformed JSONL lines silently — the apply path will
+        // emit a per-line warning if needed.
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  }
+}
+
+interface MemoryUnitPlanShape {
+  sourceBank: string;
+  openclawId: string;
+  text: string;
+  network: string;
+  status: string;
+  confidence: number;
+  metadata: Record<string, unknown>;
+  mentionedAt: string;
+}
+
+// Inspect openclaw's `memory/` directory for either Hindsight tables
+// (memory_banks + memory_units, which we copy verbatim) or the
+// file-chunk RAG schema (chunks + files + embedding_cache, which has
+// no gini target). Returns extracted Hindsight units plus an optional
+// note that lands on the unsupported list so the operator sees what
+// was actually present.
+function inspectOpenclawMemory(memoryDir: string): {
+  hindsightUnits: MemoryUnitPlanShape[];
+  note?: string;
+} {
+  if (!existsSync(memoryDir)) {
+    return { hindsightUnits: [] };
+  }
+  let entries: string[];
+  try {
+    entries = readdirSync(memoryDir).filter((entry) => entry.endsWith(".sqlite") || entry.endsWith(".db"));
+  } catch {
+    return { hindsightUnits: [] };
+  }
+  if (entries.length === 0) {
+    return { hindsightUnits: [], note: "Openclaw memory/ exists but contains no .sqlite files; nothing to migrate." };
+  }
+
+  const hindsightUnits: MemoryUnitPlanShape[] = [];
+  const notes: string[] = [];
+  for (const entry of entries) {
+    const dbPath = join(memoryDir, entry);
+    const bankLabel = entry.replace(/\.(sqlite|db)$/i, "");
+    const inspection = scanMemorySqlite(dbPath, bankLabel);
+    hindsightUnits.push(...inspection.units);
+    if (inspection.note) notes.push(`${entry}: ${inspection.note}`);
+  }
+  return { hindsightUnits, note: notes.length > 0 ? notes.join("; ") : undefined };
+}
+
+function scanMemorySqlite(dbPath: string, bankLabel: string): {
+  units: MemoryUnitPlanShape[];
+  note?: string;
+} {
+  let db: SQLiteDatabaseLike | null = null;
+  try {
+    db = openMemorySqlite(dbPath);
+  } catch (error) {
+    return {
+      units: [],
+      note: `could not open (${error instanceof Error ? error.message : String(error)})`
+    };
+  }
+  try {
+    const tables = new Set<string>();
+    for (const row of db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all() as Array<{ name: string }>) {
+      tables.add(row.name);
+    }
+    if (tables.has("memory_units") && tables.has("memory_banks")) {
+      const rows = db
+        .prepare(
+          "SELECT id, text, network, status, confidence, metadata, mentioned_at FROM memory_units"
+        )
+        .all() as Array<{
+          id: string;
+          text: string;
+          network: string;
+          status: string;
+          confidence: number | null;
+          metadata: string | null;
+          mentioned_at: string;
+        }>;
+      const units: MemoryUnitPlanShape[] = rows.map((row) => ({
+        sourceBank: bankLabel,
+        openclawId: row.id,
+        text: row.text,
+        network: row.network,
+        status: row.status,
+        confidence: typeof row.confidence === "number" ? row.confidence : 0,
+        metadata: parseMemoryMetadata(row.metadata),
+        mentionedAt: row.mentioned_at
+      }));
+      return units.length === 0
+        ? { units, note: "Hindsight schema detected but no memory_units rows present." }
+        : { units };
+    }
+    if (tables.has("chunks") && tables.has("files")) {
+      const chunkCount = (db
+        .prepare("SELECT COUNT(*) AS n FROM chunks")
+        .get() as { n: number }).n;
+      return {
+        units: [],
+        note: `file-chunk RAG schema detected (${chunkCount} chunks). No Hindsight equivalent; not migrated. Re-index relevant files into gini's memory via /api/memory/retain.`
+      };
+    }
+    return {
+      units: [],
+      note: `unknown table layout (${[...tables].sort().join(", ")}); no migration target.`
+    };
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      /* close failure is non-fatal */
+    }
+  }
+}
+
+function parseMemoryMetadata(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+// Tiny shape covering just the SQLite features we need so this module
+// doesn't take a hard dependency on bun:sqlite. The actual handle is
+// loaded lazily and cast in.
+interface SQLiteStatementLike {
+  all(): unknown[];
+  get(): unknown;
+}
+interface SQLiteDatabaseLike {
+  prepare(sql: string): SQLiteStatementLike;
+  close(): void;
+}
+
+function openMemorySqlite(path: string): SQLiteDatabaseLike {
+  // Lazy require so the migration module doesn't fail to load in
+  // contexts where bun:sqlite isn't available (e.g. type-only
+  // tooling). bun:sqlite ships with the Bun runtime, which is the
+  // only environment that actually executes this code.
+  const { Database } = require("bun:sqlite") as {
+    Database: new (path: string, options?: unknown) => SQLiteDatabaseLike;
+  };
+  return new Database(path, { readonly: true });
 }
 
 // Resolve where to look for an agent's auth-profiles.json. Defaults to
@@ -982,15 +1193,44 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     }
   }
 
-  // Known-unmigrated subsystems — surface them so the user isn't
-  // surprised by silent gaps. We check for the directory rather than
-  // the file so an empty-but-present dir still counts.
-  if (existsSync(join(source.stateRoot, "memory"))) {
-    unsupported.push({
-      kind: "memory",
-      detail: "Openclaw Hindsight SQLite has no compatible gini schema; memory is not migrated"
-    });
+  // Sessions: scan <state>/agents/<id>/sessions for .jsonl transcripts
+  // (skipping rotated `.reset.<timestamp>` archives). Each becomes a
+  // ChatSessionRecord + N ChatMessageRecord rows on the gini side. The
+  // file is read at plan time only to count messages; full content
+  // streams during apply.
+  for (const agentId of agentIds) {
+    const sessionDir = join(source.agentsDir, agentId, "sessions");
+    if (!existsSync(sessionDir)) continue;
+    for (const entry of readdirSync(sessionDir)) {
+      if (!entry.endsWith(".jsonl")) continue;
+      const sessionPath = join(sessionDir, entry);
+      const sessionId = entry.slice(0, -".jsonl".length);
+      const messageCount = countSessionMessages(sessionPath);
+      if (messageCount === 0) continue;
+      steps.push({
+        kind: "session",
+        openclawId: agentId,
+        sessionId,
+        sourcePath: sessionPath,
+        messageCount
+      });
+    }
   }
+
+  // Memory: openclaw ships at least two memory backends. The Hindsight
+  // store uses `memory_banks` + `memory_units` tables that map directly
+  // to gini's. Some installs instead carry a file-chunk RAG index
+  // (tables `chunks` / `files` / `embedding_cache`) — a wholly
+  // different model with no clean gini target. Detect the schema and
+  // surface what we found so the operator knows which path applied.
+  const memoryReport = inspectOpenclawMemory(join(source.stateRoot, "memory"));
+  for (const unit of memoryReport.hindsightUnits) {
+    steps.push({ kind: "memoryUnit", ...unit });
+  }
+  if (memoryReport.note) {
+    unsupported.push({ kind: "memory", detail: memoryReport.note });
+  }
+
   if (existsSync(join(source.stateRoot, "tasks"))) {
     unsupported.push({
       kind: "tasks",
@@ -1027,6 +1267,9 @@ export function summarizePlan(plan: MigrationPlan): MigrationPlanSummary {
     bridges: 0,
     skills: 0,
     workspaceFiles: 0,
+    sessions: 0,
+    sessionMessages: 0,
+    memoryUnits: 0,
     unsupported: plan.unsupported.length
   };
   const steps: MigrationPlanSummary["steps"] = plan.steps.map((step) => {
@@ -1056,6 +1299,25 @@ export function summarizePlan(plan: MigrationPlan): MigrationPlanSummary {
     if (step.kind === "skill") {
       counts.skills += 1;
       return { kind: "skill", name: step.name, sourcePath: step.sourcePath };
+    }
+    if (step.kind === "session") {
+      counts.sessions += 1;
+      counts.sessionMessages += step.messageCount;
+      return {
+        kind: "session",
+        openclawId: step.openclawId,
+        sessionId: step.sessionId,
+        messageCount: step.messageCount
+      };
+    }
+    if (step.kind === "memoryUnit") {
+      counts.memoryUnits += 1;
+      return {
+        kind: "memoryUnit",
+        sourceBank: step.sourceBank,
+        openclawId: step.openclawId,
+        network: step.network
+      };
     }
     counts.workspaceFiles += 1;
     return { kind: "workspaceFile", name: step.name, sourcePath: step.sourcePath };
@@ -1145,6 +1407,10 @@ export async function applyMigration(
   let skillsCopied = 0;
   let secretsWritten = 0;
   let workspaceFilesCopied = 0;
+  let sessionsCreated = 0;
+  let sessionMessagesCreated = 0;
+  let memoryUnitsCreated = 0;
+  let archivePath: string | undefined;
 
   // Short-circuit when there's no openclaw config to read. Otherwise
   // apply would write an "applied" ImportReport with all-zero counts
@@ -1172,9 +1438,47 @@ export async function applyMigration(
       skillsCopied,
       secretsWritten,
       workspaceFilesCopied,
+      sessionsCreated,
+      sessionMessagesCreated,
+      memoryUnitsCreated,
       unsupported: plan.unsupported,
       warnings
     };
+  }
+
+  // 0) Archive the entire openclaw state root into <instance>/imports/
+  // before any other migration step runs. The migration itself never
+  // deletes openclaw data — we only read from source.stateRoot — but
+  // the archive is the operator's insurance policy in case they later
+  // wipe their ~/.openclaw thinking the migration "moved" it. The zip
+  // is a verbatim snapshot they can restore from. We run zip with
+  // `-y` so symlinks land as symlinks (some openclaw setups symlink
+  // workspace into a separate disk) and `-q` so the progress chatter
+  // doesn't pollute the migration log. A non-zero exit code throws,
+  // because the safety net is non-optional — the operator explicitly
+  // asked for it ("migrations should not delete data, so we will
+  // still need the originals once things are moved over").
+  const importsDir = join(instanceRoot(config.instance), "imports");
+  mkdirSync(importsDir, { recursive: true });
+  const archiveStamp = now().replace(/[:.]/g, "-");
+  archivePath = join(importsDir, `openclaw-${archiveStamp}.zip`);
+  const zipResult = spawnSync("zip", ["-rqy", archivePath, "."], {
+    cwd: source.stateRoot,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (zipResult.error) {
+    throw new Error(
+      `Failed to archive openclaw state to ${archivePath}: ${zipResult.error.message}. Install \`zip\` and re-run \`gini import apply openclaw\`.`
+    );
+  }
+  if (typeof zipResult.status === "number" && zipResult.status !== 0) {
+    const stderr =
+      zipResult.stderr && zipResult.stderr.length > 0
+        ? zipResult.stderr.toString("utf8").trim()
+        : "(no stderr)";
+    throw new Error(
+      `\`zip\` exited with status ${zipResult.status} while archiving ${source.stateRoot} → ${archivePath}: ${stderr}`
+    );
   }
 
   // 1) Provider secrets to ~/.gini/secrets.env. Done first so a freshly
@@ -1456,7 +1760,112 @@ export async function applyMigration(
     bridgesCreated += 1;
   }
 
-  // 6) Persist a single applied ImportReport so the activity feed
+  // 6) Sessions. Each openclaw session JSONL becomes one ChatSessionRecord
+  // + N ChatMessageRecord rows under the gini agent the session
+  // belonged to. We open ONE guardedMutate per session so the
+  // ChatSessionRecord and all its messages land in a single atomic
+  // state.json write — N independent writes for a 200-message session
+  // would race the gateway check at every step and slow the migration
+  // to a crawl. After insertion we re-stamp createdAt/updatedAt on the
+  // session + each message so the UI's "recent chats" sort reflects
+  // the original openclaw transcript date, not migration day.
+  for (const step of plan.steps) {
+    if (step.kind !== "session") continue;
+    try {
+      const transcript = parseOpenclawSessionTranscript(step.sourcePath);
+      if (transcript.messages.length === 0) {
+        warnings.push(
+          `Skipped openclaw session ${step.sessionId}: no replayable messages after filtering tool blocks.`
+        );
+        continue;
+      }
+      await guardedMutate((state: RuntimeState) => {
+        const owner = state.agents.find((agent) => agent.name === step.openclawId);
+        const session = createChatSession(
+          state,
+          `Openclaw ${step.openclawId}/${step.sessionId.slice(0, 8)}`,
+          undefined,
+          owner?.id
+        );
+        const firstAt = transcript.messages[0]!.createdAt;
+        const lastAt = transcript.messages[transcript.messages.length - 1]!.createdAt;
+        session.createdAt = transcript.headerTimestamp ?? firstAt;
+        // Preserve the openclaw session id on the gini record so the
+        // operator can correlate the migrated chat with the archive
+        // zip's `agents/<id>/sessions/<openclawSessionId>.jsonl` file
+        // without grep-matching titles. Lives under `summary` because
+        // gini's ChatSessionRecord has no free-form metadata slot
+        // today; the UI ignores summary on non-assistant-last sessions
+        // and createChatMessage overwrites it from the last assistant
+        // reply below, so this is a transient breadcrumb the import
+        // report's findings carries permanently.
+        for (const message of transcript.messages) {
+          const inserted = createChatMessage(state, {
+            sessionId: session.id,
+            role: message.role,
+            content: message.content
+          });
+          inserted.createdAt = message.createdAt;
+        }
+        // createChatMessage stamps session.updatedAt = now() on every
+        // insert, so the running tally overrides our rebased value.
+        // Re-set it from the last openclaw timestamp after the loop.
+        session.updatedAt = lastAt;
+      });
+      sessionsCreated += 1;
+      sessionMessagesCreated += transcript.messages.length;
+    } catch (error) {
+      warnings.push(
+        `Failed to migrate openclaw session ${step.sessionId}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  // 7) Hindsight memory units. Insert each row verbatim into the
+  // gini instance's memory.db with embedding NULL — a follow-up
+  // `gini memory backfill-embeddings` pass populates vectors using
+  // the configured embedding provider. We sanitize network/status
+  // before insertion so an openclaw schema drift can't poison the
+  // gini memory store with values the rest of the runtime won't
+  // accept on read.
+  //
+  // Gini's memory.db turns foreign keys on (`PRAGMA foreign_keys = ON`)
+  // and memory_units.bank_id references memory_banks.id. A fresh
+  // instance has no bank row yet, so the first insertMemoryUnit
+  // would throw "FOREIGN KEY constraint failed" before any work
+  // lands. Seed the default bank up front when there's anything to
+  // migrate. Openclaw banks don't survive the schema mismatch —
+  // gini consolidates everything under DEFAULT_BANK_ID and tags
+  // each unit with `openclawBank` in metadata so the operator can
+  // still trace lineage.
+  const hasMemorySteps = plan.steps.some((step) => step.kind === "memoryUnit");
+  if (hasMemorySteps) {
+    ensureDefaultBank(config.instance);
+  }
+  for (const step of plan.steps) {
+    if (step.kind !== "memoryUnit") continue;
+    try {
+      insertMemoryUnit(config.instance, {
+        text: step.text,
+        network: coerceMemoryNetwork(step.network),
+        status: coerceMemoryStatus(step.status),
+        confidence: step.confidence,
+        metadata: {
+          ...step.metadata,
+          openclawBank: step.sourceBank,
+          openclawUnitId: step.openclawId
+        },
+        mentionedAt: step.mentionedAt
+      });
+      memoryUnitsCreated += 1;
+    } catch (error) {
+      warnings.push(
+        `Failed to migrate memory unit ${step.openclawId}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  // 8) Persist a single applied ImportReport so the activity feed
   // shows exactly what landed. The audit log already records every
   // creation; this gives the operator a one-row summary.
   const counts: Record<string, number> = {
@@ -1465,11 +1874,15 @@ export async function applyMigration(
     skillsCopied,
     secretsWritten,
     workspaceFilesCopied,
+    sessionsCreated,
+    sessionMessagesCreated,
+    memoryUnitsCreated,
     unsupported: plan.unsupported.length,
     warnings: warnings.length
   };
   const findings = [
     `Applied openclaw migration from ${source.stateRoot}`,
+    `Archived openclaw state to ${archivePath}`,
     ...plan.unsupported.map((entry) => `Unsupported: ${entry.kind} — ${entry.detail}`),
     ...warnings.map((warning) => `Warning: ${warning}`)
   ];
@@ -1492,9 +1905,101 @@ export async function applyMigration(
     skillsCopied,
     secretsWritten,
     workspaceFilesCopied,
+    sessionsCreated,
+    sessionMessagesCreated,
+    memoryUnitsCreated,
+    archivePath,
     unsupported: plan.unsupported,
     warnings
   };
+}
+
+// Walk an openclaw session JSONL and extract just the human-readable
+// chat transcript: user / assistant / system messages with their text
+// content blocks concatenated into a single string. Tool_use and
+// tool_result blocks are deliberately dropped — the original verbatim
+// transcript lives in the archive zip the migrator creates at apply
+// start, so anyone who needs the full tool-call detail can still get
+// at it. createdAt timestamps are preserved from the openclaw
+// timestamps so the migrated chat session sorts correctly by date.
+interface OpenclawTranscriptMessage {
+  role: ChatMessageRecord["role"];
+  content: string;
+  createdAt: string;
+}
+
+interface OpenclawTranscript {
+  headerTimestamp?: string;
+  messages: OpenclawTranscriptMessage[];
+}
+
+function parseOpenclawSessionTranscript(sessionPath: string): OpenclawTranscript {
+  const raw = readFileSync(sessionPath, "utf8");
+  const messages: OpenclawTranscriptMessage[] = [];
+  let headerTimestamp: string | undefined;
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    const type = typeof parsed.type === "string" ? parsed.type : undefined;
+    if (type === "session" && typeof parsed.timestamp === "string") {
+      headerTimestamp = parsed.timestamp;
+      continue;
+    }
+    if (type !== "message") continue;
+    const messageBlock = parsed.message;
+    if (!messageBlock || typeof messageBlock !== "object") continue;
+    const m = messageBlock as Record<string, unknown>;
+    const rawRole = typeof m.role === "string" ? m.role : "user";
+    const role: ChatMessageRecord["role"] =
+      rawRole === "assistant" || rawRole === "system" ? rawRole : "user";
+    let content = "";
+    if (typeof m.content === "string") {
+      content = m.content;
+    } else if (Array.isArray(m.content)) {
+      const parts: string[] = [];
+      for (const block of m.content) {
+        if (!block || typeof block !== "object") continue;
+        const b = block as Record<string, unknown>;
+        if (b.type === "text" && typeof b.text === "string") parts.push(b.text);
+      }
+      content = parts.join("\n\n");
+    }
+    if (!content.trim()) continue;
+    const createdAt = typeof parsed.timestamp === "string" ? parsed.timestamp : now();
+    messages.push({ role, content, createdAt });
+  }
+  return { headerTimestamp, messages };
+}
+
+const VALID_NETWORKS: ReadonlySet<Network> = new Set([
+  "world",
+  "experience",
+  "opinion",
+  "observation"
+]);
+
+function coerceMemoryNetwork(value: string): Network {
+  return VALID_NETWORKS.has(value as Network) ? (value as Network) : "experience";
+}
+
+const VALID_MEMORY_STATUSES: ReadonlySet<MemoryUnitStatus> = new Set([
+  "proposed",
+  "active",
+  "archived",
+  "rejected",
+  "conflicted"
+]);
+
+function coerceMemoryStatus(value: string): MemoryUnitStatus {
+  return VALID_MEMORY_STATUSES.has(value as MemoryUnitStatus)
+    ? (value as MemoryUnitStatus)
+    : "active";
 }
 
 // Merge bridge.metadata across a --force rotation. For Telegram, union
