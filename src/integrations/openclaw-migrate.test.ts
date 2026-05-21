@@ -1208,13 +1208,14 @@ describe("applyMigration", () => {
       (w) => w.includes("Discord") && w.includes("deliveryTargets")
     );
     expect(warning).toBeDefined();
-    // The recovery instructions must point at the actual flow that
-    // works today, not at the misleading `gini messaging add` shortcut
-    // (which would create a SECOND Discord bridge alongside the
-    // migrated one).
+    // The recovery instructions must point at the in-band CLI flow
+    // (disable + re-add). Hand-editing state.json is intentionally
+    // NOT suggested because it skips the per-instance lock, the
+    // audit chain, and the atomic tmp+rename that mutateState
+    // provides.
     expect(warning).toContain("messaging disable");
     expect(warning).toContain("--bot-token");
-    expect(warning).toContain("state.json");
+    expect(warning).not.toContain("state.json");
   });
 
   test("skips existing secrets.env entries unless --force is set", async () => {
