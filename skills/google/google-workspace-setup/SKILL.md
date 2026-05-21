@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 3.0.1
+    version: 3.0.2
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -191,32 +191,20 @@ If it errors with `PERMISSION_DENIED`, the user doesn't own the project — ask 
 
 #### Last step — OAuth client setup
 
-Substitute `<project_id>` with the real project id from Milestone B. Send the URLs as plain text in chat (chat renders them as clickable links) — do NOT `open` them or shell out to a browser.
+Call `request_connector` with a multi-line `reason` field that embeds both Cloud Console URLs and the click instructions. The inline form renders the reason with line breaks preserved and URLs as clickable links — the user clicks through Cloud Console from the form's body, then pastes the credentials into the form's inputs.
 
-Post a single chat message in this shape:
-
-> **Last step: manual OAuth client setup.**
->
-> **Step A — Consent screen (if not configured):**
-> `https://console.cloud.google.com/apis/credentials/consent?project=<project_id>`
-> → User Type: **External**, App name `Gini Workspace`, your email for support + developer contact, save through Scopes, add yourself as a Test user.
->
-> **Step B — Create an OAuth client:**
-> `https://console.cloud.google.com/apis/credentials?project=<project_id>`
-> → "Create Credentials" → "OAuth client ID" → Application type: **Desktop app**.
->
-> Paste the Client ID and Client Secret below when you have them.
-
-Immediately call `request_connector` so the inline form renders right under the message:
+Substitute `<project_id>` with the real project id from Milestone B:
 
 ```text
 request_connector {
   provider: "google-oauth-desktop",
-  reason: "Paste the Client ID and Client Secret from the OAuth Desktop client you just created."
+  reason: "Last step — complete two Cloud Console pages, then paste the credentials below.\n\n1. Consent screen (if not configured):\nhttps://console.cloud.google.com/apis/credentials/consent?project=<project_id>\n→ User Type: External, App name 'Gini Workspace', your email for support + developer contact, save through Scopes, add yourself as a Test user.\n\n2. Create an OAuth client:\nhttps://console.cloud.google.com/apis/credentials?project=<project_id>\n→ Create Credentials → OAuth client ID → Application type: Desktop app.\n\nPaste the Client ID and Client Secret below."
 }
 ```
 
-Don't gate on "reply done" between Step A and Step B — the form submission is what advances the flow. The user can do A and B in any order, or come back later. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. Continue to Step 3 once the connector is healthy.
+Do NOT post a separate chat message before the tool call. The reason field IS the message. The user sees one rendered card with the URLs as clickable links above the input fields. Do NOT `open <url>` for either Console URL — let the user click from the form.
+
+Don't gate on "reply done" between the two pages — the form submission is what advances the flow. The user can do them in any order, or come back later. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. Continue to Step 3 once the connector is healthy.
 
 ### 2B. Browser-only setup (emergency fallback)
 
