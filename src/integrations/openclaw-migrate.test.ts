@@ -2237,8 +2237,42 @@ describe("applyMigration sessions", () => {
     const state = readState("session-agent-binding");
     const workAgent = state.agents.find((agent) => agent.name === "work");
     expect(workAgent).toBeDefined();
-    const session = state.chatSessions.find((entry) => entry.title.includes("Openclaw work"));
+    // Title shape is `Openclaw <sessionId> :: <openclawAgentId>` so we
+    // match on the suffix rather than a "Openclaw work" substring.
+    const session = state.chatSessions.find((entry) => entry.title.endsWith(":: work"));
     expect(session?.agentId).toBe(workAgent!.id);
+  });
+
+  test("re-apply dedup survives even when the openclaw agent id is the max 64 chars", async () => {
+    // Earlier dedup used a title shape `Openclaw <agentId>/<8-char>` —
+    // for the max-length 64-char agent id the title overflowed
+    // records.ts's 80-char truncation, lopping off disambiguating
+    // session-id chars and producing duplicate sessions on re-apply.
+    // The fix moves the openclaw session id (a UUID, 36 chars) to the
+    // front and uses a unique " :: " delimiter, so the dedup key is
+    // always recoverable from the stored title.
+    const longAgentId = "a".repeat(64);
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: longAgentId, default: true, model: "openai/gpt-5.4-mini" }] }
+      })
+    );
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, longAgentId, "010a59e7-a154-4a5b-b930-660d59deb8b5", [
+      { role: "user", text: "first", timestamp: "2026-03-04T22:20:00.000Z" }
+    ]);
+    const config = loadConfig("session-long-agent-id");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.sessionsCreated).toBe(1);
+    const second = await applyMigration(config, discovery, planMigration(discovery));
+    expect(second.sessionsCreated).toBe(0);
+    expect(second.warnings.some((warning) => warning.includes("already imported"))).toBe(true);
+    const state = readState("session-long-agent-id");
+    const migrated = state.chatSessions.filter((session) => session.title.startsWith("Openclaw "));
+    expect(migrated).toHaveLength(1);
   });
 
   test("re-apply skips sessions already imported by deterministic title", async () => {

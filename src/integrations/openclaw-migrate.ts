@@ -2036,25 +2036,40 @@ export async function applyMigration(
   // session + each message so the UI's "recent chats" sort reflects
   // the original openclaw transcript date, not migration day.
   //
-  // Idempotency: the migrator's documented contract is "create what is
-  // missing, leave what exists alone." Sessions are deduped by the
-  // deterministic title prefix `Openclaw <openclawId>/<short-id>`
-  // (openclaw session ids are UUIDs, so the 8-char slice is
-  // collision-safe in practice). Re-running apply against the same
-  // source produces zero new sessions and zero new messages. The
-  // existing-titles set is built once up front so the lookup stays
-  // O(1) per step and survives a tens-of-thousands-of-existing-
-  // sessions instance without a per-step scan.
-  const existingSessionTitles = new Set(
-    readState(config.instance).chatSessions.map((session) => session.title)
-  );
+  // Idempotency: dedup by the full openclaw session id (a UUID, 36
+  // chars), NOT by the stored title — `createChatSession` truncates
+  // titles to 80 chars (records.ts:211), and a 64-char openclaw agent
+  // id makes the prior title shape `Openclaw <agentId>/<id-slice>`
+  // overflow that limit and lose disambiguating session-id chars on
+  // re-apply, duplicating the session.
+  //
+  // The session id sits between a stable prefix `Openclaw ` and a
+  // unique delimiter ` :: `; the agent id trails the delimiter and
+  // may itself be truncated, but the session id portion is always
+  // preserved verbatim (9 prefix + 36 UUID = 45 chars, well under
+  // the 80-char limit for any plausible UUID).
+  const OPENCLAW_TITLE_PREFIX = "Openclaw ";
+  const OPENCLAW_TITLE_DELIMITER = " :: ";
+  const extractOpenclawSessionId = (storedTitle: string): string | null => {
+    if (!storedTitle.startsWith(OPENCLAW_TITLE_PREFIX)) return null;
+    const afterPrefix = storedTitle.slice(OPENCLAW_TITLE_PREFIX.length);
+    const delimiterIdx = afterPrefix.indexOf(OPENCLAW_TITLE_DELIMITER);
+    return delimiterIdx >= 0 ? afterPrefix.slice(0, delimiterIdx) : afterPrefix;
+  };
+  const existingSessionIds = new Set<string>();
+  for (const session of readState(config.instance).chatSessions) {
+    const id = extractOpenclawSessionId(session.title);
+    if (id !== null) existingSessionIds.add(id);
+  }
   for (const step of plan.steps) {
     if (step.kind !== "session") continue;
-    const title = `Openclaw ${step.openclawId}/${step.sessionId.slice(0, 8)}`;
-    if (existingSessionTitles.has(title)) {
-      warnings.push(`Skipped openclaw session ${step.sessionId}: already imported as '${title}'.`);
+    if (existingSessionIds.has(step.sessionId)) {
+      warnings.push(
+        `Skipped openclaw session ${step.sessionId}: already imported (matching gini ChatSessionRecord found).`
+      );
       continue;
     }
+    const title = `${OPENCLAW_TITLE_PREFIX}${step.sessionId}${OPENCLAW_TITLE_DELIMITER}${step.openclawId}`;
     try {
       const transcript = parseOpenclawSessionTranscript(step.sourcePath);
       if (transcript.messages.length === 0) {
@@ -2082,10 +2097,10 @@ export async function applyMigration(
         // Re-set it from the last openclaw timestamp after the loop.
         session.updatedAt = lastAt;
       });
-      // Track the just-created title so a malformed plan with the same
-      // openclaw session listed twice doesn't accidentally bypass dedup
-      // and create the second copy.
-      existingSessionTitles.add(title);
+      // Track the just-imported openclaw id so a malformed plan with
+      // the same session listed twice doesn't accidentally bypass
+      // dedup and create the second copy.
+      existingSessionIds.add(step.sessionId);
       sessionsCreated += 1;
       sessionMessagesCreated += transcript.messages.length;
     } catch (error) {
