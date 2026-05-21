@@ -2699,6 +2699,38 @@ describe("applyMigration sessions", () => {
     expect(session?.agentId).toBe(workAgent!.id);
   });
 
+  test("re-apply dedup survives operator-renamed chat sessions (structured source provenance)", async () => {
+    // Earlier the dedup parsed the deterministic title prefix; a
+    // simple rename (the live UI exposes this via `gini chat rename`
+    // or the web app's rename action) would defeat dedup and import
+    // a duplicate. The structured `source.openclawSessionId` field
+    // survives renames since the UI never touches `source`.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "rename-survives", [
+      { role: "user", text: "hi", timestamp: "2026-03-04T22:20:00.000Z" }
+    ]);
+    const config = loadConfig("session-rename-survives-dedup");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const first = await applyMigration(config, discovery, planMigration(discovery));
+    expect(first.sessionsCreated).toBe(1);
+    // Operator renames the migrated chat to something opinionated.
+    await mutateState("session-rename-survives-dedup", (state) => {
+      const migrated = state.chatSessions.find(
+        (s) => s.source?.kind === "openclaw" && s.source.openclawSessionId === "rename-survives"
+      );
+      if (migrated) migrated.title = "My custom rename";
+    });
+    const second = await applyMigration(config, discovery, planMigration(discovery));
+    expect(second.sessionsCreated).toBe(0);
+    expect(second.warnings.some((warning) => warning.includes("already imported"))).toBe(true);
+    const state = readState("session-rename-survives-dedup");
+    const matchedByProvenance = state.chatSessions.filter(
+      (s) => s.source?.kind === "openclaw" && s.source.openclawSessionId === "rename-survives"
+    );
+    expect(matchedByProvenance).toHaveLength(1);
+    expect(matchedByProvenance[0]!.title).toBe("My custom rename");
+  });
+
   test("re-apply dedup survives even when the openclaw agent id is the max 64 chars", async () => {
     // Earlier dedup used a title shape `Openclaw <agentId>/<8-char>` —
     // for the max-length 64-char agent id the title overflowed

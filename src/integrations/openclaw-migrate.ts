@@ -2332,30 +2332,19 @@ export async function applyMigration(
   // session + each message so the UI's "recent chats" sort reflects
   // the original openclaw transcript date, not migration day.
   //
-  // Idempotency: dedup by the full openclaw session id (a UUID, 36
-  // chars), NOT by the stored title — `createChatSession` truncates
-  // titles to 80 chars (records.ts:211), and a 64-char openclaw agent
-  // id makes the prior title shape `Openclaw <agentId>/<id-slice>`
-  // overflow that limit and lose disambiguating session-id chars on
-  // re-apply, duplicating the session.
-  //
-  // The session id sits between a stable prefix `Openclaw ` and a
-  // unique delimiter ` :: `; the agent id trails the delimiter and
-  // may itself be truncated, but the session id portion is always
-  // preserved verbatim (9 prefix + 36 UUID = 45 chars, well under
-  // the 80-char limit for any plausible UUID).
-  const OPENCLAW_TITLE_PREFIX = "Openclaw ";
-  const OPENCLAW_TITLE_DELIMITER = " :: ";
-  const extractOpenclawSessionId = (storedTitle: string): string | null => {
-    if (!storedTitle.startsWith(OPENCLAW_TITLE_PREFIX)) return null;
-    const afterPrefix = storedTitle.slice(OPENCLAW_TITLE_PREFIX.length);
-    const delimiterIdx = afterPrefix.indexOf(OPENCLAW_TITLE_DELIMITER);
-    return delimiterIdx >= 0 ? afterPrefix.slice(0, delimiterIdx) : afterPrefix;
-  };
+  // Idempotency: dedup by the structured `source.openclawSessionId`
+  // field stored on the gini ChatSessionRecord. Earlier iterations
+  // dedup'd by parsing a deterministic title prefix, but that breaks
+  // the moment the operator renames the migrated chat — the live UI
+  // exposes `gini chat rename` and operators commonly retitle
+  // system-generated chats. Pinning provenance in the structured
+  // `source` field (kind: "openclaw") survives renames without
+  // touching the title cosmetic.
   const existingSessionIds = new Set<string>();
   for (const session of readState(config.instance).chatSessions) {
-    const id = extractOpenclawSessionId(session.title);
-    if (id !== null) existingSessionIds.add(id);
+    if (session.source?.kind === "openclaw") {
+      existingSessionIds.add(session.source.openclawSessionId);
+    }
   }
   for (const step of plan.steps) {
     if (step.kind !== "session") continue;
@@ -2365,7 +2354,12 @@ export async function applyMigration(
       );
       continue;
     }
-    const title = `${OPENCLAW_TITLE_PREFIX}${step.sessionId}${OPENCLAW_TITLE_DELIMITER}${step.openclawId}`;
+    // Title is purely cosmetic; the dedup key lives on the
+    // source.openclawSessionId field below. The title is set in the
+    // openclaw shape so the operator can recognize the chat in the
+    // UI without inspecting the structured field, but they're free
+    // to rename it.
+    const title = `Openclaw ${step.sessionId} :: ${step.openclawId}`;
     try {
       const transcript = parseOpenclawSessionTranscript(step.sourcePath);
       if (transcript.messages.length === 0) {
@@ -2376,7 +2370,16 @@ export async function applyMigration(
       }
       await guardedMutate((state: RuntimeState) => {
         const owner = state.agents.find((agent) => agent.name === step.openclawId);
-        const session = createChatSession(state, title, undefined, owner?.id);
+        const session = createChatSession(
+          state,
+          title,
+          {
+            kind: "openclaw",
+            openclawSessionId: step.sessionId,
+            openclawAgentId: step.openclawId
+          },
+          owner?.id
+        );
         const firstAt = transcript.messages[0]!.createdAt;
         const lastAt = transcript.messages[transcript.messages.length - 1]!.createdAt;
         session.createdAt = transcript.headerTimestamp ?? firstAt;

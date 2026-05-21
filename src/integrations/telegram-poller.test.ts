@@ -391,7 +391,12 @@ describe("telegram poller supervisor", () => {
     const session = readState(config.instance).chatSessions.find(
       (s) => s.source?.kind === "telegram" && s.source.chatId === -987654321
     );
-    expect(session?.source?.target).toBe("-987654321");
+    // Narrow back to the telegram variant for the target access — the
+    // ChatSessionSource union also includes a non-target-carrying
+    // openclaw kind since the migration provenance work.
+    expect(session?.source?.kind === "telegram" ? session.source.target : null).toBe(
+      "-987654321"
+    );
 
     // Wait for the agent's mirror reply to land. The echo provider
     // makes this fast; the typing-and-mirror loop will fire sendMessage
