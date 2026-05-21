@@ -18,7 +18,7 @@ The migrator looks for openclaw's state root in this order, matching openclaw's 
 3. `~/.openclaw/`.
 4. The legacy `~/.clawdbot/`.
 
-If none of those exist, you'll see "no openclaw.json found" in the planner output and the apply step is a no-op.
+If none of those exist, you'll see "no openclaw.json found" in the planner output. The apply step does not migrate anything in that case, but it DOES record a failed `ImportReport` row (`status: "failed"`, `mode: "applied"`, with an `error` field naming the missing config path) so the activity feed reflects the attempt. You can ignore that row safely — it exists so a later "where did my migration go?" question has an answer in `gini import`.
 
 ## Two-step flow
 
@@ -77,9 +77,9 @@ Use `--force` to rotate values: a fresh openclaw config with a new `TELEGRAM_BOT
 
 ## Audit trail
 
-Every applied migration writes:
+Every `apply` invocation — whether the migration found data or not — writes:
 
-- An `ImportReport` row with `source: "openclaw"`, `mode: "applied"`, and a `counts` map summarizing each subsystem.
+- An `ImportReport` row with `source: "openclaw"` and `mode: "applied"`. On success the row carries `status: "completed"` plus a `counts` map summarizing each subsystem. On a no-config apply (the state path exists but `openclaw.json` is missing), the row carries `status: "failed"` with an `error` field and empty counts — written deliberately so the activity feed always reflects the attempt instead of silently producing no record.
 - Per-creation audit rows in `state.audit` (agent created, messaging configured, etc.) emitted by the same `addAudit` path the live CRUD endpoints use.
 
 You can read the report via `gini import` (the default subcommand lists reports) and the audit rows via `gini audit`.
