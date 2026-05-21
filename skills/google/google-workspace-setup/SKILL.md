@@ -5,17 +5,11 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 3.1.3
+    version: 3.1.4
     author: Gini
     platforms: [macos, linux]
     prerequisites:
       commands: [gws]
-      env:
-        - GOOGLE_WORKSPACE_CLI_CLIENT_ID
-        - GOOGLE_WORKSPACE_CLI_CLIENT_SECRET
-    requires:
-      connectors:
-        - provider: google-oauth-desktop
 ---
 
 # Google Workspace Setup
