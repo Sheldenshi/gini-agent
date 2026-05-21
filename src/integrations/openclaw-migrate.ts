@@ -933,6 +933,30 @@ export async function applyMigration(
   // restarts. No --force override here on purpose: silently losing the
   // running gateway's writes is the failure mode the gate exists to
   // prevent, and an override would invite the exact foot-gun.
+  // Closure that re-runs the gateway-alive check before each
+  // mutateState write. The pidfile lifecycle has timing windows on
+  // both ends: `gini stop` removes the file before the runtime's
+  // SIGTERM drain has finished (server.ts pins
+  // SERVER_DRAIN_TIMEOUT_MS=5000ms and SCHEDULER_DRAIN_TIMEOUT_MS=5000ms,
+  // so the gateway may still be issuing state.json writes for up to
+  // 10000ms after the pidfile is gone), and `gini start` spawns the
+  // child before the child writes its own pidfile. The single
+  // up-front check leaves both windows open. Re-checking inside this
+  // closure narrows the race to "gateway started or finished
+  // draining between the check and the atomic rename" —
+  // milliseconds rather than seconds. The residual TOCTOU is
+  // acknowledged; full mutual exclusion would require an OS-level
+  // advisory lock the rest of gini doesn't have.
+  const guardedMutate = <T>(fn: (state: RuntimeState) => T): Promise<T> => {
+    const liveNow = detectRunningGateway(config.instance);
+    if (liveNow) {
+      throw new Error(
+        `Gini gateway came up for instance '${config.instance}' (PID ${liveNow.pid}) mid-migration. Stop it with \`gini stop --instance ${config.instance}\` and re-run \`gini import apply openclaw\`.`
+      );
+    }
+    return mutateState(config.instance, fn);
+  };
+
   const running = detectRunningGateway(config.instance);
   if (running) {
     throw new Error(
@@ -954,7 +978,7 @@ export async function applyMigration(
   // activity feed records the attempt; the failed status makes the
   // outcome unambiguous.
   if (!plan.source.configExists) {
-    const failedReport = await mutateState(config.instance, (state) =>
+    const failedReport = await guardedMutate((state) =>
       createImportReport(state, {
         source: "openclaw",
         path: source.stateRoot,
@@ -1082,7 +1106,7 @@ export async function applyMigration(
 
   // 4) Agents. Skip if an agent with the same name already exists so
   // re-running the migrator is idempotent.
-  await mutateState(config.instance, (state) => {
+  await guardedMutate((state) => {
     for (const step of plan.steps) {
       if (step.kind !== "agent") continue;
       if (state.agents.some((existing) => existing.name === step.name)) {
@@ -1164,7 +1188,7 @@ export async function applyMigration(
     // from the first call would land on a stale snapshot that gets
     // discarded before the next write, so the rotation appears to
     // succeed (no error) while the metadata never persists.
-    const decision = await mutateState(config.instance, (state) => {
+    const decision = await guardedMutate((state) => {
       const found = state.messagingBridges.find(
         (bridge) => bridge.kind === step.bridgeKind
       );
@@ -1184,7 +1208,7 @@ export async function applyMigration(
       "bot-token",
       step.tokenValue
     );
-    await mutateState(config.instance, (state) => {
+    await guardedMutate((state) => {
       const at = now();
       const metadata: Record<string, unknown> =
         step.bridgeKind === "telegram"
@@ -1262,7 +1286,7 @@ export async function applyMigration(
     ...plan.unsupported.map((entry) => `Unsupported: ${entry.kind} — ${entry.detail}`),
     ...warnings.map((warning) => `Warning: ${warning}`)
   ];
-  const report = await mutateState(config.instance, (state) =>
+  const report = await guardedMutate((state) =>
     createImportReport(state, {
       source: "openclaw",
       path: source.stateRoot,
