@@ -1205,6 +1205,52 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("warns when an openclaw agent had per-agent tool/sandbox restrictions that gini's toolset model can't carry", () => {
+    // openclaw's tools.profile / tools.allow / tools.deny / tools.exec
+    // / tools.fs / sandbox fields restrict a specific agent's tool
+    // surface. gini's DEFAULT_AGENT_TOOLSETS grants file.write +
+    // terminal.exec to every newly-created agent. Without a warning,
+    // a "minimal" openclaw agent silently gains shell exec after
+    // migration — the operator must see the diff before the agent
+    // handles untrusted input.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(join(OPENCLAW_ROOT, "agents", "minimal", "agent"), { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [
+            {
+              id: "minimal",
+              default: true,
+              tools: {
+                profile: "minimal",
+                exec: { security: "deny" },
+                fs: { workspaceOnly: true }
+              },
+              sandbox: { mode: "container", workspaceAccess: "read-only" }
+            }
+          ]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const warning = plan.unsupported.find(
+      (entry) => entry.kind === "agent:minimal:tool-restrictions"
+    );
+    expect(warning).toBeDefined();
+    expect(warning?.detail).toContain("tools.profile: minimal");
+    expect(warning?.detail).toContain("tools.exec.security: deny");
+    expect(warning?.detail).toContain("tools.fs.workspaceOnly: true");
+    expect(warning?.detail).toContain("sandbox.mode: container");
+    expect(warning?.detail).toContain("sandbox.workspaceAccess: read-only");
+    expect(warning?.detail).toContain("DEFAULT_AGENT_TOOLSETS");
+    // The agent is still migrated — the warning is informational, not
+    // a refusal. The operator's instance retains its agent record so
+    // chat history doesn't dangle.
+    expect(plan.steps.some((step) => step.kind === "agent" && step.openclawId === "minimal")).toBe(true);
+  });
+
   test("redacts the exec command from SecretRef detail to avoid leaking secret-store paths", async () => {
     // Openclaw exec-source SecretRefs carry operator-authored shell
     // commands like `op read op://CorpName-Vault/openai-prod/credential`.

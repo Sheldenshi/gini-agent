@@ -147,6 +147,61 @@ interface OpenclawAgentConfig {
   // hand-edit this for multi-instance / portable-secrets setups; the
   // migrator must honor it so auth-profiles.json is found.
   agentDir?: string;
+  // Per-agent tool/sandbox restrictions from openclaw's schema. The
+  // migrator does NOT translate these into gini-side gates (the
+  // toolset model is different), but it must DETECT them so it can
+  // warn the operator that an openclaw agent with restrictive tools
+  // is becoming a gini agent with DEFAULT_AGENT_TOOLSETS (file.write
+  // + terminal.exec). Silent widening is the only outcome worse than
+  // surfacing the diff to the operator. Shapes are opaque — we only
+  // need to know which fields are populated to enumerate what was
+  // dropped; the exact openclaw types live in openclaw's repo.
+  tools?: {
+    profile?: string;
+    allow?: string[];
+    deny?: string[];
+    exec?: { security?: string };
+    fs?: { workspaceOnly?: boolean };
+    [key: string]: unknown;
+  };
+  sandbox?: {
+    mode?: string;
+    scope?: string;
+    workspaceAccess?: string;
+    [key: string]: unknown;
+  };
+}
+
+// Enumerate openclaw's per-agent tool/sandbox restrictions that
+// don't map onto gini's toolset model. Returns a list of
+// human-readable descriptions ("tools.exec.security: deny",
+// "sandbox.mode: container") so the migrator can warn the operator
+// per-agent. Empty array means no restrictions to report — the
+// caller skips the warning. We deliberately treat ANY presence of
+// these fields as a restriction worth reporting, because the gini
+// side cannot enforce them and the operator needs to know the
+// migrated agent has wider tool access than the openclaw original.
+function describeDroppedAgentRestrictions(agent: OpenclawAgentConfig): string[] {
+  const dropped: string[] = [];
+  if (agent.tools?.profile) dropped.push(`tools.profile: ${agent.tools.profile}`);
+  if (Array.isArray(agent.tools?.allow) && agent.tools.allow.length > 0) {
+    dropped.push(`tools.allow: [${agent.tools.allow.join(", ")}]`);
+  }
+  if (Array.isArray(agent.tools?.deny) && agent.tools.deny.length > 0) {
+    dropped.push(`tools.deny: [${agent.tools.deny.join(", ")}]`);
+  }
+  if (agent.tools?.exec?.security) {
+    dropped.push(`tools.exec.security: ${agent.tools.exec.security}`);
+  }
+  if (agent.tools?.fs?.workspaceOnly === true) {
+    dropped.push(`tools.fs.workspaceOnly: true`);
+  }
+  if (agent.sandbox?.mode) dropped.push(`sandbox.mode: ${agent.sandbox.mode}`);
+  if (agent.sandbox?.scope) dropped.push(`sandbox.scope: ${agent.sandbox.scope}`);
+  if (agent.sandbox?.workspaceAccess) {
+    dropped.push(`sandbox.workspaceAccess: ${agent.sandbox.workspaceAccess}`);
+  }
+  return dropped;
 }
 
 interface OpenclawChannelConfig {
@@ -1255,6 +1310,21 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
           detail: `Skipped agent '${openclawId}': agentDir override '${agent.agentDir ?? "(default)"}' resolves outside the openclaw state root. The migrator refuses to read auth-profiles.json from paths the operator didn't include in --path.`
         });
         continue;
+      }
+      // Surface per-agent tool/sandbox restrictions that the migrator
+      // can't carry into gini. The destination agent gets
+      // DEFAULT_AGENT_TOOLSETS (file.write, terminal.exec, etc.); an
+      // openclaw agent with `tools.profile: minimal` or
+      // `tools.exec.security: deny` would silently gain those
+      // capabilities. Warn so the operator can re-apply equivalent
+      // gini-side restrictions (via per-agent toolset config) before
+      // the agent starts handling messages.
+      const droppedRestrictions = describeDroppedAgentRestrictions(agent);
+      if (droppedRestrictions.length > 0) {
+        unsupported.push({
+          kind: `agent:${openclawId}:tool-restrictions`,
+          detail: `Agent '${openclawId}' had per-agent restrictions in openclaw that gini's toolset model can't carry: ${droppedRestrictions.join("; ")}. The migrated agent receives DEFAULT_AGENT_TOOLSETS (file read/write, terminal exec, memory, messaging, mcp). Re-apply equivalent restrictions via gini's per-agent toolset config before the agent handles untrusted input.`
+        });
       }
       steps.push({
         kind: "agent",
