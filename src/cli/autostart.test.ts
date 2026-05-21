@@ -227,6 +227,54 @@ describe("resolveLaunchSpec", () => {
     expect(spec.environment.OPENAI_API_KEY).toBeUndefined();
   });
 
+  test("merges login-shell PATH into plist PATH (nvm / asdf / volta visibility)", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => "/Users/test/.nvm/versions/node/v20.0.0/bin:/opt/homebrew/bin"
+    });
+    // nvm bin is prepended so it wins over any system node on the base PATH.
+    expect(spec.environment.PATH.startsWith("/Users/test/.nvm/versions/node/v20.0.0/bin:")).toBe(true);
+    // The base launchd PATH (bun, ~/.local/bin, standard dirs) is preserved.
+    expect(spec.environment.PATH).toContain("/opt/bun/bin");
+    expect(spec.environment.PATH).toContain(join(home, ".local", "bin"));
+  });
+
+  test("falls back to base PATH when the login-shell reader returns null", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => null
+    });
+    // No nvm dir, no shell-additions. Base launchd PATH still intact.
+    expect(spec.environment.PATH).not.toContain(".nvm");
+    expect(spec.environment.PATH).toContain("/opt/bun/bin");
+  });
+
+  test("does not invoke the login shell when an explicit reader is omitted under test", () => {
+    // Sanity: tests that don't opt in to shell-PATH-merge shouldn't pay the
+    // spawn cost or pick up developer-shell quirks. We assert by checking
+    // the base PATH stays exactly what buildLaunchAgentPath would produce
+    // without a reader.
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd
+    });
+    // No nvm path should appear unless we explicitly asked for it.
+    expect(spec.environment.PATH).not.toContain(".nvm");
+  });
+
   // The Next.js BFF only proxies to the gateway over /api/*; it never
   // invokes a provider directly. Provider secrets in the web plist's
   // EnvironmentVariables would widen the secret-exposure surface for zero gain,

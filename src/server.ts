@@ -1,16 +1,4 @@
 import { writeFileSync } from "node:fs";
-import { augmentPathFromLoginShell } from "./runtime/path-bootstrap";
-
-// Merge the user's interactive-shell PATH into process.env.PATH before any
-// other module loads or spawns. Under macOS launchd the gateway inherits
-// a minimal PATH from the plist that omits ~/.nvm, ~/.asdf, ~/.volta,
-// etc. — so npm-global CLIs (codex, claude, gh installed via brew on
-// Linux, ...) are invisible to provider probes and the Bash tool. Doing
-// the merge here means every downstream spawn (provider probe, tool
-// catalog, agent loop) sees the same PATH the user sees in their
-// terminal. See src/runtime/path-bootstrap.ts for the contract.
-const pathBootstrapReport = augmentPathFromLoginShell();
-
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
@@ -45,18 +33,6 @@ const instance = parseInstance();
 const config = loadConfig(instance);
 install(config);
 writePid(config);
-
-// Surface the login-shell PATH merge result to runtime.jsonl so it's
-// debuggable when a user reports "tool not found" after autostart. The
-// augmentation itself ran above before any other import; we just record
-// what happened now that appendLog is wired to the config.
-appendLog(config.instance, "runtime.path_bootstrap", {
-  applied: pathBootstrapReport.applied,
-  reason: pathBootstrapReport.reason,
-  shell: pathBootstrapReport.shell,
-  added: pathBootstrapReport.added,
-  finalLength: pathBootstrapReport.finalLength
-});
 
 // Inform the browser session manager which instance to consult for the
 // optional CDP connection record. Without this the manager falls back to

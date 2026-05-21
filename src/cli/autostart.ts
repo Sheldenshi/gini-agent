@@ -45,6 +45,7 @@ import {
   serviceTarget,
   type PlistKind
 } from "../integrations/launchd";
+import { mergeShellPath, readLoginShellPath, type LoginShellReader } from "../runtime/path-bootstrap";
 
 // Re-export the shared launchd primitives so existing imports against
 // src/cli/autostart keep resolving (CLI commands, tests). New runtime
@@ -138,6 +139,13 @@ export interface ResolveLaunchOptions {
   // production this is undefined and the plist gets a minimal env — no
   // leak of shell-level GINI_STATE_ROOT into a permanent launchd record.
   testRoot?: { stateRoot?: string; logRoot?: string };
+  // Test seam: override the login-shell PATH lookup used to extend the
+  // plist's PATH with the user's interactive PATH (nvm, asdf, volta, …).
+  // Defaults to reading $SHELL via readLoginShellPath. Production callers
+  // don't pass this.
+  loginShellReader?: LoginShellReader;
+  // Test seam: override $SHELL. Defaults to process.env.SHELL.
+  loginShell?: string;
 }
 
 // Build the launchd command line. We exec the Bun-driven runtime *directly*
@@ -196,10 +204,25 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // Always make bun's directory available on PATH so child invocations
   // (e.g. `bun install` triggers from inside the runtime) can resolve it.
   // macOS launchd hands the service a minimal PATH; we explicitly extend
-  // it rather than copy the parent shell's because the agent must work
-  // across reboots too.
+  // it with two layers:
+  //
+  //   1. The hard-coded base — bun's dir, ~/.local/bin, and the standard
+  //      macOS dirs. Guaranteed present regardless of the user's shell
+  //      setup.
+  //   2. The user's interactive-shell PATH read via `$SHELL -ilc 'echo
+  //      $PATH'`. Picks up nvm / asdf / volta / pyenv / rbenv shims so
+  //      the launchd-spawned gateway can see the same npm-globals
+  //      (codex, claude, …) the user sees in their terminal.
+  //
+  // Best-effort: if the shell isn't set or the read fails, we fall back
+  // to (1) alone. Bun's `spawnSync` snapshots PATH at process start, so
+  // there's no useful runtime fix for this — the plist is the right
+  // place to bake the PATH in.
   const baseEnv: Record<string, string> = {
-    PATH: buildLaunchAgentPath(bunPath, home),
+    PATH: buildLaunchAgentPath(bunPath, home, {
+      loginShellReader: options.loginShellReader,
+      loginShell: options.loginShell
+    }),
     HOME: home,
     LANG: process.env.LANG ?? "en_US.UTF-8"
   };
@@ -467,7 +490,16 @@ function buildWebShim(instance: Instance): string {
   ].join("\n");
 }
 
-function buildLaunchAgentPath(bunPath: string, home: string): string {
+interface BuildPathOptions {
+  loginShellReader?: LoginShellReader;
+  loginShell?: string;
+}
+
+function buildLaunchAgentPath(
+  bunPath: string,
+  home: string,
+  options: BuildPathOptions = {}
+): string {
   const bunDir = dirname(resolve(bunPath));
   // Standard macOS PATH plus bun's dir. ~/.local/bin is included so the
   // wrapper itself is findable.
@@ -483,11 +515,42 @@ function buildLaunchAgentPath(bunPath: string, home: string): string {
   ];
   // Dedupe while preserving order.
   const seen = new Set<string>();
-  return segments.filter((s) => {
+  const base = segments.filter((s) => {
     if (seen.has(s)) return false;
     seen.add(s);
     return true;
   }).join(":");
+
+  // Merge in the user's interactive-shell PATH so version-manager dirs
+  // (nvm, asdf, volta, …) make it into the plist. Best-effort: missing
+  // $SHELL or a failing read leaves the base PATH untouched.
+  //
+  // Skipped under bun:test (and NODE_ENV=test) unless an explicit
+  // loginShellReader is provided. The existing autostart test suite
+  // calls resolveLaunchSpec dozens of times; spawning the user's shell
+  // each time would add seconds of latency AND make assertions on the
+  // PATH non-deterministic across developer machines.
+  const explicitReader = options.loginShellReader !== undefined;
+  if (!explicitReader && isTestEnv()) return base;
+  const shell = options.loginShell ?? process.env.SHELL;
+  if (!shell) return base;
+  const read = options.loginShellReader ?? readLoginShellPath;
+  let shellPath: string | null;
+  try {
+    shellPath = read(shell);
+  } catch {
+    shellPath = null;
+  }
+  if (!shellPath) return base;
+  return mergeShellPath(base, shellPath).merged;
+}
+
+function isTestEnv(): boolean {
+  return (
+    process.env.NODE_ENV === "test"
+    || process.env.BUN_TEST === "1"
+    || process.env.BUN_TEST === "true"
+  );
 }
 
 export interface PlistOptions {
