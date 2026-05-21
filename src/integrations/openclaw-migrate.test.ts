@@ -492,6 +492,36 @@ describe("planMigration", () => {
     }
   });
 
+  test("rejects path-traversal agent ids before reading auth-profiles.json", () => {
+    // openclaw state is user-supplied via --path; without slug
+    // validation, a crafted agent.id of "../../../../etc/passwd" could
+    // make the migrator readFileSync arbitrary paths under the operator's
+    // HOME. Reject and surface the bad entry on the unsupported list.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [
+            { id: "../../../../etc/passwd", default: true },
+            { id: "evil/with/slash" },
+            { id: "main" }
+          ]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const agentNames = plan.steps
+      .filter((step) => step.kind === "agent")
+      .map((step) => (step as { name: string }).name);
+    expect(agentNames).toEqual(["main"]);
+    const unsafeWarnings = plan.unsupported.filter(
+      (entry) => entry.kind === "agent" && entry.detail.includes("unsafe id")
+    );
+    expect(unsafeWarnings.length).toBe(2);
+  });
+
   test("falls back to defaults.model when an agent omits its own model", () => {
     seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false });
     writeFileSync(

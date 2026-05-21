@@ -397,6 +397,18 @@ export function parseOpenclawModelRouting(
   };
 }
 
+// Openclaw's own agent-id validator (`normalizeAgentId` at
+// src/routing/session-key.ts upstream) accepts `[a-z0-9][a-z0-9_-]{0,63}`
+// case-insensitively. We mirror that here and additionally allow `.` so
+// dotted ids that already exist in some openclaw deployments still
+// pass. The slug check is purely defensive — it rejects strings that
+// would be valid path-segment-traversal payloads when joined into
+// agentsDir for the auth-profiles.json read.
+const SAFE_AGENT_SLUG = /^[a-z0-9][a-z0-9_.-]{0,63}$/i;
+function isSafeAgentSlug(value: string): boolean {
+  return SAFE_AGENT_SLUG.test(value) && !value.includes("..");
+}
+
 // Resolve the canonical env-var name gini uses for a given provider.
 // Routes through `normalizeProvider` so the migrator and the runtime
 // agree on naming — hand-rolling `${PROVIDER.toUpperCase()}_API_KEY`
@@ -511,6 +523,20 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
     for (const agent of agentList) {
       const openclawId = (agent.id ?? "").trim();
       if (!openclawId) continue;
+      // The openclaw config is operator-supplied via --path, so a
+      // crafted agent.id like "../../../../etc/passwd" would let the
+      // auth-profiles.json read below escape source.agentsDir and open
+      // arbitrary files under the user's HOME. Restrict to a safe slug
+      // matching openclaw's own validator (alphanumerics, _-., starts
+      // with letter/digit, 64 chars max) and surface the bad entry on
+      // the unsupported list so the operator sees what was dropped.
+      if (!isSafeAgentSlug(openclawId)) {
+        unsupported.push({
+          kind: "agent",
+          detail: `Skipped agent with unsafe id '${openclawId}'. Agent ids must match /^[a-z0-9][a-z0-9_.-]{0,63}$/i.`
+        });
+        continue;
+      }
       const routing = parseOpenclawModelRouting(agent.model);
       // Fall back to the defaults block when the agent didn't supply a
       // model of its own — openclaw resolves the same way at runtime.
