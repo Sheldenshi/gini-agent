@@ -229,6 +229,80 @@ describe("request_connector dispatch", () => {
       expect(approval!.payload.providerLabel).toBe("Linear");
       expect(approval!.payload.toolCallId).toBe("call_42");
       expect(approval!.payload.reason).toBe("list my open issues");
+      // No template on the `linear` provider → empty templateParams shape
+      // for uniform consumption downstream.
+      expect(approval!.payload.templateParams).toEqual({});
     }
+  });
+
+  test("substitutes provider requestInstructions template with params", async () => {
+    // The google-oauth-desktop provider declares both `requestInstructions`
+    // (with `${project_id}` placeholder) and `requestParams`. The dispatcher
+    // owns the substitution — the model's `reason` field is overridden by
+    // the rendered template, so users always see the same multi-line
+    // instructions with the URLs filled in.
+    const instance = `req-connector-template-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_template",
+      JSON.stringify({
+        provider: "google-oauth-desktop",
+        reason: "Set up your Google OAuth Desktop client.",
+        params: { project_id: "gini-workspace-7654321" }
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      // The model's short fallback `reason` must be replaced by the
+      // substituted template. No `${project_id}` placeholders may leak
+      // through; the literal project id must appear in both URLs.
+      expect(approval!.reason).not.toBe("Set up your Google OAuth Desktop client.");
+      expect(approval!.reason).not.toContain("${project_id}");
+      expect(approval!.reason).toContain("project=gini-workspace-7654321");
+      expect(approval!.reason).toContain("credentials/consent");
+      expect(approval!.reason).toContain("Desktop app");
+      // payload.reason mirrors the substituted text so the connect endpoint
+      // and any UI consumer can read either field interchangeably.
+      expect(approval!.payload.reason).toBe(approval!.reason);
+      // templateParams is persisted alongside the approval so an auditor
+      // can recover the substitution inputs after the fact.
+      expect(approval!.payload.templateParams).toEqual({ project_id: "gini-workspace-7654321" });
+    }
+  });
+
+  test("returns a sync error when required template params are missing", async () => {
+    // google-oauth-desktop declares `project_id` as required. Omitting it
+    // must surface as a structured error the model can recover from — no
+    // approval row should be created.
+    const instance = `req-connector-missing-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_missing",
+      JSON.stringify({
+        provider: "google-oauth-desktop",
+        reason: "Set up your Google OAuth Desktop client."
+      })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("Missing required params");
+      expect(parsed.error).toContain("project_id");
+    }
+    // No approval should have been created in the missing-params branch.
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 });

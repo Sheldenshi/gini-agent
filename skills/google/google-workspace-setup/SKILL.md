@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 3.0.2
+    version: 3.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -191,18 +191,19 @@ If it errors with `PERMISSION_DENIED`, the user doesn't own the project — ask 
 
 #### Last step — OAuth client setup
 
-Call `request_connector` with a multi-line `reason` field that embeds both Cloud Console URLs and the click instructions. The inline form renders the reason with line breaks preserved and URLs as clickable links — the user clicks through Cloud Console from the form's body, then pastes the credentials into the form's inputs.
-
-Substitute `<project_id>` with the real project id from Milestone B:
+Call `request_connector` with the project id from Milestone B. The runtime fills in the URL instructions from the provider's declared template; the user sees them in the chat bubble above the form.
 
 ```text
 request_connector {
   provider: "google-oauth-desktop",
-  reason: "Last step — complete two Cloud Console pages, then paste the credentials below.\n\n1. Consent screen (if not configured):\nhttps://console.cloud.google.com/apis/credentials/consent?project=<project_id>\n→ User Type: External, App name 'Gini Workspace', your email for support + developer contact, save through Scopes, add yourself as a Test user.\n\n2. Create an OAuth client:\nhttps://console.cloud.google.com/apis/credentials?project=<project_id>\n→ Create Credentials → OAuth client ID → Application type: Desktop app.\n\nPaste the Client ID and Client Secret below."
+  reason: "Set up your Google OAuth Desktop client.",
+  params: {
+    project_id: "<actual project id from gcloud, e.g. gini-workspace-1234567>"
+  }
 }
 ```
 
-Do NOT post a separate chat message before the tool call. The reason field IS the message. The user sees one rendered card with the URLs as clickable links above the input fields. Do NOT `open <url>` for either Console URL — let the user click from the form.
+Do NOT post a separate chat message before the tool call. Do NOT `open <url>` for either Console URL — let the user click from the form.
 
 Don't gate on "reply done" between the two pages — the form submission is what advances the flow. The user can do them in any order, or come back later. The connector is created with the env bindings `GOOGLE_WORKSPACE_CLI_CLIENT_ID` and `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET`, which `gws` picks up automatically. Continue to Step 3 once the connector is healthy.
 

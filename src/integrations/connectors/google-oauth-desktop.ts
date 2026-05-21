@@ -45,5 +45,30 @@ export const googleOauthDesktopProvider: ProviderModule = {
       GOOGLE_WORKSPACE_CLI_CLIENT_ID: "client_id",
       GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: "client_secret"
     }
-  }
+  },
+  // The model was unreliable about embedding the Cloud Console URLs in its
+  // `reason` field — it kept collapsing the multi-line instructions and
+  // dropping the URLs. Declaring the template here takes that text out of
+  // the model's hands: the model only supplies `project_id`, the runtime
+  // substitutes the placeholders, and the user sees the same rendered
+  // markdown block every time. We use string concatenation + `\n` rather
+  // than a template literal so the literal `${project_id}` reaches the
+  // runtime substitutor (no JS-side interpolation).
+  requestParams: [
+    {
+      name: "project_id",
+      label: "GCP project id",
+      description: "The Cloud project the user just created or selected via gcloud.",
+      required: true
+    }
+  ],
+  requestInstructions:
+    "Last step — complete two Cloud Console pages, then paste the credentials below.\n\n"
+    + "1. Consent screen (if not configured):\n"
+    + "https://console.cloud.google.com/apis/credentials/consent?project=${project_id}\n"
+    + "→ User Type: External, App name \"Gini Workspace\", save through all screens, add yourself as Test user.\n\n"
+    + "2. Create an OAuth client:\n"
+    + "https://console.cloud.google.com/apis/credentials?project=${project_id}\n"
+    + "→ Create Credentials → OAuth client ID → Application type: Desktop app.\n\n"
+    + "Paste the Client ID and Client Secret below."
 };

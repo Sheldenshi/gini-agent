@@ -465,7 +465,12 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         type: "object",
         properties: {
           provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
-          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request." }
+          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request. If the provider declares `requestInstructions`, the runtime overrides this field with the substituted template — pass a short fallback reason anyway." },
+          params: {
+            type: "object",
+            description: "Provider-specific parameters substituted into the provider's requestInstructions template (e.g. { project_id: 'gini-workspace-1234567' }). Required keys depend on the provider — see the provider's declared requestParams.",
+            additionalProperties: { type: "string" }
+          }
         },
         required: ["provider", "reason"]
       }
