@@ -877,6 +877,58 @@ describe("planMigration", () => {
     expect(telegram?.tokenValue).toBe("tg-direct-key");
   });
 
+  test("discovers tokens from inline channel config when env vars are missing", () => {
+    // Openclaw's per-account schema stores botToken/token inline under
+    // channels.<kind>.<account>.{botToken,token}. The migrator was
+    // only reading env vars, so modern configs failed to migrate
+    // their bridges silently.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        channels: {
+          telegram: { accounts: { primary: { botToken: "tg-inline-token" } } },
+          discord: { accounts: { primary: { token: "discord-inline-token" } } }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find(
+      (step) => step.kind === "bridge" && (step as { bridgeKind: string }).bridgeKind === "telegram"
+    ) as { tokenValue: string } | undefined;
+    const discord = plan.steps.find(
+      (step) => step.kind === "bridge" && (step as { bridgeKind: string }).bridgeKind === "discord"
+    ) as { tokenValue: string } | undefined;
+    expect(telegram?.tokenValue).toBe("tg-inline-token");
+    expect(discord?.tokenValue).toBe("discord-inline-token");
+  });
+
+  test("strips telegram:/tg: prefixes from allowFrom entries before coercing to numbers", () => {
+    // Openclaw's normalizer (extensions/telegram/src/allow-from.ts)
+    // strips a leading telegram: or tg: prefix case-insensitively.
+    // Number(\"telegram:12345\") is NaN, so prefixed entries used to
+    // disappear without warning.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        channels: {
+          telegram: {
+            accounts: { primary: { botToken: "tg-token" } },
+            allowFrom: ["telegram:111", "Tg:222", "333"]
+          }
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const telegram = plan.steps.find((step) => step.kind === "bridge") as {
+      allowedChatIds: number[];
+    };
+    expect(telegram.allowedChatIds.sort((a, b) => a - b)).toEqual([111, 222, 333]);
+  });
+
   test("env.vars takes precedence over direct env.<KEY> for the same name", () => {
     // When both shapes carry the same key, vars wins — that mirrors
     // the order operators expect from their existing openclaw config

@@ -388,13 +388,75 @@ function collectOpenclawEnv(env: OpenclawConfig["env"]): Record<string, string> 
   return out;
 }
 
+// Openclaw's per-channel schema carries the bot token inline under the
+// channel block itself or under nested per-account sub-objects
+// (e.g. `channels.telegram.<account>.botToken`, `channels.discord.<acct>.token`).
+// Resolve the first plaintext we can find for the supplied key set —
+// the top-level channel block first, then each account-shaped child.
+// We deliberately don't deep-walk arbitrary nesting since the openclaw
+// shapes documented in the schema only allow one level of per-account
+// objects.
+function resolveInlineChannelToken(
+  channel: OpenclawChannelConfig | undefined,
+  keys: readonly string[]
+): string | undefined {
+  if (!channel || typeof channel !== "object") return undefined;
+  const direct = pickStringField(channel, keys);
+  if (direct) return direct;
+  const accounts = (channel as { accounts?: unknown }).accounts;
+  if (accounts && typeof accounts === "object" && !Array.isArray(accounts)) {
+    for (const account of Object.values(accounts as Record<string, unknown>)) {
+      if (account && typeof account === "object") {
+        const found = pickStringField(account as Record<string, unknown>, keys);
+        if (found) return found;
+      }
+    }
+  }
+  // Some openclaw shapes treat the channel value itself as a single
+  // account map keyed by name (e.g. `channels.telegram.myaccount.botToken`).
+  for (const value of Object.values(channel as Record<string, unknown>)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const found = pickStringField(value as Record<string, unknown>, keys);
+      if (found) return found;
+    }
+  }
+  return undefined;
+}
+
+function pickStringField(
+  bag: Record<string, unknown>,
+  keys: readonly string[]
+): string | undefined {
+  for (const key of keys) {
+    const value = bag[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+// Openclaw's allow-list normalizer (extensions/telegram/src/allow-from.ts)
+// strips a leading `telegram:` or `tg:` prefix (case-insensitive)
+// before treating the remainder as a chat id. Mirror that here so
+// configs that follow openclaw's documented prefix form don't get
+// their entries silently coerced to NaN and dropped.
+function stripTelegramAllowPrefix(value: string): string {
+  return value.replace(/^(telegram|tg):/i, "");
+}
+
+function parseChatIdEntry(entry: unknown): number | null {
+  const raw = typeof entry === "number" ? entry : Number(stripTelegramAllowPrefix(String(entry)));
+  return Number.isFinite(raw) ? raw : null;
+}
+
 function readAllowFromAsNumbers(path: string): number[] | undefined {
   if (!existsSync(path)) return undefined;
   try {
-    const data = JSON.parse(readFileSync(path, "utf8")) as { allowFrom?: string[] };
-    const ids = (data.allowFrom ?? [])
-      .map((entry) => Number(entry))
-      .filter((value) => Number.isFinite(value));
+    const data = JSON.parse(readFileSync(path, "utf8")) as { allowFrom?: unknown[] };
+    const ids: number[] = [];
+    for (const entry of data.allowFrom ?? []) {
+      const value = parseChatIdEntry(entry);
+      if (value !== null) ids.push(value);
+    }
     return ids;
   } catch {
     return undefined;
@@ -411,8 +473,8 @@ function coerceAllowFromToNumbers(raw: unknown): number[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const ids: number[] = [];
   for (const entry of raw) {
-    const value = typeof entry === "number" ? entry : Number(entry);
-    if (Number.isFinite(value)) ids.push(value);
+    const value = parseChatIdEntry(entry);
+    if (value !== null) ids.push(value);
   }
   return ids.length > 0 ? ids : undefined;
 }
@@ -748,7 +810,14 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   const dotenv = readStateDotenv(source.stateRoot);
   for (const name of Object.keys(channels)) {
     if (name === "telegram") {
-      const token = envVars.TELEGRAM_BOT_TOKEN ?? dotenv.TELEGRAM_BOT_TOKEN;
+      const inlineTelegram = resolveInlineChannelToken(channels[name], [
+        "botToken",
+        "token"
+      ]);
+      const token =
+        envVars.TELEGRAM_BOT_TOKEN ??
+        dotenv.TELEGRAM_BOT_TOKEN ??
+        inlineTelegram;
       if (token) {
         // Union the allow-list from BOTH sources openclaw uses:
         //   1. `<credDir>/telegram-allowFrom.json` (legacy + default-account)
@@ -777,7 +846,14 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         });
       }
     } else if (name === "discord") {
-      const token = envVars.DISCORD_BOT_TOKEN ?? dotenv.DISCORD_BOT_TOKEN;
+      const inlineDiscord = resolveInlineChannelToken(channels[name], [
+        "botToken",
+        "token"
+      ]);
+      const token =
+        envVars.DISCORD_BOT_TOKEN ??
+        dotenv.DISCORD_BOT_TOKEN ??
+        inlineDiscord;
       if (token) {
         steps.push({
           kind: "bridge",
