@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Node.js 18+ (or a prebuilt `gws` binary) and a Google Cloud project for OAuth credentials."
 metadata:
   gini:
-    version: 2.0.0
+    version: 2.1.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -27,8 +27,7 @@ Run this skill the first time any Workspace skill is invoked. It is idempotent �
 - A Google account (personal `@gmail.com` or a Workspace tenant).
 - A Google Cloud project for OAuth credentials. Step 2 below creates one — either via `gcloud` (fast path) or by browser-driving Cloud Console (fallback).
 - Node.js 18+ on `$PATH` if installing via npm. Homebrew and prebuilt-binary installs do not need Node.
-- The `browser` toolset enabled on the active agent. The default agent ships with it on; if `/api/status` shows `toolsetFilter` without `browser`, ask the user to enable the toolset before continuing. (Even the gcloud-hybrid path needs the browser for the final OAuth Desktop client creation step — Google has no public API for that.)
-- A **visible, managed browser session** so the user can complete sign-in (browser-only path) or download the OAuth client JSON (gcloud-hybrid path). Headless mode is the default; without an explicit connect the user has no window to act in. Confirm before the Cloud Console portion — see Step 0 inside Step 2B.
+- A working default browser on the user's machine. The gcloud-hybrid path (Step 2A) sends the OAuth consent screen + Desktop client pages to the user's default browser via `open` — no managed Chrome involved. Only Step 2B (the emergency fallback when `gcloud` cannot be installed) needs the `browser` toolset and a managed Chrome session.
 
 ## When to Use
 
@@ -127,9 +126,28 @@ Branch on the answer:
 
      Already-enabled APIs are no-ops. If this succeeds, skip to Step 3.
 
-  3. If `gcloud` is not available, fall back to browser-driving Console. Tell the user: "I'm going to verify Gmail, Calendar, Drive, Docs, Forms, and Meet APIs in your project `<project_id>`. This requires a visible browser session." Then run Step 0 from Step 2B below to make sure a visible browser is attached, hand off sign-in, navigate to `https://console.cloud.google.com/apis/library?project=<project_id>`, and run the same enablement loop from Milestone C in Step 2B (in order: Gmail, Calendar, Drive, Docs, Forms, Meet). For each: search the API name, click the result, then if the page shows **Manage** instead of **Enable** skip the click — otherwise click **Enable** and wait for the success banner.
+  3. If `gcloud` is not available, fall back to opening the API library in the **user's default browser** — Gini cannot drive Cloud Console for them, but they can click through it themselves once they're already signed in there. Use `terminal_exec`:
 
-  4. After all six are verified or enabled, summarize in chat: "Verified Gmail, Calendar, Drive, Docs, Forms, and Meet APIs in project `<project_id>`. Moving on to OAuth login." Close any browser session (`browser_close {}`) and jump to Step 3.
+     ```bash
+     open "https://console.cloud.google.com/apis/library?project=<project_id>"
+     ```
+
+     Then tell the user, in chat:
+
+     > I've opened the API library for your project. Please verify these six APIs are **Enabled** (if any shows an **Enable** button instead of **Manage**, click it):
+     >
+     > 1. Gmail API
+     > 2. Google Calendar API
+     > 3. Google Drive API
+     > 4. Google Docs API
+     > 5. Google Forms API
+     > 6. Google Meet API
+     >
+     > Reply **"done"** when all six show **Manage**.
+
+     Wait for "done." Do not try to drive these clicks from a managed Chrome session.
+
+  4. After the user confirms, jump to Step 3.
 
   If the user objects to this verification step ("I know they're all enabled, just continue"), respect that and proceed straight to Step 3 — but warn them once: "OK, skipping verification. If a future product ask fails with a 403 'API not enabled' error, the fix is to enable that API in Cloud Console at https://console.cloud.google.com/apis/library?project=`<project_id>`."
 
@@ -145,21 +163,18 @@ Detect whether `gcloud` is installed:
 command -v gcloud
 ```
 
-- **If `gcloud` is on `$PATH`** → run Step 2A (gcloud-hybrid, fast path, ~1-2 minutes). It replaces the slowest Cloud Console pages (project creation + six API enablements) with two terminal commands; only the OAuth Desktop client creation still needs the browser (Google has no public API for that).
-- **If `gcloud` is NOT installed** → ask the user:
+- **If `gcloud` is on `$PATH`** → run Step 2A (gcloud-hybrid, fast path, ~1-2 minutes). It replaces the slowest Cloud Console pages (project creation + six API enablements) with two terminal commands; only the OAuth Desktop client creation still needs the browser.
+- **If `gcloud` is NOT installed** → install it silently. The user already consented to setup; further opt-in questions are noise. Run `brew install --cask google-cloud-sdk` (macOS) or the platform installer at `https://docs.cloud.google.com/sdk/docs/install` (other platforms) via `terminal_exec`. The user sees the standard terminal approval card; approving it is sufficient consent. Verify with `gcloud --version`, then continue to Step 2A without further confirmation. Step 2B (browser-only) is reserved as an emergency fallback for when the install itself fails (no Homebrew, network error, etc.) — see the note at the top of Step 2B.
 
-  > A faster setup is available if I install `gcloud` first (the Google Cloud CLI — ~60MB download, ~1-2 minutes to install). It cuts the Cloud Console portion of setup from ~5 minutes down to ~1-2 minutes. Want me to install `gcloud`, or use the slower browser-only path (~5 minutes)?
-
-  - **User says install** → run `brew install --cask google-cloud-sdk` (macOS) or follow `https://docs.cloud.google.com/sdk/docs/install` for other platforms (use `terminal_exec`). Verify with `gcloud --version`. Then run Step 2A.
-  - **User says skip / use browser** → run Step 2B (browser-only fallback). This is the path that shipped before `gcloud` support landed; everything still works.
-
-The two paths produce the same end state (an OAuth Desktop client JSON at `~/.config/gws/client_secret.json` in a project with all six Workspace APIs enabled). Pick once per setup run; do not mix them mid-flow.
+Both paths produce the same end state: an OAuth Desktop client JSON at `~/.config/gws/client_secret.json` in a project with all six Workspace APIs enabled.
 
 ### 2A. gcloud-hybrid setup (fast path)
 
-This path assumes `gcloud` is installed and on `$PATH`. It executes project creation + API enablement via `terminal_exec` and only opens the browser for the OAuth consent screen + Desktop client creation (the parts Google does not expose programmatically).
+This path assumes `gcloud` is installed and on `$PATH`. Project creation + API enablement happen via `terminal_exec`. The OAuth consent screen + Desktop client creation steps (which Google does not expose programmatically) happen in the **user's default browser** — the one they already use day-to-day. Gini does NOT spawn a managed Chrome for Step 2A. The user is already signed in to Google in their default browser (from `gcloud auth login` below); reusing that browser avoids a second sign-in.
 
 Every `gcloud` invocation runs through `terminal_exec`. If the user wants to skip approval prompts on these specific commands, they can add `gcloud *` to their `autoApproveCommands` (per Step 5) — but that's their choice, not a default.
+
+> **Status discipline.** Don't list completed actions in chat. The user can see the terminal commands you ran and their output in the approval cards. Status messages should be action-oriented (what the user must do next), not retrospective (everything you just did). Acceptable: "Please sign in to Google in the browser tab I just opened, then reply done." Not acceptable: "I installed gcloud, signed in as X, created project Y, enabled APIs A, B, C, D, E, F." If nothing requires the user's attention next, stay quiet and continue.
 
 #### Milestone A — Sign in with gcloud
 
@@ -169,9 +184,9 @@ If the user has never used `gcloud` on this machine, `gcloud auth login` opens t
 gcloud auth login
 ```
 
-A browser tab opens at Google's sign-in page. The user signs in with the same account they want Gini to use for Workspace operations. `gcloud` stores the resulting credentials on the local machine — they never reach Gini.
+A browser tab opens in the user's default browser at Google's sign-in page. The user signs in with the same account they want Gini to use for Workspace operations. `gcloud` stores the resulting credentials on the local machine — they never reach Gini. The browser session created here is what Milestones D and E reuse — same browser, same Google sign-in cookie.
 
-If `gcloud auth list` already shows an active account the user wants to use, skip this step. Confirm with the user in chat: "I see `gcloud` is already signed in as `<email>`. Use this account?"
+If `gcloud auth list` already shows an active account, ask the user once whether to use it: "gcloud is signed in as `<email>`. Use this account?" — and continue on confirmation.
 
 #### Milestone B — Create or pick a Cloud project
 
@@ -197,8 +212,6 @@ Either way, set the active project:
 gcloud config set project <project_id>
 ```
 
-Summarize: "Project `<project_id>` is active. Moving on to enable the Workspace APIs."
-
 #### Milestone C — Enable Workspace APIs
 
 > **Enable all six APIs even if the user's current ask only needs one.** Setup is a one-time, comprehensive operation. The user just asked Gini to do something in (e.g.) Calendar today, but they'll later ask about Gmail, Drive, etc. Enabling all six APIs now means none of those future asks require re-touching the project — a later product ask should only need `gws auth login --scopes <scope>`, no project edits, no API toggling, no OAuth client changes. The user does not pay for enabled-but-unused APIs.
@@ -219,92 +232,80 @@ Note the exact service IDs — Calendar's is `calendar-json.googleapis.com` (not
 
 The command typically takes 30-60 seconds to return. If it errors with `PERMISSION_DENIED`, the user is signed in with an account that doesn't own the project — ask them to switch with `gcloud auth login` or pick a project they own with `gcloud config set project <project_id>`.
 
-Summarize: "Enabled Gmail, Calendar, Drive, Docs, Forms, and Meet APIs in `<project_id>`. Moving on to the OAuth Desktop client."
+#### Milestone D — Configure the OAuth consent screen (user's default browser)
 
-#### Milestone D — Configure the OAuth consent screen (browser)
+Google has no public API for configuring the standard OAuth consent screen (`gcloud iap oauth-brands` is **locked to IAP-protected resources** and produces clients that cannot be repurposed for Desktop OAuth). Drive this step from the user's own default browser — they're already signed in there from `gcloud auth login`, so no second sign-in is needed.
 
-Google has no public API for configuring the standard OAuth consent screen (`gcloud iap oauth-brands` is **locked to IAP-protected resources** and produces clients that cannot be repurposed for Desktop OAuth). So this step still drives Cloud Console through the browser tools.
+Open the consent screen page in the user's default browser via `terminal_exec`:
 
-First, confirm a visible browser is attached (same preflight as Step 2B's Step 0):
-
-```text
-browser_connect { reason: "Configure OAuth consent screen in Cloud Console" }
+```bash
+open "https://console.cloud.google.com/apis/credentials/consent?project=<project_id>"
 ```
 
-Wait for the user to approve. Then:
+(`open` on macOS, `xdg-open` on Linux — pick whichever resolves on the user's platform.)
 
-```text
-browser_navigate { url: "https://console.cloud.google.com/apis/credentials/consent?project=<project_id>" }
-browser_snapshot {}
+Then tell the user, in chat, with a concise click list:
+
+> I've opened the OAuth consent screen page in your default browser. Please do the following, then reply **"done"**:
+>
+> 1. User Type: pick **External**, click **Create**.
+> 2. App name: `Gini Workspace`. User support email: your own email. Developer contact: your own email. Click **Save and continue**.
+> 3. Scopes step: click **Save and continue** without adding anything.
+> 4. Test users step: click **Add users**, type your own email, click **Add**, then **Save and continue**.
+> 5. Skip the Verification step (click **Back to Dashboard** at the bottom).
+
+Wait for "done." Do not try to drive these clicks yourself — Gini cannot reach the user's default browser. If the user replies with a problem ("the page asked me something I didn't expect"), respond by walking them through manually rather than trying to take over.
+
+#### Milestone E — Create the OAuth Desktop client (user's default browser)
+
+This step also has no public API — `gcloud iap oauth-clients` only produces IAP-locked web clients. Stay in the user's default browser:
+
+```bash
+open "https://console.cloud.google.com/apis/credentials?project=<project_id>"
 ```
 
-The page asks for User Type. Choose **External**, click **Create**. Snapshot.
+Tell the user, in chat:
 
-On the App information form:
+> I've opened the Credentials page. Please:
+>
+> 1. Click **Create Credentials** at the top of the page, then **OAuth client ID** in the dropdown.
+> 2. Application type: **Desktop app**.
+> 3. Name: `gws CLI`.
+> 4. Click **Create**.
+> 5. In the dialog that appears, click **DOWNLOAD JSON**.
+>
+> Then paste the full path to the downloaded file here (it usually lands in `~/Downloads/`, e.g. `~/Downloads/client_secret_123-abc.apps.googleusercontent.com.json`).
 
-1. Type "Gini Workspace" (or whatever name the user prefers) into "App name."
-2. Pick the user's own email in "User support email" — the dropdown should be pre-populated. If unclear which email the user is signed in as, ask them rather than guessing.
-3. Skip the App logo and App domain sections.
-4. Type the user's own email into "Developer contact information."
-5. Click **Save and continue**.
-
-On the Scopes step, click **Save and continue** with no scopes added. The `gws` OAuth flow requests scopes at login time; pre-adding scopes here would also force the user through verification later.
-
-On the Test users step, click **Add users**, type the user's own email, click **Add**, then **Save and continue**. The OAuth flow only works for emails on this Test users list while the app is in testing mode.
-
-Skip the Verification step (the "Back to Dashboard" button at the bottom).
-
-Summarize: "OAuth consent screen configured with your email as the test user. Moving on to create the Desktop client."
-
-#### Milestone E — Create the OAuth Desktop client (browser)
-
-This step also has no public API — `gcloud iap oauth-clients` only produces IAP-locked web clients. Browser-driven.
-
-```text
-browser_navigate { url: "https://console.cloud.google.com/apis/credentials?project=<project_id>" }
-browser_snapshot {}
-```
-
-1. Click **Create Credentials** (top of the page), then **OAuth client ID** in the dropdown.
-2. Snapshot. In the "Application type" select, choose **Desktop app**.
-3. Snapshot. Type a name into "Name" — `gws CLI` is fine.
-4. Click **Create**.
-5. Snapshot. The Console shows a dialog with the client ID and offers a JSON download. Click **DOWNLOAD JSON**.
-6. Wait briefly for the download to land (~2s).
-
-Tell the user: "The OAuth Desktop client is created and the JSON has been downloaded."
+Wait for the user's path. Continue to Milestone F.
 
 #### Milestone F — Move the JSON into place
 
-Gini's managed Chrome saves downloads under the **per-instance state dir** (`~/.gini/instances/<instance>/downloads/`), not `~/Downloads`. macOS sandboxes `~/Downloads` so the agent can't read files saved there; the per-instance dir is owned by Gini and immediately readable. Resolve `<instance>` from `gini status` or the runtime API (`GET /api/status` → `instance`) — it's typically the project directory name.
-
-Use `terminal_exec` (substitute the resolved instance name; do not leave `<instance>` literal):
+The downloaded JSON sits in the user's `~/Downloads/`. macOS sandboxes that directory so the agent **cannot read files there directly**, but `mv` invoked through `terminal_exec` may still succeed if the user has approved broader filesystem access — try it first. Substitute `<path>` with the literal path the user pasted:
 
 ```bash
-INSTANCE_DOWNLOADS=~/.gini/instances/<instance>/downloads
 mkdir -p ~/.config/gws
-mv "$(ls -t "$INSTANCE_DOWNLOADS"/client_secret_*.apps.googleusercontent.com.json | head -n 1)" ~/.config/gws/client_secret.json
+mv "<path>" ~/.config/gws/client_secret.json
 ```
 
-The glob picks up the most recent download in case earlier credential files from a prior attempt are still in the dir. After moving, verify:
+If `mv` succeeds, continue to Step 3.
+
+If `mv` fails with `EACCES` / `Operation not permitted` / a sandbox error, tell the user:
+
+> macOS sandboxing blocks me from reading `~/Downloads/` directly. Please drag the JSON file from `~/Downloads/` to `~/.config/gws/client_secret.json` in Finder, then reply **"done"**. (This is a one-time step — future Workspace operations don't need to touch `~/Downloads`.)
+
+Wait for the user to confirm. Verify:
 
 ```bash
 ls -la ~/.config/gws/client_secret.json
 ```
 
-If the file is missing (the glob expanded to nothing), the user may be on an older Gini build that didn't route downloads to the instance dir — fall back to `~/Downloads/client_secret_*.apps.googleusercontent.com.json` and tell the user once that they're on an older runtime.
+Continue to Step 3.
 
-#### Cleanup — close the browser
+### 2B. Browser-only setup (emergency fallback)
 
-The browser-driven portion of 2A is complete. Call `browser_close {}` to tear down the browser session. The user's signed-in cookies stay on disk for any future `browser_connect`.
+This path runs only when the `gcloud` install in Step 2 **itself fails** — e.g. Homebrew is not installed, the user's machine has no network for the install, or the install completes but `gcloud --version` still doesn't resolve. The expected setup path is Step 2A; Step 2B is a last resort. Everything happens through the `browser_*` tools driving a Gini-managed Chrome.
 
-Jump to Step 3.
-
-### 2B. Browser-only setup (fallback)
-
-This path runs when `gcloud` is not installed and the user declined to install it. Everything happens through the `browser_*` tools driving Cloud Console.
-
-The Cloud Console is fiddly enough that this skill drives it through the `browser_*` tools instead of asking the user to click through six pages by hand. The flow is broken into named milestones; **pause after each milestone and summarize what just happened** in chat so the user can interrupt if anything looks off.
+The Cloud Console is fiddly enough that this skill drives it through the `browser_*` tools instead of asking the user to click through six pages by hand. The flow is broken into named milestones; pause after each milestone in case the user wants to interrupt.
 
 Two rules apply to **every** browser interaction in this section:
 
@@ -394,7 +395,7 @@ To create:
    or, if the toast message wording is different, watch for the project picker to update with the new project name.
 6. Snapshot. Open the project picker again and select the newly created project. The URL should update to include `?project=<project-id>` once the switch is complete.
 
-Summarize the milestone to the user: "Project `<name>` is selected. Moving on to enable the Workspace APIs."
+If anything in the project-creation steps required user attention (e.g. a name collision they had to resolve), surface it. Otherwise stay quiet and continue.
 
 #### Milestone C — Enable Workspace APIs
 
@@ -428,7 +429,7 @@ APIs to enable, in order:
 5. Google Forms API
 6. Google Meet API
 
-After all six are enabled, summarize: "Enabled Gmail, Calendar, Drive, Docs, Forms, and Meet APIs. Moving on to the OAuth consent screen."
+After all six are enabled, continue to the next milestone without an explicit roll-call in chat.
 
 #### Milestone D — Configure the OAuth consent screen
 
@@ -453,7 +454,7 @@ On the Test users step, click **Add users**, type the user's own email, click **
 
 Skip the Verification step (the "Back to Dashboard" button at the bottom).
 
-Summarize: "OAuth consent screen configured with your email as the test user. Moving on to create the Desktop client."
+Continue to the next milestone without re-stating what was just configured.
 
 #### Milestone E — Create the OAuth Desktop client
 
