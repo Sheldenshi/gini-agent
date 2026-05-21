@@ -2371,12 +2371,48 @@ export async function applyMigration(
   }
 
   // 4) Agents. Skip if an agent with the same name already exists so
-  // re-running the migrator is idempotent.
+  // re-running the migrator is idempotent. Track collisions with
+  // PRE-EXISTING agents (native to the operator's gini setup OR
+  // surviving from an earlier migration) so the session and memory
+  // attach steps know to refuse polluting that agent's history with
+  // openclaw transcripts. `--force` lets the operator opt in to the
+  // merge — common for re-imports where the existing agent was
+  // created by a prior migration; dangerous when it's a native
+  // agent whose history would be silently mixed with openclaw data.
+  const collidedAgentNames = new Set<string>();
   await guardedMutate((state: RuntimeState) => {
     for (const step of plan.steps) {
       if (step.kind !== "agent") continue;
-      if (state.agents.some((existing) => existing.name === step.name)) {
-        warnings.push(`Skipped existing agent: ${step.name}`);
+      const existing = state.agents.find((agent) => agent.name === step.name);
+      if (existing) {
+        // Determine whether the pre-existing agent was created by an
+        // earlier run of THIS migrator (re-import is idempotent —
+        // sessions/memory dedupe by openclawSessionId/openclawUnitId)
+        // or by a native gini path (refuse to merge openclaw data
+        // into the operator's pre-existing history without an
+        // explicit --force opt-in). We tag every migrator-created
+        // agent with an `openclaw.agent.tagged` audit row carrying
+        // the openclawAgentId; the check below intersects.
+        const isPriorMigration = state.audit.some(
+          (entry) =>
+            entry.action === "openclaw.agent.tagged" &&
+            entry.target === existing.id &&
+            (entry.evidence as { openclawAgentId?: string } | undefined)?.openclawAgentId ===
+              step.openclawId
+        );
+        if (isPriorMigration || options.force) {
+          if (!isPriorMigration) {
+            warnings.push(
+              `Existing agent '${step.name}' kept; openclaw sessions and memory will attach to it (--force).`
+            );
+          }
+        } else {
+          collidedAgentNames.add(step.name);
+          plan.unsupported.push({
+            kind: `agent:${step.name}:name-collision`,
+            detail: `Gini already has an agent named '${step.name}'. The migrator refuses to attach openclaw sessions and memory to a pre-existing agent because a native gini agent's history would be silently polluted with openclaw transcripts. Either rename the existing agent (\`gini agents rename ${step.name} <new>\`) and re-migrate, or run with \`--force\` to acknowledge the merge.`
+          });
+        }
         continue;
       }
       const giniProvider = step.providerName ? mapProviderToGini(step.providerName) : null;
@@ -2393,7 +2429,7 @@ export async function applyMigration(
           `Agent '${step.name}' used openclaw provider '${step.providerName}'; gini has no native mapping so the migrated agent will fall back to the instance-level provider.`
         );
       }
-      createAgentRecord(state, {
+      const created = createAgentRecord(state, {
         name: step.name,
         providerName: giniProvider ?? undefined,
         // Drop model when no provider resolved — `resolveEffectiveContext`
@@ -2414,6 +2450,23 @@ export async function applyMigration(
         toolsets: [...DEFAULT_AGENT_TOOLSETS],
         messagingTargets: []
       });
+      // Persist the openclaw provenance via a follow-up audit row so
+      // a re-run of the migrator can recognize this agent as one it
+      // created (vs a native gini agent the operator pre-configured)
+      // and avoid prompting for --force on the idempotent re-import
+      // path. AgentRecord has no metadata field; the audit log is the
+      // durable place to hang this without a type change.
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "openclaw.agent.tagged",
+          target: created.id,
+          risk: "low",
+          evidence: { openclawAgentId: step.openclawId, source: "openclaw-migration" }
+        },
+        { agentId: created.id }
+      );
       agentsCreated += 1;
     }
   });
@@ -2671,6 +2724,13 @@ export async function applyMigration(
   }
   for (const step of plan.steps) {
     if (step.kind !== "session") continue;
+    if (collidedAgentNames.has(step.openclawId)) {
+      // The owning openclaw agent name collides with a pre-existing
+      // gini agent. The agent step already emitted the operator-
+      // facing unsupported entry; skip silently so we don't fill
+      // warnings with N copies of the same name-collision message.
+      continue;
+    }
     if (existingSessionIds.has(step.sessionId)) {
       warnings.push(
         `Skipped openclaw session ${step.sessionId}: already imported (matching gini ChatSessionRecord found).`
@@ -2798,6 +2858,15 @@ export async function applyMigration(
     // warnings.
     const warnedOrphanBanks = new Set<string>();
     for (const step of memorySteps) {
+      if (collidedAgentNames.has(step.sourceBank)) {
+        // The Hindsight bank name (e.g. "main") matches a pre-
+        // existing gini agent. Mixing openclaw memory into a
+        // native agent's bank silently pollutes recall — the
+        // agent step emitted the operator-facing collision entry;
+        // skip silently here so we don't fill warnings with N
+        // copies of the same name-collision message.
+        continue;
+      }
       if (existingOpenclawIds.has(step.openclawId)) {
         // Re-apply against the same Hindsight source — already imported.
         continue;
@@ -2967,6 +3036,21 @@ export async function recordOpenclawPlanFailure(
   const running = detectRunningGateway(config.instance);
   if (running) return null;
   const errorMessage = error instanceof Error ? error.message : String(error);
+  // Acquire the cross-process import lock. Without it, two CLI
+  // invocations targeting the same instance — one in
+  // `applyMigration` (under the lock) and one here after a plan
+  // throw — would race on the shared `<state>.tmp` filename and
+  // corrupt or lose updates. `mutateState` only serializes in-
+  // process; the import lock is the only guard between separate
+  // OS processes. If the lock is already held by a peer (concurrent
+  // `gini import apply`), return null rather than blocking — the
+  // peer will write its own report when it finishes.
+  let importLock;
+  try {
+    importLock = acquireImportLock(config.instance);
+  } catch {
+    return null;
+  }
   try {
     return await mutateState(config.instance, (state: RuntimeState) =>
       createImportReport(state, {
@@ -2981,6 +3065,8 @@ export async function recordOpenclawPlanFailure(
     );
   } catch {
     return null;
+  } finally {
+    importLock.release();
   }
 }
 

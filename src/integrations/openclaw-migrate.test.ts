@@ -1214,6 +1214,127 @@ describe("planMigration", () => {
     expect(ref?.detail).toContain("OPENAI_API_KEY");
   });
 
+  test("refuses to attach openclaw sessions and memory to a pre-existing gini agent without --force", async () => {
+    // A native gini agent named "main" already exists. Openclaw's
+    // implicit "main" agent should NOT silently merge its
+    // sessions and memory into the operator's pre-existing one —
+    // the operator's history would be polluted with openclaw
+    // transcripts and memory units. Surface the collision so the
+    // operator either renames their native agent or passes --force.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "session-1", [
+      { role: "user", text: "from openclaw", timestamp: "2026-01-01T00:00:00.000Z" }
+    ]);
+    const config = loadConfig("agent-name-collision");
+    // Plant a native gini agent with the colliding name before
+    // running the migration.
+    mutateState(config.instance, (state) => {
+      state.agents.unshift({
+        id: "agent_native",
+        instance: config.instance,
+        name: "main",
+        status: "active",
+        toolsets: [],
+        messagingTargets: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+    // The fixture has agents.list = [main, work]. `main` collides
+    // with the native agent and is refused; `work` has no collision
+    // and is created normally.
+    expect(result.agentsCreated).toBe(1);
+    expect(
+      readState(config.instance).agents.some((agent) => agent.name === "work")
+    ).toBe(true);
+    // The collision shows up on the unsupported list with a
+    // remediation pointing at rename or --force.
+    const collision = result.unsupported.find(
+      (entry) => entry.kind === "agent:main:name-collision"
+    );
+    expect(collision).toBeDefined();
+    expect(collision?.detail).toContain("--force");
+    expect(collision?.detail).toContain("rename");
+    // The openclaw session belongs to 'main' (writeOpenclawSessionJsonl
+    // wrote it under agents/main/). It must NOT attach to the native
+    // 'main' agent. Without this refusal the session would land on
+    // agent_native and pollute the operator's history.
+    expect(result.sessionsCreated).toBe(0);
+    expect(readState(config.instance).chatSessions).toHaveLength(0);
+  });
+
+  test("--force acknowledges agent-name collision and merges openclaw sessions into the pre-existing agent", async () => {
+    // Operator who knows the collision is intentional (e.g. re-
+    // running migration after a previous successful import created
+    // the agent) can pass --force to skip the refusal. Sessions
+    // and memory then attach to the pre-existing agent.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true });
+    writeOpenclawSessionJsonl(OPENCLAW_ROOT, "main", "session-1", [
+      { role: "user", text: "from openclaw", timestamp: "2026-01-01T00:00:00.000Z" }
+    ]);
+    const config = loadConfig("agent-name-collision-force");
+    mutateState(config.instance, (state) => {
+      state.agents.unshift({
+        id: "agent_existing",
+        instance: config.instance,
+        name: "main",
+        status: "active",
+        toolsets: [],
+        messagingTargets: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      });
+    });
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan, { force: true });
+    // 'main' collision is acknowledged via --force; 'work' is created normally.
+    expect(result.agentsCreated).toBe(1);
+    expect(
+      result.unsupported.some((entry) => entry.kind === "agent:main:name-collision")
+    ).toBe(false);
+    // Session attaches to the pre-existing agent.
+    expect(result.sessionsCreated).toBe(1);
+    const state = readState(config.instance);
+    const session = state.chatSessions[0];
+    expect(session?.agentId).toBe("agent_existing");
+  });
+
+  test("recordOpenclawPlanFailure refuses to write while another import holds the lock", async () => {
+    // mutateState only serializes inside a single Node process —
+    // two CLI invocations on the same instance can corrupt state
+    // by racing on <state>.tmp. applyMigration uses the .import-lock
+    // for cross-process serialization; the plan-failure helper has
+    // to honor the same lock. We simulate a peer apply by planting
+    // a held lock file, then assert the helper returns null
+    // instead of competing for the same writeState slot.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: false });
+    const config = loadConfig("plan-fail-lock-defense");
+    const lockPath = join(GINI_STATE, "instances", "plan-fail-lock-defense", ".import-lock");
+    mkdirSync(join(GINI_STATE, "instances", "plan-fail-lock-defense"), { recursive: true });
+    // Plant a foreign lock with our own pid (so the stale-detection
+    // sees the holder as alive). The fresh acquisition attempt
+    // inside the helper hits EEXIST and bails because the peer
+    // pid is alive.
+    writeFileSync(
+      lockPath,
+      `pid=${process.pid}\ntoken=foreign-token\nat=2026-01-01T00:00:00.000Z\n`,
+      { mode: 0o600 }
+    );
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const synthetic = new Error("openclaw.json: malformed");
+    const report = await recordOpenclawPlanFailure(config, discovery, synthetic);
+    expect(report).toBeNull();
+    // Lock file still belongs to the peer — the helper did not
+    // delete it on its way out.
+    expect(existsSync(lockPath)).toBe(true);
+    expect(readFileSync(lockPath, "utf8")).toContain("token=foreign-token");
+    rmSync(lockPath, { force: true });
+  });
+
   test("orphan-bank remediation message tells operator to update bank_id too", async () => {
     // /api/memory/recall filters by both bank_id AND agent_id. The
     // migrator routes orphan memory (no matching agent) into the
