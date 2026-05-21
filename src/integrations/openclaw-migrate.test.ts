@@ -544,6 +544,15 @@ describe("applyMigration", () => {
     // Import report should land in state.
     expect(result.report.mode).toBe("applied");
     expect(result.report.status).toBe("completed");
+
+    // Audit row must announce a state-mutating apply, not a read-only
+    // inspection (per ADR openclaw-migration.md and connector-secret-storage.md
+    // the audit trail is the only post-hoc record of what was written).
+    const importAudit = state.audit.find(
+      (entry) => entry.target === result.report.id
+    );
+    expect(importAudit?.action).toBe("import.applied");
+    expect(importAudit?.evidence?.mode).toBe("applied");
   });
 
   test("is idempotent — second apply skips existing agents and bridges", async () => {

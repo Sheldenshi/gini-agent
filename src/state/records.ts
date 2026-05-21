@@ -834,15 +834,22 @@ export function createImportReport(
     ...report
   };
   state.importReports.unshift(item);
-  // Imports inspect external state files at the instance level.
+  // Audit action mirrors the report mode so a state-mutating apply
+  // doesn't pretend to be a read-only inspection in the activity feed.
   addAudit(
     state,
     {
       actor: "user",
-      action: "import.inspected",
+      action: item.mode === "applied" ? "import.applied" : "import.inspected",
       target: item.id,
-      risk: "low",
-      evidence: { source: item.source, path: item.path, counts: item.counts }
+      risk: item.mode === "applied" ? "medium" : "low",
+      evidence: {
+        source: item.source,
+        path: item.path,
+        mode: item.mode,
+        status: item.status,
+        counts: item.counts
+      }
     },
     { system: true }
   );
