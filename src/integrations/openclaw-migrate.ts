@@ -109,6 +109,11 @@ interface OpenclawAgentConfig {
   default?: boolean;
   model?: OpenclawAgentModelConfig;
   workspace?: string;
+  // Per-agent override pointing at the agent secrets directory
+  // (defaults to `<state>/agents/<id>/agent/`). Operators commonly
+  // hand-edit this for multi-instance / portable-secrets setups; the
+  // migrator must honor it so auth-profiles.json is found.
+  agentDir?: string;
 }
 
 interface OpenclawChannelConfig {
@@ -219,10 +224,17 @@ export function discoverOpenclawState(pathArg?: string): OpenclawDiscovery {
     const candidates = [join(home, ".openclaw"), join(home, ".clawdbot")];
     stateRoot = candidates.find((candidate) => existsSync(candidate)) ?? candidates[0]!;
   }
-  const configCandidates = [
-    join(stateRoot, "openclaw.json"),
-    join(stateRoot, "clawdbot.json")
-  ];
+  // Honor the OPENCLAW_CONFIG_PATH env var openclaw uses to relocate
+  // openclaw.json outside the state root (a documented part of its
+  // resolution hierarchy). Without this, an operator with the env set
+  // would see "No openclaw config found" and the migrator would short-
+  // circuit. The override only applies when no explicit pathArg was
+  // supplied — pathArg is the more specific operator gesture.
+  const configOverride = pathArg ? undefined : process.env.OPENCLAW_CONFIG_PATH;
+  const configCandidates: string[] = [];
+  if (configOverride) configCandidates.push(resolve(configOverride));
+  configCandidates.push(join(stateRoot, "openclaw.json"));
+  configCandidates.push(join(stateRoot, "clawdbot.json"));
   const configPath = configCandidates.find((candidate) => existsSync(candidate)) ?? null;
   // The default workspace dir lives INSIDE the state root by convention
   // (`<state>/workspace/`). Honor `OPENCLAW_WORKSPACE_DIR` and
@@ -534,6 +546,25 @@ function describeSecretRef(ref: OpenclawSecretRefLike): string {
   return "unknown SecretRef shape";
 }
 
+// Resolve where to look for an agent's auth-profiles.json. Defaults to
+// `<agentsDir>/<id>/agent/`. Honors `agents.list[].agentDir` as an
+// operator override, including the common `~/.openclaw/...` tilde form
+// (openclaw accepts the literal `~` in agentDir). A missing or
+// non-string override falls back to the default — same behavior the
+// pre-extraction inline code had.
+function resolveAgentDirOverride(
+  agent: OpenclawAgentConfig,
+  agentsDir: string,
+  openclawId: string
+): string {
+  const override = agent.agentDir;
+  if (typeof override === "string" && override.length > 0) {
+    const home = process.env.OPENCLAW_HOME || process.env.HOME || homedir();
+    return override.replace(/^~(?=\/|$)/, home);
+  }
+  return join(agentsDir, openclawId, "agent");
+}
+
 // Openclaw's own agent-id validator (`normalizeAgentId` at
 // src/routing/session-key.ts upstream) accepts `[a-z0-9][a-z0-9_-]{0,63}`
 // case-insensitively. We mirror that here and additionally allow `.` so
@@ -655,6 +686,11 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
   // Agents
   const agentList = config.agents?.list ?? [];
   const agentIds: string[] = [];
+  // Map each retained agent id to the directory we should look for
+  // auth-profiles.json under. Operators can override per-agent via
+  // `agents.list[].agentDir` (commonly `~` or `~/.openclaw/secrets/<id>/...`),
+  // so the default `<state>/agents/<id>/agent/` is just a fallback.
+  const agentDirs = new Map<string, string>();
   // Openclaw stores provider+model together as a "provider/model" string
   // (e.g. "openai/gpt-5", "anthropic/claude-3-5-sonnet"). The `primary`
   // slot of `AgentModelConfig` carries the same shape. Gini's
@@ -689,6 +725,7 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
       model: defaultRouting.model
     });
     agentIds.push("main");
+    agentDirs.set("main", join(source.agentsDir, "main", "agent"));
   } else {
     for (const agent of agentList) {
       const openclawId = (agent.id ?? "").trim();
@@ -720,13 +757,17 @@ export function planMigration(source: OpenclawDiscovery): MigrationPlan {
         model: routing.model ?? defaultRouting.model
       });
       agentIds.push(openclawId);
+      agentDirs.set(openclawId, resolveAgentDirOverride(agent, source.agentsDir, openclawId));
     }
   }
 
   // Provider API keys (per agent auth-profiles.json)
   const seenSecretEnv = new Set<string>();
   for (const agentId of agentIds) {
-    const authPath = join(source.agentsDir, agentId, "agent", "auth-profiles.json");
+    const authPath = join(
+      agentDirs.get(agentId) ?? join(source.agentsDir, agentId, "agent"),
+      "auth-profiles.json"
+    );
     if (!existsSync(authPath)) continue;
     let parsed: AuthProfileFile;
     try {

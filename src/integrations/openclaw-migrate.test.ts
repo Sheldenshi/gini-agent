@@ -27,38 +27,44 @@ const OPENCLAW_ROOT = `${ROOT}/openclaw-state`;
 // Capture pre-test env so we can restore it. Bun runs all test files in
 // one process, so leaving HOME/GINI_STATE_ROOT/etc. pointing at our
 // /tmp paths would poison any subsequent test (or any homedir() consumer)
-// that runs after this file.
-const ORIGINAL_HOME = process.env.HOME;
-const ORIGINAL_STATE_ROOT = process.env.GINI_STATE_ROOT;
-const ORIGINAL_LOG_ROOT = process.env.GINI_LOG_ROOT;
-const ORIGINAL_WORKSPACE = process.env.GINI_WORKSPACE;
-const ORIGINAL_OPENCLAW_HOME = process.env.OPENCLAW_HOME;
+// that runs after this file. Every OPENCLAW_* var the migrator reads
+// is included so tests can't inherit them from the developer's shell
+// (or leak them between describe blocks within the same file).
+const SAVED_ENV: Record<string, string | undefined> = {};
+const TRACKED_ENV = [
+  "HOME",
+  "GINI_STATE_ROOT",
+  "GINI_LOG_ROOT",
+  "GINI_WORKSPACE",
+  "OPENCLAW_HOME",
+  "OPENCLAW_STATE_DIR",
+  "OPENCLAW_WORKSPACE_DIR",
+  "OPENCLAW_PROFILE",
+  "OPENCLAW_CONFIG_PATH"
+] as const;
 
 beforeAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
   mkdirSync(ROOT, { recursive: true });
   mkdirSync(GINI_HOME, { recursive: true });
+  for (const name of TRACKED_ENV) SAVED_ENV[name] = process.env[name];
   process.env.GINI_STATE_ROOT = GINI_STATE;
   process.env.GINI_LOG_ROOT = `${ROOT}/logs`;
   process.env.HOME = GINI_HOME;
-  // GINI_WORKSPACE leaks the developer's real workspace path into
-  // workspaceDir() if inherited; clear it so apply tests write into the
-  // sandbox instance's workspace rather than the real one.
+  // Clear every OPENCLAW_* override and GINI_WORKSPACE so individual
+  // tests can opt in to specific shapes without inheriting from the
+  // developer's shell or from a prior test.
   delete process.env.GINI_WORKSPACE;
-  // OPENCLAW_HOME takes precedence over HOME inside
-  // discoverOpenclawState; a developer with it set in their shell
-  // would see the discovery tests resolve to a different path than
-  // the test author intended. Clear it before any test runs.
   delete process.env.OPENCLAW_HOME;
+  delete process.env.OPENCLAW_STATE_DIR;
+  delete process.env.OPENCLAW_WORKSPACE_DIR;
+  delete process.env.OPENCLAW_PROFILE;
+  delete process.env.OPENCLAW_CONFIG_PATH;
 });
 
 afterAll(() => {
   rmSync(ROOT, { recursive: true, force: true });
-  restoreEnv("HOME", ORIGINAL_HOME);
-  restoreEnv("GINI_STATE_ROOT", ORIGINAL_STATE_ROOT);
-  restoreEnv("GINI_LOG_ROOT", ORIGINAL_LOG_ROOT);
-  restoreEnv("GINI_WORKSPACE", ORIGINAL_WORKSPACE);
-  restoreEnv("OPENCLAW_HOME", ORIGINAL_OPENCLAW_HOME);
+  for (const name of TRACKED_ENV) restoreEnv(name, SAVED_ENV[name]);
 });
 
 function restoreEnv(name: string, previous: string | undefined): void {
@@ -563,26 +569,27 @@ describe("rewriteSkillFrontmatter", () => {
 
 describe("discoverOpenclawState", () => {
   const saved: Record<string, string | undefined> = {};
+  const PER_TEST_ENV = [
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_WORKSPACE_DIR",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_CONFIG_PATH"
+  ] as const;
 
   beforeEach(() => {
-    // Snapshot the three openclaw-side env vars before this describe
-    // block clears them, then restore on teardown. Without the
-    // afterEach, a developer with any of these set in their shell
-    // would have them stripped permanently for the remainder of the
-    // bun test invocation, affecting any later test file in the same
-    // process.
-    saved.OPENCLAW_STATE_DIR = process.env.OPENCLAW_STATE_DIR;
-    saved.OPENCLAW_WORKSPACE_DIR = process.env.OPENCLAW_WORKSPACE_DIR;
-    saved.OPENCLAW_PROFILE = process.env.OPENCLAW_PROFILE;
-    delete process.env.OPENCLAW_STATE_DIR;
-    delete process.env.OPENCLAW_WORKSPACE_DIR;
-    delete process.env.OPENCLAW_PROFILE;
+    // Snapshot every openclaw-side env var before this describe block
+    // mutates them, then restore on teardown. Without the afterEach,
+    // a test that intentionally sets one (e.g. the
+    // OPENCLAW_CONFIG_PATH coverage test) would leak the value into
+    // every later test in this file or the bun test process.
+    for (const name of PER_TEST_ENV) {
+      saved[name] = process.env[name];
+      delete process.env[name];
+    }
   });
 
   afterEach(() => {
-    restoreEnv("OPENCLAW_STATE_DIR", saved.OPENCLAW_STATE_DIR);
-    restoreEnv("OPENCLAW_WORKSPACE_DIR", saved.OPENCLAW_WORKSPACE_DIR);
-    restoreEnv("OPENCLAW_PROFILE", saved.OPENCLAW_PROFILE);
+    for (const name of PER_TEST_ENV) restoreEnv(name, saved[name]);
   });
 
   test("honors an explicit path argument", () => {
@@ -590,6 +597,24 @@ describe("discoverOpenclawState", () => {
     const discovery = discoverOpenclawState(OPENCLAW_ROOT);
     expect(discovery.stateRoot).toBe(OPENCLAW_ROOT);
     expect(discovery.configPath).toBe(join(OPENCLAW_ROOT, "openclaw.json"));
+  });
+
+  test("honors OPENCLAW_CONFIG_PATH for the config file location", () => {
+    // Openclaw's documented env hierarchy includes OPENCLAW_CONFIG_PATH
+    // for relocating openclaw.json outside the state root. Without
+    // honoring it, multi-instance or portable-config setups see "no
+    // openclaw config found" and the migrator no-ops.
+    const stateOnly = `${ROOT}/state-no-config`;
+    const externalConfig = `${ROOT}/external/openclaw.json`;
+    rmSync(stateOnly, { recursive: true, force: true });
+    rmSync(`${ROOT}/external`, { recursive: true, force: true });
+    mkdirSync(stateOnly, { recursive: true });
+    mkdirSync(`${ROOT}/external`, { recursive: true });
+    writeFileSync(externalConfig, JSON.stringify({ agents: { list: [{ id: "main" }] } }));
+    process.env.OPENCLAW_CONFIG_PATH = externalConfig;
+    process.env.OPENCLAW_STATE_DIR = stateOnly;
+    const discovery = discoverOpenclawState();
+    expect(discovery.configPath).toBe(externalConfig);
   });
 
   test("honors OPENCLAW_STATE_DIR env", () => {
@@ -648,6 +673,46 @@ describe("planMigration", () => {
       expect(agent.providerName).toBe("openai");
       expect(agent.model).toBe("gpt-5.4-mini");
     }
+  });
+
+  test("honors agents.list[].agentDir for auth-profiles.json resolution", () => {
+    // Openclaw lets operators relocate per-agent secret dirs via
+    // agents.list[].agentDir. Without this override, the migrator
+    // hard-codes <state>/agents/<id>/agent/ and silently misses every
+    // API key for installs using the override.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    const overrideDir = `${ROOT}/external-agent-secrets`;
+    rmSync(overrideDir, { recursive: true, force: true });
+    mkdirSync(overrideDir, { recursive: true });
+    writeFileSync(
+      join(overrideDir, "auth-profiles.json"),
+      JSON.stringify({
+        version: 1,
+        profiles: {
+          "openai-default": {
+            type: "api_key",
+            provider: "openai",
+            key: "sk-from-override-dir"
+          }
+        }
+      })
+    );
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: {
+          list: [{ id: "main", default: true, agentDir: overrideDir }]
+        }
+      })
+    );
+    const plan = planMigration(discoverOpenclawState(OPENCLAW_ROOT));
+    const secret = plan.steps.find((step) => step.kind === "secret") as {
+      envVar: string;
+      valueFrom: string;
+    } | undefined;
+    expect(secret?.envVar).toBe("OPENAI_API_KEY");
+    expect(secret?.valueFrom).toBe("sk-from-override-dir");
   });
 
   test("rejects path-traversal agent ids before reading auth-profiles.json", () => {
