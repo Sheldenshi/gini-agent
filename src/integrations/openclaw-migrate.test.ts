@@ -777,6 +777,33 @@ describe("applyMigration", () => {
     expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
   });
 
+  test("rejects malformed bot tokens before they reach the encrypted store", async () => {
+    // A token containing a control character would otherwise be
+    // persisted and leak via bridge.message after the first failed
+    // fetch echoes the full Authorization header. Migration must run
+    // the same header-safe gate the POST /api/messaging path uses.
+    rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
+    mkdirSync(OPENCLAW_ROOT, { recursive: true });
+    writeFileSync(
+      join(OPENCLAW_ROOT, "openclaw.json"),
+      JSON.stringify({
+        agents: { list: [{ id: "main", default: true }] },
+        channels: { telegram: { dmPolicy: "pairing" } },
+        env: { vars: { TELEGRAM_BOT_TOKEN: "bad\ntoken-with-newline" } }
+      })
+    );
+    const config = loadConfig("malformed-token");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+    const result = await applyMigration(config, discovery, plan);
+    expect(result.bridgesCreated).toBe(0);
+    expect(result.warnings.some((warning) =>
+      warning.includes("telegram") && warning.includes("invalid characters")
+    )).toBe(true);
+    const state = readState("malformed-token");
+    expect(state.messagingBridges.some((bridge) => bridge.kind === "telegram")).toBe(false);
+  });
+
   test("skips telegram channel with no token and records the gap", async () => {
     rmSync(OPENCLAW_ROOT, { recursive: true, force: true });
     mkdirSync(OPENCLAW_ROOT, { recursive: true });

@@ -80,6 +80,7 @@ import {
 import { writeSecret } from "../state/secrets";
 import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { skillsDir } from "../paths";
+import { assertHeaderSafeToken } from "./messaging";
 
 // --- Public types ---
 
@@ -858,6 +859,21 @@ export async function applyMigration(
   // underlying file but doesn't fork the bridge.
   for (const step of plan.steps) {
     if (step.kind !== "bridge") continue;
+    // Validate the bot token before it ever reaches the encrypted
+    // store. The same gate runs in the live POST /api/messaging path —
+    // skipping it here would let a token containing a newline or
+    // control character flow through to the poller's first fetch,
+    // which would then echo the full Authorization header value into
+    // bridge.message and leak via GET /api/messaging. Capture the
+    // failure as a warning + unsupported entry so the rest of the
+    // migration keeps making progress.
+    try {
+      assertHeaderSafeToken(step.bridgeKind, step.tokenValue);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      warnings.push(`Skipped ${step.bridgeKind} bridge: ${message}`);
+      continue;
+    }
     // First pass: decide whether we are creating or rotating. We only
     // need the bridge id (and existence flag) out of state here; we
     // intentionally do NOT keep a reference to the bridge object,

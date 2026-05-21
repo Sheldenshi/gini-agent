@@ -45,7 +45,7 @@ function bridgeSecretNamespace(bridgeId: string): string {
 // `GET /api/messaging`. Rejecting at create time stops the leak at
 // the source.
 const HEADER_SAFE_TOKEN = /^[\x21-\x7E]+$/;
-function assertHeaderSafeToken(kind: string, raw: string): void {
+export function assertHeaderSafeToken(kind: string, raw: string): void {
   if (!HEADER_SAFE_TOKEN.test(raw)) {
     throw new Error(
       `${kind === "telegram" ? "Telegram" : "Discord"} bot token contains invalid characters — header-safe printable ASCII only.`
