@@ -250,11 +250,15 @@ export function discoverOpenclawState(pathArg?: string): OpenclawDiscovery {
 
 // --- Config parsing (JSON5/JSONC tolerant) ---
 
-// Openclaw config files are documented as JSON or JSON5. We accept both
-// without pulling in a JSON5 dependency: try strict JSON first, and on
-// failure strip line/block comments and trailing commas before retrying.
-// Anything that survives that round-trip should land cleanly; anything
-// that doesn't is a real syntax error we surface to the caller.
+// Openclaw config files in the wild are strict JSON, occasionally with
+// JSONC-style line/block comments and trailing commas from hand-edits.
+// We accept that subset without pulling in a full JSON5 dependency:
+// try strict JSON first, and on failure run a single-pass string-aware
+// scanner that elides comments and stray trailing commas BEFORE the
+// closing bracket of an object or array. Unquoted keys, single-quoted
+// strings, and other JSON5-isms are not supported; anything that
+// survives that round-trip parses cleanly, and anything that doesn't
+// surfaces as a real syntax error.
 export function parseOpenclawJson(raw: string): OpenclawConfig {
   try {
     return JSON.parse(raw) as OpenclawConfig;
@@ -301,10 +305,27 @@ function stripCommentsAndTrailingCommas(input: string): string {
       i += 2;
       continue;
     }
+    // Trailing-comma elision: when we're outside any string literal,
+    // a comma followed by optional whitespace and a closing brace or
+    // bracket gets dropped. Doing this here (inside the string-aware
+    // pass) prevents a post-hoc regex from accidentally stripping
+    // commas inside string contents like `"hello, world"` — the
+    // previous /,(\s*[}\]])/g cleanup did exactly that and silently
+    // mangled user data.
+    if (c === ",") {
+      let j = i + 1;
+      while (j < input.length && /\s/.test(input[j]!)) j += 1;
+      const closer = j < input.length ? input[j] : undefined;
+      if (closer === "}" || closer === "]") {
+        // Skip the comma; keep the whitespace + closer untouched.
+        i += 1;
+        continue;
+      }
+    }
     out += c;
     i += 1;
   }
-  return out.replace(/,(\s*[}\]])/g, "$1");
+  return out;
 }
 
 // --- State-dir dotenv ---

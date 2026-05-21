@@ -203,6 +203,21 @@ describe("parseOpenclawJson", () => {
     });
   });
 
+  test("does not strip commas that appear inside string literals before braces", () => {
+    // The previous post-hoc regex /,(\s*[}\]])/g ran over the whole
+    // input without string awareness, so a value containing `, }` or
+    // `, ]` got the comma silently deleted. Verify the string-aware
+    // pass preserves user data verbatim.
+    const inputs = [
+      { raw: `{"text": "hello, }world", "x": 1, }`, expected: { text: "hello, }world", x: 1 } },
+      { raw: `{"text": "trailing, ]bracket", "items": [1, 2]}`, expected: { text: "trailing, ]bracket", items: [1, 2] } },
+      { raw: `{"a": "one,    }two"   }`, expected: { a: "one,    }two" } }
+    ];
+    for (const { raw, expected } of inputs) {
+      expect(parseOpenclawJson(raw)).toEqual(expected);
+    }
+  });
+
   test("throws on irrecoverable syntax errors", () => {
     expect(() => parseOpenclawJson("not json at all")).toThrow();
   });
