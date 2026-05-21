@@ -31,12 +31,12 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
         │ token server-side only            │ paired-device token               │ bearer token
         │                                   │                                   │
 ┌───────┴───────┐                  ┌────────┴────────┐                  ┌───────┴────────┐
-│   Next.js     │                  │  Future mobile  │                  │   CLI          │
+│   Next.js     │                  │  Expo mobile    │                  │   CLI          │
 │   BFF + UI    │                  │  app            │                  │   scripts      │
 │               │                  │                 │                  │   MCP clients  │
-│   one per     │                  │  pairs once,    │                  │                │
-│   instance    │                  │  stores token   │                  │  direct API    │
-│   localhost   │                  │  securely       │                  │  client        │
+│   one per     │                  │  user pastes    │                  │                │
+│   instance    │                  │  URL + token,   │                  │  direct API    │
+│   localhost   │                  │  AsyncStorage   │                  │  client        │
 └───────┬───────┘                  └─────────────────┘                  └────────────────┘
         │
         │ HTML / JS / SSE
@@ -122,9 +122,10 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 
 ## Not Yet Built
 
-- Native/mobile app UI.
 - Production relay for off-LAN access.
 - Push notification delivery.
 - LaunchAgent-style auto-start.
+
+A basic Expo mobile client lives under `mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.
 
 Those should build on the existing gateway contract rather than changing the runtime/source-of-truth model.

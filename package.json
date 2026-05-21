@@ -15,7 +15,10 @@
     "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit",
     "web:dev": "cd web && bun run dev",
     "web:build": "cd web && bun run build",
-    "web:start": "cd web && bun run start"
+    "web:start": "cd web && bun run start",
+    "mobile": "cd mobile && bun run start",
+    "mobile:ios": "cd mobile && bun run ios",
+    "mobile:android": "cd mobile && bun run android"
   },
   "devDependencies": {
     "@types/bun": "latest",
