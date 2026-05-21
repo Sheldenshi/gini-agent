@@ -2120,21 +2120,55 @@ export async function applyMigration(
         `Discord bridge migrated without deliveryTargets; supervisor will stay idle until you wire channels. Run \`gini messaging disable <bridge-id>\` then \`gini messaging add <name> discord <channel-id>... --bot-token <token>\` to re-create the bridge with delivery channels, supplying the same bot token openclaw used.`
       );
     }
-    // First pass: decide whether we are creating or rotating. We only
-    // need the bridge id (and existence flag) out of state here; we
-    // intentionally do NOT keep a reference to the bridge object,
-    // because the second mutateState below re-reads state from disk and
-    // returns a different object graph. Mutating an object reference
-    // from the first call would land on a stale snapshot that gets
-    // discarded before the next write, so the rotation appears to
-    // succeed (no error) while the metadata never persists.
+    // First pass: decide whether we are creating or rotating, AND
+    // for the create path, insert the bridge record BEFORE we touch
+    // the encrypted secret store. Mirrors the canonical
+    // `addMessagingBridge` ordering (record first, secret second) so
+    // a crash or gateway-up trip between insert and secret write
+    // leaves a visible bridge with empty `secretRefs` the operator
+    // can clean up via `gini messaging disable`. The previous order
+    // (writeSecret then mutateState insert) could leave an
+    // encrypted file on disk with no record pointing at it — an
+    // orphan that `gini messaging` can't see and the operator has
+    // to grep the secrets dir to find.
+    //
+    // We intentionally do NOT keep a reference to the new bridge
+    // object across the two mutateState calls: the second call
+    // re-reads state from disk and returns a different object
+    // graph. Mutating a captured reference would land on a stale
+    // snapshot that gets discarded before the next write, so the
+    // ref attachment appears to succeed while the metadata never
+    // persists.
     const decision = await guardedMutate((state: RuntimeState) => {
       const found = state.messagingBridges.find(
         (bridge) => bridge.kind === step.bridgeKind
       );
-      return found
-        ? { kind: "existing" as const, id: found.id }
-        : { kind: "new" as const, id: id("bridge") };
+      if (found) {
+        return { kind: "existing" as const, id: found.id };
+      }
+      // Pre-insert the new bridge record with empty `secretRefs`.
+      // The metadata defaults are the same shape we'd use after the
+      // secret write — there's no harm in landing them now since
+      // the bridge can't be polled without a secret anyway (the
+      // supervisors gate on secretRefs.length > 0).
+      const newId = id("bridge");
+      const at = now();
+      const metadata: Record<string, unknown> =
+        step.bridgeKind === "telegram"
+          ? { allowedChatIds: step.allowedChatIds ?? [], lastOffset: 0 }
+          : { lastInboundExternalIds: {} };
+      const item = buildMessagingBridgeRecord(state, {
+        id: newId,
+        name: `${step.bridgeKind} (migrated from openclaw)`,
+        kind: step.bridgeKind,
+        deliveryTargets: [],
+        secretRefs: [],
+        metadata
+      });
+      item.createdAt = at;
+      item.updatedAt = at;
+      state.messagingBridges.unshift(item);
+      return { kind: "new" as const, id: newId };
     });
     if (decision.kind === "existing" && !options.force) {
       warnings.push(
@@ -2157,50 +2191,29 @@ export async function applyMigration(
               lastOffset: 0
             }
           : { lastInboundExternalIds: {} };
-      if (decision.kind === "existing") {
-        // Re-find the bridge inside THIS mutateState call so the mutation
-        // lands on the fresh state graph that writeState will serialize.
-        const target = state.messagingBridges.find(
-          (bridge) => bridge.id === decision.id
-        );
-        if (target) {
-          target.secretRefs = [ref];
-          // Merge telegram allowedChatIds (union, deduplicated) so an
-          // operator who's enrolled extra chats post-migration doesn't
-          // lose them on a token rotation. lastOffset/lastInboundExternalIds
-          // are preserved from the existing metadata so the poller doesn't
-          // replay old updates.
-          target.metadata = mergeBridgeMetadata(target.metadata, metadata, step.bridgeKind);
-          target.status = "configured";
-          target.updatedAt = at;
-        }
-      } else {
-        // Route through the shared field-default builder so the
-        // migrator inherits any new MessagingBridgeRecord defaults
-        // automatically — the hand-rolled literal here used to
-        // duplicate `instance`, `status`, `createdAt`, `updatedAt`,
-        // setting up a drift risk if those defaults ever change.
-        // We still push + audit inline because the migrator needs
-        // to pre-mint `decision.id` (the secret file path
-        // `messaging.<bridgeId>.bot-token.json` depends on it) AND
-        // wants a richer audit row tagged with `source:
-        // openclaw-migration`. `createMessagingBridgeRecord` doesn't
-        // accept a pre-minted id.
-        const item = buildMessagingBridgeRecord(state, {
-          id: decision.id,
-          name: `${step.bridgeKind} (migrated from openclaw)`,
-          kind: step.bridgeKind,
-          deliveryTargets: [],
-          secretRefs: [ref],
-          metadata
-        });
-        // Pin to the at-timestamp the surrounding mutateState
-        // already captured so the audit row's evidence and the
-        // bridge's createdAt match exactly. buildMessagingBridgeRecord
-        // computes its own `now()` which can differ by a millisecond.
-        item.createdAt = at;
-        item.updatedAt = at;
-        state.messagingBridges.unshift(item);
+      // Re-find the bridge inside THIS mutateState call so the mutation
+      // lands on the fresh state graph that writeState will serialize.
+      // For both new and existing bridges, we now just attach the secret
+      // ref + finalize metadata; the record already lives in state.
+      const target = state.messagingBridges.find(
+        (bridge) => bridge.id === decision.id
+      );
+      if (target) {
+        target.secretRefs = [ref];
+        // For existing/rotate: merge telegram allowedChatIds (union,
+        // deduplicated) so an operator who's enrolled extra chats
+        // post-migration doesn't lose them on a token rotation.
+        // lastOffset / lastInboundExternalIds are preserved from the
+        // existing metadata so the poller doesn't replay old updates.
+        // For new: there's no existing metadata to merge with, but
+        // the merge is still safe (the pre-insert step seeded the
+        // canonical defaults).
+        target.metadata =
+          decision.kind === "existing"
+            ? mergeBridgeMetadata(target.metadata, metadata, step.bridgeKind)
+            : metadata;
+        target.status = "configured";
+        target.updatedAt = at;
       }
       addAudit(
         state,
