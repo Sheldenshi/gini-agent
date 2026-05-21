@@ -1257,7 +1257,7 @@ describe("planMigration", () => {
     );
     expect(collision).toBeDefined();
     expect(collision?.detail).toContain("--force");
-    expect(collision?.detail).toContain("rename");
+    expect(collision?.detail).toContain("gini agent delete");
     // The openclaw session belongs to 'main' (writeOpenclawSessionJsonl
     // wrote it under agents/main/). It must NOT attach to the native
     // 'main' agent. Without this refusal the session would land on
@@ -1372,7 +1372,7 @@ describe("planMigration", () => {
     const warning = result.warnings.find((w) => w.includes("openclaw bank 'ghost'"));
     expect(warning).toBeDefined();
     expect(warning).toContain("bank_id");
-    expect(warning).toContain("gini agents add");
+    expect(warning).toContain("gini agent create");
     expect(warning).toContain("bank_<agent-id>");
   });
 

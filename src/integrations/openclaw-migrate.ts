@@ -2410,7 +2410,7 @@ export async function applyMigration(
           collidedAgentNames.add(step.name);
           plan.unsupported.push({
             kind: `agent:${step.name}:name-collision`,
-            detail: `Gini already has an agent named '${step.name}'. The migrator refuses to attach openclaw sessions and memory to a pre-existing agent because a native gini agent's history would be silently polluted with openclaw transcripts. Either rename the existing agent (\`gini agents rename ${step.name} <new>\`) and re-migrate, or run with \`--force\` to acknowledge the merge.`
+            detail: `Gini already has an agent named '${step.name}'. The migrator refuses to attach openclaw sessions and memory to a pre-existing agent because a native gini agent's history would be silently polluted with openclaw transcripts. Either delete the existing agent (\`gini agent delete ${step.name}\`) and re-migrate so the migrator can create a fresh '${step.name}' tagged as openclaw-imported, or run with \`--force\` to acknowledge the merge into the existing agent.`
           });
         }
         continue;
@@ -2886,7 +2886,7 @@ export async function applyMigration(
         if (!warnedOrphanBanks.has(step.sourceBank)) {
           warnedOrphanBanks.add(step.sourceBank);
           warnings.push(
-            `Memory units from openclaw bank '${step.sourceBank}' have no matching gini agent (openclaw id missing from agents.list?). Units land in the default bank with agent_id NULL. \`/api/memory/recall\` filters by both bank_id AND agent_id, so reassigning only agent_id leaves the rows pinned in the default bank and invisible to recall. To recover: (1) create the gini agent (\`gini agents add <agent-id>\`) which also creates \`bank_<agent-id>\`, then (2) update BOTH fields: \`UPDATE memory_units SET agent_id = '<agent-id>', bank_id = 'bank_<agent-id>' WHERE metadata LIKE '%"openclawBank":"${step.sourceBank}"%'\`.`
+            `Memory units from openclaw bank '${step.sourceBank}' have no matching gini agent (openclaw id missing from agents.list?). Units land in the default bank with agent_id NULL. \`/api/memory/recall\` filters by both bank_id AND agent_id, so reassigning only agent_id leaves the rows pinned in the default bank and invisible to recall. To recover: (1) create the gini agent (\`gini agent create <agent-name>\`) which also creates \`bank_<agent-id>\`, then (2) update BOTH fields against the agent's actual id (visible via \`gini agents list\`): \`UPDATE memory_units SET agent_id = '<agent-id>', bank_id = 'bank_<agent-id>' WHERE metadata LIKE '%"openclawBank":"${step.sourceBank}"%'\`.`
           );
         }
       }
