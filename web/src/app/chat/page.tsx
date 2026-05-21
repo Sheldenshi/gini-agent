@@ -21,6 +21,7 @@ import { Composer } from "@/components/chat/Composer";
 import { MessageBubble } from "@/components/chat/MessageBubble";
 import { PhaseIndicator, type PhaseIndicatorPhase } from "@/components/chat/PhaseIndicator";
 import { SessionItem } from "@/components/chat/SessionItem";
+import { ToolCallRow } from "@/components/chat/ToolCallRow";
 import { api } from "@/lib/api";
 import {
   useCancelTask,
@@ -234,6 +235,16 @@ export default function ChatPage() {
     return "working";
   }, [inflightTaskId, tasksById]);
 
+  // Tool calls dispatched by the in-flight task, surfaced as inline rows
+  // above the PhaseIndicator while the agent is mid-loop. Empty when the
+  // task hasn't dispatched any tools yet, or when there's no in-flight
+  // task at all.
+  const inflightToolCalls = useMemo(() => {
+    if (!inflightTaskId) return [];
+    const task = tasksById.get(inflightTaskId);
+    return task?.recentToolCalls ?? [];
+  }, [inflightTaskId, tasksById]);
+
   // The assistant message (if any) belonging to the in-flight task — its
   // bubble shows the streaming cursor.
   const streamingAssistantMessageId: string | null = useMemo(() => {
@@ -363,7 +374,12 @@ export default function ChatPage() {
                       <li>
                         <div className="flex items-start gap-2.5">
                           <Avatar />
-                          <PhaseIndicator phase={pendingPhase} />
+                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                            {inflightToolCalls.map((call) => (
+                              <ToolCallRow key={call.id} call={call} />
+                            ))}
+                            <PhaseIndicator phase={pendingPhase} />
+                          </div>
                         </div>
                       </li>
                     ) : null}

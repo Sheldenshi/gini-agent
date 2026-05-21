@@ -1,6 +1,7 @@
 import { submitTask } from "../agent";
 import {
   addAudit,
+  appendLog,
   createChatMessage,
   createChatSession,
   deleteChatSession,
@@ -10,15 +11,16 @@ import {
   renameChatSession
 } from "../state";
 import type { ChatMessageRecord, RuntimeConfig, TaskStatus } from "../types";
+import { generateStructured } from "../provider";
+import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
-import { resolveEffectiveContext } from "./effective-context";
 
 // Statuses where a task is no longer producing partial text. Once a task
 // reaches one of these, the synthesized streaming message is dropped in
 // favor of the synced assistant message (or task error).
 //
-// Note (Review P1 #3): waiting_approval is intentionally NOT in this set.
-// Earlier, we persisted a real ChatMessageRecord for waiting_approval and
+// waiting_approval is intentionally NOT in this set. Earlier, we persisted
+// a real ChatMessageRecord for waiting_approval and
 // the syncChatTaskResult short-circuit (`if (existing) return existing`)
 // meant the placeholder text never updated even after the task completed.
 // We now treat waiting_approval as in-flight and synthesize the placeholder
@@ -28,6 +30,14 @@ const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
   "failed",
   "cancelled"
 ]);
+
+const DEFAULT_CHAT_TITLES: ReadonlySet<string> = new Set([
+  "Untitled chat",
+  "New chat"
+]);
+
+const AUTO_RENAME_USER_TURNS = 2;
+const AUTO_RENAME_ASSISTANT_TURNS = 2;
 
 export function listChatSessions(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -54,8 +64,8 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   // synthesized one disappears — the caller never sees both for the same
   // task.
   //
-  // Review P1 #3: waiting_approval is included here so the placeholder
-  // updates automatically when approval grants and the task completes;
+  // waiting_approval is included here so the placeholder updates
+  // automatically when approval grants and the task completes;
   // previously we persisted a real ChatMessageRecord for waiting_approval
   // and the sync short-circuit froze the UI at "Waiting for approval".
   //
@@ -167,7 +177,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
 }
 
 export async function syncChatTaskResult(config: RuntimeConfig, sessionId: string, taskId: string) {
-  return mutateState(config.instance, (state) => {
+  const message = await mutateState(config.instance, (state) => {
     // Reject a missing session INSIDE the same mutateState so a
     // concurrent chat-session delete can't race past a pre-check
     // (the finalize-job hook does its own pre-check as a fast-path
@@ -191,8 +201,8 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
         message.kind !== "approval_reason"
     );
     if (existing) return existing;
-    // Review P1 #3: only sync truly terminal task results into a real
-    // ChatMessageRecord. waiting_approval is in-flight — the synthetic
+    // Only sync truly terminal task results into a real ChatMessageRecord.
+    // waiting_approval is in-flight — the synthetic
     // placeholder rendered by getChatSession swaps out automatically once
     // approval grants and the task finishes.
     if (!isTerminalTaskStatus(task.status)) {
@@ -237,4 +247,98 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     }
     return message;
   });
+  if (message) {
+    await autoRenameChatAfterTurn(config, sessionId).catch((error) => {
+      appendLog(config.instance, "chat.auto_title.failed", {
+        sessionId,
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    });
+  }
+  return message;
+}
+
+async function autoRenameChatAfterTurn(config: RuntimeConfig, sessionId: string): Promise<void> {
+  const snapshot = readState(config.instance);
+  const session = snapshot.chatSessions.find((item) => item.id === sessionId);
+  if (!session) return;
+  if (!isDefaultChatTitle(session.title)) return;
+  if (isScheduledJobDeliverySession(snapshot, sessionId)) return;
+
+  const messages = snapshot.chatMessages
+    .filter((message) => message.sessionId === sessionId)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  const userTurns = messages.filter((message) => message.role === "user").length;
+  const assistantTurns = messages.filter((message) => message.role === "assistant").length;
+  if (userTurns < AUTO_RENAME_USER_TURNS || assistantTurns < AUTO_RENAME_ASSISTANT_TURNS) return;
+
+  const title = await generateChatTitle(config, messages);
+  if (!title) return;
+
+  await mutateState(config.instance, (state) => {
+    const live = state.chatSessions.find((item) => item.id === sessionId);
+    if (!live) return undefined;
+    if (!isDefaultChatTitle(live.title)) return live;
+    if (isScheduledJobDeliverySession(state, sessionId)) return live;
+    return renameChatSession(state, sessionId, title);
+  });
+}
+
+function isDefaultChatTitle(title: string): boolean {
+  return DEFAULT_CHAT_TITLES.has(title.trim());
+}
+
+function isScheduledJobDeliverySession(state: ReturnType<typeof readState>, sessionId: string): boolean {
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  if (session?.origin === "job") return true;
+  return state.jobs.some((job) => job.chatSessionId === sessionId);
+}
+
+async function generateChatTitle(
+  config: RuntimeConfig,
+  messages: ChatMessageRecord[]
+): Promise<string | undefined> {
+  const transcript = messages
+    .filter((message) => message.role === "user" || message.role === "assistant")
+    .slice(-8)
+    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.content}`)
+    .join("\n");
+  if (!transcript) return undefined;
+
+  const result = await generateStructured(
+    config,
+    {
+      schemaName: "ChatTitle",
+      echoTag: "chat-title",
+      system: [
+        "You write concise sidebar titles for chat conversations.",
+        "Choose the title from the conversation's actual topic and intent.",
+        "Return JSON with one field: title.",
+        "Use 2 to 7 words. No quotes, emojis, markdown, punctuation padding, or prefixes like \"Chat about\"."
+      ].join(" "),
+      user: `Conversation transcript:\n${transcript}`,
+      validator: {
+        parse(value: unknown) {
+          if (!value || typeof value !== "object") return { title: "" };
+          const title = (value as { title?: unknown }).title;
+          return { title: sanitizeGeneratedChatTitle(title) ?? "" };
+        }
+      }
+    },
+    providerOverrideForRuntime(config)
+  );
+  return result.data.title || undefined;
+}
+
+function sanitizeGeneratedChatTitle(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const title = value
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/^["'`*_#\s.?!:;,-]+|["'`*_#\s.?!:;,-]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!title) return undefined;
+  if (isDefaultChatTitle(title)) return undefined;
+  return title;
 }

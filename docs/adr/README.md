@@ -23,3 +23,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Runtime Identity Injection With Tell-Once + Delta + Periodic Refresh](runtime-identity-injection.md)
 - [Browser Toolset Enabled By Default](browser-default-toolset.md)
 - [`gcloud` As An Optional Accelerator For Google Workspace Setup](gws-setup-gcloud-dependency.md)
+- [Openclaw Migration](openclaw-migration.md)

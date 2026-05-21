@@ -1,5 +1,5 @@
 // Integration tests for the chat session view, focused on the
-// waiting-approval placeholder behavior (Review P1 #3).
+// waiting-approval placeholder behavior.
 //
 // Before the fix, syncChatTaskResult accepted waiting_approval as a sync
 // trigger and persisted a real ChatMessageRecord with content like
@@ -20,12 +20,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  clearEchoStructuredResponses,
   clearEchoToolCallingResponses,
+  setEchoStructuredResponse,
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
 import { createChatMessage, mutateState, readState } from "../state";
+import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
   submitChatMessage,
@@ -65,7 +68,7 @@ async function waitForStatus(
   throw new Error(`Task ${taskId} did not reach the expected state within ${timeoutMs}ms`);
 }
 
-describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
+describe("chat session waiting-approval placeholder", () => {
   let root: string;
   let workspaceRoot: string;
   let prevState: string | undefined;
@@ -79,6 +82,7 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     process.env.GINI_STATE_ROOT = root;
     process.env.GINI_LOG_ROOT = `${root}-logs`;
     clearEchoToolCallingResponses();
+    clearEchoStructuredResponses();
   });
 
   afterEach(() => {
@@ -89,6 +93,7 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     rmSync(root, { recursive: true, force: true });
     rmSync(workspaceRoot, { recursive: true, force: true });
     clearEchoToolCallingResponses();
+    clearEchoStructuredResponses();
   });
 
   test("synthesizes a placeholder for waiting_approval and swaps it for the real summary on completion", async () => {
@@ -396,5 +401,64 @@ describe("chat session waiting-approval placeholder (Review P1 #3)", () => {
     expect(message).not.toBeNull();
     expect(message?.role).toBe("assistant");
     expect(message?.content).toContain("Approval denied");
+  });
+
+  test("auto-renames a default chat with a provider-generated title after two synced turns", async () => {
+    const config = buildConfig(workspaceRoot, "chat-auto-title-default");
+    setEchoStructuredResponse("chat-title", { title: "Low Maintenance Garden Plan" });
+
+    const session = await createChat(config, { title: "" });
+    const first = await submitChatMessage(config, session.id, { content: "plan a small garden" });
+    await waitForStatus(config, first.taskId, (t) => t.status === "completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    let stateNow = readState(config.instance);
+    expect(stateNow.chatSessions.find((item) => item.id === session.id)?.title).toBe("Untitled chat");
+
+    const second = await submitChatMessage(config, session.id, { content: "make it lower maintenance" });
+    await waitForStatus(config, second.taskId, (t) => t.status === "completed");
+    await syncChatTaskResult(config, session.id, second.taskId);
+
+    stateNow = readState(config.instance);
+    expect(stateNow.chatSessions.find((item) => item.id === session.id)?.title).toBe("Low Maintenance Garden Plan");
+  });
+
+  test("does not auto-rename manually titled chats", async () => {
+    const config = buildConfig(workspaceRoot, "chat-auto-title-manual");
+    setEchoStructuredResponse("chat-title", { title: "Should Not Apply" });
+
+    const session = await createChat(config, { title: "Manual title" });
+    const first = await submitChatMessage(config, session.id, { content: "plan a small garden" });
+    await waitForStatus(config, first.taskId, (t) => t.status === "completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+    const second = await submitChatMessage(config, session.id, { content: "make it lower maintenance" });
+    await waitForStatus(config, second.taskId, (t) => t.status === "completed");
+    await syncChatTaskResult(config, session.id, second.taskId);
+
+    const stateNow = readState(config.instance);
+    expect(stateNow.chatSessions.find((item) => item.id === session.id)?.title).toBe("Manual title");
+  });
+
+  test("does not auto-rename chats bound to scheduled-job delivery", async () => {
+    const config = buildConfig(workspaceRoot, "chat-auto-title-job-delivery");
+    setEchoStructuredResponse("chat-title", { title: "Should Not Apply" });
+
+    const session = await createChat(config, { title: "" });
+    await createScheduledJob(config, {
+      name: "garden reminder",
+      prompt: "check the garden",
+      intervalSeconds: 60,
+      chatSessionId: session.id
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "plan a small garden" });
+    await waitForStatus(config, first.taskId, (t) => t.status === "completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+    const second = await submitChatMessage(config, session.id, { content: "make it lower maintenance" });
+    await waitForStatus(config, second.taskId, (t) => t.status === "completed");
+    await syncChatTaskResult(config, session.id, second.taskId);
+
+    const stateNow = readState(config.instance);
+    expect(stateNow.chatSessions.find((item) => item.id === session.id)?.title).toBe("Untitled chat");
   });
 });

@@ -303,6 +303,20 @@ export interface PendingToolCall {
   result?: string;
 }
 
+// Lightweight per-tool-call record surfaced to the chat UI so the user sees
+// what the agent is doing while a task is in-flight. This is purely a
+// display payload — execution truth still lives in audit/trace/messages.
+// Capped on the producing side (~20) so long-running loops don't bloat
+// state. Cleared/ignored once the task reaches a terminal status.
+export interface ToolCallSummary {
+  id: string;          // tool_call_id
+  name: string;        // tool name as known to the model
+  argsPreview: string; // single-line, truncated args
+  status: "running" | "done" | "error";
+  startedAt: string;
+  completedAt?: string;
+}
+
 // Snapshot of the tool-calling conversation needed to resume the loop after
 // an approval gates a tool. We persist enough context that the runtime can
 // pick up where it left off when the user approves/denies.
@@ -368,6 +382,11 @@ export interface Task {
   // once the loop finishes (completed/failed) so completed tasks don't retain
   // long-lived conversation snapshots in state.
   toolCallState?: TaskToolCallState;
+  // Recent tool calls dispatched by the chat-task loop, surfaced to the chat
+  // UI as inline rows above the "Working…" indicator. Capped at ~20 entries
+  // (oldest dropped). Not persisted as audit truth — these are a display
+  // convenience only.
+  recentToolCalls?: ToolCallSummary[];
 }
 
 export interface RuntimeEvent {
@@ -486,7 +505,15 @@ export interface ChatSessionRecord {
 // most recent prompt.
 export type ChatSessionSource =
   | { kind: "telegram"; bridgeId: string; chatId: number; target: string; lastInboundMessageId?: number }
-  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string };
+  | { kind: "discord"; bridgeId: string; channelId: string; target: string; lastInboundMessageId?: string }
+  // Openclaw migration provenance. The poller-side
+  // findOrCreate*ChatSession helpers only match on the telegram and
+  // discord kinds, so an "openclaw"-sourced session never receives
+  // live inbound — it just carries the original openclaw session id
+  // so the openclaw migrator can dedup re-apply against the
+  // structured field instead of string-matching the title (which the
+  // operator can rename via `gini chat rename`).
+  | { kind: "openclaw"; openclawSessionId: string; openclawAgentId: string };
 
 export interface ChatMessageRecord {
   id: string;
@@ -684,7 +711,12 @@ export interface ImportReport {
   instance: Instance;
   source: ImportSource;
   path: string;
-  mode: "inspect";
+  // `inspect` reports walk a source path without touching it (the historical
+  // `gini import inspect` surface). `applied` reports record a migration
+  // that actually mutated gini state — produced by `gini import apply
+  // openclaw`. The two share storage so the activity feed and audit trail
+  // surface every import attempt uniformly.
+  mode: "inspect" | "applied";
   status: "completed" | "failed";
   counts: Record<string, number>;
   findings: string[];

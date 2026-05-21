@@ -9,6 +9,7 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
+import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -37,11 +38,17 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
     // `migrateDefaultAgentToolsets` already widens `agent_default` itself
     // on read, but this defends against creation paths that fire before
     // the next normalize.
-    const desiredToolsets = ["file", "terminal", "memory", "session_search", "delegation", "browser"];
+    // Union the canonical DEFAULT_AGENT_TOOLSETS list into whatever the
+    // default agent has on disk. This keeps newly-created sibling agents
+    // on an old instance (where `agent_default.toolsets` predates a new
+    // addition like `browser`) from inheriting the stale list. The
+    // migration in `migrateDefaultAgentToolsets` widens `agent_default`
+    // itself on read, but this defends against creation paths that fire
+    // before the next normalize.
     const fallbackToolsets = (() => {
       const seed = Array.isArray(defaultAgent?.toolsets) ? [...defaultAgent.toolsets] : [];
       const known = new Set(seed);
-      for (const name of desiredToolsets) {
+      for (const name of DEFAULT_AGENT_TOOLSETS) {
         if (!known.has(name)) {
           seed.push(name);
           known.add(name);

@@ -183,8 +183,9 @@ describe("resolveLaunchSpec", () => {
         projectRootOverride: "/repo/gini",
         cwdOverride: neutralCwd
       });
-      // No testRoot opt-in → no leak. This is the round-2 fix to round 1's
-      // MEDIUM bug where shell env vars baked into the persistent plist.
+      // No testRoot opt-in → no leak. Guards against shell env vars
+      // baking into the persistent plist; GINI_STATE_ROOT in the
+      // developer's shell must never survive into a LaunchAgent record.
       expect(spec.environment.GINI_STATE_ROOT).toBeUndefined();
       expect(spec.environment.GINI_LOG_ROOT).toBeUndefined();
     } finally {
@@ -225,6 +226,182 @@ describe("resolveLaunchSpec", () => {
       readSecretsFile: () => null
     });
     expect(spec.environment.OPENAI_API_KEY).toBeUndefined();
+  });
+
+  test("merges login-shell PATH into plist PATH (nvm / asdf / volta visibility)", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => "/Users/test/.nvm/versions/node/v20.0.0/bin:/opt/homebrew/bin",
+      mergeShellPath: true
+    });
+    // bunDir stays at position 0 so the web shim can't be coerced into
+    // running a shell-provided bun. nvm bin is inserted right after,
+    // ahead of the rest of the base, so it still wins over the system
+    // dirs for any node lookup.
+    expect(spec.environment.PATH.startsWith(
+      "/opt/bun/bin:/Users/test/.nvm/versions/node/v20.0.0/bin:"
+    )).toBe(true);
+    expect(spec.environment.PATH).toContain(join(home, ".local", "bin"));
+  });
+
+  test("falls back to base PATH when the login-shell reader returns null", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => null,
+      mergeShellPath: true
+    });
+    // No nvm dir, no shell-additions. Base launchd PATH still intact.
+    expect(spec.environment.PATH).not.toContain(".nvm");
+    expect(spec.environment.PATH).toContain("/opt/bun/bin");
+  });
+
+  test("does not invoke the login shell when an explicit reader is omitted under test", () => {
+    // Sanity: tests that don't opt in to shell-PATH-merge shouldn't pay the
+    // spawn cost or pick up developer-shell quirks. We assert by checking
+    // the base PATH stays exactly what buildLaunchAgentPath would produce
+    // without a reader.
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd
+    });
+    // No nvm path should appear unless we explicitly asked for it.
+    expect(spec.environment.PATH).not.toContain(".nvm");
+  });
+
+  test("does not invoke the login shell when mergeShellPath is false (status / disable / kick paths)", () => {
+    // resolveLaunchSpecPair is called by read-only paths (status,
+    // disable, kick) as well as enable. Read-only callers must not
+    // spawn the user's interactive shell; the gate keeps them silent.
+    // A counting reader proves it was never invoked.
+    let calls = 0;
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => {
+        calls += 1;
+        return "/Users/test/.nvm/bin";
+      },
+      mergeShellPath: false
+    });
+    expect(calls).toBe(0);
+    expect(spec.environment.PATH).not.toContain(".nvm");
+  });
+
+  test("bakes SHELL into the gateway plist so refresh respawns can re-read it", () => {
+    // The autostart-refresh flow runs `gini autostart enable --kind
+    // gateway` as a launchd-spawned child of the gateway. Without
+    // SHELL in the plist's EnvironmentVariables, the child's
+    // process.env.SHELL is unset and the regenerated plist drops the
+    // nvm/asdf merge from first enable. Pin SHELL so refresh keeps
+    // the user's interactive PATH discoverable across respawns.
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      loginShellReader: () => "/Users/test/.nvm/bin",
+      mergeShellPath: true
+    });
+    expect(spec.environment.SHELL).toBe("/bin/zsh");
+  });
+
+  test("omits SHELL from the plist when neither loginShell nor process.env.SHELL is set", () => {
+    const prev = process.env.SHELL;
+    delete process.env.SHELL;
+    try {
+      const spec = resolveLaunchSpec({
+        instance: "dev",
+        homeOverride: home,
+        bunPathOverride: "/opt/bun/bin/bun",
+        projectRootOverride: "/repo/gini",
+        cwdOverride: neutralCwd
+      });
+      expect(spec.environment.SHELL).toBeUndefined();
+    } finally {
+      if (prev !== undefined) process.env.SHELL = prev;
+    }
+  });
+
+  test("omits SHELL from the plist when the configured shell does not exist on disk", () => {
+    // A stale or garbage $SHELL must not survive into the LaunchAgent's
+    // EnvironmentVariables — children of the gateway would inherit it
+    // and break in surprising ways. Gate on file existence.
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/no/such/shell/at/this/path",
+      // fileExists is the resolveLaunchSpec test seam; treat the bogus
+      // path (and only that path) as absent. The real bun + plist
+      // files still need to look present so other branches don't error.
+      fileExists: (p: string) => p !== "/no/such/shell/at/this/path"
+    });
+    expect(spec.environment.SHELL).toBeUndefined();
+  });
+
+  test("keeps bunDir at the head of PATH when the shell merge adds entries (no bun shadowing)", () => {
+    const spec = resolveLaunchSpec({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd,
+      loginShell: "/bin/zsh",
+      // Shell PATH puts a different bun ahead of nvm. The merged PATH
+      // must still resolve `bun` to /opt/bun/bin first.
+      loginShellReader: () =>
+        "/Users/test/.brew/bin:/Users/test/.nvm/versions/node/v20.0.0/bin",
+      mergeShellPath: true
+    });
+    expect(spec.environment.PATH.startsWith("/opt/bun/bin:")).toBe(true);
+    // Shell additions land right after bunDir, ahead of the rest of the base.
+    expect(spec.environment.PATH).toContain("/opt/bun/bin:/Users/test/.brew/bin:");
+  });
+
+  test("web shim execs the absolute bun path so gateway + web share a Bun", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "dev",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: neutralCwd
+    });
+    // sh -c <shim> — the shim's last line execs the resolved bun, not
+    // bare `bun`. Without this, a shell-provided bun in the plist PATH
+    // could drive the web dev server while the gateway runs under a
+    // different Bun.
+    const shim = pair.web.programArguments[pair.web.programArguments.length - 1] ?? "";
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
+    expect(shim).not.toMatch(/exec bun run dev$/m);
+  });
+
+  test("buildWebShim rejects bunPath with shell-special characters", async () => {
+    const { __testing } = await import("./autostart");
+    expect(() => __testing.buildWebShim("dev", "/opt/bun;rm -rf /")).toThrow();
+    expect(() => __testing.buildWebShim("dev", "/opt/bun bin/bun")).toThrow();
+    expect(() => __testing.buildWebShim("dev", "/opt/bun/bin/bun")).not.toThrow();
   });
 
   // The Next.js BFF only proxies to the gateway over /api/*; it never
@@ -280,7 +457,10 @@ describe("resolveLaunchSpecPair", () => {
     expect(pair.web.programArguments[1]).toBe("-c");
     const shim = pair.web.programArguments[2]!;
     expect(shim).toContain("/api/status");
-    expect(shim).toContain("exec bun run dev");
+    // Shim execs the resolved absolute bunPath (not bare `bun`) so a
+    // shell-provided bun on the launchd PATH can't run a different
+    // binary than the gateway.
+    expect(shim).toContain(`exec "/opt/bun/bin/bun" run dev`);
     // Polls the gateway port file under the state root.
     expect(shim).toContain("instances/main/runtime.port");
   });

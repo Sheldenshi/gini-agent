@@ -46,7 +46,8 @@ import type {
   SkillRecord,
   SubagentRecord,
   Task,
-  TaskToolCallState
+  TaskToolCallState,
+  ToolCallSummary
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
@@ -105,6 +106,71 @@ function addCost(accumulator: CostRecord | undefined, increment: CostRecord | un
     totalTokens: sum(accumulator.totalTokens, increment.totalTokens),
     estimatedUsd: sum(accumulator.estimatedUsd, increment.estimatedUsd)
   };
+}
+
+// Cap on Task.recentToolCalls length. The UI only renders this while a task
+// is in-flight; older entries scroll off-screen anyway. A small cap keeps
+// the state JSON bounded even on long tool-heavy loops.
+const MAX_RECENT_TOOL_CALLS = 20;
+
+// Build a compact, single-line preview of tool-call arguments for the chat
+// UI. JSON object inputs render as `key=value, key=value`; arrays/scalars
+// fall back to the trimmed JSON. Whitespace is collapsed and the result
+// truncated with an ellipsis. Returns "" when there are no arguments.
+function buildArgsPreview(rawArgs: string | undefined): string {
+  if (!rawArgs) return "";
+  const collapse = (s: string) => s.replace(/\s+/g, " ").trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawArgs);
+  } catch {
+    const fallback = collapse(rawArgs);
+    return fallback.length > 200 ? `${fallback.slice(0, 199)}…` : fallback;
+  }
+  let preview: string;
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const parts: string[] = [];
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      let valStr: string;
+      if (typeof v === "string") valStr = v;
+      else {
+        try { valStr = JSON.stringify(v); } catch { valStr = String(v); }
+      }
+      parts.push(`${k}=${valStr}`);
+    }
+    preview = parts.join(", ");
+  } else {
+    try { preview = JSON.stringify(parsed); } catch { preview = String(parsed); }
+  }
+  preview = collapse(preview);
+  if (preview.length > 200) preview = `${preview.slice(0, 199)}…`;
+  return preview;
+}
+
+// Push a new tool-call entry onto Task.recentToolCalls, capping length.
+// Mutates `item` in place — caller must already be inside `mutateState`.
+function pushRecentToolCall(item: Task, summary: ToolCallSummary): void {
+  const list = item.recentToolCalls ?? [];
+  list.push(summary);
+  if (list.length > MAX_RECENT_TOOL_CALLS) {
+    list.splice(0, list.length - MAX_RECENT_TOOL_CALLS);
+  }
+  item.recentToolCalls = list;
+}
+
+// Flip a tool-call entry's status (and stamp completedAt). No-op if the
+// entry isn't found — older entries can be evicted by the cap above.
+function updateRecentToolCall(
+  item: Task,
+  toolCallId: string,
+  status: "done" | "error"
+): void {
+  const list = item.recentToolCalls;
+  if (!list) return;
+  const entry = list.find((c) => c.id === toolCallId);
+  if (!entry) return;
+  entry.status = status;
+  entry.completedAt = now();
 }
 
 // runChatTask: kicks off the chat-task loop for a freshly submitted task.
@@ -819,13 +885,22 @@ async function runLoop(
       // effects (browser click/type, spawn_subagent, create_job)
       // before the next iteration's top-of-loop check observes the
       // cancel.
+      const argsPreview = buildArgsPreview(call.function.arguments);
+      const startedAt = now();
       const guard = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
         if (isTerminalTaskStatus(item.status)) {
           return { proceed: false as const, status: item.status };
         }
         item.currentStep = `Working: ${call.function.name}`;
-        item.updatedAt = now();
+        item.updatedAt = startedAt;
+        pushRecentToolCall(item, {
+          id: call.id,
+          name: call.function.name,
+          argsPreview,
+          status: "running",
+          startedAt
+        });
         return { proceed: true as const };
       });
       if (!guard.proceed) {
@@ -852,11 +927,21 @@ async function runLoop(
             tool_call_id: call.id,
             content: dispatch.result
           });
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), call.id, "done");
+          });
         } else {
           pendingApprovals.push({
             toolCallId: call.id,
             toolName: call.function.name,
             approvalId: dispatch.approvalId
+          });
+          // Approval-gated tools haven't actually run yet, but from the
+          // UI's perspective the agent is no longer "dispatching" this
+          // call — it's now waiting on the user. Mark done so the row
+          // stops spinning; the approval banner conveys the gate.
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), call.id, "done");
           });
         }
       } catch (error) {
@@ -867,7 +952,12 @@ async function runLoop(
         // letting the model retry as if nothing happened risks declaring
         // the task complete despite an audit-row gap. Let those escape
         // up to runChatTask's outer .catch so the task is failed.
-        if (error instanceof ApprovedActionFailedError) throw error;
+        if (error instanceof ApprovedActionFailedError) {
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), call.id, "error");
+          });
+          throw error;
+        }
 
         // Dispatch failed (bad args, unknown tool, validation error). Feed
         // the error back to the model as the tool result so it can recover.
@@ -881,6 +971,9 @@ async function runLoop(
           role: "tool",
           tool_call_id: call.id,
           content: `Error: ${message}`
+        });
+        await mutateState(config.instance, (state) => {
+          updateRecentToolCall(findTask(state, taskId), call.id, "error");
         });
       }
     }
