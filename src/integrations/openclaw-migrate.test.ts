@@ -777,6 +777,41 @@ describe("applyMigration", () => {
     expect(state.agents.some((agent) => agent.name === "main")).toBe(false);
   });
 
+  test("skips existing secrets.env entries unless --force is set", async () => {
+    // ~/.gini/secrets.env is shared across instances, so silently
+    // overwriting OPENAI_API_KEY with whatever openclaw stored would
+    // poison the operator's running production gini. Default behavior
+    // skips with a warning; --force rotates.
+    seedOpenclawTree(OPENCLAW_ROOT, { withConfig: true, withAuthProfile: true });
+    // Pre-populate secrets.env with a real-looking key the operator
+    // would not want clobbered.
+    const dotGini = join(GINI_HOME, ".gini");
+    mkdirSync(dotGini, { recursive: true });
+    writeFileSync(join(dotGini, "secrets.env"), `export OPENAI_API_KEY='sk-real-existing-key'\n`, {
+      mode: 0o600
+    });
+
+    const config = loadConfig("preserve-secrets");
+    const discovery = discoverOpenclawState(OPENCLAW_ROOT);
+    const plan = planMigration(discovery);
+
+    const skipResult = await applyMigration(config, discovery, plan);
+    expect(skipResult.secretsWritten).toBe(0);
+    expect(
+      skipResult.warnings.some((warning) => warning.includes("OPENAI_API_KEY"))
+    ).toBe(true);
+    expect(readFileSync(join(dotGini, "secrets.env"), "utf8")).toContain(
+      "sk-real-existing-key"
+    );
+
+    // --force lets the operator deliberately rotate.
+    const forceResult = await applyMigration(config, discovery, plan, { force: true });
+    expect(forceResult.secretsWritten).toBe(1);
+    expect(readFileSync(join(dotGini, "secrets.env"), "utf8")).not.toContain(
+      "sk-real-existing-key"
+    );
+  });
+
   test("rejects malformed bot tokens before they reach the encrypted store", async () => {
     // A token containing a control character would otherwise be
     // persisted and leak via bridge.message after the first failed

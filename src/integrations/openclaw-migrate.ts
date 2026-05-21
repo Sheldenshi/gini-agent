@@ -78,7 +78,7 @@ import {
   now
 } from "../state";
 import { writeSecret } from "../state/secrets";
-import { writeKeyToSecretsEnv } from "../state/secrets-env";
+import { secretsEnvHasKey, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { skillsDir } from "../paths";
 import { assertHeaderSafeToken } from "./messaging";
 
@@ -764,9 +764,21 @@ export async function applyMigration(
   }
 
   // 1) Provider secrets to ~/.gini/secrets.env. Done first so a freshly
-  // installed gini picks them up on the next `gini run`.
+  // installed gini picks them up on the next `gini run`. Mirror the
+  // same skip-if-exists pattern as workspace files, skills, and
+  // bridges: an existing OPENAI_API_KEY in ~/.gini/secrets.env is
+  // probably the operator's real production credential, and silently
+  // replacing it with whatever openclaw stored (which may be stale or
+  // a dev key) is a hard-to-debug footgun. --force is the explicit
+  // opt-in for rotation.
   for (const step of plan.steps) {
     if (step.kind !== "secret") continue;
+    if (secretsEnvHasKey(step.envVar) && !options.force) {
+      warnings.push(
+        `Skipped existing secret: ${step.envVar} (use --force to overwrite with the openclaw value)`
+      );
+      continue;
+    }
     try {
       writeKeyToSecretsEnv(step.envVar, step.valueFrom);
       secretsWritten += 1;

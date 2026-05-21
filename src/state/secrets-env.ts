@@ -74,3 +74,20 @@ export function ensureSecretsEnvPerms(): void {
   if (!existsSync(path)) return;
   try { chmodSync(path, 0o600); } catch { /* best-effort */ }
 }
+
+// Predicate: does ~/.gini/secrets.env already carry a line for this
+// env-var name? Used by callers that want to avoid silently clobbering
+// an existing key — `gini import apply openclaw` notably wants to skip
+// a provider key the operator has already configured, unless --force
+// is set, since the openclaw value may be stale or wrong.
+//
+// Matches the same `export NAME=…` / bare `NAME=…` forms writeKeyToSecretsEnv
+// recognizes, so callers see "exists" exactly when a future write would
+// overwrite it.
+export function secretsEnvHasKey(name: string): boolean {
+  const path = secretsEnvPath();
+  if (!existsSync(path)) return false;
+  const contents = readFileSync(path, "utf8");
+  const pattern = new RegExp(`^\\s*(?:export\\s+)?${name}=`, "m");
+  return pattern.test(contents);
+}
