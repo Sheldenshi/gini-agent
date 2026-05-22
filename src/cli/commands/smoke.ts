@@ -25,12 +25,14 @@ export async function smoke(ctx: CliContext): Promise<void> {
 }
 
 async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<void> {
-  const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "remember Gini keeps local runtime work inspectable" }) });
+  // The legacy `state.memories` pinned-memory surface (and the
+  // `remember <fact>` task prefix that created a proposed memory) was
+  // removed in the memory-surface consolidation. Smoke now submits a
+  // task without the "remember" prefix; identity facts route through
+  // `edit_user_profile` (auto-approved) when the agent decides to
+  // persist them. See ADR memory-surface-consolidation.md.
+  const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "summarize that Gini keeps local runtime work inspectable" }) });
   await waitForTask(config, task.id);
-  const state = await api(config, "/api/state");
-  const memory = state.memories.find((item: { status: string }) => item.status === "proposed");
-  if (!memory) throw new Error("Smoke failed: no memory proposal created.");
-  await api(config, `/api/memory/${memory.id}/approve`, { method: "POST" });
   const job = await api(config, "/api/jobs", { method: "POST", body: JSON.stringify({ name: "smoke", intervalSeconds: 60, prompt: "smoke job task" }) });
   await api(config, `/api/jobs/${job.id}/run`, { method: "POST" });
   const readTask = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "read README.md" }) });
@@ -133,7 +135,6 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     logRoot: config.logRoot,
     port: config.port,
     taskId: task.id,
-    approvedMemoryId: memory.id,
     jobId: job.id,
     readTaskId: readTask.id,
     listTaskId: listTask.id,
