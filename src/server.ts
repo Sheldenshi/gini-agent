@@ -141,6 +141,13 @@ runConnectorDetection(config)
 const server = Bun.serve({
   port: config.port,
   hostname: "127.0.0.1",
+  // Bun.serve defaults to a 10s idleTimeout. Several handlers can legitimately
+  // exceed that — approval resolution for browser.connect does teardown+relaunch
+  // of Chromium AND awaits resumeChatTask (which blocks on the agent's next
+  // model turn); model calls themselves can run minutes for reasoning models.
+  // 255s is the per-request ceiling (Bun's max), high enough that operations
+  // complete and low enough that genuinely hung sockets still get reaped.
+  idleTimeout: 255,
   fetch: createHandler(config)
 });
 
