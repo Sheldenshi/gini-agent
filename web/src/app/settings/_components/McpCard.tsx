@@ -345,8 +345,25 @@ function AddMessagingBridgeButtons() {
           Add Discord
         </Button>
       </div>
-      <Dialog open={open} onOpenChange={(value) => { if (!value) close(); }}>
-        <DialogContent>
+      <Dialog
+        open={open}
+        onOpenChange={(value) => {
+          if (value) return;
+          // Reject Esc / outside-click / X dismissals while the create
+          // POST is in flight. The mutation has no AbortController and
+          // the runtime does not enforce bridge name uniqueness, so a
+          // dismiss-then-resubmit would mint two bridges with the same
+          // name fighting over the same bot token. Cancel button is
+          // already disabled by add.isPending below.
+          if (add.isPending) return;
+          close();
+        }}
+      >
+        <DialogContent
+          showCloseButton={!add.isPending}
+          onEscapeKeyDown={(event) => { if (add.isPending) event.preventDefault(); }}
+          onInteractOutside={(event) => { if (add.isPending) event.preventDefault(); }}
+        >
           <DialogHeader>
             <DialogTitle>Add {label} bridge</DialogTitle>
             <DialogDescription>{tokenHint}</DialogDescription>
