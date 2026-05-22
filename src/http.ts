@@ -821,32 +821,51 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
 
   const stream = new ReadableStream({
     start(controller) {
-      const enqueueBlock = (block: { id: string; kind: string }): void => {
-        if (closed) return;
-        if (seen.has(block.id)) return;
-        // Frame: SSE `id` is the block id (clients send it as
-        // Last-Event-ID on reconnect), the `event` is "chat_block",
-        // and the `data` is the JSON-encoded ChatBlock. Newlines in
-        // the payload are escaped by JSON.stringify so the SSE frame
-        // boundary stays at the trailing blank line.
+      // Two enqueue paths:
+      //   - `enqueueBackfill` dedupes by block id so an initial replay
+      //     doesn't double-send a row that we already sent (relevant
+      //     on reconnect when Last-Event-ID is honored). The seen set
+      //     is consulted ONLY here.
+      //   - `enqueueLive` never dedupes. Upsert-capable kinds
+      //     (`assistant_text` streaming deltas, `tool_call` status
+      //     flips) fire the same block id repeatedly with updated
+      //     payloads; clients merge by id, so the wire MUST carry
+      //     every frame. Skipping by id here was the previous bug —
+      //     terminal `streaming: false` flips never reached the
+      //     client.
+      const enqueueFrame = (block: { id: string }): void => {
         controller.enqueue(
           encoder.encode(
             `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
           )
         );
+      };
+      const enqueueBackfill = (block: { id: string }): void => {
+        if (closed) return;
+        if (seen.has(block.id)) return;
         seen.add(block.id);
+        enqueueFrame(block);
+      };
+      const enqueueLive = (block: { id: string }): void => {
+        if (closed) return;
+        // Mark live-delivered blocks so a hypothetical mid-stream
+        // backfill (we don't issue one today, but the wiring is
+        // defensive) doesn't re-send the same row in addition.
+        seen.add(block.id);
+        enqueueFrame(block);
       };
 
       // Initial backfill: send any blocks the client is missing.
       // listChatBlocksAfter honors Last-Event-ID (or falls back to the
       // full list when the cursor is unknown / absent).
       const backfill = listChatBlocksAfter(config.instance, sessionId, lastEventId);
-      for (const block of backfill) enqueueBlock(block);
+      for (const block of backfill) enqueueBackfill(block);
 
       // Subscribe to future inserts/upserts. Listeners fire AFTER the
-      // SQLite commit so observers see durable rows.
+      // SQLite commit so observers see durable rows. Live events
+      // skip the dedup gate by design — see comment above.
       unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
-        enqueueBlock(block);
+        enqueueLive(block);
       });
 
       // Idle keepalive (mirrors eventStream above). Proxies often cap
