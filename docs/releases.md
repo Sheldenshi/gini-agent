@@ -119,9 +119,11 @@ git push origin vX.Y.Z
 
 The tag is created on the merge commit, so it's always reachable from `main`.
 
-### 4. Create the GitHub release
+### 4. Publish the GitHub release
 
-Extract the section from CHANGELOG and create the release in one shot:
+The `.github/workflows/release.yml` workflow fires on tag push, extracts the matching `[X.Y.Z]` section from `CHANGELOG.md`, and publishes a GitHub release automatically. Watch it from the Actions tab and confirm the release page renders correctly.
+
+If you need to publish by hand (workflow disabled, broken, etc.):
 
 ```bash
 VERSION=X.Y.Z
@@ -129,6 +131,7 @@ NOTES=$(mktemp)
 awk -v v="$VERSION" '
   $0 ~ "^## \\[" v "\\]" { in_section=1; next }
   in_section && /^## \[/ { exit }
+  in_section && /^\[.*\]:/ { exit }
   in_section { print }
 ' CHANGELOG.md > "$NOTES"
 gh release create "v$VERSION" --title "v$VERSION" --notes-file "$NOTES"
