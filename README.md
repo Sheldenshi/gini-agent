@@ -13,6 +13,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Memory](docs/memory.md): retain, recall, embeddings, reranking, review, and storage
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
+- [Releases](docs/releases.md): versioning, CHANGELOG conventions, and the release process
 - [Migrating from openclaw](docs/migration-from-openclaw.md): import an existing openclaw install into gini
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
 - [Roadmap](ROADMAP.md): shipped surfaces and what's planned, with design intent

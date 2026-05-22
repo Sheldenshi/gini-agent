@@ -51,6 +51,12 @@ The same rule applies to **comments inside source and tests**: describe the haza
 
 If iterating with multiple review-fix commits before the PR lands, squash to a clean narrative first (`git rebase -i`, or use squash-merge). Once the PR is merged, the messages are permanent.
 
+## CHANGELOG
+
+For any user-visible change (CLI, gateway API, web UI, install/update behavior, config keys, on-disk state shape), add an entry to `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md) in the same PR. Use the Keep-a-Changelog categories (Added, Changed, Deprecated, Removed, Fixed, Security). Skip for pure refactors, test-only changes, or doc-only PRs.
+
+See [docs/releases.md](docs/releases.md) for entry-writing rules and the full release process.
+
 ## Verification
 
 For code changes, run relevant tests plus broader checks when practical:

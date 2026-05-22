@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "license": "MIT",
-  "description": "Local-first agent runtime you can inspect, approve, and debug.",
+  "description": "The agent that remembers and learns.",
   "type": "module",
   "bin": {
     "gini": "./src/cli.ts"
