@@ -187,7 +187,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const state = readState(config.instance);
   // `state.memories` was removed as part of the memory-surface
   // consolidation; identity facts live in USER.md and recalled-from-
-  // Hindsight memory now. See ADR memory-surface-consolidation.md.
+  // Hindsight memory now. See ADR runtime-identity-files.md.
   // Subagent path: child tasks override the default Gini preamble with the
   // subagent's own system prompt and filter the enabled-skills block by the
   // subagent's skill whitelist (when set).

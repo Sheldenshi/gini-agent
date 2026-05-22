@@ -2,7 +2,7 @@
 //
 // The legacy MemoryRecord JSON store (`./legacy`) was removed when the
 // state.memories pinned-memory surface was consolidated into USER.md /
-// SOUL.md / Hindsight (see ADR memory-surface-consolidation.md). Hindsight
+// SOUL.md / Hindsight (see ADR runtime-identity-files.md). Hindsight
 // (retain/recall/reflect/reinforce on the SQLite four-network store) is
 // the sole memory surface in this barrel now.
 

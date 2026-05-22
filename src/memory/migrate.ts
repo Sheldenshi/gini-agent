@@ -2,7 +2,7 @@
 //
 // Originally drained `state.memories` rows into the Hindsight SQLite
 // store. The `state.memories` surface was removed alongside the
-// state.memories consolidation (see ADR memory-surface-consolidation.md);
+// state.memories consolidation (see ADR runtime-identity-files.md);
 // the consolidation's own one-shot migration in
 // `migrate-pinned-to-user-md.ts` now drains every active pinned row
 // into USER.md before this helper would run.

@@ -115,7 +115,7 @@ describe("createAgent", () => {
     // cascade has something concrete to clean up. The legacy
     // `state.memories` per-agent purge was removed alongside the
     // state.memories consolidation; only the Hindsight bank cascade
-    // remains. See ADR memory-surface-consolidation.md.
+    // remains. See ADR runtime-identity-files.md.
     ensureAgentBank(config.instance, created.id);
     insertMemoryUnit(config.instance, {
       bankId: bankIdForAgent(created.id),
@@ -178,5 +178,5 @@ describe("createAgent", () => {
   // is no longer a per-agent record type. USER.md is instance-scoped,
   // SOUL.md is per-agent and never inherited at create time, and
   // Hindsight banks are created fresh per agent. See ADR
-  // memory-surface-consolidation.md.
+  // runtime-identity-files.md.
 });

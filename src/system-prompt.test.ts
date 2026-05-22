@@ -204,7 +204,7 @@ describe("buildAgentSystemContext", () => {
   test("no longer renders the legacy 'Pinned memories about this user' block", () => {
     // The pinned-memory surface was consolidated into USER.md / SOUL.md /
     // Hindsight; the block should not appear in any assembled prompt
-    // regardless of caller options. See ADR memory-surface-consolidation.md.
+    // regardless of caller options. See ADR runtime-identity-files.md.
     const out = buildAgentSystemContext("1. (semantic) snip", "Your runtime identity:\n- instance: test", {
       instructionsOverride: "RULES",
       soul: "SOUL body",

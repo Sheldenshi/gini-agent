@@ -5,7 +5,7 @@ import { print } from "../output";
 
 // `gini memory list|add|approve|reject|edit|archive|delete` were removed
 // alongside the state.memories consolidation (see ADR
-// memory-surface-consolidation.md). The remaining subcommands are all
+// runtime-identity-files.md). The remaining subcommands are all
 // Hindsight surfaces (retain / recall / reflect / units / banks /
 // migrate).
 export async function memory(ctx: CliContext): Promise<void> {

@@ -107,7 +107,7 @@ export default function HomePage() {
               state.memories consolidation — pinned-memory proposals no
               longer exist as a surface. USER.md / SOUL.md / Hindsight are
               the three memory surfaces now. See ADR
-              memory-surface-consolidation.md. */}
+              runtime-identity-files.md. */}
         </div>
 
         {pending.length > 0 ? (

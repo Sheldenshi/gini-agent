@@ -119,7 +119,7 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // `normalizeState` path on the next readState consults the marker and
   // strips the dead `state.memories` field, and the SOUL.md backfill should
   // see the post-migration shape rather than racing the file write.
-  // See ADR memory-surface-consolidation.md.
+  // See ADR runtime-identity-files.md.
   const migrationReport = await migratePinnedMemoriesToUserProfile(config);
   if (migrationReport.error) {
     try {

@@ -1700,7 +1700,7 @@ async function editUserProfileTool(
   // Pre-scan the proposed body. When the scan flags a threat the write
   // is routed to `.proposed` (matching edit_soul semantics) so a hostile
   // body never lands at the approved path. Only clean bodies auto-approve.
-  // See ADR memory-surface-consolidation.md.
+  // See ADR runtime-identity-files.md.
   const previewScan = scanForInjection(body, "USER.md");
   const targetStatus: IdentityFileStatus = previewScan.findings.length > 0 ? "proposed" : "approved";
   const result = writeUserProfile(config.instance, body, targetStatus);

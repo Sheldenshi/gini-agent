@@ -274,7 +274,7 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
 // proposals on that kind which would otherwise fall through the
 // proposeImprovement normalizer and get mis-applied as a skill or job.
 // Each removed proposal lands an audit row so operators can see the
-// pruning happened. See ADR memory-surface-consolidation.md.
+// pruning happened. See ADR runtime-identity-files.md.
 function dropDeadMemoryImprovements(state: RuntimeState): void {
   if (!Array.isArray(state.improvements)) return;
   const removed: Array<{ id: string; title: string; status: string }> = [];
@@ -314,7 +314,7 @@ function dropDeadMemoryImprovements(state: RuntimeState): void {
 // from the in-memory shape so subsequent code paths never see the legacy
 // surface. The on-disk JSON keeps the field as an empty array until the
 // next write; that's fine — the migration is idempotent and the type-
-// level field is gone. See ADR memory-surface-consolidation.md.
+// level field is gone. See ADR runtime-identity-files.md.
 function dropDeadMemoriesField(state: RuntimeState): void {
   const dyn = state as unknown as {
     memories?: unknown;
@@ -660,7 +660,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // Phase C — per-agent memory isolation backfill for the SQLite
   // hindsight store. The legacy `state.memories` per-agent backfill
   // ran here too; that surface was removed in the state.memories
-  // consolidation (see ADR memory-surface-consolidation.md) so only
+  // consolidation (see ADR runtime-identity-files.md) so only
   // the SQLite-backed helper remains.
   migrateHindsightAgentIdColumns(instance, state);
   // Drop the dead AgentRecord.memoryScopes field from legacy state
@@ -671,12 +671,12 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // strips when the consolidation migration has already run for this
   // instance (marker present), so a half-installed instance keeps its
   // pinned content intact until the migration drains it. See ADR
-  // memory-surface-consolidation.md.
+  // runtime-identity-files.md.
   dropDeadMemoriesField(state);
   // Strip legacy improvement proposals with `kind: "memory"` so the
   // proposeImprovement normalizer never sees them and silently
   // mis-applies them as skills or jobs. See ADR
-  // memory-surface-consolidation.md.
+  // runtime-identity-files.md.
   dropDeadMemoryImprovements(state);
   state.relays ??= [];
   state.notifications ??= [];

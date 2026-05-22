@@ -109,7 +109,7 @@ describe("buildToolCatalog", () => {
     }
     // add_memory and update_memory were dropped as part of the
     // state.memories consolidation. See ADR
-    // memory-surface-consolidation.md.
+    // runtime-identity-files.md.
     expect(names.has("add_memory")).toBe(false);
     expect(names.has("update_memory")).toBe(false);
     // Kill switch contract: messaging toolset defaults disabled, so the

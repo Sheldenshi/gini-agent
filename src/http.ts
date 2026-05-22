@@ -363,7 +363,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // auto-approved post-consolidation for clean bodies; a write that
     // trips the injection scanner falls back to USER.md.proposed and
     // requires this approval endpoint before it lands at the approved
-    // path. See ADR memory-surface-consolidation.md and ADR
+    // path. See ADR runtime-identity-files.md and ADR
     // runtime-identity-files.md for the original propose/approve design.
     ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(await approveSoulProposal(config))],
     ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(await approveUserProfileProposal(config))],
@@ -674,7 +674,7 @@ async function approveSoulProposal(config: RuntimeConfig): Promise<{ ok: boolean
 // when `edit_user_profile` produced a body the injection scanner flagged
 // — the auto-approve path bypasses this endpoint entirely. Returns
 // `{ ok: true, path }` on success or `{ ok: false, reason }` when no
-// proposal exists. See ADR memory-surface-consolidation.md.
+// proposal exists. See ADR runtime-identity-files.md.
 async function approveUserProfileProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
   const promoted = approveUserProfile(config.instance);
   if (!promoted) return { ok: false, reason: "no proposal to approve" };

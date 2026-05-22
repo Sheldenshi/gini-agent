@@ -91,7 +91,7 @@ export function useApprovals() {
 // `useMemories` was removed alongside the state.memories
 // consolidation. The Memory page now surfaces Hindsight only — see
 // the per-unit/per-bank hooks below. See ADR
-// memory-surface-consolidation.md.
+// runtime-identity-files.md.
 
 import type { HindsightUnitView, HindsightBankView } from "@/lib/view-types";
 

@@ -74,7 +74,7 @@ export async function useAgent(config: RuntimeConfig, idOrName: string) {
 //   - Per-agent Hindsight bank (`bank_${agentId}`) + all units in it.
 //   - The agent row is removed from `state.agents`.
 // The legacy `state.memories` per-agent purge was removed alongside the
-// state.memories consolidation (see ADR memory-surface-consolidation.md);
+// state.memories consolidation (see ADR runtime-identity-files.md);
 // USER.md is instance-scoped (no per-agent purge needed) and SOUL.md
 // lives under `agents/<agentId>/SOUL.md` on disk — its filesystem
 // cleanup is left to the operator since the file may carry hand-edited

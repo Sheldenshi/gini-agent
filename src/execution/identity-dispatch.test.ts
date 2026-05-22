@@ -296,7 +296,7 @@ describe("edit_soul dispatch", () => {
 describe("edit_user_profile dispatch (auto-approved)", () => {
   // After the state.memories consolidation, edit_user_profile writes
   // directly to the approved USER.md instead of routing through
-  // .proposed. See ADR memory-surface-consolidation.md.
+  // .proposed. See ADR runtime-identity-files.md.
   test("writes directly to USER.md and emits identity.user_profile.approved audit", async () => {
     const instance = "user-approved-happy";
     const config = makeConfig(instance);

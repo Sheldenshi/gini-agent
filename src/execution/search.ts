@@ -38,7 +38,7 @@ export function searchSessions(config: RuntimeConfig, query: string, limit = 20)
   // consolidation; identity facts live in USER.md and recalled-from-
   // Hindsight memory now. Cross-session lookups against Hindsight units
   // happen via `recall_memory` / `/api/memory/recall`. See ADR
-  // memory-surface-consolidation.md.
+  // runtime-identity-files.md.
 
   for (const skill of state.skills) {
     addMatch(results, {

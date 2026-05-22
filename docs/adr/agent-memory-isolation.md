@@ -84,7 +84,7 @@ collection no longer exists; the per-agent isolation key now applies
 only to Hindsight units, jobs, sessions, and the SOUL.md file path. A
 one-shot migration drains pre-consolidation `state.memories` into
 USER.md and clears the array. See ADR
-[memory-surface-consolidation.md](./memory-surface-consolidation.md).
+[runtime-identity-files.md](./runtime-identity-files.md).
 
 ## Subagent Inheritance
 

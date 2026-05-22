@@ -15,7 +15,7 @@ describe("state primitives", () => {
   // The "memory proposals" test was removed alongside the state.memories
   // consolidation — `createMemory` no longer exists; pinned identity
   // facts live in USER.md and recalled-from-Hindsight memory now.
-  // See ADR memory-surface-consolidation.md.
+  // See ADR runtime-identity-files.md.
 
   test("improvement proposals are governed before application", () => {
     const state = createEmptyState("sandbox");

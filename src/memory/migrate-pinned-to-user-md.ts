@@ -9,7 +9,7 @@
 // Migration order matters: `install()` must call this AFTER
 // `scaffoldInstanceIdentityFiles` (which materializes the zero-byte
 // USER.md placeholder) so the append path always has a file to write
-// against. See ADR memory-surface-consolidation.md.
+// against. See ADR runtime-identity-files.md.
 
 import { existsSync, readFileSync } from "node:fs";
 import type { Instance, RuntimeConfig } from "../types";
@@ -81,7 +81,7 @@ function readApprovedUserProfile(instance: Instance): string {
 //   - Per-agent scoping is lost (USER.md is instance-scoped). Pinned
 //     identity facts SHOULD have been cross-agent in the first place —
 //     that's the whole reason for the consolidation. See ADR
-//     memory-surface-consolidation.md.
+//     runtime-identity-files.md.
 //   - Bullets are deduplicated by exact content match so re-runs of the
 //     migration on a partially-cleaned state file don't produce duplicate
 //     rows. (The marker should prevent this — defense in depth.)

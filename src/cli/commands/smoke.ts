@@ -30,7 +30,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
   // removed in the memory-surface consolidation. Smoke now submits a
   // task without the "remember" prefix; identity facts route through
   // `edit_user_profile` (auto-approved) when the agent decides to
-  // persist them. See ADR memory-surface-consolidation.md.
+  // persist them. See ADR runtime-identity-files.md.
   const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "summarize that Gini keeps local runtime work inspectable" }) });
   await waitForTask(config, task.id);
   // Memory-surface coverage: submit a chat task carrying an explicit
@@ -40,7 +40,7 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
   // emits an `auto-retain completed` trace event — that's the
   // replacement persistence path we care about. We also exercise the
   // direct retain seam below so the Hindsight write path stays
-  // covered. See ADR memory-surface-consolidation.md.
+  // covered. See ADR runtime-identity-files.md.
   const identityTask = await api(config, "/api/tasks", {
     method: "POST",
     body: JSON.stringify({ input: "my name is SmokeTester and I prefer concise replies", mode: "chat" })

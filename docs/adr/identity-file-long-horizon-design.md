@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-22
-- **See also:** [Runtime Identity Files](./runtime-identity-files.md), [Memory Surface Consolidation](./memory-surface-consolidation.md)
+- **See also:** [Runtime Identity Files](./runtime-identity-files.md)
 
 ## Decision
 
@@ -93,7 +93,7 @@ INSTRUCTIONS.md and the `edit_user_profile` tool description tell the model:
 
 > DO NOT save to USER.md: task progress, PR/issue/commit IDs, completed-work logs, file counts, anything that will be stale in a week. Those belong in long-term memory (auto-retain handles them silently).
 
-This is the partition documented in [memory-surface-consolidation.md](./memory-surface-consolidation.md): USER.md is always-inject identity; everything else is Hindsight's job.
+This is the partition documented in [runtime-identity-files.md](./runtime-identity-files.md): USER.md is always-inject identity; everything else is Hindsight's job.
 
 ### USER vs SOUL partition
 

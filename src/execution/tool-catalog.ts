@@ -817,7 +817,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // USER.md is instance-scoped so the user's identity carries across
     // agent switches. Distinct from edit_soul (per-agent persona, still
     // propose → approve). Always exposed. See ADR
-    // memory-surface-consolidation.md.
+    // runtime-identity-files.md.
     toolset: "identity",
     type: "function",
     function: {

@@ -7,7 +7,7 @@ import { HindsightPanel } from "./_components/HindsightPanel";
 // The legacy "user-curated MemoryRecord rows" panel was removed
 // alongside the state.memories consolidation. USER.md and SOUL.md are
 // the human-curated layers; Hindsight is the recall-on-demand layer
-// shown below. See ADR memory-surface-consolidation.md.
+// shown below. See ADR runtime-identity-files.md.
 export default function MemoryPage() {
   const status = useStatus();
   const activeAgentName = status.data?.activeAgent?.name;

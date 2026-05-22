@@ -2,13 +2,13 @@
 
 Gini memory is visible, governable, and local by default.
 
-After the state.memories consolidation (see [ADR memory-surface-consolidation.md](./adr/memory-surface-consolidation.md)) there are three memory surfaces:
+Gini has three memory surfaces (see [ADR runtime-identity-files.md](./adr/runtime-identity-files.md) for the partition):
 
 - **USER.md** — instance-scoped user identity, always injected into the prompt. Edited via the `edit_user_profile` tool, auto-approved when the injection scan passes (a flagged body routes through `.proposed` for review).
 - **SOUL.md** — per-agent persona, always injected. Edited via the `edit_soul` tool which always routes through `.proposed` for user approval.
 - **Hindsight** — per-agent SQLite bank populated automatically by auto-retain at the end of every chat task. Queried by recall on each turn and by the `recall_memory` tool on demand.
 
-The legacy `state.memories` pinned-memory store, `add_memory`, `update_memory`, and the `/api/memory` CRUD routes are gone. This document covers Hindsight; USER.md / SOUL.md are documented in [runtime-identity-files.md](./adr/runtime-identity-files.md).
+This document covers Hindsight; USER.md / SOUL.md are documented in [runtime-identity-files.md](./adr/runtime-identity-files.md).
 
 Hindsight units live in `~/.gini/instances/<instance>/memory.db` using SQLite. The model cache for local embeddings and reranking lives in `~/.gini/models/`.
 

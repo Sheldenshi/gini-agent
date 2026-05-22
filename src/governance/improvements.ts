@@ -5,7 +5,7 @@ export async function proposeImprovement(config: RuntimeConfig, input: Record<st
   const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
   const trace = taskId ? readTrace(config.instance, taskId) : [];
   // The "memory" improvement kind was removed alongside the
-  // state.memories consolidation (see ADR memory-surface-consolidation.md).
+  // state.memories consolidation (see ADR runtime-identity-files.md).
   // Skill and job stay; anything else defaults to skill so a legacy
   // payload doesn't crash but lands on the skill creation path.
   const kind = input.kind === "job" ? "job" : "skill";

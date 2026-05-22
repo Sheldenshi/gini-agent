@@ -503,7 +503,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   // right isolation key. Legacy `state.memories` pinned-memory access
   // was removed as part of the memory-surface consolidation; identity
   // facts live in USER.md and recalled-from-Hindsight memory now. See
-  // ADR memory-surface-consolidation.md.
+  // ADR runtime-identity-files.md.
   const memoryState = await mutateState(config.instance, (state) => state);
   const memoryEffective = resolveEffectiveContext(memoryState, config);
   const activeAgentId = memoryEffective.agentId;
@@ -586,7 +586,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     // `state.memories` was consolidated into USER.md / SOUL.md /
     // Hindsight. Long-term retention now flows through auto-retain
     // (scheduleAutoRetain below); identity facts route through
-    // `edit_user_profile`. See ADR memory-surface-consolidation.md.
+    // `edit_user_profile`. See ADR runtime-identity-files.md.
     item.status = "completed";
     item.currentStep = "Completed";
     item.summary = providerResult.text;

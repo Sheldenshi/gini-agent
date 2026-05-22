@@ -33,7 +33,7 @@ export type AgentContext =
 // The `memoryId` branch was removed alongside the state.memories
 // consolidation — pinned memories no longer exist as a record type the
 // audit emitter can attribute against. See ADR
-// memory-surface-consolidation.md.
+// runtime-identity-files.md.
 function resolveAgentId(state: RuntimeState, ctx: AgentContext): string | undefined {
   if ("system" in ctx && ctx.system === true) return undefined;
   if (ctx.agentId) return ctx.agentId;

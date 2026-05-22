@@ -556,7 +556,7 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   // The legacy MemoryRecord migration panel was removed alongside the
   // state.memories consolidation — `legacyMigrationStatus` now returns
   // `fullyMigrated: true` unconditionally, so there's nothing left to
-  // surface. See ADR memory-surface-consolidation.md.
+  // surface. See ADR runtime-identity-files.md.
   const legacyMigration = legacyMigrationStatus(undefined);
   // Embedding-provider snapshot. Surfaces the active provider/model + cache
   // size, and warns if any active unit is embedded with a model other than

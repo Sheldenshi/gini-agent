@@ -167,7 +167,7 @@ export function identityBudgetState(
 //
 // The legacy "Pinned memories about this user" block was removed when
 // `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
-// See ADR memory-surface-consolidation.md.
+// See ADR runtime-identity-files.md.
 //
 // Placing memory in the system channel (rather than the user message)
 // gives it higher-priority placement without talking the model into

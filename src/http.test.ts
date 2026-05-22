@@ -479,7 +479,7 @@ describe("runtime api", () => {
   test("approval-gated file patch produces a diff approval", async () => {
     // Memory CRUD via `/api/memory` was removed alongside the
     // state.memories consolidation. See ADR
-    // memory-surface-consolidation.md.
+    // runtime-identity-files.md.
     const config = testConfig("memory-patch");
     config.workspaceRoot = process.cwd();
     const handler = createHandler(config);

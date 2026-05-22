@@ -1,5 +1,5 @@
 // Unit tests for the one-shot state.memories → USER.md migration.
-// See ADR memory-surface-consolidation.md.
+// See ADR runtime-identity-files.md.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -51,7 +51,7 @@ async function seedMemories(config: RuntimeConfig, items: Array<{ id: string; co
     // consolidation. The migration helper still reads through to the
     // legacy on-disk shape, so the test seeds the array via an `unknown`
     // cast to mimic an existing-instance state file. See ADR
-    // memory-surface-consolidation.md.
+    // runtime-identity-files.md.
     const stateDyn = state as unknown as { memories: Array<Record<string, unknown>> };
     stateDyn.memories = items.map((item) => ({
       id: item.id,

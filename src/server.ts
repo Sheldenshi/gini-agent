@@ -89,7 +89,7 @@ void mutateState(config.instance, (state) => {
 // `migrate-pinned-to-user-md.ts` now drains every active pinned row into
 // USER.md. `migrateIfNeeded` is kept as a no-op so older external
 // callers don't break, but the report is always `null` — nothing to log.
-// See ADR memory-surface-consolidation.md.
+// See ADR runtime-identity-files.md.
 migrateIfNeeded(config).catch((error) => {
   appendLog(config.instance, "memory.migrate.error", {
     error: error instanceof Error ? error.message : String(error)

@@ -4,7 +4,7 @@
 // Pinned-memory CRUD tools (`add_memory` / `update_memory`) were removed
 // alongside the `state.memories` consolidation — USER.md / SOUL.md /
 // Hindsight are now the three memory surfaces. See ADR
-// memory-surface-consolidation.md.
+// runtime-identity-files.md.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
