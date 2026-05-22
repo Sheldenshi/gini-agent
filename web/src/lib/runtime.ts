@@ -31,40 +31,32 @@ const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
   /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
 ];
 
-// Cache the file-read values across requests but invalidate on mtime change,
-// so a gateway respawn that picks a different port doesn't strand the BFF
-// pointing at the old port. We cache for 2s minimum to avoid stat'ing on
-// every single request when a SSE stream is open.
+// Cache file-read values across requests, invalidated by mtime change so
+// a gateway respawn that rotates the port (or a config edit that flips
+// the tunnel toggle) takes effect on the very next request. statSync on
+// a local file is sub-ms; we don't need a TTL on top of it to keep the
+// hot path cheap.
 interface FileCache {
-  // The mtimeMs we read at; null when the file was missing.
-  mtime: number | null;
+  mtime: number;
   value: string;
-  readAt: number;
 }
-const fileCacheTtlMs = 2000;
 const fileCache: Map<string, FileCache> = new Map();
 
 function readFileWithMtimeCache(path: string): string | null {
-  const now = Date.now();
-  const cached = fileCache.get(path);
-  if (cached && now - cached.readAt < fileCacheTtlMs) return cached.value || null;
-
-  if (!existsSync(path)) {
-    fileCache.set(path, { mtime: null, value: "", readAt: now });
+  if (!existsSync(path)) return null;
+  let mtime: number;
+  try {
+    mtime = statSync(path).mtimeMs;
+  } catch {
     return null;
   }
-  let mtime: number | null = null;
-  try { mtime = statSync(path).mtimeMs; } catch { /* ignore */ }
-  if (cached && cached.mtime !== null && mtime === cached.mtime) {
-    cached.readAt = now;
-    return cached.value || null;
-  }
+  const cached = fileCache.get(path);
+  if (cached && cached.mtime === mtime) return cached.value || null;
   try {
     const value = readFileSync(path, "utf8").trim();
-    fileCache.set(path, { mtime, value, readAt: now });
+    fileCache.set(path, { mtime, value });
     return value || null;
   } catch {
-    fileCache.set(path, { mtime, value: "", readAt: now });
     return null;
   }
 }
@@ -111,6 +103,42 @@ export function runtimeToken(): string {
     return typeof parsed.token === "string" ? parsed.token : "";
   } catch {
     return "";
+  }
+}
+
+// Resolve the per-instance tunnel state from config.json on demand. Reading
+// from disk on each request (with the same 2s mtime cache the other runtime
+// helpers use) avoids the env-injection race that bit first-boot autostart:
+//
+//   * `gini start` spawns the web process BEFORE the runtime persists a
+//     freshly-minted tunnel secret — the env var the child inherits is
+//     therefore empty until the next restart.
+//   * The autostart web plist does not propagate GINI_TUNNEL_SECRET at all,
+//     so the supervised web has no idea a tunnel was ever configured.
+//
+// Both cases used to produce a 404 for every tunneled request because the
+// proxy fell back to the empty-string env. Reading the secret + enabled
+// flag from the same config.json source the gateway uses as its source of
+// truth keeps the two layers in lockstep — flipping the toggle takes
+// effect on the next request without restarting the web.
+export interface TunnelRuntimeState {
+  enabled: boolean;
+  secret: string;
+}
+
+export function runtimeTunnelState(): TunnelRuntimeState {
+  const configPath = join(stateRoot(), "instances", runtimeInstance(), "config.json");
+  const raw = readFileWithMtimeCache(configPath);
+  if (!raw) return { enabled: false, secret: "" };
+  try {
+    const parsed = JSON.parse(raw) as { tunnel?: { enabled?: unknown; secret?: unknown } };
+    const tunnel = parsed.tunnel ?? {};
+    return {
+      enabled: tunnel.enabled === true,
+      secret: typeof tunnel.secret === "string" ? tunnel.secret : ""
+    };
+  } catch {
+    return { enabled: false, secret: "" };
   }
 }
 

@@ -64,7 +64,7 @@ describe("TunnelManager", () => {
       streamChunks: ["INF starting...\n", "INF https://test-vibes-77.trycloudflare.com\n"]
     });
     const snapshot = await manager.start();
-    expect(snapshot.publicUrl).toBe(`https://test-vibes-77.trycloudflare.com/${snapshot.secret}/`);
+    expect(snapshot.publicUrl).toBe(`https://test-vibes-77.trycloudflare.com/${snapshot.secret}`);
     expect(snapshot.cloudflareUrl).toBe("https://test-vibes-77.trycloudflare.com");
     expect(snapshot.observedAt).not.toBeNull();
     await manager.stop();
@@ -185,7 +185,7 @@ describe("TunnelManager", () => {
   test("composeAppleNoteBody renders the public URL prominently", () => {
     const body = composeAppleNoteBody({
       enabled: true,
-      publicUrl: "https://x.trycloudflare.com/sssss/",
+      publicUrl: "https://x.trycloudflare.com/sssss",
       cloudflareUrl: "https://x.trycloudflare.com",
       secret: "sssss",
       targetUrl: "http://127.0.0.1:7778",
@@ -200,7 +200,7 @@ describe("TunnelManager", () => {
       },
       lastError: null
     });
-    expect(body.split("\n")[0]).toBe("https://x.trycloudflare.com/sssss/");
+    expect(body.split("\n")[0]).toBe("https://x.trycloudflare.com/sssss");
     expect(body).toContain("Target: http://127.0.0.1:7778");
   });
 
@@ -387,7 +387,7 @@ describe("TunnelManager", () => {
   test("renderSnapshotQr returns ANSI + SVG when a URL is set", () => {
     const out = renderSnapshotQr({
       enabled: true,
-      publicUrl: "https://x.trycloudflare.com/abcd1234efgh5678/",
+      publicUrl: "https://x.trycloudflare.com/abcd1234efgh5678",
       cloudflareUrl: "https://x.trycloudflare.com",
       secret: "abcd1234efgh5678",
       targetUrl: "http://127.0.0.1:7778",
@@ -404,7 +404,7 @@ describe("TunnelManager", () => {
     });
     expect(out?.svg.startsWith("<svg")).toBe(true);
     expect(out?.ansi.length).toBeGreaterThan(50);
-    expect(out?.url).toBe("https://x.trycloudflare.com/abcd1234efgh5678/");
+    expect(out?.url).toBe("https://x.trycloudflare.com/abcd1234efgh5678");
   });
 });
 

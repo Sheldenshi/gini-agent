@@ -338,12 +338,18 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       GINI_TOKEN: config.token,
       GINI_INSTANCE: config.instance,
       GINI_DIST_DIR: `.next-${instanceSlug}`,
-      // Forwarded so the Next.js middleware can recognize the
-      // per-instance tunnel secret and rewrite external requests
-      // (`https://<...>.trycloudflare.com/<secret>/...`) by stripping
-      // the prefix before the app router sees the path. Direct localhost
-      // requests are untouched.
-      GINI_TUNNEL_SECRET: (config.tunnel?.secret ?? ""),
+      // Tunnel secret is no longer forwarded via env — the Next.js proxy
+      // reads it (and the enabled flag) from ~/.gini/instances/<inst>/config.json
+      // on each request via runtimeTunnelState(). Reading lazily from the
+      // same source the gateway treats as the source of truth eliminates
+      // two failure modes:
+      //   1. Spawn-order race on first boot: the gateway mints the
+      //      secret inside src/server.ts AFTER this child has been
+      //      spawned, so the inherited env was always empty on first
+      //      run.
+      //   2. Autostart: the launchd web plist does not propagate
+      //      runtime env at all, so the supervised web had no way to
+      //      learn the secret without a manual restart.
       PORT: String(port)
     }
   });

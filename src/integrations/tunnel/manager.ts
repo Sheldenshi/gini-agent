@@ -18,7 +18,7 @@ import {
 } from "./apple-notes";
 import { spawnQuickTunnel, type SpawnTunnelOptions, type TunnelHandle } from "./cloudflared";
 import { encodeQr, renderQrAnsi, renderQrSvg } from "./qr";
-import { generateSecret, normalizeSecret, tunnelPathPrefix } from "./secret-path";
+import { generateSecret, normalizeSecret } from "./secret-path";
 
 // Resolved tunnel config: every PersistedTunnelConfig field with defaults
 // applied. New fields added to the persisted shape automatically widen
@@ -265,7 +265,11 @@ export class TunnelManager {
     }
     this.handle = handle;
     const observedAt = new Date().toISOString();
-    const publicUrl = `${handle.url}${tunnelPathPrefix(this.config.secret)}`;
+    // Emit the bare-secret form (no trailing slash). Next 16 308s the
+    // trailing-slash form back to bare anyway; encoding the bare form
+    // directly in the QR / Notes / CLI saves a redirect hop and avoids
+    // any scanner that follows redirects timing out on the bounce.
+    const publicUrl = `${handle.url}/${this.config.secret}`;
     this.snapshot = {
       ...this.snapshot,
       publicUrl,

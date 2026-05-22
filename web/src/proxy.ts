@@ -23,7 +23,7 @@
 // /_next/static and /_next/image so static asset loading is unaffected.
 
 import { NextResponse, type NextRequest } from "next/server";
-import { runtimeToken, runtimeUrl } from "@/lib/runtime";
+import { runtimeToken, runtimeTunnelState, runtimeUrl } from "@/lib/runtime";
 
 // Upper bound on the round-trip to the local gateway's /api/setup/status.
 // The gateway is on 127.0.0.1 and the call hits a tiny in-memory check, so
@@ -51,12 +51,6 @@ async function isProviderConfigured(): Promise<boolean | null> {
   }
 }
 
-// Per-instance tunnel secret. Injected by the runtime when it spawns the
-// Next.js child (see src/cli/process.ts `GINI_TUNNEL_SECRET`). Empty
-// string when the feature is not configured; in that case external
-// requests are 404'd.
-const TUNNEL_SECRET = process.env.GINI_TUNNEL_SECRET ?? "";
-
 // Cookie name + lifetime for the post-bootstrap tunnel session. The
 // secret in the URL is a bootstrap credential: the first request must
 // carry `/<secret>/` so the proxy can verify ownership, after which it
@@ -73,7 +67,7 @@ const SESSION_TTL_SECONDS = 60 * 60 * 24;
 
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const host = request.headers.get("host") ?? "";
-  const isLocalHost = host.startsWith("localhost") || host.startsWith("127.0.0.1");
+  const isLocalHost = isLocalHostName(host);
   const { pathname } = request.nextUrl;
 
   if (!isLocalHost) {
@@ -89,14 +83,33 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     //   2. The session cookie matches the secret — subsequent requests
     //      no longer need the prefix in the URL, so the page's relative
     //      `fetch("/api/runtime/...")` calls just work.
-    if (!TUNNEL_SECRET) return new NextResponse("Not Found", { status: 404 });
-    const prefix = `/${TUNNEL_SECRET}`;
-    const hasPrefix = pathname.startsWith(`${prefix}/`);
-    const cookieAuth = request.cookies.get(SESSION_COOKIE)?.value === TUNNEL_SECRET;
+    //
+    // The secret + enabled flag come from config.json on every request
+    // (mtime-cached for 2s). Reading lazily avoids the env-injection race
+    // that bit first-boot autostart: the runtime mints the secret in
+    // src/server.ts AFTER `gini start` has already spawned the web with
+    // an empty GINI_TUNNEL_SECRET, and the autostart web plist did not
+    // propagate the env var at all. Now both layers consult the same
+    // disk record the gateway treats as the source of truth, so a
+    // freshly-enabled tunnel starts authorizing requests on the next
+    // request without restarting the web.
+    const { enabled, secret } = runtimeTunnelState();
+    if (!enabled || !secret) return new NextResponse("Not Found", { status: 404 });
+    const prefix = `/${secret}`;
+    // Accept BOTH `/<secret>/...` (canonical) and bare `/<secret>` (the
+    // form Next 16 produces after its automatic trailing-slash 308).
+    // Without the bare match, a QR-scanned URL ending in `/<secret>/`
+    // gets normalized to `/<secret>` before the proxy runs and would
+    // then 404. Direct rewrite — no redirect — so we never reintroduce
+    // the trailing-slash loop.
+    const hasPrefix = pathname === prefix || pathname.startsWith(`${prefix}/`);
+    const cookieAuth = request.cookies.get(SESSION_COOKIE)?.value === secret;
     if (!hasPrefix && !cookieAuth) {
       return new NextResponse("Not Found", { status: 404 });
     }
-    const stripped = hasPrefix ? (pathname.slice(prefix.length) || "/") : pathname;
+    const stripped = hasPrefix
+      ? (pathname === prefix ? "/" : pathname.slice(prefix.length) || "/")
+      : pathname;
 
     // Apply the same setup gate localhost requests get, but only on
     // page navigations (not API or _next/* asset fetches that the page
@@ -106,7 +119,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
       if (configured === false) {
         const setupUrl = new URL("/setup", request.url);
         const setupRedirect = NextResponse.redirect(setupUrl);
-        if (hasPrefix) attachSession(setupRedirect);
+        if (hasPrefix) attachSession(setupRedirect, secret);
         return setupRedirect;
       }
     }
@@ -114,7 +127,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     const rewritten = request.nextUrl.clone();
     rewritten.pathname = stripped;
     const response = NextResponse.rewrite(rewritten);
-    if (hasPrefix) attachSession(response);
+    if (hasPrefix) attachSession(response, secret);
     return response;
   }
 
@@ -130,14 +143,25 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   return NextResponse.next();
 }
 
-function attachSession(response: NextResponse): void {
-  response.cookies.set(SESSION_COOKIE, TUNNEL_SECRET, {
+function attachSession(response: NextResponse, secret: string): void {
+  response.cookies.set(SESSION_COOKIE, secret, {
     httpOnly: true,
     secure: true,
     sameSite: "lax",
     path: "/",
     maxAge: SESSION_TTL_SECONDS
   });
+}
+
+// Detect a localhost-shaped Host header. Previously matched with naive
+// `startsWith` which accepted `localhost.attacker.example` and similar
+// suffix-shadow hostnames. Anchor the host portion (port stripped) to a
+// known-good set instead so a hostile Host header can't masquerade as
+// localhost to skip the tunnel-secret gate.
+function isLocalHostName(host: string): boolean {
+  const lower = host.toLowerCase();
+  const bare = lower.includes(":") ? lower.slice(0, lower.lastIndexOf(":")) : lower;
+  return bare === "localhost" || bare === "127.0.0.1" || bare === "::1" || bare === "[::1]";
 }
 
 export const config = {

@@ -77,7 +77,7 @@ describe("tunnel HTTP integration", () => {
     );
     expect(response.status).toBe(200);
     const payload = (await response.json()) as TunnelSnapshot;
-    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
+    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789");
   });
 
   test("GET /api/tunnel invokes refreshAppleNote when the hook is provided", async () => {
@@ -120,7 +120,7 @@ describe("tunnel HTTP integration", () => {
     );
     expect(response.status).toBe(200);
     const payload = (await response.json()) as TunnelSnapshot;
-    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
+    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789");
   });
 
   test("PATCH /api/tunnel with { enabled: true } invokes applyConfig and returns the new snapshot", async () => {
@@ -132,7 +132,7 @@ describe("tunnel HTTP integration", () => {
         getSnapshot: () => stubSnapshot(),
         applyConfig: async (update) => {
           calls.push(update);
-          return { ...stubSnapshot(), publicUrl: "https://example.trycloudflare.com/abcdefghij0123456789/" };
+          return { ...stubSnapshot(), publicUrl: "https://example.trycloudflare.com/abcdefghij0123456789" };
         }
       }
     });
@@ -147,7 +147,7 @@ describe("tunnel HTTP integration", () => {
     const payload = (await response.json()) as TunnelSnapshot;
     expect(calls).toHaveLength(1);
     expect(calls[0]).toEqual({ enabled: true });
-    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789/");
+    expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789");
   });
 
   test("PATCH /api/tunnel with { appleNotes: { enabled } } forwards the nested shape verbatim", async () => {
@@ -337,7 +337,7 @@ function testConfig(instance: string): RuntimeConfig {
 function stubSnapshot(): TunnelSnapshot {
   return {
     enabled: true,
-    publicUrl: "https://example.trycloudflare.com/abcdefghij0123456789/",
+    publicUrl: "https://example.trycloudflare.com/abcdefghij0123456789",
     cloudflareUrl: "https://example.trycloudflare.com",
     secret: "abcdefghij0123456789",
     targetUrl: "http://127.0.0.1:7337",
