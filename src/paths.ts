@@ -221,22 +221,40 @@ export function workspaceDir(instance: Instance): string {
     : join(instanceRoot(instance), "workspace");
 }
 
+// Allow-list of provider names that GINI_PROVIDER may set. Shared between
+// defaultConfig() and the `gini install` validator so the two sites can't
+// drift. `echo` is here because the ephemeral smoke path pins it to keep
+// CI offline (src/cli/args.ts); without it, smoke would fall through to
+// the codex default and hit the real codex backend with a nonsense model.
+export const ENV_PROVIDER_ALLOWED = ["openai", "codex", "echo"] as const;
+export type EnvProviderName = (typeof ENV_PROVIDER_ALLOWED)[number];
+
+export function isEnvProviderName(value: unknown): value is EnvProviderName {
+  return typeof value === "string"
+    && (ENV_PROVIDER_ALLOWED as readonly string[]).includes(value);
+}
+
 export function defaultConfig(instance: Instance): RuntimeConfig {
   // Platform default fallback is codex/gpt-5.5. Users without `codex` CLI
   // auth will hit a runtime error on first prompt — that's the accepted
   // tradeoff for not landing on the placeholder `echo` provider. The
-  // `echo` provider is still a valid explicit choice (tests and the
-  // `gini provider set echo` path), it just isn't the default.
-  const providerName = process.env.GINI_PROVIDER === "openai" || process.env.GINI_PROVIDER === "codex"
-    ? process.env.GINI_PROVIDER
-    : "codex";
+  // `echo` provider is still a valid explicit choice (tests, the
+  // `gini provider set echo` path, and the ephemeral smoke runner),
+  // it just isn't the default.
+  const envProvider = process.env.GINI_PROVIDER;
+  const providerName: EnvProviderName = isEnvProviderName(envProvider) ? envProvider : "codex";
+  const defaultModelFor: Record<EnvProviderName, string> = {
+    codex: "gpt-5.5",
+    openai: "gpt-5.4-mini",
+    echo: "gini-echo-v0"
+  };
   return {
     instance,
     port: Number(process.env.GINI_PORT ?? defaultRuntimePort(instance)),
     token: crypto.randomUUID(),
     provider: {
       name: providerName,
-      model: process.env.GINI_MODEL ?? (providerName === "codex" ? "gpt-5.5" : "gpt-5.4-mini"),
+      model: process.env.GINI_MODEL ?? defaultModelFor[providerName],
       apiKeyEnv: providerName === "openai" ? "OPENAI_API_KEY" : undefined
     },
     workspaceRoot: workspaceDir(instance),

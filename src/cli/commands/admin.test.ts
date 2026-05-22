@@ -172,6 +172,20 @@ describe("install_ provider env override", () => {
     expect(cfg.provider).toEqual({ name: "openai", model: "gpt-5.4", apiKeyEnv: "OPENAI_API_KEY" });
   });
 
+  test("fresh install with GINI_PROVIDER=echo lands on echo/gini-echo-v0", async () => {
+    // The install_ validator must accept echo (smoke pins it explicitly in
+    // src/cli/args.ts), and defaultConfig must produce the echo model so
+    // smoke stays offline. Without both, smoke would either throw at the
+    // validator or fall through to the codex default with a nonsense model.
+    const instance = "fresh-echo";
+    process.env.GINI_PROVIDER = "echo";
+    await install_(makeCtx(instance));
+    const cfg = readPersistedConfig(instance);
+    expect(cfg.provider.name).toBe("echo");
+    expect(cfg.provider.model).toBe("gini-echo-v0");
+    expect(cfg.provider.apiKeyEnv).toBeUndefined();
+  });
+
   test("fresh install with no env vars lands on the codex/gpt-5.5 platform default", async () => {
     const instance = "fresh-default";
     await install_(makeCtx(instance));

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultRuntimePort, defaultWebPort, loadConfig, migrateLegacyInstancePaths } from "./paths";
+import { defaultRuntimePort, defaultWebPort, isEnvProviderName, loadConfig, migrateLegacyInstancePaths } from "./paths";
 
 describe("default port helpers", () => {
   test("production default instance is pinned to memorable 7777/7778 ports", () => {
@@ -51,6 +51,64 @@ describe("default port helpers", () => {
       if (rp !== wp) differOnAtLeastOne += 1;
     }
     expect(differOnAtLeastOne).toBeGreaterThan(0);
+  });
+});
+
+describe("GINI_PROVIDER env recognition", () => {
+  function withProviderEnv<T>(
+    overrides: { provider?: string; model?: string },
+    fn: (root: string) => T
+  ): T {
+    const root = mkdtempSync(join(tmpdir(), "gini-paths-env-"));
+    const prev = {
+      state: process.env.GINI_STATE_ROOT,
+      log: process.env.GINI_LOG_ROOT,
+      provider: process.env.GINI_PROVIDER,
+      model: process.env.GINI_MODEL,
+      port: process.env.GINI_PORT
+    };
+    process.env.GINI_STATE_ROOT = root;
+    delete process.env.GINI_LOG_ROOT;
+    delete process.env.GINI_PORT;
+    if (overrides.provider === undefined) delete process.env.GINI_PROVIDER;
+    else process.env.GINI_PROVIDER = overrides.provider;
+    if (overrides.model === undefined) delete process.env.GINI_MODEL;
+    else process.env.GINI_MODEL = overrides.model;
+    try {
+      return fn(root);
+    } finally {
+      if (prev.state === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = prev.state;
+      if (prev.log === undefined) delete process.env.GINI_LOG_ROOT;
+      else process.env.GINI_LOG_ROOT = prev.log;
+      if (prev.provider === undefined) delete process.env.GINI_PROVIDER;
+      else process.env.GINI_PROVIDER = prev.provider;
+      if (prev.model === undefined) delete process.env.GINI_MODEL;
+      else process.env.GINI_MODEL = prev.model;
+      if (prev.port === undefined) delete process.env.GINI_PORT;
+      else process.env.GINI_PORT = prev.port;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("isEnvProviderName accepts the three documented values and rejects others", () => {
+    expect(isEnvProviderName("openai")).toBe(true);
+    expect(isEnvProviderName("codex")).toBe(true);
+    expect(isEnvProviderName("echo")).toBe(true);
+    expect(isEnvProviderName("anthropic")).toBe(false);
+    expect(isEnvProviderName("")).toBe(false);
+    expect(isEnvProviderName(undefined)).toBe(false);
+  });
+
+  test("GINI_PROVIDER=echo lands on echo/gini-echo-v0 (smoke contract)", () => {
+    // Without this, ephemeral smoke (src/cli/args.ts pins GINI_PROVIDER=echo)
+    // would fall through to the codex default and call the real backend.
+    withProviderEnv({ provider: "echo" }, () => {
+      const config = loadConfig("smoke-echo-default");
+      expect(config.provider.name).toBe("echo");
+      expect(config.provider.model).toBe("gini-echo-v0");
+      expect(config.provider.apiKeyEnv).toBeUndefined();
+    });
   });
 });
 

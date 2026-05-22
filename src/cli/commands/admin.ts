@@ -9,7 +9,7 @@ import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { configPath, loadConfig, parseInstance } from "../../paths";
+import { configPath, isEnvProviderName, loadConfig, parseInstance } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -48,10 +48,10 @@ export async function install_(ctx: CliContext): Promise<void> {
   // the env.
   const instance = parseInstance(ctx.rawArgs);
   const envProvider = process.env.GINI_PROVIDER;
-  if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
+  if (envProvider && !isEnvProviderName(envProvider)) {
     throw new Error(
       `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
-      `Use 'openai' or 'codex', leave it unset to accept the platform default, ` +
+      `Use 'openai', 'codex', or 'echo', leave it unset to accept the platform default, ` +
       `or run \`gini provider set <name> [model]\` after install.`
     );
   }
