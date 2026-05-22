@@ -38,9 +38,14 @@ export async function install_(ctx: CliContext): Promise<void> {
   // when set, whether or not a config already exists on disk. This is
   // load-bearing for the conductor `setup` script: if a worktree's
   // instance dir was materialized earlier (e.g. by a tmux `gini run`
-  // racing the install) the existing config would otherwise pin the
-  // platform default and the env vars in `setup` would be silently
-  // ignored.
+  // racing the install, or by a legacy `~/.gini/lanes/<inst>/config.json`
+  // that loadConfig migrates into place) the existing config would
+  // otherwise pin a stale provider and the env vars in `setup` would
+  // be silently ignored. We unconditionally apply the env override
+  // after ctx.config: on a fresh install defaultConfig() already used
+  // the env vars so the rewrite is a no-op; on a pre-existing or
+  // migrated config it brings the on-disk shape into agreement with
+  // the env.
   const instance = parseInstance(ctx.rawArgs);
   const envProvider = process.env.GINI_PROVIDER;
   if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
@@ -50,14 +55,24 @@ export async function install_(ctx: CliContext): Promise<void> {
       `or run \`gini provider set <name> [model]\` after install.`
     );
   }
-  const configExisted = existsSync(configPath(instance));
   const { config } = ctx;
-  if (configExisted && (envProvider === "openai" || envProvider === "codex")) {
+  if (envProvider === "openai" || envProvider === "codex") {
     // Mirror defaultConfig()'s provider field shape so the on-disk form
     // is identical whether the env vars hit the fresh-config branch in
-    // defaultConfig() or this rewrite path on a pre-existing config.
+    // defaultConfig() or this rewrite path on a pre-existing/migrated
+    // config. Model resolution:
+    //   - GINI_MODEL set → use it.
+    //   - GINI_MODEL unset AND provider changed → use new provider's
+    //     default (mirrors defaultConfig).
+    //   - GINI_MODEL unset AND provider unchanged → preserve the
+    //     existing model so a user with codex/gpt-custom doesn't get
+    //     clobbered to gpt-5.5 by a re-run of `gini install` with the
+    //     same GINI_PROVIDER.
     const envModel = process.env.GINI_MODEL;
-    const model = envModel ?? (envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini");
+    const providerChanged = config.provider?.name !== envProvider;
+    const providerDefaultModel = envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini";
+    const model = envModel
+      ?? (providerChanged ? providerDefaultModel : (config.provider?.model ?? providerDefaultModel));
     config.provider = {
       name: envProvider,
       model,
