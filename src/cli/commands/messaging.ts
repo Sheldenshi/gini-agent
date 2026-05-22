@@ -67,7 +67,7 @@ export async function messaging(ctx: CliContext): Promise<void> {
     print(await api(config, id ? `/api/messaging/${encodeURIComponent(id)}/messages` : "/api/messaging/messages"));
     return;
   }
-  if (sub === "allow" || sub === "deny") {
+  if (sub === "allow" || sub === "deny" || sub === "reject-pending") {
     const [id, chatIdStr] = restAfter(cliArgs, sub);
     if (!id || !chatIdStr) {
       throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name> <chat-id>`);
