@@ -1923,7 +1923,7 @@ async function runApprovedAction(
         // calling this after an earlier connect.
         //
         // `mode: "managed"` enforces the approval card's contract: the
-        // user just consented to "Open a browser window," so a stale
+        // user just consented to "Connect to agent's browser," so a stale
         // CDP-mode record (which may be headless or attached to a
         // browser the user can't see) must be torn down and replaced
         // with a fresh managed launch — never silently returned as-is.

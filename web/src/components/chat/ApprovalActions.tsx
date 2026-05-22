@@ -238,7 +238,7 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                   : isBrowserConnect
                     ? signInStarted
                       ? "Sign in to continue"
-                      : "Open a browser window"
+                      : "Connect to agent's browser"
                     : approval.action}
               </span>
               {/*

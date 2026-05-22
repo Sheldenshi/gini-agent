@@ -174,7 +174,7 @@ export default function HomePage() {
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
                         <span className="font-mono text-[11px]">
-                          {isBrowserConnect ? "Open a browser window" : approval.action}
+                          {isBrowserConnect ? "Connect to agent's browser" : approval.action}
                         </span>
                         {/*
                           Suppress the MEDIUM-RISK badge for `browser.connect`.

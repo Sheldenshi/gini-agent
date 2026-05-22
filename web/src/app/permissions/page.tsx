@@ -114,7 +114,7 @@ function ApprovalCard({
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <CardTitle className="font-mono text-sm">
-              {isBrowserConnect ? "Open a browser window" : approval.action}
+              {isBrowserConnect ? "Connect to agent's browser" : approval.action}
             </CardTitle>
             <CardDescription className="line-clamp-1 font-mono text-[11px]">
               {isBrowserConnect ? reasonText : approval.target}

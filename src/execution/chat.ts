@@ -96,7 +96,7 @@ export function getChatSession(config: RuntimeConfig, id: string) {
       );
       if (hasPersistedApprovalReason) continue;
       // browser.connect approvals render their own self-describing card in
-      // chat ("Open a browser window" + the reason + Connect/Cancel). A
+      // chat ("Connect to agent's browser" + the reason + Connect/Cancel). A
       // generic "Waiting for approval..." bubble next to that card is
       // redundant noise — the card already conveys what's pending. Skip the
       // placeholder when the pending approval(s) for this task are all
