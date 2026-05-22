@@ -30,9 +30,12 @@ import {
   type ToolCall
 } from "../provider";
 import {
+  SOUL_SOFT_CAP_CHARS,
+  USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
   decideIdentityEmission,
+  identityBudgetState,
   renderFullIdentity
 } from "../system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity-files";
@@ -239,6 +242,29 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
     instructionsOverride = loadInstructions(config.instance, { onBlocked }) ?? undefined;
     soulBlock = loadSoul(config.instance, effectiveForAgent.agentId, { onBlocked }) ?? undefined;
     userProfileBlock = loadUserProfile(config.instance, { onBlocked }) ?? undefined;
+    // Surface "over cap" identity files to the trace so the operator can
+    // see the model is pushing past the soft cap. Skipped for BLOCKED
+    // notices (already audited via onBlocked) and absent files.
+    if (userProfileBlock && !userProfileBlock.startsWith("[BLOCKED:")) {
+      const budget = identityBudgetState(userProfileBlock, USER_SOFT_CAP_CHARS);
+      if (budget.overCap) {
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "identity file budget exceeded: USER.md",
+          data: { file: "USER.md", used: budget.used, cap: budget.cap, pct: budget.pct }
+        });
+      }
+    }
+    if (soulBlock && !soulBlock.startsWith("[BLOCKED:")) {
+      const budget = identityBudgetState(soulBlock, SOUL_SOFT_CAP_CHARS);
+      if (budget.overCap) {
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "identity file budget exceeded: SOUL.md",
+          data: { file: "SOUL.md", used: budget.used, cap: budget.cap, pct: budget.pct }
+        });
+      }
+    }
   }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt

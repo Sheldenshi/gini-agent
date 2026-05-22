@@ -88,6 +88,71 @@ export interface AgentSystemContextOptions {
   userProfile?: string;
 }
 
+// Soft caps surfaced to the model in the system-prompt block headers so
+// the model can see how full the file is and self-manage consolidation.
+// Deliberately not enforced — we never truncate identity content (hostile
+// UX). The header just nudges the model to consolidate when usage gets
+// high; the cap is a guideline, not a wall.
+//
+// 1500 chars is roughly 350-400 tokens, sized so a comfortably-populated
+// USER.md / SOUL.md fits inside the typical per-turn budget without
+// dominating the system prompt. The model can let either file overshoot
+// — the budget line in the header just shifts to "over cap — please
+// consolidate" and an audit trace fires.
+export const USER_SOFT_CAP_CHARS = 1500;
+export const SOUL_SOFT_CAP_CHARS = 1500;
+// When usage crosses this fraction of the cap, the header reads
+// "near cap — consolidate" to nudge the model to consolidate proactively
+// rather than waiting to overshoot.
+const BUDGET_NEAR_CAP_FRACTION = 0.8;
+
+// Render a single-line budget header above a USER.md or SOUL.md block.
+// The fraction is rounded to the nearest percent so the model sees a
+// stable, clean number. Three regions:
+//   - usage < 80% → "USER profile (412 / 1500 chars, 27%):"
+//   - 80% ≤ usage ≤ 100% → adds " — near cap, consolidate"
+//   - usage > 100% → "USER profile (1612 / 1500 chars, 107% — over cap, please consolidate):"
+//
+// The numerator is the actual character count of the block content;
+// the denominator is the per-file soft cap above.
+function renderBudgetHeader(label: string, content: string, softCapChars: number): string {
+  const used = content.length;
+  const pct = Math.round((used / softCapChars) * 100);
+  if (used > softCapChars) {
+    return `${label} (${used} / ${softCapChars} chars, ${pct}% — over cap, please consolidate):`;
+  }
+  if (used / softCapChars >= BUDGET_NEAR_CAP_FRACTION) {
+    return `${label} (${used} / ${softCapChars} chars, ${pct}% — near cap, consolidate):`;
+  }
+  return `${label} (${used} / ${softCapChars} chars, ${pct}%):`;
+}
+
+export function renderUserProfileBlock(content: string): string {
+  return `${renderBudgetHeader("USER profile", content, USER_SOFT_CAP_CHARS)}\n${content}`;
+}
+
+export function renderSoulBlock(content: string): string {
+  return `${renderBudgetHeader("SOUL persona", content, SOUL_SOFT_CAP_CHARS)}\n${content}`;
+}
+
+// Pure inspection: report whether a USER.md / SOUL.md content blob is
+// over the soft cap. Used by the call sites to emit an "over cap" trace
+// event so operators can see the model is sailing past the budget.
+export function identityBudgetState(
+  content: string,
+  softCapChars: number
+): { used: number; cap: number; pct: number; overCap: boolean; nearCap: boolean } {
+  const used = content.length;
+  const pct = Math.round((used / softCapChars) * 100);
+  return {
+    used,
+    cap: softCapChars,
+    pct,
+    overCap: used > softCapChars,
+    nearCap: used / softCapChars >= BUDGET_NEAR_CAP_FRACTION
+  };
+}
+
 // Assemble the system-area context. The block order encodes a stable
 // "agent → persona → self → user-curated facts → recalled memory"
 // progression so the model encounters its own identity before any
@@ -117,13 +182,26 @@ export function buildAgentSystemContext(
     : getDefaultGiniInstructions();
   const parts: string[] = [instructions];
   if (options?.soul && options.soul.trim().length > 0) {
-    parts.push(options.soul);
+    // BLOCKED notices are emitted by the load path as a one-line
+    // sentinel; they're a safety message, not file content, so the
+    // budget header is suppressed for them. Healthy bodies get a
+    // budget header so the model can see how full the file is and
+    // self-manage consolidation.
+    parts.push(
+      options.soul.startsWith("[BLOCKED:")
+        ? options.soul
+        : renderSoulBlock(options.soul)
+    );
   }
   if (identityBlock && identityBlock.length > 0) {
     parts.push(identityBlock);
   }
   if (options?.userProfile && options.userProfile.trim().length > 0) {
-    parts.push(options.userProfile);
+    parts.push(
+      options.userProfile.startsWith("[BLOCKED:")
+        ? options.userProfile
+        : renderUserProfileBlock(options.userProfile)
+    );
   }
   if (recalledContext && recalledContext.trim().length > 0) {
     parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);

@@ -8,12 +8,17 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   IDENTITY_FULL_REFRESH_INTERVAL,
+  SOUL_SOFT_CAP_CHARS,
+  USER_SOFT_CAP_CHARS,
   __resetDefaultGiniInstructionsCacheForTest,
   buildAgentSystemContext,
   decideIdentityEmission,
   getDefaultGiniInstructions,
+  identityBudgetState,
   renderFullIdentity,
-  renderIdentityDelta
+  renderIdentityDelta,
+  renderSoulBlock,
+  renderUserProfileBlock
 } from "./system-prompt";
 import type { AgentIdentity, IdentitySnapshotRecord } from "./types";
 
@@ -234,6 +239,86 @@ describe("buildAgentSystemContext", () => {
         "Long-term memory of prior conversations with this user (use these facts when answering):\n1. (semantic) snip"
       ].join("\n\n")
     );
+  });
+});
+
+describe("identity-file budget headers", () => {
+  test("renderUserProfileBlock wraps content with a percentage budget header under cap", () => {
+    const content = "Name: Alex.\nLocation: Berlin.";
+    const out = renderUserProfileBlock(content);
+    // Header reports the actual chars, the cap, and a percentage.
+    const expectedPct = Math.round((content.length / USER_SOFT_CAP_CHARS) * 100);
+    expect(out).toBe(
+      `USER profile (${content.length} / ${USER_SOFT_CAP_CHARS} chars, ${expectedPct}%):\n${content}`
+    );
+    // Under 80% the header has no near-cap suffix.
+    expect(out).not.toContain("near cap");
+    expect(out).not.toContain("over cap");
+  });
+
+  test("renderUserProfileBlock adds 'near cap, consolidate' between 80% and 100%", () => {
+    // Build a payload sized to land in the 80-100% band exactly. Use the
+    // exact cap fraction so the test is independent of rounding.
+    const content = "a".repeat(Math.floor(USER_SOFT_CAP_CHARS * 0.85));
+    const out = renderUserProfileBlock(content);
+    expect(out.split("\n", 1)[0]).toContain("near cap, consolidate");
+    expect(out).not.toContain("over cap");
+  });
+
+  test("renderUserProfileBlock reports 'over cap, please consolidate' beyond 100%", () => {
+    // Overshoot the cap by ~10%.
+    const content = "a".repeat(USER_SOFT_CAP_CHARS + 150);
+    const out = renderUserProfileBlock(content);
+    expect(out.split("\n", 1)[0]).toContain("over cap, please consolidate");
+    // We do NOT truncate — full content rides into the prompt.
+    expect(out).toContain(content);
+  });
+
+  test("renderSoulBlock has the same shape as renderUserProfileBlock with SOUL label and cap", () => {
+    const content = "Voice: terse.\nStyle: literal.";
+    const out = renderSoulBlock(content);
+    const expectedPct = Math.round((content.length / SOUL_SOFT_CAP_CHARS) * 100);
+    expect(out).toBe(
+      `SOUL persona (${content.length} / ${SOUL_SOFT_CAP_CHARS} chars, ${expectedPct}%):\n${content}`
+    );
+  });
+
+  test("buildAgentSystemContext renders USER and SOUL blocks with budget headers", () => {
+    const out = buildAgentSystemContext(undefined, "ID-BLOCK", {
+      instructionsOverride: "RULES",
+      soul: "PERSONA body",
+      userProfile: "USER body"
+    });
+    expect(out).toContain("USER profile (");
+    expect(out).toContain("SOUL persona (");
+    expect(out).toContain("USER body");
+    expect(out).toContain("PERSONA body");
+  });
+
+  test("BLOCKED notices skip the budget header (it's a safety message, not file content)", () => {
+    const blocked = "[BLOCKED: USER.md contained potential prompt injection (prompt_injection). Content not loaded.]";
+    const out = buildAgentSystemContext(undefined, "ID-BLOCK", {
+      instructionsOverride: "RULES",
+      userProfile: blocked
+    });
+    // BLOCKED notice rides as-is; no "USER profile (N / 1500..." header
+    // wraps it. Otherwise the model sees a budget number for a notice
+    // that has nothing to do with the actual file body.
+    expect(out).toContain(blocked);
+    expect(out).not.toMatch(/USER profile \(\d+ \/ 1500/);
+  });
+
+  test("identityBudgetState classifies regions correctly", () => {
+    const small = identityBudgetState("small body", USER_SOFT_CAP_CHARS);
+    expect(small.overCap).toBe(false);
+    expect(small.nearCap).toBe(false);
+    const near = identityBudgetState("a".repeat(Math.floor(USER_SOFT_CAP_CHARS * 0.85)), USER_SOFT_CAP_CHARS);
+    expect(near.overCap).toBe(false);
+    expect(near.nearCap).toBe(true);
+    const over = identityBudgetState("a".repeat(USER_SOFT_CAP_CHARS + 200), USER_SOFT_CAP_CHARS);
+    expect(over.overCap).toBe(true);
+    expect(over.nearCap).toBe(true);
+    expect(over.pct).toBeGreaterThan(100);
   });
 });
 
