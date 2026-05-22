@@ -57,9 +57,7 @@ If iterating with multiple review-fix commits before the PR lands, squash to a c
 
 ## CHANGELOG
 
-For any user-visible change (CLI, gateway API, web UI, install/update behavior, config keys, on-disk state shape), add an entry to `## [Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md) in the same PR. Use the Keep-a-Changelog categories (Added, Changed, Deprecated, Removed, Fixed, Security). Skip for pure refactors, test-only changes, or doc-only PRs.
-
-See [docs/releases.md](docs/releases.md) for entry-writing rules and the full release process.
+Don't touch [`CHANGELOG.md`](CHANGELOG.md) during normal work. The CHANGELOG is curated at release time from the PR titles since the last tag — see [docs/releases.md](docs/releases.md). PR titles already describe the technical change, so they're the input the release author works from.
 
 ## Verification
 

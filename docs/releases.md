@@ -16,9 +16,11 @@ The package is `"private": true` (no npm publish). Versions exist for human-read
 
 [`CHANGELOG.md`](../CHANGELOG.md) follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The format is non-negotiable; tooling and humans both rely on it.
 
+**The CHANGELOG is curated at release time, not per PR.** PRs land with clear titles (per [AGENTS.md](../AGENTS.md#commits-and-pr-titles)) and the release author distills those titles into CHANGELOG entries when cutting the release. The `[Unreleased]` heading stays empty between releases; it exists as a placeholder for the next versioned section to anchor below.
+
 ### Categories
 
-Group entries under these headings, in this order, and omit any that are empty:
+When writing the section for a new release, group entries under these headings, in this order, and omit any that are empty:
 
 - **Added** — new features users can use.
 - **Changed** — behavior changes to existing features.
@@ -27,15 +29,15 @@ Group entries under these headings, in this order, and omit any that are empty:
 - **Fixed** — bug fixes.
 - **Security** — vulnerability fixes (cross-reference `SECURITY.md`).
 
-### When to add an entry
+### What to include
 
-Every PR that produces a **user-visible** change adds a line under `## [Unreleased]`. User-visible means: changes a CLI command, the gateway API, the web UI, install/update behavior, config keys, on-disk state shape, or default behavior.
+One line per user-visible change. User-visible means: changes a CLI command, the gateway API, the web UI, install/update behavior, config keys, on-disk state shape, or default behavior.
 
-Skip the changelog for: pure refactors, internal renames, test-only changes, doc fixes that don't change product behavior, and dependency bumps that don't change behavior. PR titles already cover those (see [AGENTS.md](../AGENTS.md#commits-and-pr-titles)).
+Omit: pure refactors, internal renames, test-only changes, doc fixes that don't change product behavior, dependency bumps that don't change behavior.
 
 ### How to write an entry
 
-One line per change, present tense, user-focused. Lead with the verb and the user-visible thing, not the file you touched.
+Present tense, user-focused. Lead with the verb and the user-visible thing, not the file that was touched.
 
 Good:
 
@@ -57,14 +59,18 @@ If a change links to an issue, PR, or ADR that adds important context, append it
 
 ## Release process
 
-A release is a version bump, a tag, a GitHub release, and a CHANGELOG entry — done together, from `main`.
+A release is a version bump, a tag, a GitHub release, and a CHANGELOG section — done together, from `main`.
 
-### 1. Decide the version
+### 1. Survey what changed
 
-Look at what's in `## [Unreleased]`:
+```bash
+git log $(git describe --tags --abbrev=0)..main --oneline
+```
 
-- Any **Added**, **Changed**, **Removed**, or **Deprecated** entries → minor bump.
-- Only **Fixed** or **Security** entries → patch bump.
+Read the PR titles. Decide:
+
+- Any new features, behavior changes, removals, or deprecations → minor bump.
+- Only fixes (including security) → patch bump.
 
 If you can't decide, default up.
 
@@ -79,7 +85,7 @@ git checkout -b release/<version>
 Edit `CHANGELOG.md`:
 
 - Add a new `## [X.Y.Z] - YYYY-MM-DD` heading directly below `## [Unreleased]`.
-- Move every entry under `[Unreleased]` into the new section, preserving subsection order.
+- Write entries by distilling the PR titles from step 1 into the categories above.
 - Leave `## [Unreleased]` empty (don't delete the heading).
 - Update the link footnotes at the bottom of the file so `[X.Y.Z]` points at the compare URL and `[Unreleased]` points at `vX.Y.Z...HEAD`.
 
