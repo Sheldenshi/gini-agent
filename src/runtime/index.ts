@@ -3,8 +3,10 @@ import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
 import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot } from "../paths";
 import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
 import { addAudit } from "../state/audit";
+import { appendLog } from "../state/trace";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
+import { migratePinnedMemoriesToUserProfile } from "../memory/migrate-pinned-to-user-md";
 import { providerHealth } from "../provider";
 import { scaffoldAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
 import { currentVersionInfo } from "./update";
@@ -109,6 +111,26 @@ export function install(config: RuntimeConfig): void {
   // behavior change from "gate everything" to "auto-approve safe
   // actions" for this instance.
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  // One-shot migration: drain `state.memories` (legacy pinned memories) into
+  // the instance-scoped USER.md and clear the array. Idempotent via a state
+  // marker; best-effort — a failure audits via appendLog and lets the runtime
+  // continue. Must run AFTER scaffoldInstanceIdentityFiles (so USER.md is
+  // materialized) and BEFORE the SOUL.md backfill loop below (the backfill
+  // touches agents, the migration touches memories — independent surfaces,
+  // but keeping migrations ordered before agent work matches the install
+  // flow's "drain legacy first, then provision per-agent" shape). See ADR
+  // memory-surface-consolidation.md.
+  void migratePinnedMemoriesToUserProfile(config).then((report) => {
+    if (report.error) {
+      try {
+        appendLog(config.instance, "memory.pinned.migration.error", {
+          error: report.error
+        });
+      } catch {
+        // Logging itself failing must not crash startup.
+      }
+    }
+  });
   const state = readState(config.instance);
   // Backfill per-agent SOUL.md placeholders for every existing agent.
   // Catches the 21+ already-provisioned instances on disk that pre-date
