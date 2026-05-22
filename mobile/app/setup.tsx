@@ -13,7 +13,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { RuntimeStatus } from "@/src/types";
 
 const DEFAULT_BASE_URL = "http://localhost:7421";
@@ -63,24 +63,20 @@ export default function SetupScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["bottom"]}>
-      <Stack.Screen
-        options={{
-          title: "Connect to Gini",
-          headerStyle: { backgroundColor: theme.bg },
-          headerTitleStyle: { color: theme.text },
-          headerTintColor: theme.accent
-        }}
-      />
+      <Stack.Screen options={{ title: "Connect to Gini" }} />
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={styles.flex}
       >
-        <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
+        <ScrollView
+          contentContainerStyle={styles.scroll}
+          keyboardShouldPersistTaps="handled"
+        >
           <Text style={styles.heading}>Connect to Gini</Text>
           <Text style={styles.subhead}>
             Paste the runtime's base URL and bearer token. You can find the
-            token in {`~/.gini/instances/<instance>/config.json`} or by running
-            {" "}<Text style={styles.mono}>gini status</Text>.
+            token in {`~/.gini/instances/<instance>/config.json`} or by running{" "}
+            <Text style={styles.mono}>gini status</Text>.
           </Text>
 
           <Text style={styles.label}>Base URL</Text>
@@ -92,7 +88,7 @@ export default function SetupScreen() {
             inputMode="url"
             keyboardType="url"
             placeholder={DEFAULT_BASE_URL}
-            placeholderTextColor={theme.subtle}
+            placeholderTextColor={theme.placeholder}
             editable={!busy}
             style={styles.input}
           />
@@ -105,7 +101,7 @@ export default function SetupScreen() {
             autoCorrect={false}
             secureTextEntry
             placeholder="paste token"
-            placeholderTextColor={theme.subtle}
+            placeholderTextColor={theme.placeholder}
             editable={!busy}
             style={styles.input}
           />
@@ -115,10 +111,7 @@ export default function SetupScreen() {
           <TouchableOpacity
             disabled={busy}
             onPress={onSubmit}
-            style={[
-              styles.button,
-              busy && { backgroundColor: theme.buttonDisabled }
-            ]}
+            style={[styles.button, busy && { backgroundColor: theme.buttonDisabled }]}
           >
             {busy ? (
               <ActivityIndicator color={theme.buttonText} />
@@ -141,22 +134,46 @@ export default function SetupScreen() {
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
-  scroll: { padding: 20, paddingTop: 32, gap: 12 },
-  heading: { fontSize: 24, fontWeight: "700", color: theme.text },
-  subhead: { fontSize: 14, lineHeight: 20, marginBottom: 8, color: theme.subtle },
-  mono: { fontFamily: Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" }) },
-  label: { fontSize: 13, fontWeight: "600", marginTop: 12, color: theme.text },
+  scroll: { padding: 20, paddingTop: 24, gap: 12 },
+  heading: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 24
+  },
+  subhead: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 8
+  },
+  mono: {
+    fontFamily: family("JetBrainsMono"),
+    fontSize: 13
+  },
+  label: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 13,
+    marginTop: 12
+  },
   input: {
     borderWidth: 1,
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 12,
+    fontFamily: family("HankenGrotesk", 500),
     fontSize: 16,
     color: theme.text,
-    borderColor: theme.border,
-    backgroundColor: theme.inputBg
+    borderColor: theme.inputBorder,
+    backgroundColor: theme.bg
   },
-  error: { fontSize: 14, marginTop: 4, color: theme.danger },
+  error: {
+    color: theme.danger,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    marginTop: 4
+  },
   button: {
     marginTop: 20,
     paddingVertical: 14,
@@ -165,6 +182,16 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: theme.button
   },
-  buttonText: { fontSize: 16, fontWeight: "600", color: theme.buttonText },
-  footnote: { fontSize: 12, marginTop: 16, lineHeight: 18, color: theme.subtle }
+  buttonText: {
+    color: theme.buttonText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 16
+  },
+  footnote: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 12,
+    lineHeight: 18,
+    marginTop: 16
+  }
 });

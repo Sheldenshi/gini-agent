@@ -8,7 +8,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useAuth } from "@/src/auth";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 
 export default function SettingsScreen() {
   const { credentials, clear } = useAuth();
@@ -33,14 +33,7 @@ export default function SettingsScreen() {
 
   return (
     <SafeAreaView style={styles.safe} edges={["bottom"]}>
-      <Stack.Screen
-        options={{
-          title: "Settings",
-          headerStyle: { backgroundColor: theme.bg },
-          headerTitleStyle: { color: theme.text },
-          headerTintColor: theme.accent
-        }}
-      />
+      <Stack.Screen options={{ title: "Settings" }} />
 
       <View style={styles.body}>
         <View style={styles.section}>
@@ -75,14 +68,18 @@ const styles = StyleSheet.create({
   body: { flex: 1, padding: 20 },
   section: { marginBottom: 20 },
   label: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 600),
     fontSize: 12,
-    fontWeight: "600",
     textTransform: "uppercase",
     letterSpacing: 0.5,
-    marginBottom: 4,
-    color: theme.subtle
+    marginBottom: 4
   },
-  value: { fontSize: 16, color: theme.text },
+  value: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 16
+  },
   button: {
     marginTop: 12,
     paddingVertical: 14,
@@ -91,5 +88,9 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     backgroundColor: theme.danger
   },
-  buttonText: { fontSize: 16, fontWeight: "600", color: "#FFFFFF" }
+  buttonText: {
+    color: theme.buttonText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 16
+  }
 });
