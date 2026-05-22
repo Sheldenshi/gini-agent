@@ -34,9 +34,9 @@ Each repo worktree gets an isolated instance derived from the directory name, so
 4. Run the verification commands below.
 5. Open a PR against `main` using the PR template.
 
-### Branch names (suggested, not required)
+### Branch names
 
-Maintainers branch as `<github-username>/<kebab-case-topic>` (e.g., `jane/fix-chat-title-overflow`). Outside contributors work on forks, so any descriptive branch name is fine.
+Use `<github-username>/<kebab-case-topic>`, e.g. `jane/fix-chat-title-overflow`.
 
 ## Verification
 
