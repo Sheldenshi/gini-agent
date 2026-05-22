@@ -33,6 +33,43 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
   // persist them. See ADR memory-surface-consolidation.md.
   const task = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "summarize that Gini keeps local runtime work inspectable" }) });
   await waitForTask(config, task.id);
+  // Memory-surface coverage: submit a chat task carrying an explicit
+  // identity fact and confirm the auto-retain pipeline fired. With the
+  // echo provider the structured fact extractor returns nothing
+  // (echo does not synthesize JSON), but the pipeline itself runs and
+  // emits an `auto-retain completed` trace event — that's the
+  // replacement persistence path we care about. We also exercise the
+  // direct retain seam below so the Hindsight write path stays
+  // covered. See ADR memory-surface-consolidation.md.
+  const identityTask = await api(config, "/api/tasks", {
+    method: "POST",
+    body: JSON.stringify({ input: "my name is SmokeTester and I prefer concise replies", mode: "chat" })
+  });
+  await waitForTask(config, identityTask.id);
+  const identityDetail = await api(config, `/api/tasks/${identityTask.id}`);
+  const identityTrace = Array.isArray(identityDetail?.trace) ? identityDetail.trace : [];
+  const autoRetainFired = identityTrace.some(
+    (entry: { type?: string; message?: string }) =>
+      entry.type === "memory" && (entry.message === "auto-retain completed" || entry.message === "retain completed")
+  );
+  // Belt-and-braces: drive the retain seam directly so the smoke trail
+  // still includes at least one Hindsight unit even when the LLM
+  // extractor returns nothing.
+  await api(config, "/api/memory/retain", {
+    method: "POST",
+    body: JSON.stringify({ text: "Smoke retains a deterministic fact about SmokeTester preferring concise replies." })
+  });
+  // Auto-retain (and the direct retain above) run asynchronously; poll
+  // the unit count for a bounded window so the smoke doesn't hang if
+  // the pipeline ever drops a write.
+  const deadline = Date.now() + 5000;
+  let hindsightAfter: unknown = [];
+  while (Date.now() < deadline) {
+    hindsightAfter = await api(config, "/api/memory/units?bank=bank_agent_default");
+    if (Array.isArray(hindsightAfter) && hindsightAfter.length > 0) break;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  const hindsightUnitsAfterIdentityTask = Array.isArray(hindsightAfter) ? hindsightAfter.length : 0;
   const job = await api(config, "/api/jobs", { method: "POST", body: JSON.stringify({ name: "smoke", intervalSeconds: 60, prompt: "smoke job task" }) });
   await api(config, `/api/jobs/${job.id}/run`, { method: "POST" });
   const readTask = await api(config, "/api/tasks", { method: "POST", body: JSON.stringify({ input: "read README.md" }) });
@@ -164,6 +201,9 @@ async function runSmokeFlow(config: RuntimeConfig, ephemeral: boolean): Promise<
     },
     traces: finalState.tasks.length,
     auditEvents: finalState.audit.length,
+    identityTaskId: identityTask.id,
+    autoRetainFired,
+    hindsightUnitsAfterIdentityTask,
     evidencePath: bundle.path
   });
 }
