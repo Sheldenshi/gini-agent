@@ -177,8 +177,17 @@ const server = Bun.serve({
   idleTimeout: 255,
   fetch: createHandler(config, {
     tunnel: {
-      getSecret: () => tunnelResolved.config.secret,
-      getSnapshot: () => tunnelManager.getSnapshot()
+      // Only honor the secret-path bypass when the tunnel is actively
+      // configured to expose the gateway. The secret itself is persisted
+      // on first boot regardless of `enabled` (so flipping the flag later
+      // keeps the URL prefix stable), but that persistence must never
+      // create an authorization path on a runtime the operator hasn't
+      // opted into exposing publicly. Without this gate, anyone who can
+      // read `config.json` on the host could reach `/api/*` over
+      // localhost by appending the persisted secret, bypassing the
+      // bearer-token check the rest of the gateway relies on.
+      getSecret: () => (tunnelResolved.config.enabled ? tunnelResolved.config.secret : null),
+      getSnapshot: () => (tunnelResolved.config.enabled ? tunnelManager.getSnapshot() : null)
     }
   })
 });

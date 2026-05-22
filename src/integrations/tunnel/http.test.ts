@@ -148,6 +148,29 @@ describe("tunnel HTTP integration", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("content-type")).toContain("text/html");
   });
+
+  test("getSecret returning null disables the secret-path bypass entirely", async () => {
+    const config = testConfig("tunnel-http-disabled-secret");
+    // Simulates a runtime where the tunnel feature is disabled but a
+    // secret is still persisted on disk. Any request that previously
+    // would have matched the bypass now falls through to the regular
+    // bearer-token check.
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => null,
+        getSnapshot: () => null
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/abcdefghij0123456789/api/state")
+    );
+    expect(response.status).toBe(404);
+    // Direct /api/* without bearer still 401.
+    const bareApi = await handler(
+      new Request("http://127.0.0.1:7337/api/state")
+    );
+    expect(bareApi.status).toBe(401);
+  });
 });
 
 function testConfig(instance: string): RuntimeConfig {
