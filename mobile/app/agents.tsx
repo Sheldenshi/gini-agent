@@ -1,4 +1,4 @@
-import { Link, router, Stack } from "expo-router";
+import { Link, router } from "expo-router";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -83,9 +83,7 @@ export default function AgentsScreen() {
   if (unauthorized) return null;
 
   return (
-    <SafeAreaView style={styles.safe} edges={["bottom"]}>
-      <Stack.Screen options={{ headerShown: false }} />
-
+    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <View style={styles.split}>
         <AgentRail
           agents={list}
@@ -125,9 +123,10 @@ function AgentRail({
         </View>
       ) : (
         <FlatList
+          style={styles.railList}
           data={agents}
           keyExtractor={(a) => a.id}
-          contentContainerStyle={styles.railList}
+          contentContainerStyle={styles.railListContent}
           showsVerticalScrollIndicator={false}
           renderItem={({ item }) => (
             <AgentAvatar
@@ -453,7 +452,8 @@ const styles = StyleSheet.create({
     borderRightColor: theme.border
   },
   railLoading: { flex: 1, alignItems: "center", justifyContent: "center" },
-  railList: { paddingVertical: 12, gap: 12 },
+  railList: { flex: 1 },
+  railListContent: { paddingVertical: 12, gap: 12 },
   railFooter: {
     paddingVertical: 12,
     alignItems: "center",

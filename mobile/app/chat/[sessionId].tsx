@@ -9,8 +9,6 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
-  useColorScheme,
   View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -20,7 +18,8 @@ import {
   useSendMessage,
   useSyncChatTask
 } from "@/src/queries";
-import type { ChatMessage, Task } from "@/src/types";
+import { theme } from "@/src/theme";
+import type { ChatMessage } from "@/src/types";
 
 // Web parity: a paired assistant ChatMessage is only persisted once the
 // task is terminal AND not waiting on approval. Until then, we render
@@ -32,8 +31,6 @@ const TERMINAL_TASK_STATUSES = new Set<string>([
 ]);
 
 export default function ChatDetailScreen() {
-  const scheme = useColorScheme();
-  const theme = scheme === "dark" ? darkTheme : lightTheme;
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const session = useChatSession(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
@@ -146,8 +143,15 @@ export default function ChatDetailScreen() {
   if (unauthorized) return null;
 
   return (
-    <SafeAreaView style={[styles.safe, { backgroundColor: theme.bg }]} edges={["bottom"]}>
-      <Stack.Screen options={{ title: headerTitle }} />
+    <SafeAreaView style={styles.safe} edges={["bottom"]}>
+      <Stack.Screen
+        options={{
+          title: headerTitle,
+          headerStyle: { backgroundColor: theme.bg },
+          headerTitleStyle: { color: theme.text },
+          headerTintColor: theme.accent
+        }}
+      />
 
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -156,7 +160,7 @@ export default function ChatDetailScreen() {
       >
         {!session.data ? (
           <View style={styles.center}>
-            <ActivityIndicator />
+            <ActivityIndicator color={theme.subtle} />
           </View>
         ) : (
           <ScrollView
@@ -165,28 +169,19 @@ export default function ChatDetailScreen() {
             keyboardShouldPersistTaps="handled"
           >
             {messages && messages.length > 0 ? (
-              messages.map((m) => (
-                <Bubble key={m.id} message={m} theme={theme} />
-              ))
+              messages.map((m) => <Bubble key={m.id} message={m} />)
             ) : (
               <View style={styles.emptyChat}>
-                <Text style={[styles.emptyChatText, { color: theme.subtle }]}>
-                  What can I help with?
-                </Text>
+                <Text style={styles.emptyChatText}>What can I help with?</Text>
               </View>
             )}
             {inflightTaskId && !hasPendingAssistantBubble(messages, inflightTaskId) ? (
-              <Phase theme={theme} label={pendingPhase ?? "Working"} />
+              <Phase label={pendingPhase ?? "Working"} />
             ) : null}
           </ScrollView>
         )}
 
-        <View
-          style={[
-            styles.composerWrap,
-            { borderTopColor: theme.border, backgroundColor: theme.bg }
-          ]}
-        >
+        <View style={styles.composerWrap}>
           <TextInput
             value={text}
             onChangeText={setText}
@@ -196,10 +191,7 @@ export default function ChatDetailScreen() {
             editable={!!sessionId}
             onSubmitEditing={submit}
             blurOnSubmit={false}
-            style={[
-              styles.composerInput,
-              { color: theme.text, borderColor: theme.border, backgroundColor: theme.inputBg }
-            ]}
+            style={styles.composerInput}
           />
           <Pressable
             onPress={submit}
@@ -208,14 +200,16 @@ export default function ChatDetailScreen() {
               styles.sendButton,
               {
                 backgroundColor:
-                  !text.trim() || showSendBusy ? theme.buttonDisabled : theme.button
+                  !text.trim() || showSendBusy
+                    ? theme.buttonDisabled
+                    : theme.button
               }
             ]}
           >
             {send.isPending ? (
               <ActivityIndicator color={theme.buttonText} />
             ) : (
-              <Text style={[styles.sendText, { color: theme.buttonText }]}>Send</Text>
+              <Text style={styles.sendText}>Send</Text>
             )}
           </Pressable>
         </View>
@@ -232,26 +226,19 @@ function hasPendingAssistantBubble(
   return messages.some((m) => m.role === "assistant" && m.taskId === inflightTaskId);
 }
 
-interface BubbleTheme {
-  user: string;
-  userText: string;
-  assistant: string;
-  assistantText: string;
-  system: string;
-  systemText: string;
-}
-
-function Bubble({
-  message,
-  theme
-}: {
-  message: ChatMessage;
-  theme: BubbleTheme;
-}) {
+function Bubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
-  const bg = isUser ? theme.user : isSystem ? theme.system : theme.assistant;
-  const color = isUser ? theme.userText : isSystem ? theme.systemText : theme.assistantText;
+  const bg = isUser
+    ? theme.userBubble
+    : isSystem
+      ? theme.systemBubble
+      : theme.assistantBubble;
+  const color = isUser
+    ? theme.userBubbleText
+    : isSystem
+      ? theme.systemBubbleText
+      : theme.assistantBubbleText;
   const align = isUser ? "flex-end" : "flex-start";
   return (
     <View style={{ alignSelf: align, maxWidth: "85%" }}>
@@ -273,32 +260,33 @@ function Bubble({
   );
 }
 
-function Phase({ theme, label }: { theme: BubbleTheme & { subtle: string }; label: string }) {
+function Phase({ label }: { label: string }) {
   return (
     <View style={{ alignSelf: "flex-start", maxWidth: "85%" }}>
       <View
         style={[
           styles.bubble,
           styles.phase,
-          { backgroundColor: theme.assistant, borderTopLeftRadius: 4 }
+          {
+            backgroundColor: theme.assistantBubble,
+            borderTopLeftRadius: 4
+          }
         ]}
       >
         <ActivityIndicator size="small" color={theme.subtle} />
-        <Text style={[styles.bubbleText, { color: theme.subtle, fontStyle: "italic" }]}>
-          {label}…
-        </Text>
+        <Text style={[styles.bubbleText, styles.phaseLabel]}>{label}…</Text>
       </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1 },
+  safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
   messages: { padding: 16, gap: 10, paddingBottom: 24 },
   emptyChat: { flex: 1, minHeight: 240, alignItems: "center", justifyContent: "center" },
-  emptyChatText: { fontSize: 18, fontWeight: "500" },
+  emptyChatText: { fontSize: 18, fontWeight: "500", color: theme.subtle },
   bubble: {
     paddingVertical: 10,
     paddingHorizontal: 14,
@@ -306,6 +294,7 @@ const styles = StyleSheet.create({
   },
   bubbleText: { fontSize: 16, lineHeight: 22 },
   phase: { flexDirection: "row", alignItems: "center", gap: 8 },
+  phaseLabel: { color: theme.subtle, fontStyle: "italic" },
   composerWrap: {
     flexDirection: "row",
     alignItems: "flex-end",
@@ -313,7 +302,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingTop: 8,
     paddingBottom: 8,
-    borderTopWidth: StyleSheet.hairlineWidth
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: theme.border,
+    backgroundColor: theme.bg
   },
   composerInput: {
     flex: 1,
@@ -323,7 +314,10 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 18,
     borderWidth: 1,
-    fontSize: 16
+    fontSize: 16,
+    color: theme.text,
+    backgroundColor: theme.inputBg,
+    borderColor: theme.border
   },
   sendButton: {
     paddingHorizontal: 16,
@@ -333,39 +327,5 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  sendText: { fontSize: 15, fontWeight: "600" }
+  sendText: { fontSize: 15, fontWeight: "600", color: theme.buttonText }
 });
-
-const lightTheme = {
-  bg: "#ffffff",
-  text: "#0a0a0a",
-  subtle: "#6b7280",
-  border: "#e4e4e7",
-  inputBg: "#fafafa",
-  user: "#2563eb",
-  userText: "#ffffff",
-  assistant: "#f4f4f5",
-  assistantText: "#0a0a0a",
-  system: "#fef3c7",
-  systemText: "#7c2d12",
-  button: "#0a0a0a",
-  buttonDisabled: "#a1a1aa",
-  buttonText: "#ffffff"
-};
-
-const darkTheme = {
-  bg: "#0a0a0a",
-  text: "#fafafa",
-  subtle: "#9ca3af",
-  border: "#27272a",
-  inputBg: "#18181b",
-  user: "#3b82f6",
-  userText: "#ffffff",
-  assistant: "#18181b",
-  assistantText: "#fafafa",
-  system: "#451a03",
-  systemText: "#fde68a",
-  button: "#fafafa",
-  buttonDisabled: "#52525b",
-  buttonText: "#0a0a0a"
-};

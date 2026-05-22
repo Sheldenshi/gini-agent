@@ -1,4 +1,4 @@
-import { router } from "expo-router";
+import { Stack, router } from "expo-router";
 import { useState } from "react";
 import {
   ActivityIndicator,
@@ -8,20 +8,17 @@ import {
   StyleSheet,
   Text,
   TextInput,
-  TouchableOpacity,
-  useColorScheme,
-  View
+  TouchableOpacity
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
+import { theme } from "@/src/theme";
 import type { RuntimeStatus } from "@/src/types";
 
 const DEFAULT_BASE_URL = "http://localhost:7421";
 
 export default function SetupScreen() {
-  const scheme = useColorScheme();
-  const theme = scheme === "dark" ? darkTheme : lightTheme;
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
@@ -65,20 +62,28 @@ export default function SetupScreen() {
   };
 
   return (
-    <SafeAreaView style={[styles.safe, { backgroundColor: theme.bg }]} edges={["bottom"]}>
+    <SafeAreaView style={styles.safe} edges={["bottom"]}>
+      <Stack.Screen
+        options={{
+          title: "Connect to Gini",
+          headerStyle: { backgroundColor: theme.bg },
+          headerTitleStyle: { color: theme.text },
+          headerTintColor: theme.accent
+        }}
+      />
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         style={styles.flex}
       >
         <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
-          <Text style={[styles.heading, { color: theme.text }]}>Connect to Gini</Text>
-          <Text style={[styles.subhead, { color: theme.subtle }]}>
+          <Text style={styles.heading}>Connect to Gini</Text>
+          <Text style={styles.subhead}>
             Paste the runtime's base URL and bearer token. You can find the
             token in {`~/.gini/instances/<instance>/config.json`} or by running
             {" "}<Text style={styles.mono}>gini status</Text>.
           </Text>
 
-          <Text style={[styles.label, { color: theme.text }]}>Base URL</Text>
+          <Text style={styles.label}>Base URL</Text>
           <TextInput
             value={baseUrl}
             onChangeText={setBaseUrl}
@@ -89,10 +94,10 @@ export default function SetupScreen() {
             placeholder={DEFAULT_BASE_URL}
             placeholderTextColor={theme.subtle}
             editable={!busy}
-            style={[styles.input, { color: theme.text, borderColor: theme.border, backgroundColor: theme.inputBg }]}
+            style={styles.input}
           />
 
-          <Text style={[styles.label, { color: theme.text }]}>Bearer token</Text>
+          <Text style={styles.label}>Bearer token</Text>
           <TextInput
             value={token}
             onChangeText={setToken}
@@ -102,26 +107,27 @@ export default function SetupScreen() {
             placeholder="paste token"
             placeholderTextColor={theme.subtle}
             editable={!busy}
-            style={[styles.input, { color: theme.text, borderColor: theme.border, backgroundColor: theme.inputBg }]}
+            style={styles.input}
           />
 
-          {error ? (
-            <Text style={[styles.error, { color: theme.danger }]}>{error}</Text>
-          ) : null}
+          {error ? <Text style={styles.error}>{error}</Text> : null}
 
           <TouchableOpacity
             disabled={busy}
             onPress={onSubmit}
-            style={[styles.button, { backgroundColor: busy ? theme.buttonDisabled : theme.button }]}
+            style={[
+              styles.button,
+              busy && { backgroundColor: theme.buttonDisabled }
+            ]}
           >
             {busy ? (
               <ActivityIndicator color={theme.buttonText} />
             ) : (
-              <Text style={[styles.buttonText, { color: theme.buttonText }]}>Save & continue</Text>
+              <Text style={styles.buttonText}>Save & continue</Text>
             )}
           </TouchableOpacity>
 
-          <Text style={[styles.footnote, { color: theme.subtle }]}>
+          <Text style={styles.footnote}>
             On a real device, replace localhost with the runtime host's LAN
             IP (e.g. http://192.168.1.42:7421). The simulator/emulator can
             keep localhost.
@@ -133,52 +139,32 @@ export default function SetupScreen() {
 }
 
 const styles = StyleSheet.create({
-  safe: { flex: 1 },
+  safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
   scroll: { padding: 20, paddingTop: 32, gap: 12 },
-  heading: { fontSize: 24, fontWeight: "700" },
-  subhead: { fontSize: 14, lineHeight: 20, marginBottom: 8 },
+  heading: { fontSize: 24, fontWeight: "700", color: theme.text },
+  subhead: { fontSize: 14, lineHeight: 20, marginBottom: 8, color: theme.subtle },
   mono: { fontFamily: Platform.select({ ios: "Menlo", android: "monospace", default: "monospace" }) },
-  label: { fontSize: 13, fontWeight: "600", marginTop: 12 },
+  label: { fontSize: 13, fontWeight: "600", marginTop: 12, color: theme.text },
   input: {
     borderWidth: 1,
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 12,
-    fontSize: 16
+    fontSize: 16,
+    color: theme.text,
+    borderColor: theme.border,
+    backgroundColor: theme.inputBg
   },
-  error: { fontSize: 14, marginTop: 4 },
+  error: { fontSize: 14, marginTop: 4, color: theme.danger },
   button: {
     marginTop: 20,
     paddingVertical: 14,
     borderRadius: 10,
     alignItems: "center",
-    justifyContent: "center"
+    justifyContent: "center",
+    backgroundColor: theme.button
   },
-  buttonText: { fontSize: 16, fontWeight: "600" },
-  footnote: { fontSize: 12, marginTop: 16, lineHeight: 18 }
+  buttonText: { fontSize: 16, fontWeight: "600", color: theme.buttonText },
+  footnote: { fontSize: 12, marginTop: 16, lineHeight: 18, color: theme.subtle }
 });
-
-const lightTheme = {
-  bg: "#ffffff",
-  text: "#0a0a0a",
-  subtle: "#6b7280",
-  border: "#d4d4d8",
-  inputBg: "#fafafa",
-  button: "#0a0a0a",
-  buttonDisabled: "#a1a1aa",
-  buttonText: "#ffffff",
-  danger: "#dc2626"
-};
-
-const darkTheme = {
-  bg: "#0a0a0a",
-  text: "#fafafa",
-  subtle: "#9ca3af",
-  border: "#27272a",
-  inputBg: "#18181b",
-  button: "#fafafa",
-  buttonDisabled: "#52525b",
-  buttonText: "#0a0a0a",
-  danger: "#f87171"
-};

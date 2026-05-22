@@ -10,6 +10,7 @@ import { ActivityIndicator, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
+import { theme } from "@/src/theme";
 
 // Single shared client across the tree so navigating between screens
 // keeps caches warm. Built once per app lifetime — Expo Router never
@@ -43,18 +44,25 @@ export default function RootLayout() {
     };
   }, []);
 
+  // Force the dark palette across every screen — there is no light
+  // variant in v1. Stack header tint/background come from the per-screen
+  // options to keep the rule of "the screen owns its own chrome", but
+  // the content background is set globally so the brief flash between
+  // route transitions doesn't show the OS-default white.
   const screenOptions = useMemo(
     () => ({
-      headerStyle: { backgroundColor: "transparent" } as const,
-      contentStyle: { backgroundColor: "transparent" } as const
+      headerStyle: { backgroundColor: theme.bg } as const,
+      headerTitleStyle: { color: theme.text } as const,
+      headerTintColor: theme.accent,
+      contentStyle: { backgroundColor: theme.bg } as const
     }),
     []
   );
 
   if (!primed) {
     return (
-      <View style={{ flex: 1, alignItems: "center", justifyContent: "center" }}>
-        <ActivityIndicator />
+      <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: theme.bg }}>
+        <ActivityIndicator color={theme.subtle} />
       </View>
     );
   }
@@ -64,7 +72,9 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <QueryClientProvider client={queryClient}>
           <AuthCacheGuard />
-          <StatusBar style="auto" />
+          {/* Dark palette is the only theme — pin the status bar text to
+              light so it stays readable against the navy header. */}
+          <StatusBar style="light" />
           <Stack screenOptions={screenOptions}>
             <Stack.Screen name="index" options={{ headerShown: false }} />
             <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
