@@ -571,6 +571,12 @@ export async function recordDeniedChatAttempt(
   await mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === bridgeId);
     if (!live) return;
+    // Re-check the allowlist inside the lock. The poller's authorize call
+    // happens outside mutateState, so if the operator clicks Approve in the
+    // window between that read and us getting here the chat is already
+    // allowed — silently skipping the deny write keeps the pending list from
+    // re-appearing after a successful approval.
+    if (isChatAllowed(live, attempt.chatId)) return;
     const meta = { ...(live.metadata ?? {}) };
     const existing = readRecentDeniedChats(live).filter((entry) => entry.chatId !== attempt.chatId);
     const entry: DeniedChatAttempt = {
