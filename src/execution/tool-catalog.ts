@@ -758,48 +758,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Add a new memory item. Defaults `status: "proposed"` — the agent
-    // doesn't pin its own memory active; the user reviews via the existing
-    // approval flow (`POST /api/memory/<id>/approve`).
-    toolset: "memory",
-    type: "function",
-    function: {
-      name: "add_memory",
-      description: "Propose a new memory item. Memory items added by the agent start as `proposed` and require user approval via the memory review flow (`POST /api/memory/<id>/approve`). Use when the user shares a stable fact about themselves or their preferences that should ride the system prompt on future tasks. Avoid noting ephemeral context (it's already in the conversation) — propose only things worth remembering across sessions.",
-      parameters: {
-        type: "object",
-        properties: {
-          content: { type: "string", description: "The memory text (1-2 sentences). Keep it concise — pinned memories cost context every turn." },
-          confidence: { type: "number", description: "Confidence in the fact, 0-1. Defaults to 1. Lower for inferred facts." },
-          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Mark `sensitive` for items the user wouldn't want surfaced in default UI views. Defaults to `normal`." },
-          provenance: { type: "string", description: "Short note about where the fact came from (e.g. 'User said in chat'). Defaults to 'Proposed by agent'." }
-        },
-        required: ["content"]
-      }
-    }
-  },
-  {
-    // Edit an existing memory in place. Use sparingly — `add_memory` is
-    // the usual path. The audit trail records every edit; the user can
-    // archive a bad edit via `DELETE /api/memory/<id>`.
-    toolset: "memory",
-    type: "function",
-    function: {
-      name: "update_memory",
-      description: "Edit an existing memory item in place (content / confidence / sensitivity). Use sparingly — `add_memory` is the usual path. The audit trail records every edit, and the user can archive a bad edit via `DELETE /api/memory/<id>`. Supply only the fields you want to change.",
-      parameters: {
-        type: "object",
-        properties: {
-          memoryId: { type: "string", description: "Id of the memory to edit (e.g. 'mem_abc123')." },
-          content: { type: "string", description: "Optional new memory text." },
-          confidence: { type: "number", description: "Optional new confidence value, 0-1." },
-          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Optional new sensitivity classification." }
-        },
-        required: ["memoryId"]
-      }
-    }
-  },
-  {
     // Manually trigger an existing scheduled job. Wraps the same
     // `runJobNow` entrypoint that `POST /api/jobs/<id>/run` calls. Low-risk
     // / no approval: the spawned task itself still flows through the job's

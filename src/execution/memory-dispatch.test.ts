@@ -1,11 +1,10 @@
 // Unit tests for the memory-tool dispatch surface:
-//   - `recall_memory` (read-only on-demand recall)
-//   - `add_memory` (proposed by default)
-//   - `update_memory` (edit in place)
+//   - `recall_memory` (read-only on-demand recall against Hindsight)
 //
-// We seed the SQLite memory store with a few hand-crafted units to exercise
-// the recall path, and exercise the legacy MemoryRecord CRUD path for add /
-// update.
+// Pinned-memory CRUD tools (`add_memory` / `update_memory`) were removed
+// alongside the `state.memories` consolidation — USER.md / SOUL.md /
+// Hindsight are now the three memory surfaces. See ADR
+// memory-surface-consolidation.md.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
@@ -56,8 +55,8 @@ function makeConfig(instance: string): RuntimeConfig {
   };
 }
 
-// Seed an active agent so resolveEffectiveContext returns one — the
-// legacy memory CRUD path refuses to write when no agent is active.
+// Seed an active agent so resolveEffectiveContext returns one — recall
+// refuses to run when no agent is active.
 async function seedAgent(config: RuntimeConfig): Promise<void> {
   await mutateState(config.instance, (state) => {
     if (!state.agents.find((a) => a.id === TEST_AGENT)) {
@@ -122,7 +121,7 @@ describe("memory tool registration", () => {
     expect(tool?.function.parameters.required).toEqual(["query"]);
   });
 
-  test("add_memory registers with toolset 'memory' and requires content", () => {
+  test("add_memory and update_memory are NOT in the catalog (dropped surfaces)", () => {
     const ts: ToolsetRecord = {
       id: "toolset_memory",
       instance: "test",
@@ -135,29 +134,9 @@ describe("memory tool registration", () => {
       updatedAt: "2026-01-01T00:00:00.000Z"
     };
     const catalog = buildToolCatalog(stateWithToolsets([ts]));
-    const tool = catalog.find((t) => t.function.name === "add_memory");
-    expect(tool).toBeDefined();
-    expect(tool?.toolset).toBe("memory");
-    expect(tool?.function.parameters.required).toEqual(["content"]);
-  });
-
-  test("update_memory registers with toolset 'memory' and requires memoryId", () => {
-    const ts: ToolsetRecord = {
-      id: "toolset_memory",
-      instance: "test",
-      name: "memory",
-      description: "",
-      status: "enabled",
-      toolNames: [],
-      scopes: ["task"],
-      createdAt: "2026-01-01T00:00:00.000Z",
-      updatedAt: "2026-01-01T00:00:00.000Z"
-    };
-    const catalog = buildToolCatalog(stateWithToolsets([ts]));
-    const tool = catalog.find((t) => t.function.name === "update_memory");
-    expect(tool).toBeDefined();
-    expect(tool?.toolset).toBe("memory");
-    expect(tool?.function.parameters.required).toEqual(["memoryId"]);
+    const names = catalog.map((t) => t.function.name);
+    expect(names).not.toContain("add_memory");
+    expect(names).not.toContain("update_memory");
   });
 });
 
@@ -211,120 +190,25 @@ describe("recall_memory dispatch", () => {
       dispatchToolCall(config, taskId, "recall_memory", "call_recall_empty", JSON.stringify({}))
     ).rejects.toThrow(/query/);
   });
-});
 
-describe("add_memory dispatch", () => {
-  test("writes a proposed-status memory and emits memory.added audit", async () => {
-    const instance = "memory-add-happy";
-    const config = makeConfig(instance);
-    await seedAgent(config);
-    const taskId = await seedTask(config);
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "add_memory",
-      "call_add",
-      JSON.stringify({ content: "User prefers dark mode." })
-    );
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      expect(result.result).toMatch(/Proposed memory mem_/);
-      expect(result.result).toMatch(/status: proposed/);
-    }
-
-    const state = readState(instance);
-    const memory = state.memories.find((m) => m.content === "User prefers dark mode.");
-    expect(memory).toBeDefined();
-    expect(memory?.status).toBe("proposed");
-
-    const audit = state.audit.find((event) => event.action === "memory.added" && event.actor === "agent");
-    expect(audit).toBeDefined();
-    expect(audit?.evidence?.memoryId).toBe(memory?.id);
-    expect(audit?.evidence?.status).toBe("proposed");
-  });
-
-  test("ignores caller-supplied status override (always proposed)", async () => {
-    const instance = "memory-add-override";
-    const config = makeConfig(instance);
-    await seedAgent(config);
-    const taskId = await seedTask(config);
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "add_memory",
-      "call_add_override",
-      JSON.stringify({ content: "Sneaky fact", status: "active" })
-    );
-    expect(result.kind).toBe("sync");
-
-    const memory = readState(instance).memories.find((m) => m.content === "Sneaky fact");
-    expect(memory?.status).toBe("proposed");
-  });
-
-  test("rejects missing content", async () => {
-    const instance = "memory-add-bad";
+  test("add_memory dispatch is rejected as unknown tool", async () => {
+    const instance = "memory-add-removed";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
     await expect(
-      dispatchToolCall(config, taskId, "add_memory", "call_add_bad", JSON.stringify({}))
-    ).rejects.toThrow(/content/);
-  });
-});
-
-describe("update_memory dispatch", () => {
-  test("edits content and emits the canonical memory.edited audit", async () => {
-    const instance = "memory-update-happy";
-    const config = makeConfig(instance);
-    await seedAgent(config);
-    const taskId = await seedTask(config);
-    // Seed an existing memory via the dispatch path.
-    const addRes = await dispatchToolCall(
-      config,
-      taskId,
-      "add_memory",
-      "call_add_for_update",
-      JSON.stringify({ content: "Original content" })
-    );
-    expect(addRes.kind).toBe("sync");
-    const memoryBefore = readState(instance).memories.find((m) => m.content === "Original content");
-    expect(memoryBefore).toBeDefined();
-
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "update_memory",
-      "call_update",
-      JSON.stringify({ memoryId: memoryBefore!.id, content: "Updated content" })
-    );
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      expect(result.result).toMatch(new RegExp(memoryBefore!.id));
-      expect(result.result).toMatch(/content/);
-    }
-
-    const memoryAfter = readState(instance).memories.find((m) => m.id === memoryBefore!.id);
-    expect(memoryAfter?.content).toBe("Updated content");
-
-    // editMemory writes the canonical row (actor=user, risk=medium). The
-    // update_memory tool wrapper does NOT layer a second agent-attributed
-    // row — the medium-risk row is the safeguard; a low-risk agent row
-    // would just obscure it. Pin both: at least one canonical row exists,
-    // and no agent-attributed `memory.edited` row exists for this target.
-    const audits = readState(instance).audit.filter(
-      (event) => event.action === "memory.edited" && event.target === memoryBefore!.id
-    );
-    expect(audits.length).toBeGreaterThan(0);
-    const canonical = audits.find((event) => event.actor === "user" && event.risk === "medium");
-    expect(canonical).toBeDefined();
-    const agentDuplicate = audits.find((event) => event.actor === "agent");
-    expect(agentDuplicate).toBeUndefined();
+      dispatchToolCall(
+        config,
+        taskId,
+        "add_memory",
+        "call_add",
+        JSON.stringify({ content: "removed" })
+      )
+    ).rejects.toThrow(/Unknown tool/);
   });
 
-  test("rejects missing memoryId", async () => {
-    const instance = "memory-update-no-id";
+  test("update_memory dispatch is rejected as unknown tool", async () => {
+    const instance = "memory-update-removed";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
@@ -333,41 +217,9 @@ describe("update_memory dispatch", () => {
         config,
         taskId,
         "update_memory",
-        "call_update_no_id",
-        JSON.stringify({ content: "x" })
+        "call_update",
+        JSON.stringify({ memoryId: "mem_x", content: "removed" })
       )
-    ).rejects.toThrow(/memoryId/);
-  });
-
-  test("rejects empty patch", async () => {
-    const instance = "memory-update-empty";
-    const config = makeConfig(instance);
-    await seedAgent(config);
-    const taskId = await seedTask(config);
-    await expect(
-      dispatchToolCall(
-        config,
-        taskId,
-        "update_memory",
-        "call_update_empty",
-        JSON.stringify({ memoryId: "mem_nope" })
-      )
-    ).rejects.toThrow(/at least one field/);
-  });
-
-  test("surfaces error for unknown memoryId", async () => {
-    const instance = "memory-update-missing";
-    const config = makeConfig(instance);
-    await seedAgent(config);
-    const taskId = await seedTask(config);
-    await expect(
-      dispatchToolCall(
-        config,
-        taskId,
-        "update_memory",
-        "call_update_missing",
-        JSON.stringify({ memoryId: "mem_nope", content: "x" })
-      )
-    ).rejects.toThrow(/Memory not found/);
+    ).rejects.toThrow(/Unknown tool/);
   });
 });

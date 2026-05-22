@@ -96,8 +96,6 @@ describe("buildToolCatalog", () => {
     const names = new Set(catalog.map((t) => t.function.name));
     const expectedVisible = [
       "recall_memory",
-      "add_memory",
-      "update_memory",
       "search_history",
       "cancel_task",
       "install_skill",
@@ -109,6 +107,11 @@ describe("buildToolCatalog", () => {
     for (const tool of expectedVisible) {
       expect(names.has(tool)).toBe(true);
     }
+    // add_memory and update_memory were dropped as part of the
+    // state.memories consolidation. See ADR
+    // memory-surface-consolidation.md.
+    expect(names.has("add_memory")).toBe(false);
+    expect(names.has("update_memory")).toBe(false);
     // Kill switch contract: messaging toolset defaults disabled, so the
     // surface-gateway send_message tool stays hidden in a fresh catalog.
     expect(names.has("send_message")).toBe(false);

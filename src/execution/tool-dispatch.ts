@@ -29,7 +29,7 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
-import { createMemoryFromInput, editMemory, recall } from "../memory";
+import { recall } from "../memory";
 import {
   loadSoul,
   loadUserProfile,
@@ -111,10 +111,6 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await runJobTool(config, taskId, args) };
     case "recall_memory":
       return { kind: "sync", result: await recallMemoryTool(config, taskId, args) };
-    case "add_memory":
-      return { kind: "sync", result: await addMemoryTool(config, taskId, args) };
-    case "update_memory":
-      return { kind: "sync", result: await updateMemoryTool(config, taskId, args) };
     case "edit_soul":
       return { kind: "sync", result: await editSoulTool(config, taskId, args) };
     case "edit_user_profile":
@@ -1428,122 +1424,6 @@ async function recallMemoryTool(
     totalTokens: result.totalTokens,
     excerpts
   });
-}
-
-// Propose a new memory item. Always lands as `status: "proposed"` —
-// the agent does not pin its own memory active. The user reviews via
-// the existing memory approval flow (`POST /api/memory/<id>/approve`).
-async function addMemoryTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const content = requireString(args, "content");
-  let confidence = 1;
-  if (args.confidence !== undefined && args.confidence !== null) {
-    if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
-      throw new Error("Invalid input: confidence must be a number.");
-    }
-    confidence = Math.max(0, Math.min(1, args.confidence));
-  }
-  let sensitivity: "normal" | "sensitive" = "normal";
-  if (args.sensitivity !== undefined && args.sensitivity !== null) {
-    if (args.sensitivity !== "normal" && args.sensitivity !== "sensitive") {
-      throw new Error("Invalid input: sensitivity must be 'normal' or 'sensitive'.");
-    }
-    sensitivity = args.sensitivity;
-  }
-  let provenance = "Proposed by agent";
-  if (args.provenance !== undefined && args.provenance !== null) {
-    if (typeof args.provenance !== "string") {
-      throw new Error("Invalid input: provenance must be a string.");
-    }
-    provenance = args.provenance;
-  }
-  // Agent-proposed memory ALWAYS starts proposed — the user reviews
-  // before pinning. We deliberately don't honor an inbound `status`
-  // override; the catalog signature reflects that.
-  const memory = await createMemoryFromInput(config, {
-    content,
-    confidence,
-    sensitivity,
-    provenance,
-    status: "proposed"
-  });
-  await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    addAudit(
-      state,
-      {
-        actor: "agent",
-        action: "memory.added",
-        target: memory.id,
-        risk: "low",
-        taskId: item.id,
-        runId: item.runId,
-        evidence: {
-          memoryId: memory.id,
-          contentExcerpt: content.length > 200 ? `${content.slice(0, 200)}…` : content,
-          status: memory.status,
-          confidence,
-          sensitivity
-        }
-      },
-      { taskId: item.id }
-    );
-    item.updatedAt = now();
-  });
-  appendTrace(config.instance, taskId, {
-    type: "memory",
-    message: "Proposed new memory",
-    data: { memoryId: memory.id, status: memory.status, contentBytes: content.length }
-  });
-  return `Proposed memory ${memory.id} (status: ${memory.status}). Awaiting user approval via /api/memory/${memory.id}/approve.`;
-}
-
-// Edit an existing memory in place. Use sparingly — `add_memory` is the
-// usual path. The audit trail records every edit; the user can archive
-// a bad edit via `DELETE /api/memory/<id>`.
-async function updateMemoryTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const memoryId = requireString(args, "memoryId");
-  const input: Record<string, unknown> = {};
-  if (args.content !== undefined && args.content !== null) {
-    if (typeof args.content !== "string") {
-      throw new Error("Invalid input: content must be a string.");
-    }
-    input.content = args.content;
-  }
-  if (args.confidence !== undefined && args.confidence !== null) {
-    if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
-      throw new Error("Invalid input: confidence must be a number.");
-    }
-    input.confidence = args.confidence;
-  }
-  if (args.sensitivity !== undefined && args.sensitivity !== null) {
-    if (args.sensitivity !== "normal" && args.sensitivity !== "sensitive") {
-      throw new Error("Invalid input: sensitivity must be 'normal' or 'sensitive'.");
-    }
-    input.sensitivity = args.sensitivity;
-  }
-  if (Object.keys(input).length === 0) {
-    throw new Error("Invalid input: update_memory requires at least one field to change.");
-  }
-  // `editMemory` already writes the canonical `memory.edited` audit row
-  // (medium risk, actor user) — that's the safeguard the memory module
-  // owns. Writing a second row from the tool wrapper would just obscure
-  // the medium-risk gate with low-risk agent noise. The per-task trace
-  // below carries the agent's narrative.
-  const memory = await editMemory(config, memoryId, input);
-  appendTrace(config.instance, taskId, {
-    type: "memory",
-    message: "Edited memory",
-    data: { memoryId, appliedFields: Object.keys(input) }
-  });
-  return `Updated memory ${memory.id}: ${Object.keys(input).join(", ")}.`;
 }
 
 // Propose an edit to the active agent's SOUL.md. The body always lands
