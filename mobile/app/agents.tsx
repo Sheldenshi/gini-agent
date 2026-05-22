@@ -22,7 +22,7 @@ import {
   useCreateChat,
   useUseAgent
 } from "@/src/queries";
-import { theme } from "@/src/theme";
+import { avatarColor, avatarInitial, theme } from "@/src/theme";
 import type { AgentRecord, ChatSession } from "@/src/types";
 
 // Home screen: a full-width chat list for the currently selected agent.
@@ -321,6 +321,20 @@ function ChatList({
   onNewChat: () => void;
   creatingChat: boolean;
 }) {
+  // Hooks run unconditionally so the loading / error / empty branches
+  // below don't break Rules of Hooks. Filter is empty by default; we
+  // fall back to "New chat" for untitled sessions so empty-title rows
+  // remain reachable via search.
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return chats;
+    return chats.filter((s) => {
+      const t = (s.title?.trim() || "New chat").toLowerCase();
+      return t.includes(q);
+    });
+  }, [chats, query]);
+
   if (isAgentsLoading && agents.length === 0) {
     return (
       <View style={styles.center}>
@@ -394,19 +408,42 @@ function ChatList({
   }
 
   return (
-    <FlatList
-      data={chats}
-      keyExtractor={(s) => s.id}
-      refreshControl={
-        <RefreshControl
-          refreshing={isChatsFetching && !isChatsLoading}
-          onRefresh={onRetryChats}
-          tintColor={theme.subtle}
+    <View style={{ flex: 1 }}>
+      <View style={styles.searchBarContainer}>
+        <TextInput
+          value={query}
+          onChangeText={setQuery}
+          placeholder="Search"
+          placeholderTextColor={theme.subtle}
+          autoCapitalize="none"
+          autoCorrect={false}
+          returnKeyType="search"
+          clearButtonMode="while-editing"
+          style={styles.searchBarInput}
+          accessibilityLabel="Search chats"
         />
-      }
-      ItemSeparatorComponent={ChatRowSeparator}
-      renderItem={({ item }) => <ChatRow session={item} agent={agent} />}
-    />
+      </View>
+      <FlatList
+        data={filtered}
+        keyExtractor={(s) => s.id}
+        refreshControl={
+          <RefreshControl
+            refreshing={isChatsFetching && !isChatsLoading}
+            onRefresh={onRetryChats}
+            tintColor={theme.subtle}
+          />
+        }
+        ItemSeparatorComponent={ChatRowSeparator}
+        renderItem={({ item }) => <ChatRow session={item} agent={agent} />}
+        ListEmptyComponent={
+          query.trim() ? (
+            <View style={styles.searchEmpty}>
+              <Text style={styles.emptySub}>No chats match “{query}”</Text>
+            </View>
+          ) : null
+        }
+      />
+    </View>
   );
 }
 
@@ -428,6 +465,8 @@ function ChatRow({
   // present, which the runtime fills in for some flows.
   const subtitle = session.summary?.trim() || agent?.name || "";
   const time = relativeTime(session.updatedAt ?? session.createdAt);
+  const initial = avatarInitial(title);
+  const bg = avatarColor(session.id);
 
   return (
     <TouchableOpacity
@@ -435,6 +474,9 @@ function ChatRow({
       activeOpacity={0.7}
       style={styles.chatRow}
     >
+      <View style={[styles.chatRowAvatar, { backgroundColor: bg }]}>
+        <Text style={styles.chatRowAvatarText}>{initial}</Text>
+      </View>
       <View style={styles.chatRowBody}>
         <View style={styles.chatRowTopLine}>
           <Text style={styles.chatRowTitle} numberOfLines={1}>
@@ -703,21 +745,48 @@ const styles = StyleSheet.create({
   },
   headerActionText: { color: theme.accent, fontSize: 15, fontWeight: "500" },
 
+  // Search bar — pill-shaped TextInput above the chat list.
+  searchBarContainer: { paddingHorizontal: 12, paddingVertical: 8 },
+  searchBarInput: {
+    backgroundColor: theme.inputBg,
+    color: theme.text,
+    fontSize: 15,
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 12
+  },
+  searchEmpty: { padding: 24, alignItems: "center" },
+
   // Chat rows.
   chatRow: {
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 12
+    paddingVertical: 12,
+    gap: 12
   },
+  // Separator starts at the title's left edge so the avatar column
+  // stays uninterrupted: 16 (row padding) + 48 (avatar) + 12 (gap).
   chatRowSeparator: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: theme.border,
-    marginLeft: 16 // align with title text
+    marginLeft: 76
+  },
+  chatRowAvatar: {
+    width: 48,
+    height: 48,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  chatRowAvatarText: {
+    color: "#FFFFFF",
+    fontSize: 18,
+    fontWeight: "700"
   },
   chatRowBody: { flex: 1, gap: 2 },
-  chatRowTopLine: { flexDirection: "row", alignItems: "baseline", gap: 8 },
-  chatRowTitle: { flex: 1, color: theme.text, fontSize: 16, fontWeight: "600" },
+  chatRowTopLine: { flexDirection: "row", alignItems: "flex-start", gap: 8 },
+  chatRowTitle: { flex: 1, color: theme.text, fontSize: 16, fontWeight: "700" },
   chatRowTime: { color: theme.subtle, fontSize: 12 },
   chatRowSubtitle: { color: theme.subtle, fontSize: 13 },
 
