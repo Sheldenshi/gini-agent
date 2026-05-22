@@ -4,7 +4,6 @@ import { BlockAssistantText } from "./BlockAssistantText";
 import { BlockPhase } from "./BlockPhase";
 import { BlockSystemNote } from "./BlockSystemNote";
 import { BlockToolCall } from "./BlockToolCall";
-import { BlockToolResult } from "./BlockToolResult";
 import { BlockUserText } from "./BlockUserText";
 
 // Dispatcher for the typed ChatBlock union. The switch is exhaustive on
@@ -20,7 +19,10 @@ export function BlockRenderer({ block }: { block: ChatBlock }) {
     case "tool_call":
       return <BlockToolCall block={block} />;
     case "tool_result":
-      return <BlockToolResult block={block} />;
+      // Tool results are noise in the transcript — the assistant's reply
+      // already summarizes the meaningful output. The block is still
+      // emitted and persisted so future "expand details" UI can reach it.
+      return null;
     case "phase":
       return <BlockPhase block={block} />;
     case "approval_requested":
