@@ -216,7 +216,11 @@ const server = Bun.serve({
       // localhost by appending the persisted secret, bypassing the
       // bearer-token check the rest of the gateway relies on.
       getSecret: () => (tunnelResolved.config.enabled ? tunnelResolved.config.secret : null),
-      getSnapshot: () => (tunnelResolved.config.enabled ? tunnelManager.getSnapshot() : null),
+      // Always return the snapshot — the snapshot carries `enabled` so
+      // the UI can render "Off" vs "Live" without having to guess from
+      // missing fields. Sensitive content (secret + publicUrl) is still
+      // stripped by the BFF redactor before reaching the browser.
+      getSnapshot: () => tunnelManager.getSnapshot(),
       // Only expose the refresh hook when the tunnel feature is opted into.
       // Without this gate, a disabled-tunnel runtime would still let
       // `GET /api/tunnel` invoke the manager and return its internal

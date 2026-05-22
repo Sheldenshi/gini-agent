@@ -49,6 +49,7 @@ export function redactTunnelSnapshot(payload: unknown): unknown {
   // clients can still check `!!secret` / `!!publicUrl` against the
   // expected shape.
   return {
+    enabled: typeof record.enabled === "boolean" ? record.enabled : null,
     publicUrl: null,
     cloudflareUrl: typeof record.cloudflareUrl === "string" ? record.cloudflareUrl : null,
     secret: null,

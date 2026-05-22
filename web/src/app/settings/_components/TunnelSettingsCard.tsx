@@ -12,6 +12,7 @@ import {
   DialogHeader,
   DialogTitle
 } from "@/components/ui/dialog";
+import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 
 interface AppleNotesStatus {
@@ -24,6 +25,7 @@ interface AppleNotesStatus {
 }
 
 interface TunnelSnapshot {
+  enabled: boolean | null;
   publicUrl: string | null;
   cloudflareUrl: string | null;
   secret: string | null;
@@ -33,9 +35,12 @@ interface TunnelSnapshot {
   lastError: string | null;
 }
 
-// The browser receives a snapshot with `secret` and `publicUrl` set to null
-// by the BFF redactor. `cloudflareUrl` (the bare host) is enough to show
-// the operator that the tunnel is live; full URLs stay on the host.
+// Same shape as the existing Toolsets/MCP/Messaging/Devices cards on
+// this page: an outline button labeled with the action ("Enable" vs
+// "Disable") next to a StatusPill that shows the current state.
+// Optimistic mutation flips the cache immediately so the toggle never
+// freezes when the click itself severs the response path (disabling
+// the tunnel from a page being served through that same tunnel).
 export function TunnelSettingsCard() {
   const queryClient = useQueryClient();
   const snapshot = useQuery({
@@ -45,28 +50,47 @@ export function TunnelSettingsCard() {
   });
   const [infoOpen, setInfoOpen] = useState(false);
 
-  const tunnelEnabled = snapshot.data?.cloudflareUrl !== null || (snapshot.data?.appleNotes?.enabled ?? false);
-  const notesEnabled = snapshot.data?.appleNotes?.enabled ?? false;
+  const tunnelEnabled = snapshot.data?.enabled === true;
+  const liveUrl = snapshot.data?.cloudflareUrl ?? null;
+  const tunnelStatus = !tunnelEnabled
+    ? "disabled"
+    : liveUrl
+      ? "active"
+      : "pending";
+  const tunnelDescription = !tunnelEnabled
+    ? "Off — the gateway is reachable on localhost only."
+    : liveUrl
+      ? `Live at ${liveUrl}`
+      : "Connecting…";
+
   const notesAvailable = snapshot.data?.appleNotes?.available;
+  const notesEnabled = snapshot.data?.appleNotes?.enabled === true;
   const notesUnavailableReason = notesAvailable === false
     ? snapshot.data?.appleNotes?.lastError ?? "iCloud account not found in Notes.app on this host."
     : null;
+  const notesStatus = !tunnelEnabled || !notesEnabled
+    ? "disabled"
+    : notesUnavailableReason
+      ? "error"
+      : "active";
+  const notesDescription = !tunnelEnabled
+    ? "Off — enable the tunnel first."
+    : notesUnavailableReason
+      ? notesUnavailableReason
+      : notesEnabled
+        ? snapshot.data?.appleNotes?.lastSyncedAt
+          ? `Last synced ${new Date(snapshot.data.appleNotes.lastSyncedAt).toLocaleString()}`
+          : "Waiting for the next sync…"
+        : "Off";
 
   // Toggling the tunnel off while the operator is currently accessing the
   // gateway through that same tunnel is inherently self-defeating: the
   // runtime tears cloudflared down before our PATCH gets a response, so
-  // the fetch hangs and the toggle button looks frozen. Optimistic
-  // updates flip the visible state the instant the user clicks, the
-  // request fires fire-and-forget, and refetches that come back as
-  // errors (because the tunnel is gone) leave the optimistic state in
-  // place instead of reverting.
+  // the fetch hangs and the button looks frozen. Optimistic updates
+  // flip the visible state the instant the user clicks; the PATCH races
+  // against a short ceiling so the mutation can't pend forever.
   const toggleTunnel = useMutation({
     mutationFn: async (enabled: boolean) => {
-      // Race the actual PATCH against a short ceiling — the runtime
-      // applies the change as soon as it parses the body, so we don't
-      // need to wait for the response. If the response never comes
-      // (tunnel torn down before the reply was written), we resolve
-      // anyway and let the optimistic state stand.
       const fetchPromise = api<TunnelSnapshot>("/tunnel", {
         method: "PATCH",
         body: JSON.stringify({ enabled })
@@ -77,14 +101,11 @@ export function TunnelSettingsCard() {
     onMutate: async (enabled: boolean) => {
       await queryClient.cancelQueries({ queryKey: ["tunnel"] });
       const previous = queryClient.getQueryData<TunnelSnapshot>(["tunnel"]);
-      // Project the snapshot onto a "what the user expects to see" view:
-      // disabling clears the live URL fields, enabling leaves a stub
-      // observedAt so the description switches to "Connecting…" instead
-      // of "Off" until the next refetch.
       queryClient.setQueryData<TunnelSnapshot | undefined>(["tunnel"], (old) =>
         old
           ? {
               ...old,
+              enabled,
               cloudflareUrl: enabled ? old.cloudflareUrl : null,
               publicUrl: null,
               observedAt: enabled ? old.observedAt ?? new Date().toISOString() : null,
@@ -102,9 +123,6 @@ export function TunnelSettingsCard() {
       toast.success(enabled ? "Tunnel enabled" : "Tunnel disabled");
     },
     onError: (error: Error, _enabled, context) => {
-      // Hard fetch error (DNS, refused) — keep the optimistic state so
-      // the user isn't bounced back to a value that no longer matches
-      // reality. Surface the error in a toast for visibility.
       toast.error(error.message);
       if (context?.previous) queryClient.setQueryData(["tunnel"], context.previous);
     }
@@ -138,11 +156,9 @@ export function TunnelSettingsCard() {
     }
   });
 
-  const liveUrl = snapshot.data?.cloudflareUrl ?? null;
-  // Cache-buster ties the QR fetch to the observedAt timestamp so a fresh
-  // tunnel URL always pulls a fresh SVG (the cache headers say no-store
-  // but a stale browser-cached image would otherwise be a footgun).
-  const qrSrc = liveUrl && snapshot.data?.observedAt
+  // Cache-buster ties the QR fetch to the observedAt timestamp so a
+  // fresh tunnel URL pulls a fresh SVG.
+  const qrSrc = tunnelEnabled && liveUrl && snapshot.data?.observedAt
     ? `/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(snapshot.data.observedAt)}`
     : null;
 
@@ -155,22 +171,19 @@ export function TunnelSettingsCard() {
             Expose this gateway publicly via a Cloudflare quick tunnel. Authorization is by URL secret path — no password.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <Row
-            label="Tunnel"
-            description={
-              liveUrl
-                ? `Live at ${liveUrl}`
-                : tunnelEnabled
-                  ? "Connecting…"
-                  : "Off"
-            }
-          >
-            <ToggleButton
-              checked={tunnelEnabled}
-              disabled={toggleTunnel.isPending}
-              onChange={(next) => toggleTunnel.mutate(next)}
-            />
+        <CardContent className="space-y-3">
+          <Row label="Tunnel" description={tunnelDescription}>
+            <div className="flex items-center gap-2">
+              <StatusPill value={tunnelStatus} />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={toggleTunnel.isPending}
+                onClick={() => toggleTunnel.mutate(!tunnelEnabled)}
+              >
+                {tunnelEnabled ? "Disable" : "Enable"}
+              </Button>
+            </div>
           </Row>
 
           {qrSrc ? (
@@ -202,23 +215,19 @@ export function TunnelSettingsCard() {
                 </button>
               </span>
             }
-            description={
-              !tunnelEnabled
-                ? "Enable the tunnel first."
-                : notesUnavailableReason
-                  ? notesUnavailableReason
-                  : notesEnabled
-                    ? snapshot.data?.appleNotes?.lastSyncedAt
-                      ? `Last synced ${new Date(snapshot.data.appleNotes.lastSyncedAt).toLocaleString()}`
-                      : "Waiting for the next sync…"
-                    : "Off"
-            }
+            description={notesDescription}
           >
-            <ToggleButton
-              checked={notesEnabled}
-              disabled={!tunnelEnabled || notesAvailable === false || toggleNotes.isPending}
-              onChange={(next) => toggleNotes.mutate(next)}
-            />
+            <div className="flex items-center gap-2">
+              <StatusPill value={notesStatus} />
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={!tunnelEnabled || notesAvailable === false || toggleNotes.isPending}
+                onClick={() => toggleNotes.mutate(!notesEnabled)}
+              >
+                {notesEnabled ? "Disable" : "Enable"}
+              </Button>
+            </div>
           </Row>
 
           {snapshot.data?.appleNotes?.lastError && notesEnabled ? (
@@ -263,33 +272,11 @@ interface RowProps {
 function Row({ label, description, children }: RowProps) {
   return (
     <div className="flex items-start justify-between gap-3">
-      <div className="space-y-0.5">
+      <div className="min-w-0 space-y-0.5">
         <div className="text-sm font-medium">{label}</div>
         <div className="text-xs text-muted-foreground">{description}</div>
       </div>
       <div>{children}</div>
     </div>
-  );
-}
-
-interface ToggleButtonProps {
-  checked: boolean;
-  disabled?: boolean;
-  onChange(next: boolean): void;
-}
-
-function ToggleButton({ checked, disabled, onChange }: ToggleButtonProps) {
-  return (
-    <Button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      variant={checked ? "default" : "outline"}
-      size="sm"
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-    >
-      {checked ? "On" : "Off"}
-    </Button>
   );
 }

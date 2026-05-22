@@ -336,6 +336,7 @@ function testConfig(instance: string): RuntimeConfig {
 
 function stubSnapshot(): TunnelSnapshot {
   return {
+    enabled: true,
     publicUrl: "https://example.trycloudflare.com/abcdefghij0123456789/",
     cloudflareUrl: "https://example.trycloudflare.com",
     secret: "abcdefghij0123456789",

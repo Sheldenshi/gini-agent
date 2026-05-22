@@ -29,6 +29,8 @@ export type TunnelConfig = Required<PersistedTunnelConfig> & {
 };
 
 export interface TunnelSnapshot {
+  /** Whether the operator has opted into running cloudflared at all. */
+  enabled: boolean;
   /** Public URL with the secret path appended (`https://x.trycloudflare.com/<secret>/`). */
   publicUrl: string | null;
   /** Raw cloudflared URL without the secret path. */
@@ -115,6 +117,7 @@ export class TunnelManager {
     this.logPath = opts.logPath;
     this.disableAppleNotes = opts.disableAppleNotes ?? false;
     this.snapshot = {
+      enabled: this.config.enabled,
       publicUrl: null,
       cloudflareUrl: null,
       secret: this.config.secret,
@@ -158,6 +161,9 @@ export class TunnelManager {
   updateConfig(update: { enabled?: boolean; appleNotes?: TunnelConfig["appleNotes"] }): void {
     if (typeof update.enabled === "boolean") {
       (this.config as { enabled: boolean }).enabled = update.enabled;
+      // Mirror onto the snapshot so the UI sees the toggle change
+      // immediately, even if cloudflared has not yet been torn down.
+      this.snapshot = { ...this.snapshot, enabled: update.enabled };
     }
     if (update.appleNotes) {
       (this.config as { appleNotes: TunnelConfig["appleNotes"] }).appleNotes = {

@@ -184,6 +184,7 @@ describe("TunnelManager", () => {
 
   test("composeAppleNoteBody renders the public URL prominently", () => {
     const body = composeAppleNoteBody({
+      enabled: true,
       publicUrl: "https://x.trycloudflare.com/sssss/",
       cloudflareUrl: "https://x.trycloudflare.com",
       secret: "sssss",
@@ -275,6 +276,7 @@ describe("TunnelManager", () => {
 
   test("renderSnapshotQr returns null when there is no public URL", () => {
     const out = renderSnapshotQr({
+      enabled: true,
       publicUrl: null,
       cloudflareUrl: null,
       secret: "x",
@@ -384,6 +386,7 @@ describe("TunnelManager", () => {
 
   test("renderSnapshotQr returns ANSI + SVG when a URL is set", () => {
     const out = renderSnapshotQr({
+      enabled: true,
       publicUrl: "https://x.trycloudflare.com/abcd1234efgh5678/",
       cloudflareUrl: "https://x.trycloudflare.com",
       secret: "abcd1234efgh5678",
