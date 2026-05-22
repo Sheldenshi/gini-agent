@@ -2,7 +2,8 @@ import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
-import { readState, readTrace } from "./state";
+import { appendTrace, mutateState, readState, readTrace } from "./state";
+import { browserNavigate, safetyCheck } from "./tools/browser";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -195,6 +196,85 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
       return json({ ok: true, connector: probed });
+    }],
+    // Stage 1 of the browser.connect two-stage flow. The chat UI's
+    // "Connect" button POSTs here on a `browser.connect` approval. We:
+    //   1. Validate the approval is `browser.connect` and pending.
+    //   2. Launch the per-instance managed Chrome (visible) via the
+    //      same connectBrowser capability the legacy single-stage path
+    //      uses. Idempotent — re-clicking Connect is a no-op.
+    //   3. If the approval payload carries a `url` (the page the agent
+    //      was trying to reach), navigate the visible window there so
+    //      the user lands directly on the sign-in form.
+    //   4. Mark the approval payload `signInStarted: true` while keeping
+    //      it pending. The UI re-renders with "I've signed in" / "Cancel"
+    //      buttons. Clicking "I've signed in" hits the regular /approve
+    //      endpoint, and executeApprovedAction's browser.connect branch
+    //      reads signInStarted to switch the browser to headless instead
+    //      of re-launching.
+    ["POST", /^\/api\/approvals\/([^/]+)\/open-browser$/, async (_request, params) => {
+      const approvalId = params[0];
+      const before = readState(config.instance);
+      const approval = before.approvals.find((a) => a.id === approvalId);
+      if (!approval) return json({ error: "Approval not found" }, 404);
+      if (approval.action !== "browser.connect") {
+        return json({ error: `Approval ${approvalId} is not a browser.connect (${approval.action})` }, 400);
+      }
+      if (approval.status !== "pending") {
+        return json({ error: `Approval is already ${approval.status}` }, 410);
+      }
+      const targetUrl = typeof approval.payload.url === "string" ? approval.payload.url : "";
+      if (targetUrl) {
+        // Block SSRF / loopback / file:// before launching. Same guard
+        // browserNavigate would apply on its first call; we surface it
+        // earlier so the visible window doesn't open at all when the
+        // target is unsafe.
+        const blocked = safetyCheck(targetUrl);
+        if (blocked) return json({ error: blocked }, 400);
+      }
+      // Launch visible managed Chrome. skipAudit is false here so the
+      // capability writes its own browser.connect audit row; the second
+      // stage (executeApprovedAction on /approve) writes a richer row
+      // carrying the approval reason.
+      const status = await connectBrowser(config, { mode: "managed" });
+      if (!status.connected) {
+        return json({ ok: false, error: "Browser failed to launch." }, 500);
+      }
+      // Navigate the visible Chrome to the target page so the user lands
+      // on the sign-in form. browserNavigate uses the per-task session
+      // which reuses the persistent context's first page (the about:blank
+      // tab Chromium opened at launch). Failure to navigate is non-fatal
+      // — the window is still up; the user can navigate manually.
+      let openedUrl: string | undefined;
+      let navigateError: string | undefined;
+      if (targetUrl && approval.taskId) {
+        try {
+          await browserNavigate(approval.taskId, { url: targetUrl });
+          openedUrl = targetUrl;
+        } catch (error) {
+          navigateError = error instanceof Error ? error.message : String(error);
+        }
+      }
+      await mutateState(config.instance, (state) => {
+        const item = state.approvals.find((a) => a.id === approvalId);
+        if (!item) return;
+        item.payload = {
+          ...item.payload,
+          signInStarted: true,
+          openedAt: new Date().toISOString(),
+          openedUrl: openedUrl ?? null,
+          navigateError: navigateError ?? null
+        };
+        if (item.taskId) {
+          appendTrace(config.instance, item.taskId, {
+            type: "approval",
+            message: "Browser connect: visible window opened, awaiting sign-in",
+            data: { approvalId, openedUrl, navigateError }
+          });
+        }
+      });
+      const refreshed = readState(config.instance).approvals.find((a) => a.id === approvalId);
+      return json({ ok: true, approval: refreshed, openedUrl: openedUrl ?? null, navigateError: navigateError ?? null });
     }],
     ["GET", /^\/api\/audit$/, (request) => {
       const agentId = agentIdFilter(request);

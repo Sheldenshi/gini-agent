@@ -1895,7 +1895,19 @@ async function runApprovedAction(
     // by requestBrowserConnect. Only an explicit boolean true unlocks
     // the windowless launch — any other value (undefined, false,
     // non-boolean) falls back to the visible default.
-    const headless = approval.payload.headless === true;
+    const explicitHeadless = approval.payload.headless === true;
+    // Two-stage flow: when the user clicks "Connect" first, the HTTP
+    // `/open-browser` endpoint launches the visible Chrome and navigates
+    // to the target URL, then sets `signInStarted: true` on the payload.
+    // The user signs in inside that window and clicks "I've signed in",
+    // which routes here through the regular /approve endpoint. At that
+    // point we switch the same per-instance profile to headless so the
+    // window closes and the agent continues invisibly with the persisted
+    // cookies. When signInStarted is false (legacy auto-approve / yolo
+    // path with no prior open-browser call), we honor the explicit
+    // headless flag the agent passed.
+    const signInStarted = approval.payload.signInStarted === true;
+    const headless = signInStarted ? true : explicitHeadless;
     let result: string;
     let succeeded = false;
     let mode: string | undefined;

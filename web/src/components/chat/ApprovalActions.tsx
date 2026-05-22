@@ -110,6 +110,26 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  // Stage 1 of the browser.connect two-stage flow. The "Connect" button
+  // POSTs here, which launches the visible managed Chrome and (if the
+  // approval payload carries a `url`) navigates the window there. The
+  // approval stays pending with `signInStarted: true` on its payload, so
+  // this card re-renders with the "I've signed in" / "Cancel" pair.
+  const openBrowser = useMutation({
+    mutationFn: ({ approvalId }: { approvalId: string }) =>
+      api<{ ok: boolean; approval?: Approval; openedUrl?: string | null; navigateError?: string | null }>(
+        `/approvals/${approvalId}/open-browser`,
+        { method: "POST" }
+      ),
+    onSuccess: (result) => {
+      if (result.navigateError) {
+        toast.error(`Browser opened, but navigation failed: ${result.navigateError}`);
+      }
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
   // POSTs the user-entered field values to the approval connect endpoint.
   // The runtime stores every value as a secret (encrypted at rest) so the
   // env binding lookup in resolveSkillEnv can find them; the field's
@@ -172,6 +192,14 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
         // and use the reason (carried on the approval's target /
         // payload.reason) as the body.
         const isBrowserConnect = approval.action === "browser.connect";
+        // Two-stage browser.connect flow. The HTTP /open-browser endpoint
+        // flips this flag on the payload after launching visible Chrome
+        // and navigating to the target URL. The UI uses it to switch from
+        // a single "Connect" CTA to the "I've signed in" / "Cancel" pair.
+        const signInStarted = isBrowserConnect && approval.payload?.signInStarted === true;
+        const openedUrl = isBrowserConnect && typeof approval.payload?.openedUrl === "string"
+          ? approval.payload.openedUrl
+          : "";
         // `||` (not `??`) so an empty-string reason also falls back to
         // the approval target. `??` only fires for null/undefined; a
         // payload that carried `reason: ""` would otherwise render a
@@ -208,7 +236,9 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                 {isConnectorRequest
                   ? `Connect ${providerLabel}`
                   : isBrowserConnect
-                    ? "Open a browser window"
+                    ? signInStarted
+                      ? "Sign in to continue"
+                      : "Open a browser window"
                     : approval.action}
               </span>
               {/*
@@ -276,9 +306,16 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                 </div>
               </>
             ) : isBrowserConnect ? (
-              <p className="mt-1 whitespace-pre-wrap text-xs text-foreground/90">
-                {renderReason(reasonText)}
-              </p>
+              <>
+                <p className="mt-1 whitespace-pre-wrap text-xs text-foreground/90">
+                  {renderReason(reasonText)}
+                </p>
+                {signInStarted ? (
+                  <p className="mt-2 text-[11px] text-muted-foreground">
+                    A Chrome window opened{openedUrl ? <> on <span className="font-mono text-foreground/80">{openedUrl}</span></> : ""}. Sign in there, then click <span className="text-foreground/90">I&apos;ve signed in</span> — the window will close and the agent will continue.
+                  </p>
+                ) : null}
+              </>
             ) : (
               <>
                 <p className="mt-1 text-xs text-muted-foreground">{approval.reason}</p>
@@ -328,6 +365,34 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                     Cancel
                   </Button>
                 </>
+              ) : isBrowserConnect ? (
+                <>
+                  {signInStarted ? (
+                    <Button
+                      size="sm"
+                      disabled={decide.isPending}
+                      onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
+                    >
+                      {decide.isPending ? "Continuing…" : "I've signed in"}
+                    </Button>
+                  ) : (
+                    <Button
+                      size="sm"
+                      disabled={openBrowser.isPending}
+                      onClick={() => openBrowser.mutate({ approvalId: approval.id })}
+                    >
+                      {openBrowser.isPending ? "Opening…" : "Connect"}
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={decide.isPending || openBrowser.isPending}
+                    onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                  >
+                    Cancel
+                  </Button>
+                </>
               ) : (
                 <>
                   <Button
@@ -335,7 +400,7 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                     disabled={decide.isPending}
                     onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
                   >
-                    {isBrowserConnect ? "Connect" : "Approve"}
+                    Approve
                   </Button>
                   <Button
                     size="sm"
@@ -343,7 +408,7 @@ export function ApprovalActions({ taskId }: { taskId: string }) {
                     disabled={decide.isPending}
                     onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
                   >
-                    {isBrowserConnect ? "Cancel" : "Deny"}
+                    Deny
                   </Button>
                 </>
               )}

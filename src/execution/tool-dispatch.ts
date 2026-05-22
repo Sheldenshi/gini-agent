@@ -1929,6 +1929,13 @@ async function requestBrowserConnect(
   // executor in agent.ts can pass it through to connectBrowser when the
   // user approves.
   const headless = args.headless === true;
+  // Optional target URL — the page the agent was trying to reach. When the
+  // user clicks "Connect" the open-browser endpoint launches visible Chrome
+  // and navigates here directly, so the user lands on the sign-in form
+  // instead of an empty about:blank. Validated minimally; safetyCheck runs
+  // server-side in the open-browser endpoint before navigation.
+  const urlArg = typeof args.url === "string" ? args.url.trim() : "";
+  const url = urlArg.length > 0 ? urlArg : undefined;
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -1943,14 +1950,14 @@ async function requestBrowserConnect(
       target: reason,
       risk: "medium",
       reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
-      payload: { reason, toolCallId, headless }
+      payload: { reason, toolCallId, headless, url }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for browser connect (chat-task)",
-      data: { approvalId: approval.id, reason, toolCallId, headless }
+      data: { approvalId: approval.id, reason, toolCallId, headless, url }
     });
     return approval.id;
   });

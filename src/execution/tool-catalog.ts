@@ -421,12 +421,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     type: "function",
     function: {
       name: "browser_connect",
-      description: "Spawn a visible managed Chrome window so the user can sign in to a third-party service (Google Cloud Console, Slack, etc). The user is prompted to approve. Use this BEFORE browser_navigate when the user needs to interact with a sign-in / OAuth page — Google blocks automated sign-in and a headless window cannot accept credentials. Requires `reason`: one short user-facing sentence shown on the approval card so the user knows why a browser is opening.",
+      description: "Surface a Connect button in chat so the user can sign in to a third-party service in a visible Chrome window. Use this whenever a navigation lands on a sign-in / OAuth / auth-wall page (login screen, identity-provider redirect, 401/403, \"please sign in\" interstitial) — do NOT report sign-in as a blocker, call this tool instead. The user clicks Connect, signs in once, clicks \"I've signed in\", then the browser switches to headless and the agent continues with the persisted session. Always pass `url`: the page the agent was trying to reach (so the visible Chrome opens directly on the sign-in form).",
       parameters: {
         type: "object",
         properties: {
-          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Google Cloud Console')." },
-          headless: { type: "boolean", description: "Set `true` to relaunch as a headless (windowless) Chrome session using the same profile dir as the prior managed connect. Cookies from the visible session replay, so the headless session is already signed in. Use this AFTER sign-in to continue automation invisibly.", default: false }
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription')." },
+          url: { type: "string", description: "Absolute http(s) URL the agent was trying to reach. The visible Chrome opens directly on this page so the user lands on the sign-in form, and the agent retries this URL after sign-in." },
+          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / \"I've signed in\" flow handles the headed→headless transition automatically.", default: false }
         },
         required: ["reason"]
       }
