@@ -26,7 +26,6 @@ export function createEmptyState(instance: Instance): RuntimeState {
     tasks: [],
     approvals: [],
     audit: [],
-    memories: [],
     skills: [],
     jobs: [],
     connectors: [
@@ -153,7 +152,6 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "tasks",
     "approvals",
     "audit",
-    "memories",
     "skills",
     "jobs",
     "connectors",
@@ -270,23 +268,35 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
   delete stateAny.activeProfileId;
 }
 
-// Drop the dead `MemoryRecord.scope` and `AgentRecord.memoryScopes` fields
-// from persisted state. Neither was consulted at runtime after Phase C —
-// `agentId` is the only memory isolation boundary. Idempotent: a second
-// pass over an already-cleaned state file matches no rows. Emits one
-// summary audit event per collection when something was stripped so the
-// cleanup shows up in `gini doctor` / /api/audit.
-function migrateDropDeadMemoryFields(state: RuntimeState): void {
-  let scopesStripped = 0;
-  if (Array.isArray(state.memories)) {
-    for (const memory of state.memories) {
-      const rec = memory as unknown as { scope?: unknown };
-      if (rec.scope !== undefined) {
-        delete rec.scope;
-        scopesStripped += 1;
-      }
-    }
+// Defensive drop of the legacy `state.memories` field. The migration in
+// `migratePinnedMemoriesToUserProfile` clears the array and sets a marker
+// so this normally runs against an empty array, but old state files from
+// instances that haven't yet booted post-consolidation still carry the
+// field on disk. The `migrations.statePinnedToUserMd` marker gates the
+// drop — without it, a half-installed instance could lose pinned content
+// before the migration ran. With it, the field is dead and we strip it
+// from the in-memory shape so subsequent code paths never see the legacy
+// surface. The on-disk JSON keeps the field as an empty array until the
+// next write; that's fine — the migration is idempotent and the type-
+// level field is gone. See ADR memory-surface-consolidation.md.
+function dropDeadMemoriesField(state: RuntimeState): void {
+  const dyn = state as unknown as {
+    memories?: unknown;
+    migrations?: { statePinnedToUserMd?: string };
+  };
+  if (!Array.isArray(dyn.memories)) return;
+  if (!dyn.migrations?.statePinnedToUserMd) {
+    // Migration hasn't run yet for this instance. Leave `state.memories`
+    // intact so the migration can drain it.
+    return;
   }
+  delete dyn.memories;
+}
+
+// Drop the dead `AgentRecord.memoryScopes` field from persisted state.
+// Idempotent: a second pass over an already-cleaned state file matches
+// no rows.
+function migrateDropDeadAgentMemoryScopes(state: RuntimeState): void {
   let memoryScopesStripped = 0;
   if (Array.isArray(state.agents)) {
     for (const agent of state.agents) {
@@ -296,20 +306,6 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
         memoryScopesStripped += 1;
       }
     }
-  }
-  if (scopesStripped > 0) {
-    // Migration housekeeping at instance load — no agent context yet.
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "memory.scope.dropped",
-        target: "state.memories",
-        risk: "low",
-        evidence: { stripped: scopesStripped }
-      },
-      { system: true }
-    );
   }
   if (memoryScopesStripped > 0) {
     addAudit(
@@ -322,47 +318,6 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
         evidence: { stripped: memoryScopesStripped }
       },
       { system: true }
-    );
-  }
-}
-
-// Phase C — per-agent memory isolation backfill for the legacy
-// MemoryRecord store. Walks state.memories and stamps `agentId` on rows
-// that pre-date Phase C, bundling all of them under whichever agent was
-// active at migration time (typically the default agent on davao-style
-// instances). Idempotent: rows already carrying `agentId` are skipped.
-// Audits the count so the rebucketing shows up in `gini doctor` /
-// /api/audit. Hindsight unit/bank backfill lives in
-// migrateHindsightAgentIdColumns (runs against SQLite, not JSON state).
-function migrateMemoryAgentId(state: RuntimeState): void {
-  if (!Array.isArray(state.memories) || state.memories.length === 0) return;
-  const defaultAgentId =
-    state.activeAgentId
-    ?? state.agents.find((agent) => agent.status === "active")?.id
-    ?? state.agents[0]?.id
-    ?? "agent_default";
-  // Treat stale agentIds (pointing at a deleted/unknown agent) the same as
-  // missing — leaving them stamped to a dead id strands the memory under
-  // an unselectable bucket in the UI. Mirrors the predicate in
-  // migrateRecordAgentIds.
-  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
-  let stamped = 0;
-  for (const memory of state.memories) {
-    if (memory.agentId && validAgentIds.has(memory.agentId)) continue;
-    memory.agentId = defaultAgentId;
-    stamped += 1;
-  }
-  if (stamped > 0) {
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "memory.agentid.backfill",
-        target: defaultAgentId,
-        risk: "low",
-        evidence: { stamped, agentId: defaultAgentId }
-      },
-      { agentId: defaultAgentId }
     );
   }
 }
@@ -579,7 +534,6 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.tasks ??= [];
   state.approvals ??= [];
   state.audit ??= [];
-  state.memories ??= [];
   state.skills ??= [];
   state.jobs ??= [];
   state.pairingCodes ??= [];
@@ -667,15 +621,22 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // Runs after the default-agent seed branch above so the migration sees
   // a real `agent_default` row when one was just synthesized. Idempotent.
   backfillDefaultAgentToolsets(state);
-  // Phase C — per-agent memory isolation backfill. Runs after agents are
-  // present so the migration can stamp the right id. Both helpers are
-  // idempotent so a re-read of an already-migrated state file is a no-op.
-  migrateMemoryAgentId(state);
+  // Phase C — per-agent memory isolation backfill for the SQLite
+  // hindsight store. The legacy `state.memories` per-agent backfill
+  // ran here too; that surface was removed in the state.memories
+  // consolidation (see ADR memory-surface-consolidation.md) so only
+  // the SQLite-backed helper remains.
   migrateHindsightAgentIdColumns(instance, state);
-  // Drop dead MemoryRecord.scope / AgentRecord.memoryScopes fields from
-  // legacy state files. Runs after agents are populated so the audit
-  // event can land on a valid state.
-  migrateDropDeadMemoryFields(state);
+  // Drop the dead AgentRecord.memoryScopes field from legacy state
+  // files. Runs after agents are populated so the audit event lands on
+  // a valid state.
+  migrateDropDeadAgentMemoryScopes(state);
+  // Defensive drop of the now-removed `state.memories` field. Only
+  // strips when the consolidation migration has already run for this
+  // instance (marker present), so a half-installed instance keeps its
+  // pinned content intact until the migration drains it. See ADR
+  // memory-surface-consolidation.md.
+  dropDeadMemoriesField(state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];

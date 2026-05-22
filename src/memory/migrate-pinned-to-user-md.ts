@@ -18,6 +18,20 @@ import { addAudit } from "../state/audit";
 import { appendLog } from "../state/trace";
 import { writeUserProfile, userProfilePath } from "../runtime/identity-files";
 
+// Legacy MemoryRecord shape (pre-consolidation). Inlined here because the
+// type was removed from `src/types.ts` — the migration is the only
+// remaining consumer of the structural shape and it needs to read whatever
+// the persisted state.json still carries on disk.
+interface LegacyMemoryRecord {
+  id: string;
+  agentId?: string;
+  content: string;
+  status: "proposed" | "active" | "archived" | "rejected" | "conflicted";
+  confidence?: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface MigrationReport {
   // True when the migration ran in this call (regardless of whether any rows
   // were actually migrated — a state file with `state.memories: []` still
@@ -84,14 +98,17 @@ export async function migratePinnedMemoriesToUserProfile(
   // Read-only snapshot to decide whether the migration needs to run at all.
   // Avoids burning a mutateState window when the marker is already set.
   const initial = readState(config.instance);
-  const existing = (initial as unknown as { migrations?: { statePinnedToUserMd?: string } }).migrations;
-  if (existing?.statePinnedToUserMd) {
+  const dyn = initial as unknown as {
+    migrations?: { statePinnedToUserMd?: string };
+    memories?: LegacyMemoryRecord[];
+  };
+  if (dyn.migrations?.statePinnedToUserMd) {
     return { ran: false, migrated: 0 };
   }
 
   const candidates: string[] = [];
   const seen = new Set<string>();
-  for (const memory of initial.memories ?? []) {
+  for (const memory of dyn.memories ?? []) {
     if (memory.status !== "active") continue;
     const text = (memory.content ?? "").trim();
     if (!text) continue;
@@ -131,15 +148,16 @@ export async function migratePinnedMemoriesToUserProfile(
 
   try {
     await mutateState(config.instance, (state) => {
-      const migratedIds = (state.memories ?? [])
-        .filter((memory) => memory.status === "active")
-        .map((memory) => memory.id);
-      state.memories = [];
-      const stateWithMigrations = state as unknown as {
+      const stateDyn = state as unknown as {
+        memories?: LegacyMemoryRecord[];
         migrations?: { statePinnedToUserMd?: string };
       };
-      stateWithMigrations.migrations = {
-        ...(stateWithMigrations.migrations ?? {}),
+      const migratedIds = (stateDyn.memories ?? [])
+        .filter((memory: LegacyMemoryRecord) => memory.status === "active")
+        .map((memory: LegacyMemoryRecord) => memory.id);
+      stateDyn.memories = [];
+      stateDyn.migrations = {
+        ...(stateDyn.migrations ?? {}),
         statePinnedToUserMd: at
       };
       addAudit(

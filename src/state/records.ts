@@ -10,7 +10,6 @@ import type {
   JobRunRecord,
   Instance,
   McpServerRecord,
-  MemoryRecord,
   MessagingBridgeRecord,
   MessagingMessageRecord,
   NotificationRecord,
@@ -388,22 +387,6 @@ export function createApproval(
         ? { agentId: item.agentId }
         : { system: true }
   );
-  return item;
-}
-
-export function createMemory(
-  state: RuntimeState,
-  memory: Omit<MemoryRecord, "id" | "instance" | "createdAt" | "updatedAt">
-): MemoryRecord {
-  const at = now();
-  const item: MemoryRecord = {
-    id: id("mem"),
-    instance: state.instance,
-    createdAt: at,
-    updatedAt: at,
-    ...memory
-  };
-  state.memories.unshift(item);
   return item;
 }
 

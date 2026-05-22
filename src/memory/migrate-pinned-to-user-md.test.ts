@@ -47,7 +47,13 @@ afterEach(() => {
 async function seedMemories(config: RuntimeConfig, items: Array<{ id: string; content: string; status?: "active" | "proposed" | "archived" }>): Promise<void> {
   await mutateState(config.instance, (state) => {
     const at = "2026-01-01T00:00:00.000Z";
-    state.memories = items.map((item) => ({
+    // `state.memories` was removed from the type alongside the
+    // consolidation. The migration helper still reads through to the
+    // legacy on-disk shape, so the test seeds the array via an `unknown`
+    // cast to mimic an existing-instance state file. See ADR
+    // memory-surface-consolidation.md.
+    const stateDyn = state as unknown as { memories: Array<Record<string, unknown>> };
+    stateDyn.memories = items.map((item) => ({
       id: item.id,
       instance: state.instance,
       agentId: "agent_default",
@@ -74,9 +80,12 @@ describe("migratePinnedMemoriesToUserProfile", () => {
     expect(report.marker).toBeDefined();
 
     const state = readState(config.instance);
-    expect(state.memories).toEqual([]);
-    const migrations = (state as unknown as { migrations?: { statePinnedToUserMd?: string } }).migrations;
-    expect(migrations?.statePinnedToUserMd).toBe(report.marker);
+    const stateDyn = state as unknown as { memories?: unknown[]; migrations?: { statePinnedToUserMd?: string } };
+    // After dropDeadMemoriesField runs (post-migration), the field is
+    // stripped from the in-memory shape. Either an undefined or an
+    // empty array is acceptable as the post-migration shape.
+    expect(stateDyn.memories === undefined || (Array.isArray(stateDyn.memories) && stateDyn.memories.length === 0)).toBe(true);
+    expect(stateDyn.migrations?.statePinnedToUserMd).toBe(report.marker);
 
     // No USER.md created on disk when there is nothing to write.
     expect(existsSync(userProfilePath(config.instance))).toBe(false);
@@ -100,7 +109,8 @@ describe("migratePinnedMemoriesToUserProfile", () => {
     expect(body).toContain("- Prefers concise replies.");
 
     const state = readState(config.instance);
-    expect(state.memories).toEqual([]);
+    const stateDyn = state as unknown as { memories?: unknown[] };
+    expect(stateDyn.memories === undefined || (Array.isArray(stateDyn.memories) && stateDyn.memories.length === 0)).toBe(true);
 
     const audit = state.audit.find((event) => event.action === "memory.pinned.migrated");
     expect(audit).toBeDefined();
@@ -174,7 +184,7 @@ describe("migratePinnedMemoriesToUserProfile", () => {
 
     // Marker still present and unchanged.
     const state = readState(config.instance);
-    const migrations = (state as unknown as { migrations?: { statePinnedToUserMd?: string } }).migrations;
-    expect(migrations?.statePinnedToUserMd).toBe(first.marker);
+    const stateDyn = state as unknown as { migrations?: { statePinnedToUserMd?: string } };
+    expect(stateDyn.migrations?.statePinnedToUserMd).toBe(first.marker);
   });
 });

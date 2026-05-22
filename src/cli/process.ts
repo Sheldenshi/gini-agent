@@ -553,13 +553,11 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
   // user (or `gini doctor` consumer) can confirm the schema is in place; phases
   // 2+ will add retain/recall metrics on top of the same probe.
   const memory = probeMemoryDb(config.instance);
-  // Phase 6: legacy MemoryRecord migration progress. Surfaced in doctor so a
-  // user can verify that all eligible rows have been migrated into the
-  // SQLite store before the legacy panel hides itself in the web UI.
-  const legacyMigration = legacyMigrationStatus(state.memories);
-  if (legacyMigration.pending > 0) {
-    recommendations.push(`${legacyMigration.pending} legacy memory rows are not yet migrated. Run \`gini memory migrate\`.`);
-  }
+  // The legacy MemoryRecord migration panel was removed alongside the
+  // state.memories consolidation — `legacyMigrationStatus` now returns
+  // `fullyMigrated: true` unconditionally, so there's nothing left to
+  // surface. See ADR memory-surface-consolidation.md.
+  const legacyMigration = legacyMigrationStatus(undefined);
   // Embedding-provider snapshot. Surfaces the active provider/model + cache
   // size, and warns if any active unit is embedded with a model other than
   // the current provider's model (recall's semantic channel skips those).

@@ -14,7 +14,6 @@ import {
   useChatSessions,
   useEvents,
   useInvalidate,
-  useMemories,
   useStatus,
   useTasks
 } from "@/lib/queries";
@@ -29,7 +28,6 @@ export default function HomePage() {
   const tasks = useTasks();
   const approvals = useApprovals();
   const events = useEvents();
-  const memories = useMemories();
   const chatSessions = useChatSessions();
   const invalidate = useInvalidate();
 
@@ -64,7 +62,6 @@ export default function HomePage() {
   const pendingVisible = pending.slice(0, HOME_APPROVAL_LIMIT);
   const pendingExtra = pending.length - pendingVisible.length;
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
-  const proposedMemories = (memories.data ?? []).filter((m) => m.status === "proposed");
 
   // "Today's cost" = sum of estimatedUsd on tasks updated in the last 24h.
   // The runtime tracks cost on Task and JobRun; we sum across recent tasks
@@ -106,26 +103,11 @@ export default function HomePage() {
               <p className="text-xs text-muted-foreground">{todaysCost.counted} tasks with cost data</p>
             </CardContent>
           </Card>
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <CardTitle className="text-sm">Memory changes needing review</CardTitle>
-                  <CardDescription>Proposed memories awaiting approve / reject</CardDescription>
-                </div>
-                <Link
-                  href="/memory"
-                  className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent"
-                >
-                  Review
-                </Link>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <p className="text-2xl font-semibold">{proposedMemories.length}</p>
-              <p className="text-xs text-muted-foreground">{(memories.data?.length ?? 0)} memories total</p>
-            </CardContent>
-          </Card>
+          {/* "Memory changes needing review" card removed alongside the
+              state.memories consolidation — pinned-memory proposals no
+              longer exist as a surface. USER.md / SOUL.md / Hindsight are
+              the three memory surfaces now. See ADR
+              memory-surface-consolidation.md. */}
         </div>
 
         {pending.length > 0 ? (

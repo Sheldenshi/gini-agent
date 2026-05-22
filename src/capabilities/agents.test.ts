@@ -112,7 +112,10 @@ describe("createAgent", () => {
     const created = await createAgent(config, { name: "scratch" });
     // Bank already created by createAgent → ensureAgentBank. Stamp a
     // hindsight unit and a legacy MemoryRecord onto the new agent so the
-    // cascade has something concrete to clean up.
+    // cascade has something concrete to clean up. The legacy
+    // `state.memories` per-agent purge was removed alongside the
+    // state.memories consolidation; only the Hindsight bank cascade
+    // remains. See ADR memory-surface-consolidation.md.
     ensureAgentBank(config.instance, created.id);
     insertMemoryUnit(config.instance, {
       bankId: bankIdForAgent(created.id),
@@ -120,32 +123,15 @@ describe("createAgent", () => {
       text: "scratch hindsight",
       network: "experience"
     });
-    await mutateState(config.instance, (state) => {
-      state.memories.push({
-        id: "mem_scratch_only",
-        instance: config.instance,
-        agentId: created.id,
-        content: "scratch memory",
-        status: "active",
-        sensitivity: "normal",
-        confidence: 1,
-        provenance: "test fixture",
-        createdAt: "2025-01-01",
-        updatedAt: "2025-01-01"
-      });
-      return null;
-    });
 
     const result = await deleteAgent(config, created.id);
     expect(result.ok).toBe(true);
     expect(result.id).toBe(created.id);
-    expect(result.memoriesArchived).toBe(1);
     expect(result.unitsDeleted).toBe(1);
     expect(result.bankDeleted).toBe(true);
 
     const after = readState(config.instance);
     expect(after.agents.find((agent) => agent.id === created.id)).toBeUndefined();
-    expect(after.memories.find((memory) => memory.id === "mem_scratch_only")).toBeUndefined();
     expect(getBank(config.instance, bankIdForAgent(created.id))).toBeNull();
     expect(listMemoryUnits(config.instance, bankIdForAgent(created.id))).toEqual([]);
     expect(after.audit.some((event) => event.action === "agent.deleted" && event.target === created.id)).toBe(true);
@@ -187,34 +173,10 @@ describe("createAgent", () => {
     );
   });
 
-  test("does not copy memories from the default agent (clean memory)", async () => {
-    const config = buildConfig(workspaceRoot, "create-agent-clean-memory", root);
-    install(config);
-    // Stamp a memory on the default agent.
-    await mutateState(config.instance, (state) => {
-      const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
-      if (!defaultAgent) throw new Error("default agent missing after install");
-      state.memories.push({
-        id: "mem_default_only",
-        instance: config.instance,
-        agentId: defaultAgent.id,
-        content: "should not leak",
-        status: "active",
-        sensitivity: "normal",
-        confidence: 1,
-        provenance: "test fixture",
-        createdAt: "2025-01-01",
-        updatedAt: "2025-01-01"
-      });
-      return defaultAgent;
-    });
-
-    const created = await createAgent(config, { name: "fresh" });
-    const after = readState(config.instance);
-    const ownedByNewAgent = after.memories.filter((memory) => memory.agentId === created.id);
-    expect(ownedByNewAgent).toEqual([]);
-    // And the original memory on the default agent stays put.
-    const ownedByDefault = after.memories.filter((memory) => memory.id === "mem_default_only");
-    expect(ownedByDefault.length).toBe(1);
-  });
+  // The "does not copy memories from the default agent" test was
+  // removed alongside the state.memories consolidation — pinned memory
+  // is no longer a per-agent record type. USER.md is instance-scoped,
+  // SOUL.md is per-agent and never inherited at create time, and
+  // Hindsight banks are created fresh per agent. See ADR
+  // memory-surface-consolidation.md.
 });

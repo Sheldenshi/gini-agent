@@ -87,7 +87,6 @@ export {
   renameChatSession,
   createChatMessage,
   createApproval,
-  createMemory,
   createSkill,
   createJob,
   createJobRun,
