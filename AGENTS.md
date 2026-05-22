@@ -55,10 +55,6 @@ The same rule applies to **comments inside source and tests**: describe the haza
 
 If iterating with multiple review-fix commits before the PR lands, squash to a clean narrative first (`git rebase -i`, or use squash-merge). Once the PR is merged, the messages are permanent.
 
-## CHANGELOG
-
-Don't touch [`CHANGELOG.md`](CHANGELOG.md) during normal work. The CHANGELOG is curated at release time from the PR titles since the last tag — see [docs/releases.md](docs/releases.md). PR titles already describe the technical change, so they're the input the release author works from.
-
 ## Verification
 
 For code changes, run relevant tests plus broader checks when practical:
