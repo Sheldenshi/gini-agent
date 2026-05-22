@@ -159,6 +159,28 @@ describe("setup-api", () => {
     expect(cfg.provider?.name).toBe("codex");
   });
 
+  test("POST codex succeeds during openai→codex switch even when OPENAI_API_KEY is set", async () => {
+    // Pins a one-directional false negative: codexAuthPath() used to
+    // honor provider.apiKeyEnv unconditionally. During an openai→codex
+    // switch the on-disk config still names openai with
+    // apiKeyEnv="OPENAI_API_KEY". With OPENAI_API_KEY=sk-... in env,
+    // codexAuthPath would resolve to the literal sk-... string, miss
+    // ~/.codex/auth.json, and report no codex credentials. The fix
+    // ignores apiKeyEnv whenever the probed provider is not codex.
+    const codexDir = join(s.home, ".codex");
+    mkdirSync(codexDir, { recursive: true });
+    const authPath = join(codexDir, "auth.json");
+    writeFileSync(authPath, JSON.stringify({ OPENAI_API_KEY: "sk-test-codex-auth" }));
+    process.env.CODEX_AUTH_JSON = authPath;
+    // Seed an openai config with the stale apiKeyEnv that triggers the bug.
+    config.provider = { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" };
+    process.env.OPENAI_API_KEY = "sk-fake-openai";
+    const result = await setSetupProvider(config, { provider: "codex" });
+    expect(result.ok).toBe(true);
+    expect(result.provider.configured).toBe(true);
+    expect(result.provider.provider.name).toBe("codex");
+  });
+
   test("POST unknown provider rejects with descriptive error", async () => {
     const result = await setSetupProvider(config, { provider: "anthropic" });
     expect(result.ok).toBe(false);
