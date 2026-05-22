@@ -25,12 +25,20 @@ shape that depends on memorising the URL breaks at the next reboot.
 
 ## Decision
 
-1. The runtime spawns `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:<port>`
+1. The runtime spawns `cloudflared tunnel --no-autoupdate --url http://127.0.0.1:<webPort>`
    as a managed subprocess when `tunnel.enabled` is true (or
-   `GINI_TUNNEL=1` is set on the boot environment). The subprocess
-   lifetime matches the gateway lifetime exactly: it's started after
-   `Bun.serve` returns, and torn down inside the SIGTERM drain alongside
-   the scheduler, the browser sessions, and the messaging supervisors.
+   `GINI_TUNNEL=1` is set on the boot environment). cloudflared targets
+   the **Next.js web port** rather than the raw gateway. The web layer
+   already proxies `/api/*` to the runtime through the BFF and serves
+   the full settings/chat/etc. UI, so tunnelling the web port lets a
+   phone scan the QR and land on a real product surface instead of the
+   bare landing the runtime would otherwise serve. The web port is
+   written to `~/.gini/instances/<inst>/web.port` once Next.js comes
+   up; the manager polls that file with a 60s ceiling that covers a
+   cold Next.js compile. The subprocess lifetime matches the gateway
+   lifetime exactly: it's started after Next.js reports a port, and
+   torn down inside the SIGTERM drain alongside the scheduler, the
+   browser sessions, and the messaging supervisors.
 
 2. The cloudflared stderr banner is parsed to obtain the public URL. The
    manager keeps that URL in an in-memory snapshot exposed over
@@ -41,9 +49,21 @@ shape that depends on memorising the URL breaks at the next reboot.
 3. Authorization for tunneled requests is by URL prefix. The runtime
    mints (and persists) a 192-bit, 32-character base64url secret per
    instance. A request whose pathname begins with `/<secret>/` is treated
-   as fully authorized; the prefix is stripped before the request reaches
-   the regular API router. The secret is stable across restarts so a URL
+   as fully authorized. The secret is stable across restarts so a URL
    prefix the operator bookmarks or pastes into a note keeps working.
+
+   **Where the strip happens**: the secret is stripped at the **Next.js
+   proxy layer** (`web/src/proxy.ts`) for tunneled requests, NOT at the
+   gateway. The proxy reads the live `tunnel.enabled` + `tunnel.secret`
+   slot from `config.json` on every request (mtime-cached), gates the
+   tunnelled host on a match, mints an HttpOnly session cookie on the
+   first valid request so subsequent navigations don't need the prefix,
+   and rewrites the path before handing off to Next.js. The BFF then
+   forwards the prefix-less path to the runtime with the gateway bearer
+   it already injects. The gateway's own secret-path guard (in
+   `src/http.ts`) stays in place as a defence in depth — direct
+   localhost hits to `/<secret>/api/*` still work the same way they
+   used to, which is what the CLI smoke tests rely on.
 
 4. The bearer-token gate stays the only authorization path for direct
    localhost requests. `/api/pairing/claim` remains the existing public
@@ -136,8 +156,12 @@ the prompt:
   step is best-effort — a failed write logs `tunnel.secret.persist.error`
   and continues with the in-memory secret.
 - **No browser-token leak**: the secret-path strip happens at the
-  runtime gateway, not the Next.js BFF. The browser-side bundle never
-  sees the secret — same boundary as the existing bearer-token contract.
+  Next.js proxy server-side (`web/src/proxy.ts`), not in the
+  browser-side bundle. The browser receives a redacted `/api/tunnel`
+  snapshot (publicUrl + secret nulled by `web/src/app/api/runtime/tunnel/route.ts`)
+  and never sees the raw secret. The HttpOnly session cookie keeps
+  same-origin fetches authorised for the lifetime of the tunnel
+  session without exposing the secret to JavaScript.
 - **CLI surface**: `gini tunnel status|qr|enable|disable|rotate-secret|sync-notes|apple-notes ...`
   exposes the snapshot, prints the ANSI QR, flips the persistent
   config, and rotates the secret.
