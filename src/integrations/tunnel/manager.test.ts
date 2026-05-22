@@ -281,7 +281,7 @@ describe("TunnelManager", () => {
     await manager.stop();
   });
 
-  test("stop() during in-flight start tears the child down on its own", async () => {
+  test("stop() during in-flight start aborts the spawn and kills the child", async () => {
     setupInstanceDir("tunnel-manager-stop-during-start");
     let killed = false;
     const manager = new TunnelManager({
@@ -295,19 +295,21 @@ describe("TunnelManager", () => {
       disableAppleNotes: true,
       spawn: () => {
         const child = scriptedChild(["INF https://laggard-tunnel-9.trycloudflare.com\n"], {
-          urlDelayMs: 20,
+          urlDelayMs: 200,
           onKill: () => { killed = true; }
         });
         return child;
       }
     });
     const startP = manager.start();
-    // Don't await start — issue stop while it's still spawning.
+    // Issue stop while spawn is mid-flight. The AbortSignal threaded
+    // through spawnQuickTunnel rejects the URL race promptly so the
+    // gateway's shutdown drain budget (5s) catches the teardown.
     await manager.stop();
-    const snapshot = await startP;
-    expect(snapshot.publicUrl).toBeNull();
-    expect(snapshot.lastError).toContain("cancelled by concurrent stop");
+    await expect(startP).rejects.toThrow(/aborted/);
     expect(killed).toBe(true);
+    // Snapshot must reflect the cancellation, not a stale URL.
+    expect(manager.getSnapshot().publicUrl).toBeNull();
   });
 
   test("renderSnapshotQr returns ANSI + SVG when a URL is set", () => {

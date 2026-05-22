@@ -88,6 +88,23 @@ describe("spawnQuickTunnel", () => {
     await fakeChild.exited;
   });
 
+  test("external abort cancels the spawn promptly", async () => {
+    const fakeChild = makeFakeChild([], { keepOpen: true });
+    const spawnStub: SpawnTunnelOptions["spawn"] = () => fakeChild;
+    const controller = new AbortController();
+    // Abort 20ms in; the long startup timeout would otherwise dominate.
+    setTimeout(() => controller.abort(), 20);
+    await expect(
+      spawnQuickTunnel({
+        targetUrl: "http://127.0.0.1:7778",
+        spawn: spawnStub,
+        startupTimeoutMs: 5000,
+        signal: controller.signal
+      })
+    ).rejects.toThrow(/aborted/);
+    await fakeChild.exited;
+  });
+
   test("startup timeout kills the child process", async () => {
     const fakeChild = makeFakeChild([], { keepOpen: true });
     const spawnStub: SpawnTunnelOptions["spawn"] = () => fakeChild;

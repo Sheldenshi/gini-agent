@@ -27,6 +27,14 @@ export interface SpawnTunnelOptions {
   /** Cap on how long to wait for the first URL to appear. Defaults to 25s. */
   startupTimeoutMs?: number;
   /**
+   * Optional abort signal. When triggered, the in-flight spawn rejects
+   * promptly, the cloudflared child is SIGTERM'd, and the log handle is
+   * closed. Used by the TunnelManager so a SIGTERM in the gateway's
+   * shutdown drain can cancel a pending spawn without waiting for the
+   * full `startupTimeoutMs`.
+   */
+  signal?: AbortSignal;
+  /**
    * Injectable spawner for tests. Receives the resolved command + args and
    * must return a Bun-compatible Subprocess. The default uses Bun.spawn.
    */
@@ -76,6 +84,23 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
   const urlPromise = parseUrlFromStderr(child.stderr, logHandle);
   const timeoutMs = options.startupTimeoutMs ?? 25_000;
 
+  // Externally-aborted spawn: the parent runtime can cancel before
+  // either the URL arrives or the timeout elapses. Wrap the abort in a
+  // promise alongside the rest of the race so cleanup runs through the
+  // shared catch path.
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (!options.signal) return;
+    if (options.signal.aborted) {
+      reject(new Error("cloudflared spawn aborted"));
+      return;
+    }
+    options.signal.addEventListener(
+      "abort",
+      () => reject(new Error("cloudflared spawn aborted")),
+      { once: true }
+    );
+  });
+
   let url: string;
   try {
     url = await Promise.race([
@@ -85,7 +110,8 @@ export async function spawnQuickTunnel(options: SpawnTunnelOptions): Promise<Tun
       }),
       Bun.sleep(timeoutMs).then(() => {
         throw new Error(`cloudflared did not advertise a URL within ${timeoutMs}ms`);
-      })
+      }),
+      abortPromise
     ]);
   } catch (error) {
     // Clean up before the throw escapes: kill the child if it's still

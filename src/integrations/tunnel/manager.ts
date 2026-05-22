@@ -82,6 +82,12 @@ export class TunnelManager {
   private snapshot: TunnelSnapshot;
   private stopping = false;
   private monitor: Promise<void> | null = null;
+  // AbortController fed into `spawnQuickTunnel` so stop() can cancel an
+  // in-flight spawn instead of waiting out the full startup timeout. The
+  // gateway's shutdown drain is bounded at SCHEDULER_DRAIN_TIMEOUT_MS;
+  // without an abort, a SIGTERM landing mid-spawn would orphan the
+  // cloudflared child past process.exit.
+  private spawnAbort: AbortController | null = null;
   // In-flight start. Concurrent start() callers share this single promise so
   // we never spawn two cloudflared subprocesses for one manager. Cleared
   // when the spawn settles (success or failure).
@@ -174,13 +180,15 @@ export class TunnelManager {
   }
 
   private async startInner(): Promise<TunnelSnapshot> {
+    this.spawnAbort = new AbortController();
     let handle: TunnelHandle;
     try {
       handle = await spawnQuickTunnel({
         targetUrl: this.targetUrl,
         binary: this.binary,
         logPath: this.logPath,
-        spawn: this.spawn
+        spawn: this.spawn,
+        signal: this.spawnAbort.signal
       });
     } catch (error) {
       this.snapshot = {
@@ -263,6 +271,15 @@ export class TunnelManager {
   }
 
   private async stopInner(): Promise<void> {
+    // Abort any in-flight spawn so the startup race ends inside the
+    // gateway's drain budget instead of running out the full
+    // `startupTimeoutMs`. The catch in spawnQuickTunnel kills the
+    // freshly-spawned child and closes the log handle, so this path is
+    // safe to invoke even when no spawn is in flight.
+    if (this.spawnAbort) {
+      try { this.spawnAbort.abort(); } catch { /* ignore */ }
+      this.spawnAbort = null;
+    }
     // If a start() is in flight, wait for it to settle before we begin
     // teardown. The startInner path sees `stopping === true` and stops
     // the freshly-spawned child itself, so by the time the awaited start
