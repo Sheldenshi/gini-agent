@@ -146,6 +146,14 @@ runConnectorDetection(config)
 // `gini tunnel enable` (or by editing config.json directly).
 const tunnelResolved = resolveTunnelConfig(config);
 if (tunnelResolved.mutated) {
+  // Persist the freshly-minted secret BOTH to disk and into the
+  // in-memory `config` object. Other handlers (e.g.
+  // updateAutoApproveSettings in src/runtime/index.ts) write the
+  // in-memory config back to disk wholesale on settings changes; if we
+  // skipped the in-memory copy here, the next such write would
+  // overwrite the disk file's `tunnel.secret` with `undefined` and
+  // break every bookmarked URL prefix.
+  config.tunnel = { ...(config.tunnel ?? {}), secret: tunnelResolved.config.secret };
   try {
     const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
     const existingTunnel = (onDisk.tunnel ?? {}) as Record<string, unknown>;

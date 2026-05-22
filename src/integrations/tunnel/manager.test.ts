@@ -203,6 +203,76 @@ describe("TunnelManager", () => {
     expect(body).toContain("Target: http://127.0.0.1:7778");
   });
 
+  test("unexpected cloudflared exit clears the handle so start() can respawn", async () => {
+    setupInstanceDir("tunnel-manager-respawn");
+    let spawnCount = 0;
+    const exitResolvers: Array<{ resolve: (code: number) => void }> = [];
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-respawn",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      disableAppleNotes: true,
+      spawn: () => {
+        spawnCount += 1;
+        const resolvers = Promise.withResolvers<number>();
+        exitResolvers.push({ resolve: resolvers.resolve });
+        const child = scriptedChild([`INF https://respawn-${spawnCount}.trycloudflare.com\n`]);
+        // Override exited so the test controls when the child "dies".
+        return { ...child, exited: resolvers.promise };
+      }
+    });
+    await manager.start();
+    expect(manager.getSnapshot().publicUrl).toContain("respawn-1");
+    // Simulate an unexpected exit. The monitor should clear `this.handle`.
+    exitResolvers[0]!.resolve(137);
+    await Bun.sleep(5);
+    expect(manager.getSnapshot().publicUrl).toBeNull();
+    // A fresh start() should now spawn a replacement, not short-circuit.
+    await manager.start();
+    expect(spawnCount).toBe(2);
+    expect(manager.getSnapshot().publicUrl).toContain("respawn-2");
+    // Pre-resolve the second exit so stop() doesn't have to wait its 5s
+    // SIGKILL grace timer; the test child intentionally overrides
+    // `exited` so the manager's stop flow needs our help to settle.
+    exitResolvers[1]!.resolve(0);
+    await manager.stop();
+  });
+
+  test("notesRefresh latch clears after start()-time fire-and-forget", async () => {
+    setupInstanceDir("tunnel-manager-latch");
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-latch",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: true, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      spawn: () => scriptedChild(["INF https://latch-1.trycloudflare.com\n"]),
+      osascript: async (script) => {
+        if (script.includes("name of every account")) {
+          return { stdout: "yes\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+    });
+    await manager.start();
+    await manager.flushNotes();
+    // After flush the inner refresh has settled. The latch must be cleared
+    // — otherwise a subsequent explicit refresh would short-circuit on
+    // the stale resolved promise and never run a fresh write.
+    const second = manager.refreshAppleNote();
+    const third = manager.refreshAppleNote();
+    // Both must dedup onto a fresh single-flight, not the stale one.
+    expect(await second).toBe(await third);
+    expect((await second).appleNotes.lastSyncedAt).not.toBeNull();
+    await manager.stop();
+  });
+
   test("renderSnapshotQr returns null when there is no public URL", () => {
     const out = renderSnapshotQr({
       publicUrl: null,

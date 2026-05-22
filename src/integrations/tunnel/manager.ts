@@ -230,17 +230,28 @@ export class TunnelManager {
     });
 
     if (this.config.appleNotes.enabled && !this.disableAppleNotes) {
-      this.notesRefresh = this.refreshAppleNote().catch((error) => {
+      // Fire-and-forget refresh, but do NOT store the catch-wrapped
+      // promise on `this.notesRefresh` — `refreshAppleNote()` already
+      // owns that slot and clears it on settle by identity comparison.
+      // If we wrapped + reassigned here, the inner promise's finally
+      // would see a different value in the slot, skip the clear, and
+      // pin the latch forever, blocking every subsequent refresh.
+      // Errors are reported via the `tunnel.notes.error` log path.
+      void this.refreshAppleNote().catch((error) => {
         appendLog(this.instance, "tunnel.notes.error", {
           error: error instanceof Error ? error.message : String(error)
         });
-        return this.getSnapshot();
       });
     }
 
-    // Watch the subprocess so an unexpected exit surfaces in the snapshot.
+    // Watch the subprocess so an unexpected exit surfaces in the snapshot
+    // and clears the live-handle state. Without nulling `this.handle`, the
+    // next `start()` would see a dangling handle and short-circuit on
+    // `if (this.handle) return getSnapshot()`, leaving the user stuck on
+    // a failed-tunnel snapshot until they explicitly called stop().
     this.monitor = handle.exited.then((code) => {
       if (this.stopping) return;
+      if (this.handle === handle) this.handle = null;
       this.snapshot = {
         ...this.snapshot,
         publicUrl: null,
