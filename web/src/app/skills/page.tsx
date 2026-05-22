@@ -291,15 +291,6 @@ export default function SkillsPage() {
                   providersById={providersById}
                 />
                 <div className="flex flex-wrap gap-2">
-                  {deriveActivation(detail, connectorsByProv, providersById).label === "needs setup" ? (
-                    <Button
-                      size="sm"
-                      disabled={setupViaChat.isPending}
-                      onClick={() => setupViaChat.mutate(detail)}
-                    >
-                      {setupViaChat.isPending ? "Opening chat…" : "Set up via chat"}
-                    </Button>
-                  ) : null}
                   <Button size="sm" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "test" })}>Test</Button>
                   {detail.status === "enabled" ? (
                     <Button size="sm" variant="outline" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "disable" })}>Disable</Button>
@@ -416,14 +407,42 @@ export default function SkillsPage() {
                                   </div>
                                 );
                               })()
+                            ) : needsChatSetup(provider) ? (
+                              // OAuth-style or multi-field providers (e.g.
+                              // google-oauth-desktop with client_id +
+                              // client_secret) require real out-of-band
+                              // setup — Google Cloud Console clicks, CLI
+                              // installs, OAuth consent. Defer to the
+                              // agent in chat instead of popping a form
+                              // the user can't fill in.
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                disabled={setupViaChat.isPending}
+                                onClick={() => setupViaChat.mutate(detail)}
+                              >
+                                {setupViaChat.isPending ? "Opening chat…" : "Set up via chat"}
+                              </Button>
                             ) : (
-                              // No connector exists yet — the panel-level
-                              // "Set up via chat" button handles this. Show
-                              // a passive status here so the row still
-                              // communicates which provider is missing.
-                              <span className="text-[10px] text-muted-foreground">
-                                not configured
-                              </span>
+                              // Simple secret-only providers (e.g. linear
+                              // PAT). Original credential dialog works
+                              // fine — user pastes one token and submits.
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                onClick={() =>
+                                  setDialog({
+                                    open: true,
+                                    provider: req.provider,
+                                    suggestedName: provider.label,
+                                    mode: "create"
+                                  })
+                                }
+                              >
+                                Set up {provider.label}
+                              </Button>
                             )}
                           </li>
                         );
@@ -654,6 +673,14 @@ function ActivationRow({
       ) : null}
     </div>
   );
+}
+
+// Provider setup is "chat-grade" when it requires non-secret config the
+// user can't just paste from a settings page — typically OAuth Client ID
+// alongside Client Secret. The credential dialog only handles "paste one
+// secret", so anything multi-field gets routed to the agent instead.
+function needsChatSetup(provider: ProviderDescriptor): boolean {
+  return provider.fields.some((f) => !f.secret);
 }
 
 function connectorsByProvider(connectors: ConnectorRecord[]): Map<string, ConnectorRecord[]> {
