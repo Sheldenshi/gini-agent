@@ -66,7 +66,7 @@ Stable local clients use the gateway API:
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
-All routes require `Authorization: Bearer <token>` except health checks and the limited SSE token compatibility path.
+All routes require `Authorization: Bearer <token>` except health checks, the limited SSE token compatibility path, and requests arriving through the optional Cloudflare quick tunnel with a valid secret-path prefix (see [Cloudflare Quick Tunnel With Secret-Path Auth And iCloud Notes Mirror](adr/tunnel-and-icloud-pairing.md)). The tunnel surface is opt-in (`tunnel.enabled` in the instance config) and rejects requests whose URL does not begin with the per-instance secret path.
 
 ## Boundaries
 

@@ -71,7 +71,7 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 ## Auth
 
-The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
+The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript. When the operator opts into the Cloudflare quick tunnel (`tunnel.enabled`), requests arriving through the tunnel are authorized by a stable per-instance secret URL prefix instead of a bearer token — the URL itself is the credential. The secret-path auth is gated entirely on `tunnel.enabled`; flipping it off restores bearer-only access immediately. See [Cloudflare Quick Tunnel With Secret-Path Auth And iCloud Notes Mirror](adr/tunnel-and-icloud-pairing.md) for the trust model.
 
 ## Lifecycle Commands
 
