@@ -1408,6 +1408,18 @@ function readCodexCredentials(provider: ProviderConfig): {
   }
 }
 
+// Public helper for callers that need a yes/no on "are codex credentials
+// usable?" without the full credential record. Routes through the same
+// codexAuthPath() resolution providerHealth uses so CODEX_AUTH_JSON is
+// interpreted consistently (filesystem path, not raw JSON) everywhere.
+//
+// Pass a ProviderConfig if available; an empty {name:"codex"} is enough
+// when the caller just wants to gate a UI flow on credential presence.
+export function hasUsableCodexCredentials(provider?: ProviderConfig): boolean {
+  const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
+  return readCodexCredentials(probe).ok;
+}
+
 function codexAuthPath(provider: ProviderConfig): string {
   const raw = provider.apiKeyEnv && process.env[provider.apiKeyEnv]
     ? process.env[provider.apiKeyEnv]

@@ -137,10 +137,23 @@ describe("setup-api", () => {
   test("POST codex succeeds when ~/.codex/auth.json is present and parseable", async () => {
     const codexDir = join(s.home, ".codex");
     mkdirSync(codexDir, { recursive: true });
-    writeFileSync(join(codexDir, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "sk-test" }));
+    const authPath = join(codexDir, "auth.json");
+    writeFileSync(authPath, JSON.stringify({ OPENAI_API_KEY: "sk-test" }));
+    // Both codex paths (the codexAuthPath resolution in provider.ts and the
+    // gate in setSetupProvider) must agree on what CODEX_AUTH_JSON points
+    // at. beforeEach scrubs it to a non-existent sandbox file so the dev
+    // machine's real ~/.codex/auth.json doesn't leak in; point it at the
+    // test fixture we just wrote so both helpers resolve to the same path.
+    process.env.CODEX_AUTH_JSON = authPath;
     const result = await setSetupProvider(config, { provider: "codex" });
     expect(result.ok).toBe(true);
     expect(result.plistRefreshNeeded).toBe(false);
+    // Pins the helper-divergence regression: a previous version of
+    // hasCodexAuth treated CODEX_AUTH_JSON as raw JSON and silently fell
+    // back to ~/.codex/auth.json, so result.ok was true for the wrong
+    // reason and the embedded provider record reported configured=false.
+    expect(result.provider.configured).toBe(true);
+    expect(result.provider.provider.name).toBe("codex");
     const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
     expect(cfg.provider?.name).toBe("codex");
