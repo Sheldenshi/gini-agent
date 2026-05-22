@@ -148,6 +148,18 @@ export class TunnelManager {
   async start(): Promise<TunnelSnapshot> {
     if (this.handle) return this.getSnapshot();
     if (this.starting) return this.starting;
+    // Wait for an in-flight teardown to complete before spawning a new
+    // tunnel. The stopInner path nulls `this.handle` before awaiting
+    // `handle.stop()`, so without this guard a fast caller can see no
+    // live handle, set `stopping = false`, and spawn cloudflared while
+    // the lingering stop() is still in its handle.stop() await. When
+    // stop() then resumes, its later clauses (`monitor`, `notesRefresh`
+    // cleanup, snapshot clear) would clobber the freshly-started tunnel.
+    if (this.stopPromise) {
+      try { await this.stopPromise; } catch { /* errors already logged */ }
+    }
+    if (this.handle) return this.getSnapshot();
+    if (this.starting) return this.starting;
     this.stopping = false;
     const startPromise = this.startInner();
     this.starting = startPromise;

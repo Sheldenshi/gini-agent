@@ -247,6 +247,40 @@ describe("TunnelManager", () => {
     await manager.stop();
   });
 
+  test("start() during in-flight stop waits for teardown before spawning", async () => {
+    setupInstanceDir("tunnel-manager-start-during-stop");
+    let spawnCount = 0;
+    const spawned: Array<{ killed: boolean }> = [];
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-start-during-stop",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      disableAppleNotes: true,
+      spawn: () => {
+        const state = { killed: false };
+        spawned.push(state);
+        const url = `INF https://restart-${++spawnCount}.trycloudflare.com\n`;
+        return scriptedChild([url], {
+          killDelayMs: 30,
+          onKill: () => { state.killed = true; }
+        });
+      }
+    });
+    await manager.start();
+    const stopP = manager.stop();
+    const startP = manager.start();
+    await Promise.all([stopP, startP]);
+    // First child stopped completely before the second spawn began.
+    expect(spawned[0]?.killed).toBe(true);
+    expect(spawnCount).toBe(2);
+    expect(manager.getSnapshot().publicUrl).toContain("restart-2");
+    await manager.stop();
+  });
+
   test("stop() during in-flight start tears the child down on its own", async () => {
     setupInstanceDir("tunnel-manager-stop-during-start");
     let killed = false;
@@ -351,7 +385,7 @@ function makeManager(instance: string, options: ScriptedSpawnOptions): TunnelMan
 
 function scriptedChild(
   chunks: string[],
-  options: { urlDelayMs?: number; onKill?: () => void } = {}
+  options: { urlDelayMs?: number; killDelayMs?: number; onKill?: () => void } = {}
 ) {
   const encoder = new TextEncoder();
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -379,7 +413,11 @@ function scriptedChild(
       try { controllerRef?.close(); } catch { /* ignore */ }
       controllerRef = null;
       options.onKill?.();
-      exitResolvers.resolve(0);
+      if (options.killDelayMs) {
+        setTimeout(() => exitResolvers.resolve(0), options.killDelayMs);
+      } else {
+        exitResolvers.resolve(0);
+      }
     }
   };
 }
