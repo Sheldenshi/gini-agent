@@ -148,13 +148,19 @@ Smoke tests pin echo providers so parallel smoke runs and CI do not download mod
 
 ## Current Surfaces
 
-- `gini memory list/add/edit/approve/reject/archive`
-- `/api/memory`
-- `/api/banks`
-- `/api/memory/recall`
-- `/api/memory/reflect`
-- `/api/memory/migrate`
-- web Memory page
+After the state.memories consolidation (see ADR
+memory-surface-consolidation.md):
+
+- `USER.md` — instance-scoped user-identity surface. Edits via
+  `edit_user_profile` (auto-approved).
+- `SOUL.md` — per-agent persona. Edits via `edit_soul` (propose →
+  approve via `POST /api/identity-files/soul/approve`).
+- Hindsight — per-agent SQLite bank populated by auto-retain at task
+  end; queried by recall on each turn and the `recall_memory` tool.
+- `gini memory {retain|recall|reflect|units|banks|migrate}`
+- `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`,
+  `/api/memory/units`, `/api/memory/banks`
+- web Memory page (Hindsight only)
 
 ## Direction
 

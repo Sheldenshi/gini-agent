@@ -338,23 +338,30 @@ or `skills/agents/codex/SKILL.md` — those skills cover `--allowedTools`,
 
 ## Memory
 
-Pinned memories ride the system prompt every turn. Long-term memory is
-pulled by embedding recall on each task.
+Three surfaces, no fourth:
 
-The agent has three tools for memory: `recall_memory` for explicit
-mid-task lookups (distinct from the automatic recall that runs at task
-start), `add_memory` to propose a new memory, and `update_memory` to
-edit an existing one in place. `add_memory` always lands as `proposed`
-and requires user approval via the memory review flow — same gate as
-the memory reflection pipeline.
+- `USER.md` (instance-scoped, always-inject) — user identity, preferences,
+  recurring goals. Edits go through `edit_user_profile`, which
+  auto-approves: writes land at the approved file and ride the system
+  prompt on the next turn. Cross-agent — switching agents preserves
+  the user profile.
+- `SOUL.md` (per-agent, always-inject) — agent persona and behavior
+  rules. Edits go through `edit_soul` with a propose-vs-approve gate
+  because persona edits change behavior across every turn.
+- Hindsight (per-agent SQLite bank, recall-on-demand) — long-term
+  memory populated by auto-retain at task end. Recall surfaces relevant
+  units automatically; `recall_memory` is the on-demand lookup tool.
 
-API: `POST /api/memory { content, status }`, `GET /api/memory`,
-`PATCH /api/memory/<id>`, `DELETE /api/memory/<id>`,
-`POST /api/memory/<id>/approve`, `POST /api/memory/recall { query, tokenBudget, bankId }`.
+The legacy `state.memories` pinned-memory store, `add_memory`,
+`update_memory`, the `/api/memory` CRUD routes, and
+`gini memory list|add|approve|reject` were removed in the
+memory-surface consolidation. The only API surfaces are the Hindsight
+endpoints (`/api/memory/retain`, `/api/memory/recall`,
+`/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`) plus
+the identity-file approve endpoint for SOUL.md
+(`POST /api/identity-files/soul/approve`).
 
-Human-operator CLI mirror: `gini memory {add|list|edit|delete|recall|reflect}`.
-
-Keep pinned memories short — every active row costs context every turn.
+Human-operator CLI mirror: `gini memory {retain|recall|reflect|units|banks|migrate}`.
 
 ## Skills
 

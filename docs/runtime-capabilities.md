@@ -29,7 +29,7 @@ bun run gini evidence
 | CLI task workflow | `gini task submit/list/show/retry/cancel` |
 | Chat and session history | `gini chat new/send/sync/show/list`, `/api/chat` |
 | Execution runs | `gini runs list/show`, `/api/runs`; chat turns create durable runs with plan steps and compatibility task links |
-| Persistent memory | `gini memory list/add/edit/approve/reject/archive`, `/api/memory` |
+| Persistent memory | USER.md (instance), SOUL.md (per-agent), Hindsight (per-agent SQLite bank). `gini memory retain/recall/reflect/units/banks/migrate`, `/api/memory/{retain,recall,reflect,units,banks}` |
 | Embeddings | Local Transformers.js by default; OpenAI and echo are opt-in. `gini embedding status`, `gini embedding reembed`, `/api/embedding/*` |
 | Reranker | Local Transformers.js cross-encoder by default; echo and none are opt-in. `gini reranker status`, `/api/reranker/status` |
 | Skills | Skills load enabled by default and can be enabled or disabled. `gini skills list/add/show/search/validate/test/enable/disable/rollback`, `/api/skills` |
@@ -57,7 +57,7 @@ Stable local clients use the gateway API:
 - `/api/status`, `/api/healthz`, `/api/state`
 - `/api/version`, `/api/update/check`, `/api/update`
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/approvals`
-- `/api/memory`, `/api/banks`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/migrate`
+- `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/memory/migrate`
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`

@@ -113,7 +113,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/status`, `/api/healthz`, `/api/state`
 - `/api/version`, `/api/update/check`, `/api/update`
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/approvals`
-- `/api/memory`, `/api/banks`, `/api/embedding/*`, `/api/reranker/status`
+- `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/embedding/*`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`

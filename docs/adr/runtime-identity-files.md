@@ -14,16 +14,15 @@ Gini exposes three markdown files at the runtime root that the agent loop loads 
 | `SOUL.md` | `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` | per-agent | agent may propose edits via `edit_soul` (proposed → approved) |
 | `USER.md` | `~/.gini/instances/<inst>/USER.md` | instance | agent may propose edits via `edit_user_profile` (proposed → approved) |
 
-The three files are a curated layer over the existing memory pipeline; they do not replace `state.memories` (legacy pinned memories) or the Hindsight per-agent bank.
+The three files are a curated layer over the Hindsight memory pipeline. The legacy `state.memories` pinned-memory store was retired alongside the memory-surface consolidation — USER.md (instance), SOUL.md (per-agent), and Hindsight (per-agent bank) are the three memory surfaces now. See ADR [memory-surface-consolidation.md](./memory-surface-consolidation.md).
 
 System-prompt assembly order in `buildAgentSystemContext`:
 
 1. `INSTRUCTIONS.md` content (falls back to the bundled `src/runtime/defaults/INSTRUCTIONS.md` when the per-instance file is absent)
 2. `SOUL.md` content (per active agent, when present)
 3. Runtime identity block (unchanged, see ADR runtime-identity-injection.md)
-4. Pinned memories (`state.memories`, unchanged)
-5. `USER.md` content (when present)
-6. Long-term recalled memory (Hindsight, unchanged)
+4. `USER.md` content (when present)
+5. Long-term recalled memory (Hindsight, unchanged)
 
 All three files are passed through a prompt-injection scanner before they reach the prompt. Files that match a threat pattern are replaced inline with a `[BLOCKED: ... ]` notice and a warning is recorded in the runtime trace; the gateway does not crash on a malicious file.
 
@@ -53,7 +52,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
   - `writeSoul(instance, agentId, content, status)` and `writeUserProfile(instance, content, status)` write `<file>` for approved content and `<file>.proposed` for proposed content. The gateway only reads the approved file into the prompt; proposals require approval via the API.
   - `scanForInjection(content, filename)` ports Hermes' `_CONTEXT_THREAT_PATTERNS` and `_CONTEXT_INVISIBLE_CHARS`.
 - `src/execution/chat-task.ts` (modern agent loop) and `src/provider.ts::generateTaskSummary` (legacy single-shot path) load the three files via `identity-files.ts` and pass them through `buildAgentSystemContext`.
-- `src/execution/tool-catalog.ts` adds `edit_soul` and `edit_user_profile` tools (toolset `identity`, always exposed alongside `add_memory`). Both tools propose a new file body; the body lands as `<file>.proposed` and is reflected in the audit + trace stream.
+- `src/execution/tool-catalog.ts` adds `edit_soul` and `edit_user_profile` tools (toolset `identity`, always exposed). The `edit_soul` tool proposes a new SOUL.md body; the body lands as `SOUL.md.proposed` and is reflected in the audit + trace stream until the user approves. The `edit_user_profile` tool was changed to auto-approve in the memory-surface consolidation — see ADR [memory-surface-consolidation.md](./memory-surface-consolidation.md); writes land directly at `USER.md` with the injection scan still gating threat patterns.
 - `src/execution/tool-dispatch.ts` routes `edit_soul` / `edit_user_profile` to handlers that call into `identity-files.ts`. The handlers are sync (no approval gate at dispatch time) and rely on the proposed-vs-approved file split to keep unreviewed content out of the prompt.
 - Both `edit_soul` and `edit_user_profile` accept an `action` field with three values:
   - `set` — replace the whole file body with `content` (default).
@@ -63,7 +62,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 ## Boundary
 
 - **Per-agent filesystem convention.** `~/.gini/instances/<inst>/agents/<agentId>/SOUL.md` is the first per-agent filesystem artifact in Gini. The directory is created lazily on first write; readers tolerate a missing directory and treat it as "no SOUL set". This convention is reserved for per-agent state that is too large or too human-edited to belong in `state.json`.
-- **Approved-file vs proposed-file split.** The runtime only ever reads the approved file (`SOUL.md`, `USER.md`) into the system prompt. Agent-proposed edits land as `SOUL.md.proposed` / `USER.md.proposed` and never reach the model until the user approves them via the approval API. This mirrors how `add_memory` lands as `status: "proposed"` and only enters the pinned-memory block after a `POST /api/memory/<id>/approve`.
+- **Approved-file vs proposed-file split.** The runtime only ever reads the approved file (`SOUL.md`, `USER.md`) into the system prompt. Agent-proposed `SOUL.md` edits land as `SOUL.md.proposed` and never reach the model until the user approves them via `POST /api/identity-files/soul/approve`. `edit_user_profile` was switched to auto-approve in the memory-surface consolidation (USER.md is a smaller-blast-radius surface, scoped to user facts); SOUL.md edits keep the gate because persona changes reshape every reply. See ADR [memory-surface-consolidation.md](./memory-surface-consolidation.md).
 - **Injection-scan policy is fail-soft.** A file that trips a threat pattern is replaced inline with a `[BLOCKED: <filename> contained potential prompt injection (<reasons>). Content not loaded.]` notice and a warning is appended to the runtime trace. The gateway must keep running — a hostile USER.md must not lock the user out of their own instance.
 - **INSTRUCTIONS.md is user-only.** The agent has no tool to edit it. The bundled `src/runtime/defaults/INSTRUCTIONS.md` remains shipped with the runtime so a fresh instance has a working preamble without filesystem setup.
 - **Scaffold asymmetry.** At instance creation `install()` seeds `INSTRUCTIONS.md` with the bytes of the bundled `src/runtime/defaults/INSTRUCTIONS.md` so the user opens the file to a working baseline they can edit against — an empty file gives them nothing to anchor on. `USER.md` and per-agent `SOUL.md` stay zero-byte because no defaults exist (a user profile and an agent persona are both inherently caller-supplied). Drift cost: a user who never edits the seeded `INSTRUCTIONS.md` is frozen at install-time defaults even as the bundled file evolves on later Gini upgrades. The escape hatch is deletion — removing the file restores the bundled fallback path at the next chat turn.
@@ -87,7 +86,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 
 - **One `IDENTITY.md` carrying all three concerns.** Rejected. Operating rules (the model's behavior contract), persona (the agent's voice), and user identity (who the user is) have different scopes and different edit policies. Collapsing them would either force per-agent operating rules (defeating the instance-level baseline) or instance-level persona (breaking the multi-agent product story).
 - **Persist file content inside `state.json`.** Rejected. Markdown is human-edited; round-tripping through JSON serialization adds friction for what should be `vim ~/.gini/instances/<inst>/USER.md`.
-- **Skip the proposed-file split and rely on inline approval.** Rejected. The propose / approve split mirrors the existing `add_memory` flow and lets the user inspect the diff before approval. Inline approval would bypass the audit chain for human-readable content.
+- **Skip the proposed-file split and rely on inline approval.** Rejected for `SOUL.md` — the persona surface materially changes agent behavior across every turn, so the second pair of eyes earns its keep. `USER.md` was later flipped to auto-approve in the memory-surface consolidation (smaller blast radius); see ADR [memory-surface-consolidation.md](./memory-surface-consolidation.md).
 - **Apply the injection scan only to `SOUL.md`.** Rejected. All three files reach the system prompt; all three need the same scan. A user pasting a hostile USER.md from a stranger is the realistic threat — same shape as the Hermes context-file model.
 
 ## Acceptance Checks
