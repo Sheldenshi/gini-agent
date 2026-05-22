@@ -1087,3 +1087,35 @@ export async function disableMessagingBridge(config: RuntimeConfig, idOrName: st
   });
   return bridge;
 }
+
+// Hard-delete a messaging bridge: drop the record from
+// state.messagingBridges entirely and erase its encrypted secret
+// files on disk. Existing chat sessions and messages keep their
+// `bridgeId` reference (the runtime treats those as historical, and
+// the UI gates rendering on the bridge existing) — a cascade would
+// also wipe useful audit history. The secret-file sweep runs before
+// the state mutation so a crash mid-remove still erases the token;
+// the orphaned bridge record can then be removed on retry.
+export async function removeMessagingBridge(config: RuntimeConfig, idOrName: string) {
+  const bridge = readState(config.instance).messagingBridges.find(
+    (item) => item.id === idOrName || item.name === idOrName
+  );
+  if (!bridge) throw new Error(`Messaging bridge not found: ${idOrName}`);
+  deleteConnectorSecrets(config.instance, bridgeSecretNamespace(bridge.id));
+  return mutateState(config.instance, (state) => {
+    const index = state.messagingBridges.findIndex((item) => item.id === bridge.id);
+    if (index >= 0) state.messagingBridges.splice(index, 1);
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.removed",
+        target: bridge.id,
+        risk: "medium",
+        evidence: { kind: bridge.kind, name: bridge.name }
+      },
+      { system: true }
+    );
+    return { id: bridge.id, removed: true } as const;
+  });
+}
