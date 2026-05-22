@@ -191,4 +191,43 @@ describe("buildToolCatalog", () => {
     expect(names.has("file_read")).toBe(true);
     expect(names.has("terminal_exec")).toBe(true);
   });
+
+  describe("identity tool descriptions", () => {
+    // The descriptions of `edit_user_profile` and `edit_soul` carry the
+    // bulk of the in-prompt steering. Pin the key clauses so a future
+    // rewrite that drops them surfaces as a test failure instead of
+    // silently regressing model behavior.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+
+    test("edit_user_profile description names the H2 sections and the soft cap", () => {
+      const tool = catalog.find((t) => t.function.name === "edit_user_profile");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      // H2 section convention (Identity, Preferences, Background, Goals).
+      expect(desc).toContain("## Identity");
+      expect(desc).toContain("## Preferences");
+      // Set preferred over append.
+      expect(desc).toContain('Prefer `action: "set"`');
+      // Declarative-not-imperative phrasing rule.
+      expect(desc).toContain("facts ABOUT the user");
+      // Budget awareness clause.
+      expect(desc).toContain("soft cap");
+      // SKIP-list keyword (a single representative entry is enough).
+      expect(desc).toContain("task progress");
+      // Don't-narrate / short ack rule.
+      expect(desc).toContain("Got it");
+    });
+
+    test("edit_soul description names the H2 sections and the soft cap", () => {
+      const tool = catalog.find((t) => t.function.name === "edit_soul");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      expect(desc).toContain("## Voice");
+      expect(desc).toContain("## Style");
+      expect(desc).toContain('Prefer `action: "set"`');
+      expect(desc).toContain("Voice is terse");
+      expect(desc).toContain("soft cap");
+    });
+  });
 });
