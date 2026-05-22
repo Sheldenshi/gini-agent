@@ -1,5 +1,12 @@
 import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
+import {
+  encodeQr,
+  renderQrAnsi,
+  renderQrSvg,
+  stripTunnelPrefix,
+  type TunnelSnapshot
+} from "./integrations/tunnel";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import { appendTrace, mutateState, readState, readTrace } from "./state";
@@ -39,8 +46,52 @@ import { projectRoot } from "./paths";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
-export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
+export interface TunnelHandlerHooks {
+  /** Stable per-instance secret URL prefix. */
+  getSecret(): string | null;
+  /** Snapshot of the current tunnel state for `/api/tunnel`. */
+  getSnapshot(): TunnelSnapshot | null;
+}
+
+export interface CreateHandlerOptions {
+  tunnel?: TunnelHandlerHooks;
+}
+
+export function createHandler(
+  config: RuntimeConfig,
+  options: CreateHandlerOptions = {}
+): (request: Request) => Response | Promise<Response> {
+  const tunnel = options.tunnel ?? null;
   const routes: Array<[string, RegExp, Handler]> = [
+    // GET /api/tunnel returns the live tunnel snapshot (URL + secret + Apple
+    // Notes mirror status). The bearer-token auth on the surrounding
+    // handler already gates this — only the operator and authorized
+    // tunneled requests can read the secret.
+    ["GET", /^\/api\/tunnel$/, () => {
+      if (!tunnel) return json({ enabled: false }, 200);
+      const snapshot = tunnel.getSnapshot();
+      return json(snapshot ?? { enabled: false });
+    }],
+    // SVG QR for the current public URL. Returns 404 when the tunnel hasn't
+    // produced a URL yet (cloudflared still negotiating, tunnel disabled).
+    ["GET", /^\/api\/tunnel\/qr\.svg$/, () => {
+      const snapshot = tunnel?.getSnapshot();
+      if (!snapshot?.publicUrl) return json({ error: "tunnel URL not available" }, 404);
+      const svg = renderQrSvg(encodeQr(snapshot.publicUrl));
+      return new Response(svg, {
+        headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
+    // ANSI QR for terminal rendering. Useful for `gini tunnel qr` printing
+    // a fresh QR without re-encoding client-side.
+    ["GET", /^\/api\/tunnel\/qr\.txt$/, () => {
+      const snapshot = tunnel?.getSnapshot();
+      if (!snapshot?.publicUrl) return json({ error: "tunnel URL not available" }, 404);
+      const ansi = renderQrAnsi(encodeQr(snapshot.publicUrl));
+      return new Response(ansi, {
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
     ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
@@ -665,20 +716,41 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
   return async (request: Request) => {
     const url = new URL(request.url);
-    if (url.pathname.startsWith("/api/")) {
-      if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
+    // Secret-path tunnel guard. When a tunnel secret is configured AND the
+    // pathname is prefixed with it, strip the prefix, mark the request as
+    // tunneled, and let the rest of the routing run as usual. Tunneled
+    // requests bypass the bearer-token check — the URL itself is the
+    // credential. Direct localhost callers (CLI, BFF) keep using the
+    // bearer-token path below; the tunnel guard only fires when the path
+    // actually begins with `/<secret>/`.
+    const secret = tunnel?.getSecret() ?? null;
+    let tunneled = false;
+    let effectivePathname = url.pathname;
+    if (secret) {
+      const stripped = stripTunnelPrefix(url.pathname, secret);
+      if (stripped !== null) {
+        tunneled = true;
+        effectivePathname = stripped;
+      }
+    }
+    if (tunneled && request.method === "GET" && (effectivePathname === "/" || effectivePathname === "")) {
+      return tunnelLanding(config, tunnel?.getSnapshot() ?? null);
+    }
+    if (effectivePathname.startsWith("/api/")) {
+      if (request.method === "POST" && effectivePathname === "/api/pairing/claim") {
         try {
           return json(await claimPairing(config, await body(request)), 201);
         } catch (error) {
           return json({ error: error instanceof Error ? error.message : String(error) }, 400);
         }
       }
-      if (!await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
+      if (!tunneled && !await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
+      const routedRequest = tunneled ? rewriteRequestPath(request, url, effectivePathname) : request;
       for (const [method, pattern, handler] of routes) {
-        const match = url.pathname.match(pattern);
+        const match = effectivePathname.match(pattern);
         if (request.method === method && match) {
           try {
-            return await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value])));
+            return await handler(routedRequest, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value])));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             return json({ error: message }, statusFromErrorMessage(message));
@@ -687,7 +759,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return json({ error: "Not found" }, 404);
     }
-    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
+    if (request.method === "GET" && (effectivePathname === "/" || effectivePathname === "")) {
       return json({
         name: "gini-runtime",
         instance: config.instance,
@@ -698,6 +770,60 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }
     return json({ error: "Not found" }, 404);
   };
+}
+
+// When a tunneled request lands on the prefix-stripped path, rebuild the
+// Request so downstream handlers that consume `new URL(request.url)` see
+// the rewritten pathname. Headers, method, and body are preserved verbatim.
+function rewriteRequestPath(original: Request, originalUrl: URL, newPathname: string): Request {
+  const rewritten = new URL(originalUrl.toString());
+  rewritten.pathname = newPathname;
+  // Bun's Request constructor rejects bodied GETs with the original Request
+  // sentinel, so use it as the second arg to clone headers/method/body.
+  return new Request(rewritten.toString(), original);
+}
+
+// Friendly HTML landing served at the tunnel root. Lists the current public
+// URL, the local target the gateway is forwarding to, and a few entry-point
+// API URLs the user can hit from their phone.
+function tunnelLanding(config: RuntimeConfig, snapshot: TunnelSnapshot | null): Response {
+  const publicUrl = snapshot?.publicUrl ?? "(not connected)";
+  const observedAt = snapshot?.observedAt ?? "—";
+  const html = [
+    `<!doctype html><html lang="en"><head><meta charset="utf-8">`,
+    `<meta name="viewport" content="width=device-width,initial-scale=1">`,
+    `<title>Gini gateway — ${escapeHtml(config.instance)}</title>`,
+    `<style>`,
+    `body{font-family:system-ui,-apple-system,BlinkMacSystemFont,sans-serif;background:#0e1116;color:#e6edf3;padding:24px;margin:0;line-height:1.5}`,
+    `h1{font-size:1.4rem;margin:0 0 12px;font-weight:600}`,
+    `code{background:#1c2128;padding:2px 6px;border-radius:4px;font-size:0.95em;word-break:break-all}`,
+    `.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin:12px 0}`,
+    `.label{color:#7d8590;font-size:0.85em;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px}`,
+    `a{color:#58a6ff;text-decoration:none}a:hover{text-decoration:underline}`,
+    `ul{padding-left:20px}`,
+    `</style></head><body>`,
+    `<h1>Gini gateway · ${escapeHtml(config.instance)}</h1>`,
+    `<div class="card"><div class="label">Public URL</div><code>${escapeHtml(publicUrl)}</code></div>`,
+    `<div class="card"><div class="label">Observed</div>${escapeHtml(observedAt)}</div>`,
+    `<div class="card"><div class="label">Try</div><ul>`,
+    `<li><a href="./api/status">/api/status</a></li>`,
+    `<li><a href="./api/tunnel">/api/tunnel</a></li>`,
+    `<li><a href="./api/tunnel/qr.svg">/api/tunnel/qr.svg</a></li>`,
+    `<li><a href="./api/state">/api/state</a></li>`,
+    `</ul></div></body></html>`
+  ].join("");
+  return new Response(html, {
+    headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // Strict parse for Telegram chat_id values on the allow/deny endpoints.

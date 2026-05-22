@@ -45,6 +45,44 @@ bun run gini provider set openai gpt-5.4-mini
 bun run gini doctor
 ```
 
+## Public access via Cloudflare quick tunnel
+
+The gateway can expose itself through a Cloudflare quick tunnel so it is
+reachable from any device on any network. Authorization is by URL prefix
+— the operator never types a password — and the URL prefix stays stable
+across restarts even though Cloudflare rotates the public hostname.
+
+```sh
+bun run gini tunnel enable        # flip the persistent config flag
+bun run gini stop && bun run gini start   # pick up the flag
+bun run gini tunnel status        # current URL + secret + Apple Notes status
+bun run gini tunnel qr            # ANSI QR for the current URL
+```
+
+The CLI prints the full `https://<random>.trycloudflare.com/<secret>/`
+URL. Scan the QR with a phone camera or open the URL in any browser —
+the runtime renders a small landing page that links into `/api/status`,
+`/api/state`, and `/api/tunnel/qr.svg`.
+
+`cloudflared` must be on PATH (`brew install cloudflared` on macOS). With
+the binary missing the tunnel snapshot stays empty and the rest of the
+runtime is unaffected.
+
+On macOS with iCloud signed in, the runtime also mirrors the current URL
+into a Note named `gini-tunnel-<instance>` inside a top-level folder
+called `gini` (configurable via `gini tunnel apple-notes folder <name>`).
+The note refreshes on every URL change so the operator's iPhone sees the
+latest URL via iCloud sync without scanning a new QR. The first invocation
+triggers a one-time macOS Automation permission prompt for Notes.app — open
+System Settings → Privacy & Security → Automation if the prompt does not
+appear, find the entry for the process that started the runtime (Bun or
+`gini`), and grant Notes access. The runtime never blocks waiting for the
+prompt; the snapshot's `appleNotes.lastError` field reports whether the
+last sync succeeded.
+
+For the full design + threat model see
+[Cloudflare Quick Tunnel With Secret-Path Auth And iCloud Notes Mirror](adr/tunnel-and-icloud-pairing.md).
+
 ## Start And Stop
 
 Persistent runtime:

@@ -1,11 +1,11 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
-import { loadConfig, parseInstance, runtimePortPath } from "./paths";
+import { configPath, loadConfig, parseInstance, runtimePortPath, tunnelLogPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
 import { applyLegacyTelegramPairingMigration } from "./state/store";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
@@ -13,6 +13,7 @@ import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
+import { resolveTunnelConfig, TunnelManager } from "./integrations/tunnel";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -138,6 +139,32 @@ runConnectorDetection(config)
     });
   });
 
+// Resolve tunnel config + persist a freshly-generated secret. The secret
+// stays stable across restarts so the URL prefix the user bookmarks (or
+// saves in Apple Notes) keeps working; only the cloudflared hostname
+// rotates. `enabled` defaults to false — operators opt in via
+// `gini tunnel enable` (or by editing config.json directly).
+const tunnelResolved = resolveTunnelConfig(config);
+if (tunnelResolved.mutated) {
+  try {
+    const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
+    const existingTunnel = (onDisk.tunnel ?? {}) as Record<string, unknown>;
+    onDisk.tunnel = { ...existingTunnel, secret: tunnelResolved.config.secret };
+    writeFileSync(configPath(config.instance), `${JSON.stringify(onDisk, null, 2)}\n`);
+  } catch (error) {
+    appendLog(config.instance, "tunnel.secret.persist.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+const tunnelManager = new TunnelManager({
+  instance: config.instance,
+  config: tunnelResolved.config,
+  targetUrl: `http://127.0.0.1:${config.port}`,
+  logPath: tunnelLogPath(config.instance)
+});
+
 const server = Bun.serve({
   port: config.port,
   hostname: "127.0.0.1",
@@ -148,7 +175,12 @@ const server = Bun.serve({
   // 255s is the per-request ceiling (Bun's max), high enough that operations
   // complete and low enough that genuinely hung sockets still get reaped.
   idleTimeout: 255,
-  fetch: createHandler(config)
+  fetch: createHandler(config, {
+    tunnel: {
+      getSecret: () => tunnelResolved.config.secret,
+      getSnapshot: () => tunnelManager.getSnapshot()
+    }
+  })
 });
 
 // Record the live port so clients (CLI status, autostart web shim, BFF
@@ -161,6 +193,19 @@ writeFileSync(runtimePortPath(config.instance), String(server.port));
 
 appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
+
+// Fire-and-forget tunnel bring-up. We don't block listen-readiness on
+// cloudflared because the local gateway is already serving and the tunnel
+// is a convenience layer. Errors are logged and surfaced through the
+// snapshot. The manager is told to stay quiet when the user hasn't
+// opted in.
+if (tunnelResolved.config.enabled) {
+  void tunnelManager.start().catch((error) => {
+    appendLog(config.instance, "tunnel.start.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+}
 
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
 // scheduling the next tick so a slow tick (e.g. spawning N script jobs
@@ -340,7 +385,11 @@ process.on("SIGTERM", async () => {
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
       // close shouldn't block runtime shutdown.
-      closeBrowserSessions().catch(() => {})
+      closeBrowserSessions().catch(() => {}),
+      // Tear down the cloudflared subprocess. The manager swallows its own
+      // errors; we still wrap the await defensively so a slow kill can't
+      // keep the runtime from exiting.
+      tunnelManager.stop().catch(() => {})
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);

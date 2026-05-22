@@ -134,6 +134,8 @@ bun run gini import plan openclaw                # dry-run summary
 bun run gini import apply openclaw [--force]     # migrate openclaw → gini
 bun run gini snapshot create "before trying candidate"
 bun run gini provider show
+bun run gini tunnel enable          # expose gateway via Cloudflare quick tunnel
+bun run gini tunnel qr              # print scannable QR for the current public URL
 ```
 
 ## Providers
@@ -238,6 +240,7 @@ GINI_STATE_ROOT=.gini GINI_LOG_ROOT=.gini-logs bun run gini --instance sandbox s
 - ✅ Paired-device auth
 - ✅ Auto-start after install (macOS LaunchAgents; runtime + webapp)
 - ✅ Browser-based onboarding at install (/setup route)
+- ✅ Cloudflare quick-tunnel exposure with secret-path auth + iCloud Notes mirror
 - ⚪ iOS mobile app for remote control
 - ⚪ Verification layer (reproducible builds, verify-app)
 - ⚪ Gini as MCP server

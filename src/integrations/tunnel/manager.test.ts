@@ -1,0 +1,255 @@
+import { describe, expect, test } from "bun:test";
+import { rmSync } from "node:fs";
+import {
+  composeAppleNoteBody,
+  renderSnapshotQr,
+  resolveTunnelConfig,
+  TunnelManager,
+  type TunnelManagerOptions
+} from "./manager";
+import type { RuntimeConfig } from "../../types";
+
+describe("resolveTunnelConfig", () => {
+  test("generates a fresh secret when the on-disk value is missing", () => {
+    const result = resolveTunnelConfig(baseConfig());
+    expect(result.mutated).toBe(true);
+    expect(result.config.secret).toMatch(/^[A-Za-z0-9_-]{16,}$/);
+  });
+
+  test("preserves an existing valid secret", () => {
+    const config = baseConfig();
+    config.tunnel = { secret: "preserved-secret-1234567890abc" };
+    const result = resolveTunnelConfig(config);
+    expect(result.mutated).toBe(false);
+    expect(result.config.secret).toBe("preserved-secret-1234567890abc");
+  });
+
+  test("env var GINI_TUNNEL=1 flips the default enabled flag on", () => {
+    const config = baseConfig();
+    const result = resolveTunnelConfig(config, { GINI_TUNNEL: "1" });
+    expect(result.config.enabled).toBe(true);
+  });
+
+  test("explicit config.tunnel.enabled wins over env", () => {
+    const config = baseConfig();
+    config.tunnel = { enabled: false, secret: "abcdefghij1234567890" };
+    const result = resolveTunnelConfig(config, { GINI_TUNNEL: "1" });
+    expect(result.config.enabled).toBe(false);
+  });
+
+  test("apple notes enabled defaults to true on darwin and false elsewhere", () => {
+    const originalPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "darwin" });
+    try {
+      const a = resolveTunnelConfig(baseConfig());
+      expect(a.config.appleNotes.enabled).toBe(true);
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+    }
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      const b = resolveTunnelConfig(baseConfig());
+      expect(b.config.appleNotes.enabled).toBe(false);
+    } finally {
+      Object.defineProperty(process, "platform", { value: originalPlatform });
+    }
+  });
+});
+
+describe("TunnelManager", () => {
+  test("start populates the snapshot once the URL appears", async () => {
+    setupInstanceDir("tunnel-manager-start");
+    const manager = makeManager("tunnel-manager-start", {
+      streamChunks: ["INF starting...\n", "INF https://test-vibes-77.trycloudflare.com\n"]
+    });
+    const snapshot = await manager.start();
+    expect(snapshot.publicUrl).toBe(`https://test-vibes-77.trycloudflare.com/${snapshot.secret}/`);
+    expect(snapshot.cloudflareUrl).toBe("https://test-vibes-77.trycloudflare.com");
+    expect(snapshot.observedAt).not.toBeNull();
+    await manager.stop();
+  });
+
+  test("stop tears down the subprocess and clears the public URL", async () => {
+    setupInstanceDir("tunnel-manager-stop");
+    const manager = makeManager("tunnel-manager-stop", {
+      streamChunks: ["INF https://test-vibes-66.trycloudflare.com\n"]
+    });
+    await manager.start();
+    await manager.stop();
+    const snapshot = manager.getSnapshot();
+    expect(snapshot.publicUrl).toBeNull();
+    expect(snapshot.cloudflareUrl).toBeNull();
+  });
+
+  test("Apple Notes push is invoked when iCloud is signed in and disabled flag false", async () => {
+    setupInstanceDir("tunnel-manager-notes");
+    const calls: string[] = [];
+    const manager = makeManager("tunnel-manager-notes", {
+      streamChunks: ["INF https://test-vibes-55.trycloudflare.com\n"],
+      osascript: async (script) => {
+        calls.push(script);
+        if (script.includes("name of every account")) {
+          return { stdout: "yes\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+    });
+    await manager.start();
+    // Give the fire-and-forget refresh a moment to settle.
+    await Bun.sleep(20);
+    const snapshot = manager.getSnapshot();
+    expect(snapshot.appleNotes.available).toBe(true);
+    expect(snapshot.appleNotes.lastSyncedAt).not.toBeNull();
+    expect(calls.some((script) => script.includes("make new note"))).toBe(true);
+    await manager.stop();
+  });
+
+  test("Apple Notes is skipped when iCloud lookup reports no", async () => {
+    setupInstanceDir("tunnel-manager-no-icloud");
+    const manager = makeManager("tunnel-manager-no-icloud", {
+      streamChunks: ["INF https://test-vibes-44.trycloudflare.com\n"],
+      osascript: async () => ({ stdout: "no\n", stderr: "", exitCode: 0 })
+    });
+    await manager.start();
+    await Bun.sleep(20);
+    const snapshot = manager.getSnapshot();
+    expect(snapshot.appleNotes.available).toBe(false);
+    expect(snapshot.appleNotes.lastSyncedAt).toBeNull();
+    await manager.stop();
+  });
+
+  test("composeAppleNoteBody renders the public URL prominently", () => {
+    const body = composeAppleNoteBody({
+      publicUrl: "https://x.trycloudflare.com/sssss/",
+      cloudflareUrl: "https://x.trycloudflare.com",
+      secret: "sssss",
+      targetUrl: "http://127.0.0.1:7778",
+      observedAt: "2026-01-01T00:00:00.000Z",
+      appleNotes: {
+        enabled: true,
+        folder: "gini",
+        noteName: "n",
+        available: true,
+        lastSyncedAt: null,
+        lastError: null
+      },
+      lastError: null
+    });
+    expect(body.split("\n")[0]).toBe("https://x.trycloudflare.com/sssss/");
+    expect(body).toContain("Target: http://127.0.0.1:7778");
+  });
+
+  test("renderSnapshotQr returns null when there is no public URL", () => {
+    const out = renderSnapshotQr({
+      publicUrl: null,
+      cloudflareUrl: null,
+      secret: "x",
+      targetUrl: "http://127.0.0.1:1",
+      observedAt: null,
+      appleNotes: {
+        enabled: false,
+        folder: "",
+        noteName: "",
+        available: null,
+        lastSyncedAt: null,
+        lastError: null
+      },
+      lastError: null
+    });
+    expect(out).toBeNull();
+  });
+
+  test("renderSnapshotQr returns ANSI + SVG when a URL is set", () => {
+    const out = renderSnapshotQr({
+      publicUrl: "https://x.trycloudflare.com/abcd1234efgh5678/",
+      cloudflareUrl: "https://x.trycloudflare.com",
+      secret: "abcd1234efgh5678",
+      targetUrl: "http://127.0.0.1:7778",
+      observedAt: "2026-01-01",
+      appleNotes: {
+        enabled: false,
+        folder: "",
+        noteName: "",
+        available: null,
+        lastSyncedAt: null,
+        lastError: null
+      },
+      lastError: null
+    });
+    expect(out?.svg.startsWith("<svg")).toBe(true);
+    expect(out?.ansi.length).toBeGreaterThan(50);
+    expect(out?.url).toBe("https://x.trycloudflare.com/abcd1234efgh5678/");
+  });
+});
+
+function baseConfig(): RuntimeConfig {
+  return {
+    instance: "tunnel-test",
+    port: 7337,
+    token: "test-token",
+    provider: { name: "echo", model: "gini-echo-v0" },
+    workspaceRoot: "/tmp",
+    stateRoot: "/tmp/gini-tunnel-tests/instances/tunnel-test",
+    logRoot: "/tmp/gini-tunnel-tests-logs/tunnel-test",
+    approvalMode: "auto"
+  };
+}
+
+function setupInstanceDir(instance: string): void {
+  const root = "/tmp/gini-tunnel-tests";
+  process.env.GINI_STATE_ROOT = root;
+  process.env.GINI_LOG_ROOT = `${root}-logs`;
+  rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
+}
+
+interface ScriptedSpawnOptions {
+  streamChunks: string[];
+  osascript?: TunnelManagerOptions["osascript"];
+  disableAppleNotes?: boolean;
+}
+
+function makeManager(instance: string, options: ScriptedSpawnOptions): TunnelManager {
+  return new TunnelManager({
+    instance,
+    config: {
+      enabled: true,
+      secret: "abcd1234efgh5678ijkl9012mnop3456",
+      appleNotes: {
+        enabled: true,
+        folder: "gini-test",
+        noteName: "tunnel-url",
+        account: "iCloud"
+      }
+    },
+    targetUrl: "http://127.0.0.1:7778",
+    disableAppleNotes: options.disableAppleNotes ?? !options.osascript,
+    spawn: () => scriptedChild(options.streamChunks),
+    osascript: options.osascript
+  });
+}
+
+function scriptedChild(chunks: string[]) {
+  const encoder = new TextEncoder();
+  let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
+  const exitResolvers = Promise.withResolvers<number>();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controllerRef = controller;
+      (async () => {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      })();
+    },
+    cancel() {
+      controllerRef = null;
+    }
+  });
+  return {
+    stderr: stream,
+    exited: exitResolvers.promise,
+    pid: 99999,
+    kill() {
+      try { controllerRef?.close(); } catch { /* ignore */ }
+      exitResolvers.resolve(0);
+    }
+  };
+}

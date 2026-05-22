@@ -216,6 +216,24 @@ export interface RuntimeConfig {
     // non-conforming value falls back to the built-in default.
     maxIterations?: number;
   };
+  // Optional Cloudflare Quick Tunnel mirror. When `enabled: true`, the
+  // runtime spawns `cloudflared tunnel --url <runtime>` at startup so the
+  // gateway is reachable from outside the local network through the
+  // returned `https://*.trycloudflare.com` URL. Authorization for tunneled
+  // requests is by URL path: requests whose pathname begins with
+  // `/<secret>/` are treated as fully authorized. The secret is persisted
+  // so the URL prefix stays stable across restarts even though the
+  // cloudflared hostname rotates.
+  tunnel?: {
+    enabled?: boolean;
+    secret?: string;
+    appleNotes?: {
+      enabled?: boolean;
+      folder?: string;
+      noteName?: string;
+      account?: string;
+    };
+  };
 }
 
 export interface RuntimeState {

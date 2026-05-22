@@ -215,6 +215,10 @@ export function snapshotsDir(instance: Instance): string {
   return join(instanceRoot(instance), "snapshots");
 }
 
+export function tunnelLogPath(instance: Instance): string {
+  return join(logDir(instance), "cloudflared.log");
+}
+
 export function workspaceDir(instance: Instance): string {
   return process.env.GINI_WORKSPACE
     ? resolve(process.env.GINI_WORKSPACE)
