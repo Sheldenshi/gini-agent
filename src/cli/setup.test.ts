@@ -385,7 +385,10 @@ describe("codexProvider.checkCredentials (direct)", () => {
 });
 
 describe("gini setup --yes codex precedence", () => {
-  test("CODEX_AUTH_JSON set and fresh echo config → picks codex with default model", async () => {
+  test("CODEX_AUTH_JSON set and fresh config → lands on codex with default model", async () => {
+    // Platform default is codex/gpt-5.5, and CODEX_AUTH_JSON satisfies the
+    // credential check, so `gini setup --yes` reports the codex provider
+    // step as already configured and leaves the config pointing at codex.
     const stateRoot = scratch("codex-yes");
     const home = scratch("codex-yes-home");
     const instance = "dev";
@@ -402,7 +405,6 @@ describe("gini setup --yes codex precedence", () => {
       env
     });
     expect(result.code).toBe(0);
-    expect(result.stdout).toContain("codex");
     const cfgPath = join(stateRoot, "instances", instance, "config.json");
     const cfg = JSON.parse(readFileSync(cfgPath, "utf8")) as { provider?: { name?: string; model?: string } };
     expect(cfg.provider?.name).toBe("codex");

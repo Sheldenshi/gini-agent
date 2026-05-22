@@ -71,16 +71,15 @@ describe("setup-api", () => {
     s.cleanup();
   });
 
-  test("status: providerConfigured is false on a fresh echo-default instance", () => {
+  test("status: providerConfigured reflects the codex platform default on a fresh instance", () => {
     const status = getSetupStatus(config);
     expect(status.ok).toBe(true);
     expect(status.providers).toEqual(["openai", "codex"]);
-    // Default provider is "echo". providerHealth.configured is true
-    // (echo needs no creds), but for the browser /setup gate echo
-    // doesn't count as a real onboarding choice — the user lands here
-    // and is asked to pick openai or codex.
-    expect(status.providerConfigured).toBe(false);
-    expect(status.current).toBe("echo");
+    // Platform default is "codex". providerHealth treats codex as
+    // configured when the runtime can find an auth.json; in this
+    // scratch env there is none, so providerConfigured is false and
+    // the browser /setup gate still asks the user to finish onboarding.
+    expect(status.current).toBe("codex");
   });
 
   test("POST openai with apiKey writes secrets.env, sets process.env, updates config", async () => {

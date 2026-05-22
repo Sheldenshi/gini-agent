@@ -222,16 +222,21 @@ export function workspaceDir(instance: Instance): string {
 }
 
 export function defaultConfig(instance: Instance): RuntimeConfig {
+  // Platform default fallback is codex/gpt-5.5. Users without `codex` CLI
+  // auth will hit a runtime error on first prompt — that's the accepted
+  // tradeoff for not landing on the placeholder `echo` provider. The
+  // `echo` provider is still a valid explicit choice (tests and the
+  // `gini provider set echo` path), it just isn't the default.
   const providerName = process.env.GINI_PROVIDER === "openai" || process.env.GINI_PROVIDER === "codex"
     ? process.env.GINI_PROVIDER
-    : "echo";
+    : "codex";
   return {
     instance,
     port: Number(process.env.GINI_PORT ?? defaultRuntimePort(instance)),
     token: crypto.randomUUID(),
     provider: {
       name: providerName,
-      model: process.env.GINI_MODEL ?? (providerName === "echo" ? "gini-echo-v0" : providerName === "codex" ? "gpt-5.5" : "gpt-5.4-mini"),
+      model: process.env.GINI_MODEL ?? (providerName === "codex" ? "gpt-5.5" : "gpt-5.4-mini"),
       apiKeyEnv: providerName === "openai" ? "OPENAI_API_KEY" : undefined
     },
     workspaceRoot: workspaceDir(instance),
