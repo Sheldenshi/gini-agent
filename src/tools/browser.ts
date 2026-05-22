@@ -135,7 +135,27 @@ let exitHookRegistered = false;
 
 function loadChromium(): Promise<typeof import("playwright-core").chromium> {
   if (!chromiumImport) {
-    chromiumImport = import("playwright-core").then((mod) => mod.chromium);
+    // Surface a friendlier error than the bare Node module-resolution
+    // string when playwright-core isn't installed. Matches the
+    // defensive wrapper in src/capabilities/browser-connect.ts so
+    // both code paths emit the same install hint.
+    chromiumImport = import("playwright-core").then(
+      (mod) => mod.chromium,
+      (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        const isMissing =
+          (error as { code?: string } | undefined)?.code === "MODULE_NOT_FOUND" ||
+          (error as { code?: string } | undefined)?.code === "ERR_MODULE_NOT_FOUND" ||
+          message.includes("Cannot find package 'playwright-core'") ||
+          message.includes("Cannot find module 'playwright-core'");
+        if (isMissing) {
+          throw new Error(
+            "Browser runtime is missing. Run `bun install` in the gini-agent checkout, then restart the runtime."
+          );
+        }
+        throw error;
+      }
+    );
   }
   return chromiumImport;
 }

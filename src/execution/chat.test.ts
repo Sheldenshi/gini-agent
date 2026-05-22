@@ -27,7 +27,7 @@ import {
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
-import { mutateState, readState } from "../state";
+import { createChatMessage, mutateState, readState } from "../state";
 import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
@@ -172,6 +172,197 @@ describe("chat session waiting-approval placeholder", () => {
     expect(assistantMsgs).toHaveLength(1);
     expect(assistantMsgs[0]?.id).not.toBe(`${taskId}-streaming`);
     expect(assistantMsgs[0]?.content).toBe("All done.");
+  });
+
+  test("surfaces the connector.request approval reason as a durable assistant bubble (kind:approval_reason)", async () => {
+    // requestConnectorTool persists the model's `reason` as a real
+    // ChatMessageRecord at approval-creation time, tagged kind:"approval_reason".
+    // This durable row is what the user sees as the chat bubble above the
+    // inline form (with rendered URLs), AND what stays in history after the
+    // form is submitted and the approval resolves.
+    //
+    // Bypassing dispatchToolCall in this test — we set up the state shape
+    // dispatchToolCall produces and assert getChatSession returns the
+    // persisted row (not a synthesized placeholder) and that the row
+    // carries the kind tag.
+    const config = buildConfig(workspaceRoot, "chat-placeholder-connector");
+
+    const session = await createChat(config, { title: "connector-placeholder" });
+
+    const reasonText = [
+      "To connect Google OAuth Desktop client, you need a Client ID and Client secret.",
+      "",
+      "1. Open https://console.cloud.google.com/apis/credentials",
+      "2. Create OAuth client ID -> Desktop app",
+      "3. Paste the values below."
+    ].join("\n");
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: "task_connreq",
+        title: "connect provider",
+        input: "please connect google",
+        status: "waiting_approval",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "running tool"
+      };
+      state.tasks.push(task);
+      const sessionRecord = state.chatSessions.find((s) => s.id === session.id);
+      if (sessionRecord) sessionRecord.taskIds.push(task.id);
+      const approval = {
+        id: "approval_connreq",
+        instance: state.instance,
+        status: "pending" as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        taskId: task.id,
+        action: "connector.request" as const,
+        target: "google",
+        risk: "medium" as const,
+        reason: reasonText,
+        payload: {
+          provider: "google",
+          providerLabel: "Google OAuth Desktop client",
+          fields: [
+            { name: "client_id", label: "Client ID", secret: false, required: true },
+            { name: "client_secret", label: "Client secret", secret: true, required: true }
+          ]
+        }
+      };
+      state.approvals.push(approval);
+      task.approvalIds.push(approval.id);
+      // Mirror what requestConnectorTool does at dispatch time: persist
+      // the reason as a real assistant message tagged approval_reason.
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "assistant",
+        content: reasonText,
+        taskId: task.id,
+        kind: "approval_reason"
+      });
+      return task.id;
+    });
+
+    const view = getChatSession(config, session.id);
+    const assistantMsgs = view.messages.filter((m) => m.role === "assistant" && m.taskId === taskId);
+    // Exactly one assistant row for this task while waiting_approval:
+    // the persisted approval_reason. No synthesized placeholder layered
+    // on top of it.
+    expect(assistantMsgs).toHaveLength(1);
+    expect(assistantMsgs[0]?.id).toMatch(/^msg_/);
+    expect(assistantMsgs[0]?.kind).toBe("approval_reason");
+    expect(assistantMsgs[0]?.content).toBe(reasonText);
+    expect(assistantMsgs[0]?.content).toContain("https://console.cloud.google.com/apis/credentials");
+  });
+
+  test("approval_reason bubble survives task progress: partial-summary streaming renders alongside it", async () => {
+    // After the user submits the inline form, the task resumes and the
+    // model starts working again (gws install, gws auth login, etc.).
+    // partialSummary on the task should still synthesize a streaming
+    // bubble — the approval_reason row must NOT suppress it, otherwise
+    // the user sees no progress until the task finishes.
+    const config = buildConfig(workspaceRoot, "chat-placeholder-progress");
+    const session = await createChat(config, { title: "approval-then-progress" });
+    const reasonText = "Last step: paste your Client ID and Client Secret below.";
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: "task_progress",
+        title: "post-approval progress",
+        input: "calendar today",
+        status: "running",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        partialSummary: "Running gws auth login..."
+      };
+      state.tasks.push(task);
+      const sessionRecord = state.chatSessions.find((s) => s.id === session.id);
+      if (sessionRecord) sessionRecord.taskIds.push(task.id);
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "assistant",
+        content: reasonText,
+        taskId: task.id,
+        kind: "approval_reason"
+      });
+      return task.id;
+    });
+
+    const view = getChatSession(config, session.id);
+    const assistantMsgs = view.messages.filter((m) => m.role === "assistant" && m.taskId === taskId);
+    // Two assistant rows: the persisted approval_reason AND the
+    // synthesized partial-summary placeholder.
+    expect(assistantMsgs).toHaveLength(2);
+    const reasonRow = assistantMsgs.find((m) => m.kind === "approval_reason");
+    const streamingRow = assistantMsgs.find((m) => m.id === `${taskId}-streaming`);
+    expect(reasonRow?.content).toBe(reasonText);
+    expect(streamingRow?.content).toBe("Running gws auth login...");
+  });
+
+  test("falls back to the generic placeholder when no connector.request approval is linked", async () => {
+    // Sanity check: other approval types (e.g. file.write) still get the
+    // existing currentStep / "Waiting for approval" placeholder. We don't
+    // want this fix to silently change other approval flows.
+    const config = buildConfig(workspaceRoot, "chat-placeholder-fallback");
+
+    const session = await createChat(config, { title: "fallback-placeholder" });
+
+    const taskId = await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: "task_filewrite",
+        title: "write a file",
+        input: "write x.txt",
+        status: "waiting_approval",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "preparing file write"
+      };
+      state.tasks.push(task);
+      const sessionRecord = state.chatSessions.find((s) => s.id === session.id);
+      if (sessionRecord) sessionRecord.taskIds.push(task.id);
+      const approval = {
+        id: "approval_filewrite",
+        instance: state.instance,
+        status: "pending" as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        taskId: task.id,
+        action: "file.write" as const,
+        target: "x.txt",
+        risk: "medium" as const,
+        reason: "About to write a file",
+        payload: { path: "x.txt", content: "x" }
+      };
+      state.approvals.push(approval);
+      task.approvalIds.push(approval.id);
+      return task.id;
+    });
+
+    const view = getChatSession(config, session.id);
+    const assistantMsgs = view.messages.filter((m) => m.role === "assistant" && m.taskId === taskId);
+    expect(assistantMsgs).toHaveLength(1);
+    // file.write approvals don't trigger the new branch — falls through to
+    // currentStep, exactly as before.
+    expect(assistantMsgs[0]?.content).toBe("preparing file write");
   });
 
   test("syncChatTaskResult writes the failure message for failed tasks", async () => {

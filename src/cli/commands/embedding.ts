@@ -18,12 +18,18 @@ export async function embedding(ctx: CliContext): Promise<void> {
   if (sub === "reembed") {
     const bank = flagValue(cliArgs, "--bank");
     const dryRun = hasFlag(cliArgs, "--dry-run");
-    const body = JSON.stringify({ bankId: bank, dryRun });
+    const allBanks = hasFlag(cliArgs, "--all-banks");
+    if (allBanks && bank) {
+      throw new Error("--all-banks and --bank are mutually exclusive");
+    }
+    const body = JSON.stringify(
+      allBanks ? { allBanks: true, dryRun } : { bankId: bank, dryRun }
+    );
     print(await api(config, "/api/embedding/reembed", { method: "POST", body }));
     return;
   }
   // help/usage
   throw new Error(
-    "Usage: gini embedding <status|reembed> [--bank ID] [--dry-run]"
+    "Usage: gini embedding <status|reembed> [--bank ID | --all-banks] [--dry-run]"
   );
 }

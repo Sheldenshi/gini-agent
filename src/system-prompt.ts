@@ -5,7 +5,9 @@
 // and the chat-task agent loop in execution/ pull from here so they ship
 // the same instructions to the model.
 
-import type { AgentIdentity, IdentitySnapshotRecord, JobRecord, MemoryRecord } from "./types";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import type { AgentIdentity, IdentitySnapshotRecord, JobRecord } from "./types";
 
 // Number of user turns in the same chat session between full identity
 // re-emissions. Below this threshold the model receives only field-level
@@ -18,38 +20,188 @@ export const IDENTITY_FULL_REFRESH_INTERVAL = 10;
 const IDENTITY_HEADER = "Your runtime identity:";
 const IDENTITY_DELTA_HEADER = "Runtime identity changes since last turn:";
 
-const INSTRUCTIONS = [
-  "You are Gini, a local-first personal agent.",
-  "Reply directly and concisely.",
-  "When the user asks for an action you have a tool for, execute it; do not narrate what you would do.",
-  "Keep working until the task is done or you are genuinely blocked (waiting on approval, missing input, or a tool failure).",
-  "Do not claim to have performed side effects. Risky side effects are handled by tools and approvals.",
-  "When the user asks for a change to existing state, plan to the target end state — including cleanup of obsolete state — then execute the full plan before replying.",
-  "Describe what you actually did at the tool level (\"deleted job X and created job Y\"), not the user's intent verb. Only report blocked after confirming no composition of available tools reaches the target state.",
-  "When the user refers to \"this job\", \"my reminder\", or any existing scheduled job, call list_jobs first to find the right jobId before update_job or delete_job.",
-  "You have an interactive browser (Playwright Chromium) with a persistent per-instance profile — authenticated workflows persist across runs. If a site needs a sign-in the user has not done yet, propose opening the visible window (POST /api/browser/connect) so they can sign in once; cookies stick.",
-  "You can schedule one-shot or recurring jobs (interval or cron). Chat-created jobs deliver into a fresh dedicated chat thread named after the job, so repeated fires do not bury the current conversation. Use create_job rather than telling the user to set a reminder elsewhere.",
-  "Before claiming a capability gap (Telegram, MCP, connectors, subagents, messaging, etc.), load the `gini` skill — it documents what is built in and how to wire it up."
-].join("\n");
+// Path to the canonical default operating-rules file. The bytes of this
+// file are the single source of truth for the baseline preamble shipped
+// with the runtime. `getDefaultGiniInstructions()` reads it on first call
+// and caches the trimmed content; `scaffoldInstanceIdentityFiles` copies
+// the same file bytes-as-is into freshly-installed instances. Keeping the
+// two paths anchored on one disk artifact ensures the seeded
+// INSTRUCTIONS.md and the runtime fallback never drift. See ADR
+// runtime-identity-files.md.
+export const DEFAULT_INSTRUCTIONS_PATH = join(import.meta.dir, "runtime", "defaults", "INSTRUCTIONS.md");
 
-// Assemble the system-area context: base instructions + identity block +
-// pinned memories + long-term recalled memory. Placing memory in the system
-// channel (rather than the user message) gives it higher-priority placement
-// without talking the model into believing it. The identity block sits
-// directly after INSTRUCTIONS so the model encounters self-context before
-// any user/world facts.
+// Per-process memoized read. The file is a shipped build asset and never
+// changes between calls; reading it on every chat turn would be wasted
+// disk IO. We resolve it lazily so importing this module does not touch
+// the filesystem (tests construct prompts without needing the asset).
+let cachedDefaultInstructions: string | undefined;
+
+// Active resolver for the default-instructions path. Production code uses
+// the constant above; tests can swap a missing path in to exercise the
+// failure-mode branch and restore the original via the reset helper.
+let activeInstructionsPath: string = DEFAULT_INSTRUCTIONS_PATH;
+
+// Read the canonical default operating-rules file and return its trimmed
+// content. The bytes live in `src/runtime/defaults/INSTRUCTIONS.md` and
+// ship with the runtime — a missing file is an unrecoverable build
+// problem, so this throws loudly rather than falling back to a hardcoded
+// sentinel. See ADR runtime-identity-files.md.
+export function getDefaultGiniInstructions(): string {
+  if (cachedDefaultInstructions !== undefined) return cachedDefaultInstructions;
+  let raw: string;
+  try {
+    raw = readFileSync(activeInstructionsPath, "utf8");
+  } catch (error) {
+    throw new Error(
+      `default INSTRUCTIONS.md missing from bundle at ${activeInstructionsPath}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  cachedDefaultInstructions = raw.trim();
+  return cachedDefaultInstructions;
+}
+
+// Test-only: drop the memoized read and point the active path back at
+// the bundled file (or to an overridden path for the failure-mode test).
+// Production code must never call this — the bundled file does not change
+// at runtime — so the helper is gated behind a `__` prefix to signal
+// intent. Pass `undefined` to restore the default.
+export function __resetDefaultGiniInstructionsCacheForTest(overridePath?: string): void {
+  cachedDefaultInstructions = undefined;
+  activeInstructionsPath = overridePath ?? DEFAULT_INSTRUCTIONS_PATH;
+}
+
+export interface AgentSystemContextOptions {
+  // When set, replaces the default operating-rules preamble (from
+  // `getDefaultGiniInstructions`). Sourced from
+  // ~/.gini/instances/<inst>/INSTRUCTIONS.md by the call sites; absent
+  // files fall back to the default.
+  instructionsOverride?: string;
+  // Per-agent persona body sourced from
+  // ~/.gini/instances/<inst>/agents/<agentId>/SOUL.md. Sits between
+  // instructions and the identity block.
+  soul?: string;
+  // Instance-scoped user profile body sourced from
+  // ~/.gini/instances/<inst>/USER.md. Sits between the runtime identity
+  // block and recalled long-term memory so the model encounters
+  // "who am I talking to" right before "what do I remember about prior
+  // conversations".
+  userProfile?: string;
+}
+
+// Soft caps surfaced to the model in the system-prompt block headers so
+// the model can see how full the file is and self-manage consolidation.
+// Deliberately not enforced — we never truncate identity content (hostile
+// UX). The header just nudges the model to consolidate when usage gets
+// high; the cap is a guideline, not a wall.
+//
+// 1500 chars is roughly 350-400 tokens, sized so a comfortably-populated
+// USER.md / SOUL.md fits inside the typical per-turn budget without
+// dominating the system prompt. The model can let either file overshoot
+// — the budget line in the header just shifts to "over cap — please
+// consolidate" and an audit trace fires.
+export const USER_SOFT_CAP_CHARS = 1500;
+export const SOUL_SOFT_CAP_CHARS = 1500;
+// When usage crosses this fraction of the cap, the header reads
+// "near cap — consolidate" to nudge the model to consolidate proactively
+// rather than waiting to overshoot.
+const BUDGET_NEAR_CAP_FRACTION = 0.8;
+
+// Render a single-line budget header above a USER.md or SOUL.md block.
+// The fraction is rounded to the nearest percent so the model sees a
+// stable, clean number. Three regions:
+//   - usage < 80% → "USER profile (412 / 1500 chars, 27%):"
+//   - 80% ≤ usage ≤ 100% → adds " — near cap, consolidate"
+//   - usage > 100% → "USER profile (1612 / 1500 chars, 107% — over cap, please consolidate):"
+//
+// The numerator is the actual character count of the block content;
+// the denominator is the per-file soft cap above.
+function renderBudgetHeader(label: string, content: string, softCapChars: number): string {
+  const used = content.length;
+  const pct = Math.round((used / softCapChars) * 100);
+  if (used > softCapChars) {
+    return `${label} (${used} / ${softCapChars} chars, ${pct}% — over cap, please consolidate):`;
+  }
+  if (used / softCapChars >= BUDGET_NEAR_CAP_FRACTION) {
+    return `${label} (${used} / ${softCapChars} chars, ${pct}% — near cap, consolidate):`;
+  }
+  return `${label} (${used} / ${softCapChars} chars, ${pct}%):`;
+}
+
+export function renderUserProfileBlock(content: string): string {
+  return `${renderBudgetHeader("USER profile", content, USER_SOFT_CAP_CHARS)}\n${content}`;
+}
+
+export function renderSoulBlock(content: string): string {
+  return `${renderBudgetHeader("SOUL persona", content, SOUL_SOFT_CAP_CHARS)}\n${content}`;
+}
+
+// Pure inspection: report whether a USER.md / SOUL.md content blob is
+// over the soft cap. Used by the call sites to emit an "over cap" trace
+// event so operators can see the model is sailing past the budget.
+export function identityBudgetState(
+  content: string,
+  softCapChars: number
+): { used: number; cap: number; pct: number; overCap: boolean; nearCap: boolean } {
+  const used = content.length;
+  const pct = Math.round((used / softCapChars) * 100);
+  return {
+    used,
+    cap: softCapChars,
+    pct,
+    overCap: used > softCapChars,
+    nearCap: used / softCapChars >= BUDGET_NEAR_CAP_FRACTION
+  };
+}
+
+// Assemble the system-area context. The block order encodes a stable
+// "agent → persona → self → user-curated facts → recalled memory"
+// progression so the model encounters its own identity before any
+// user/world facts.
+//
+// Order (each block elided when empty):
+//   1. INSTRUCTIONS — operating rules (file override or default).
+//   2. SOUL.md      — per-agent persona.
+//   3. identity     — runtime identity block (instance/agent/provider/...).
+//   4. USER.md      — instance-scoped user profile.
+//   5. recalled     — Hindsight long-term memory.
+//
+// The legacy "Pinned memories about this user" block was removed when
+// `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
+// See ADR runtime-identity-files.md.
+//
+// Placing memory in the system channel (rather than the user message)
+// gives it higher-priority placement without talking the model into
+// believing it. See ADR runtime-identity-files.md.
 export function buildAgentSystemContext(
-  memories: MemoryRecord[],
   recalledContext?: string,
-  identityBlock?: string
+  identityBlock?: string,
+  options?: AgentSystemContextOptions
 ): string {
-  const parts = [INSTRUCTIONS];
+  const instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
+    ? options.instructionsOverride
+    : getDefaultGiniInstructions();
+  const parts: string[] = [instructions];
+  if (options?.soul && options.soul.trim().length > 0) {
+    // BLOCKED notices are emitted by the load path as a one-line
+    // sentinel; they're a safety message, not file content, so the
+    // budget header is suppressed for them. Healthy bodies get a
+    // budget header so the model can see how full the file is and
+    // self-manage consolidation.
+    parts.push(
+      options.soul.startsWith("[BLOCKED:")
+        ? options.soul
+        : renderSoulBlock(options.soul)
+    );
+  }
   if (identityBlock && identityBlock.length > 0) {
     parts.push(identityBlock);
   }
-  if (memories.length > 0) {
-    const pinned = memories.map((memory) => `- ${memory.content}`).join("\n");
-    parts.push(`Pinned memories about this user (curated, always relevant):\n${pinned}`);
+  if (options?.userProfile && options.userProfile.trim().length > 0) {
+    parts.push(
+      options.userProfile.startsWith("[BLOCKED:")
+        ? options.userProfile
+        : renderUserProfileBlock(options.userProfile)
+    );
   }
   if (recalledContext && recalledContext.trim().length > 0) {
     parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);

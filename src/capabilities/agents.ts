@@ -9,6 +9,8 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
+import { scaffoldAgentSoulFile } from "../runtime/identity-files";
+import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -29,6 +31,32 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
     // Memory and hindsight content is NOT copied: agents start empty.
     // Only the *config* is inherited from the default agent.
     const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
+    // When the caller doesn't supply toolsets, union the current desired
+    // default list into whatever the default agent has on disk. This keeps
+    // newly-created sibling agents on an old instance (where
+    // `agent_default.toolsets` predates a new addition like `browser`)
+    // from inheriting the stale list. The migration in
+    // `migrateDefaultAgentToolsets` already widens `agent_default` itself
+    // on read, but this defends against creation paths that fire before
+    // the next normalize.
+    // Union the canonical DEFAULT_AGENT_TOOLSETS list into whatever the
+    // default agent has on disk. This keeps newly-created sibling agents
+    // on an old instance (where `agent_default.toolsets` predates a new
+    // addition like `browser`) from inheriting the stale list. The
+    // migration in `migrateDefaultAgentToolsets` widens `agent_default`
+    // itself on read, but this defends against creation paths that fire
+    // before the next normalize.
+    const fallbackToolsets = (() => {
+      const seed = Array.isArray(defaultAgent?.toolsets) ? [...defaultAgent.toolsets] : [];
+      const known = new Set(seed);
+      for (const name of DEFAULT_AGENT_TOOLSETS) {
+        if (!known.has(name)) {
+          seed.push(name);
+          known.add(name);
+        }
+      }
+      return seed;
+    })();
     return createAgentRecord(state, {
       name,
       providerName: typeof input.providerName === "string"
@@ -39,7 +67,7 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
         : defaultAgent?.model,
       toolsets: Array.isArray(input.toolsets)
         ? input.toolsets.map(String)
-        : (defaultAgent?.toolsets ?? ["file", "terminal", "memory", "session_search"]),
+        : fallbackToolsets,
       messagingTargets: Array.isArray(input.messagingTargets)
         ? input.messagingTargets.map(String)
         : (defaultAgent?.messagingTargets ?? [])
@@ -50,6 +78,13 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
   // there's no copying of memories or hindsight units from the default
   // agent or any other agent.
   ensureAgentBank(config.instance, record.id);
+  // Scaffold the per-agent SOUL.md as a zero-byte placeholder so the
+  // user can fill it in without first having to create the directory.
+  // The load path treats an empty file as absent, so this does not
+  // change prompt behavior — it only surfaces the file on disk.
+  // Order matters: state has already been persisted, so a crash here
+  // can never leave a SOUL.md for a non-existent agent.
+  scaffoldAgentSoulFile(config.instance, record.id);
   return record;
 }
 
@@ -64,16 +99,19 @@ export async function useAgent(config: RuntimeConfig, idOrName: string) {
 //   - Unknown agent id/name throws (mapped to 404 by the HTTP layer).
 // Cascade:
 //   - Per-agent Hindsight bank (`bank_${agentId}`) + all units in it.
-//   - Legacy MemoryRecord rows where `agentId === <deletedAgentId>` are
-//     hard-deleted. The owning agent is going away, so archiving them
-//     serves no purpose.
 //   - The agent row is removed from `state.agents`.
+// The legacy `state.memories` per-agent purge was removed alongside the
+// state.memories consolidation (see ADR runtime-identity-files.md);
+// USER.md is instance-scoped (no per-agent purge needed) and SOUL.md
+// lives under `agents/<agentId>/SOUL.md` on disk — its filesystem
+// cleanup is left to the operator since the file may carry hand-edited
+// content worth preserving.
 // Returns counts so callers/tests can verify the cascade scope. A single
 // audit event records the deletion + cleanup counts.
 export async function deleteAgent(
   config: RuntimeConfig,
   idOrName: string
-): Promise<{ ok: true; id: string; memoriesArchived: number; unitsDeleted: number; bankDeleted: boolean }> {
+): Promise<{ ok: true; id: string; unitsDeleted: number; bankDeleted: boolean }> {
   const result = await mutateState(config.instance, (state) => {
     const agent = state.agents.find((item) => item.id === idOrName || item.name === idOrName);
     if (!agent) throw new Error(`Agent not found: ${idOrName}`);
@@ -83,11 +121,8 @@ export async function deleteAgent(
     if (state.activeAgentId === agent.id) {
       throw new Error("Cannot delete the active agent; switch to another agent first.");
     }
-    const memoriesBefore = state.memories.length;
-    state.memories = state.memories.filter((memory) => memory.agentId !== agent.id);
-    const memoriesArchived = memoriesBefore - state.memories.length;
     state.agents = state.agents.filter((item) => item.id !== agent.id);
-    return { id: agent.id, name: agent.name, memoriesArchived };
+    return { id: agent.id, name: agent.name };
   });
 
   // Drop the per-agent Hindsight bank + its units outside the JSON state
@@ -115,7 +150,6 @@ export async function deleteAgent(
         risk: "medium",
         evidence: {
           name: result.name,
-          memoriesArchived: result.memoriesArchived,
           unitsDeleted,
           bankDeleted
         }
@@ -128,7 +162,6 @@ export async function deleteAgent(
   return {
     ok: true,
     id: result.id,
-    memoriesArchived: result.memoriesArchived,
     unitsDeleted,
     bankDeleted
   };

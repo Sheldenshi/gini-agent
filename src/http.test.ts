@@ -35,9 +35,9 @@ describe("runtime api", () => {
     const proposal = await call(handler, config, "/api/improvements", {
       method: "POST",
       body: JSON.stringify({
-        kind: "memory",
+        kind: "skill",
         title: "Remember review preference",
-        payload: { content: "Prefer evidence-backed reviews." }
+        payload: { name: "review-pref", description: "Prefer evidence-backed reviews.", trigger: "review", steps: ["Cite evidence"] }
       })
     });
 
@@ -45,7 +45,7 @@ describe("runtime api", () => {
     const state = readState(config.instance);
 
     expect(rejected.status).toBe("rejected");
-    expect(state.memories).toHaveLength(0);
+    expect(state.skills.some((skill) => skill.name === "review-pref")).toBe(false);
     expect(state.audit.some((event) => event.action === "improvement.rejected")).toBe(true);
   });
 
@@ -348,7 +348,7 @@ describe("runtime api", () => {
 
     await call(handler, config, "/api/improvements", {
       method: "POST",
-      body: JSON.stringify({ kind: "memory", title: "event-test", payload: { content: "events are observable" } })
+      body: JSON.stringify({ kind: "skill", title: "event-test", payload: { name: "event-test" } })
     });
     const response = await rawCall(handler, config, "/api/events/stream", {}, config.token);
     const reader = response.body?.getReader();
@@ -372,7 +372,7 @@ describe("runtime api", () => {
 
     await call(handler, config, "/api/improvements", {
       method: "POST",
-      body: JSON.stringify({ kind: "memory", title: "first", payload: { content: "first" } })
+      body: JSON.stringify({ kind: "skill", title: "first", payload: { name: "first" } })
     });
     // Read the full event log once to discover the most-recent id.
     const events = await call(handler, config, "/api/events");
@@ -476,20 +476,13 @@ describe("runtime api", () => {
     expect(detail.taskIds).toContain(submitted.taskId);
   });
 
-  test("supports memory edit/archive and approval-gated file patch diffs", async () => {
+  test("approval-gated file patch produces a diff approval", async () => {
+    // Memory CRUD via `/api/memory` was removed alongside the
+    // state.memories consolidation. See ADR
+    // runtime-identity-files.md.
     const config = testConfig("memory-patch");
     config.workspaceRoot = process.cwd();
     const handler = createHandler(config);
-
-    const memory = await call(handler, config, "/api/memory", {
-      method: "POST",
-      body: JSON.stringify({ content: "original memory", status: "active" })
-    });
-    const edited = await call(handler, config, `/api/memory/${memory.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ content: "edited memory" })
-    });
-    const archived = await call(handler, config, `/api/memory/${memory.id}`, { method: "DELETE" });
 
     const task = await call(handler, config, "/api/tasks", {
       method: "POST",
@@ -498,8 +491,6 @@ describe("runtime api", () => {
     const detail = await waitForTask(handler, config, task.id);
     const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
 
-    expect(edited.content).toBe("edited memory");
-    expect(archived.status).toBe("archived");
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");
     expect(String(approval?.payload.diff)).toContain("--- before");
@@ -648,7 +639,7 @@ describe("runtime api", () => {
 
     await call(handler, config, "/api/improvements", {
       method: "POST",
-      body: JSON.stringify({ kind: "memory", title: "readiness", payload: { content: "readiness evidence" } })
+      body: JSON.stringify({ kind: "skill", title: "readiness", payload: { name: "readiness" } })
     });
     const readiness = await call(handler, config, "/api/readiness/v1");
 
@@ -1211,7 +1202,6 @@ describe("runtime api", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });
@@ -1498,29 +1488,14 @@ describe("runtime api", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
-      });
-      state.memories.unshift({
-        id: "mem_ghost",
-        instance: state.instance,
-        agentId: "agent_ghost",
-        content: "ghost",
-        status: "active",
-        confidence: 1,
-        sensitivity: "normal",
-        provenance: "test",
-        createdAt: at,
-        updatedAt: at
       });
     });
     // Trigger the migration via a fresh read.
     await call(handler, config, "/api/tasks");
     const stamped = readState(config.instance);
     const ghostTask = stamped.tasks.find((t) => t.id === "task_ghost");
-    const ghostMemory = stamped.memories.find((m) => m.id === "mem_ghost");
     expect(ghostTask?.agentId).toBe(defaultAgentId);
-    expect(ghostMemory?.agentId).toBe(defaultAgentId);
     // Re-reading should be idempotent — no further backfill row beyond
     // what the first migration produced.
     await call(handler, config, "/api/tasks");
@@ -1552,10 +1527,6 @@ describe("runtime api", () => {
       method: "POST",
       body: JSON.stringify({ name: "branch-job", prompt: "hi", intervalSeconds: 3600 })
     });
-    const memory = await call(handler, config, "/api/memory", {
-      method: "POST",
-      body: JSON.stringify({ content: "branch-mem", status: "active" })
-    });
     await mutateState(config.instance, (state) => {
       state.tasks.unshift({
         id: "task_branch",
@@ -1569,7 +1540,6 @@ describe("runtime api", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });
@@ -1601,12 +1571,6 @@ describe("runtime api", () => {
         { actor: "runtime", action: "test.branch.sessionId", target: "from-session", risk: "low" },
         { sessionId: session.id }
       );
-      // memoryId branch
-      addAudit(
-        state,
-        { actor: "runtime", action: "test.branch.memoryId", target: "from-memory", risk: "low" },
-        { memoryId: memory.id }
-      );
       // system: true branch
       addAudit(
         state,
@@ -1619,7 +1583,6 @@ describe("runtime api", () => {
     expect(audit.find((a) => a.action === "test.branch.taskId")?.agentId).toBe(defaultAgentId);
     expect(audit.find((a) => a.action === "test.branch.jobId")?.agentId).toBe(defaultAgentId);
     expect(audit.find((a) => a.action === "test.branch.sessionId")?.agentId).toBe(defaultAgentId);
-    expect(audit.find((a) => a.action === "test.branch.memoryId")?.agentId).toBe(defaultAgentId);
     expect(audit.find((a) => a.action === "test.branch.system")?.agentId).toBeUndefined();
   });
 
@@ -1667,17 +1630,11 @@ describe("runtime api", () => {
         { actor: "runtime", action: "test.missing.session", target: "x", risk: "low" },
         { sessionId: "chat_does_not_exist" }
       );
-      addAudit(
-        state,
-        { actor: "runtime", action: "test.missing.memory", target: "x", risk: "low" },
-        { memoryId: "mem_does_not_exist" }
-      );
     });
     const audit = readState(config.instance).audit;
     expect(audit.find((a) => a.action === "test.missing.task")?.agentId).toBeUndefined();
     expect(audit.find((a) => a.action === "test.missing.job")?.agentId).toBeUndefined();
     expect(audit.find((a) => a.action === "test.missing.session")?.agentId).toBeUndefined();
-    expect(audit.find((a) => a.action === "test.missing.memory")?.agentId).toBeUndefined();
   });
 
   test("POST /api/messaging/:id/allow with a malformed chatId returns 400 (not 500)", async () => {
@@ -1843,6 +1800,136 @@ describe("runtime api", () => {
       config.token
     );
     expect(response.status).toBe(404);
+  });
+
+  test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
+    // Same parseChatIdStrict guard as /allow — pin it here so the new
+    // route doesn't regress to 500 on bad input as the surface grows.
+    const config = testConfig("messaging-reject-pending-bad-chatid");
+    const handler = createHandler(config);
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    const badPayloads: Array<unknown> = [null, "", "123abc", "abc", 1.5];
+    for (const chatId of badPayloads) {
+      const response = await rawCall(
+        handler,
+        config,
+        `/api/messaging/${bridge.id}/reject-pending`,
+        { method: "POST", body: JSON.stringify({ chatId }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toMatch(/chatId must be a finite integer/);
+    }
+  });
+
+  test("rejects /api/embedding/reembed payloads that pass both allBanks and bankId", async () => {
+    // The CLI throws when both --all-banks and --bank are supplied
+    // (src/cli/commands/embedding.ts). The HTTP API has to mirror
+    // that contract: silently ignoring bankId when allBanks=true
+    // would let a caller think they were reembedding a single bank
+    // and instead trigger a full-instance reembed — a destructive,
+    // irreversible operation against every bank in the instance.
+    const config = testConfig("embedding-reembed-conflict");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/embedding/reembed",
+      {
+        method: "POST",
+        body: JSON.stringify({ allBanks: true, bankId: "bank_default" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/mutually exclusive/);
+  });
+
+  describe("identity-files routes", () => {
+    test("GET /api/identity-files returns INSTRUCTIONS.md, USER.md, and SOULs with budget metadata", async () => {
+      const config = testConfig("identity-show");
+      const handler = createHandler(config);
+      // Seed USER.md so the budget snapshot is meaningful.
+      const { writeUserProfile, scaffoldInstanceIdentityFiles } = await import("./runtime/identity-files");
+      scaffoldInstanceIdentityFiles(config.instance);
+      writeUserProfile(config.instance, "## Identity\n- Name: TestUser", "approved");
+      const dump = await call(handler, config, "/api/identity-files");
+      expect(dump.instance).toBe(config.instance);
+      expect(dump.userProfile.content).toContain("Name: TestUser");
+      expect(dump.userProfile.cap).toBe(1500);
+      expect(dump.userProfile.budget.used).toBeGreaterThan(0);
+      expect(dump.userProfile.budget.overCap).toBe(false);
+      // INSTRUCTIONS.md is materialized by scaffold; the route returns
+      // its content trimmed.
+      expect(dump.instructions.content).toMatch(/local-first personal agent/);
+    });
+
+    test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
+      const config = testConfig("identity-history");
+      const handler = createHandler(config);
+      const { writeUserProfile } = await import("./runtime/identity-files");
+      writeUserProfile(config.instance, "v1", "approved");
+      writeUserProfile(config.instance, "v2", "approved");
+      writeUserProfile(config.instance, "v3", "approved");
+      const out = await call(handler, config, "/api/identity-files/history?kind=user");
+      expect(out.kind).toBe("user");
+      // Three writes → two snapshots in history (first write has nothing
+      // to roll back to).
+      expect(out.entries.length).toBe(2);
+      // Each entry carries a path-safe name and a positive size.
+      for (const entry of out.entries) {
+        expect(entry.name).toMatch(/\.md$/);
+        expect(entry.sizeBytes).toBeGreaterThan(0);
+      }
+    });
+
+    test("POST /api/identity-files/rollback restores from a snapshot and emits an audit row", async () => {
+      const config = testConfig("identity-rollback");
+      const handler = createHandler(config);
+      const { writeUserProfile, listUserProfileHistory, userProfilePath } = await import("./runtime/identity-files");
+      writeUserProfile(config.instance, "v1 body", "approved");
+      writeUserProfile(config.instance, "v2 body", "approved");
+      writeUserProfile(config.instance, "v3 body", "approved");
+      const history = listUserProfileHistory(config.instance);
+      const v1Snap = history.find((e) => readFileSync(e.path, "utf8") === "v1 body");
+      expect(v1Snap).toBeDefined();
+      const result = await call(handler, config, "/api/identity-files/rollback", {
+        method: "POST",
+        body: JSON.stringify({ kind: "user", snapshot: v1Snap!.name })
+      });
+      expect(result.ok).toBe(true);
+      expect(result.restoredBytes).toBe(Buffer.byteLength("v1 body", "utf8"));
+      // The active USER.md now holds the rolled-back body.
+      expect(readFileSync(userProfilePath(config.instance), "utf8")).toBe("v1 body");
+      // Audit row recorded the rollback.
+      const state = readState(config.instance);
+      const audit = state.audit.find((a) => a.action === "identity.user_profile.rollback");
+      expect(audit).toBeDefined();
+      // Pre-rollback snapshot was created so the rollback is itself
+      // reversible.
+      expect(result.preRestoreSnapshot).not.toBeNull();
+    });
+
+    test("POST /api/identity-files/rollback rejects an unknown snapshot name with reason='no snapshot'", async () => {
+      const config = testConfig("identity-rollback-unknown");
+      const handler = createHandler(config);
+      const { writeUserProfile } = await import("./runtime/identity-files");
+      writeUserProfile(config.instance, "v1", "approved");
+      const result = await call(handler, config, "/api/identity-files/rollback", {
+        method: "POST",
+        body: JSON.stringify({ kind: "user", snapshot: "2099-01-01T00-00-00.000Z.md" })
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("no snapshot");
+    });
   });
 });
 

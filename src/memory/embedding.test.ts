@@ -10,7 +10,8 @@ import {
   listMemoryUnits,
   readState
 } from "../state";
-import { embeddingStatus, reembedBank } from "./embedding";
+import { embeddingStatus, reembedAllBanks, reembedBank } from "./embedding";
+import { ensureAgentBank } from "../state";
 import type { RuntimeConfig } from "../types";
 
 const ROOT = "/tmp/gini-embed-domain-test";
@@ -142,5 +143,52 @@ describe("reembedBank", () => {
 
     const state = readState(instance);
     expect(state.audit.find((entry) => entry.action === "embedding.reembed.dry-run")).toBeTruthy();
+  });
+});
+
+describe("reembedAllBanks", () => {
+  test("walks every bank — the post-openclaw-migration workflow that single-bank reembed misses", async () => {
+    const instance = "embed-reembed-all-banks";
+    const config = makeConfig(instance);
+    ensureDefaultBank(instance);
+    // Two per-agent banks plus the default — simulates an openclaw
+    // migration that routed 'main' + 'work' agents into dedicated
+    // banks alongside the seeded default.
+    const mainBank = ensureAgentBank(instance, "agent_main");
+    const workBank = ensureAgentBank(instance, "agent_work");
+    insertMemoryUnit(instance, {
+      bankId: DEFAULT_BANK_ID,
+      agentId: null,
+      text: "orphan unit",
+      network: "world"
+    });
+    insertMemoryUnit(instance, {
+      bankId: mainBank.id,
+      agentId: "agent_main",
+      text: "main unit",
+      network: "world"
+    });
+    insertMemoryUnit(instance, {
+      bankId: workBank.id,
+      agentId: "agent_work",
+      text: "work unit",
+      network: "world"
+    });
+    const reports = await reembedAllBanks(config, {});
+    // One report per bank, all using the active provider (echo here).
+    const bankIds = reports.map((r) => r.bankId).sort();
+    expect(bankIds).toEqual([DEFAULT_BANK_ID, mainBank.id, workBank.id].sort());
+    for (const report of reports) {
+      expect(report.totalUnits).toBe(1);
+      expect(report.migrated).toBe(1);
+      expect(report.failed).toBe(0);
+    }
+    // Every unit ends up with a populated embedding now.
+    for (const bankId of [DEFAULT_BANK_ID, mainBank.id, workBank.id]) {
+      const units = listMemoryUnits(instance, bankId);
+      expect(units).toHaveLength(1);
+      expect(units[0]!.embedding).not.toBeNull();
+      expect(units[0]!.embeddingModel).not.toBeNull();
+    }
   });
 });

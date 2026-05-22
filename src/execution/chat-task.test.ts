@@ -27,9 +27,9 @@ import {
   now,
   readState
 } from "../state";
-import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, Task, ToolsetRecord } from "../types";
+import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity } from "./chat-task";
+import { buildAgentIdentity, buildInactiveSkillsBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -1661,5 +1661,145 @@ describe("buildAgentIdentity", () => {
     expect(identity.toolsets).toEqual([]);
     expect(identity.agentId).toBe("(none)");
     expect(identity.memoryNamespace).toBe("(none)");
+  });
+});
+
+describe("buildInactiveSkillsBlock", () => {
+  // Minimal SkillRecord factory. Only the fields the block builder
+  // reads (name, description, status, requiredConnectors, source) carry
+  // meaningful values; the rest are stubbed so the type checks.
+  function makeSkill(opts: {
+    name: string;
+    description?: string;
+    requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+    status?: SkillRecord["status"];
+    source?: SkillRecord["source"];
+  }): SkillRecord {
+    const at = "2026-05-19T00:00:00.000Z";
+    return {
+      id: `skill_${opts.name}`,
+      instance: "test-instance",
+      name: opts.name,
+      description: opts.description ?? "(no description)",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: opts.status ?? "enabled",
+      version: 1,
+      createdAt: at,
+      updatedAt: at,
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      requiredConnectors: opts.requiredConnectors,
+      source: opts.source
+    };
+  }
+
+  test("routes setup-skill providers to the setup skill instead of request_connector", () => {
+    // google-oauth-desktop declares setupSkill: "google-workspace-setup".
+    // The block must point the model at that skill, NOT at request_connector.
+    const skill = makeSkill({
+      name: "google-calendar",
+      description: "Google Calendar",
+      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("google-oauth-desktop");
+    expect(block).toContain("read_skill");
+    expect(block).toContain("google-workspace-setup");
+    // Must NOT emit the bare request_connector shortcut for this provider.
+    expect(block).not.toContain("call `request_connector` with provider id `google-oauth-desktop`");
+  });
+
+  test("collapses multiple skills sharing one setup-skill provider into a single line", () => {
+    // All six Google Workspace product skills share one connector — the
+    // block should emit ONE provider line, not six per-skill lines.
+    const skills = [
+      makeSkill({ name: "google-calendar", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
+      makeSkill({ name: "google-gmail", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
+      makeSkill({ name: "google-drive", requiredConnectors: [{ provider: "google-oauth-desktop" }] })
+    ];
+    const block = buildInactiveSkillsBlock(skills);
+    const providerLines = block.split("\n").filter((line) => line.includes("google-oauth-desktop"));
+    expect(providerLines).toHaveLength(1);
+    expect(providerLines[0]).toContain("google-calendar");
+    expect(providerLines[0]).toContain("google-gmail");
+    expect(providerLines[0]).toContain("google-drive");
+    expect(providerLines[0]).toContain("google-workspace-setup");
+  });
+
+  test("falls back to request_connector guidance for providers without a setup skill", () => {
+    // The linear provider does not declare setupSkill, so the block must
+    // emit the default request_connector instruction.
+    const skill = makeSkill({
+      name: "needs-linear",
+      description: "Test skill that needs Linear.",
+      requiredConnectors: [{ provider: "linear" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("linear");
+    expect(block).toContain("call `request_connector` with provider id `linear`");
+    // Must NOT mention read_skill — no setup skill is declared.
+    expect(block).not.toMatch(/read_skill/);
+  });
+
+  test("returns an empty string when no inactive-with-connector skills are present", () => {
+    expect(buildInactiveSkillsBlock([])).toBe("");
+    // Skills with no requiredConnectors are filtered out before the
+    // grouping step.
+    const skill = makeSkill({ name: "no-conn", requiredConnectors: [] });
+    expect(buildInactiveSkillsBlock([skill])).toBe("");
+  });
+
+  test("opens with the dual-path intro so the model knows both routing options", () => {
+    const skill = makeSkill({
+      name: "needs-linear",
+      requiredConnectors: [{ provider: "linear" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toMatch(/^Skills below need an external connector\./);
+    expect(block).toContain("setup skill");
+    expect(block).toContain("request_connector");
+  });
+
+  test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
+    // The model has been observed shortcutting to browser_navigate
+    // (calendar.google.com, gmail.com, a Google sign-in page) instead of
+    // running the listed setup skill. The block must include an explicit
+    // directive forbidding that shortcut so the setup skill becomes the
+    // only sanctioned route.
+    const skill = makeSkill({
+      name: "google-calendar",
+      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("ONLY correct path");
+    expect(block).toContain("browser_navigate");
+    expect(block).toContain("calendar.google.com");
+    expect(block).toContain("gmail.com");
+    expect(block).toContain("read_skill");
+    // The directive sits after the per-provider lines so the model reads
+    // "what needs connecting" before "the rule for how to satisfy it".
+    const lines = block.split("\n");
+    const providerLineIdx = lines.findIndex((line) => line.includes("google-oauth-desktop"));
+    const directiveIdx = lines.findIndex((line) => line.includes("ONLY correct path"));
+    expect(providerLineIdx).toBeGreaterThan(-1);
+    expect(directiveIdx).toBeGreaterThan(providerLineIdx);
+  });
+
+  test("skips the no-browser-shortcut directive when no provider declares a setup skill", () => {
+    // request_connector is the only path advertised when no setup skill is
+    // declared, so the browser-shortcut directive is unnecessary noise.
+    const skill = makeSkill({
+      name: "needs-linear",
+      requiredConnectors: [{ provider: "linear" }]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).not.toContain("ONLY correct path");
+    expect(block).not.toContain("browser_navigate");
   });
 });

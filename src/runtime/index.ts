@@ -3,9 +3,12 @@ import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
 import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot } from "../paths";
 import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
 import { addAudit } from "../state/audit";
+import { appendLog } from "../state/trace";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
+import { migratePinnedMemoriesToUserProfile } from "../memory/migrate-pinned-to-user-md";
 import { providerHealth } from "../provider";
+import { scaffoldAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
 import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
@@ -83,10 +86,16 @@ function countMemoryUnitsIfPresent(config: RuntimeConfig): number {
   }
 }
 
-export function install(config: RuntimeConfig): void {
+export async function install(config: RuntimeConfig): Promise<void> {
   // After resetInstance removes the instance root, the directory is gone. Ensure it
   // before writing the config so reinstall is a clean idempotent operation.
   ensureDir(instanceRoot(config.instance));
+  // Scaffold the two instance-scoped identity files (INSTRUCTIONS.md and
+  // USER.md) as zero-byte placeholders. The loaders treat an empty file as
+  // absent and fall back to defaults, so this purely surfaces the files in
+  // the filesystem for the user to discover. Best-effort: scaffolding never
+  // throws on a filesystem error.
+  scaffoldInstanceIdentityFiles(config.instance);
   // Approval-mode migration: legacy configs that carry
   // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
   // get aliased to `approvalMode: "yolo"`. Patch the in-memory config
@@ -102,7 +111,33 @@ export function install(config: RuntimeConfig): void {
   // behavior change from "gate everything" to "auto-approve safe
   // actions" for this instance.
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
-  readState(config.instance);
+  // One-shot migration: drain `state.memories` (legacy pinned memories) into
+  // the instance-scoped USER.md and clear the array. Idempotent via a state
+  // marker; best-effort — a failure audits via appendLog and lets the runtime
+  // continue. Must run AFTER scaffoldInstanceIdentityFiles (so USER.md is
+  // materialized) and BEFORE the SOUL.md backfill loop below — the
+  // `normalizeState` path on the next readState consults the marker and
+  // strips the dead `state.memories` field, and the SOUL.md backfill should
+  // see the post-migration shape rather than racing the file write.
+  // See ADR runtime-identity-files.md.
+  const migrationReport = await migratePinnedMemoriesToUserProfile(config);
+  if (migrationReport.error) {
+    try {
+      appendLog(config.instance, "memory.pinned.migration.error", {
+        error: migrationReport.error
+      });
+    } catch {
+      // Logging itself failing must not crash startup.
+    }
+  }
+  const state = readState(config.instance);
+  // Backfill per-agent SOUL.md placeholders for every existing agent.
+  // Catches the 21+ already-provisioned instances on disk that pre-date
+  // the scaffold logic. Quiet on no-ops — only the first creation per
+  // file matters; the rest are silent.
+  for (const agent of state.agents) {
+    scaffoldAgentSoulFile(config.instance, agent.id);
+  }
   // Audit + side-effects of the migration. Fire-and-forget; the
   // synchronous patch above is what the policy seam actually consults.
   void migrateLegacyApprovalMode(config);
@@ -115,14 +150,14 @@ export function install(config: RuntimeConfig): void {
   void seedDefaultAgentFromRuntimeConfig(config);
 }
 
-export function resetInstance(config: RuntimeConfig): void {
+export async function resetInstance(config: RuntimeConfig): Promise<void> {
   // Close the cached memory DB handle (if any) before removing the state
   // root so we release the WAL/SHM file descriptors. Without this, the
   // physical files would still be unlinked but a subsequent getMemoryDb()
   // could hand back the closed handle from the cache.
   closeMemoryDb(config.instance);
   rmSync(config.stateRoot, { recursive: true, force: true });
-  install(config);
+  await install(config);
 }
 
 export function uninstallInstance(config: RuntimeConfig): void {
@@ -228,6 +263,11 @@ export function updateAutoApproveSettings(
     config.dangerousTerminalPatterns = cleaned;
   }
   ensureDir(instanceRoot(config.instance));
+  // Safety net: settings PATCH can land on an instance whose identity
+  // files were never scaffolded (e.g. an instance bootstrapped on a build
+  // that pre-dated the scaffold logic). Idempotent — does nothing if the
+  // files already exist.
+  scaffoldInstanceIdentityFiles(config.instance);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   const effectiveMode: ApprovalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
   return {

@@ -34,18 +34,11 @@ export function searchSessions(config: RuntimeConfig, query: string, limit = 20)
     }
   }
 
-  for (const memory of state.memories) {
-    addMatch(results, {
-      id: memory.id,
-      instance: memory.instance,
-      kind: "memory",
-      title: memory.content.slice(0, 80),
-      excerpt: `${memory.content}\n${memory.provenance}`,
-      taskId: memory.sourceTaskId,
-      source: `memory:${memory.id}`,
-      at: memory.updatedAt
-    }, needle);
-  }
+  // The `state.memories` source was removed alongside the state.memories
+  // consolidation; identity facts live in USER.md and recalled-from-
+  // Hindsight memory now. Cross-session lookups against Hindsight units
+  // happen via `recall_memory` / `/api/memory/recall`. See ADR
+  // runtime-identity-files.md.
 
   for (const skill of state.skills) {
     addMatch(results, {

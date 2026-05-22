@@ -9,7 +9,6 @@ import type {
   ImprovementProposal,
   JobRecord,
   JobRunRecord,
-  MemoryRecord,
   RuntimeEvent,
   RuntimeStatus,
   SkillRecord,
@@ -90,13 +89,10 @@ export function useApprovals() {
   });
 }
 
-export function useMemories() {
-  return useQuery<MemoryRecord[]>({
-    queryKey: ["memory"],
-    queryFn: () => api<MemoryRecord[]>("/memory"),
-    refetchInterval: 60_000
-  });
-}
+// `useMemories` was removed alongside the state.memories
+// consolidation. The Memory page now surfaces Hindsight only — see
+// the per-unit/per-bank hooks below. See ADR
+// runtime-identity-files.md.
 
 import type { HindsightUnitView, HindsightBankView } from "@/lib/view-types";
 

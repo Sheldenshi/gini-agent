@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addAudit, createEmptyState, createImprovementProposal, createMemory, createPromotionProposal, createTask, decidePromotion, mutateState, readState, taskCounts } from "./state";
+import { addAudit, createEmptyState, createImprovementProposal, createPromotionProposal, createTask, decidePromotion, mutateState, readState, taskCounts } from "./state";
 
 describe("state primitives", () => {
   test("creates instance-aware task records", () => {
@@ -12,18 +12,10 @@ describe("state primitives", () => {
     expect(task.tracePath).toContain("/sandbox/traces/");
   });
 
-  test("memory proposals are inspectable before activation", () => {
-    const state = createEmptyState("dev");
-    const memory = createMemory(state, {
-      content: "Gini keeps receipts.",
-      confidence: 0.8,
-      status: "proposed",
-      sensitivity: "normal",
-      provenance: "test"
-    });
-    expect(memory.status).toBe("proposed");
-    expect(state.memories[0]?.id).toBe(memory.id);
-  });
+  // The "memory proposals" test was removed alongside the state.memories
+  // consolidation — `createMemory` no longer exists; pinned identity
+  // facts live in USER.md and recalled-from-Hindsight memory now.
+  // See ADR runtime-identity-files.md.
 
   test("improvement proposals are governed before application", () => {
     const state = createEmptyState("sandbox");
@@ -135,7 +127,6 @@ describe("state primitives", () => {
             tracePath: `${dir}/traces/task_legacy.jsonl`,
             auditIds: [],
             approvalIds: [],
-            memoryIds: [],
             skillIds: []
           }
         ],

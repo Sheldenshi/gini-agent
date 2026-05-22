@@ -13,6 +13,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 - [Memory](docs/memory.md): retain, recall, embeddings, reranking, review, and storage
 - [Runtime Capabilities](docs/runtime-capabilities.md): current CLI/API capability map and verification commands
 - [Operations](docs/operations.md): install, start, stop, smoke, diagnostics, and cleanup
+- [Migrating from openclaw](docs/migration-from-openclaw.md): import an existing openclaw install into gini
 - [Implementation Notes](docs/implementation-notes.md): source layout and module boundary rules
 - [Roadmap](ROADMAP.md): shipped surfaces and what's planned, with design intent
 
@@ -22,7 +23,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Architecture In One Sentence
 
-Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract.
+Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract. The one documented exception is `gini import apply openclaw`, which requires the gateway stopped and mutates state in-process; see [Architecture Overview](docs/architecture-overview.md) and [Openclaw Migration](docs/adr/openclaw-migration.md).
 
 ```text
                  GATEWAY (Bun runtime, one per instance)
@@ -117,7 +118,7 @@ bun run gini chat send <session-id> "remember Gini should keep work inspectable"
 bun run gini runs list
 bun run gini task submit "read docs and summarize the gateway"
 bun run gini approvals
-bun run gini memory list
+bun run gini memory recall "<query>"
 bun run gini job add heartbeat 60 "check runtime health"
 bun run gini connectors health
 bun run gini evidence
@@ -129,6 +130,8 @@ bun run gini messaging add local demo local
 bun run gini messaging add tg telegram <chat-id> --bot-token <bot-token>
 bun run gini messaging add disc discord <channel-id> --bot-token <bot-token>
 bun run gini import inspect openclaw ~/.openclaw
+bun run gini import plan openclaw                # dry-run summary
+bun run gini import apply openclaw [--force]     # migrate openclaw → gini
 bun run gini snapshot create "before trying candidate"
 bun run gini provider show
 ```

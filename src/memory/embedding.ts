@@ -166,6 +166,27 @@ export async function reembedBank(config: RuntimeConfig, input: ReembedInput): P
   };
 }
 
+// Reembed every bank known to the instance's memory.db. Useful after
+// openclaw migration, which routes Hindsight units into per-agent
+// banks (`bank_<agentId>`) — a plain `gini embedding reembed` only
+// walks `bank_default` and leaves the per-agent banks unembedded
+// (semantic recall returns nothing). This helper enumerates
+// `listBanks` and reembeds each, returning the per-bank reports so
+// the CLI can render an aggregate summary.
+export async function reembedAllBanks(
+  config: RuntimeConfig,
+  input: { dryRun?: boolean } = {}
+): Promise<ReembedReport[]> {
+  ensureDefaultBank(config.instance);
+  const banks = listBanks(config.instance);
+  if (banks.length === 0) return [];
+  const reports: ReembedReport[] = [];
+  for (const bank of banks) {
+    reports.push(await reembedBank(config, { bankId: bank.id, dryRun: input.dryRun }));
+  }
+  return reports;
+}
+
 // Used by `gini doctor` to flag any bank that has units in a model that
 // isn't the currently-active provider's model.
 export function listBanksWithModelMismatch(config: RuntimeConfig): EmbeddingModelCount[] {

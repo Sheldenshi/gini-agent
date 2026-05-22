@@ -102,7 +102,7 @@ describe("normalizeState toolset/tool backfill", () => {
     const after = normalized.toolsets.find((ts) => ts.name === "browser")!;
     // toolNames is now the full default set, in stable order (old names
     // first, new names appended).
-    expect(after.toolNames.length).toBe(16);
+    expect(after.toolNames.length).toBe(17);
     for (const name of newerNames) {
       expect(after.toolNames.includes(name)).toBe(true);
     }
@@ -178,12 +178,78 @@ describe("normalizeState toolset/tool backfill", () => {
     expect(intervalJob?.intervalSeconds).toBe(60);
   });
 
+  test("unions new default toolsets into existing agent_default without touching user-authored agents", () => {
+    // Simulate an instance whose `agent_default` row was persisted before
+    // `browser` joined the default toolsets list, alongside a
+    // user-authored agent with an explicit narrow toolset pick.
+    const state = createEmptyState("test-instance-agent-migrate");
+    const defaultAgentRecord = state.agents.find((agent) => agent.id === "agent_default");
+    expect(defaultAgentRecord).toBeDefined();
+    // Pre-Phase-2 default toolsets list (no browser, no delegation).
+    defaultAgentRecord!.toolsets = ["file", "terminal", "memory", "session_search"];
+    const originalUpdatedAt = defaultAgentRecord!.updatedAt;
+    // Pin updatedAt back in time so we can verify the migration bumped it.
+    defaultAgentRecord!.updatedAt = "2025-01-01T00:00:00.000Z";
+    // Add a user-authored agent with a deliberately narrow toolset.
+    state.agents.push({
+      id: "agent_user_custom",
+      instance: "test-instance-agent-migrate",
+      name: "user-custom",
+      status: "inactive",
+      providerName: undefined,
+      model: undefined,
+      toolsets: ["file"],
+      messagingTargets: [],
+      createdAt: originalUpdatedAt,
+      updatedAt: originalUpdatedAt
+    });
+    // Add a legacy `profile_default` row to confirm the migration also
+    // covers the legacy id.
+    state.agents.push({
+      id: "profile_default",
+      instance: "test-instance-agent-migrate",
+      name: "legacy-default",
+      status: "inactive",
+      providerName: undefined,
+      model: undefined,
+      toolsets: ["file", "terminal"],
+      messagingTargets: [],
+      createdAt: originalUpdatedAt,
+      updatedAt: "2025-01-01T00:00:00.000Z"
+    });
+
+    const normalized = normalizeState("test-instance-agent-migrate", state);
+
+    const migratedDefault = normalized.agents.find((agent) => agent.id === "agent_default")!;
+    // Browser (and any other current default) is unioned in; pre-existing
+    // entries are preserved in order.
+    expect(migratedDefault.toolsets).toContain("file");
+    expect(migratedDefault.toolsets).toContain("terminal");
+    expect(migratedDefault.toolsets).toContain("memory");
+    expect(migratedDefault.toolsets).toContain("session_search");
+    expect(migratedDefault.toolsets).toContain("delegation");
+    expect(migratedDefault.toolsets).toContain("browser");
+    expect(migratedDefault.updatedAt).not.toBe("2025-01-01T00:00:00.000Z");
+
+    const migratedLegacy = normalized.agents.find((agent) => agent.id === "profile_default")!;
+    expect(migratedLegacy.toolsets).toContain("browser");
+    expect(migratedLegacy.toolsets).toContain("delegation");
+    expect(migratedLegacy.updatedAt).not.toBe("2025-01-01T00:00:00.000Z");
+
+    // User-authored agent is untouched.
+    const userCustom = normalized.agents.find((agent) => agent.id === "agent_user_custom")!;
+    expect(userCustom.toolsets).toEqual(["file"]);
+    expect(userCustom.updatedAt).toBe(originalUpdatedAt);
+  });
+
   test("backfilled tool rows for a DISABLED toolset stay disabled", () => {
     const state = createEmptyState("test-instance-6");
     const browser = state.toolsets.find((ts) => ts.name === "browser");
     expect(browser).toBeDefined();
-    // Reduce to the old 9-tool roster and leave the toolset disabled
-    // (the on-disk default for the browser toolset).
+    // Simulate an instance whose operator has explicitly disabled the
+    // browser toolset, then trim its tool roster to the historical 9-tool
+    // shape so the backfill below has work to do.
+    browser!.status = "disabled";
     browser!.toolNames = [
       "browser.navigate",
       "browser.snapshot",
@@ -195,7 +261,6 @@ describe("normalizeState toolset/tool backfill", () => {
       "browser.console",
       "browser.close"
     ];
-    expect(browser!.status).toBe("disabled");
     const newerNames = ["browser.vision", "browser.hover"];
     state.tools = state.tools.filter(
       (tool) => tool.toolset !== "browser" || !newerNames.includes(tool.name)
@@ -455,5 +520,58 @@ describe("applyLegacyTelegramPairingMigration", () => {
     expect(migrated).toBe(false);
     const live = state.messagingBridges.find((b) => b.id === "bridge_disc_1");
     expect(live?.metadata?.pairingCode).toBeUndefined();
+  });
+});
+
+describe("dropDeadMemoryImprovements", () => {
+  test("strips improvements with the legacy kind: memory and audits each removal", () => {
+    const state = createEmptyState("legacy-memory-improvements");
+    // Inject legacy proposals via the dynamic shape — the type-level
+    // ImprovementKind dropped "memory" alongside the state.memories
+    // consolidation, but persisted state files still carry them.
+    state.improvements = [
+      ...state.improvements,
+      {
+        id: "imp_mem_1",
+        instance: state.instance,
+        // Cast through unknown because the field is no longer typed.
+        kind: "memory" as unknown as "skill",
+        title: "remember preferences",
+        rationale: "legacy",
+        status: "proposed",
+        sourceTaskId: undefined,
+        sourceTraceIds: [],
+        payload: { content: "x" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      },
+      {
+        id: "imp_skill_1",
+        instance: state.instance,
+        kind: "skill",
+        title: "real skill",
+        rationale: "ok",
+        status: "proposed",
+        sourceTaskId: undefined,
+        sourceTraceIds: [],
+        payload: { name: "real skill" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      }
+    ];
+
+    const normalized = normalizeState(state.instance, state);
+
+    // The legacy memory proposal is gone; the skill proposal stays.
+    expect(normalized.improvements.find((p) => p.id === "imp_mem_1")).toBeUndefined();
+    expect(normalized.improvements.find((p) => p.id === "imp_skill_1")).toBeDefined();
+
+    // The removal landed an audit row so operators can see why the
+    // proposal disappeared.
+    const audit = normalized.audit.find(
+      (event) => event.action === "improvement.memory-kind.removed" && event.target === "imp_mem_1"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.title).toBe("remember preferences");
   });
 });

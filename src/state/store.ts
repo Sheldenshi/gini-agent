@@ -26,7 +26,6 @@ export function createEmptyState(instance: Instance): RuntimeState {
     tasks: [],
     approvals: [],
     audit: [],
-    memories: [],
     skills: [],
     jobs: [],
     connectors: [
@@ -153,7 +152,6 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "tasks",
     "approvals",
     "audit",
-    "memories",
     "skills",
     "jobs",
     "connectors",
@@ -270,23 +268,71 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
   delete stateAny.activeProfileId;
 }
 
-// Drop the dead `MemoryRecord.scope` and `AgentRecord.memoryScopes` fields
-// from persisted state. Neither was consulted at runtime after Phase C —
-// `agentId` is the only memory isolation boundary. Idempotent: a second
-// pass over an already-cleaned state file matches no rows. Emits one
-// summary audit event per collection when something was stripped so the
-// cleanup shows up in `gini doctor` / /api/audit.
-function migrateDropDeadMemoryFields(state: RuntimeState): void {
-  let scopesStripped = 0;
-  if (Array.isArray(state.memories)) {
-    for (const memory of state.memories) {
-      const rec = memory as unknown as { scope?: unknown };
-      if (rec.scope !== undefined) {
-        delete rec.scope;
-        scopesStripped += 1;
-      }
-    }
+// Strip legacy improvement proposals with `kind: "memory"` from the
+// in-memory shape. The `memory` kind was removed alongside the
+// state.memories consolidation; older state files may still carry
+// proposals on that kind which would otherwise fall through the
+// proposeImprovement normalizer and get mis-applied as a skill or job.
+// Each removed proposal lands an audit row so operators can see the
+// pruning happened. See ADR runtime-identity-files.md.
+function dropDeadMemoryImprovements(state: RuntimeState): void {
+  if (!Array.isArray(state.improvements)) return;
+  const removed: Array<{ id: string; title: string; status: string }> = [];
+  state.improvements = state.improvements.filter((proposal) => {
+    const dyn = proposal as unknown as { kind?: unknown; id?: unknown; title?: unknown; status?: unknown };
+    if (dyn.kind !== "memory") return true;
+    removed.push({
+      id: typeof dyn.id === "string" ? dyn.id : "<unknown>",
+      title: typeof dyn.title === "string" ? dyn.title : "<untitled>",
+      status: typeof dyn.status === "string" ? dyn.status : "<unknown>"
+    });
+    return false;
+  });
+  if (removed.length === 0) return;
+  for (const entry of removed) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "improvement.memory-kind.removed",
+        target: entry.id,
+        risk: "low",
+        evidence: { title: entry.title, status: entry.status, reason: "kind: memory removed in consolidation" }
+      },
+      { system: true }
+    );
   }
+}
+
+// Defensive drop of the legacy `state.memories` field. The migration in
+// `migratePinnedMemoriesToUserProfile` clears the array and sets a marker
+// so this normally runs against an empty array, but old state files from
+// instances that haven't yet booted post-consolidation still carry the
+// field on disk. The `migrations.statePinnedToUserMd` marker gates the
+// drop — without it, a half-installed instance could lose pinned content
+// before the migration ran. With it, the field is dead and we strip it
+// from the in-memory shape so subsequent code paths never see the legacy
+// surface. The on-disk JSON keeps the field as an empty array until the
+// next write; that's fine — the migration is idempotent and the type-
+// level field is gone. See ADR runtime-identity-files.md.
+function dropDeadMemoriesField(state: RuntimeState): void {
+  const dyn = state as unknown as {
+    memories?: unknown;
+    migrations?: { statePinnedToUserMd?: string };
+  };
+  if (!Array.isArray(dyn.memories)) return;
+  if (!dyn.migrations?.statePinnedToUserMd) {
+    // Migration hasn't run yet for this instance. Leave `state.memories`
+    // intact so the migration can drain it.
+    return;
+  }
+  delete dyn.memories;
+}
+
+// Drop the dead `AgentRecord.memoryScopes` field from persisted state.
+// Idempotent: a second pass over an already-cleaned state file matches
+// no rows.
+function migrateDropDeadAgentMemoryScopes(state: RuntimeState): void {
   let memoryScopesStripped = 0;
   if (Array.isArray(state.agents)) {
     for (const agent of state.agents) {
@@ -296,20 +342,6 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
         memoryScopesStripped += 1;
       }
     }
-  }
-  if (scopesStripped > 0) {
-    // Migration housekeeping at instance load — no agent context yet.
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "memory.scope.dropped",
-        target: "state.memories",
-        risk: "low",
-        evidence: { stripped: scopesStripped }
-      },
-      { system: true }
-    );
   }
   if (memoryScopesStripped > 0) {
     addAudit(
@@ -322,47 +354,6 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
         evidence: { stripped: memoryScopesStripped }
       },
       { system: true }
-    );
-  }
-}
-
-// Phase C — per-agent memory isolation backfill for the legacy
-// MemoryRecord store. Walks state.memories and stamps `agentId` on rows
-// that pre-date Phase C, bundling all of them under whichever agent was
-// active at migration time (typically the default agent on davao-style
-// instances). Idempotent: rows already carrying `agentId` are skipped.
-// Audits the count so the rebucketing shows up in `gini doctor` /
-// /api/audit. Hindsight unit/bank backfill lives in
-// migrateHindsightAgentIdColumns (runs against SQLite, not JSON state).
-function migrateMemoryAgentId(state: RuntimeState): void {
-  if (!Array.isArray(state.memories) || state.memories.length === 0) return;
-  const defaultAgentId =
-    state.activeAgentId
-    ?? state.agents.find((agent) => agent.status === "active")?.id
-    ?? state.agents[0]?.id
-    ?? "agent_default";
-  // Treat stale agentIds (pointing at a deleted/unknown agent) the same as
-  // missing — leaving them stamped to a dead id strands the memory under
-  // an unselectable bucket in the UI. Mirrors the predicate in
-  // migrateRecordAgentIds.
-  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
-  let stamped = 0;
-  for (const memory of state.memories) {
-    if (memory.agentId && validAgentIds.has(memory.agentId)) continue;
-    memory.agentId = defaultAgentId;
-    stamped += 1;
-  }
-  if (stamped > 0) {
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "memory.agentid.backfill",
-        target: defaultAgentId,
-        risk: "low",
-        evidence: { stamped, agentId: defaultAgentId }
-      },
-      { agentId: defaultAgentId }
     );
   }
 }
@@ -386,8 +377,8 @@ function migrateTaskChatSessionId(state: RuntimeState): void {
 }
 
 // Stamp the active-at-migration-time agent onto records that pre-date the
-// per-agent isolation field. Mirrors migrateMemoryAgentId — idempotent and
-// audit-emitting. Covers Task, ChatSessionRecord, JobRecord, JobRunRecord,
+// per-agent isolation field. Idempotent and audit-emitting. Covers Task,
+// ChatSessionRecord, JobRecord, JobRunRecord,
 // SubagentRecord, Approval in one pass so the backfill audit doesn't fan
 // out into six separate rows. RuntimeEvent and AuditEvent are deliberately
 // excluded — see the comment at the stamp loop below.
@@ -569,6 +560,81 @@ function migrateHindsightAgentIdColumns(instance: Instance, state: RuntimeState)
   }
 }
 
+// Union the desired default-agent toolsets list into existing
+// `agent_default` (and the legacy `profile_default`) records on disk.
+// Without this, an instance created before a new default toolset (e.g.
+// `browser`) was added still carries the old toolsets array, and
+// `resolveEffectiveContext` filters the tool catalog by that stale list —
+// so even though the toolset row itself is enabled by the global
+// backfill, the agent's whitelist still excludes the new tool family.
+//
+// Only touches the default agent records. User-authored agents keep
+// whatever toolsets they have; they were explicit picks.
+// Historical snapshots of the default-agent toolsets list. The migration
+// only fires when the agent's current toolsets exactly matches one of
+// these — that's the "user never customized" signal. If the user removed
+// or rearranged anything, we leave the list alone (they made an
+// explicit pick). Each snapshot represents a stable point in the
+// default's evolution before a new toolset was added.
+const HISTORICAL_DEFAULT_AGENT_TOOLSETS: ReadonlyArray<ReadonlyArray<string>> = [
+  // Pre-delegation, pre-messaging/mcp, pre-browser.
+  ["file", "terminal", "memory", "session_search"],
+  // Pre-messaging/mcp, pre-browser (handled by backfillDefaultAgentToolsets above).
+  ["file", "terminal", "memory", "session_search", "delegation"],
+  // Post-messaging/mcp, pre-browser. This is what backfillDefaultAgentToolsets
+  // produces when it fires on the prior-default snapshot.
+  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"]
+];
+
+function migrateDefaultAgentToolsets(state: RuntimeState, instance: Instance): void {
+  if (!Array.isArray(state.agents) || state.agents.length === 0) return;
+  const at = now();
+  const desired = defaultAgent(instance, at).toolsets;
+  if (!Array.isArray(desired) || desired.length === 0) return;
+  for (const agent of state.agents) {
+    if (agent.id !== "agent_default" && agent.id !== "profile_default") continue;
+    const existing = Array.isArray(agent.toolsets) ? agent.toolsets : null;
+    if (existing === null) {
+      agent.toolsets = [...desired];
+      agent.updatedAt = at;
+      continue;
+    }
+    // `profile_default` is the legacy agent id (renamed to
+    // `agent_default`). Anyone still on it has a stale config — always
+    // migrate it up to the current default without the customization
+    // check applied to `agent_default`.
+    const isLegacyDefault = agent.id === "profile_default";
+    const existingSet = new Set(existing);
+    if (!isLegacyDefault) {
+      // For `agent_default`, only union when the current toolsets exactly
+      // matches one of the historical snapshots OR the current desired
+      // default. Any divergence (user added/removed something) is treated
+      // as customization and left alone.
+      const matchesSnapshot = (snapshot: ReadonlyArray<string>): boolean => {
+        if (snapshot.length !== existing.length) return false;
+        for (const name of snapshot) {
+          if (!existingSet.has(name)) return false;
+        }
+        return true;
+      };
+      const isHistorical = HISTORICAL_DEFAULT_AGENT_TOOLSETS.some(matchesSnapshot);
+      const isCurrent = matchesSnapshot(desired);
+      if (!isHistorical && !isCurrent) continue;
+    }
+    let mutated = false;
+    for (const name of desired) {
+      if (!existingSet.has(name)) {
+        existing.push(name);
+        existingSet.add(name);
+        mutated = true;
+      }
+    }
+    if (mutated) {
+      agent.updatedAt = at;
+    }
+  }
+}
+
 export function normalizeState(instance: Instance, state: RuntimeState): RuntimeState {
   migrateProfileFieldsToAgent(state);
   migrateLaneFieldToInstance(state);
@@ -579,7 +645,6 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.tasks ??= [];
   state.approvals ??= [];
   state.audit ??= [];
-  state.memories ??= [];
   state.skills ??= [];
   state.jobs ??= [];
   state.pairingCodes ??= [];
@@ -641,6 +706,23 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       state.tools!.push(tool);
     }
   }
+  // `mcp` and `messaging` originally shipped disabled. Their default flipped
+  // to enabled so a fresh instance has all toolsets on. For existing
+  // instances created before the flip, promote the row only when the operator
+  // never touched it (createdAt === updatedAt). Anyone who explicitly
+  // disabled it has updatedAt > createdAt and is left alone.
+  for (const name of ["mcp", "messaging"] as const) {
+    const row = state.toolsets!.find((t) => t.name === name);
+    if (!row) continue;
+    if (row.status !== "disabled") continue;
+    if (row.createdAt !== row.updatedAt) continue;
+    row.status = "enabled";
+    row.updatedAt = at;
+    for (const tool of state.tools!.filter((t) => t.toolset === name)) {
+      tool.status = "available";
+      tool.updatedAt = at;
+    }
+  }
   state.subagents ??= [];
   state.mcpServers ??= [];
   state.messagingBridges ??= [];
@@ -667,15 +749,31 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // Runs after the default-agent seed branch above so the migration sees
   // a real `agent_default` row when one was just synthesized. Idempotent.
   backfillDefaultAgentToolsets(state);
-  // Phase C — per-agent memory isolation backfill. Runs after agents are
-  // present so the migration can stamp the right id. Both helpers are
-  // idempotent so a re-read of an already-migrated state file is a no-op.
-  migrateMemoryAgentId(state);
+  // Union new default toolsets (e.g. `browser` after Phase 2) into the
+  // existing `agent_default` record. Runs after agents are populated;
+  // idempotent.
+  migrateDefaultAgentToolsets(state, instance);
+  // Phase C — per-agent memory isolation backfill for the SQLite
+  // hindsight store. The legacy `state.memories` per-agent backfill
+  // ran here too; that surface was removed in the state.memories
+  // consolidation (see ADR runtime-identity-files.md) so only
+  // the SQLite-backed helper remains.
   migrateHindsightAgentIdColumns(instance, state);
-  // Drop dead MemoryRecord.scope / AgentRecord.memoryScopes fields from
-  // legacy state files. Runs after agents are populated so the audit
-  // event can land on a valid state.
-  migrateDropDeadMemoryFields(state);
+  // Drop the dead AgentRecord.memoryScopes field from legacy state
+  // files. Runs after agents are populated so the audit event lands on
+  // a valid state.
+  migrateDropDeadAgentMemoryScopes(state);
+  // Defensive drop of the now-removed `state.memories` field. Only
+  // strips when the consolidation migration has already run for this
+  // instance (marker present), so a half-installed instance keeps its
+  // pinned content intact until the migration drains it. See ADR
+  // runtime-identity-files.md.
+  dropDeadMemoriesField(state);
+  // Strip legacy improvement proposals with `kind: "memory"` so the
+  // proposeImprovement normalizer never sees them and silently
+  // mis-applies them as skills or jobs. See ADR
+  // runtime-identity-files.md.
+  dropDeadMemoryImprovements(state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];

@@ -1,10 +1,14 @@
 import type { RuntimeConfig } from "../types";
-import { addAudit, createImprovementProposal, createJob, createMemory, createSkill, mutateState, now, readState, readTrace } from "../state";
+import { addAudit, createImprovementProposal, createJob, createSkill, mutateState, now, readState, readTrace } from "../state";
 
 export async function proposeImprovement(config: RuntimeConfig, input: Record<string, unknown>) {
   const taskId = typeof input.sourceTaskId === "string" ? input.sourceTaskId : undefined;
   const trace = taskId ? readTrace(config.instance, taskId) : [];
-  const kind = input.kind === "skill" || input.kind === "job" ? input.kind : "memory";
+  // The "memory" improvement kind was removed alongside the
+  // state.memories consolidation (see ADR runtime-identity-files.md).
+  // Skill and job stay; anything else defaults to skill so a legacy
+  // payload doesn't crash but lands on the skill creation path.
+  const kind = input.kind === "job" ? "job" : "skill";
   const title = String(input.title ?? `${kind} improvement`);
   const payload = normalizeImprovementPayload(kind, input.payload);
 
@@ -68,18 +72,6 @@ export async function reviewImprovement(config: RuntimeConfig, proposalId: strin
 }
 
 function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited<ReturnType<typeof proposeImprovement>>): string {
-  if (proposal.kind === "memory") {
-    const memory = createMemory(state, {
-      content: String(proposal.payload.content ?? proposal.title),
-      sourceTaskId: proposal.sourceTaskId,
-      confidence: Number(proposal.payload.confidence ?? 0.75),
-      status: "active",
-      sensitivity: proposal.payload.sensitivity === "sensitive" ? "sensitive" : "normal",
-      provenance: `Applied improvement ${proposal.id}`
-    });
-    return memory.id;
-  }
-
   if (proposal.kind === "skill") {
     const skill = createSkill(state, {
       name: String(proposal.payload.name ?? proposal.title),
@@ -112,9 +104,8 @@ function applyImprovement(state: ReturnType<typeof readState>, proposal: Awaited
   return job.id;
 }
 
-function normalizeImprovementPayload(kind: "memory" | "skill" | "job", payload: unknown): Record<string, unknown> {
+function normalizeImprovementPayload(kind: "skill" | "job", payload: unknown): Record<string, unknown> {
   const value = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-  if (kind === "memory") return { content: String(value.content ?? ""), ...value };
   if (kind === "skill") return { name: String(value.name ?? "Draft skill"), steps: Array.isArray(value.steps) ? value.steps : [], ...value };
   return { name: String(value.name ?? "Suggested job"), prompt: String(value.prompt ?? ""), ...value };
 }

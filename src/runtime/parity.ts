@@ -7,7 +7,7 @@ export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks
   const checks: ParityCheck[] = [
     check("cli", "CLI workflow", true, ["install/start/status/task commands exist"], "pass"),
     check("events", "Runtime event stream", true, [`${state.events.length} events`, "events API feeds CLI/mobile/watch surfaces"], "pass"),
-    check("memory", "Persistent memory", true, [`${state.memories.length} memory records`, "proposal/approve/reject APIs", "user/project/device/temporary scopes"], "pass"),
+    check("memory", "Persistent memory", true, ["USER.md (cross-agent identity)", "SOUL.md (per-agent persona)", "Hindsight per-agent bank (auto-retain + recall)"], "pass"),
     check("skills", "Skills/procedures", true, [`${state.skills.length} skills`, "search/show/update/test/enable/disable/rollback APIs"], "pass"),
     check("session_search", "Session search", true, ["search API returns task/trace/memory/skill/audit citations"], "pass"),
     check("jobs", "Cron/jobs", true, [`${state.jobs.length} jobs`, `${state.jobRuns.length} run records`, "prompt/script run/replay/update/remove APIs"], "pass"),
@@ -18,7 +18,10 @@ export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks
     check("mcp", "MCP integration", true, [`${state.mcpServers.length} MCP server records`, "add/health/invoke/disable APIs"], "pass"),
     check("messaging", "Messaging bridge", true, [`${state.messagingBridges.length} bridge records`, "add/health/disable APIs and notification routing"], "pass"),
     check("agents", "Config/agent equivalent", true, state.agents.map((item) => `${item.name}:${item.status}`), state.agents.length > 0 ? "pass" : "missing"),
-    check("migration", "Hermes/OpenClaw import basics", true, [`${state.importReports.length} import inspection reports`, "read-only guided inspection by default"], "pass"),
+    check("migration", "Hermes/OpenClaw import basics", true, [
+      `${state.importReports.filter((report) => report.mode === "inspect").length} inspect, ${state.importReports.filter((report) => report.mode === "applied").length} applied import reports`,
+      "inspect for read-only summary, apply for in-process state mutation (openclaw migrator)"
+    ], "pass"),
     check("mobile", "Mobile/remote control structure", true, [`${state.devices.length} paired devices`, "mobile bootstrap and revocation contracts"], "pass"),
     check("relay", "Remote relay and notifications", true, [`${state.relays.length} relay records`, `${state.notifications.length} notifications`, "local/lan/hosted relay records with queued notifications"], "pass")
   ];

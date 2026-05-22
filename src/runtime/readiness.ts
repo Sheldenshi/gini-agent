@@ -15,7 +15,7 @@ export function v1Readiness(config: RuntimeConfig) {
     readiness("instance_state", "Instance-aware state", true, [config.instance, config.stateRoot]),
     readiness("providers", "Provider abstraction", true, parity.checks.find((check) => check.id === "providers")?.evidence ?? []),
     readiness("jobs", "Job scheduler and history", true, [`${state.jobs.length} jobs`, `${state.jobRuns.length} job runs`]),
-    readiness("memory_skills", "Memory and skill governance", true, [`${state.memories.length} memories`, `${state.skills.length} skills`]),
+    readiness("memory_skills", "Memory and skill governance", true, [`${state.skills.length} skills`, "USER.md / SOUL.md / Hindsight"]),
     readiness("messaging", "Messaging bridge", true, [`${state.messagingBridges.length} bridges`, `${state.messagingMessages.length} messages`]),
     readiness("mcp", "MCP/plugin surface", true, [`${state.mcpServers.length} MCP servers`]),
     readiness("support_bundle", "Support/evidence bundle", true, ["gini evidence", "gini smoke evidencePath"]),

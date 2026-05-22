@@ -186,9 +186,6 @@ export function TaskDetail({
                 <Section title={`Approvals (${task.approvalIds.length})`}>
                   <IdList ids={task.approvalIds} hint="Open Permissions to act on these." />
                 </Section>
-                <Section title={`Memory changes (${task.memoryIds.length})`}>
-                  <IdList ids={task.memoryIds} hint="Review on the Memory page." />
-                </Section>
                 <Section title={`Skills used (${task.skillIds.length})`}>
                   <IdList ids={task.skillIds} hint="Inspect on the Skills page." />
                 </Section>

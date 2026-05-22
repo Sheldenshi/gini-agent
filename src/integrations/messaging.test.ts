@@ -481,6 +481,66 @@ describe("messaging telegram wiring", () => {
     expect(listAllowedChats(config, bridge.id).ownerChatId).toBe(4242);
   });
 
+  test("rejectPendingChat clears the row from recentDeniedChats without granting allowlist access", async () => {
+    const config = testConfig("telegram-reject-pending-keeps-allowlist");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { allowChat, authorizeTelegramChat, listAllowedChats, recordDeniedChatAttempt, rejectPendingChat } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    // Seed an existing allowlist entry so we can later assert it stays
+    // untouched across the reject call — the failure mode we're guarding
+    // against is reject accidentally removing or adding allowlist rows.
+    await allowChat(config, bridge.id, 11);
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 4242, chatType: "private", sender: "@shelden" });
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 9999, chatType: "private", sender: "@iris" });
+
+    const view = await rejectPendingChat(config, bridge.id, 4242);
+    expect(view.recentDeniedChats.map((entry) => entry.chatId)).toEqual([9999]);
+    expect(view.allowedChatIds).toEqual([11]);
+    expect(view.ownerChatId).toBe(11);
+
+    // The rejected chat is still denied — reject doesn't enrol it.
+    expect(await authorizeTelegramChat(config, bridge.id, 4242)).toBe(false);
+
+    // Idempotent: rejecting an already-cleared chatId is a no-op that
+    // still returns the current allowlist view rather than throwing.
+    const again = await rejectPendingChat(config, bridge.id, 4242);
+    expect(again.recentDeniedChats.map((entry) => entry.chatId)).toEqual([9999]);
+
+    expect(listAllowedChats(config, bridge.id).allowedChatIds).toEqual([11]);
+  });
+
+  test("recordDeniedChatAttempt no-ops when the chat became allowlisted before the deny write", async () => {
+    // The Telegram poller authorizes outside mutateState, so an operator
+    // approval that lands after the read but before recordDeniedChatAttempt
+    // gets the lock must NOT cause the chat to re-appear in
+    // recentDeniedChats. Simulate the race by allowlisting the chat
+    // before recording the deny.
+    const config = testConfig("telegram-deny-races-allow");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { allowChat, listAllowedChats, recordDeniedChatAttempt } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    await allowChat(config, bridge.id, 4242);
+
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 4242, chatType: "private", sender: "@shelden" });
+
+    const view = listAllowedChats(config, bridge.id);
+    expect(view.allowedChatIds).toEqual([4242]);
+    expect(view.recentDeniedChats.find((entry) => entry.chatId === 4242)).toBeUndefined();
+  });
+
   test("denyChat removes a chat but keeps ownerChatId on metadata as audit history", async () => {
     const config = testConfig("telegram-deny-keeps-owner");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
@@ -786,8 +846,10 @@ describe("messaging discord wiring", () => {
       botToken: "TOK"
     });
 
+    const { rejectPendingChat } = await import("./messaging");
     await expect(allowChat(config, bridge.id, 1)).rejects.toThrow(/only applies to telegram/);
     await expect(denyChat(config, bridge.id, 1)).rejects.toThrow(/only applies to telegram/);
+    await expect(rejectPendingChat(config, bridge.id, 1)).rejects.toThrow(/only applies to telegram/);
     expect(() => listAllowedChats(config, bridge.id)).toThrow(/only applies to telegram/);
   });
 

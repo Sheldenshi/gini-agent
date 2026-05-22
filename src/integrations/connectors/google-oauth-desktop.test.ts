@@ -1,0 +1,66 @@
+import { describe, expect, test } from "bun:test";
+import { googleOauthDesktopProvider } from "./google-oauth-desktop";
+import { getProvider } from "./registry";
+
+describe("googleOauthDesktopProvider", () => {
+  test("declares the expected id, label, and description", () => {
+    expect(googleOauthDesktopProvider.id).toBe("google-oauth-desktop");
+    expect(googleOauthDesktopProvider.label).toBe("Google OAuth Desktop client");
+    expect(googleOauthDesktopProvider.description).toMatch(/Desktop OAuth/);
+    expect(googleOauthDesktopProvider.description.length).toBeGreaterThan(0);
+  });
+
+  test("declares client_id as a required non-secret field", () => {
+    const field = googleOauthDesktopProvider.fields.find((f) => f.name === "client_id");
+    expect(field).toBeDefined();
+    expect(field!.label).toBe("Client ID");
+    expect(field!.secret).toBe(false);
+    expect(field!.required).toBe(true);
+    expect(field!.placeholder).toMatch(/apps\.googleusercontent\.com/);
+  });
+
+  test("declares client_secret as a required secret field", () => {
+    const field = googleOauthDesktopProvider.fields.find((f) => f.name === "client_secret");
+    expect(field).toBeDefined();
+    expect(field!.label).toBe("Client secret");
+    expect(field!.secret).toBe(true);
+    expect(field!.required).toBe(true);
+    expect(field!.placeholder).toMatch(/GOCSPX-/);
+  });
+
+  test("maps env bindings to the gws CLI's expected variable names", () => {
+    expect(googleOauthDesktopProvider.secrets).toBeDefined();
+    expect(googleOauthDesktopProvider.secrets!.purposes).toEqual([
+      "client_id",
+      "client_secret"
+    ]);
+    expect(googleOauthDesktopProvider.secrets!.envBindings).toEqual({
+      GOOGLE_WORKSPACE_CLI_CLIENT_ID: "client_id",
+      GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: "client_secret"
+    });
+  });
+
+  test("defines no probe — OAuth client validation happens in `gws auth login`", () => {
+    // Health falls back to the presence-only branch in `checkConnector`,
+    // which marks the connector healthy when `status === "configured"`.
+    // The downstream `gws auth login` is the real validation step.
+    expect(googleOauthDesktopProvider.probe).toBeUndefined();
+  });
+
+  test("registers under its declared id in the provider registry", () => {
+    const found = getProvider("google-oauth-desktop");
+    expect(found).toBeDefined();
+    expect(found!.id).toBe("google-oauth-desktop");
+    expect(found!.label).toBe(googleOauthDesktopProvider.label);
+  });
+
+  test("declares no provider-owned request instructions or params", () => {
+    // Skill-specific instruction text (Cloud Console URLs, multi-step
+    // walkthroughs) belongs in the skill body, not the provider module.
+    // The provider is a generic OAuth Desktop client descriptor; the
+    // dispatcher substitutes `${var}` from the model's `reason` field at
+    // call time when the skill passes `params`.
+    expect(googleOauthDesktopProvider.requestInstructions).toBeUndefined();
+    expect(googleOauthDesktopProvider.requestParams).toBeUndefined();
+  });
+});

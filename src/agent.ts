@@ -21,7 +21,6 @@ import {
   appendTrace,
   assertInsideWorkspace,
   assertInsideWorkspaceNoSymlinkEscape,
-  createMemory,
   createTask,
   findInFlightAssistantTextForTask,
   isTerminalTaskStatus,
@@ -60,6 +59,7 @@ import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
+import { connectBrowser } from "./capabilities/browser-connect";
 import {
   abortApprovalsForTask,
   claimApproval,
@@ -530,14 +530,14 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   }
 
   // No tool matched: fall through to provider summarization.
-  // Phase C — resolve the active agent so memory access (pinned + recall +
-  // proposed) all use the same isolation key.
+  // Phase C — resolve the active agent so Hindsight recall uses the
+  // right isolation key. Legacy `state.memories` pinned-memory access
+  // was removed as part of the memory-surface consolidation; identity
+  // facts live in USER.md and recalled-from-Hindsight memory now. See
+  // ADR runtime-identity-files.md.
   const memoryState = await mutateState(config.instance, (state) => state);
   const memoryEffective = resolveEffectiveContext(memoryState, config);
   const activeAgentId = memoryEffective.agentId;
-  const activeMemory = memoryState.memories.filter((memory) =>
-    memory.status === "active" && (!activeAgentId || memory.agentId === activeAgentId)
-  );
 
   // Hindsight phase 5: auto-recall. Pull relevant facts/opinions from the
   // four-network store and inject as additional context. Best-effort — if
@@ -593,7 +593,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     }
   };
 
-  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext, onDelta);
+  const providerResult = await generateTaskSummary(config, task.input, recalledContext, onDelta, undefined, taskId);
   await flush();
   appendTrace(config.instance, taskId, {
     type: "model",
@@ -602,7 +602,6 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       provider: providerResult.provider,
       responseId: providerResult.responseId,
       usage: providerResult.usage,
-      memoryUsed: activeMemory.map((memory) => memory.id),
       hindsightUnitsRecalled
     }
   });
@@ -611,43 +610,14 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     const item = findTask(state, taskId);
     // Respect a terminal status set while `generateTaskSummary` was
     // awaiting. Without this guard a cancel landing during the
-    // provider call would be silently overwritten with `completed`,
-    // and the `remember` branch would also create a memory + audit
-    // row against a cancelled task.
+    // provider call would be silently overwritten with `completed`.
     if (isTerminalTaskStatus(item.status)) return item;
-    if (lower.includes("remember ")) {
-      // Phase C — reject loud when no active agent so we don't silently
-      // leak into a default pool. Message matches createMemoryFromInput
-      // so the gateway's statusFromErrorMessage mapping to 400 applies
-      // uniformly across the legacy + remember-prefix create paths.
-      if (!activeAgentId) {
-        throw new Error("Cannot create memory: no active agent.");
-      }
-      const content = item.input.split(/remember\s+/i).at(-1)?.trim() || item.input;
-      const memory = createMemory(state, {
-        agentId: activeAgentId,
-        content,
-        sourceTaskId: item.id,
-        confidence: 0.7,
-        status: "proposed",
-        sensitivity: "normal",
-        provenance: `Proposed from task ${item.id}`
-      });
-      item.memoryIds.push(memory.id);
-      addAudit(
-        state,
-        {
-          actor: "agent",
-          action: "memory.proposed",
-          target: memory.id,
-          risk: "medium",
-          taskId: item.id,
-          evidence: { content }
-        },
-        { taskId: item.id }
-      );
-      appendTrace(config.instance, taskId, { type: "memory", message: "Memory proposed", data: { memoryId: memory.id } });
-    }
+    // The legacy "remember <fact>" prefix used to create a proposed
+    // MemoryRecord row at task completion. That path was removed when
+    // `state.memories` was consolidated into USER.md / SOUL.md /
+    // Hindsight. Long-term retention now flows through auto-retain
+    // (scheduleAutoRetain below); identity facts route through
+    // `edit_user_profile`. See ADR runtime-identity-files.md.
     item.status = "completed";
     item.currentStep = "Completed";
     item.summary = providerResult.text;
@@ -1102,7 +1072,7 @@ export function mapApprovalToPolicyAction(
     if (payload && typeof payload.source === "string") return "code.exec";
     return "terminal.exec";
   }
-  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file" || action === "browser.connect") {
     return action;
   }
   if (action === "messaging.send") {
@@ -1963,6 +1933,124 @@ async function runApprovedAction(
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
     }
     return resultStr;
+  }
+
+  if (approval.action === "browser.connect") {
+    // Reason is captured at request time so the audit row preserves
+    // WHY the user was asked to consent (e.g. "Sign in to Google
+    // Cloud Console"). The actual side effect — spawning a managed
+    // Chrome — runs through the same `connectBrowser` capability
+    // a `gini browser connect` CLI call uses, so the lifecycle is
+    // identical from the runtime's perspective.
+    const reason = typeof approval.payload.reason === "string" ? approval.payload.reason : "(no reason given)";
+    // Headless rides on the approval payload, captured at request time
+    // by requestBrowserConnect. Only an explicit boolean true unlocks
+    // the windowless launch — any other value (undefined, false,
+    // non-boolean) falls back to the visible default.
+    const explicitHeadless = approval.payload.headless === true;
+    // Two-stage flow: when the user clicks "Connect" first, the HTTP
+    // `/open-browser` endpoint launches the visible Chrome and navigates
+    // to the target URL, then sets `signInStarted: true` on the payload.
+    // The user signs in inside that window and clicks "I've signed in",
+    // which routes here through the regular /approve endpoint. At that
+    // point we switch the same per-instance profile to headless so the
+    // window closes and the agent continues invisibly with the persisted
+    // cookies. When signInStarted is false (legacy auto-approve / yolo
+    // path with no prior open-browser call), we honor the explicit
+    // headless flag the agent passed.
+    const signInStarted = approval.payload.signInStarted === true;
+    const headless = signInStarted ? true : explicitHeadless;
+    let result: string;
+    let succeeded = false;
+    let mode: string | undefined;
+    let dataDir: string | null | undefined;
+    let recordHeadless: boolean | undefined;
+    try {
+      if (signal.aborted) {
+        result = JSON.stringify({ success: false, aborted: true, error: "Browser connect aborted: task was cancelled." });
+      } else {
+        // connectBrowser is idempotent — if the user already has a
+        // managed Chrome attached, it returns the existing record
+        // without relaunching. That's the right shape for an agent
+        // calling this after an earlier connect.
+        //
+        // `mode: "managed"` enforces the approval card's contract: the
+        // user just consented to "Connect to agent's browser," so a stale
+        // CDP-mode record (which may be headless or attached to a
+        // browser the user can't see) must be torn down and replaced
+        // with a fresh managed launch — never silently returned as-is.
+        //
+        // `headless` is passed through verbatim from the approval
+        // payload. When true, Playwright launches the same per-instance
+        // profile dir with headless: true — cookies from a prior
+        // visible session replay so the new context is already signed
+        // in.
+        //
+        // `skipAudit: true` because this dispatch already records a
+        // richer browser.connect audit row below (with the user-facing
+        // `reason` and the `approvalId`); letting the capability also
+        // write its own row would double-count the action and leave a
+        // reasonless row in the activity log. `skipAudit` lives on the
+        // third (internal) argument — NOT on the public `ConnectInput` —
+        // so an HTTP caller hitting `POST /api/browser/connect` with body
+        // `{"skipAudit": true}` cannot suppress its own audit row.
+        const status = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
+        succeeded = status.connected;
+        mode = status.record?.mode;
+        dataDir = status.record?.dataDir;
+        recordHeadless = status.record?.headless;
+        result = JSON.stringify({
+          success: succeeded,
+          connected: status.connected,
+          mode,
+          dataDir,
+          headless: recordHeadless
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      result = JSON.stringify({ success: false, error: message });
+    }
+    const task = await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "browser.connect",
+          target: reason,
+          risk: "medium",
+          taskId: approval.taskId,
+          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
+          approvalId: approval.id,
+          // Spread caller markers FIRST so canonical runtime fields can't
+          // be overwritten by smuggled keys. The side-effect audit
+          // mirrors the per-action shape of file.write / browser.upload_file.
+          evidence: { ...extraEvidence, reason, success: succeeded, mode, dataDir, headless: recordHeadless }
+        },
+        approvalAgentContext(approval)
+      );
+      if (approval.taskId && !chatToolCallId) {
+        completeApprovedTask(
+          state,
+          approval.taskId,
+          succeeded ? "Browser connect completed." : "Browser connect failed.",
+          succeeded ? undefined : "Browser connect failed."
+        );
+      }
+      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
+    });
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: succeeded ? "tool" : "error",
+        message: "Browser connect approved",
+        data: { reason, success: succeeded, mode, headless: recordHeadless }
+      });
+    }
+    if (task) await updateRunFromTask(config, task);
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
   }
 
   return undefined;

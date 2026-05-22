@@ -30,11 +30,15 @@ import {
   type ToolCall
 } from "../provider";
 import {
+  SOUL_SOFT_CAP_CHARS,
+  USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
   decideIdentityEmission,
+  identityBudgetState,
   renderFullIdentity
 } from "../system-prompt";
+import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity-files";
 import type {
   AgentIdentity,
   CostRecord,
@@ -46,7 +50,8 @@ import type {
   SkillRecord,
   SubagentRecord,
   Task,
-  TaskToolCallState
+  TaskToolCallState,
+  ToolCallSummary
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
@@ -68,6 +73,7 @@ import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
+import { getProvider } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
@@ -119,6 +125,71 @@ function addCost(accumulator: CostRecord | undefined, increment: CostRecord | un
   };
 }
 
+// Cap on Task.recentToolCalls length. The UI only renders this while a task
+// is in-flight; older entries scroll off-screen anyway. A small cap keeps
+// the state JSON bounded even on long tool-heavy loops.
+const MAX_RECENT_TOOL_CALLS = 20;
+
+// Build a compact, single-line preview of tool-call arguments for the chat
+// UI. JSON object inputs render as `key=value, key=value`; arrays/scalars
+// fall back to the trimmed JSON. Whitespace is collapsed and the result
+// truncated with an ellipsis. Returns "" when there are no arguments.
+function buildArgsPreview(rawArgs: string | undefined): string {
+  if (!rawArgs) return "";
+  const collapse = (s: string) => s.replace(/\s+/g, " ").trim();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawArgs);
+  } catch {
+    const fallback = collapse(rawArgs);
+    return fallback.length > 200 ? `${fallback.slice(0, 199)}…` : fallback;
+  }
+  let preview: string;
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const parts: string[] = [];
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      let valStr: string;
+      if (typeof v === "string") valStr = v;
+      else {
+        try { valStr = JSON.stringify(v); } catch { valStr = String(v); }
+      }
+      parts.push(`${k}=${valStr}`);
+    }
+    preview = parts.join(", ");
+  } else {
+    try { preview = JSON.stringify(parsed); } catch { preview = String(parsed); }
+  }
+  preview = collapse(preview);
+  if (preview.length > 200) preview = `${preview.slice(0, 199)}…`;
+  return preview;
+}
+
+// Push a new tool-call entry onto Task.recentToolCalls, capping length.
+// Mutates `item` in place — caller must already be inside `mutateState`.
+function pushRecentToolCall(item: Task, summary: ToolCallSummary): void {
+  const list = item.recentToolCalls ?? [];
+  list.push(summary);
+  if (list.length > MAX_RECENT_TOOL_CALLS) {
+    list.splice(0, list.length - MAX_RECENT_TOOL_CALLS);
+  }
+  item.recentToolCalls = list;
+}
+
+// Flip a tool-call entry's status (and stamp completedAt). No-op if the
+// entry isn't found — older entries can be evicted by the cap above.
+function updateRecentToolCall(
+  item: Task,
+  toolCallId: string,
+  status: "done" | "error"
+): void {
+  const list = item.recentToolCalls;
+  if (!list) return;
+  const entry = list.find((c) => c.id === toolCallId);
+  if (!entry) return;
+  entry.status = status;
+  entry.completedAt = now();
+}
+
 // runChatTask: kicks off the chat-task loop for a freshly submitted task.
 // Sets the task to running, builds the initial system + user messages,
 // recalls memory the same way the legacy path does, then calls runLoop.
@@ -165,8 +236,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const effectiveForAgent = resolveEffectiveContext(stateForAgent, config);
   const agentIdForMemory = effectiveForAgent.agentId;
 
-  // Auto-recall: same as the legacy path. If recall fails we continue with
-  // pinned memories only; the model can still answer.
+  // Auto-recall: queries the Hindsight bank for relevant context. If
+  // recall fails we continue without it — the model can still answer
+  // off USER.md / SOUL.md and the task input.
   let recalledContext: string | undefined;
   let hindsightUnitsRecalled = 0;
   if (agentIdForMemory) {
@@ -193,13 +265,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
 
   const state = readState(config.instance);
-  // Phase C: pinned memories are also per-agent. Records without an
-  // agentId (pre-migration leftovers) are excluded — the migration in
-  // normalizeState backfills them on first read, so this filter should
-  // only drop content during the in-flight first-boot rewrite.
-  const activeMemory = state.memories.filter((memory) =>
-    memory.status === "active" && (!agentIdForMemory || memory.agentId === agentIdForMemory)
-  );
+  // `state.memories` was removed as part of the memory-surface
+  // consolidation; identity facts live in USER.md and recalled-from-
+  // Hindsight memory now. See ADR runtime-identity-files.md.
   // Subagent path: child tasks override the default Gini preamble with the
   // subagent's own system prompt and filter the enabled-skills block by the
   // subagent's skill whitelist (when set).
@@ -236,9 +304,55 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
       identityBlock = renderFullIdentity(identity);
     }
   }
+  // Runtime identity files (INSTRUCTIONS.md / SOUL.md / USER.md). The
+  // subagent path opts out — subagents already get an override prompt.
+  // Blocked files emit a runtime trace warning but never crash the
+  // gateway. See ADR runtime-identity-files.md.
+  let instructionsOverride: string | undefined;
+  let soulBlock: string | undefined;
+  let userProfileBlock: string | undefined;
+  if (!subagent) {
+    const onBlocked = (filename: string, findings: string[]): void => {
+      appendTrace(config.instance, taskId, {
+        type: "model",
+        message: `identity file blocked: ${filename}`,
+        data: { filename, findings }
+      });
+    };
+    instructionsOverride = loadInstructions(config.instance, { onBlocked }) ?? undefined;
+    soulBlock = loadSoul(config.instance, effectiveForAgent.agentId, { onBlocked }) ?? undefined;
+    userProfileBlock = loadUserProfile(config.instance, { onBlocked }) ?? undefined;
+    // Surface "over cap" identity files to the trace so the operator can
+    // see the model is pushing past the soft cap. Skipped for BLOCKED
+    // notices (already audited via onBlocked) and absent files.
+    if (userProfileBlock && !userProfileBlock.startsWith("[BLOCKED:")) {
+      const budget = identityBudgetState(userProfileBlock, USER_SOFT_CAP_CHARS);
+      if (budget.overCap) {
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "identity file budget exceeded: USER.md",
+          data: { file: "USER.md", used: budget.used, cap: budget.cap, pct: budget.pct }
+        });
+      }
+    }
+    if (soulBlock && !soulBlock.startsWith("[BLOCKED:")) {
+      const budget = identityBudgetState(soulBlock, SOUL_SOFT_CAP_CHARS);
+      if (budget.overCap) {
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "identity file budget exceeded: SOUL.md",
+          data: { file: "SOUL.md", used: budget.used, cap: budget.cap, pct: budget.pct }
+        });
+      }
+    }
+  }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
-    : buildAgentSystemContext(activeMemory, recalledContext, identityBlock);
+    : buildAgentSystemContext(recalledContext, identityBlock, {
+        instructionsOverride,
+        soul: soulBlock,
+        userProfile: userProfileBlock
+      });
   const filteredSkills = filterSkillsForSubagent(state.skills, subagent);
   const visibleSkills = filteredSkills.filter((skill) => isSkillActive(state, skill));
   const skillsBlock = buildEnabledSkillsBlock(visibleSkills);
@@ -436,12 +550,20 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
 // Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
 // these skills are turned on but unusable because a required connector is
 // missing. We tell the model exactly which provider needs connecting so it
-// can call `request_connector` instead of refusing or hallucinating.
+// can either invoke the provider's setup skill (when the provider declares
+// one) or call `request_connector` directly to ask the user to connect.
 //
 // Skills with `requiredConnectors` undefined / empty are skipped: those are
 // inactive for some other reason (validation status, etc.) and there's no
 // connector affordance to offer.
-function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+//
+// We group by provider — multiple product skills often share the same
+// connector (e.g. all Google Workspace skills share google-oauth-desktop),
+// and emitting one line per provider keeps the block compact and points
+// the model at a single setup path per connector.
+//
+// Exported for unit testing; production callers use it via runChatTask.
+export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
   const candidates = skills.filter(
     (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
   );
@@ -461,17 +583,49 @@ function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
       byName.set(skill.name, skill);
     }
   }
-  const lines = Array.from(byName.values())
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((s) => {
-      const desc = s.description.trim() || "(no description)";
-      const providers = (s.requiredConnectors ?? []).map((r) => r.provider).join(", ");
-      return `- ${s.name}: ${desc} — needs connector: ${providers}.`;
+  // Group dedup'd skills by provider id. setupSkill is captured per
+  // provider — if any skill's required provider declares one, the
+  // provider-level line directs the model to invoke that skill instead
+  // of calling request_connector directly.
+  const grouped = new Map<string, { skills: string[]; setupSkill?: string }>();
+  for (const skill of byName.values()) {
+    for (const req of skill.requiredConnectors ?? []) {
+      const entry = grouped.get(req.provider) ?? { skills: [] };
+      entry.skills.push(skill.name);
+      const module = getProvider(req.provider);
+      if (module?.setupSkill) entry.setupSkill = module.setupSkill;
+      grouped.set(req.provider, entry);
+    }
+  }
+  const lines = Array.from(grouped.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([provider, entry]) => {
+      const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
+      if (entry.setupSkill) {
+        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
+      }
+      return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
     });
-  return [
-    "Available skills that need connection (call `request_connector` with the provider id to ask the user to connect):",
+  // The setup skill is the ONLY correct path for the listed providers.
+  // Without this directive, the model has shortcutted to browser_navigate
+  // (opening gmail.com / calendar.google.com / a Google sign-in page) to
+  // extract data or coax the user into signing in outside the proper flow.
+  // Browser tools exist for unrelated web tasks; they are not a bypass for
+  // the connector handshake.
+  const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
+  const intro = hasSetupSkill
+    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For providers WITHOUT a setup skill, call `request_connector` with the provider id directly."
+    : "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.";
+  const sections: string[] = [
+    intro,
     ...lines
-  ].join("\n");
+  ];
+  if (hasSetupSkill) {
+    sections.push(
+      "IMPORTANT: When a skill above lists a setup skill, that setup skill is the ONLY correct path to satisfy the user's request. Do NOT use `browser_navigate`, `browser_click`, or other browser tools to access the provider's web surface directly (e.g. navigating to gmail.com or calendar.google.com to extract data, or opening a Google sign-in page outside the setup flow). The browser tools are for unrelated tasks. If the user asks for something that requires a missing-connector skill, your first step is `read_skill` with the listed setup skill — never `browser_navigate`."
+    );
+  }
+  return sections.join("\n");
 }
 
 // Advertise configured http MCP servers in the system prompt. The model
@@ -869,13 +1023,22 @@ async function runLoop(
       // effects (browser click/type, spawn_subagent, create_job)
       // before the next iteration's top-of-loop check observes the
       // cancel.
+      const argsPreview = buildArgsPreview(call.function.arguments);
+      const startedAt = now();
       const guard = await mutateState(config.instance, (state) => {
         const item = findTask(state, taskId);
         if (isTerminalTaskStatus(item.status)) {
           return { proceed: false as const, status: item.status };
         }
         item.currentStep = `Working: ${call.function.name}`;
-        item.updatedAt = now();
+        item.updatedAt = startedAt;
+        pushRecentToolCall(item, {
+          id: call.id,
+          name: call.function.name,
+          argsPreview,
+          status: "running",
+          startedAt
+        });
         return { proceed: true as const };
       });
       if (!guard.proceed) {
@@ -904,7 +1067,8 @@ async function runLoop(
           taskId,
           call.function.name,
           call.id,
-          call.function.arguments
+          call.function.arguments,
+          workingMessages
         );
         if (dispatch.kind === "sync") {
           toolResultMessages.push({
@@ -916,6 +1080,12 @@ async function runLoop(
           // block carrying a truncated preview of the dispatch result.
           emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
           emitToolResult(emitCtx, { callId: call.id, result: dispatch.result });
+          // Mirror onto the legacy Task.recentToolCalls display payload so
+          // clients still reading the task record (rather than the block
+          // stream) see the same status flip.
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), call.id, "done");
+          });
         } else {
           pendingApprovals.push({
             toolCallId: call.id,
@@ -938,6 +1108,14 @@ async function runLoop(
               summary: approvalRow.reason ?? approvalRow.target
             });
           }
+          // Approval-gated tools haven't actually run yet, but from the
+          // UI's perspective the agent is no longer "dispatching" this
+          // call — it's now waiting on the user. Mark done on the legacy
+          // recentToolCalls payload so the row stops spinning; the
+          // approval block conveys the gate.
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), call.id, "done");
+          });
         }
       } catch (error) {
         // An approved side effect (file.write, terminal.exec, etc.) that
@@ -947,7 +1125,12 @@ async function runLoop(
         // letting the model retry as if nothing happened risks declaring
         // the task complete despite an audit-row gap. Let those escape
         // up to runChatTask's outer .catch so the task is failed.
-        if (error instanceof ApprovedActionFailedError) throw error;
+        if (error instanceof ApprovedActionFailedError) {
+          await mutateState(config.instance, (state) => {
+            updateRecentToolCall(findTask(state, taskId), call.id, "error");
+          });
+          throw error;
+        }
 
         // Dispatch failed (bad args, unknown tool, validation error). Feed
         // the error back to the model as the tool result so it can recover.
@@ -966,6 +1149,9 @@ async function runLoop(
           callId: call.id,
           status: "error",
           errorMessage: message
+        });
+        await mutateState(config.instance, (state) => {
+          updateRecentToolCall(findTask(state, taskId), call.id, "error");
         });
       }
     }

@@ -8,7 +8,7 @@ export async function improvement(ctx: CliContext): Promise<void> {
   const sub = cliArgs[1] ?? "list";
   if (sub === "propose") {
     const [kind, title, sourceTaskId, ...contentParts] = restAfter(cliArgs, sub);
-    if (!kind || !title) throw new Error("Usage: gini improvement propose memory|skill|job <title> [source-task-id] [content]");
+    if (!kind || !title) throw new Error("Usage: gini improvement propose skill|job <title> [source-task-id] [content]");
     const content = contentParts.join(" ").trim() || title;
     print(await api(config, "/api/improvements", {
       method: "POST",

@@ -31,7 +31,7 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
-install(config);
+await install(config);
 writePid(config);
 
 // Inform the browser session manager which instance to consult for the
@@ -83,25 +83,18 @@ void mutateState(config.instance, (state) => {
   });
 });
 
-// Hindsight phase 6: opportunistic legacy migration. Runs once per server
-// start; subsequent starts are no-ops because each migrated record carries
-// metadata.migratedToUnitId. Failures are logged but do not block startup —
-// `gini doctor` surfaces the count of unmigrated rows.
-migrateIfNeeded(config)
-  .then((report) => {
-    if (!report) return;
-    appendLog(config.instance, "memory.migrated", {
-      total: report.total,
-      migrated: report.migrated,
-      skipped: report.skipped,
-      failed: report.failed
-    });
-  })
-  .catch((error) => {
-    appendLog(config.instance, "memory.migrate.error", {
-      error: error instanceof Error ? error.message : String(error)
-    });
+// Legacy Hindsight-migration opportunistic seam. The
+// state.memories surface was retired in the memory-surface
+// consolidation; the install-time migration in
+// `migrate-pinned-to-user-md.ts` now drains every active pinned row into
+// USER.md. `migrateIfNeeded` is kept as a no-op so older external
+// callers don't break, but the report is always `null` — nothing to log.
+// See ADR runtime-identity-files.md.
+migrateIfNeeded(config).catch((error) => {
+  appendLog(config.instance, "memory.migrate.error", {
+    error: error instanceof Error ? error.message : String(error)
   });
+});
 
 // Slice 2: load filesystem-backed skills (bundled + user) at boot. Errors
 // are absorbed into the audit/log so a malformed SKILL.md can never block
@@ -141,6 +134,13 @@ runConnectorDetection(config)
 const server = Bun.serve({
   port: config.port,
   hostname: "127.0.0.1",
+  // Bun.serve defaults to a 10s idleTimeout. Several handlers can legitimately
+  // exceed that — approval resolution for browser.connect does teardown+relaunch
+  // of Chromium AND awaits resumeChatTask (which blocks on the agent's next
+  // model turn); model calls themselves can run minutes for reasoning models.
+  // 255s is the per-request ceiling (Bun's max), high enough that operations
+  // complete and low enough that genuinely hung sockets still get reaped.
+  idleTimeout: 255,
   fetch: createHandler(config)
 });
 

@@ -45,7 +45,7 @@ function bridgeSecretNamespace(bridgeId: string): string {
 // `GET /api/messaging`. Rejecting at create time stops the leak at
 // the source.
 const HEADER_SAFE_TOKEN = /^[\x21-\x7E]+$/;
-function assertHeaderSafeToken(kind: string, raw: string): void {
+export function assertHeaderSafeToken(kind: string, raw: string): void {
   if (!HEADER_SAFE_TOKEN.test(raw)) {
     throw new Error(
       `${kind === "telegram" ? "Telegram" : "Discord"} bot token contains invalid characters — header-safe printable ASCII only.`
@@ -571,6 +571,12 @@ export async function recordDeniedChatAttempt(
   await mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === bridgeId);
     if (!live) return;
+    // Re-check the allowlist inside the lock. The poller's authorize call
+    // happens outside mutateState, so if the operator clicks Approve in the
+    // window between that read and us getting here the chat is already
+    // allowed — silently skipping the deny write keeps the pending list from
+    // re-appearing after a successful approval.
+    if (isChatAllowed(live, attempt.chatId)) return;
     const meta = { ...(live.metadata ?? {}) };
     const existing = readRecentDeniedChats(live).filter((entry) => entry.chatId !== attempt.chatId);
     const entry: DeniedChatAttempt = {
@@ -602,7 +608,11 @@ function generatePairingCode(): string {
 // Mint (or rotate) a pairing code on the bridge. Called from
 // addMessagingBridge so a freshly-created telegram bridge already has
 // a valid code, and from pairMessagingBridge when the operator wants
-// a new window after the previous code expired.
+// a new window after the previous code expired. Also exported under
+// `mintTelegramPairingCodeInState` so the openclaw migrator can mint
+// a code on a migrated bridge that came across with no allowlist —
+// otherwise the poller silently denies every inbound and the bridge
+// looks "configured" but does nothing.
 function regeneratePairingCodeInState(
   bridges: MessagingBridgeRecord[],
   bridgeId: string
@@ -616,6 +626,8 @@ function regeneratePairingCodeInState(
   live.updatedAt = now();
   return live;
 }
+
+export const mintTelegramPairingCodeInState = regeneratePairingCodeInState;
 
 export async function pairMessagingBridge(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.instance, (state) => {
@@ -784,6 +796,41 @@ export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: 
         action: "messaging.chat.denied",
         target: live.id,
         risk: "medium",
+        evidence: { chatId }
+      },
+      { system: true }
+    );
+    return chatAllowlistView(live);
+  });
+}
+
+// Drop a chat from `recentDeniedChats` without touching the allowlist.
+// Backs the operator UI's "Reject" button on a pending pairing request —
+// the chat stays denied (the bridge keeps dropping its messages), but the
+// row is cleared from the pending list so it doesn't keep nagging the
+// operator. If the same chat sends another message after this it'll
+// re-appear in `recentDeniedChats` because there is no long-term denylist.
+export async function rejectPendingChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+  if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
+  return mutateState(config.instance, (state) => {
+    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
+    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
+    if (live.kind !== "telegram") {
+      // Reuse the existing allowlist-only prefix so statusFromErrorMessage
+      // already maps this to a 400 the way it does for allowChat / denyChat.
+      throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
+    }
+    const meta = { ...(live.metadata ?? {}) };
+    meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
+    live.metadata = meta;
+    live.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "messaging.pending.rejected",
+        target: live.id,
+        risk: "low",
         evidence: { chatId }
       },
       { system: true }

@@ -20,16 +20,20 @@ export type AgentContext =
   | { taskId: string; agentId?: string; system?: never }
   | { jobId: string; agentId?: string; system?: never }
   | { sessionId: string; agentId?: string; system?: never }
-  | { memoryId: string; agentId?: string; system?: never }
   | { system: true; agentId?: never };
 
 // Resolve the owning agent from a caller-supplied context. Deterministic:
 //   - explicit `agentId` always wins.
-//   - source ids (`taskId` / `jobId` / `sessionId` / `memoryId`) resolve via
-//     the corresponding record in state.
+//   - source ids (`taskId` / `jobId` / `sessionId`) resolve via the
+//     corresponding record in state.
 //   - `system: true` returns undefined (stored unattributed).
 //   - if a source id is provided but the record doesn't exist (deleted, race),
 //     return undefined. Do NOT fall back to `state.activeAgentId`.
+//
+// The `memoryId` branch was removed alongside the state.memories
+// consolidation — pinned memories no longer exist as a record type the
+// audit emitter can attribute against. See ADR
+// runtime-identity-files.md.
 function resolveAgentId(state: RuntimeState, ctx: AgentContext): string | undefined {
   if ("system" in ctx && ctx.system === true) return undefined;
   if (ctx.agentId) return ctx.agentId;
@@ -44,10 +48,6 @@ function resolveAgentId(state: RuntimeState, ctx: AgentContext): string | undefi
   if ("sessionId" in ctx && ctx.sessionId) {
     const session = state.chatSessions.find((candidate) => candidate.id === ctx.sessionId);
     return session?.agentId;
-  }
-  if ("memoryId" in ctx && ctx.memoryId) {
-    const memory = state.memories.find((candidate) => candidate.id === ctx.memoryId);
-    return memory?.agentId;
   }
   return undefined;
 }
