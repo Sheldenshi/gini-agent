@@ -33,8 +33,9 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
 
   // Find the matching approval row so the Connect dialog has the
   // provider id from `approval.payload.provider`. The approval may not
-  // yet be in the cache on first render — that's fine; the buttons stay
-  // disabled until it loads, mirroring the legacy ApprovalActions flow.
+  // yet be in the cache on first render — the Connect button stays
+  // disabled until the row loads so the dialog never opens without the
+  // provider id it needs.
   const approval = (approvals.data ?? []).find((a) => a.id === block.approvalId) ?? null;
   const isPending = approval ? approval.status === "pending" : true;
 
