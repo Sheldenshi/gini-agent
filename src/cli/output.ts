@@ -86,7 +86,7 @@ Usage:
   bun run gini runs list|show
   bun run gini approvals
   bun run gini approval approve|deny <approval-id>
-  bun run gini memory list|add|approve|reject
+  bun run gini memory retain|recall|reflect|units|banks|migrate
   bun run gini reranker status
   bun run gini skills list|add|show|search|validate|test|enable|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
