@@ -120,6 +120,8 @@ Usage:
   bun run gini audit
   bun run gini evidence
   bun run gini smoke
+  bun run gini tunnel status|qr|enable|disable|rotate-secret|sync-notes
+  bun run gini tunnel apple-notes enable|disable|folder <name>
 
 Process lifecycle:
   gini start      - daemon mode; instance keeps running after the terminal

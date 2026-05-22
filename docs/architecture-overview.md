@@ -22,6 +22,8 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
                            │  • state.json                   │
                            │  • traces, audit, events        │
                            │  • bearer-token auth            │
+                           │  • optional secret-path tunnel  │
+                           │    (gini tunnel enable)         │
                            │                                 │
                            │  /api/* (HTTP + SSE)            │
                            └────────────────┬────────────────┘
