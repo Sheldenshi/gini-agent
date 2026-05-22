@@ -62,9 +62,6 @@ Describe the technical change, not the process that produced it. See [AGENTS.md]
 
 If you iterate with multiple review-fix commits, squash to a clean narrative before merging.
 
-## CHANGELOG
-
-You don't need to update [`CHANGELOG.md`](CHANGELOG.md) in your PR. It's curated at release time from the PR titles since the last tag — see [docs/releases.md](docs/releases.md). Just write a clear PR title and you're done.
 
 ## License
 
