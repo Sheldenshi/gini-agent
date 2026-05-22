@@ -1,18 +1,33 @@
 "use client";
 
+import { useState } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Check, X } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import type { ChatAllowlistView } from "@runtime/integrations/messaging";
+import type { MessagingBridgeRecord } from "@runtime/types";
 
 export interface McpRow { id: string; name: string; status: string; command: string; lastHealthAt?: string }
 export interface MessagingRow { id: string; name: string; status: string; kind: string }
+
+type AddBridgeKind = "telegram" | "discord";
 
 export function McpCard({
   servers,
@@ -74,12 +89,17 @@ export function MessagingCard({
   return (
     <Card>
       <CardHeader>
-        <CardTitle className="text-sm">Messaging bridges</CardTitle>
-        <CardDescription>{bridges.length} configured</CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <CardTitle className="text-sm">Messaging bridges</CardTitle>
+            <CardDescription>{bridges.length} configured</CardDescription>
+          </div>
+          <AddMessagingBridgeButtons />
+        </div>
       </CardHeader>
       <CardContent>
         {bridges.length === 0 ? (
-          <EmptyState title="No bridges" />
+          <EmptyState title="No bridges — add a Telegram or Discord bot above to get started." />
         ) : (
           <ul className="divide-y divide-border">
             {bridges.map((item) => (
@@ -199,4 +219,236 @@ function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
       ))}
     </ul>
   );
+}
+
+// "Add Telegram" / "Add Discord" buttons + the matching create dialog.
+// Renders the same POST /api/messaging surface the CLI uses, so the
+// browser is a peer of `gini messaging add` rather than a partial view.
+// The bot token never leaves the dialog and is forwarded straight to
+// the runtime, which encrypts it into the per-instance secret store
+// before responding.
+function AddMessagingBridgeButtons() {
+  const invalidate = useInvalidate();
+  const [open, setOpen] = useState(false);
+  const [kind, setKind] = useState<AddBridgeKind>("telegram");
+  const [name, setName] = useState("");
+  const [botToken, setBotToken] = useState("");
+  const [result, setResult] = useState<MessagingBridgeRecord | null>(null);
+
+  const add = useMutation<MessagingBridgeRecord, Error, { name: string; kind: AddBridgeKind; botToken: string }>({
+    mutationFn: (input) =>
+      api<MessagingBridgeRecord>("/messaging", {
+        method: "POST",
+        body: JSON.stringify(input)
+      }),
+    onSuccess: (record) => {
+      toast.success(`${labelFor(record.kind === "discord" ? "discord" : "telegram")} bridge added.`);
+      invalidate(["messaging", "events", "state"]);
+      setResult(record);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const openFor = (next: AddBridgeKind) => {
+    setKind(next);
+    setName("");
+    setBotToken("");
+    setResult(null);
+    add.reset();
+    setOpen(true);
+  };
+
+  const close = () => {
+    setOpen(false);
+    // Defer state reset so the closing animation isn't disrupted.
+    setTimeout(() => {
+      setName("");
+      setBotToken("");
+      setResult(null);
+      add.reset();
+    }, 150);
+  };
+
+  const submit = () => {
+    const trimmedName = name.trim();
+    const trimmedToken = botToken.trim();
+    if (!trimmedName) {
+      toast.error("Name is required.");
+      return;
+    }
+    if (!trimmedToken) {
+      toast.error("Bot token is required.");
+      return;
+    }
+    add.mutate({ name: trimmedName, kind, botToken: trimmedToken });
+  };
+
+  const label = labelFor(kind);
+  const tokenHint = kind === "telegram"
+    ? "Open Telegram, chat with @BotFather, run /newbot, and paste the token below."
+    : "Open the Discord Developer Portal, create an application, add a bot, and copy its token.";
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-2">
+        <Button size="sm" variant="outline" onClick={() => openFor("telegram")}>
+          Add Telegram
+        </Button>
+        <Button size="sm" variant="outline" onClick={() => openFor("discord")}>
+          Add Discord
+        </Button>
+      </div>
+      <Dialog open={open} onOpenChange={(value) => { if (!value) close(); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add {label} bridge</DialogTitle>
+            <DialogDescription>{tokenHint}</DialogDescription>
+          </DialogHeader>
+          {result ? (
+            <BridgeAddedSummary record={result} onClose={close} />
+          ) : (
+            <>
+              <div className="grid gap-3">
+                <div className="grid gap-1.5">
+                  <Label htmlFor="bridge-name" className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Name
+                  </Label>
+                  <Input
+                    id="bridge-name"
+                    value={name}
+                    onChange={(event) => setName(event.target.value)}
+                    placeholder={kind === "telegram" ? "my-telegram-bot" : "my-discord-bot"}
+                    autoComplete="off"
+                    autoFocus
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    A short label so you can recognize this bridge later.
+                  </p>
+                </div>
+                <div className="grid gap-1.5">
+                  <Label htmlFor="bridge-token" className="text-[11px] uppercase tracking-wide text-muted-foreground">
+                    Bot token
+                  </Label>
+                  <Input
+                    id="bridge-token"
+                    type="password"
+                    value={botToken}
+                    onChange={(event) => setBotToken(event.target.value)}
+                    placeholder={kind === "telegram" ? "123456789:ABCdef..." : "MzA1...Ovy4MCQQ"}
+                    autoComplete="off"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Stored encrypted in the per-instance secret store. Never leaves your machine.
+                  </p>
+                </div>
+              </div>
+              {add.error ? (
+                <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+                  {add.error.message}
+                </p>
+              ) : null}
+              <DialogFooter>
+                <DialogClose asChild>
+                  <Button variant="outline" disabled={add.isPending}>Cancel</Button>
+                </DialogClose>
+                <Button
+                  onClick={submit}
+                  disabled={add.isPending || name.trim().length === 0 || botToken.trim().length === 0}
+                >
+                  {add.isPending ? "Adding…" : `Add ${label}`}
+                </Button>
+              </DialogFooter>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
+
+// Post-create summary view. For Telegram, surfaces the auto-minted
+// pairing code with a copy button so the user can DM the bot and
+// enroll their chat without needing to look up their own chat_id.
+// The TTL surfaced here matches PAIRING_CODE_TTL_MS in
+// src/integrations/messaging.ts (15 * 60 * 1000 ms). For Discord,
+// points the user at the invite-and-add-to-channel flow since there's
+// no pairing token to display.
+function BridgeAddedSummary({
+  record,
+  onClose
+}: {
+  record: MessagingBridgeRecord;
+  onClose: () => void;
+}) {
+  const metadata = (record.metadata ?? {}) as {
+    pairingCode?: string;
+    pairingCodeExpiresAt?: string;
+    botUsername?: string;
+  };
+  const code = metadata.pairingCode;
+  const expires = metadata.pairingCodeExpiresAt;
+  const botUsername = metadata.botUsername;
+
+  const copyCode = async () => {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast.success("Pairing code copied.");
+    } catch {
+      toast.error("Couldn't access the clipboard — copy the code manually.");
+    }
+  };
+
+  return (
+    <>
+      <div className="space-y-3 text-xs">
+        <p className="text-sm">
+          <span className="font-medium">{record.name}</span> is now configured as a {record.kind} bridge.
+        </p>
+        {record.kind === "telegram" ? (
+          <div className="space-y-2 rounded-md border border-sky-500/30 bg-sky-500/5 p-3">
+            <p className="text-sm font-medium">Next: pair your chat</p>
+            {code ? (
+              <>
+                <p>
+                  DM {botUsername ? `@${botUsername}` : "your bot"} on Telegram with the code below
+                  to enroll your chat. The code expires
+                  {expires ? ` at ${new Date(expires).toLocaleString()}` : " in 15 minutes"}.
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <code className="rounded bg-muted px-2 py-1 font-mono text-sm">{code}</code>
+                  <Button size="sm" variant="outline" onClick={copyCode}>Copy</Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  After you DM the code, a pairing request will appear under the bridge on this
+                  page — click Approve to finish enrollment.
+                </p>
+              </>
+            ) : (
+              <p>Bridge created. Use the bridge&apos;s Health button to confirm the token is valid.</p>
+            )}
+          </div>
+        ) : null}
+        {record.kind === "discord" ? (
+          <div className="space-y-2 rounded-md border border-indigo-500/30 bg-indigo-500/5 p-3">
+            <p className="text-sm font-medium">Next: invite the bot to your server</p>
+            <p>
+              Open the Discord Developer Portal, copy the bot&apos;s OAuth2 install URL, and add it
+              to the server and channels you want to use. Then click Health on the new bridge to
+              verify the token.
+            </p>
+          </div>
+        ) : null}
+      </div>
+      <DialogFooter>
+        <Button onClick={onClose}>Done</Button>
+      </DialogFooter>
+    </>
+  );
+}
+
+function labelFor(kind: string): string {
+  if (kind === "telegram") return "Telegram";
+  if (kind === "discord") return "Discord";
+  return kind;
 }
