@@ -1,3 +1,4 @@
+import { Feather } from "@expo/vector-icons";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -9,6 +10,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  TouchableOpacity,
   View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -19,15 +21,14 @@ import {
   useChatBlocks,
   useSendMessage
 } from "@/src/queries";
-import { theme } from "@/src/theme";
+import { family, theme } from "@/src/theme";
 import type { ChatBlock } from "@/src/types";
 
-// Pure renderer of the runtime's typed ChatBlock stream. The previous
-// implementation derived a phase indicator from Task.currentStep,
-// synthesized an in-flight placeholder, and POSTed /sync after each
-// terminal task. All that derivation lives server-side now — this
-// screen polls /chat/:id/blocks, walks the list, and dispatches each
-// block through BlockRenderer.
+// Three sections: a header with back arrow + centered title, the
+// scrolling conversation, and the input bar (pill + circular send
+// button). All chrome lives in this screen — the native stack header
+// is hidden so the iOS-style centered title and equal-width edge spacers
+// land exactly per the design.
 export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const blocks = useChatBlocks(sessionId ?? null);
@@ -55,7 +56,11 @@ export default function ChatDetailScreen() {
       if (b.kind !== "phase") return true;
       const isLast = i === list.length - 1;
       if (!isLast) return false;
-      return b.label !== "Completed" && b.label !== "Cancelled" && b.label !== "Failed";
+      return (
+        b.label !== "Completed" &&
+        b.label !== "Cancelled" &&
+        b.label !== "Failed"
+      );
     });
   }, [list]);
 
@@ -108,14 +113,15 @@ export default function ChatDetailScreen() {
     return () => clearTimeout(id);
   }, [list.length, sessionId, lastAssistantUpdatedAt]);
 
+  const trimmed = text.trim();
   const showSendBusy = send.isPending || inFlight;
+  const sendDisabled = !trimmed || showSendBusy || !sessionId;
 
   const submit = () => {
-    const trimmed = text.trim();
     // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
     // also covers in-flight assistant work, not just the mutation's own
     // pending state.
-    if (!trimmed || showSendBusy || !sessionId) return;
+    if (sendDisabled) return;
     send.mutate(trimmed, {
       onSuccess: () => setText("")
     });
@@ -124,15 +130,27 @@ export default function ChatDetailScreen() {
   if (unauthorized) return null;
 
   return (
-    <SafeAreaView style={styles.safe} edges={["bottom"]}>
-      <Stack.Screen
-        options={{
-          title: headerTitle,
-          headerStyle: { backgroundColor: theme.bg },
-          headerTitleStyle: { color: theme.text },
-          headerTintColor: theme.accent
-        }}
-      />
+    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+      <Stack.Screen options={{ headerShown: false }} />
+
+      {/* Header — back arrow on the left, centered title, a transparent
+          spacer on the right so the title's `textAlign: center` lines up
+          visually even though the right edge has no icon. */}
+      <View style={styles.header}>
+        <TouchableOpacity
+          onPress={() => router.back()}
+          hitSlop={8}
+          style={styles.headerIconButton}
+          accessibilityRole="button"
+          accessibilityLabel="Back"
+        >
+          <Feather name="arrow-left" size={24} color={theme.text} />
+        </TouchableOpacity>
+        <Text style={styles.headerTitle} numberOfLines={1}>
+          {headerTitle}
+        </Text>
+        <View style={styles.headerSpacer} />
+      </View>
 
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
@@ -141,7 +159,7 @@ export default function ChatDetailScreen() {
       >
         {blocks.isPending && !blocks.data ? (
           <View style={styles.center}>
-            <ActivityIndicator color={theme.subtle} />
+            <ActivityIndicator color={theme.muted} />
           </View>
         ) : (
           <ScrollView
@@ -169,37 +187,42 @@ export default function ChatDetailScreen() {
           </ScrollView>
         )}
 
-        <View style={styles.composerWrap}>
-          <TextInput
-            value={text}
-            onChangeText={setText}
-            placeholder="Message"
-            placeholderTextColor={theme.subtle}
-            multiline
-            editable={!!sessionId}
-            onSubmitEditing={submit}
-            blurOnSubmit={false}
-            style={styles.composerInput}
-          />
-          <Pressable
-            onPress={submit}
-            disabled={!text.trim() || showSendBusy}
-            style={[
-              styles.sendButton,
-              {
-                backgroundColor:
-                  !text.trim() || showSendBusy
-                    ? theme.buttonDisabled
-                    : theme.button
-              }
-            ]}
-          >
-            {send.isPending ? (
-              <ActivityIndicator color={theme.buttonText} />
-            ) : (
-              <Text style={styles.sendText}>Send</Text>
-            )}
-          </Pressable>
+        {/* Input bar — pill input with a leading "+" affordance (no-op
+            in v1) and a navy circular send button. The pill sits inside
+            a white surface bar with a top hairline so the input feels
+            anchored to the bottom edge. */}
+        <View style={styles.inputBar}>
+          <View style={styles.inputPill}>
+            <Feather name="plus" size={24} color={theme.codeChipText} />
+            <TextInput
+              value={text}
+              onChangeText={setText}
+              placeholder="Message Gini..."
+              placeholderTextColor={theme.inputPlaceholder}
+              multiline
+              editable={!!sessionId}
+              onSubmitEditing={submit}
+              blurOnSubmit={false}
+              style={styles.inputText}
+              accessibilityLabel="Message input"
+            />
+            <Pressable
+              onPress={submit}
+              disabled={sendDisabled}
+              style={[
+                styles.sendButton,
+                sendDisabled && styles.sendButtonDisabled
+              ]}
+              accessibilityRole="button"
+              accessibilityLabel="Send"
+            >
+              {send.isPending ? (
+                <ActivityIndicator color={theme.buttonText} />
+              ) : (
+                <Feather name="arrow-up" size={22} color={theme.buttonText} />
+              )}
+            </Pressable>
+          </View>
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -210,45 +233,94 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
-  messages: { padding: 16, gap: 10, paddingBottom: 24 },
+
+  // Header. Equal-width edge boxes (icon + spacer) so the centered
+  // title sits geometrically in the middle of the row.
+  header: {
+    height: 64,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    backgroundColor: theme.bg,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border
+  },
+  headerIconButton: {
+    width: 36,
+    height: 36,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  headerSpacer: { width: 36, height: 36 },
+  headerTitle: {
+    flex: 1,
+    textAlign: "center",
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 19
+  },
+
+  // Conversation — vertical block stream with consistent gap and outer
+  // padding. The block components own their own bubble geometry.
+  messages: {
+    padding: 16,
+    paddingTop: 18,
+    paddingBottom: 24,
+    gap: 16
+  },
   emptyChat: {
     flex: 1,
     minHeight: 240,
     alignItems: "center",
     justifyContent: "center"
   },
-  emptyChatText: { fontSize: 18, fontWeight: "500", color: theme.subtle },
-  composerWrap: {
-    flexDirection: "row",
-    alignItems: "flex-end",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingTop: 8,
-    paddingBottom: 8,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: theme.border,
-    backgroundColor: theme.bg
+  emptyChatText: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 18
   },
-  composerInput: {
-    flex: 1,
-    minHeight: 40,
-    maxHeight: 140,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 18,
+
+  // Input bar — sits at the bottom of the screen above the home
+  // indicator (consumed by the SafeAreaView). White with a top
+  // hairline; the pill itself is height 56 with a 28 corner radius.
+  inputBar: {
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 14,
+    backgroundColor: theme.bg,
+    borderTopWidth: 1,
+    borderTopColor: theme.border
+  },
+  inputPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    minHeight: 56,
+    borderRadius: 28,
+    backgroundColor: theme.bg,
     borderWidth: 1,
-    fontSize: 16,
+    borderColor: theme.inputBorder,
+    paddingLeft: 18,
+    paddingRight: 8,
+    paddingVertical: 4
+  },
+  inputText: {
+    flex: 1,
     color: theme.text,
-    backgroundColor: theme.inputBg,
-    borderColor: theme.border
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 17,
+    paddingVertical: 8,
+    // Cap the multiline input height so a long paste doesn't push the
+    // composer up over the conversation.
+    maxHeight: 120
   },
   sendButton: {
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 18,
-    minWidth: 64,
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: theme.button,
     alignItems: "center",
     justifyContent: "center"
   },
-  sendText: { fontSize: 15, fontWeight: "600", color: theme.buttonText }
+  sendButtonDisabled: { backgroundColor: theme.buttonDisabled }
 });
