@@ -917,8 +917,8 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // "tool didn't exist". Note: `send_message` (toolset `messaging`)
     // is deliberately NOT in this bypass — it's a surface-gateway tool
     // (outbound messaging) where the operator's toolset kill switch
-    // must work. Its toolset defaults disabled; flipping the toolset
-    // to enabled is how the operator turns it on.
+    // must work. Flipping the `messaging` toolset to disabled is how
+    // the operator turns it off.
     if (tool.function.name === "cancel_task") return true;
     if (tool.function.name === "install_skill") return true;
     if (tool.function.name === "enable_skill") return true;

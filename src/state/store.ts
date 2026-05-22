@@ -716,6 +716,23 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       state.tools!.push(tool);
     }
   }
+  // `mcp` and `messaging` originally shipped disabled. Their default flipped
+  // to enabled so a fresh instance has all toolsets on. For existing
+  // instances created before the flip, promote the row only when the operator
+  // never touched it (createdAt === updatedAt). Anyone who explicitly
+  // disabled it has updatedAt > createdAt and is left alone.
+  for (const name of ["mcp", "messaging"] as const) {
+    const row = state.toolsets!.find((t) => t.name === name);
+    if (!row) continue;
+    if (row.status !== "disabled") continue;
+    if (row.createdAt !== row.updatedAt) continue;
+    row.status = "enabled";
+    row.updatedAt = at;
+    for (const tool of state.tools!.filter((t) => t.toolset === name)) {
+      tool.status = "available";
+      tool.updatedAt = at;
+    }
+  }
   state.subagents ??= [];
   state.mcpServers ??= [];
   state.messagingBridges ??= [];

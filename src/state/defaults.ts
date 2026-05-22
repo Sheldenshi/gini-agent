@@ -63,7 +63,7 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       instance,
       name: "mcp",
       description: "Expose selected external MCP tools through configured server records.",
-      status: "disabled",
+      status: "enabled",
       toolNames: ["mcp.invoke"],
       scopes: ["task", "job", "skill", "subagent", "mcp"],
       createdAt: at,
@@ -74,7 +74,7 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       instance,
       name: "messaging",
       description: "Bridge task input and notifications to configured messaging channels.",
-      status: "disabled",
+      status: "enabled",
       toolNames: ["message.send"],
       scopes: ["job", "messaging"],
       createdAt: at,
@@ -135,11 +135,10 @@ export function defaultTools(instance: Instance, at: string): ToolRecord[] {
 // mirror the canonical list rather than duplicating it inline and
 // drifting silently when this list grows.
 //
-// `messaging` and `mcp` are in the whitelist so that when an operator
-// enables those toolsets (they ship disabled in `defaultToolsets`),
-// the active agent doesn't silently gate them out via the per-agent
-// intersection. The kill switch then lives where it should: on the
-// toolset's enabled/disabled status.
+// `messaging` and `mcp` are in the whitelist so that the active agent
+// doesn't silently gate them out via the per-agent intersection. The
+// kill switch lives where it should: on the toolset's enabled/disabled
+// status.
 //
 // `browser` is included so new agents can drive the headless Chrome
 // surface (navigate/snapshot/click/type/upload/etc.) on day one.

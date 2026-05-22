@@ -78,14 +78,13 @@ describe("buildToolCatalog", () => {
     }
   });
 
-  test("fresh-default toolsets surface the always-on agent-capability tools but hide send_message", () => {
+  test("fresh-default toolsets surface the always-on agent-capability tools plus send_message", () => {
     // Pin the contract that a freshly cloned instance's default toolset
     // state advertises the agent-capability meta-tools (cancel_task,
     // install_skill, enable_skill, disable_skill) plus the
-    // memory/session_search tools whose toolsets ship enabled. The
-    // surface-gateway tool `send_message` lives under a toolset that
-    // ships disabled — it should NOT appear until the operator enables
-    // `messaging`. `mcp_call` is always-on (no toolset gate).
+    // memory/session_search tools. All shipped toolsets default enabled,
+    // so the surface-gateway tool `send_message` is also visible.
+    // `mcp_call` is always-on (no toolset gate).
     const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
     const catalog = buildToolCatalog(state);
     const names = new Set(catalog.map((t) => t.function.name));
@@ -99,29 +98,20 @@ describe("buildToolCatalog", () => {
       "enable_skill",
       "disable_skill",
       "mcp_call",
-      "request_connector"
+      "request_connector",
+      "send_message"
     ];
     for (const tool of expectedVisible) {
       expect(names.has(tool)).toBe(true);
     }
-    // Kill switch contract: messaging toolset defaults disabled, so the
-    // surface-gateway send_message tool stays hidden in a fresh catalog.
-    expect(names.has("send_message")).toBe(false);
-  });
-
-  test("enabling the messaging toolset exposes send_message", () => {
-    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) =>
-      t.name === "messaging" ? { ...t, status: "enabled" as const } : t
-    ));
-    const catalog = buildToolCatalog(state);
-    const names = new Set(catalog.map((t) => t.function.name));
-    expect(names.has("send_message")).toBe(true);
   });
 
   test("disabling messaging toolset hides send_message (kill switch works)", () => {
-    // messaging defaults disabled. This assertion is the negative half
-    // of the kill-switch contract.
-    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
+    // messaging defaults enabled. Flip it to disabled to verify the
+    // kill switch still removes send_message from the catalog.
+    const state = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) =>
+      t.name === "messaging" ? { ...t, status: "disabled" as const } : t
+    ));
     const catalog = buildToolCatalog(state);
     const names = new Set(catalog.map((t) => t.function.name));
     expect(names.has("send_message")).toBe(false);
