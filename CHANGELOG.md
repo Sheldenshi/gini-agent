@@ -4,11 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-05-22
-
 ### Added
 
 - Initial public open-source release. See [README.md](README.md) for what's included and the [Roadmap](ROADMAP.md) for what's planned.
 
-[Unreleased]: https://github.com/Lilac-Labs/gini-agent/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/Lilac-Labs/gini-agent/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Lilac-Labs/gini-agent/commits/main
