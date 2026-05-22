@@ -90,12 +90,26 @@ export function getChatSession(config: RuntimeConfig, id: string) {
       // connector.request approvals now persist their `reason` as a durable
       // assistant message at request_connector time (kind:"approval_reason"),
       // so no placeholder is needed for that case — the real message is in
-      // `stored` already. Other approval types (file.write, browser.connect,
-      // messaging.send, etc.) still get the generic "Working: …" placeholder.
+      // `stored` already.
       const hasPersistedApprovalReason = stored.some(
         (m) => m.role === "assistant" && m.taskId === task.id && m.kind === "approval_reason"
       );
       if (hasPersistedApprovalReason) continue;
+      // browser.connect approvals render their own self-describing card in
+      // chat ("Open a browser window" + the reason + Connect/Cancel). A
+      // generic "Waiting for approval..." bubble next to that card is
+      // redundant noise — the card already conveys what's pending. Skip the
+      // placeholder when the pending approval(s) for this task are all
+      // browser.connect.
+      const pendingApprovals = state.approvals.filter(
+        (a) => a.taskId === task.id && a.status === "pending"
+      );
+      if (
+        pendingApprovals.length > 0 &&
+        pendingApprovals.every((a) => a.action === "browser.connect")
+      ) {
+        continue;
+      }
       content = task.currentStep || "Waiting for approval...";
     } else if (task.partialSummary) {
       content = task.partialSummary;

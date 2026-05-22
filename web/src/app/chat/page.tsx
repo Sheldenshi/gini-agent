@@ -392,6 +392,20 @@ export default function ChatPage() {
                               <ToolCallRow key={call.id} call={call} />
                             ))}
                             <PhaseIndicator phase={pendingPhase} />
+                            {/*
+                              Some approval types (browser.connect) suppress
+                              the "Waiting for approval..." placeholder bubble
+                              because their inline card is self-describing.
+                              Render the card here alongside the phase
+                              indicator so the user still gets an actionable
+                              control when there's no streaming assistant
+                              message to anchor it to.
+                            */}
+                            {inflightTaskId && tasksById.get(inflightTaskId)?.status === "waiting_approval" ? (
+                              <div className="mt-1 max-w-[90%]">
+                                <ApprovalActions taskId={inflightTaskId} />
+                              </div>
+                            ) : null}
                           </div>
                         </div>
                       </li>
