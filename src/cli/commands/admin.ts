@@ -34,9 +34,9 @@ export async function install_(ctx: CliContext): Promise<void> {
   // takes over for a brand-new instance; `gini setup --yes` and the
   // browser /setup page can still rewrite that later.
   //
-  // GINI_PROVIDER=openai|codex (optionally with GINI_MODEL) always wins
-  // when set, whether or not a config already exists on disk. This is
-  // load-bearing for the conductor `setup` script: if a worktree's
+  // GINI_PROVIDER=openai|codex|echo (optionally with GINI_MODEL) always
+  // wins when set, whether or not a config already exists on disk. This
+  // is load-bearing for the conductor `setup` script: if a worktree's
   // instance dir was materialized earlier (e.g. by a tmux `gini run`
   // racing the install, or by a legacy `~/.gini/lanes/<inst>/config.json`
   // that loadConfig migrates into place) the existing config would
@@ -46,6 +46,11 @@ export async function install_(ctx: CliContext): Promise<void> {
   // the env vars so the rewrite is a no-op; on a pre-existing or
   // migrated config it brings the on-disk shape into agreement with
   // the env.
+  //
+  // GINI_MODEL alone (no GINI_PROVIDER) on an existing config also
+  // wins — defaultConfig() honors GINI_MODEL on a fresh install, so the
+  // existing-config path must match that contract or users get an
+  // asymmetric "model env ignored after first install" surprise.
   const instance = parseInstance(ctx.rawArgs);
   const envProvider = process.env.GINI_PROVIDER;
   if (envProvider && !isEnvProviderName(envProvider)) {
@@ -56,7 +61,8 @@ export async function install_(ctx: CliContext): Promise<void> {
     );
   }
   const { config } = ctx;
-  if (envProvider === "openai" || envProvider === "codex") {
+  const envModel = process.env.GINI_MODEL;
+  if (envProvider === "openai" || envProvider === "codex" || envProvider === "echo") {
     // Mirror defaultConfig()'s provider field shape so the on-disk form
     // is identical whether the env vars hit the fresh-config branch in
     // defaultConfig() or this rewrite path on a pre-existing/migrated
@@ -68,9 +74,12 @@ export async function install_(ctx: CliContext): Promise<void> {
     //     existing model so a user with codex/gpt-custom doesn't get
     //     clobbered to gpt-5.5 by a re-run of `gini install` with the
     //     same GINI_PROVIDER.
-    const envModel = process.env.GINI_MODEL;
     const providerChanged = config.provider?.name !== envProvider;
-    const providerDefaultModel = envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini";
+    const providerDefaultModel = envProvider === "codex"
+      ? "gpt-5.5"
+      : envProvider === "openai"
+        ? "gpt-5.4-mini"
+        : "gini-echo-v0";
     const model = envModel
       ?? (providerChanged ? providerDefaultModel : (config.provider?.model ?? providerDefaultModel));
     config.provider = {
@@ -78,6 +87,15 @@ export async function install_(ctx: CliContext): Promise<void> {
       model,
       apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined
     };
+    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+  } else if (envModel !== undefined && config.provider) {
+    // Asymmetry fix: fresh configs honor GINI_MODEL alone via
+    // defaultConfig(), but the existing-config branch above only fires
+    // when GINI_PROVIDER is set. If only GINI_MODEL is set on an
+    // existing config, apply the model update in place — keep the
+    // current provider name and apiKeyEnv untouched so a stale
+    // OPENAI_API_KEY value (or absence) survives the rewrite.
+    config.provider = { ...config.provider, model: envModel };
     writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
   }
   install(config);

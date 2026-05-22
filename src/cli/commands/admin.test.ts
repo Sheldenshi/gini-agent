@@ -115,6 +115,35 @@ describe("install_ provider env override", () => {
     expect(cfg.provider.apiKeyEnv).toBeUndefined();
   });
 
+  test("codex → echo with GINI_PROVIDER=echo rewrites provider to echo/gini-echo-v0", async () => {
+    // Echo must be honored by the override branch on existing configs —
+    // not just fresh installs — otherwise a user pinning echo via env
+    // (smoke, offline CI) would silently keep their old provider after
+    // a re-run of `gini install`.
+    const instance = "switch-to-echo";
+    seedInstanceConfig(instance, { name: "codex", model: "gpt-5.5" });
+    process.env.GINI_PROVIDER = "echo";
+    await install_(makeCtx(instance));
+    const cfg = readPersistedConfig(instance);
+    expect(cfg.provider.name).toBe("echo");
+    expect(cfg.provider.model).toBe("gini-echo-v0");
+    expect(cfg.provider.apiKeyEnv).toBeUndefined();
+  });
+
+  test("GINI_MODEL alone on existing config updates the model in place", async () => {
+    // Symmetry with defaultConfig(): fresh configs honor GINI_MODEL
+    // even when GINI_PROVIDER is unset, so existing configs must too.
+    // The provider name and apiKeyEnv stay as they were.
+    const instance = "model-only-update";
+    seedInstanceConfig(instance, { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" });
+    process.env.GINI_MODEL = "gpt-5.6";
+    await install_(makeCtx(instance));
+    const cfg = readPersistedConfig(instance);
+    expect(cfg.provider.name).toBe("openai");
+    expect(cfg.provider.model).toBe("gpt-5.6");
+    expect(cfg.provider.apiKeyEnv).toBe("OPENAI_API_KEY");
+  });
+
   test("pre-existing config + no env vars leaves provider byte-identical on disk", async () => {
     // Byte equality catches regressions where the no-env branch silently
     // rewrites the file with semantically-identical content. mtime is the
