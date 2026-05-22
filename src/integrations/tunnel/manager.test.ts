@@ -95,8 +95,7 @@ describe("TunnelManager", () => {
       }
     });
     await manager.start();
-    // Give the fire-and-forget refresh a moment to settle.
-    await Bun.sleep(20);
+    await manager.flushNotes();
     const snapshot = manager.getSnapshot();
     expect(snapshot.appleNotes.available).toBe(true);
     expect(snapshot.appleNotes.lastSyncedAt).not.toBeNull();
@@ -111,7 +110,7 @@ describe("TunnelManager", () => {
       osascript: async () => ({ stdout: "no\n", stderr: "", exitCode: 0 })
     });
     await manager.start();
-    await Bun.sleep(20);
+    await manager.flushNotes();
     const snapshot = manager.getSnapshot();
     expect(snapshot.appleNotes.available).toBe(false);
     expect(snapshot.appleNotes.lastSyncedAt).toBeNull();
@@ -157,6 +156,59 @@ describe("TunnelManager", () => {
       lastError: null
     });
     expect(out).toBeNull();
+  });
+
+  test("concurrent start() calls dedup onto a single spawn", async () => {
+    setupInstanceDir("tunnel-manager-dedup");
+    let spawnCount = 0;
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-dedup",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      disableAppleNotes: true,
+      spawn: () => {
+        spawnCount += 1;
+        return scriptedChild(["INF https://dedup-tunnel-1.trycloudflare.com\n"]);
+      }
+    });
+    const [a, b] = await Promise.all([manager.start(), manager.start()]);
+    expect(spawnCount).toBe(1);
+    expect(a.cloudflareUrl).toBe("https://dedup-tunnel-1.trycloudflare.com");
+    expect(b.cloudflareUrl).toBe("https://dedup-tunnel-1.trycloudflare.com");
+    await manager.stop();
+  });
+
+  test("stop() during in-flight start tears the child down on its own", async () => {
+    setupInstanceDir("tunnel-manager-stop-during-start");
+    let killed = false;
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-stop-during-start",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      disableAppleNotes: true,
+      spawn: () => {
+        const child = scriptedChild(["INF https://laggard-tunnel-9.trycloudflare.com\n"], {
+          urlDelayMs: 20,
+          onKill: () => { killed = true; }
+        });
+        return child;
+      }
+    });
+    const startP = manager.start();
+    // Don't await start — issue stop while it's still spawning.
+    await manager.stop();
+    const snapshot = await startP;
+    expect(snapshot.publicUrl).toBeNull();
+    expect(snapshot.lastError).toContain("cancelled by concurrent stop");
+    expect(killed).toBe(true);
   });
 
   test("renderSnapshotQr returns ANSI + SVG when a URL is set", () => {
@@ -228,15 +280,22 @@ function makeManager(instance: string, options: ScriptedSpawnOptions): TunnelMan
   });
 }
 
-function scriptedChild(chunks: string[]) {
+function scriptedChild(
+  chunks: string[],
+  options: { urlDelayMs?: number; onKill?: () => void } = {}
+) {
   const encoder = new TextEncoder();
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
   const exitResolvers = Promise.withResolvers<number>();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
-      (async () => {
-        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      void (async () => {
+        if (options.urlDelayMs) await Bun.sleep(options.urlDelayMs);
+        for (const chunk of chunks) {
+          if (!controllerRef) return;
+          controller.enqueue(encoder.encode(chunk));
+        }
       })();
     },
     cancel() {
@@ -249,6 +308,8 @@ function scriptedChild(chunks: string[]) {
     pid: 99999,
     kill() {
       try { controllerRef?.close(); } catch { /* ignore */ }
+      controllerRef = null;
+      options.onKill?.();
       exitResolvers.resolve(0);
     }
   };

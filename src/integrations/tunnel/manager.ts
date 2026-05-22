@@ -85,6 +85,18 @@ export class TunnelManager {
   private snapshot: TunnelSnapshot;
   private stopping = false;
   private monitor: Promise<void> | null = null;
+  // In-flight start. Concurrent start() callers share this single promise so
+  // we never spawn two cloudflared subprocesses for one manager. Cleared
+  // when the spawn settles (success or failure).
+  private starting: Promise<TunnelSnapshot> | null = null;
+  // Records the most recent stop() promise so callers (and overlapping
+  // start() invocations) can await an in-flight teardown before kicking off
+  // a fresh tunnel. Cleared when the teardown settles.
+  private stopPromise: Promise<void> | null = null;
+  // Tracks any in-flight Apple Notes write so stop() can await it before
+  // declaring the manager torn down. Without this, a slow osascript write
+  // can land snapshot mutations after the user has stopped the manager.
+  private notesRefresh: Promise<TunnelSnapshot> | null = null;
 
   constructor(opts: TunnelManagerOptions) {
     this.instance = opts.instance;
@@ -118,15 +130,44 @@ export class TunnelManager {
   }
 
   /**
+   * Await any in-flight Apple Notes refresh. Returns immediately when no
+   * write is pending. Tests use this to wait deterministically for the
+   * fire-and-forget refresh kicked off by `start()`; production callers
+   * generally do not need it.
+   */
+  async flushNotes(): Promise<TunnelSnapshot> {
+    if (this.notesRefresh) {
+      try { await this.notesRefresh; } catch { /* errors already logged */ }
+    }
+    return this.getSnapshot();
+  }
+
+  /**
    * Spin up cloudflared. Resolves once the public URL has been observed.
-   * Safe to call multiple times — subsequent calls return the existing
-   * snapshot without re-spawning.
+   * Concurrent callers share a single in-flight spawn so the manager
+   * never owns two cloudflared subprocesses simultaneously. Subsequent
+   * calls after a successful start return the existing snapshot.
    */
   async start(): Promise<TunnelSnapshot> {
     if (this.handle) return this.getSnapshot();
+    if (this.starting) return this.starting;
     this.stopping = false;
+    const startPromise = this.startInner();
+    this.starting = startPromise;
     try {
-      this.handle = await spawnQuickTunnel({
+      return await startPromise;
+    } finally {
+      // Only clear the slot when *this* promise is still the registered
+      // in-flight start. A stop() that ran during spawn may have already
+      // replaced the slot with null, in which case we leave it alone.
+      if (this.starting === startPromise) this.starting = null;
+    }
+  }
+
+  private async startInner(): Promise<TunnelSnapshot> {
+    let handle: TunnelHandle;
+    try {
+      handle = await spawnQuickTunnel({
         targetUrl: this.targetUrl,
         binary: this.binary,
         logPath: this.logPath,
@@ -140,31 +181,48 @@ export class TunnelManager {
       appendLog(this.instance, "tunnel.spawn.error", { error: this.snapshot.lastError });
       throw error;
     }
+    // If stop() ran while spawn was in flight, the user no longer wants
+    // this tunnel. Tear the freshly-born child down ourselves instead of
+    // leaving it as an orphan, and surface the cancellation as the
+    // start() return value (publicUrl: null, lastError set).
+    if (this.stopping) {
+      try { await handle.stop(); } catch { /* best effort */ }
+      this.snapshot = {
+        ...this.snapshot,
+        publicUrl: null,
+        cloudflareUrl: null,
+        lastError: "cloudflared cancelled by concurrent stop()"
+      };
+      appendLog(this.instance, "tunnel.start.cancelled", { url: handle.url });
+      return this.getSnapshot();
+    }
+    this.handle = handle;
     const observedAt = new Date().toISOString();
-    const publicUrl = `${this.handle.url}${tunnelPathPrefix(this.config.secret)}`;
+    const publicUrl = `${handle.url}${tunnelPathPrefix(this.config.secret)}`;
     this.snapshot = {
       ...this.snapshot,
       publicUrl,
-      cloudflareUrl: this.handle.url,
+      cloudflareUrl: handle.url,
       observedAt,
       lastError: null
     };
     appendLog(this.instance, "tunnel.started", {
-      url: this.handle.url,
+      url: handle.url,
       target: this.targetUrl,
-      pid: this.handle.pid
+      pid: handle.pid
     });
 
     if (this.config.appleNotes.enabled && !this.disableAppleNotes) {
-      void this.refreshAppleNote().catch((error) => {
+      this.notesRefresh = this.refreshAppleNote().catch((error) => {
         appendLog(this.instance, "tunnel.notes.error", {
           error: error instanceof Error ? error.message : String(error)
         });
+        return this.getSnapshot();
       });
     }
 
     // Watch the subprocess so an unexpected exit surfaces in the snapshot.
-    this.monitor = this.handle.exited.then((code) => {
+    this.monitor = handle.exited.then((code) => {
       if (this.stopping) return;
       this.snapshot = {
         ...this.snapshot,
@@ -179,23 +237,52 @@ export class TunnelManager {
   }
 
   /**
-   * Tear down the cloudflared subprocess. Idempotent.
+   * Tear down the cloudflared subprocess. Idempotent and safe to call
+   * during an in-flight start: when the spawn settles, startInner sees
+   * `stopping === true` and tears the new child down itself.
    */
   async stop(): Promise<void> {
-    if (!this.handle) return;
+    if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
+    const stopPromise = this.stopInner();
+    this.stopPromise = stopPromise;
+    try {
+      await stopPromise;
+    } finally {
+      if (this.stopPromise === stopPromise) this.stopPromise = null;
+    }
+  }
+
+  private async stopInner(): Promise<void> {
+    // If a start() is in flight, wait for it to settle before we begin
+    // teardown. The startInner path sees `stopping === true` and stops
+    // the freshly-spawned child itself, so by the time the awaited start
+    // returns there is no live subprocess left to clean up here.
+    if (this.starting) {
+      try { await this.starting; } catch { /* swallowed by start's own logging */ }
+    }
     const handle = this.handle;
     this.handle = null;
-    try {
-      await handle.stop();
-    } catch (error) {
-      appendLog(this.instance, "tunnel.stop.error", {
-        error: error instanceof Error ? error.message : String(error)
-      });
+    if (handle) {
+      try {
+        await handle.stop();
+      } catch (error) {
+        appendLog(this.instance, "tunnel.stop.error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
     }
     if (this.monitor) {
       try { await this.monitor; } catch { /* monitor never rejects */ }
       this.monitor = null;
+    }
+    if (this.notesRefresh) {
+      // Wait for the in-flight Apple Notes write so its `lastSyncedAt`
+      // and `lastError` mutations don't land after we report the
+      // snapshot as stopped. Failures already logged inside the refresh
+      // path; swallow any rejection here.
+      try { await this.notesRefresh; } catch { /* ignore */ }
+      this.notesRefresh = null;
     }
     this.snapshot = {
       ...this.snapshot,
