@@ -2,7 +2,16 @@ import { writeFileSync } from "node:fs";
 import type { ApprovalMode, RuntimeConfig } from "./types";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
-import { addAudit, appendTrace, mutateState, readState, readTrace } from "./state";
+import {
+  addAudit,
+  appendTrace,
+  listChatBlocks,
+  listChatBlocksAfter,
+  mutateState,
+  readState,
+  readTrace,
+  subscribeChatBlocks
+} from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
@@ -137,6 +146,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
+    // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
+    // /blocks endpoint returns the full ordered list for initial render;
+    // /stream is the SSE companion clients subscribe to for live
+    // updates. Both validate the session exists so a stale link returns
+    // 404 rather than streaming an empty channel forever.
+    ["GET", /^\/api\/chat\/([^/]+)\/blocks$/, (_request, params) => {
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      return json(listChatBlocks(config.instance, sessionId));
+    }],
+    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, (request, params) => chatBlockStream(config, request, params[0])],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
     ["GET", /^\/api\/tasks$/, (request) => {
@@ -1093,6 +1116,111 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
     cancel() {
       closed = true;
       if (interval) clearInterval(interval);
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive"
+    }
+  });
+}
+
+// ChatBlock SSE stream. Per ADR chat-block-protocol.md, each frame is
+// `id: <blockId>\nevent: chat_block\ndata: <json>\n\n` so a browser
+// EventSource auto-attaches Last-Event-ID on reconnect and the runtime
+// resumes from the cursor instead of re-replaying the full list.
+//
+// Differs from `eventStream` above: that route polls the global ring
+// buffer at 1s. Here we use the in-process EventEmitter wired into
+// insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
+// inserts and upserts both fire AFTER the SQLite commit so subscribers
+// observe durable rows.
+function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string): Response {
+  let closed = false;
+  let keepalive: Timer | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const encoder = new TextEncoder();
+  const seen = new Set<string>();
+  const lastEventId =
+    request.headers.get("last-event-id") ??
+    new URL(request.url).searchParams.get("lastEventId") ??
+    null;
+
+  // Validate the session exists. We do this inside the stream factory
+  // (rather than at the route handler) so the 404 carries the SSE
+  // content-type semantics for clients that route both error and
+  // success branches through the same EventSource handler.
+  const state = readState(config.instance);
+  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+    return new Response(JSON.stringify({ error: `Chat session not found: ${sessionId}` }), {
+      status: 404,
+      headers: { "content-type": "application/json" }
+    });
+  }
+
+  const stream = new ReadableStream({
+    start(controller) {
+      // Two enqueue paths:
+      //   - `enqueueBackfill` dedupes by block id so an initial replay
+      //     doesn't double-send a row that we already sent (relevant
+      //     on reconnect when Last-Event-ID is honored). The seen set
+      //     is consulted ONLY here.
+      //   - `enqueueLive` never dedupes. Upsert-capable kinds
+      //     (`assistant_text` streaming deltas, `tool_call` status
+      //     flips) fire the same block id repeatedly with updated
+      //     payloads; clients merge by id, so the wire MUST carry
+      //     every frame. Skipping by id here was the previous bug —
+      //     terminal `streaming: false` flips never reached the
+      //     client.
+      const enqueueFrame = (block: { id: string }): void => {
+        controller.enqueue(
+          encoder.encode(
+            `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
+          )
+        );
+      };
+      const enqueueBackfill = (block: { id: string }): void => {
+        if (closed) return;
+        if (seen.has(block.id)) return;
+        seen.add(block.id);
+        enqueueFrame(block);
+      };
+      const enqueueLive = (block: { id: string }): void => {
+        if (closed) return;
+        // Mark live-delivered blocks so a hypothetical mid-stream
+        // backfill (we don't issue one today, but the wiring is
+        // defensive) doesn't re-send the same row in addition.
+        seen.add(block.id);
+        enqueueFrame(block);
+      };
+
+      // Initial backfill: send any blocks the client is missing.
+      // listChatBlocksAfter honors Last-Event-ID (or falls back to the
+      // full list when the cursor is unknown / absent).
+      const backfill = listChatBlocksAfter(config.instance, sessionId, lastEventId);
+      for (const block of backfill) enqueueBackfill(block);
+
+      // Subscribe to future inserts/upserts. Listeners fire AFTER the
+      // SQLite commit so observers see durable rows. Live events
+      // skip the dedup gate by design — see comment above.
+      unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
+        enqueueLive(block);
+      });
+
+      // Idle keepalive (mirrors eventStream above). Proxies often cap
+      // idle streams around 30-60s; a comment line resets the idle-byte
+      // clock at every hop without surfacing as an event.
+      keepalive = setInterval(() => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(`: keepalive\n\n`));
+      }, 5_000);
+    },
+    cancel() {
+      closed = true;
+      if (keepalive) clearInterval(keepalive);
+      if (unsubscribe) unsubscribe();
     }
   });
   return new Response(stream, {

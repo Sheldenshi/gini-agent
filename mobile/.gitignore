@@ -1,0 +1,20 @@
+# Expo / Metro
+.expo/
+.expo-shared/
+dist/
+web-build/
+expo-env.d.ts
+
+# Node
+node_modules/
+
+# OS / IDE
+.DS_Store
+*.log
+*.tsbuildinfo
+
+# Native
+ios/Pods/
+android/.gradle/
+android/app/build/
+android/build/

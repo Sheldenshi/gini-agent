@@ -237,6 +237,19 @@ function parseArgs(raw: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+// Forgiving variant of parseArgs for ChatBlock emission. The strict
+// parseArgs above throws on malformed JSON to keep dispatch correct;
+// emission must never abort the loop, so this helper returns an empty
+// object on failure and lets the chat-task loop continue. Used by
+// emitToolCallRunning in chat-task.ts.
+export function parseToolArgsLenient(raw: string): Record<string, unknown> {
+  try {
+    return parseArgs(raw);
+  } catch {
+    return {};
+  }
+}
+
 function requireString(args: Record<string, unknown>, key: string): string {
   const value = args[key];
   if (typeof value !== "string" || value.length === 0) {

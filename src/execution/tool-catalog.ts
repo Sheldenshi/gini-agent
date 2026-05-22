@@ -15,9 +15,16 @@ import type { RuntimeState } from "../types";
 // each entry small and self-documenting so models with weaker tool-calling
 // (local Llamas, some compat providers) still understand what each tool
 // does without extra system-prompt context.
-const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
+//
+// `displayLabel` is the human-readable short label clients render in
+// tool_call ChatBlocks. Server-side ownership keeps the labels consistent
+// across web / mobile / CLI bridges (see ADR chat-block-protocol.md).
+// When omitted on a TOOL_DEFS entry, `chatBlockLabelFor` falls back to a
+// humanized version of the tool name.
+const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string }> = [
   {
     toolset: "file",
+    displayLabel: "Read file",
     type: "function",
     function: {
       name: "file_read",
@@ -33,6 +40,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "List directory",
     type: "function",
     function: {
       name: "file_list",
@@ -47,6 +55,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "Search files",
     type: "function",
     function: {
       name: "file_search",
@@ -63,6 +72,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "Write file",
     type: "function",
     function: {
       name: "file_write",
@@ -79,6 +89,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "Patch file",
     type: "function",
     function: {
       name: "file_patch",
@@ -96,6 +107,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "messaging",
+    displayLabel: "Fetch URL",
     type: "function",
     function: {
       name: "web_fetch",
@@ -111,6 +123,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "terminal",
+    displayLabel: "Run shell command",
     type: "function",
     function: {
       name: "terminal_exec",
@@ -128,6 +141,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "terminal",
+    displayLabel: "Run code",
     type: "function",
     function: {
       name: "code_exec",
@@ -148,6 +162,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // the user to enable a toolset. Sync, low-risk, no approval needed: the
     // body is just text content that already lives in state.
     toolset: "skills",
+    displayLabel: "Read skill",
     type: "function",
     function: {
       name: "read_skill",
@@ -169,6 +184,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // result. Medium-risk: no approval, but every call is audited and
     // traced; depth-capped at 3 levels.
     toolset: "subagents",
+    displayLabel: "Spawn subagent",
     type: "function",
     function: {
       name: "spawn_subagent",
@@ -189,6 +205,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Open page",
     type: "function",
     function: {
       name: "browser_navigate",
@@ -204,6 +221,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Snapshot page",
     type: "function",
     function: {
       name: "browser_snapshot",
@@ -218,6 +236,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Click element",
     type: "function",
     function: {
       name: "browser_click",
@@ -233,6 +252,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Type text",
     type: "function",
     function: {
       name: "browser_type",
@@ -249,6 +269,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Press key",
     type: "function",
     function: {
       name: "browser_press",
@@ -264,6 +285,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Scroll page",
     type: "function",
     function: {
       name: "browser_scroll",
@@ -279,6 +301,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Go back",
     type: "function",
     function: {
       name: "browser_back",
@@ -288,6 +311,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Read console",
     type: "function",
     function: {
       name: "browser_console",
@@ -303,6 +327,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Close browser",
     type: "function",
     function: {
       name: "browser_close",
@@ -312,6 +337,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Hover element",
     type: "function",
     function: {
       name: "browser_hover",
@@ -327,6 +353,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Drag element",
     type: "function",
     function: {
       name: "browser_drag",
@@ -343,6 +370,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Select option",
     type: "function",
     function: {
       name: "browser_select_option",
@@ -360,6 +388,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Wait for element",
     type: "function",
     function: {
       name: "browser_wait_for",
@@ -381,6 +410,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Manage tabs",
     type: "function",
     function: {
       name: "browser_tabs",
@@ -402,6 +432,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Upload file",
     type: "function",
     function: {
       name: "browser_upload_file",
@@ -418,6 +449,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "See page",
     type: "function",
     function: {
       name: "browser_connect",
@@ -458,6 +490,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // the model needs this path even on a fresh instance with no toolsets
     // toggled.
     toolset: "connectors",
+    displayLabel: "Request connector",
     type: "function",
     function: {
       name: "request_connector",
@@ -482,6 +515,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // based on the tool's `annotations.destructiveHint`; for v0 every call
     // auto-executes.
     toolset: "mcp",
+    displayLabel: "Call MCP tool",
     type: "function",
     function: {
       name: "mcp_call",
@@ -506,6 +540,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // modal). Always exposed (like read_skill / spawn_subagent) so a
     // fresh instance can schedule reminders without toolset toggling.
     toolset: "jobs",
+    displayLabel: "Schedule job",
     type: "function",
     function: {
       name: "create_job",
@@ -559,6 +594,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // existing scheduled job, so update_job / delete_job target the right
     // id instead of accidentally creating a duplicate via create_job.
     toolset: "jobs",
+    displayLabel: "List jobs",
     type: "function",
     function: {
       name: "list_jobs",
@@ -579,6 +615,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // Low-risk / no approval for the same reason as create_job: the user
     // can always pause/delete from /jobs.
     toolset: "jobs",
+    displayLabel: "Update job",
     type: "function",
     function: {
       name: "update_job",
@@ -608,6 +645,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // (the agent should be able to do delete+create or update smoothly).
     // The user can always restore via re-creation; audit trail is preserved.
     toolset: "jobs",
+    displayLabel: "Delete job",
     type: "function",
     function: {
       name: "delete_job",
@@ -628,6 +666,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // API path — use it when you already have the SKILL.md text in hand
     // and just need to land it on the runtime.
     toolset: "skills",
+    displayLabel: "Install skill",
     type: "function",
     function: {
       name: "install_skill",
@@ -660,6 +699,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // `setSkillStatus(config, idOrName, "enabled")` and writes a
     // skill.enabled audit row.
     toolset: "skills",
+    displayLabel: "Enable skill",
     type: "function",
     function: {
       name: "enable_skill",
@@ -678,6 +718,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // read_skill refuses to fetch its body. Low-risk; underlying handler
     // writes a skill.disabled audit row.
     toolset: "skills",
+    displayLabel: "Disable skill",
     type: "function",
     function: {
       name: "disable_skill",
@@ -699,6 +740,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // cannot cancel itself — that would terminate the running
     // conversation).
     toolset: "subagents",
+    displayLabel: "Cancel task",
     type: "function",
     function: {
       name: "cancel_task",
@@ -718,6 +760,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // policy seam auto-approves; "strict" gates every call. The user
     // can pre-approve specific bridges or flip approvalMode at runtime.
     toolset: "messaging",
+    displayLabel: "Send message",
     type: "function",
     function: {
       name: "send_message",
@@ -739,6 +782,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // were dropped in the state.memories consolidation — for memory
     // recall use `recall_memory` against the Hindsight bank instead.)
     toolset: "session_search",
+    displayLabel: "Search history",
     type: "function",
     function: {
       name: "search_history",
@@ -761,6 +805,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // compact summary so the model can decide whether to dig deeper or
     // ask the user for clarification. Low-risk / no approval.
     toolset: "memory",
+    displayLabel: "Recall memory",
     type: "function",
     function: {
       name: "recall_memory",
@@ -785,6 +830,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // tool only fires an EXISTING job — for one-off prompts use create_job
     // with intervalSeconds + oneShot=true instead.
     toolset: "jobs",
+    displayLabel: "Run job",
     type: "function",
     function: {
       name: "run_job",
@@ -808,6 +854,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // hide the per-agent persona surface on fresh instances.
     // See ADR runtime-identity-files.md.
     toolset: "identity",
+    displayLabel: "Edit persona",
     type: "function",
     function: {
       name: "edit_soul",
@@ -836,6 +883,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // propose → approve). Always exposed. See ADR
     // runtime-identity-files.md.
     toolset: "identity",
+    displayLabel: "Edit user profile",
     type: "function",
     function: {
       name: "edit_user_profile",
@@ -858,7 +906,10 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   }
 ];
 
-export type ToolCatalogTool = ToolFunctionSpec & { toolset: string };
+export type ToolCatalogTool = ToolFunctionSpec & {
+  toolset: string;
+  displayLabel?: string;
+};
 
 // Public read-only copy. Returned ordering is stable so the toolsHash is
 // deterministic across boots (used for resume after approval).
@@ -965,8 +1016,151 @@ export function hashCatalog(tools: ToolCatalogTool[]): string {
   return createHash("sha1").update(summary).digest("hex").slice(0, 16);
 }
 
-// Return the OpenAI tool spec without the `toolset` annotation we use for
-// filtering. The provider only knows the `type/function` shape.
+// Return the OpenAI tool spec without the `toolset` / `displayLabel`
+// annotations we use for filtering and chat rendering. The provider
+// only knows the `type/function` shape.
 export function toProviderTools(tools: ToolCatalogTool[]): ToolFunctionSpec[] {
-  return tools.map(({ toolset: _toolset, ...rest }) => rest);
+  return tools.map(({ toolset: _toolset, displayLabel: _displayLabel, ...rest }) => rest);
+}
+
+// Display-label lookup for ChatBlock rendering. Returns the catalog
+// entry's explicit `displayLabel` when set; otherwise humanizes the
+// tool's machine name (`file_read` → `File read`) as a stable fallback.
+// Centralized server-side so web, mobile, and CLI bridges render the
+// same vocabulary in tool_call ChatBlocks (ADR chat-block-protocol.md).
+export function chatBlockLabelFor(toolName: string): string {
+  const entry = TOOL_DEFS.find((t) => t.function.name === toolName);
+  if (entry?.displayLabel) return entry.displayLabel;
+  // Fallback: split underscores, capitalize the first word, lowercase
+  // the rest. `file_read` → `File read`, `mcp_call` → `Mcp call`. We
+  // intentionally don't title-case every word — `Search History` looks
+  // like a marketing label rather than a compact verb phrase.
+  const tokens = toolName.split(/[._]/).filter(Boolean);
+  if (tokens.length === 0) return toolName;
+  const first = tokens[0]!;
+  const head = first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+  const tail = tokens.slice(1).map((t) => t.toLowerCase()).join(" ");
+  return tail ? `${head} ${tail}` : head;
+}
+
+// Truncate a short headline string to 80 chars with an ellipsis. Picked
+// to fit one bubble line on a phone (mobile is the narrowest target);
+// web can expand the bubble for the full args object via `argsFull`.
+function truncatePreview(value: string, maxLen = 80): string {
+  if (value.length <= maxLen) return value;
+  return value.slice(0, maxLen - 1) + "…";
+}
+
+// Stringify the value half of an args entry compactly: strings pass
+// through, numbers/booleans are coerced, objects/arrays are JSON-encoded
+// with a hard length cap so a giant blob doesn't blow out the preview.
+function previewValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+// Per-tool argsPreview override — returns the most useful 1-line
+// representation of the call's headline argument. Falls back to a
+// generic "key=value, ..." dump of all top-level args when no specific
+// mapping fires. Always truncated to 80 chars (see truncatePreview).
+//
+// Add new entries here as new tools land; the helper deliberately
+// covers all the current first-class tools so clients render a useful
+// inline preview without each one rebuilding the per-tool mapping.
+export function chatBlockArgsPreviewFor(
+  toolName: string,
+  args: Record<string, unknown> | null | undefined
+): string {
+  const safe = args ?? {};
+  // Headline-arg mapping per tool. Order matters within an entry only
+  // when multiple alt sources are queried (e.g. `browser_*` may have
+  // `url` OR `ref`).
+  switch (toolName) {
+    case "file_read":
+    case "file_list":
+    case "file_search":
+    case "file_write":
+    case "file_patch":
+      return truncatePreview(previewValue(safe.path) || previewValue(safe.pattern));
+    case "web_fetch":
+      return truncatePreview(previewValue(safe.url));
+    case "terminal_exec":
+      return truncatePreview(previewValue(safe.command));
+    case "code_exec":
+      return truncatePreview(`${previewValue(safe.language) || "code"}: ${previewValue(safe.code)}`);
+    case "read_skill":
+    case "enable_skill":
+    case "disable_skill":
+      return truncatePreview(previewValue(safe.name) || previewValue(safe.skillId));
+    case "install_skill":
+      return truncatePreview(previewValue(safe.category) || "skill");
+    case "spawn_subagent":
+      return truncatePreview(previewValue(safe.name) || previewValue(safe.prompt));
+    case "browser_navigate":
+      return truncatePreview(previewValue(safe.url));
+    case "browser_click":
+    case "browser_type":
+    case "browser_hover":
+    case "browser_select_option":
+    case "browser_upload_file":
+      return truncatePreview(previewValue(safe.ref));
+    case "browser_press":
+      return truncatePreview(previewValue(safe.key));
+    case "browser_scroll":
+      return truncatePreview(previewValue(safe.direction));
+    case "browser_wait_for":
+      return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
+    case "browser_tabs":
+      return truncatePreview(previewValue(safe.action));
+    case "browser_vision":
+      return truncatePreview(previewValue(safe.question));
+    case "browser_drag":
+      return truncatePreview(
+        `${previewValue(safe.fromRef)} → ${previewValue(safe.toRef)}`
+      );
+    case "browser_snapshot":
+    case "browser_back":
+    case "browser_close":
+    case "browser_console":
+      return "";
+    case "mcp_call":
+      return truncatePreview(
+        `${previewValue(safe.server)}.${previewValue(safe.tool)}`
+      );
+    case "request_connector":
+      return truncatePreview(previewValue(safe.provider));
+    case "create_job":
+    case "run_job":
+    case "delete_job":
+    case "update_job":
+      return truncatePreview(previewValue(safe.name) || previewValue(safe.jobId));
+    case "list_jobs":
+      return truncatePreview(previewValue(safe.nameContains) || "");
+    case "cancel_task":
+      return truncatePreview(previewValue(safe.taskId));
+    case "send_message":
+      return truncatePreview(previewValue(safe.text));
+    case "search_history":
+      return truncatePreview(previewValue(safe.query));
+    case "recall_memory":
+      return truncatePreview(previewValue(safe.query));
+    case "add_memory":
+      return truncatePreview(previewValue(safe.content));
+    case "update_memory":
+      return truncatePreview(previewValue(safe.memoryId));
+    default: {
+      // Generic fallback: key=value, ... for the first few entries.
+      // Keeps unmapped or future tools from emitting an empty preview.
+      const parts = Object.entries(safe)
+        .slice(0, 3)
+        .map(([key, value]) => `${key}=${previewValue(value)}`);
+      return truncatePreview(parts.join(", "));
+    }
+  }
 }

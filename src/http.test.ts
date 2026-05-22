@@ -1665,6 +1665,143 @@ describe("runtime api", () => {
     }
   });
 
+  // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
+  // routes are smoke-tested here; deeper assertions on per-block
+  // shape live in src/state/chat-blocks.test.ts and
+  // src/execution/chat-task.test.ts.
+  test("GET /api/chat/:id/blocks returns ordered ChatBlock list and 404 for missing sessions", async () => {
+    const config = testConfig("chat-blocks-list");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "blocks endpoint smoke" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "please reply" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+
+    const blocks = await call(handler, config, `/api/chat/${session.id}/blocks`);
+    expect(Array.isArray(blocks)).toBe(true);
+    expect(blocks.length).toBeGreaterThan(0);
+    expect(blocks[0].kind).toBe("user_text");
+    expect(blocks[0].text).toBe("please reply");
+    // Ordinals monotonically increase.
+    const ordinals = blocks.map((b: { ordinal: number }) => b.ordinal);
+    for (let i = 1; i < ordinals.length; i += 1) {
+      expect(ordinals[i]).toBeGreaterThan(ordinals[i - 1]!);
+    }
+
+    const missing = await rawCall(
+      handler,
+      config,
+      `/api/chat/chat_does_not_exist/blocks`,
+      {},
+      config.token
+    );
+    expect(missing.status).toBe(404);
+  });
+
+  test("DELETE /api/chat/:id cascades chat blocks (subsequent /blocks returns 404)", async () => {
+    const config = testConfig("chat-blocks-cascade");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "cascade smoke" })
+    });
+    await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "blocks should disappear after delete" })
+    });
+    // Wait for at least the user_text block to land. We don't need the
+    // assistant turn to finish for this assertion.
+    let blocks: unknown[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      const result = await call(handler, config, `/api/chat/${session.id}/blocks`);
+      if (Array.isArray(result) && result.length > 0) {
+        blocks = result;
+        break;
+      }
+      await Bun.sleep(20);
+    }
+    expect(blocks.length).toBeGreaterThan(0);
+
+    await call(handler, config, `/api/chat/${session.id}`, { method: "DELETE" });
+
+    const afterDelete = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/blocks`,
+      {},
+      config.token
+    );
+    expect(afterDelete.status).toBe(404);
+  });
+
+  test("GET /api/chat/:id/stream returns SSE with chat_block frames", async () => {
+    const config = testConfig("chat-blocks-stream");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stream smoke" })
+    });
+    // Pre-publish some blocks so the initial backfill carries data.
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "stream this" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/event-stream");
+    // Read just the first frame to confirm the SSE shape; if we
+    // consumed the whole body we'd block on the keepalive interval.
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      // Pump up to ~500ms collecting frames so the backfill arrives.
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("user_text")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_block");
+    expect(buffer).toContain("user_text");
+    expect(buffer).toContain("stream this");
+  });
+
+  test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
+    const config = testConfig("chat-blocks-stream-404");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/chat_unknown/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.

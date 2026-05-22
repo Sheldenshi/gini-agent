@@ -22,6 +22,7 @@ import {
   assertInsideWorkspace,
   assertInsideWorkspaceNoSymlinkEscape,
   createTask,
+  findInFlightAssistantTextForTask,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -47,6 +48,13 @@ import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
+import {
+  emitPhase,
+  emitSystemNote,
+  emitToolCallStatus,
+  finalizeAssistantText,
+  resolveEmitContext
+} from "./execution/chat-task-emit";
 import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
@@ -254,6 +262,28 @@ export async function cancelTask(
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
+  // Chat-block emission for cancellation (ADR chat-block-protocol.md
+  // risks §4). Flip any in-flight streaming assistant_text to
+  // `streaming: false` while keeping the partial text the user already
+  // saw, THEN emit a system_note("Cancelled") and the terminal
+  // "Cancelled" phase. Best-effort: a chat-blocks read/write failure
+  // here must not block the rest of the cancellation lifecycle.
+  try {
+    const emitCtx = resolveEmitContext(config, taskId);
+    if (emitCtx) {
+      const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
+      if (inFlight) {
+        finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+      }
+      emitSystemNote(emitCtx, "Cancelled");
+      emitPhase(emitCtx, "Cancelled");
+    }
+  } catch (error) {
+    appendLog(config.instance, "chat.cancel_block.emit_failed", {
+      taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
   // Cascade cancellation to descendant subagent tasks. If the cancelled
   // task spawned subagents (whose taskIds are children), cancel each one
   // recursively. Walk the runtime state for any task whose parentTaskId is
@@ -732,6 +762,30 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
+  // Chat-block emission for failure. Mirrors cancelTask's invariant:
+  // partial assistant_text stays visible (we flip to streaming: false
+  // rather than dropping), then a system_note carries the error
+  // message and a "Failed" phase marks the terminal state. Best-effort
+  // — failures during chat-block emission would otherwise mask the
+  // task-failure caller's view.
+  if (task.status === "failed") {
+    try {
+      const emitCtx = resolveEmitContext(config, taskId);
+      if (emitCtx) {
+        const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
+        if (inFlight) {
+          finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+        }
+        emitSystemNote(emitCtx, message);
+        emitPhase(emitCtx, "Failed");
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.fail_block.emit_failed", {
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
   // Cascade cancellation to descendant subagent tasks when a parent
   // task is failed (e.g. via approval denial or a runtime exception).
   // Without this, a failed parent leaves running children executing
@@ -903,6 +957,35 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
   if (approval.item.taskId) {
     appendTrace(config.instance, approval.item.taskId, { type: "approval", message: `Approval ${approval.item.status}`, data: { approvalId } });
     appendTrace(config.instance, approval.item.taskId, { type: "error", message: `Approval denied: ${approval.item.target}`, data: {} });
+    // Chat-block emission for the denial path. Flip the matching
+    // tool_call row to `denied` (callId lives on approval.payload as
+    // `toolCallId`), emit the system_note, and mark the terminal
+    // phase. The denial bypasses failTask's emission path so we do
+    // the equivalent inline. Best-effort: a SQLite failure here
+    // doesn't block the rest of the lifecycle.
+    try {
+      const taskIdForEmit = approval.item.taskId;
+      const emitCtx = resolveEmitContext(config, taskIdForEmit);
+      if (emitCtx) {
+        const toolCallId = approvalToolCallId(approval.item.payload);
+        if (toolCallId) {
+          emitToolCallStatus(emitCtx, { callId: toolCallId, status: "denied" });
+        }
+        if (approval.task) {
+          const inFlight = findInFlightAssistantTextForTask(config.instance, taskIdForEmit);
+          if (inFlight) {
+            finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+          }
+          emitSystemNote(emitCtx, `Approval denied: ${approval.item.target}`);
+          emitPhase(emitCtx, "Failed");
+        }
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.deny_block.emit_failed", {
+        approvalId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     if (approval.task) {
       await updateRunFromTask(config, approval.task);
       if (approval.task.jobId) await finalizeJobRunFromTask(config, approval.task);

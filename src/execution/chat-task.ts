@@ -56,7 +56,20 @@ import type {
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
-import { dispatchToolCall } from "./tool-dispatch";
+import {
+  emitApprovalRequested,
+  emitAssistantTextStart,
+  emitPhase,
+  emitSystemNote,
+  emitToolCallRunning,
+  emitToolCallStatus,
+  emitToolResult,
+  finalizeAssistantText,
+  resolveEmitContext,
+  updateAssistantTextDelta,
+  type ChatEmitContext
+} from "./chat-task-emit";
+import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
@@ -727,6 +740,19 @@ async function runLoop(
   // graceful exhaustion, and the failure fallback.
   let accumulatedCost: CostRecord | undefined = taskRow?.cost ? { ...taskRow.cost } : undefined;
 
+  // Resolve the ChatBlock emission context once per runLoop entry. Tasks
+  // with no chat session (subagent children, imperative CLI runs) get
+  // `undefined`, in which case the emit* helpers are no-ops. Per ADR
+  // chat-block-protocol.md, subagent inner work stays opaque to the
+  // user — only the parent's `spawn_subagent` tool_call surfaces.
+  const emitCtx: ChatEmitContext | undefined = resolveEmitContext(config, taskId);
+  // Tracks the in-flight assistant_text block id for delta upserts so a
+  // streaming model response only emits a single block per loop
+  // iteration. Reset between iterations so the next provider call gets
+  // a fresh block.
+  let inFlightAssistantBlockId: string | undefined;
+  let inFlightAssistantText = "";
+
   while (iterations < cap) {
     iterations += 1;
 
@@ -754,8 +780,21 @@ async function runLoop(
 
     // Stream partial text into task.partialSummary just like the legacy
     // path. Debounced to avoid thrashing mutateState on every SSE delta.
+    //
+    // We also accrete the streamed text into an assistant_text ChatBlock
+    // for the new protocol. The first delta inserts the block; every
+    // subsequent delta upserts with the full running text so reconnecting
+    // clients always observe a monotonically growing string and never
+    // splice partial deltas themselves (ADR chat-block-protocol.md).
+    // Both writes are debounced together so a thousand-token response
+    // doesn't trigger a thousand SQLite UPDATEs.
     let pending = "";
     let lastFlush = 0;
+    // Reset per-iteration: a new model call gets a fresh assistant_text
+    // block. The terminal flip to `streaming: false` happens at the
+    // completion / iteration-cap / cancellation paths below.
+    inFlightAssistantBlockId = undefined;
+    inFlightAssistantText = "";
     const flush = async (): Promise<void> => {
       if (!pending) return;
       const delta = pending;
@@ -764,6 +803,20 @@ async function runLoop(
       await mutateState(config.instance, (state) => {
         appendTaskPartial(state, taskId, delta);
       });
+      // Mirror the same flush boundary to the assistant_text block so
+      // SSE subscribers see the same cadence the partialSummary path
+      // exposes today. The block carries the FULL accreted text (not
+      // the delta), so a reconnect always observes a monotonically
+      // growing string and never needs to splice deltas itself.
+      if (emitCtx) {
+        inFlightAssistantText += delta;
+        if (!inFlightAssistantBlockId) {
+          const block = emitAssistantTextStart(emitCtx, inFlightAssistantText);
+          inFlightAssistantBlockId = block?.id;
+        } else {
+          updateAssistantTextDelta(emitCtx, inFlightAssistantBlockId, inFlightAssistantText);
+        }
+      }
     };
     const onDelta = (text: string): void => {
       pending += text;
@@ -795,6 +848,11 @@ async function runLoop(
       const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
       return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
     }
+    // Phase block paired with the currentStep flip above so the chat UI
+    // renders the same "Thinking" marker the web/mobile clients already
+    // synthesize from currentStep today. Subsequent per-tool phases
+    // ("Working: <toolName>") emit per dispatch inside the loop below.
+    emitPhase(emitCtx, "Thinking");
 
     const result = await generateToolCallingResponse(
       config,
@@ -866,6 +924,23 @@ async function runLoop(
         item.updatedAt = now();
         return item;
       });
+      // Finalize the streaming assistant_text block (if any) with the
+      // model's full text, then emit a terminal "Completed" phase. We
+      // skip the finalize when the task was cancelled mid-stream —
+      // cancelTask owns the streaming-text flip in that case so the
+      // partial-text invariant from ADR risks §4 holds.
+      if (finished.status === "completed") {
+        if (inFlightAssistantBlockId) {
+          finalizeAssistantText(emitCtx, inFlightAssistantBlockId, finalText || "(no content)");
+        } else if (finalText) {
+          // No streaming deltas observed (provider returned the whole
+          // string at once). Emit the final block in one shot so the
+          // client still gets an assistant_text row.
+          const block = emitAssistantTextStart(emitCtx, finalText);
+          if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
+        }
+        emitPhase(emitCtx, "Completed");
+      }
       appendTrace(config.instance, taskId, {
         type: "task",
         message: "Chat task completed",
@@ -922,6 +997,22 @@ async function runLoop(
     const pendingApprovals: PendingToolCall[] = [];
     const toolResultMessages: ToolCallingMessage[] = [];
 
+    // Before we start dispatching tool calls, finalize the streaming
+    // assistant_text block (if any) so clients see the model's
+    // pre-tool-call narration as a settled block rather than a
+    // perpetually-streaming row. The next iteration will allocate a
+    // fresh block for whatever text the model emits after the tool
+    // results come back.
+    if (inFlightAssistantBlockId) {
+      finalizeAssistantText(
+        emitCtx,
+        inFlightAssistantBlockId,
+        inFlightAssistantText || (result.text ?? "")
+      );
+      inFlightAssistantBlockId = undefined;
+      inFlightAssistantText = "";
+    }
+
     for (const call of result.toolCalls) {
       // Re-check terminal status under the same `mutateState` lock
       // that flips currentStep. The post-model bail-out above is
@@ -959,6 +1050,17 @@ async function runLoop(
         const stale = readState(config.instance).tasks.find((t) => t.id === taskId);
         return stale ?? ({ id: taskId, status: "cancelled" } as unknown as Task);
       }
+      // Per-tool phase + tool_call(running) emission. Args are parsed
+      // leniently — emission must never abort dispatch on malformed
+      // JSON, so a bad-arg call still gets a row with `argsFull: {}`
+      // and the standard tool_call_id linkage to the eventual error.
+      emitPhase(emitCtx, `Working: ${call.function.name}`);
+      const parsedArgs = parseToolArgsLenient(call.function.arguments);
+      emitToolCallRunning(emitCtx, {
+        toolName: call.function.name,
+        callId: call.id,
+        args: parsedArgs
+      });
       try {
         const dispatch = await dispatchToolCall(
           config,
@@ -974,6 +1076,13 @@ async function runLoop(
             tool_call_id: call.id,
             content: dispatch.result
           });
+          // Flip the tool_call row to `ok` and append a tool_result
+          // block carrying a truncated preview of the dispatch result.
+          emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
+          emitToolResult(emitCtx, { callId: call.id, result: dispatch.result });
+          // Mirror onto the legacy Task.recentToolCalls display payload so
+          // clients still reading the task record (rather than the block
+          // stream) see the same status flip.
           await mutateState(config.instance, (state) => {
             updateRecentToolCall(findTask(state, taskId), call.id, "done");
           });
@@ -983,10 +1092,27 @@ async function runLoop(
             toolName: call.function.name,
             approvalId: dispatch.approvalId
           });
+          // Re-read the approval row to surface action/risk/summary on
+          // the approval_requested block. The dispatch returns just
+          // the id; the full row is the source of truth for these
+          // fields (and `action` lets clients pick connector.request
+          // vs the standard Approve/Deny pair).
+          const approvalRow = readState(config.instance).approvals.find(
+            (a) => a.id === dispatch.approvalId
+          );
+          if (approvalRow) {
+            emitApprovalRequested(emitCtx, {
+              approvalId: approvalRow.id,
+              action: approvalRow.action,
+              risk: approvalRow.risk,
+              summary: approvalRow.reason ?? approvalRow.target
+            });
+          }
           // Approval-gated tools haven't actually run yet, but from the
           // UI's perspective the agent is no longer "dispatching" this
-          // call — it's now waiting on the user. Mark done so the row
-          // stops spinning; the approval banner conveys the gate.
+          // call — it's now waiting on the user. Mark done on the legacy
+          // recentToolCalls payload so the row stops spinning; the
+          // approval block conveys the gate.
           await mutateState(config.instance, (state) => {
             updateRecentToolCall(findTask(state, taskId), call.id, "done");
           });
@@ -1018,6 +1144,11 @@ async function runLoop(
           role: "tool",
           tool_call_id: call.id,
           content: `Error: ${message}`
+        });
+        emitToolCallStatus(emitCtx, {
+          callId: call.id,
+          status: "error",
+          errorMessage: message
         });
         await mutateState(config.instance, (state) => {
           updateRecentToolCall(findTask(state, taskId), call.id, "error");
@@ -1100,6 +1231,16 @@ async function runLoop(
       item.updatedAt = now();
       return item;
     });
+    // Emit the exhaustion summary as a final assistant_text block and a
+    // terminal Completed phase. The system_note marks the cap-reached
+    // condition explicitly so clients can render a hint without parsing
+    // the currentStep string.
+    if (exhausted.status === "completed") {
+      const block = emitAssistantTextStart(emitCtx, finalText);
+      if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
+      emitSystemNote(emitCtx, `Iteration cap reached (${cap}). Returning best-effort summary.`);
+      emitPhase(emitCtx, "Completed");
+    }
     appendTrace(config.instance, taskId, {
       type: "warning",
       message: `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
@@ -1138,6 +1279,12 @@ async function runLoop(
       item.updatedAt = now();
       return item;
     });
+    // Cap-reached fail path: emit a system_note so the chat thread has
+    // an explicit marker rather than just trailing off after the last
+    // assistant_text. Phase blocks track currentStep; the system_note
+    // captures the error condition.
+    emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+    emitPhase(emitCtx, "Failed");
     appendTrace(config.instance, taskId, {
       type: "error",
       message: "Chat task hit iteration cap and tool-less summary call failed",
@@ -1212,12 +1359,26 @@ export async function resumeChatTask(
   // the loop.
   const snapshot = stage.task.toolCallState!;
   const messages = (snapshot.messages as ToolCallingMessage[]).slice();
+  // Resolve the emit context once for the chat-block flips below. Tasks
+  // without a chat session (subagent children) skip emission, matching
+  // the loop-entry behavior in runLoop.
+  const resumeEmitCtx = resolveEmitContext(config, taskId);
   for (const entry of snapshot.pending) {
     messages.push({
       role: "tool",
       tool_call_id: entry.toolCallId,
       content: entry.result ?? "(no result)"
     });
+    // Pair the resumed tool_result message with a chat-block update so
+    // clients see the previously-running tool_call flip to `ok` and a
+    // tool_result row appear. We only flip to `ok` here — a denial path
+    // already routed through decideApproval(deny) which we'll handle
+    // separately, and dispatch errors are already emitted at the
+    // chat-task loop's main dispatch branch.
+    emitToolCallStatus(resumeEmitCtx, { callId: entry.toolCallId, status: "ok" });
+    if (typeof entry.result === "string") {
+      emitToolResult(resumeEmitCtx, { callId: entry.toolCallId, result: entry.result });
+    }
   }
 
   const resumed = await mutateState(config.instance, (state) => {

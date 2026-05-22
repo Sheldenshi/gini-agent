@@ -28,6 +28,7 @@ import type {
 } from "../types";
 import { id, now } from "./ids";
 import { addAudit, appendEvent, type AgentContext } from "./audit";
+import { deleteChatBlocksForSession } from "./chat-blocks";
 import { tracePath } from "./trace";
 import { hashSecret, randomPairingCode } from "./security";
 import { expirePairingCodes } from "./store";
@@ -284,6 +285,21 @@ export function deleteChatSession(state: RuntimeState, id: string): ChatSessionR
   const session = state.chatSessions[index]!;
   state.chatSessions.splice(index, 1);
   state.chatMessages = state.chatMessages.filter((message) => message.sessionId !== id);
+  // ChatBlock rows (ADR chat-block-protocol.md) live in SQLite, parallel
+  // to the legacy ChatMessageRecord list above. Drop them at the same
+  // boundary so a deleted session doesn't leave orphan block rows the
+  // /blocks endpoint would surface after re-create. Best-effort: a SQLite
+  // open failure here must not abort the in-memory state delete (the
+  // rest of the cleanup is irreversibly written above), so we swallow
+  // errors and log via console.warn so operators can spot drift.
+  try {
+    deleteChatBlocksForSession(state.instance, id);
+  } catch (error) {
+    console.warn(
+      `[chat-blocks] cascade delete failed for session ${id}:`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
   // Identity snapshots are keyed on conversationId (the chat session id),
   // so removing the session must drop the matching snapshot or we leak
   // one IdentitySnapshotRecord per deleted chat forever.

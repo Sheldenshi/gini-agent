@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type {
   Approval,
   BrowserConnectionRecord,
+  ChatBlock,
   ConnectorRecord,
   ImprovementProposal,
   JobRecord,
@@ -259,6 +260,114 @@ export function useDeleteChatSession() {
       qc.invalidateQueries({ queryKey: ["chat"] });
     }
   });
+}
+
+// ChatBlock protocol consumer. Fetches the ordered block list once and
+// subscribes to the per-session SSE stream for live updates. The block
+// list is the single source of truth for the chat page — clients render
+// it as-is (no client-side phase synthesis, no partialSummary swap, no
+// approval join). See ADR chat-block-protocol.md.
+//
+// Merge rules (matching the wire contract):
+//   - Incoming frames are upserted by `id`. The streaming `assistant_text`
+//     kind emits the same id repeatedly with the FULL accreted text on
+//     every delta; merging by id keeps the rendered string monotonically
+//     growing without splicing deltas client-side.
+//   - `tool_call` rows flip status (running -> ok / error / denied) under
+//     a stable id, so the same upsert path covers them.
+//   - All other kinds are append-only, but the merge logic is uniform.
+//
+// The SSE stream auto-attaches Last-Event-ID on browser-driven reconnects.
+// On open we still issue a fresh GET /blocks so a tab waking from sleep or
+// a fresh navigation gets the durable list before any live frames land.
+export function useChatBlocks(sessionId: string | null) {
+  const [blocks, setBlocks] = useState<ChatBlock[]>([]);
+  const [isLoading, setIsLoading] = useState<boolean>(Boolean(sessionId));
+  const [error, setError] = useState<Error | null>(null);
+
+  // Stash sessionId in a ref so the effect cleanup observes the exact
+  // sessionId it opened against rather than whatever the latest render
+  // captured. Without this, a quick session switch could leak an
+  // EventSource because the closed-over id no longer matches.
+  const activeSessionRef = useRef<string | null>(sessionId);
+  activeSessionRef.current = sessionId;
+
+  useEffect(() => {
+    if (!sessionId) {
+      setBlocks([]);
+      setIsLoading(false);
+      setError(null);
+      return;
+    }
+
+    let cancelled = false;
+    const source = new EventSource(`/api/runtime/chat/${sessionId}/stream`);
+
+    setIsLoading(true);
+    setError(null);
+
+    // Reset to the durable list on session change. The SSE stream's
+    // initial backfill will replay missing blocks, but we want the
+    // bubble for the current session to start from a known-good
+    // snapshot rather than the previous session's residue.
+    api<ChatBlock[]>(`/chat/${sessionId}/blocks`)
+      .then((initial) => {
+        if (cancelled || activeSessionRef.current !== sessionId) return;
+        // Sort defensively — the server already returns ordinal-asc, but
+        // a future server-side change shouldn't silently re-order the UI.
+        const sorted = [...initial].sort((a, b) => a.ordinal - b.ordinal);
+        setBlocks(sorted);
+        setIsLoading(false);
+      })
+      .catch((err: Error) => {
+        if (cancelled || activeSessionRef.current !== sessionId) return;
+        setError(err);
+        setIsLoading(false);
+      });
+
+    const merge = (incoming: ChatBlock) => {
+      if (cancelled || activeSessionRef.current !== sessionId) return;
+      setBlocks((prev) => {
+        const idx = prev.findIndex((b) => b.id === incoming.id);
+        if (idx >= 0) {
+          // Upsert in place. assistant_text streaming deltas hit this
+          // path with the running total; tool_call status flips also.
+          const next = prev.slice();
+          next[idx] = incoming;
+          return next;
+        }
+        // Append + re-sort by ordinal. SSE generally arrives in order
+        // but a backfill batch can interleave with live frames on
+        // reconnect; keep the render ordering authoritative.
+        const next = [...prev, incoming];
+        next.sort((a, b) => a.ordinal - b.ordinal);
+        return next;
+      });
+    };
+
+    source.addEventListener("chat_block", (event) => {
+      const messageEvent = event as MessageEvent;
+      try {
+        const block = JSON.parse(messageEvent.data) as ChatBlock;
+        merge(block);
+      } catch {
+        // A malformed frame shouldn't kill the stream — ignore and
+        // wait for the next one. The SSE browser implementation
+        // handles reconnect with Last-Event-ID on transport errors.
+      }
+    });
+
+    // EventSource has built-in reconnect with backoff; don't close on
+    // error or transient hiccups turn into permanent disconnects.
+    source.onerror = () => {};
+
+    return () => {
+      cancelled = true;
+      source.close();
+    };
+  }, [sessionId]);
+
+  return { blocks, isLoading, error };
 }
 
 export function useCancelTask() {
