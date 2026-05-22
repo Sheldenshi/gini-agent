@@ -28,30 +28,43 @@ import { api } from "../api";
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
   // install path (`curl … | bash`) has no GINI_PROVIDER env, and the
-  // browser /setup flow is responsible for picking a provider. If no env
-  // is set and no config exists yet, materialize a placeholder ("echo")
-  // config; the runtime starts, /api/setup/status reports
-  // providerConfigured:false, and the browser /setup page replaces the
-  // placeholder. Existing configs are not overwritten.
+  // browser /setup flow is responsible for picking a provider when the
+  // user lands on a fresh instance without env vars set. When no env
+  // is set the platform default in defaultConfig() (codex/gpt-5.5)
+  // takes over for a brand-new instance; `gini setup --yes` and the
+  // browser /setup page can still rewrite that later.
   //
-  // For users who want to skip the browser flow, GINI_PROVIDER=openai|codex
-  // is still honored — it short-circuits the placeholder and writes the
-  // real provider directly.
+  // GINI_PROVIDER=openai|codex (optionally with GINI_MODEL) always wins
+  // when set, whether or not a config already exists on disk. This is
+  // load-bearing for the conductor `setup` script: if a worktree's
+  // instance dir was materialized earlier (e.g. by a tmux `gini run`
+  // racing the install) the existing config would otherwise pin the
+  // platform default and the env vars in `setup` would be silently
+  // ignored.
   const instance = parseInstance(ctx.rawArgs);
-  if (!existsSync(configPath(instance))) {
-    const envProvider = process.env.GINI_PROVIDER;
-    if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
-      throw new Error(
-        `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
-        `Use 'openai' or 'codex', leave it unset for a placeholder config that the /setup page replaces, ` +
-        `or run \`gini provider set <name> [model]\` after install.`
-      );
-    }
-    // envProvider is undefined → placeholder config will materialize via
-    // defaultConfig() inside install(); /api/setup/status will report
-    // providerConfigured:false; the browser /setup flow takes over.
+  const envProvider = process.env.GINI_PROVIDER;
+  if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
+    throw new Error(
+      `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
+      `Use 'openai' or 'codex', leave it unset to accept the platform default, ` +
+      `or run \`gini provider set <name> [model]\` after install.`
+    );
   }
+  const configExisted = existsSync(configPath(instance));
   const { config } = ctx;
+  if (configExisted && (envProvider === "openai" || envProvider === "codex")) {
+    // Mirror defaultConfig()'s provider field shape so the on-disk form
+    // is identical whether the env vars hit the fresh-config branch in
+    // defaultConfig() or this rewrite path on a pre-existing config.
+    const envModel = process.env.GINI_MODEL;
+    const model = envModel ?? (envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini");
+    config.provider = {
+      name: envProvider,
+      model,
+      apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined
+    };
+    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+  }
   install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
 }
