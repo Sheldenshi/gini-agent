@@ -29,6 +29,10 @@ Keep ADRs current when architecture changes.
 - Side-effecting tools must preserve approval, audit, and trace behavior.
 - Instance-aware paths, ports, logs, and state must remain isolated.
 
+## Branches
+
+Use `<type>/<kebab-case-topic>`, where `<type>` is one of `feat`, `fix`, `chore`, `docs`, `refactor`, or `test`. Examples: `feat/profile-switcher`, `fix/chat-title-overflow`, `docs/release-process`.
+
 ## Commits and PR titles
 
 Commit messages and PR titles describe the technical change, not the process that produced it. Public history is what reviewers and future readers see; the back-and-forth that shaped the diff is internal.
