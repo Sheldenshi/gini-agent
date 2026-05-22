@@ -190,18 +190,12 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
   if (requiresToken) {
     const ref = writeSecret(config.instance, bridgeSecretNamespace(bridge.id), "bot-token", botToken);
     await mutateState(config.instance, (state) => attachSecretRef(state.messagingBridges, bridge.id, ref));
-    if (kind === "telegram") {
-      // Auto-mint a pairing code so the operator can DM the bot and
-      // enroll their chat in one paste, without ever needing to look
-      // up their own chat_id. The whitelist remains the source of
-      // truth — pairing just consumes a one-shot token to populate
-      // it. Telegram-only: Discord uses channel-as-auth (see ADR
-      // discord-bridge.md) and has no pairing flow to feed.
-      return mutateState(config.instance, (state) => regeneratePairingCodeInState(state.messagingBridges, bridge.id));
-    }
-    // Discord bridges need the token but skip pairing — the bridge
-    // record returned from createMessagingBridgeRecord already carries
-    // the secretRef attachment via the mutate above.
+    // Telegram + Discord both store the token here; enrollment is
+    // per-chat from this point on. For telegram, the poller mints a
+    // verification code when any unrecognized chat DMs the bot and
+    // surfaces a matching entry to the operator UI. Discord uses
+    // channel-as-auth (see ADR discord-bridge.md) so the operator
+    // configured the target channel IDs at create time.
     const refreshed = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
     return refreshed ?? bridge;
   }
@@ -482,32 +476,32 @@ export function findDiscordChatSession(
 // permitted chat_ids on `metadata.allowedChatIds`; the poller silently
 // drops updates from anyone not on the list. There is NO trust-on-
 // first-use: even the first DM from the bridge owner is denied until
-// they explicitly run `gini messaging allow <bridge> <chat-id>` on
-// their own machine.
+// they explicitly approve their chat from the operator UI (or run
+// `gini messaging allow <bridge> <chat-id>` on the host).
 //
-// To make chat-id discovery painless (the owner doesn't typically
-// know their own Telegram user_id off the top of their head), the
-// poller records the last few denied attempts on
-// `metadata.recentDeniedChats`. The owner runs `gini messaging chats
-// <bridge>` and sees both the allowlist and a list of pending
-// attempts, including their own — they pick out the right chat_id and
-// enroll it. The list is bounded so a flood of stranger pings can't
-// blow up the state record.
+// Enrollment is a two-sided handshake. When a chat the bot doesn't
+// recognize sends any message (including /start), the poller mints a
+// short verification code in the `AB-1A-22` format, sends it back to
+// the user via Telegram, and surfaces a matching pending-request
+// entry to the operator. The operator confirms the code matches what
+// the user sees and clicks Approve, at which point the chat lands on
+// `allowedChatIds` and the bot greets the user to close the loop.
+// `metadata.recentDeniedChats` holds the pending entries (bounded at
+// MAX_RECENT_DENIED_CHATS so a flood of stranger pings can't bloat
+// the state record). Codes are private-chat only: groups still get
+// recorded as pending but no code or bot reply, and the operator
+// approves them by chat_id alone.
 
 const MAX_RECENT_DENIED_CHATS = 10;
 
-// Pairing code parameters. Telegram chat_ids are not visible in the
-// Telegram UI, so a fresh operator can't easily run `allow <chat-id>`
-// without first discovering their own id. The pairing code is a one-
-// shot, time-bounded token printed only on the runtime's local stdout
-// when the bridge is created. The operator pastes it into Telegram as
-// their first DM; the poller validates it, enrolls the originating
-// chat, and consumes the code. Codes are scoped to private chats
-// only — groups always require explicit `allow` so a stranger who
-// adds the bot to their group can never accidentally trip pairing.
-const PAIRING_CODE_BYTES = 4; // 32 bits → 4.3B combos, plenty against the 15-min window
-const PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
-const PAIRING_CODE_PREFIX = "pair-";
+// Per-chat verification code parameters. Format is "AB-1A-22" — three
+// uppercase hex pairs separated by single dashes — chosen for easy
+// over-the-phone confirmation. 24 bits of entropy (16M combos) is
+// overkill against the 10-minute window; readability matters more
+// here than collision resistance. The code lives in the matching
+// `recentDeniedChats` entry; a DM after expiry mints a fresh one.
+const VERIFICATION_CODE_BYTES = 3;
+const VERIFICATION_CODE_TTL_MS = 10 * 60 * 1000;
 
 export interface DeniedChatAttempt {
   chatId: number;
@@ -518,6 +512,16 @@ export interface DeniedChatAttempt {
   // Last time we saw an attempt from this chat. Newer attempts from
   // the same chat just bump the timestamp instead of stacking entries.
   lastAttemptAt: string;
+  // Verification code surfaced to both the user (in the bot's reply
+  // to their DM) and the operator (in the pending-request UI). The
+  // operator confirms the codes match before clicking Approve so a
+  // TOFU enrollment can't race a legitimate user. Only set for
+  // private chats — groups stay code-less and the operator approves
+  // them by chat_id alone. A DM after `verificationCodeExpiresAt`
+  // mints a fresh code; repeated DMs inside the window reuse the
+  // existing one so we don't spam the user with new codes.
+  verificationCode?: string;
+  verificationCodeExpiresAt?: string;
 }
 
 export interface ChatAllowlistView {
@@ -557,39 +561,69 @@ export async function authorizeTelegramChat(
   return isChatAllowed(bridge, chatId);
 }
 
-// Record a denied chat attempt on the bridge so the owner can find
-// their own chat_id via `gini messaging chats <bridge>` without
-// tailing the runtime log. Dedupes by chatId — repeated attempts from
-// the same stranger just refresh the timestamp instead of stacking
-// entries. Bounded at MAX_RECENT_DENIED_CHATS to keep the state record
-// small if a public-known bridge gets pinged at scale.
+// Record a denied chat attempt on the bridge and mint (or reuse) a
+// verification code for the user-side reply. The bot DMs the same
+// code back to the chat so the operator can confirm the codes match
+// before clicking Approve. Dedupes by chatId — repeated attempts
+// from the same stranger refresh the timestamp instead of stacking
+// entries, and keep the existing code as long as it hasn't expired
+// so the user doesn't get a new code on every retry. Codes only
+// generated for private chats; groups get a code-less pending entry
+// (the operator approves them by chat_id alone since there's no
+// safe per-user channel to deliver a code through). Bounded at
+// MAX_RECENT_DENIED_CHATS so a flood of stranger pings can't bloat
+// the state record. Returns the resulting entry so the poller can
+// drive the user-side bot reply; returns undefined if the chat was
+// already allowed (a race against an operator Approve) or the bridge
+// disappeared.
 export async function recordDeniedChatAttempt(
   config: RuntimeConfig,
   bridgeId: string,
   attempt: { chatId: number; chatType: string; sender?: string }
-): Promise<void> {
-  await mutateState(config.instance, (state) => {
+): Promise<DeniedChatAttempt | undefined> {
+  return mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === bridgeId);
-    if (!live) return;
+    if (!live) return undefined;
     // Re-check the allowlist inside the lock. The poller's authorize call
     // happens outside mutateState, so if the operator clicks Approve in the
     // window between that read and us getting here the chat is already
     // allowed — silently skipping the deny write keeps the pending list from
     // re-appearing after a successful approval.
-    if (isChatAllowed(live, attempt.chatId)) return;
+    if (isChatAllowed(live, attempt.chatId)) return undefined;
     const meta = { ...(live.metadata ?? {}) };
-    const existing = readRecentDeniedChats(live).filter((entry) => entry.chatId !== attempt.chatId);
+    const existing = readRecentDeniedChats(live);
+    const prior = existing.find((entry) => entry.chatId === attempt.chatId);
+    const isPrivate = attempt.chatType === "private";
+    const priorExpiresAt = prior?.verificationCodeExpiresAt
+      ? Date.parse(prior.verificationCodeExpiresAt)
+      : Number.NaN;
+    const canReuse = isPrivate
+      && typeof prior?.verificationCode === "string"
+      && Number.isFinite(priorExpiresAt)
+      && priorExpiresAt > Date.now();
+    const verificationCode = isPrivate
+      ? (canReuse ? prior!.verificationCode! : generateVerificationCode())
+      : undefined;
+    const verificationCodeExpiresAt = isPrivate
+      ? (canReuse
+          ? prior!.verificationCodeExpiresAt!
+          : new Date(Date.now() + VERIFICATION_CODE_TTL_MS).toISOString())
+      : undefined;
     const entry: DeniedChatAttempt = {
       chatId: attempt.chatId,
       chatType: attempt.chatType,
       ...(attempt.sender ? { sender: attempt.sender } : {}),
-      lastAttemptAt: now()
+      lastAttemptAt: now(),
+      ...(verificationCode ? { verificationCode } : {}),
+      ...(verificationCodeExpiresAt ? { verificationCodeExpiresAt } : {})
     };
+    const filtered = existing.filter((existingEntry) => existingEntry.chatId !== attempt.chatId);
     // Newest first; cap at MAX so an attacker pinging in a loop can't
     // bloat the state record.
-    meta.recentDeniedChats = [entry, ...existing].slice(0, MAX_RECENT_DENIED_CHATS);
+    meta.recentDeniedChats = [entry, ...filtered].slice(0, MAX_RECENT_DENIED_CHATS);
     live.metadata = meta;
     live.updatedAt = entry.lastAttemptAt;
+    return entry;
   });
 }
 
@@ -601,135 +635,68 @@ function readRecentDeniedChats(bridge: MessagingBridgeRecord): DeniedChatAttempt
     .filter((entry) => entry && typeof entry.chatId === "number");
 }
 
-function generatePairingCode(): string {
-  return PAIRING_CODE_PREFIX + randomBytes(PAIRING_CODE_BYTES).toString("hex");
+function generateVerificationCode(): string {
+  const hex = randomBytes(VERIFICATION_CODE_BYTES).toString("hex").toUpperCase();
+  return `${hex.slice(0, 2)}-${hex.slice(2, 4)}-${hex.slice(4, 6)}`;
 }
 
-// Mint (or rotate) a pairing code on the bridge. Called from
-// addMessagingBridge so a freshly-created telegram bridge already has
-// a valid code, and from pairMessagingBridge when the operator wants
-// a new window after the previous code expired. Also exported under
-// `mintTelegramPairingCodeInState` so the openclaw migrator can mint
-// a code on a migrated bridge that came across with no allowlist —
-// otherwise the poller silently denies every inbound and the bridge
-// looks "configured" but does nothing.
-function regeneratePairingCodeInState(
-  bridges: MessagingBridgeRecord[],
-  bridgeId: string
-): MessagingBridgeRecord {
-  const live = bridges.find((b) => b.id === bridgeId);
-  if (!live) throw new Error(`Messaging bridge not found: ${bridgeId}`);
-  const meta = { ...(live.metadata ?? {}) };
-  meta.pairingCode = generatePairingCode();
-  meta.pairingCodeExpiresAt = new Date(Date.now() + PAIRING_CODE_TTL_MS).toISOString();
-  live.metadata = meta;
-  live.updatedAt = now();
-  return live;
-}
-
-export const mintTelegramPairingCodeInState = regeneratePairingCodeInState;
-
-export async function pairMessagingBridge(config: RuntimeConfig, idOrName: string) {
-  return mutateState(config.instance, (state) => {
-    const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
-    if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
-    if (live.kind !== "telegram") {
-      throw new Error(`Pairing codes only apply to telegram bridges (got '${live.kind}').`);
-    }
-    const refreshed = regeneratePairingCodeInState(state.messagingBridges, live.id);
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "messaging.pairing.minted",
-        target: refreshed.id,
-        risk: "medium",
-        evidence: { expiresAt: refreshed.metadata?.pairingCodeExpiresAt }
-      },
-      { system: true }
-    );
-    return refreshed;
-  });
-}
-
-// True when the bridge currently has a valid (non-expired) pairing
-// code. The poller calls this to decide whether to nudge a denied
-// chat with a "send your pairing code" hint instead of going silent —
-// outside a pairing window the bot stays dark so strangers don't get
-// confirmation that it's running.
-export function hasActivePairingCode(config: RuntimeConfig, bridgeId: string): boolean {
-  const bridge = readState(config.instance).messagingBridges.find((b) => b.id === bridgeId);
-  if (!bridge) return false;
-  const meta = bridge.metadata;
-  if (!meta) return false;
-  if (typeof meta.pairingCode !== "string") return false;
-  const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
-  if (!expiresRaw) return false;
-  const expiresAt = Date.parse(expiresRaw);
-  return Number.isFinite(expiresAt) && expiresAt > Date.now();
-}
-
-// Atomically validate and consume a pairing attempt. Returns true when
-// the message text matches the bridge's active pairing code AND the
-// chat is private AND the code hasn't expired — in which case the
-// originating chat is enrolled (as if `allow` were called) and the
-// code is cleared. Wrong codes / expired codes / group chats return
-// false; the poller's normal deny path takes over from there.
-export async function tryClaimPairingCode(
+// Bounded retry for best-effort Telegram outbound sends — used to
+// deliver verification codes and post-approve greetings, both of
+// which are user-visible signals where a single transient Telegram
+// hiccup shouldn't silently drop the message. Returns success or the
+// final error so the caller can log with context. Backoffs are
+// short (250ms + 750ms) because the operator is actively waiting on
+// the UI side; if Telegram is still unreachable after one second
+// we stop and surface the failure in the runtime log.
+const OUTBOUND_RETRY_BACKOFFS_MS: ReadonlyArray<number> = [250, 750];
+async function sendMessagingOutputWithRetries(
   config: RuntimeConfig,
   bridgeId: string,
-  payload: { chatId: number; chatType: string; text: string }
-): Promise<boolean> {
-  if (payload.chatType !== "private") return false;
-  return mutateState(config.instance, (state) => {
-    const live = state.messagingBridges.find((b) => b.id === bridgeId);
-    if (!live) return false;
-    const meta = { ...(live.metadata ?? {}) };
-    const code = typeof meta.pairingCode === "string" ? meta.pairingCode : undefined;
-    const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
-    if (!code || !expiresRaw) return false;
-    const expiresAt = Date.parse(expiresRaw);
-    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
-      // Stale code — clear it so the field doesn't linger on metadata
-      // and the operator can re-mint cleanly.
-      delete meta.pairingCode;
-      delete meta.pairingCodeExpiresAt;
-      live.metadata = meta;
-      live.updatedAt = now();
-      return false;
+  payload: { text: string; target: string }
+): Promise<{ ok: true } | { ok: false; error: Error }> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= OUTBOUND_RETRY_BACKOFFS_MS.length; attempt++) {
+    try {
+      // parseMode "none" — these messages are short plain-text
+      // operator-flow signals (verification codes, post-approve
+      // greetings). MarkdownV2 escaping would turn the dashes in
+      // "AB-1A-22" into "AB\-1A\-22" inside the chat client.
+      await sendMessagingOutput(config, bridgeId, { ...payload, parseMode: "none" });
+      return { ok: true };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt === OUTBOUND_RETRY_BACKOFFS_MS.length) break;
+      await new Promise((resolve) => setTimeout(resolve, OUTBOUND_RETRY_BACKOFFS_MS[attempt]));
     }
-    if (payload.text.trim().toLowerCase() !== code.toLowerCase()) return false;
+  }
+  return { ok: false, error: lastError ?? new Error("send failed") };
+}
 
-    // Code matched — consume it and enroll the chat. The whitelist is
-    // still the source of truth; we just populated it via pairing
-    // instead of a direct CLI call.
-    delete meta.pairingCode;
-    delete meta.pairingCodeExpiresAt;
-    const allowed = readAllowedChatIds(live);
-    if (!allowed.includes(payload.chatId)) allowed.push(payload.chatId);
-    meta.allowedChatIds = allowed;
-    if (readOwnerChatId(live) === undefined) meta.ownerChatId = payload.chatId;
-    meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== payload.chatId);
-    live.metadata = meta;
-    live.updatedAt = now();
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "messaging.pairing.claimed",
-        target: live.id,
-        risk: "medium",
-        evidence: { chatId: payload.chatId }
-      },
-      { system: true }
-    );
-    return true;
+// Send the per-chat verification code to a Telegram user who DM'd
+// the bot from a not-yet-allowlisted chat. The operator sees the
+// same code on the pending-request row and confirms it matches what
+// the user reports before clicking Approve. Wraps the bounded retry
+// helper so a transient Telegram blip doesn't strand the operator
+// staring at a code the user never got.
+export async function deliverVerificationCode(
+  config: RuntimeConfig,
+  bridgeId: string,
+  payload: { chatId: number; code: string; expiresAt?: string }
+): Promise<{ ok: true } | { ok: false; error: Error }> {
+  const expiresAtRaw = payload.expiresAt ? Date.parse(payload.expiresAt) : Number.NaN;
+  const minutesRemaining = Number.isFinite(expiresAtRaw)
+    ? Math.max(1, Math.round((expiresAtRaw - Date.now()) / 60_000))
+    : Math.round(VERIFICATION_CODE_TTL_MS / 60_000);
+  const text = `Enrollment code: ${payload.code}\n\nExpires in ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}. Share it with the operator to be approved.`;
+  return sendMessagingOutputWithRetries(config, bridgeId, {
+    text,
+    target: String(payload.chatId)
   });
 }
 
 export async function allowChat(config: RuntimeConfig, idOrName: string, chatId: number) {
   if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
-  return mutateState(config.instance, (state) => {
+  const result = await mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
     if (live.kind !== "telegram") {
@@ -748,13 +715,6 @@ export async function allowChat(config: RuntimeConfig, idOrName: string, chatId:
     // Drop the enrolled chat from the pending-attempts list so the
     // owner's view stays clean.
     meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);
-    // An explicit allow closes any active pairing window — the
-    // operator just established trust through the CLI, so the
-    // pairing-window hint becomes noise. They can mint a fresh code
-    // with `gini messaging pair` whenever they want to onboard a
-    // new chat via the shortcut path.
-    delete meta.pairingCode;
-    delete meta.pairingCodeExpiresAt;
     live.metadata = meta;
     live.updatedAt = now();
     addAudit(
@@ -768,8 +728,24 @@ export async function allowChat(config: RuntimeConfig, idOrName: string, chatId:
       },
       { system: true }
     );
-    return chatAllowlistView(live);
+    return { bridgeId: live.id, view: chatAllowlistView(live) };
   });
+  // Best-effort greeting back to the chat so the user knows they
+  // were approved without having to send another message and wait
+  // for an agent reply. The mutation is already committed; a failed
+  // send leaves the chat enrolled but quietly logs the error.
+  const greeting = await sendMessagingOutputWithRetries(config, result.bridgeId, {
+    text: "Paired. You can chat with the bot now.",
+    target: String(chatId)
+  });
+  if (!greeting.ok) {
+    appendLog(config.instance, "messaging.telegram.greeting_send_error", {
+      bridgeId: result.bridgeId,
+      chatId,
+      error: greeting.error.message
+    });
+  }
+  return result.view;
 }
 
 export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: number) {

@@ -668,9 +668,11 @@ export interface MessagingBridgeRecord {
   //     botUsername, botId, lastOffset,
   //     allowedChatIds: number[],           // per-chat allowlist (no TOFU)
   //     ownerChatId?: number,               // first-enrolled chat for audit history
-  //     recentDeniedChats?: DeniedChatAttempt[],
-  //     pairingCode?: string,               // one-shot enroll-via-DM code
-  //     pairingCodeExpiresAt?: string       // ISO timestamp; 15-minute TTL
+  //     recentDeniedChats?: DeniedChatAttempt[]  // pending enrollment requests; each
+  //                                              // entry carries a verificationCode +
+  //                                              // verificationCodeExpiresAt for the
+  //                                              // operator-side handshake (see
+  //                                              // src/integrations/messaging.ts)
   //   }
   //   discord: {
   //     botUsername, botId, globalName?,

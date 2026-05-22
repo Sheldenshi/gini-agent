@@ -1,5 +1,4 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
@@ -878,76 +877,3 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   return state;
 }
 
-// One-shot migration for telegram bridges created before the chat
-// allowlist + pairing-code surface landed. Without this, a legacy
-// bridge upgrades into `metadata.allowedChatIds === undefined`, the
-// poller's `authorizeTelegramChat` denies every inbound, and the
-// operator sees total silence on a bridge that previously worked.
-// The mint gives them a pairing code they can DM the bot with to
-// re-enroll without recreating the bridge.
-//
-// Lives OUTSIDE normalizeState by design. normalizeState runs on every
-// read, including pure inspections like `gini messaging chats`. If the
-// backfill ran there, each read would mint a different random code on
-// a legacy bridge until something persisted via mutateState — operators
-// running pre-runtime CLI inspections could see a code that's never
-// actually live. Callers explicitly invoke this from a write path
-// (server startup), so the mint happens exactly once and the code is
-// durable from the first observation onward.
-//
-// Idempotent: only fires when the bridge has NO allowlist AND NO
-// pairing code at all (active or expired). After one mint the second
-// branch sees a present pairingCode and skips.
-const LEGACY_PAIRING_CODE_BYTES = 4;
-const LEGACY_PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
-const LEGACY_PAIRING_CODE_PREFIX = "pair-";
-export function applyLegacyTelegramPairingMigration(state: RuntimeState): boolean {
-  let migrated = false;
-  for (const bridge of state.messagingBridges ?? []) {
-    if (bridge.kind !== "telegram") continue;
-    const meta = (bridge.metadata ?? {}) as Record<string, unknown>;
-    // Treat ANY present allowlist array as "already migrated", even if
-    // it's empty. An explicit `allowedChatIds: []` is the operator
-    // saying "I disabled every chat on purpose" (via `gini messaging
-    // deny` on each one). Reopening the pairing window on such a
-    // bridge would surprise the operator and could undo a deliberate
-    // lockout. Only a fully-absent `allowedChatIds` indicates the
-    // pre-allowlist schema we're migrating from.
-    const allowed = meta.allowedChatIds;
-    const hasAllowlist = Array.isArray(allowed);
-    const hasAnyCode = typeof meta.pairingCode === "string";
-    if (hasAllowlist || hasAnyCode) continue;
-    // The migration only targets bridges that ACTUALLY polled before
-    // the allowlist landed — those have `lastOffset` set on metadata
-    // from their pre-allowlist runtime. A bridge with no `lastOffset`
-    // is either brand-new (addMessagingBridge already minted a code
-    // for it) or one whose code was deliberately cleared by
-    // tryClaimPairingCode after a failed/expired claim; in either
-    // case minting another code would be surprising. The strict
-    // `typeof === "number"` guard also avoids ambiguity from a
-    // legacy `0` sentinel or a malformed serialization.
-    const lastOffset = meta.lastOffset;
-    if (typeof lastOffset !== "number") continue;
-    const code = LEGACY_PAIRING_CODE_PREFIX + randomBytes(LEGACY_PAIRING_CODE_BYTES).toString("hex");
-    bridge.metadata = {
-      ...meta,
-      pairingCode: code,
-      pairingCodeExpiresAt: new Date(Date.now() + LEGACY_PAIRING_CODE_TTL_MS).toISOString()
-    };
-    bridge.updatedAt = now();
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "messaging.pairing.migrated",
-        target: bridge.id,
-        risk: "low",
-        evidence: { reason: "legacy-bridge-allowlist-backfill" }
-      },
-      // Messaging bridge is an instance-shared resource — not bound to any agent.
-      { system: true }
-    );
-    migrated = true;
-  }
-  return migrated;
-}

@@ -129,7 +129,10 @@ describe("telegram poller supervisor", () => {
       botToken: "TOK"
     });
     // Pre-enroll the chat — no TOFU, so the poller would otherwise
-    // drop this update silently as a denied stranger.
+    // drop this update silently as a denied stranger. allowChat also
+    // sends a greeting back to the chat as an outbound record; the
+    // assertions below filter by direction so the greeting doesn't
+    // mask the actual inbound.
     const { allowChat } = await import("./messaging");
     await allowChat(config, bridge.id, 42);
 
@@ -144,11 +147,11 @@ describe("telegram poller supervisor", () => {
     ]);
 
     await waitFor(
-      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id),
+      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id && m.direction === "inbound"),
       "inbound message recorded"
     );
 
-    const inbound = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id);
+    const inbound = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
     expect(inbound?.direction).toBe("inbound");
     expect(inbound?.text).toBe("ping");
     expect(inbound?.target).toBe("42");
@@ -286,10 +289,10 @@ describe("telegram poller supervisor", () => {
     ]);
 
     await waitFor(
-      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id),
+      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id && m.direction === "inbound"),
       "inbound message recorded"
     );
-    const record = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id);
+    const record = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
 
     expect(downloadedPaths).toEqual(["photos/BIG.jpg"]);
     expect(record?.media?.kind).toBe("photo");
@@ -359,6 +362,10 @@ describe("telegram poller supervisor", () => {
     const { allowChat, checkMessagingBridge } = await import("./messaging");
     await checkMessagingBridge(config, bridge.id);
     await allowChat(config, bridge.id, -987654321);
+    // allowChat queues an outbound greeting through the stub; drop it
+    // from the recorded send-call list so the agent-reply assertions
+    // below read sendCalls[0] as the actual mirrored reply.
+    sendCalls.length = 0;
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -377,12 +384,12 @@ describe("telegram poller supervisor", () => {
     ]);
 
     await waitFor(
-      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id),
+      () => readState(config.instance).messagingMessages.some((m) => m.bridgeId === bridge.id && m.direction === "inbound"),
       "inbound message recorded"
     );
 
     // Mention stripped + sender prefix in the task input.
-    const inbound = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id);
+    const inbound = readState(config.instance).messagingMessages.find((m) => m.bridgeId === bridge.id && m.direction === "inbound");
     expect(inbound?.text).toBe("@shelden: ship it please");
     expect(inbound?.target).toBe("-987654321");
 
@@ -408,15 +415,15 @@ describe("telegram poller supervisor", () => {
     await supervisor.stopAll();
   });
 
-  test("strangers' updates are silently dropped (no inbound record), but the offset still advances", async () => {
-    const config = testConfig("poller-stranger-deny");
+  test("stranger DMs from a private chat receive a verification code reply and land on the pending list; the offset still advances", async () => {
+    const config = testConfig("poller-stranger-verify");
     type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
     const queue: Pending[] = [];
-    let sendCalls = 0;
+    const sendCalls: Array<{ chatId: string | number; text: string }> = [];
     const client: TelegramClient = {
       async getMe() { return { id: 1, is_bot: true, username: "gini_agent_bot" }; },
       async sendMessage(chatId, text) {
-        sendCalls += 1;
+        sendCalls.push({ chatId, text });
         return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
       },
       async sendPhoto(chatId) {
@@ -442,9 +449,13 @@ describe("telegram poller supervisor", () => {
     });
 
     // Owner enrolls themselves explicitly. The allowlist contains
-    // just [11], so any subsequent chat is a stranger.
+    // just [11], so any subsequent chat is a stranger. allowChat
+    // queues an outbound greeting through the stub; drop it from the
+    // recorded send-call list so the assertions below only see the
+    // stranger-path activity.
     const { allowChat } = await import("./messaging");
     await allowChat(config, bridge.id, 11);
+    sendCalls.length = 0;
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -462,103 +473,35 @@ describe("telegram poller supervisor", () => {
       }
     ]);
 
-    // Wait until the offset advances — the only deterministic signal
-    // that the loop processed the denied update without producing a
-    // messagingMessage record.
     await waitFor(() => {
       const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
       return live?.metadata?.lastOffset === 71;
     }, "offset advanced past denied update", 3000);
 
-    expect(readState(config.instance).messagingMessages.filter((m) => m.bridgeId === bridge.id)).toEqual([]);
-    expect(sendCalls).toBe(0);
+    // No inbound message lands because the chat is still unauthorized,
+    // but the verification-code reply is sent and recorded as outbound.
+    expect(readState(config.instance).messagingMessages.filter(
+      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
+    )).toEqual([]);
+    expect(sendCalls.length).toBeGreaterThan(0);
+    expect(sendCalls[0]?.chatId).toBe("9999");
+    expect(sendCalls[0]?.text.toLowerCase()).toContain("enrollment code");
 
-    // The denied attempt is recorded on the bridge metadata so the
-    // owner can find the chat_id via `gini messaging chats` without
-    // tailing the log.
+    // The denied attempt is recorded on the bridge metadata with the
+    // matching verification code so the operator can confirm before
+    // clicking Approve.
     const { listAllowedChats } = await import("./messaging");
     const view = listAllowedChats(config, bridge.id);
     const stranger = view.recentDeniedChats.find((entry) => entry.chatId === 9999);
     expect(stranger).toBeDefined();
     expect(stranger?.sender).toBe("Stranger");
+    expect(stranger?.verificationCode).toMatch(/^[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}$/);
 
     await supervisor.stopAll();
   });
 
-  test("first DM containing the pairing code auto-enrolls the chat and sends a confirmation", async () => {
-    const config = testConfig("poller-pair-claim");
-    type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
-    const queue: Pending[] = [];
-    const sendCalls: Array<{ chatId: string | number; text: string }> = [];
-    const client: TelegramClient = {
-      async getMe() { return { id: 1, is_bot: true, username: "gini_agent_bot" }; },
-      async sendMessage(chatId, text) {
-        sendCalls.push({ chatId, text });
-        return { message_id: 50, date: 0, chat: { id: Number(chatId), type: "private" }, text };
-      },
-      async sendPhoto(chatId) {
-        return { message_id: 51, date: 0, chat: { id: Number(chatId), type: "private" } };
-      },
-      async sendChatAction() { return true as const; },
-      async getFile(fileId) { return { file_id: fileId, file_unique_id: fileId, file_path: `photos/${fileId}.jpg` }; },
-      async downloadFile() { return new Uint8Array().buffer; },
-      getUpdates(_offset, _timeout, signal) {
-        return new Promise((resolve, reject) => {
-          queue.push({ resolve });
-          signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-        });
-      }
-    };
-    setMessagingDeps({ telegramClientFactory: () => client });
-
-    const bridge = await addMessagingBridge(config, {
-      name: "tg",
-      kind: "telegram",
-      deliveryTargets: [],
-      botToken: "TOK"
-    });
-    const code = String(bridge.metadata!.pairingCode);
-
-    const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
-    supervisor.reconcile();
-
-    queue.shift()?.resolve([
-      {
-        update_id: 80,
-        message: {
-          message_id: 1,
-          date: 0,
-          chat: { id: 7777, type: "private" },
-          text: code,
-          from: { id: 7, is_bot: false, first_name: "Shelden", username: "shelden" }
-        }
-      }
-    ]);
-
-    // Wait until the bridge metadata reflects the enrolled chat.
-    await waitFor(() => {
-      const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
-      const allowed = (live?.metadata?.allowedChatIds ?? []) as number[];
-      return allowed.includes(7777);
-    }, "chat enrolled via pairing code", 3000);
-
-    // Confirmation message went out, NOT a task-derived reply — the
-    // pairing message is consumed, not turned into a task input.
-    expect(sendCalls.some((c) => c.text.startsWith("Paired"))).toBe(true);
-    expect(readState(config.instance).messagingMessages.some(
-      (m) => m.bridgeId === bridge.id && m.direction === "inbound"
-    )).toBe(false);
-
-    // Code was consumed.
-    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
-    expect(live?.metadata?.pairingCode).toBeUndefined();
-    expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
-
-    await supervisor.stopAll();
-  });
-
-  test("unpaired DM during a pairing window gets a hint reply instead of silence", async () => {
-    const config = testConfig("poller-pair-hint");
+  test("denied DMs in private chats get the verification code text in the bot reply", async () => {
+    const config = testConfig("poller-verify-text");
     type Pending = { resolve: (u: import("./telegram").TelegramUpdate[]) => void };
     const queue: Pending[] = [];
     const sendCalls: Array<{ chatId: string | number; text: string }> = [];
@@ -589,9 +532,6 @@ describe("telegram poller supervisor", () => {
       deliveryTargets: [],
       botToken: "TOK"
     });
-    // Bridge auto-minted a pairing code; we don't claim it. The DM
-    // that arrives is plain "hi" — denied, but should receive a hint
-    // because the pairing window is open.
 
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
@@ -609,12 +549,15 @@ describe("telegram poller supervisor", () => {
       }
     ]);
 
-    await waitFor(() => sendCalls.length > 0, "hint reply dispatched", 3000);
+    await waitFor(() => sendCalls.length > 0, "verification code reply dispatched", 3000);
     expect(sendCalls[0]?.chatId).toBe("12345");
-    expect(sendCalls[0]?.text.toLowerCase()).toContain("pairing code");
+    const text = sendCalls[0]?.text ?? "";
+    expect(text.toLowerCase()).toContain("enrollment code");
+    expect(text).toMatch(/[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}/);
+    expect(text.toLowerCase()).toContain("minute");
 
-    // The chat was still denied (not enrolled, no task created), and
-    // the attempt is recorded on recentDeniedChats.
+    // The chat is still denied (not enrolled, no task created); the
+    // pending entry on metadata carries the same code.
     const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
     expect((live?.metadata?.allowedChatIds ?? []) as number[]).toEqual([]);
     expect(readState(config.instance).messagingMessages.some(

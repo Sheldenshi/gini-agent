@@ -13,14 +13,13 @@ import type { MessagingBridgeRecord, MessagingMessageMedia, RuntimeConfig, TaskS
 import { appendLog, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import {
   authorizeTelegramChat,
+  deliverVerificationCode,
   findTelegramChatSession,
-  hasActivePairingCode,
   isBotTokenRef,
   readBridgeBotToken,
   receiveMessagingInput,
   recordDeniedChatAttempt,
-  sendMessagingOutput,
-  tryClaimPairingCode
+  sendMessagingOutput
 } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
 import {
@@ -217,72 +216,46 @@ async function runLoop(
       const incoming = extractIncomingPayload(update, { botUsername });
       if (incoming) {
         // Allowlist gate: every chat — including the operator's first
-        // DM — is denied until explicitly enrolled. A private chat can
-        // also enroll itself by sending the bridge's pairing code as
-        // its first message; that's the only shortcut around the
-        // explicit `allow` call. Denied updates are dropped silently
-        // (no acknowledgement to strangers), but the attempt lands on
-        // `bridge.metadata.recentDeniedChats` so the operator can
-        // discover their chat_id via `gini messaging chats <bridge>`
-        // without tailing the log. The offset still advances so the
-        // same denied update doesn't get re-fetched on the next poll.
+        // DM — is denied until explicitly approved from the operator
+        // UI (or via `gini messaging allow <bridge> <chat-id>`). For
+        // private chats we mint a per-chat verification code and DM
+        // it back to the user; the operator sees the same code next
+        // to the pending-request row and confirms before clicking
+        // Approve. Group chats are recorded silently — no code reply,
+        // no acknowledgement — because there's no safe per-user
+        // channel to deliver a code through. The offset still
+        // advances so the same denied update doesn't get re-fetched
+        // on the next poll.
         const allowed = await authorizeTelegramChat(config, bridgeId, incoming.chatId);
         if (!allowed) {
-          const paired = await tryClaimPairingCode(config, bridgeId, {
-            chatId: incoming.chatId,
-            chatType: incoming.chatType,
-            text: incoming.text
-          });
-          if (paired) {
-            appendLog(config.instance, "messaging.telegram.chat_paired", {
-              bridgeId,
-              chatId: incoming.chatId,
-              senderHandle: incoming.senderHandle
-            });
-            // Confirm the pair back to the user. The pairing message
-            // itself is consumed (not turned into a task) so the
-            // operator's first "real" turn comes next.
-            try {
-              await sendMessagingOutput(config, bridgeId, {
-                text: "Paired. You can chat with the bot now.",
-                target: String(incoming.chatId)
-              });
-            } catch (error) {
-              appendLog(config.instance, "messaging.telegram.pair_confirm_error", {
-                bridgeId,
-                error: error instanceof Error ? error.message : String(error)
-              });
-            }
-            await advanceOffset(config, bridgeId, update.update_id);
-            continue;
-          }
           appendLog(config.instance, "messaging.telegram.chat_denied", {
             bridgeId,
             chatId: incoming.chatId,
             chatType: incoming.chatType,
             senderHandle: incoming.senderHandle
           });
-          await recordDeniedChatAttempt(config, bridgeId, {
+          const entry = await recordDeniedChatAttempt(config, bridgeId, {
             chatId: incoming.chatId,
             chatType: incoming.chatType,
             sender: incoming.senderHandle
           });
-          // Hint reply during an active pairing window: a denied
-          // private DM is most likely the operator typing "hi" before
-          // they noticed the pairing code, so a one-line nudge saves
-          // them from staring at silence. Outside the window — or for
-          // groups — we stay dark so strangers don't get confirmation
-          // the bot exists.
-          if (incoming.chatType === "private" && hasActivePairingCode(config, bridgeId)) {
-            try {
-              await sendMessagingOutput(config, bridgeId, {
-                text: "Please send your pairing code to enroll this chat.",
-                target: String(incoming.chatId)
-              });
-            } catch (error) {
-              appendLog(config.instance, "messaging.telegram.pair_hint_error", {
+          // Deliver the verification code to the user with bounded
+          // retries. If Telegram is still unreachable after the
+          // backoff window the operator sees a code in their UI that
+          // the user never received — they can choose to deny and
+          // wait for the user to DM again (which mints a fresh code
+          // if the previous one expired in the meantime).
+          if (entry?.verificationCode) {
+            const result = await deliverVerificationCode(config, bridgeId, {
+              chatId: incoming.chatId,
+              code: entry.verificationCode,
+              expiresAt: entry.verificationCodeExpiresAt
+            });
+            if (!result.ok) {
+              appendLog(config.instance, "messaging.telegram.verification_send_error", {
                 bridgeId,
-                error: error instanceof Error ? error.message : String(error)
+                chatId: incoming.chatId,
+                error: result.error.message
               });
             }
           }

@@ -563,8 +563,8 @@ describe("messaging telegram wiring", () => {
     expect(listAllowedChats(config, bridge.id).allowedChatIds).toEqual([11]);
   });
 
-  test("fresh telegram bridge auto-mints a pairing code with an expiry in the future", async () => {
-    const config = testConfig("telegram-pair-mint");
+  test("fresh telegram bridge does not pre-mint any enrollment code; verification codes are minted per DM", async () => {
+    const config = testConfig("telegram-no-pre-mint");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
 
     const bridge = await addMessagingBridge(config, {
@@ -574,18 +574,16 @@ describe("messaging telegram wiring", () => {
       botToken: "TOK"
     });
 
-    const code = bridge.metadata?.pairingCode;
-    const expires = bridge.metadata?.pairingCodeExpiresAt;
-    expect(typeof code).toBe("string");
-    expect(String(code).startsWith("pair-")).toBe(true);
-    expect(typeof expires).toBe("string");
-    expect(Date.parse(String(expires))).toBeGreaterThan(Date.now());
+    // No pre-minted code on a fresh bridge — the new flow waits for
+    // a user DM and mints a verification code at that point.
+    expect(bridge.metadata?.pairingCode).toBeUndefined();
+    expect(bridge.metadata?.pairingCodeExpiresAt).toBeUndefined();
   });
 
-  test("tryClaimPairingCode enrolls a private chat that sends the right code, then consumes it", async () => {
-    const config = testConfig("telegram-pair-claim");
+  test("recordDeniedChatAttempt mints a verification code in AB-1A-22 format for private DMs", async () => {
+    const config = testConfig("telegram-verify-mint");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
-    const { authorizeTelegramChat, listAllowedChats, tryClaimPairingCode } = await import("./messaging");
+    const { recordDeniedChatAttempt } = await import("./messaging");
 
     const bridge = await addMessagingBridge(config, {
       name: "tg",
@@ -593,42 +591,22 @@ describe("messaging telegram wiring", () => {
       deliveryTargets: [],
       botToken: "TOK"
     });
-    const code = String(bridge.metadata!.pairingCode);
 
-    // Wrong code → no enrollment.
-    expect(
-      await tryClaimPairingCode(config, bridge.id, { chatId: 4242, chatType: "private", text: "pair-deadbeef" })
-    ).toBe(false);
-    expect(await authorizeTelegramChat(config, bridge.id, 4242)).toBe(false);
-
-    // Right code with surrounding whitespace and different case → enroll.
-    const ok = await tryClaimPairingCode(config, bridge.id, {
+    const entry = await recordDeniedChatAttempt(config, bridge.id, {
       chatId: 4242,
       chatType: "private",
-      text: `  ${code.toUpperCase()}  `
+      sender: "alice"
     });
-    expect(ok).toBe(true);
 
-    const view = listAllowedChats(config, bridge.id);
-    expect(view.allowedChatIds).toEqual([4242]);
-    expect(view.ownerChatId).toBe(4242);
-    // Code consumed.
-    const refreshed = listAllowedChats(config, bridge.id);
-    expect(refreshed).toBeDefined();
-    const bridges = (await import("../state")).readState(config.instance).messagingBridges;
-    const live = bridges.find((b) => b.id === bridge.id)!;
-    expect(live.metadata?.pairingCode).toBeUndefined();
-    expect(live.metadata?.pairingCodeExpiresAt).toBeUndefined();
-
-    // Replay of the same code does nothing now.
-    const replay = await tryClaimPairingCode(config, bridge.id, { chatId: 9999, chatType: "private", text: code });
-    expect(replay).toBe(false);
+    expect(entry?.verificationCode).toMatch(/^[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}$/);
+    expect(typeof entry?.verificationCodeExpiresAt).toBe("string");
+    expect(Date.parse(String(entry?.verificationCodeExpiresAt))).toBeGreaterThan(Date.now());
   });
 
-  test("group chats never pair — the code is private-only", async () => {
-    const config = testConfig("telegram-pair-group-reject");
+  test("recordDeniedChatAttempt reuses an unexpired code for repeated DMs from the same chat", async () => {
+    const config = testConfig("telegram-verify-reuse");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
-    const { authorizeTelegramChat, tryClaimPairingCode } = await import("./messaging");
+    const { recordDeniedChatAttempt } = await import("./messaging");
 
     const bridge = await addMessagingBridge(config, {
       name: "tg",
@@ -636,22 +614,27 @@ describe("messaging telegram wiring", () => {
       deliveryTargets: [],
       botToken: "TOK"
     });
-    const code = String(bridge.metadata!.pairingCode);
 
-    const tried = await tryClaimPairingCode(config, bridge.id, {
-      chatId: -987654321,
-      chatType: "supergroup",
-      text: code
+    const first = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: 4242,
+      chatType: "private",
+      sender: "alice"
     });
-    expect(tried).toBe(false);
-    expect(await authorizeTelegramChat(config, bridge.id, -987654321)).toBe(false);
+    const second = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: 4242,
+      chatType: "private",
+      sender: "alice"
+    });
+
+    expect(second?.verificationCode).toBe(first?.verificationCode);
+    expect(second?.verificationCodeExpiresAt).toBe(first?.verificationCodeExpiresAt);
   });
 
-  test("expired pairing codes are rejected and cleaned up off metadata", async () => {
-    const config = testConfig("telegram-pair-expired");
+  test("recordDeniedChatAttempt mints a fresh code after the previous one expired", async () => {
+    const config = testConfig("telegram-verify-expired");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
-    const { tryClaimPairingCode } = await import("./messaging");
-    const { mutateState, readState } = await import("../state");
+    const { recordDeniedChatAttempt } = await import("./messaging");
+    const { mutateState } = await import("../state");
 
     const bridge = await addMessagingBridge(config, {
       name: "tg",
@@ -659,28 +642,36 @@ describe("messaging telegram wiring", () => {
       deliveryTargets: [],
       botToken: "TOK"
     });
-    const code = String(bridge.metadata!.pairingCode);
 
-    // Backdate the expiry so the code is stale.
+    const first = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: 4242,
+      chatType: "private",
+      sender: "alice"
+    });
+
+    // Backdate the recorded expiry so the next DM sees a stale code.
     await mutateState(config.instance, (state) => {
       const live = state.messagingBridges.find((b) => b.id === bridge.id);
-      if (live) live.metadata!.pairingCodeExpiresAt = new Date(Date.now() - 1000).toISOString();
+      const meta = (live?.metadata ?? {}) as Record<string, unknown>;
+      const entries = meta.recentDeniedChats as Array<Record<string, unknown>> | undefined;
+      const match = entries?.find((e) => e.chatId === 4242);
+      if (match) match.verificationCodeExpiresAt = new Date(Date.now() - 1000).toISOString();
     });
 
-    const tried = await tryClaimPairingCode(config, bridge.id, { chatId: 4242, chatType: "private", text: code });
-    expect(tried).toBe(false);
+    const second = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: 4242,
+      chatType: "private",
+      sender: "alice"
+    });
 
-    // The stale code+expiry were cleaned up so the field doesn't
-    // linger on metadata after a failed attempt.
-    const live = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
-    expect(live?.metadata?.pairingCode).toBeUndefined();
-    expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
+    expect(second?.verificationCode).not.toBe(first?.verificationCode);
+    expect(Date.parse(String(second?.verificationCodeExpiresAt))).toBeGreaterThan(Date.now());
   });
 
-  test("explicit allowChat closes the pairing window (CLI trust supersedes the code)", async () => {
-    const config = testConfig("telegram-pair-allow-clears");
+  test("recordDeniedChatAttempt does not mint a verification code for group chats", async () => {
+    const config = testConfig("telegram-verify-groups");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
-    const { allowChat, hasActivePairingCode } = await import("./messaging");
+    const { recordDeniedChatAttempt } = await import("./messaging");
 
     const bridge = await addMessagingBridge(config, {
       name: "tg",
@@ -688,29 +679,19 @@ describe("messaging telegram wiring", () => {
       deliveryTargets: [],
       botToken: "TOK"
     });
-    expect(hasActivePairingCode(config, bridge.id)).toBe(true);
 
-    await allowChat(config, bridge.id, 4242);
-    expect(hasActivePairingCode(config, bridge.id)).toBe(false);
-  });
-
-  test("pairMessagingBridge regenerates the code with a fresh expiry", async () => {
-    const config = testConfig("telegram-pair-regen");
-    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
-    const { pairMessagingBridge } = await import("./messaging");
-
-    const bridge = await addMessagingBridge(config, {
-      name: "tg",
-      kind: "telegram",
-      deliveryTargets: [],
-      botToken: "TOK"
+    const entry = await recordDeniedChatAttempt(config, bridge.id, {
+      chatId: -987654321,
+      chatType: "supergroup",
+      sender: "grouper"
     });
-    const initialCode = String(bridge.metadata!.pairingCode);
 
-    const refreshed = await pairMessagingBridge(config, bridge.id);
-    expect(typeof refreshed.metadata?.pairingCode).toBe("string");
-    expect(refreshed.metadata?.pairingCode).not.toBe(initialCode);
-    expect(Date.parse(String(refreshed.metadata?.pairingCodeExpiresAt))).toBeGreaterThan(Date.now());
+    // The entry still lands on the pending list so the operator can
+    // approve by chat_id, but there's no per-user code to deliver
+    // since groups have no safe per-user channel.
+    expect(entry?.chatId).toBe(-987654321);
+    expect(entry?.verificationCode).toBeUndefined();
+    expect(entry?.verificationCodeExpiresAt).toBeUndefined();
   });
 
   test("disableMessagingBridge erases the stored bot token", async () => {
@@ -827,8 +808,9 @@ describe("messaging discord wiring", () => {
     });
 
     expect(bridge.kind).toBe("discord");
-    expect(bridge.metadata?.pairingCode).toBeUndefined();
-    expect(bridge.metadata?.pairingCodeExpiresAt).toBeUndefined();
+    // Discord uses channel-as-auth and never carries a per-user
+    // enrollment surface. The verification-code flow is telegram-only.
+    expect(bridge.metadata?.verificationCode).toBeUndefined();
   });
 
   test("allowChat / denyChat / listAllowedChats reject non-telegram bridges", async () => {
