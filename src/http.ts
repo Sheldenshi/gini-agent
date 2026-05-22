@@ -24,7 +24,23 @@ import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableM
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
-import { approveSoul, approveUserProfile, soulPath, userProfilePath } from "./runtime/identity-files";
+import {
+  approveSoul,
+  approveUserProfile,
+  instructionsPath,
+  listSoulHistory,
+  listUserProfileHistory,
+  loadInstructions,
+  loadSoul,
+  loadUserProfile,
+  restoreSoulFromHistory,
+  restoreUserProfileFromHistory,
+  soulHistoryDir,
+  soulPath,
+  userProfileHistoryDir,
+  userProfilePath
+} from "./runtime/identity-files";
+import { SOUL_SOFT_CAP_CHARS, USER_SOFT_CAP_CHARS, identityBudgetState } from "./system-prompt";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
@@ -351,6 +367,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // runtime-identity-files.md for the original propose/approve design.
     ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(await approveSoulProposal(config))],
     ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(await approveUserProfileProposal(config))],
+    // Read-only inspection: dump INSTRUCTIONS.md, USER.md, and the
+    // SOUL.md for the active or named agent with char counts vs the
+    // soft cap. Returns full file content (no truncation). The CLI
+    // `gini identity show` consumes this endpoint.
+    ["GET", /^\/api\/identity-files$/, (request) => json(showIdentityFiles(config, request))],
+    // List history snapshots for USER.md or a per-agent SOUL.md.
+    // kind ∈ {user, soul}; agentId required for soul. Newest first.
+    ["GET", /^\/api\/identity-files\/history$/, (request) => json(showIdentityHistory(config, request))],
+    // Restore an identity file from a named history snapshot. Atomic.
+    // Emits an audit row + creates a fresh pre-rollback snapshot so
+    // the rollback is itself reversible.
+    ["POST", /^\/api\/identity-files\/rollback$/, async (request) => json(await rollbackIdentityFile(config, request))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
@@ -665,6 +693,163 @@ async function approveUserProfileProposal(config: RuntimeConfig): Promise<{ ok: 
     );
   });
   return { ok: true, path };
+}
+
+// Identity-file inspection. Returns the bytes of INSTRUCTIONS.md,
+// USER.md, and (for the active or named agent) SOUL.md with char-vs-cap
+// budget metadata. No truncation — the response carries the full file
+// content. The CLI `gini identity show` consumes this endpoint and
+// pretty-prints; downstream UIs are free to do the same. SOUL.md
+// surfaces under all agents in the instance by default (an empty
+// agentId query parameter dumps each agent's SOUL.md alongside the
+// shared instance-level USER.md / INSTRUCTIONS.md).
+function showIdentityFiles(config: RuntimeConfig, request: Request): unknown {
+  const state = readState(config.instance);
+  const requestedAgent = new URL(request.url).searchParams.get("agentId") ?? undefined;
+  const instructionsContent = loadInstructions(config.instance);
+  const userContent = loadUserProfile(config.instance);
+  const userBudget = userContent && !userContent.startsWith("[BLOCKED:")
+    ? identityBudgetState(userContent, USER_SOFT_CAP_CHARS)
+    : null;
+  const targetAgents = requestedAgent
+    ? state.agents.filter((a) => a.id === requestedAgent || a.name === requestedAgent)
+    : state.agents;
+  const soulEntries = targetAgents.map((agent) => {
+    const content = loadSoul(config.instance, agent.id);
+    const budget = content && !content.startsWith("[BLOCKED:")
+      ? identityBudgetState(content, SOUL_SOFT_CAP_CHARS)
+      : null;
+    return {
+      agentId: agent.id,
+      agentName: agent.name,
+      path: soulPath(config.instance, agent.id),
+      content,
+      budget
+    };
+  });
+  return {
+    instance: config.instance,
+    instructions: {
+      path: instructionsPath(config.instance),
+      content: instructionsContent
+    },
+    userProfile: {
+      path: userProfilePath(config.instance),
+      content: userContent,
+      budget: userBudget,
+      cap: USER_SOFT_CAP_CHARS
+    },
+    souls: soulEntries,
+    soulCap: SOUL_SOFT_CAP_CHARS
+  };
+}
+
+// List history snapshots for USER.md or a per-agent SOUL.md. Query
+// params: kind=user|soul, agentId=<id> (required when kind=soul).
+// Returns the snapshot entries newest-first; each carries the filename
+// (which the rollback endpoint accepts), the absolute path, mtime, and
+// size.
+function showIdentityHistory(config: RuntimeConfig, request: Request): unknown {
+  const url = new URL(request.url);
+  const kind = (url.searchParams.get("kind") ?? "").toLowerCase();
+  const agentId = url.searchParams.get("agentId") ?? undefined;
+  if (kind === "user") {
+    return {
+      kind: "user",
+      dir: userProfileHistoryDir(config.instance),
+      entries: listUserProfileHistory(config.instance)
+    };
+  }
+  if (kind === "soul") {
+    if (!agentId) return { error: "agentId required when kind=soul" };
+    return {
+      kind: "soul",
+      agentId,
+      dir: soulHistoryDir(config.instance, agentId),
+      entries: listSoulHistory(config.instance, agentId)
+    };
+  }
+  return { error: "kind must be one of: user, soul" };
+}
+
+// Restore an identity file from a named history snapshot. Payload:
+// { kind: "user" | "soul", snapshot: "<name>", agentId?: "<id>" }.
+// Emits an `identity.<file>.rollback` audit row with the source
+// snapshot and the pre-rollback snapshot path (so the rollback is
+// itself recoverable). Returns 404 when the snapshot doesn't exist.
+async function rollbackIdentityFile(
+  config: RuntimeConfig,
+  request: Request
+): Promise<unknown> {
+  const payload = (await body(request)) as { kind?: unknown; snapshot?: unknown; agentId?: unknown };
+  const kind = typeof payload.kind === "string" ? payload.kind : "";
+  const snapshot = typeof payload.snapshot === "string" ? payload.snapshot : "";
+  if (!snapshot) return { ok: false, reason: "snapshot required" };
+  if (kind === "user") {
+    const result = restoreUserProfileFromHistory(config.instance, snapshot);
+    if (!result.ok) return { ok: false, reason: result.reason };
+    await mutateState(config.instance, (s) => {
+      addAudit(
+        s,
+        {
+          actor: "user",
+          action: "identity.user_profile.rollback",
+          target: userProfilePath(config.instance),
+          risk: "low",
+          evidence: {
+            snapshot,
+            fromPath: result.from,
+            restoredBytes: result.restoredBytes,
+            preRestoreSnapshot: result.preRestoreSnapshot
+          }
+        },
+        { system: true }
+      );
+    });
+    return {
+      ok: true,
+      kind: "user",
+      restoredBytes: result.restoredBytes,
+      fromPath: result.from,
+      preRestoreSnapshot: result.preRestoreSnapshot,
+      activePath: userProfilePath(config.instance)
+    };
+  }
+  if (kind === "soul") {
+    const agentId = typeof payload.agentId === "string" ? payload.agentId : "";
+    if (!agentId) return { ok: false, reason: "agentId required when kind=soul" };
+    const result = restoreSoulFromHistory(config.instance, agentId, snapshot);
+    if (!result.ok) return { ok: false, reason: result.reason };
+    await mutateState(config.instance, (s) => {
+      addAudit(
+        s,
+        {
+          actor: "user",
+          action: "identity.soul.rollback",
+          target: soulPath(config.instance, agentId),
+          risk: "low",
+          evidence: {
+            agentId,
+            snapshot,
+            fromPath: result.from,
+            restoredBytes: result.restoredBytes,
+            preRestoreSnapshot: result.preRestoreSnapshot
+          }
+        },
+        { agentId }
+      );
+    });
+    return {
+      ok: true,
+      kind: "soul",
+      agentId,
+      restoredBytes: result.restoredBytes,
+      fromPath: result.from,
+      preRestoreSnapshot: result.preRestoreSnapshot,
+      activePath: soulPath(config.instance, agentId)
+    };
+  }
+  return { ok: false, reason: "kind must be one of: user, soul" };
 }
 
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {

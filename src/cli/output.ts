@@ -121,6 +121,7 @@ Usage:
   bun run gini audit
   bun run gini evidence
   bun run gini smoke
+  bun run gini identity show|history|rollback
 
 Process lifecycle:
   gini start      - daemon mode; instance keeps running after the terminal

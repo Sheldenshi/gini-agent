@@ -1664,6 +1664,85 @@ describe("runtime api", () => {
       expect(body.error).toMatch(/chatId must be a finite integer/);
     }
   });
+
+  describe("identity-files routes", () => {
+    test("GET /api/identity-files returns INSTRUCTIONS.md, USER.md, and SOULs with budget metadata", async () => {
+      const config = testConfig("identity-show");
+      const handler = createHandler(config);
+      // Seed USER.md so the budget snapshot is meaningful.
+      const { writeUserProfile, scaffoldInstanceIdentityFiles } = await import("./runtime/identity-files");
+      scaffoldInstanceIdentityFiles(config.instance);
+      writeUserProfile(config.instance, "## Identity\n- Name: TestUser", "approved");
+      const dump = await call(handler, config, "/api/identity-files");
+      expect(dump.instance).toBe(config.instance);
+      expect(dump.userProfile.content).toContain("Name: TestUser");
+      expect(dump.userProfile.cap).toBe(1500);
+      expect(dump.userProfile.budget.used).toBeGreaterThan(0);
+      expect(dump.userProfile.budget.overCap).toBe(false);
+      // INSTRUCTIONS.md is materialized by scaffold; the route returns
+      // its content trimmed.
+      expect(dump.instructions.content).toMatch(/local-first personal agent/);
+    });
+
+    test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
+      const config = testConfig("identity-history");
+      const handler = createHandler(config);
+      const { writeUserProfile } = await import("./runtime/identity-files");
+      writeUserProfile(config.instance, "v1", "approved");
+      writeUserProfile(config.instance, "v2", "approved");
+      writeUserProfile(config.instance, "v3", "approved");
+      const out = await call(handler, config, "/api/identity-files/history?kind=user");
+      expect(out.kind).toBe("user");
+      // Three writes → two snapshots in history (first write has nothing
+      // to roll back to).
+      expect(out.entries.length).toBe(2);
+      // Each entry carries a path-safe name and a positive size.
+      for (const entry of out.entries) {
+        expect(entry.name).toMatch(/\.md$/);
+        expect(entry.sizeBytes).toBeGreaterThan(0);
+      }
+    });
+
+    test("POST /api/identity-files/rollback restores from a snapshot and emits an audit row", async () => {
+      const config = testConfig("identity-rollback");
+      const handler = createHandler(config);
+      const { writeUserProfile, listUserProfileHistory, userProfilePath } = await import("./runtime/identity-files");
+      writeUserProfile(config.instance, "v1 body", "approved");
+      writeUserProfile(config.instance, "v2 body", "approved");
+      writeUserProfile(config.instance, "v3 body", "approved");
+      const history = listUserProfileHistory(config.instance);
+      const v1Snap = history.find((e) => readFileSync(e.path, "utf8") === "v1 body");
+      expect(v1Snap).toBeDefined();
+      const result = await call(handler, config, "/api/identity-files/rollback", {
+        method: "POST",
+        body: JSON.stringify({ kind: "user", snapshot: v1Snap!.name })
+      });
+      expect(result.ok).toBe(true);
+      expect(result.restoredBytes).toBe(Buffer.byteLength("v1 body", "utf8"));
+      // The active USER.md now holds the rolled-back body.
+      expect(readFileSync(userProfilePath(config.instance), "utf8")).toBe("v1 body");
+      // Audit row recorded the rollback.
+      const state = readState(config.instance);
+      const audit = state.audit.find((a) => a.action === "identity.user_profile.rollback");
+      expect(audit).toBeDefined();
+      // Pre-rollback snapshot was created so the rollback is itself
+      // reversible.
+      expect(result.preRestoreSnapshot).not.toBeNull();
+    });
+
+    test("POST /api/identity-files/rollback rejects an unknown snapshot name with reason='no snapshot'", async () => {
+      const config = testConfig("identity-rollback-unknown");
+      const handler = createHandler(config);
+      const { writeUserProfile } = await import("./runtime/identity-files");
+      writeUserProfile(config.instance, "v1", "approved");
+      const result = await call(handler, config, "/api/identity-files/rollback", {
+        method: "POST",
+        body: JSON.stringify({ kind: "user", snapshot: "2099-01-01T00-00-00.000Z.md" })
+      });
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe("no snapshot");
+    });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
