@@ -420,8 +420,8 @@ function BridgeAddedSummary({
                   <Button size="sm" variant="outline" onClick={copyCode}>Copy</Button>
                 </div>
                 <p className="text-[11px] text-muted-foreground">
-                  After you DM the code, a pairing request will appear under the bridge on this
-                  page — click Approve to finish enrollment.
+                  Your chat is enrolled automatically once the code matches — the bot replies
+                  &quot;Paired&quot; and you can start messaging. No approval step required.
                 </p>
               </>
             ) : (
