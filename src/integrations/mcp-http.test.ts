@@ -74,6 +74,62 @@ describe("redactSecretsInText", () => {
   test("leaves non-secret bodies untouched", () => {
     expect(redactSecretsInText("rate limited; retry-after: 30s")).toBe("rate limited; retry-after: 30s");
   });
+
+  test("redacts URL query token (?token=)", () => {
+    const input = "GET https://api.example.com/v1?token=SUPERSECRET HTTP/1.1";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("redacts URL query access_token (&access_token=)", () => {
+    const input = "redirect_uri=foo&access_token=SUPERSECRET&state=xyz";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("redacts form-encoded api_key=", () => {
+    const input = "grant_type=client_credentials&api_key=SUPERSECRET";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts JSON-quoted {"x-api-key":"..."}', () => {
+    const input = '{"headers":{"x-api-key":"SUPERSECRET"}}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts JSON-quoted {"x-auth-token":"..."}', () => {
+    const input = '{"x-auth-token":"SUPERSECRET"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts JSON-quoted {"cookie":"session=..."}', () => {
+    const input = '{"cookie":"session=SUPERSECRET"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts JSON-quoted authorization with lowercase bearer', () => {
+    const input = '{"authorization":"bearer SUPERSECRET"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("redacts entire Cookie header value (multi-cookie)", () => {
+    const input = "Cookie: theme=light; session=SUPERSECRET; foo=bar";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).not.toContain("foo=bar");
+  });
 });
 
 describe("postRpc error body redaction (regression)", () => {
@@ -86,6 +142,24 @@ describe("postRpc error body redaction (regression)", () => {
     expect(result.error).toBeTruthy();
     expect(result.error).not.toContain(leakedToken);
     expect(result.error).toContain("401");
+  });
+
+  test("sanitizes secrets echoed inside a JSON-RPC 200 error message", async () => {
+    const leakedToken = "lin_api_RPC200_LEAKED";
+    globalThis.fetch = (async (_url: unknown, init: RequestInit | undefined) => {
+      const id = (await readRequestId(init)) ?? 0;
+      const body = {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32000, message: `Bad auth: Authorization: Bearer ${leakedToken}` }
+      };
+      return jsonResp(body);
+    }) as unknown as typeof fetch;
+    const result = await httpMcpInitialize("https://example.test/mcp", { authorization: `Bearer ${leakedToken}` });
+    expect(result.ok).toBe(false);
+    expect(result.error).toBeTruthy();
+    expect(result.error).not.toContain(leakedToken);
+    expect(result.error).toContain("[REDACTED]");
   });
 });
 

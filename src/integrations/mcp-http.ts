@@ -50,10 +50,10 @@ export interface McpCallToolResult {
 // the value lands in state.json or audit evidence.
 //
 // The redaction is best-effort, not exhaustive: it targets well-known
-// auth header names plus any `*-Token` / `*-Key` variant. The body might
-// be JSON, plaintext, HTML, or framed SSE; matching on a header-style
-// `Name: value` prefix on each line covers the common cases without
-// trying to parse arbitrary upstream formats.
+// auth header names plus any `*-Token` / `*-Key` variant, in both
+// header-style (`Name: value`), URL/form-encoded (`?token=` / `&api_key=`),
+// and JSON-quoted (`"x-api-key":"value"`) forms. All name matches are
+// case-insensitive.
 const AUTH_HEADER_NAMES = [
   "authorization",
   "cookie",
@@ -63,23 +63,72 @@ const AUTH_HEADER_NAMES = [
   "x-auth-token"
 ];
 
+// Query/form-style secret parameter names. Matched after `?` or `&`, or as
+// a `name=value` segment at a delimiter boundary (start-of-string, whitespace,
+// `&`, `;`, or `,`). Case-insensitive.
+const SECRET_QUERY_PARAMS = [
+  "token",
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "api_key",
+  "api-key",
+  "apikey",
+  "client_secret"
+];
+
 export function redactSecretsInText(input: string): string {
   if (!input) return input;
-  // 1) Exact-match well-known auth headers: replace the value with [REDACTED].
   let out = input;
+
+  // 1) JSON-quoted form first: `"name"\s*:\s*"value"`. Cover known
+  //    auth-bearing header names plus the *-token/*-key tail. Doing
+  //    this before the generic header pass means we redact the *contents*
+  //    of the quoted value (not just up to the closing quote via the
+  //    `[^"]` exclusion in the generic pass, which would still leave
+  //    nothing — but the generic pass treats the surrounding `"` as a
+  //    stop char and misses this form entirely).
   for (const name of AUTH_HEADER_NAMES) {
+    const re = new RegExp(`("${name}"\\s*:\\s*)"[^"]*"`, "gi");
+    out = out.replace(re, '$1"[REDACTED]"');
+  }
+  out = out.replace(/("[A-Za-z][\w-]*-(?:token|key)"\s*:\s*)"[^"]*"/gi, '$1"[REDACTED]"');
+
+  // 2) Cookie header: redact the entire value up to newline / end-of-string,
+  //    not just up to the first `;`. A `Cookie:` header is a single
+  //    header whose value is a `; `-delimited list of `name=value` pairs,
+  //    every one of which can be a session token. Same applies to
+  //    `Set-Cookie:`.
+  out = out.replace(/((?:^|[\r\n])(?:set-)?cookie\s*:\s*)[^\r\n]+/gi, "$1[REDACTED]");
+
+  // 3) Header-style well-known auth headers (after Cookie handling so the
+  //    Cookie line is already fully redacted). Stops at line terminators
+  //    and structural delimiters typical of header dumps.
+  for (const name of AUTH_HEADER_NAMES) {
+    if (name === "cookie" || name === "set-cookie") continue; // handled above
     const re = new RegExp(`(${name}\\s*[:=]\\s*)([^\\r\\n,;"']+)`, "gi");
     out = out.replace(re, "$1[REDACTED]");
   }
-  // 2) Any header-style line that ends in `-token` or `-key` (e.g.
+
+  // 4) Any header-style line that ends in `-token` or `-key` (e.g.
   //    `X-Service-Token: …`). Conservative: requires the name to be at
   //    the start of a line or after `, ` / `; ` to avoid mangling JSON
   //    values that happen to contain "key".
   out = out.replace(/(^|[\r\n,;])([A-Za-z][\w-]*-(?:token|key))\s*:\s*[^\r\n,;"']+/gi, "$1$2: [REDACTED]");
-  // 3) Bearer tokens that appear without a header name (e.g. echoed in a
-  //    JSON `"authorization":"Bearer …"` body or in prose). We already
-  //    handled the header-name case above; this catches bare `Bearer X`.
-  out = out.replace(/\bBearer\s+[A-Za-z0-9._\-+/=]+/g, "Bearer [REDACTED]");
+
+  // 5) URL / form-encoded secret query params (`?token=…`, `&access_token=…`,
+  //    `api_key=…`). Value runs until the next `&`, `;`, whitespace, or
+  //    end-of-string. Case-insensitive.
+  for (const param of SECRET_QUERY_PARAMS) {
+    const re = new RegExp(`(^|[?&;,\\s])(${param})=([^&;\\s"'<>\\r\\n]+)`, "gi");
+    out = out.replace(re, "$1$2=[REDACTED]");
+  }
+
+  // 6) Bearer tokens that appear without a header name (e.g. echoed in a
+  //    JSON `"authorization":"Bearer …"` body or in prose). Case-insensitive
+  //    so lowercase `bearer` is also caught.
+  out = out.replace(/\b[Bb]earer\s+[A-Za-z0-9._\-+/=]+/g, "Bearer [REDACTED]");
+
   return out;
 }
 
@@ -148,7 +197,11 @@ async function postRpc(url: string, headers: Record<string, string>, method: str
   if (!payload.ok) return payload;
   if (payload.body && typeof payload.body === "object" && "error" in payload.body) {
     const err = (payload.body as { error: { message?: string; code?: number } }).error;
-    return { ok: false, error: err.message ?? `MCP error code ${err.code ?? "?"}` };
+    // JSON-RPC error messages can include echoed request metadata (including
+    // Authorization), same hazard as the non-2xx HTTP body above. Scrub
+    // before returning so the message never lands in audit evidence raw.
+    const safeMessage = err.message ? redactSecretsInText(err.message) : undefined;
+    return { ok: false, error: safeMessage ?? `MCP error code ${err.code ?? "?"}` };
   }
   if (payload.body && typeof payload.body === "object" && "result" in payload.body) {
     return { ok: true, result: (payload.body as { result: unknown }).result };
