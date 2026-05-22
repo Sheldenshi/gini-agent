@@ -130,6 +130,72 @@ describe("redactSecretsInText", () => {
     expect(out).not.toContain("SUPERSECRET");
     expect(out).not.toContain("foo=bar");
   });
+
+  test("redacts inline Cookie: in prose (not at line start)", () => {
+    const input = "upstream echoed Cookie: theme=light; session=SUPERSECRET; foo=bar";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).not.toContain("foo=bar");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("redacts inline Set-Cookie: in prose (not at line start)", () => {
+    const input = "server replied Set-Cookie: session=SUPERSECRET; HttpOnly; foo=bar";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).not.toContain("foo=bar");
+  });
+
+  test("catches mixed-case bare bearer tokens", () => {
+    const input = "auth: bEaReR SUPERSECRET";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("catches uppercase BEARER bare tokens", () => {
+    const input = "got: BEARER SUPERSECRET trailing";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test("does not over-redact prose after a single 'bearer' word", () => {
+    // The bare-bearer match should consume only the token immediately
+    // following the keyword, not everything to end-of-string.
+    const input = "Bearer ABC123 followed by harmless prose and more text";
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("ABC123");
+    expect(out).toContain("followed by harmless prose and more text");
+  });
+
+  test('redacts escaped-JSON x-api-key (backslash-quoted)', () => {
+    const input = '{"error":"{\\"x-api-key\\":\\"SUPERSECRET\\"}"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts escaped-JSON cookie (backslash-quoted)', () => {
+    const input = '{"error":"{\\"cookie\\":\\"session=SUPERSECRET\\"}"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts escaped-JSON authorization (backslash-quoted)', () => {
+    const input = '{"error":"{\\"authorization\\":\\"Bearer SUPERSECRET\\"}"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
+
+  test('redacts escaped-JSON arbitrary *-token / *-key', () => {
+    const input = '{"err":"got \\"x-service-token\\":\\"SUPERSECRET\\" back"}';
+    const out = redactSecretsInText(input);
+    expect(out).not.toContain("SUPERSECRET");
+    expect(out).toContain("[REDACTED]");
+  });
 });
 
 describe("postRpc error body redaction (regression)", () => {
