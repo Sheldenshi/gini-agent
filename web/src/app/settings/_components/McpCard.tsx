@@ -9,22 +9,10 @@ import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
+import type { ChatAllowlistView } from "@runtime/integrations/messaging";
 
 export interface McpRow { id: string; name: string; status: string; command: string; lastHealthAt?: string }
 export interface MessagingRow { id: string; name: string; status: string; kind: string }
-
-interface DeniedChatAttempt {
-  chatId: number;
-  chatType: string;
-  sender?: string;
-  lastAttemptAt: string;
-}
-
-interface ChatAllowlistView {
-  allowedChatIds: number[];
-  ownerChatId?: number;
-  recentDeniedChats: DeniedChatAttempt[];
-}
 
 export function McpCard({
   servers,
