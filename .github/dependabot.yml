@@ -1,12 +1,12 @@
 version: 2
 updates:
-  - package-ecosystem: npm
+  - package-ecosystem: bun
     directory: "/"
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
 
-  - package-ecosystem: npm
+  - package-ecosystem: bun
     directory: "/web"
     schedule:
       interval: weekly
