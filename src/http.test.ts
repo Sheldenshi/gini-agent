@@ -1708,6 +1708,33 @@ describe("runtime api", () => {
     }
   });
 
+  test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
+    // Same parseChatIdStrict guard as /allow — pin it here so the new
+    // route doesn't regress to 500 on bad input as the surface grows.
+    const config = testConfig("messaging-reject-pending-bad-chatid");
+    const handler = createHandler(config);
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    const badPayloads: Array<unknown> = [null, "", "123abc", "abc", 1.5];
+    for (const chatId of badPayloads) {
+      const response = await rawCall(
+        handler,
+        config,
+        `/api/messaging/${bridge.id}/reject-pending`,
+        { method: "POST", body: JSON.stringify({ chatId }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toMatch(/chatId must be a finite integer/);
+    }
+  });
+
   test("rejects /api/embedding/reembed payloads that pass both allBanks and bankId", async () => {
     // The CLI throws when both --all-banks and --bank are supplied
     // (src/cli/commands/embedding.ts). The HTTP API has to mirror
