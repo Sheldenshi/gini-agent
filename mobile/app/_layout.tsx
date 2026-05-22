@@ -78,7 +78,10 @@ export default function RootLayout() {
           <Stack screenOptions={screenOptions}>
             <Stack.Screen name="index" options={{ headerShown: false }} />
             <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
-            <Stack.Screen name="agents" options={{ headerShown: false }} />
+            {/* agents.tsx owns its own headerTitle/headerRight via a
+                <Stack.Screen> inside the component, so the native stack
+                header stays on for safe-area + transition behavior. */}
+            <Stack.Screen name="agents" />
             <Stack.Screen name="settings" options={{ title: "Settings" }} />
             <Stack.Screen name="chat/[sessionId]" options={{ title: "Chat" }} />
           </Stack>
