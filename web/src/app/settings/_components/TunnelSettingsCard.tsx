@@ -76,6 +76,14 @@ export function TunnelSettingsCard() {
     onError: (error: Error) => toast.error(error.message)
   });
 
+  const liveUrl = snapshot.data?.cloudflareUrl ?? null;
+  // Cache-buster ties the QR fetch to the observedAt timestamp so a fresh
+  // tunnel URL always pulls a fresh SVG (the cache headers say no-store
+  // but a stale browser-cached image would otherwise be a footgun).
+  const qrSrc = liveUrl && snapshot.data?.observedAt
+    ? `/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(snapshot.data.observedAt)}`
+    : null;
+
   return (
     <>
       <Card>
@@ -89,8 +97,8 @@ export function TunnelSettingsCard() {
           <Row
             label="Tunnel"
             description={
-              snapshot.data?.cloudflareUrl
-                ? `Live at ${snapshot.data.cloudflareUrl}`
+              liveUrl
+                ? `Live at ${liveUrl}`
                 : tunnelEnabled
                   ? "Connecting…"
                   : "Off"
@@ -102,6 +110,21 @@ export function TunnelSettingsCard() {
               onChange={(next) => toggleTunnel.mutate(next)}
             />
           </Row>
+
+          {qrSrc ? (
+            <div className="flex flex-col items-center gap-2 rounded-md border border-border bg-card/40 p-3">
+              <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Scan to open on a phone</div>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={qrSrc}
+                alt="QR code for the current tunnel URL"
+                className="h-44 w-44 rounded-sm bg-white"
+              />
+              <p className="text-[11px] text-muted-foreground">
+                The URL embedded in this QR rotates on every gateway restart.
+              </p>
+            </div>
+          ) : null}
 
           <Row
             label={
