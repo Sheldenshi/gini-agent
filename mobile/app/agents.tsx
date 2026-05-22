@@ -1,7 +1,8 @@
 import { router, Stack } from "expo-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Animated,
   FlatList,
   Modal,
   Pressable,
@@ -10,7 +11,8 @@ import {
   Text,
   TextInput,
   TouchableOpacity,
-  View
+  View,
+  useWindowDimensions
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
@@ -22,13 +24,14 @@ import {
   useCreateChat,
   useUseAgent
 } from "@/src/queries";
-import { avatarColor, avatarInitial, theme } from "@/src/theme";
+import { theme } from "@/src/theme";
 import type { AgentRecord, ChatSession } from "@/src/types";
 
 // Home screen: a full-width chat list for the currently selected agent.
 // The agent picker lives in the native stack header — tapping the title
-// opens a slide-up Modal listing every agent. The "New" and "Settings"
-// text actions share the right side of the header.
+// opens a Slack-style left-drawer Modal listing every agent. The "+ new
+// chat" icon and "Settings" text label share the right side of the
+// header.
 export default function AgentsScreen() {
   const agents = useAgents();
   const useAgent = useUseAgent();
@@ -273,7 +276,9 @@ function HeaderActions({
           {creating ? (
             <ActivityIndicator color={theme.accent} />
           ) : (
-            <Text style={styles.headerActionText}>New</Text>
+            <View style={styles.headerPlus}>
+              <Text style={styles.headerPlusText}>+</Text>
+            </View>
           )}
         </TouchableOpacity>
       ) : null}
@@ -465,8 +470,6 @@ function ChatRow({
   // present, which the runtime fills in for some flows.
   const subtitle = session.summary?.trim() || agent?.name || "";
   const time = relativeTime(session.updatedAt ?? session.createdAt);
-  const initial = avatarInitial(title);
-  const bg = avatarColor(session.id);
 
   return (
     <TouchableOpacity
@@ -474,9 +477,6 @@ function ChatRow({
       activeOpacity={0.7}
       style={styles.chatRow}
     >
-      <View style={[styles.chatRowAvatar, { backgroundColor: bg }]}>
-        <Text style={styles.chatRowAvatarText}>{initial}</Text>
-      </View>
       <View style={styles.chatRowBody}>
         <View style={styles.chatRowTopLine}>
           <Text style={styles.chatRowTitle} numberOfLines={1}>
@@ -495,6 +495,16 @@ function ChatRow({
     </TouchableOpacity>
   );
 }
+
+// Width of the exposed strip on the right side of the screen where the
+// previous screen peeks through; tapping this strip dismisses the picker.
+// Mirrors Slack's workspace-switcher behavior. Kept small so the picker
+// itself has room for the agent list — 40px is enough to read as a
+// dismiss target without the panel feeling cramped.
+const PICKER_DISMISS_STRIP = 40;
+// Slide animation duration in ms. Matches the React Native iOS sheet
+// animation feel.
+const PICKER_ANIM_DURATION = 220;
 
 function AgentPickerModal({
   visible,
@@ -525,65 +535,130 @@ function AgentPickerModal({
   onCancelNewAgent: () => void;
   onClose: () => void;
 }) {
-  // Full-height panel modeled on Slack's workspace switcher: large title
-  // top-left, list takes the middle (flex: 1), and the "+ New agent" row
-  // pins to the bottom under a divider. The Modal itself still uses
-  // `transparent` + slide animation so the sheet slides up over the
-  // current screen rather than replacing it outright.
+  // Slack-style left drawer: full-height panel that slides in from the
+  // left edge. We drive the slide ourselves with Animated.View so we can
+  // reveal a thin strip of the previous screen on the right that doubles
+  // as a tap-to-dismiss target — `Modal animationType="slide"` doesn't
+  // support horizontal animation directly. The Modal itself uses
+  // `animationType="none"` and we control the open/close transitions.
+  //
+  // `mounted` decouples render lifetime from `visible` so the close
+  // animation can run to completion before the Modal unmounts. When
+  // `visible` flips true we mount immediately, snap to the off-screen
+  // position, then animate to 0. When `visible` flips false we animate
+  // back to the off-screen position and only set `mounted=false` once
+  // the animation finishes.
+  const { width: screenWidth } = useWindowDimensions();
+  const panelWidth = Math.max(0, screenWidth - PICKER_DISMISS_STRIP);
+  // Initial value is the off-screen position so first-render's slide-in
+  // starts from the left edge. The Animated.Value is created once via
+  // useRef; subsequent updates flow through setValue / Animated.timing.
+  const translateX = useRef(new Animated.Value(-panelWidth)).current;
+  const [mounted, setMounted] = useState(visible);
+
+  useEffect(() => {
+    if (visible) {
+      // Mount the panel (no-op if already mounted) and slide it in. We
+      // snap to the off-screen position first so a re-open from
+      // mid-close starts cleanly from the left edge rather than jumping
+      // from wherever the close animation paused.
+      setMounted(true);
+      translateX.setValue(-panelWidth);
+      const anim = Animated.timing(translateX, {
+        toValue: 0,
+        duration: PICKER_ANIM_DURATION,
+        useNativeDriver: true
+      });
+      anim.start();
+      return () => {
+        anim.stop();
+      };
+    }
+    // Slide out, then unmount on completion. Animating from the current
+    // value (which may be 0 or mid-slide) means the close picks up
+    // smoothly even if the user dismisses mid-open.
+    const anim = Animated.timing(translateX, {
+      toValue: -panelWidth,
+      duration: PICKER_ANIM_DURATION,
+      useNativeDriver: true
+    });
+    anim.start(({ finished }) => {
+      if (finished) setMounted(false);
+    });
+    return () => {
+      anim.stop();
+    };
+  }, [visible, panelWidth, translateX]);
+
+  if (!mounted) return null;
+
   return (
     <Modal
-      visible={visible}
+      visible
       transparent
-      animationType="slide"
+      animationType="none"
       onRequestClose={onClose}
       statusBarTranslucent
     >
-      <View style={styles.modalSheet}>
-        <SafeAreaView edges={["top", "bottom"]} style={styles.modalSheetInner}>
-          <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>
-              {mode === "list" ? "Agents" : "New agent"}
-            </Text>
-            <TouchableOpacity
-              onPress={onClose}
-              hitSlop={8}
-              accessibilityRole="button"
-              accessibilityLabel="Close"
-              style={styles.modalClose}
-            >
-              <Text style={styles.modalCloseText}>Done</Text>
-            </TouchableOpacity>
-          </View>
-          {mode === "list" ? (
-            <>
-              <FlatList
-                data={agents}
-                keyExtractor={(a) => a.id}
-                style={styles.pickerList}
-                contentContainerStyle={styles.pickerListContent}
-                renderItem={({ item }) => (
-                  <AgentPickerRow
-                    agent={item}
-                    selected={item.id === selectedAgentId}
-                    onPress={() => onPick(item)}
-                  />
-                )}
-                ItemSeparatorComponent={PickerRowSpacer}
+      <View style={styles.modalRoot}>
+        <Animated.View
+          style={[
+            styles.modalPanel,
+            { width: panelWidth, transform: [{ translateX }] }
+          ]}
+        >
+          <SafeAreaView edges={["top", "bottom"]} style={styles.modalSheetInner}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>
+                {mode === "list" ? "Agents" : "New agent"}
+              </Text>
+              <TouchableOpacity
+                onPress={onClose}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="Close"
+                style={styles.modalClose}
+              >
+                <Text style={styles.modalCloseText}>Done</Text>
+              </TouchableOpacity>
+            </View>
+            {mode === "list" ? (
+              <>
+                <FlatList
+                  data={agents}
+                  keyExtractor={(a) => a.id}
+                  style={styles.pickerList}
+                  contentContainerStyle={styles.pickerListContent}
+                  renderItem={({ item }) => (
+                    <AgentPickerRow
+                      agent={item}
+                      selected={item.id === selectedAgentId}
+                      onPress={() => onPick(item)}
+                    />
+                  )}
+                  ItemSeparatorComponent={PickerRowSpacer}
+                />
+                <View style={styles.pickerFooterDivider} />
+                <NewAgentFooterRow onPress={onStartNewAgent} />
+              </>
+            ) : (
+              <NewAgentForm
+                name={newAgentName}
+                error={newAgentError}
+                creating={creating}
+                onChangeName={onChangeNewAgentName}
+                onSubmit={onSubmitNewAgent}
+                onCancel={onCancelNewAgent}
               />
-              <View style={styles.pickerFooterDivider} />
-              <NewAgentFooterRow onPress={onStartNewAgent} />
-            </>
-          ) : (
-            <NewAgentForm
-              name={newAgentName}
-              error={newAgentError}
-              creating={creating}
-              onChangeName={onChangeNewAgentName}
-              onSubmit={onSubmitNewAgent}
-              onCancel={onCancelNewAgent}
-            />
-          )}
-        </SafeAreaView>
+            )}
+          </SafeAreaView>
+        </Animated.View>
+        <Pressable
+          onPress={onClose}
+          style={[styles.modalDismissStrip, { width: PICKER_DISMISS_STRIP }]}
+          accessibilityRole="button"
+          accessibilityLabel="Close agent picker"
+        />
       </View>
     </Modal>
   );
@@ -752,6 +827,29 @@ const styles = StyleSheet.create({
     justifyContent: "center"
   },
   headerActionText: { color: theme.accent, fontSize: 15, fontWeight: "500" },
+  // WeChat-style circle-plus icon used for "new chat". The thin stroke
+  // and matching accent color keep it visually quiet next to the
+  // "Settings" text label that still lives in the header.
+  headerPlus: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: theme.accent,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  headerPlusText: {
+    color: theme.accent,
+    fontSize: 18,
+    lineHeight: 18,
+    fontWeight: "400",
+    // Optical centering: the "+" glyph carries slightly more bottom
+    // bearing than top in most system fonts, so a tiny negative top
+    // margin pulls it into the geometric center of the circle. Without
+    // this it visually sits a hair low.
+    marginTop: -1
+  },
 
   // Search bar — pill-shaped TextInput above the chat list.
   searchBarContainer: { paddingHorizontal: 12, paddingVertical: 8 },
@@ -773,24 +871,12 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     gap: 12
   },
-  // Separator starts at the title's left edge so the avatar column
-  // stays uninterrupted: 16 (row padding) + 48 (avatar) + 12 (gap).
+  // Separator starts at the row's horizontal padding (16) since rows
+  // no longer have a leading avatar column.
   chatRowSeparator: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: theme.border,
-    marginLeft: 76
-  },
-  chatRowAvatar: {
-    width: 48,
-    height: 48,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center"
-  },
-  chatRowAvatarText: {
-    color: "#FFFFFF",
-    fontSize: 18,
-    fontWeight: "700"
+    marginLeft: 16
   },
   chatRowBody: { flex: 1, gap: 2 },
   chatRowTopLine: { flexDirection: "row", alignItems: "flex-start", gap: 8 },
@@ -813,18 +899,26 @@ const styles = StyleSheet.create({
   },
   newButtonText: { color: theme.buttonText, fontSize: 15, fontWeight: "600" },
 
-  // Modal — full-height panel modeled on Slack's workspace switcher.
-  // The sheet fills the entire screen (the slide animation still gives
-  // it a panel feel) and the inner SafeAreaView consumes both the top
-  // notch inset and the bottom home-indicator inset so neither the
-  // title nor the pinned footer collides with system chrome.
-  modalSheet: {
+  // Modal — Slack-style left-edge drawer. `modalRoot` lays out the
+  // animated panel (full height, almost-full width) and a thin
+  // tap-to-dismiss strip on the right that lets the previous screen
+  // peek through. The inner SafeAreaView consumes both the top notch
+  // inset and the bottom home-indicator inset so neither the title nor
+  // the pinned footer collides with system chrome.
+  modalRoot: {
     position: "absolute",
     top: 0,
     left: 0,
     right: 0,
     bottom: 0,
+    flexDirection: "row"
+  },
+  modalPanel: {
+    height: "100%",
     backgroundColor: theme.bg
+  },
+  modalDismissStrip: {
+    height: "100%"
   },
   modalSheetInner: { flex: 1 },
   modalHeader: {
