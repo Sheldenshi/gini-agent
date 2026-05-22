@@ -1553,7 +1553,9 @@ async function editUserProfileTool(
   }
   if (action === "remove") {
     const needle = requireString(args, "needle");
-    const removeResult = removeUserProfileSection(config.instance, needle, "proposed");
+    // Auto-approve: write directly to the approved USER.md instead of
+    // routing through `.proposed`. See ADR memory-surface-consolidation.md.
+    const removeResult = removeUserProfileSection(config.instance, needle, "approved");
     if (!removeResult.ok) {
       const reason = removeResult.reason === "no source"
         ? "no approved USER.md exists to remove from"
@@ -1566,7 +1568,7 @@ async function editUserProfileTool(
         state,
         {
           actor: "agent",
-          action: "identity.user_profile.proposed",
+          action: "identity.user_profile.approved",
           target: removeResult.path,
           risk: "low",
           taskId: item.id,
@@ -1575,7 +1577,8 @@ async function editUserProfileTool(
             action,
             needle,
             path: removeResult.path,
-            scanFindings: removeResult.scanFindings
+            scanFindings: removeResult.scanFindings,
+            autoApproved: true
           }
         },
         { taskId: item.id }
@@ -1584,10 +1587,10 @@ async function editUserProfileTool(
     });
     appendTrace(config.instance, taskId, {
       type: "model",
-      message: "Proposed USER.md remove",
+      message: "USER.md remove (auto-approved)",
       data: { action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings }
     });
-    return `Proposed USER.md edit at ${removeResult.path} (removed paragraph matching "${needle}"). Awaiting user approval via POST /api/identity-files/user/approve.`;
+    return `Updated USER.md at ${removeResult.path} (removed paragraph matching "${needle}").`;
   }
   const content = requireString(args, "content");
   let body = content;
@@ -1597,14 +1600,19 @@ async function editUserProfileTool(
       body = `${existing.trim()}\n\n${content.trim()}`;
     }
   }
-  const result = writeUserProfile(config.instance, body, "proposed");
+  // Auto-approve: write directly to the approved file. The injection
+  // scan still runs inside `writeUserProfile` — when it flags threats
+  // the scanFindings list rides on the audit row + tool-result string,
+  // matching the fail-soft posture from the propose-vs-approve era. See
+  // ADR memory-surface-consolidation.md.
+  const result = writeUserProfile(config.instance, body, "approved");
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(
       state,
       {
         actor: "agent",
-        action: "identity.user_profile.proposed",
+        action: "identity.user_profile.approved",
         target: result.path,
         risk: "low",
         taskId: item.id,
@@ -1613,7 +1621,8 @@ async function editUserProfileTool(
           action,
           path: result.path,
           contentBytes: body.length,
-          scanFindings: result.scanFindings
+          scanFindings: result.scanFindings,
+          autoApproved: true
         }
       },
       { taskId: item.id }
@@ -1622,13 +1631,13 @@ async function editUserProfileTool(
   });
   appendTrace(config.instance, taskId, {
     type: "model",
-    message: "Proposed USER.md edit",
+    message: "USER.md edit (auto-approved)",
     data: { action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings }
   });
   const scanNote = result.scanFindings.length > 0
-    ? ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`
+    ? ` (scan flagged: ${result.scanFindings.join(", ")})`
     : "";
-  return `Proposed USER.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/user/approve.`;
+  return `Updated USER.md at ${result.path}${scanNote}.`;
 }
 
 // Cross-session lookup wrapping `searchSessions`. Returns up to `limit`

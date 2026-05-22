@@ -810,25 +810,28 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Propose an edit to the instance-scoped USER.md. Same propose →
-    // approve flow as edit_soul. USER.md is instance-scoped so the
-    // user's identity carries across agent switches. Always exposed.
+    // Edit the instance-scoped USER.md. Auto-approved: writes land at
+    // USER.md directly and ride the system prompt on the next turn.
+    // USER.md is instance-scoped so the user's identity carries across
+    // agent switches. Distinct from edit_soul (per-agent persona, still
+    // propose → approve). Always exposed. See ADR
+    // memory-surface-consolidation.md.
     toolset: "identity",
     type: "function",
     function: {
       name: "edit_user_profile",
-      description: "Propose an edit to the instance-scoped USER.md (user profile). The proposed body lands as USER.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/user/approve`. Use when the user shares a stable identity fact you should remember about THEM (preferences, role, recurring goals). Distinct from add_memory: USER.md is a single curated profile block that rides the system prompt every turn; add_memory pins short discrete facts. `action: \"set\"` replaces the whole file; `action: \"append\"` adds a new section; `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing approved body (requires `needle`).",
+      description: "Edit the instance-scoped USER.md (user profile). Auto-approved: writes go straight to USER.md (no separate approval step) and ride the system prompt on the next turn. Use when the user shares a stable identity fact you should remember about THEM (name, role, preferences, recurring goals). USER.md is instance-scoped so the user's identity bridges across agent switches. The injection scan still gates content that trips a threat pattern. `action: \"set\"` replaces the whole file; `action: \"append\"` adds a new section; `action: \"remove\"` drops the first paragraph containing the `needle` substring (requires `needle`). Distinct from edit_soul which still requires user approval — SOUL.md edits change agent behavior across every turn, so they keep a second pair of eyes.",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
             enum: ["set", "append", "remove"],
-            description: "Whether to replace the whole USER.md body (set), append a new section below the existing approved content (append), or drop the first paragraph containing `needle` from the existing approved content (remove).",
+            description: "Whether to replace the whole USER.md body (set), append a new section below the existing content (append), or drop the first paragraph containing `needle` from the existing content (remove).",
             default: "set"
           },
           content: { type: "string", description: "The new USER.md body (action=set) or the section to append (action=append). Not required for action=remove." },
-          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing approved USER.md that contains this substring is dropped." }
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing USER.md that contains this substring is dropped." }
         },
         required: []
       }

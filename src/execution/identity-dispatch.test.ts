@@ -228,9 +228,12 @@ describe("edit_soul dispatch", () => {
   });
 });
 
-describe("edit_user_profile dispatch", () => {
-  test("writes a USER.md.proposed and emits identity.user_profile.proposed audit", async () => {
-    const instance = "user-propose-happy";
+describe("edit_user_profile dispatch (auto-approved)", () => {
+  // After the state.memories consolidation, edit_user_profile writes
+  // directly to the approved USER.md instead of routing through
+  // .proposed. See ADR memory-surface-consolidation.md.
+  test("writes directly to USER.md and emits identity.user_profile.approved audit", async () => {
+    const instance = "user-approved-happy";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
@@ -244,20 +247,22 @@ describe("edit_user_profile dispatch", () => {
     );
 
     expect(result.kind).toBe("sync");
-    expect(existsSync(userProfileProposedPath(instance))).toBe(true);
-    expect(readFileSync(userProfileProposedPath(instance), "utf8")).toBe(
+    // Body landed at the approved path; no .proposed sibling exists.
+    expect(existsSync(userProfilePath(instance))).toBe(true);
+    expect(readFileSync(userProfilePath(instance), "utf8")).toBe(
       "User prefers concise replies."
     );
-    expect(existsSync(userProfilePath(instance))).toBe(false);
+    expect(existsSync(userProfileProposedPath(instance))).toBe(false);
 
     const audit = readState(instance).audit.find(
-      (event) => event.action === "identity.user_profile.proposed" && event.actor === "agent"
+      (event) => event.action === "identity.user_profile.approved" && event.actor === "agent"
     );
     expect(audit).toBeDefined();
+    expect(audit?.evidence?.autoApproved).toBe(true);
   });
 
   test("records scan findings on the audit when the body trips a threat pattern", async () => {
-    const instance = "user-propose-blocked";
+    const instance = "user-approved-blocked";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
@@ -272,19 +277,20 @@ describe("edit_user_profile dispatch", () => {
 
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
-      // The tool still writes the proposal — the propose-vs-approve gate
-      // is the safety, not the scan. The scan result rides on the audit
-      // row + the user-facing tool result string so the operator sees it.
+      // Fail-soft: the body still writes (the injection scanner on the
+      // load path replaces it with a BLOCKED notice at read time when
+      // the scan finds threats). The scan findings ride on the audit
+      // row + tool-result string so the operator can see them.
       expect(result.result).toMatch(/scan flagged: prompt_injection/);
     }
     const audit = readState(instance).audit.find(
-      (event) => event.action === "identity.user_profile.proposed"
+      (event) => event.action === "identity.user_profile.approved"
     );
     expect((audit?.evidence?.scanFindings as string[] | undefined) ?? []).toContain("prompt_injection");
   });
 
-  test("remove drops a matching paragraph from the approved USER.md as a proposal", async () => {
-    const instance = "user-propose-remove";
+  test("remove drops a matching paragraph directly from the approved USER.md", async () => {
+    const instance = "user-approved-remove";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
@@ -302,21 +308,22 @@ describe("edit_user_profile dispatch", () => {
     );
 
     expect(result.kind).toBe("sync");
-    const proposed = readFileSync(userProfileProposedPath(instance), "utf8");
-    expect(proposed).toContain("Likes coffee.");
-    expect(proposed).toContain("Prefers async.");
-    expect(proposed).not.toContain("commute traffic");
-    expect(readFileSync(approvedPath, "utf8")).toContain("commute traffic");
+    // Approved file updated in place; no .proposed sibling created.
+    const body = readFileSync(approvedPath, "utf8");
+    expect(body).toContain("Likes coffee.");
+    expect(body).toContain("Prefers async.");
+    expect(body).not.toContain("commute traffic");
+    expect(existsSync(userProfileProposedPath(instance))).toBe(false);
 
     const audit = readState(instance).audit.find(
-      (event) => event.action === "identity.user_profile.proposed" && event.evidence?.action === "remove"
+      (event) => event.action === "identity.user_profile.approved" && event.evidence?.action === "remove"
     );
     expect(audit).toBeDefined();
     expect(audit?.evidence?.needle).toBe("commute traffic");
   });
 
   test("remove returns a clean failure when the needle does not match", async () => {
-    const instance = "user-propose-remove-miss";
+    const instance = "user-approved-remove-miss";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
@@ -337,12 +344,13 @@ describe("edit_user_profile dispatch", () => {
     if (result.kind === "sync") {
       expect(result.result).toMatch(/no paragraph matched needle/);
     }
+    // Neither approved nor proposed was touched on a miss.
     expect(existsSync(userProfileProposedPath(instance))).toBe(false);
     expect(readFileSync(approvedPath, "utf8")).toBe("Likes coffee.");
   });
 
   test("remove returns 'no source' when no approved USER.md exists", async () => {
-    const instance = "user-propose-remove-no-source";
+    const instance = "user-approved-remove-no-source";
     const config = makeConfig(instance);
     await seedAgent(config);
     const taskId = await seedTask(config);
@@ -359,5 +367,39 @@ describe("edit_user_profile dispatch", () => {
     if (result.kind === "sync") {
       expect(result.result).toMatch(/no approved USER\.md exists/);
     }
+  });
+});
+
+describe("edit_soul keeps the propose-vs-approve gate (asymmetric)", () => {
+  // The consolidation auto-approves edit_user_profile but explicitly
+  // leaves edit_soul behind the propose gate — SOUL.md materially
+  // changes agent behavior. Pin the asymmetry here.
+  test("edit_soul writes to SOUL.md.proposed (not the approved file)", async () => {
+    const instance = "soul-still-proposed";
+    const config = makeConfig(instance);
+    await seedAgent(config);
+    const taskId = await seedTask(config);
+
+    await dispatchToolCall(
+      config,
+      taskId,
+      "edit_soul",
+      "call_soul_proposed_gate",
+      JSON.stringify({ content: "Hard-edged critic persona." })
+    );
+
+    expect(existsSync(soulProposedPath(instance, TEST_AGENT))).toBe(true);
+    expect(existsSync(soulPath(instance, TEST_AGENT))).toBe(false);
+
+    const audit = readState(instance).audit.find(
+      (event) => event.action === "identity.soul.proposed"
+    );
+    expect(audit).toBeDefined();
+    // No identity.soul.approved row from the tool itself — approval
+    // requires the POST /api/identity-files/soul/approve endpoint.
+    const approved = readState(instance).audit.find(
+      (event) => event.action === "identity.soul.approved"
+    );
+    expect(approved).toBeUndefined();
   });
 });
