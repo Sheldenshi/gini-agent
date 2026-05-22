@@ -10,6 +10,7 @@ import {
 } from "../state";
 import { addAudit } from "../state/audit";
 import { scaffoldAgentSoulFile } from "../runtime/identity-files";
+import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
   const state = readState(config.instance);
@@ -30,6 +31,32 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
     // Memory and hindsight content is NOT copied: agents start empty.
     // Only the *config* is inherited from the default agent.
     const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
+    // When the caller doesn't supply toolsets, union the current desired
+    // default list into whatever the default agent has on disk. This keeps
+    // newly-created sibling agents on an old instance (where
+    // `agent_default.toolsets` predates a new addition like `browser`)
+    // from inheriting the stale list. The migration in
+    // `migrateDefaultAgentToolsets` already widens `agent_default` itself
+    // on read, but this defends against creation paths that fire before
+    // the next normalize.
+    // Union the canonical DEFAULT_AGENT_TOOLSETS list into whatever the
+    // default agent has on disk. This keeps newly-created sibling agents
+    // on an old instance (where `agent_default.toolsets` predates a new
+    // addition like `browser`) from inheriting the stale list. The
+    // migration in `migrateDefaultAgentToolsets` widens `agent_default`
+    // itself on read, but this defends against creation paths that fire
+    // before the next normalize.
+    const fallbackToolsets = (() => {
+      const seed = Array.isArray(defaultAgent?.toolsets) ? [...defaultAgent.toolsets] : [];
+      const known = new Set(seed);
+      for (const name of DEFAULT_AGENT_TOOLSETS) {
+        if (!known.has(name)) {
+          seed.push(name);
+          known.add(name);
+        }
+      }
+      return seed;
+    })();
     return createAgentRecord(state, {
       name,
       providerName: typeof input.providerName === "string"
@@ -40,7 +67,7 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
         : defaultAgent?.model,
       toolsets: Array.isArray(input.toolsets)
         ? input.toolsets.map(String)
-        : (defaultAgent?.toolsets ?? ["file", "terminal", "memory", "session_search"]),
+        : fallbackToolsets,
       messagingTargets: Array.isArray(input.messagingTargets)
         ? input.messagingTargets.map(String)
         : (defaultAgent?.messagingTargets ?? [])

@@ -1665,6 +1665,57 @@ describe("runtime api", () => {
     }
   });
 
+  test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
+    // Same parseChatIdStrict guard as /allow — pin it here so the new
+    // route doesn't regress to 500 on bad input as the surface grows.
+    const config = testConfig("messaging-reject-pending-bad-chatid");
+    const handler = createHandler(config);
+    const { addMessagingBridge } = await import("./integrations/messaging");
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+    const badPayloads: Array<unknown> = [null, "", "123abc", "abc", 1.5];
+    for (const chatId of badPayloads) {
+      const response = await rawCall(
+        handler,
+        config,
+        `/api/messaging/${bridge.id}/reject-pending`,
+        { method: "POST", body: JSON.stringify({ chatId }) },
+        config.token
+      );
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body.error).toMatch(/chatId must be a finite integer/);
+    }
+  });
+
+  test("rejects /api/embedding/reembed payloads that pass both allBanks and bankId", async () => {
+    // The CLI throws when both --all-banks and --bank are supplied
+    // (src/cli/commands/embedding.ts). The HTTP API has to mirror
+    // that contract: silently ignoring bankId when allBanks=true
+    // would let a caller think they were reembedding a single bank
+    // and instead trigger a full-instance reembed — a destructive,
+    // irreversible operation against every bank in the instance.
+    const config = testConfig("embedding-reembed-conflict");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/embedding/reembed",
+      {
+        method: "POST",
+        body: JSON.stringify({ allBanks: true, bankId: "bank_default" })
+      },
+      config.token
+    );
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toMatch(/mutually exclusive/);
+  });
+
   describe("identity-files routes", () => {
     test("GET /api/identity-files returns INSTRUCTIONS.md, USER.md, and SOULs with budget metadata", async () => {
       const config = testConfig("identity-show");

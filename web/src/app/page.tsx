@@ -130,15 +130,50 @@ export default function HomePage() {
             </CardHeader>
             <CardContent>
               <ul className="divide-y divide-border">
-                {pendingVisible.map((approval) => (
+                {pendingVisible.map((approval) => {
+                  // browser.connect uses the reason as the body and a
+                  // friendlier label as the title — the raw target
+                  // is the same reason string, so the per-row
+                  // rendering stays compact.
+                  const isBrowserConnect = approval.action === "browser.connect";
+                  // The user-facing reason for browser.connect lives on
+                  // payload.reason (set by the dispatch); fall back to the
+                  // approval target (same string) if it's missing. We
+                  // surface this instead of `approval.reason` (the policy
+                  // engine's internal "why this needs approval" text)
+                  // because the chat-side ApprovalActions card shows the
+                  // user-facing reason — the home pending list should match.
+                  // `||` (not `??`) so an empty-string reason also falls
+                  // back to the approval target. `??` only fires for
+                  // null/undefined; a payload that carried `reason: ""`
+                  // would otherwise render a blank card body.
+                  const browserConnectBody =
+                    (typeof approval.payload.reason === "string" && approval.payload.reason.length > 0
+                      ? approval.payload.reason
+                      : undefined) || approval.target;
+                  return (
                   <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-mono text-[11px]">{approval.action}</span>
-                        <RiskPill value={approval.risk} />
+                        <span className="font-mono text-[11px]">
+                          {isBrowserConnect ? "Connect to agent's browser" : approval.action}
+                        </span>
+                        {/*
+                          Suppress the MEDIUM-RISK badge for `browser.connect`.
+                          The action is still gated (the user still has to
+                          click Connect to consent) but the visual framing is
+                          softer because this is a benign sign-in step, not a
+                          destructive action. All other approvals keep the
+                          badge.
+                        */}
+                        {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
                       </div>
-                      <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
-                      <p className="line-clamp-2 text-sm">{approval.reason}</p>
+                      {isBrowserConnect ? null : (
+                        <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
+                      )}
+                      <p className="line-clamp-2 text-sm">
+                        {isBrowserConnect ? browserConnectBody : approval.reason}
+                      </p>
                     </div>
                     <div className="flex shrink-0 gap-2">
                       <Button
@@ -146,7 +181,7 @@ export default function HomePage() {
                         disabled={decide.isPending}
                         onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
                       >
-                        Approve
+                        {isBrowserConnect ? "Connect" : "Approve"}
                       </Button>
                       <Button
                         size="sm"
@@ -154,11 +189,12 @@ export default function HomePage() {
                         disabled={decide.isPending}
                         onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
                       >
-                        Deny
+                        {isBrowserConnect ? "Cancel" : "Deny"}
                       </Button>
                     </div>
                   </li>
-                ))}
+                  );
+                })}
               </ul>
             </CardContent>
           </Card>

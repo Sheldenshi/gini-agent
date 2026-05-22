@@ -35,6 +35,8 @@
 // render a uniform status card.
 
 import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { instanceRoot } from "../paths";
 import { addAudit, mutateState, now, readState } from "../state";
 import { findChromePath } from "../tools/chrome-discovery";
 import {
@@ -179,8 +181,46 @@ function validateCdpUrl(raw: string): { ok: true; url: string } | { ok: false; e
   return { ok: true, url: parsed.toString() };
 }
 
-interface ConnectInput {
+// PUBLIC input shape — accepted directly from authenticated callers (HTTP
+// POST /api/browser/connect body, CLI). Keep this surface minimal and
+// auditable. Fields that affect audit / trust semantics MUST NOT live here,
+// because the HTTP route hands the parsed body straight to connectBrowser
+// without filtering — declaring those fields on this type would let an
+// authenticated client suppress its own audit trail by setting them in the
+// POST body. Such fields belong in `InternalConnectOptions` (third arg),
+// reachable only from in-process call sites.
+export interface ConnectInput {
   cdpUrl?: unknown;
+  // When set to "managed", an existing record that is NOT managed (i.e. a
+  // `cdp`-mode record that may be headless or owned by a different Chrome)
+  // is torn down and replaced with a fresh managed launch instead of being
+  // returned as-is. The default behavior (no `mode`) preserves the existing
+  // "vanilla reconnect" semantics used by the CLI and HTTP endpoint —
+  // empty input means "reconnect to whatever exists." The `browser_connect`
+  // tool dispatch sets `mode: "managed"` because its contract (and the
+  // approval card the user just consented to) promises a visible Chrome
+  // window; silently handing back a stale CDP session would violate that.
+  mode?: "managed";
+  // When true AND mode === "managed", the managed Chrome is launched with
+  // headless: true so no window appears. The per-instance profile dir is
+  // unchanged from the headed launch, so cookies from a prior visible
+  // sign-in replay — the headless session is already signed in. Use this
+  // AFTER sign-in to continue Cloud Console / OAuth work invisibly. Only
+  // takes effect on managed mode; cdp mode is unaffected (the user owns
+  // that Chrome's visibility).
+  headless?: boolean;
+}
+
+// INTERNAL options — never plumbed from network input. Lives as a separate
+// third argument to `connectBrowser` so it can't be smuggled in through
+// `POST /api/browser/connect`'s JSON body. The HTTP route omits this arg,
+// so `skipAudit` always defaults to false on that path and the capability
+// always writes its `browser.connect` audit row. Only the in-process
+// tool-dispatch caller (which writes its own richer audit row with the
+// approval `reason` + `approvalId`) sets `skipAudit: true` to avoid a
+// duplicate, reasonless row.
+interface InternalConnectOptions {
+  skipAudit?: boolean;
 }
 
 // Serializes concurrent /api/browser/connect calls. The browser-connect
@@ -201,17 +241,31 @@ let pendingDisconnect: Promise<Status> | null = null;
 // Idempotent connect. Mode is decided by whether the caller supplied a
 // cdpUrl. We re-probe an existing record before returning it so a crashed
 // Chrome doesn't appear as still-connected.
-export function connectBrowser(config: RuntimeConfig, input: ConnectInput): Promise<Status> {
+//
+// The third `internal` argument is OFF-LIMITS to network callers (the HTTP
+// route omits it). It carries flags that affect audit / trust semantics
+// (`skipAudit`); putting them on `ConnectInput` would let any authenticated
+// HTTP client set `{"skipAudit": true}` in the POST body and suppress the
+// capability's own audit row, breaking the tamper-resistance contract.
+export function connectBrowser(
+  config: RuntimeConfig,
+  input: ConnectInput,
+  internal: InternalConnectOptions = {}
+): Promise<Status> {
   if (pendingConnect) return pendingConnect;
   pendingConnect = (async () => {
-    return await connectBrowserInner(config, input);
+    return await connectBrowserInner(config, input, internal);
   })().finally(() => {
     pendingConnect = null;
   });
   return pendingConnect;
 }
 
-async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): Promise<Status> {
+async function connectBrowserInner(
+  config: RuntimeConfig,
+  input: ConnectInput,
+  internal: InternalConnectOptions
+): Promise<Status> {
   // Validate caller input BEFORE we touch any existing state. A bad cdpUrl
   // (malformed, blocked SSRF target, unsupported protocol) must surface as
   // a 400 to the caller without tearing down the user's already-managed
@@ -228,13 +282,32 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
     validatedCallerCdp = validated.url;
   }
 
+  const wantHeadless = input.headless === true;
   const existing = readState(config.instance).browser ?? null;
   if (existing) {
     // If the caller explicitly asked for a *different* endpoint than what's
     // stored, don't short-circuit on the old record — fall through to the
     // teardown + fresh attach path.
     const callerCdp = validatedCallerCdp;
-    const targetsSameEndpoint = targetsExistingRecord(existing, callerCdp);
+    // Strict-managed mode: if the caller demands a managed Chrome and the
+    // existing record isn't managed (e.g. it's a `cdp`-mode record left
+    // over from a prior /api/browser/connect with a custom endpoint), the
+    // existing record cannot satisfy the contract. Treat it as a mismatch
+    // so we fall through to teardown + fresh managed launch rather than
+    // silently returning a stale CDP session that may be headless.
+    const strictManagedMismatch =
+      input.mode === "managed" && existing.mode !== "managed";
+    // Visibility mismatch: caller asked for headless when current is
+    // headed (or vice versa). Even if the mode matches, the launch
+    // option differs so we cannot short-circuit — Chromium must be
+    // relaunched with the new headless flag against the same profile
+    // dir. Only relevant when both sides are managed.
+    const headlessMismatch =
+      input.mode === "managed" &&
+      existing.mode === "managed" &&
+      (existing.headless === true) !== wantHeadless;
+    const targetsSameEndpoint =
+      !strictManagedMismatch && !headlessMismatch && targetsExistingRecord(existing, callerCdp);
 
     if (targetsSameEndpoint) {
       if (existing.mode === "managed") {
@@ -292,12 +365,17 @@ async function connectBrowserInner(config: RuntimeConfig, input: ConnectInput): 
   // headless-handle ambiguity — the next browser_* call reuses the live
   // managed context. For the cdp path we still drop any cached headless
   // handle so ensureShared rebuilds via the CDP branch on the next call.
+  // `skipAudit` is read from the in-process `internal` arg ONLY. Reading it
+  // from `input` (which we hand the HTTP body to verbatim) would let any
+  // authenticated caller post `{"skipAudit": true}` and silence their own
+  // audit row.
+  const skipAudit = internal.skipAudit === true;
   if (validatedCallerCdp) {
-    const result = await connectExisting(config, validatedCallerCdp);
+    const result = await connectExisting(config, validatedCallerCdp, { skipAudit });
     await disconnectSharedBrowser();
     return result;
   }
-  return await launchManaged(config);
+  return await launchManaged(config, { skipAudit, headless: wantHeadless });
 }
 
 // Full teardown of an existing connection record. Sends SIGTERM to the
@@ -365,7 +443,11 @@ function targetsExistingRecord(
 // connectBrowserInner (validateCdpUrl + safetyCheck against the http
 // form). We re-derive the http form here for the probe rather than
 // threading both representations through the call site.
-async function connectExisting(config: RuntimeConfig, validatedUrl: string): Promise<Status> {
+async function connectExisting(
+  config: RuntimeConfig,
+  validatedUrl: string,
+  opts: { skipAudit?: boolean } = {}
+): Promise<Status> {
   const httpForm = cdpHttpForm(validatedUrl);
   const probe = await probeCdp(httpForm, PROBE_TIMEOUT_MS);
   if (!probe) {
@@ -385,22 +467,38 @@ async function connectExisting(config: RuntimeConfig, validatedUrl: string): Pro
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "browser.connect",
-        target: redactUrlCredentials(record.cdpUrl),
-        risk: "medium",
-        evidence: { mode: "cdp", browser: probe.Browser ?? null }
-      },
-      { system: true }
-    );
+    // When the caller is the runtime's tool-dispatch path (skipAudit), it
+    // already writes a richer browser.connect audit row carrying the
+    // approval reason and approvalId — emitting a second row here would
+    // double-count the action.
+    if (!opts.skipAudit) {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "browser.connect",
+          target: redactUrlCredentials(record.cdpUrl),
+          risk: "medium",
+          evidence: { mode: "cdp", browser: probe.Browser ?? null }
+        },
+        { system: true }
+      );
+    }
   });
   return { connected: true, record };
 }
 
-async function launchManaged(config: RuntimeConfig): Promise<Status> {
+async function launchManaged(
+  config: RuntimeConfig,
+  opts: { skipAudit?: boolean; headless?: boolean } = {}
+): Promise<Status> {
+  // Headless-after-signin support: when the caller asks for a headless
+  // managed launch, Playwright is invoked with `headless: true` against
+  // the SAME per-instance profile dir as the visible launch would use.
+  // Cookies + storage persisted by the prior visible session replay, so
+  // the headless context is already signed in. Falls back to visible
+  // (`headless: false`) for any other value.
+  const wantHeadless = opts.headless === true;
   // findChromePath honors GINI_CHROME_PATH first, then falls back to
   // Playwright's bundled Chromium, then system browsers. For the
   // launchPersistentContext path we pass the resolved path through to
@@ -414,6 +512,19 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   const dataDir = profileDirFor(config);
   mkdirSync(dataDir, { recursive: true });
 
+  // Route downloads from the managed Chrome into a directory Gini can
+  // read. macOS sandboxes ~/Downloads so the agent (running as a Bun
+  // process without Files-and-Folders entitlement) can't open files
+  // saved there — the Workspace setup skill in particular was getting
+  // stuck because the OAuth client_secret.json landed in ~/Downloads and
+  // had to be moved by a manual terminal command. Saving under the
+  // per-instance state dir (which Gini already owns) makes any download
+  // immediately readable. CDP mode (existing user Chrome) is unaffected:
+  // Playwright cannot override a remote Chrome's user-configured
+  // downloads dir; the setup skill explains that fallback.
+  const downloadsPath = join(instanceRoot(config.instance), "downloads");
+  mkdirSync(downloadsPath, { recursive: true });
+
   // CRITICAL: tear down any existing shared handle BEFORE we attempt to
   // launch the visible Chrome. The headless persistent context the agent
   // may already be using is rooted at the same profile dir, and Chromium
@@ -425,8 +536,29 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
   //
   // Dynamically import playwright-core so tests can mock it via
   // mock.module without forcing every test that imports this module to
-  // pull in the full browser SDK at module-init time.
-  const playwright = (await import("playwright-core")) as typeof import("playwright-core");
+  // pull in the full browser SDK at module-init time. Catch the
+  // module-not-found case explicitly so users see a friendly install
+  // hint instead of the bare Node module-resolution error — this
+  // happens when the runtime was started before `bun install` resolved
+  // the dep, or in a slim install that intentionally omitted browser
+  // tooling.
+  let playwright: typeof import("playwright-core");
+  try {
+    playwright = (await import("playwright-core")) as typeof import("playwright-core");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const isMissing =
+      (error as { code?: string } | undefined)?.code === "MODULE_NOT_FOUND" ||
+      (error as { code?: string } | undefined)?.code === "ERR_MODULE_NOT_FOUND" ||
+      message.includes("Cannot find package 'playwright-core'") ||
+      message.includes("Cannot find module 'playwright-core'");
+    if (isMissing) {
+      throw new Error(
+        "Browser runtime is missing. Run `bun install` in the gini-agent checkout, then restart the runtime."
+      );
+    }
+    throw error;
+  }
   const chromium = playwright.chromium;
 
   // withTeardownLock holds the admission gate CLOSED for the entire
@@ -440,8 +572,10 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
 
     try {
       return await chromium.launchPersistentContext(dataDir, {
-        headless: false,
+        headless: wantHeadless,
         executablePath: chromePath ?? undefined,
+        acceptDownloads: true,
+        downloadsPath,
         args: [
           "--no-first-run",
           "--no-default-browser-check",
@@ -490,21 +624,28 @@ async function launchManaged(config: RuntimeConfig): Promise<Status> {
     pid,
     dataDir,
     chromePath: resolvedChromePath ?? null,
-    startedAt: now()
+    startedAt: now(),
+    headless: wantHeadless
   };
   await mutateState(config.instance, (state) => {
     state.browser = record;
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "browser.connect",
-        target: dataDir,
-        risk: "medium",
-        evidence: { mode: "managed", pid }
-      },
-      { system: true }
-    );
+    // When the caller is the runtime's tool-dispatch path (skipAudit), it
+    // already writes a richer browser.connect audit row carrying the
+    // approval reason and approvalId — emitting a second row here would
+    // double-count the action.
+    if (!opts.skipAudit) {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "browser.connect",
+          target: dataDir,
+          risk: "medium",
+          evidence: { mode: "managed", pid, headless: wantHeadless }
+        },
+        { system: true }
+      );
+    }
   });
   return { connected: true, record };
 }

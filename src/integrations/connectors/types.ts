@@ -87,4 +87,28 @@ export interface ProviderModule {
   // when undefined. The periodic re-probe job uses this to pace the
   // background health pass.
   probeIntervalMs?: number;
+  // Optional. When set, the runtime constructs the user-visible message
+  // shown above the inline connector.request form by substituting
+  // `${name}` placeholders with values from the tool call's `params`
+  // argument. Each placeholder name must appear in `requestParams`. If
+  // the provider doesn't declare `requestInstructions`, the model's
+  // `reason` field is used verbatim (current behavior).
+  requestInstructions?: string;
+  // Optional. Parameters the model can pass to `request_connector`. Each
+  // is exposed in `params: { [name]: string }` on the tool call. Required
+  // params are validated at dispatch time. Non-secret only — these are
+  // runtime context (e.g. project IDs), not credentials.
+  requestParams?: Array<{
+    name: string;
+    label: string;
+    description?: string;
+    required?: boolean;
+  }>;
+  // Optional. The name of a bundled Gini skill that owns the setup flow
+  // for this provider. When set, the runtime tells the model to invoke
+  // THIS SKILL (via read_skill) when the connector is missing, instead of
+  // the default "call request_connector" shortcut. The setup skill is
+  // responsible for any installation, OAuth, project provisioning, etc.,
+  // and itself calls request_connector at the end to capture credentials.
+  setupSkill?: string;
 }

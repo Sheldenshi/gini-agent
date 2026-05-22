@@ -10,6 +10,7 @@ import { linearProvider } from "./linear";
 import { genericProvider } from "./generic";
 import { claudeCodeProvider } from "./claude-code";
 import { codexProvider } from "./codex";
+import { googleOauthDesktopProvider } from "./google-oauth-desktop";
 
 const REGISTRY = new Map<string, ProviderModule>();
 
@@ -25,6 +26,7 @@ register(linearProvider);
 register(genericProvider);
 register(claudeCodeProvider);
 register(codexProvider);
+register(googleOauthDesktopProvider);
 
 export function getProvider(id: string): ProviderModule | undefined {
   return REGISTRY.get(id);

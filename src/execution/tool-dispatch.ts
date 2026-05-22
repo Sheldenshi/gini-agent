@@ -17,6 +17,7 @@ import {
   appendTrace,
   assertInsideWorkspace,
   createApproval,
+  createChatMessage,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -83,7 +84,16 @@ export async function dispatchToolCall(
   taskId: string,
   toolName: string,
   toolCallId: string,
-  rawArgs: string
+  rawArgs: string,
+  // Current chat-task turn's in-flight message buffer. Only the loop in
+  // chat-task.ts owns this — it accumulates assistant tool_calls and tool
+  // results across iterations of the same task run, none of which land on
+  // `task.toolCallState.messages` until the task pauses for approval. Gates
+  // that need to inspect the current turn's tool history (e.g. the
+  // setup-skill gate inside request_connector) must look here too, not
+  // only at the persisted snapshot. Optional so test callers that bypass
+  // the loop keep working.
+  messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
   let args: Record<string, unknown>;
   try {
@@ -136,7 +146,7 @@ export async function dispatchToolCall(
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "request_connector":
-      return await requestConnectorTool(config, taskId, toolCallId, args);
+      return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -191,6 +201,15 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    case "browser_connect":
+      // Spawning a managed Chrome surfaces a desktop window and
+      // creates a persistent per-instance profile dir — the
+      // trust-establishment moment that gates every subsequent
+      // browser action. Route through the approval gate so the
+      // user sees an explicit "open a browser window for X" card.
+      // The policy seam falls through to `{ mode: "gate" }` for
+      // this action under "auto" mode (yolo still auto-approves).
+      return pendingOrAuto(config, "browser.connect", undefined, (reason) => requestBrowserConnect(config, taskId, toolCallId, args, reason));
     case "file_write":
       return pendingOrAuto(config, "file.write", undefined, (reason) => requestFileWrite(config, taskId, toolCallId, args, reason));
     case "file_patch":
@@ -2101,6 +2120,61 @@ async function requestBrowserUpload(
   });
 }
 
+// Approval-gated browser_connect. Spawns a visible managed Chrome
+// after user consent. The reason flows onto the approval row's
+// evidence so the UI can render a friendlier label ("Open a browser
+// window — <reason>") instead of the generic terminal-exec card.
+// The actual connectBrowser() call runs in agent.executeApprovedAction's
+// "browser.connect" branch.
+async function requestBrowserConnect(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  const reason = requireString(args, "reason");
+  // Headless is opt-in: only honor an explicit boolean true. Anything else
+  // (undefined, false, non-boolean) maps to the existing visible default
+  // so legacy callers that never set the field keep getting a headed
+  // managed Chrome. The flag rides on the approval payload so the
+  // executor in agent.ts can pass it through to connectBrowser when the
+  // user approves.
+  const headless = args.headless === true;
+  // Optional target URL — the page the agent was trying to reach. When the
+  // user clicks "Connect" the open-browser endpoint launches visible Chrome
+  // and navigates here directly, so the user lands on the sign-in form
+  // instead of an empty about:blank. Validated minimally; safetyCheck runs
+  // server-side in the open-browser endpoint before navigation.
+  const urlArg = typeof args.url === "string" ? args.url.trim() : "";
+  const url = urlArg.length > 0 ? urlArg : undefined;
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(state, {
+      taskId: item.id,
+      action: "browser.connect",
+      // Use the reason as the target so the approval card surfaces
+      // it prominently. The web UI also reads evidence.reason for
+      // the body when rendering a browser.connect card.
+      target: reason,
+      risk: "medium",
+      reason: reasonOverride ?? "Opening a managed browser window requires explicit approval.",
+      payload: { reason, toolCallId, headless, url }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser connect (chat-task)",
+      data: { approvalId: approval.id, reason, toolCallId, headless, url }
+    });
+    return approval.id;
+  });
+}
+
 async function requestFilePatch(
   config: RuntimeConfig,
   taskId: string,
@@ -2233,7 +2307,8 @@ async function requestConnectorTool(
   config: RuntimeConfig,
   taskId: string,
   toolCallId: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
   const providerId = requireString(args, "provider");
   const reason = requireString(args, "reason");
@@ -2249,6 +2324,12 @@ async function requestConnectorTool(
       })
     };
   }
+
+  // The model owns the full user-visible string. The skill body (when one
+  // applies) shows the format — the model reads it, substitutes any real
+  // values like project IDs, and passes the finished text here. No runtime
+  // templating: `reason` becomes the approval's `reason` verbatim.
+
   // Fast path: if a healthy + configured connector already exists for
   // this provider, the model is calling defensively. Tell it to proceed
   // and skip the round-trip through the approval UI.
@@ -2261,6 +2342,61 @@ async function requestConnectorTool(
       kind: "sync",
       result: `${provider.label} is already connected. Proceed with the original request.`
     };
+  }
+
+  // Setup-skill gate: providers that declare `setupSkill` own a multi-step
+  // prerequisite flow (install CLI, OAuth, project provisioning, enable
+  // APIs, etc.) before credential capture is meaningful. The model has
+  // been observed bypassing the skill and calling request_connector
+  // directly with a generic reason, leaving the user without the
+  // prerequisites needed to mint credentials. Refuse the call when the
+  // task's tool-call history shows no prior `read_skill` for the
+  // declared setup skill — the error directs the model there, the
+  // skill body itself calls request_connector at the end, and the
+  // resumed call passes this same gate naturally because the
+  // intervening read_skill is now in the message history.
+  //
+  // Look in BOTH the in-flight workingMessages (current turn's tool
+  // history, only available via the chat-task loop's messageHistory
+  // arg) AND the persisted snapshot on task.toolCallState. The
+  // snapshot is only written when a task pauses for approval, so the
+  // first time the model calls request_connector inside the same turn
+  // it just called read_skill, only messageHistory has the evidence.
+  if (provider.setupSkill) {
+    const task = state.tasks.find((t) => t.id === taskId);
+    const persisted = task?.toolCallState?.messages ?? [];
+    const inFlight = messageHistory ?? [];
+    const allMessages: readonly unknown[] = [...persisted, ...inFlight];
+    const hasReadSetup = allMessages.some((m) => {
+      if (!m || typeof m !== "object") return false;
+      const msg = m as { role?: unknown; tool_calls?: unknown };
+      if (msg.role !== "assistant") return false;
+      const calls = msg.tool_calls;
+      if (!Array.isArray(calls)) return false;
+      return calls.some((c) => {
+        if (!c || typeof c !== "object") return false;
+        const call = c as { function?: { name?: unknown; arguments?: unknown } };
+        const fn = call.function;
+        if (!fn || fn.name !== "read_skill") return false;
+        try {
+          const args = typeof fn.arguments === "string"
+            ? JSON.parse(fn.arguments)
+            : (fn.arguments ?? {});
+          return (args as { name?: unknown })?.name === provider.setupSkill;
+        } catch {
+          return false;
+        }
+      });
+    });
+    if (!hasReadSetup) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `This provider's setup is owned by the '${provider.setupSkill}' skill. Call \`read_skill\` with name '${provider.setupSkill}' first — that skill body walks through the required prerequisites (install, OAuth, project provisioning, APIs) and itself calls request_connector at the end.`
+        })
+      };
+    }
   }
 
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
@@ -2285,6 +2421,24 @@ async function requestConnectorTool(
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();
+    // Persist the model's `reason` as a durable assistant bubble in the
+    // chat session so it survives past approval resolution. Without this,
+    // the bubble exists only while the task is `waiting_approval` (via
+    // the synthesizer in getChatSession) and disappears once the user
+    // saves the form — leaving no record of the instructions they just
+    // acted on. Tag with kind:"approval_reason" so syncChatTaskResult's
+    // single-summary-per-task short-circuit doesn't mistake this for the
+    // task's final summary.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",

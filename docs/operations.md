@@ -18,6 +18,8 @@ Why the browser flow: piped `curl … | bash` has no controlling terminal, so th
 
 The terminal-driven `gini setup` command remains available for interactive shells that prefer it.
 
+LaunchAgent `PATH` and version managers: at `gini autostart enable` time, the plist's `PATH` is the base macOS set (bun's dir, `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, …) extended with the entries reported by your interactive `$SHELL`. This is what lets a launchd-supervised gateway see CLIs installed under per-user version managers — `~/.nvm/versions/node/<v>/bin`, `~/.asdf/shims`, `~/.volta/bin`, pyenv, rbenv, etc. — the same way your terminal does. If you later switch node versions, install a new path manager, or move a CLI to a different bin dir, re-run `gini autostart enable` to refresh the plist.
+
 From source (for developers):
 
 ```sh

@@ -160,6 +160,11 @@ async function dispatchJobReplyToBridge(
   // same).
   const dispatchTo = session.outboundMirror ?? session.source;
   if (!dispatchTo) return;
+  // Bridge-dispatch only applies to telegram / discord sources. The
+  // openclaw provenance source carries no live channel routing
+  // (it's just a migration breadcrumb), so a job that landed on a
+  // migrated chat has nowhere to mirror its assistant reply.
+  if (dispatchTo.kind !== "telegram" && dispatchTo.kind !== "discord") return;
   // The synced assistant message is the most recent one on the
   // session keyed to this task; pick it up from chatMessages so we
   // never accidentally re-dispatch an older turn.

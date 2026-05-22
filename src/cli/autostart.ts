@@ -45,6 +45,11 @@ import {
   serviceTarget,
   type PlistKind
 } from "../integrations/launchd";
+import { mergeShellPath, readLoginShellPath, type LoginShellReader } from "../runtime/path-bootstrap";
+// Shared with the openclaw migrator and the CLI setup readback so all
+// three call sites agree on how to decode the value half of a
+// secrets.env line.
+import { unquoteSecretsValue } from "../state/secrets-env";
 
 // Re-export the shared launchd primitives so existing imports against
 // src/cli/autostart keep resolving (CLI commands, tests). New runtime
@@ -138,6 +143,18 @@ export interface ResolveLaunchOptions {
   // production this is undefined and the plist gets a minimal env — no
   // leak of shell-level GINI_STATE_ROOT into a permanent launchd record.
   testRoot?: { stateRoot?: string; logRoot?: string };
+  // Test seam: override the login-shell PATH lookup used to extend the
+  // plist's PATH with the user's interactive PATH (nvm, asdf, volta, …).
+  // Defaults to reading $SHELL via readLoginShellPath. Production callers
+  // don't pass this.
+  loginShellReader?: LoginShellReader;
+  // Test seam: override $SHELL. Defaults to process.env.SHELL.
+  loginShell?: string;
+  // Opt-in: actually run the user's login shell to capture their PATH.
+  // Defaults to false so non-write callers (status, disable, kick) don't
+  // spend up to 3s spawning the user's shell just to compute metadata
+  // they don't need. The enable / write paths pass true.
+  mergeShellPath?: boolean;
 }
 
 // Build the launchd command line. We exec the Bun-driven runtime *directly*
@@ -196,13 +213,42 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // Always make bun's directory available on PATH so child invocations
   // (e.g. `bun install` triggers from inside the runtime) can resolve it.
   // macOS launchd hands the service a minimal PATH; we explicitly extend
-  // it rather than copy the parent shell's because the agent must work
-  // across reboots too.
+  // it with two layers:
+  //
+  //   1. The hard-coded base — bun's dir, ~/.local/bin, and the standard
+  //      macOS dirs. Guaranteed present regardless of the user's shell
+  //      setup.
+  //   2. The user's interactive-shell PATH read via `$SHELL -ilc 'echo
+  //      $PATH'`. Picks up nvm / asdf / volta / pyenv / rbenv shims so
+  //      the launchd-spawned gateway can see the same npm-globals
+  //      (codex, claude, …) the user sees in their terminal.
+  //
+  // Best-effort: if the shell isn't set or the read fails, we fall back
+  // to (1) alone. Bun's `spawnSync` snapshots PATH at process start, so
+  // there's no useful runtime fix for this — the plist is the right
+  // place to bake the PATH in.
+  // SHELL is baked into the plist so launchd-spawned children (notably
+  // the autostart-refresh path that runs `gini autostart enable
+  // --kind gateway` after an OpenAI key change) start with $SHELL set
+  // and can re-read the same shell PATH. Without this, refresh
+  // regenerates the plist with the bare launchd PATH and silently
+  // wipes the nvm/asdf merge we did at first enable. We only persist
+  // it when the path resolves to an existing file on disk — a stale
+  // or garbage $SHELL would otherwise survive in launchd's
+  // EnvironmentVariables and confuse every future child process.
+  const shellRaw = options.loginShell ?? process.env.SHELL ?? "";
+  const shell = shellRaw && fileExists(shellRaw) ? shellRaw : "";
   const baseEnv: Record<string, string> = {
-    PATH: buildLaunchAgentPath(bunPath, home),
+    PATH: buildLaunchAgentPath(bunPath, home, {
+      loginShellReader: options.loginShellReader,
+      loginShell: options.loginShell,
+      mergeShellPath: options.mergeShellPath ?? false,
+      home
+    }),
     HOME: home,
     LANG: process.env.LANG ?? "en_US.UTF-8"
   };
+  if (shell) baseEnv.SHELL = shell;
   // Opt-in: only propagate GINI_STATE_ROOT / GINI_LOG_ROOT into the plist
   // when an explicit testRoot is passed. Reading them from process.env
   // would bake whatever scratch path the developer's shell currently has
@@ -279,7 +325,7 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   // default-by-instance hash from sh, so we read the file the gateway
   // writes; until it appears (cold boot), we fall back to the default
   // gateway port for instance 'main' and to a 30s timeout overall.
-  const shim = buildWebShim(options.instance);
+  const shim = buildWebShim(options.instance, bunPath);
   const web: LaunchSpec = {
     programArguments: ["/bin/sh", "-c", shim],
     workingDirectory,
@@ -368,17 +414,6 @@ export function parseSecretsEnv(body: string): Record<string, string> {
   return out;
 }
 
-function unquoteSecretsValue(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return "";
-  if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/'\\''/g, "'");
-  }
-  if (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) {
-    return trimmed.slice(1, -1).replace(/\\(["\\$`])/g, "$1");
-  }
-  return trimmed;
-}
 
 function isGiniAgentCheckout(dir: string, fileExists: (path: string) => boolean): boolean {
   const pkg = join(dir, "package.json");
@@ -403,7 +438,7 @@ function isGiniAgentCheckout(dir: string, fileExists: (path: string) => boolean)
 // HOME is set by launchd from EnvironmentVariables; we expand it inline so
 // the script doesn't depend on a parent process env. The instance dir
 // path matches `src/paths.ts` (instances/<inst>/runtime.port).
-function buildWebShim(instance: Instance): string {
+function buildWebShim(instance: Instance, bunPath: string): string {
   // Reject suspicious instance names defensively. CLI validation (and the
   // dir-name layout) already restricts instances to alphanumerics, dashes,
   // and underscores, but we'd rather fail at write time than emit a shim
@@ -412,6 +447,12 @@ function buildWebShim(instance: Instance): string {
   // break out via `$(...)` or `${...}`; we forbid those characters.
   if (!/^[A-Za-z0-9._-]+$/.test(instance)) {
     throw new Error(`autostart: refusing to embed instance name '${instance}' in launchd shim — name must match [A-Za-z0-9._-]+`);
+  }
+  // Same constraint applies to bunPath — it gets embedded in the shim and
+  // exec'd. Reject paths with shell-meaningful characters so a malformed
+  // override can't break out of the exec line.
+  if (!/^[A-Za-z0-9._\/-]+$/.test(bunPath)) {
+    throw new Error(`autostart: refusing to embed bunPath '${bunPath}' in launchd shim — path must match [A-Za-z0-9._/-]+`);
   }
   // GINI_STATE_ROOT is propagated into the env via the plist when --test-root
   // is passed; absent that, the runtime uses ~/.gini. We honor the same
@@ -426,8 +467,12 @@ function buildWebShim(instance: Instance): string {
     // the sleep, walk to the next iteration, and only exit when the
     // overall loop completes. Trapping → exit 0 makes the polling phase
     // honor KeepAlive.SuccessfulExit:false the same way the runtime does.
-    // Once `exec bun run dev` runs, the shell is gone and bun handles
-    // SIGTERM directly.
+    // Once `exec <bunPath> run dev` runs, the shell is gone and bun
+    // handles SIGTERM directly. We exec the absolute bunPath (the
+    // same one the gateway's programArguments uses) instead of bare
+    // `bun` so the gateway and the web dev server always run under
+    // the same Bun even if the launchd PATH starts with a different
+    // bun (e.g. one provided by the user's interactive shell PATH).
     `trap 'exit 0' TERM INT`,
     `cd web 2>/dev/null || true`,
     `state_root="\${GINI_STATE_ROOT:-$HOME/.gini}"`,
@@ -463,11 +508,27 @@ function buildWebShim(instance: Instance): string {
     `echo $$ > "$instance_root/web.pid"`,
     `if [ -n "$PORT" ]; then echo "$PORT" > "$instance_root/web.port"; fi`,
     // 4) Hand off to Next.js. exec so launchd tracks dev server PID.
-    `exec bun run dev`
+    `exec "${bunPath}" run dev`
   ].join("\n");
 }
 
-function buildLaunchAgentPath(bunPath: string, home: string): string {
+interface BuildPathOptions {
+  loginShellReader?: LoginShellReader;
+  loginShell?: string;
+  // Opt-in: when true, spawn the user's login shell and merge its PATH
+  // into the base. Default false because most call sites
+  // (`resolveLaunchSpecPair` from status / disable / kick) only want
+  // metadata and shouldn't pay the 100-500ms shell spawn or risk a
+  // hung rc file. The enable path passes true.
+  mergeShellPath?: boolean;
+  home?: string;
+}
+
+function buildLaunchAgentPath(
+  bunPath: string,
+  home: string,
+  options: BuildPathOptions = {}
+): string {
   const bunDir = dirname(resolve(bunPath));
   // Standard macOS PATH plus bun's dir. ~/.local/bin is included so the
   // wrapper itself is findable.
@@ -483,11 +544,58 @@ function buildLaunchAgentPath(bunPath: string, home: string): string {
   ];
   // Dedupe while preserving order.
   const seen = new Set<string>();
-  return segments.filter((s) => {
+  const base = segments.filter((s) => {
     if (seen.has(s)) return false;
     seen.add(s);
     return true;
   }).join(":");
+
+  // Merge in the user's interactive-shell PATH so version-manager dirs
+  // (nvm, asdf, volta, …) make it into the plist. Three gates apply:
+  //
+  //   1. `mergeShellPath: true` must be set by the caller. The default
+  //      is false so non-write call sites (status / disable / kick)
+  //      don't spend 100-500ms spawning a shell to compute a PATH that
+  //      gets thrown away.
+  //   2. Skipped under bun:test (and NODE_ENV=test) unless an explicit
+  //      loginShellReader is provided. The existing autostart suite
+  //      asserts on the PATH; live shell reads would make assertions
+  //      flaky across developer machines.
+  //   3. Missing $SHELL or a failing read leaves the base PATH alone.
+  // mergeShellPath is the single gate. Tests must opt in with
+  // mergeShellPath: true AND pass a loginShellReader; a reader alone
+  // does not override the default-off behavior, so test cases that
+  // verify "no shell read happened" can pass a counting reader and
+  // assert it was never called.
+  if (options.mergeShellPath !== true) return base;
+  const explicitReader = options.loginShellReader !== undefined;
+  if (!explicitReader && isTestEnv()) return base;
+  const shell = options.loginShell ?? process.env.SHELL;
+  if (!shell) return base;
+  const read = options.loginShellReader ?? readLoginShellPath;
+  let shellPath: string | null;
+  try {
+    shellPath = read(shell, { home });
+  } catch {
+    shellPath = null;
+  }
+  if (!shellPath) return base;
+  // pinFirst: 1 keeps bunDir at the head of PATH even when the user's
+  // shell provides a different bun. Without this, a shell-provided bun
+  // could shadow the launchd-baked bunDir and the web shim's
+  // `exec <bunPath> run dev` would still execute the right bun (we
+  // pass the absolute bunPath) but any other PATH-relative `bun` would
+  // not. Treating the first base entry (bunDir) as fixed avoids that
+  // class of surprise.
+  return mergeShellPath(base, shellPath, { pinFirst: 1 }).merged;
+}
+
+function isTestEnv(): boolean {
+  return (
+    process.env.NODE_ENV === "test"
+    || process.env.BUN_TEST === "1"
+    || process.env.BUN_TEST === "true"
+  );
 }
 
 export interface PlistOptions {

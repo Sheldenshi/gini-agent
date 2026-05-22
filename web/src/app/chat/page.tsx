@@ -21,6 +21,7 @@ import { Composer } from "@/components/chat/Composer";
 import { MessageBubble } from "@/components/chat/MessageBubble";
 import { PhaseIndicator, type PhaseIndicatorPhase } from "@/components/chat/PhaseIndicator";
 import { SessionItem } from "@/components/chat/SessionItem";
+import { ToolCallRow } from "@/components/chat/ToolCallRow";
 import { api } from "@/lib/api";
 import {
   useCancelTask,
@@ -160,8 +161,17 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (!messages || !tasks) return;
+    // The "task already has its assistant reply" check must ignore
+    // approval-reason rows (kind:"approval_reason"), which the runtime
+    // persists for a task when it pauses on a connector.request approval.
+    // Treating those as the final reply means we skip the post-completion
+    // sync that turns task.summary into a user-visible bubble — the user
+    // would see the streamed text mid-flight but no durable assistant
+    // message after the task terminates, and inflightTaskId stays wedged.
     const assistantTaskIds = new Set(
-      messages.filter((m) => m.role === "assistant" && m.taskId).map((m) => m.taskId as string)
+      messages
+        .filter((m) => m.role === "assistant" && m.taskId && m.kind !== "approval_reason")
+        .map((m) => m.taskId as string)
     );
     for (const message of messages) {
       if (message.role !== "user" || !message.taskId) continue;
@@ -223,6 +233,16 @@ export default function ChatPage() {
     // Any other tool-specific currentStep ("Reading file", "Executing", …)
     // counts as working.
     return "working";
+  }, [inflightTaskId, tasksById]);
+
+  // Tool calls dispatched by the in-flight task, surfaced as inline rows
+  // above the PhaseIndicator while the agent is mid-loop. Empty when the
+  // task hasn't dispatched any tools yet, or when there's no in-flight
+  // task at all.
+  const inflightToolCalls = useMemo(() => {
+    if (!inflightTaskId) return [];
+    const task = tasksById.get(inflightTaskId);
+    return task?.recentToolCalls ?? [];
   }, [inflightTaskId, tasksById]);
 
   // The assistant message (if any) belonging to the in-flight task — its
@@ -336,11 +356,24 @@ export default function ChatPage() {
                       const showApprovalActions =
                         message.role === "assistant" &&
                         messageTask?.status === "waiting_approval";
+                      // Surface the task's tool-call breadcrumbs above the
+                      // assistant bubble so the work the agent did (navigate,
+                      // connect, snapshot, ...) stays visible after this turn
+                      // is no longer in-flight. recentToolCalls is persisted
+                      // on the task record and survives task completion. The
+                      // bottom placeholder block below only runs when there
+                      // is NO assistant message for the in-flight task, so
+                      // double-rendering isn't possible.
+                      const messageToolCalls =
+                        message.role === "assistant" && messageTask
+                          ? messageTask.recentToolCalls
+                          : undefined;
                       return (
                         <li key={message.id}>
                           <MessageBubble
                             message={message}
                             isStreaming={message.id === streamingAssistantMessageId}
+                            toolCalls={messageToolCalls}
                           />
                           {showApprovalActions && message.taskId ? (
                             <div className="ml-[46px] mt-1 max-w-[90%]">
@@ -354,8 +387,29 @@ export default function ChatPage() {
                       <li>
                         <div className="flex items-start gap-2.5">
                           <Avatar />
-                          <PhaseIndicator phase={pendingPhase} />
+                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                            {inflightToolCalls.map((call) => (
+                              <ToolCallRow key={call.id} call={call} />
+                            ))}
+                            <PhaseIndicator phase={pendingPhase} />
+                          </div>
                         </div>
+                        {/*
+                          Some approval types (browser.connect) suppress the
+                          "Waiting for approval..." placeholder bubble because
+                          their inline card is self-describing. Render the
+                          card here — sibling of the avatar block, indented
+                          by ml-[46px] to align with the message body — so it
+                          sits at the same visual level as the connector
+                          inline form (which renders as a sibling of the
+                          approval_reason MessageBubble in the messages.map
+                          branch above), not nested inside the avatar body.
+                        */}
+                        {inflightTaskId && tasksById.get(inflightTaskId)?.status === "waiting_approval" ? (
+                          <div className="ml-[46px] mt-1 max-w-[90%]">
+                            <ApprovalActions taskId={inflightTaskId} />
+                          </div>
+                        ) : null}
                       </li>
                     ) : null}
                   </ul>

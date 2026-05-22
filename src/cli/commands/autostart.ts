@@ -276,7 +276,12 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
   const { instance, testRoot } = options;
   const kinds = options.kinds ?? KINDS;
   const deps: EnableLaunchctlDeps = options.launchctl ?? { isLoaded, bootout, bootstrap, kickstart };
-  const services = supervisedServices({ instance, testRoot, kinds });
+  // Only the enable path opts in to spawning the user's login shell to
+  // merge nvm/asdf/volta dirs into the plist. status / disable / kick
+  // (further down this file) don't pass mergeShellPath, so they keep
+  // returning the base launchd PATH without paying the shell-spawn
+  // cost or risking a hung rc file.
+  const services = supervisedServices({ instance, testRoot, kinds, mergeShellPath: true });
   const resolution = services[0]?.resolution ?? "installed";
   const logRoot = resolveLogRoot(instance, testRoot);
   const results: PerKindEnableResult[] = [];

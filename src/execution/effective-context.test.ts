@@ -131,6 +131,48 @@ describe("resolveEffectiveContext", () => {
     expect(ctx.agentId).toBe(agent.id);
   });
 
+  test("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv", () => {
+    // Pre-fix, an agent with providerName=\"openrouter\" running on an
+    // instance configured for OpenAI would carry OpenAI's baseUrl
+    // (\"https://api.openai.com/v1\") and apiKeyEnv (\"OPENAI_API_KEY\")
+    // because the resolver spread config.provider unconditionally.
+    // The migrated agent then POSTs to the wrong endpoint with the
+    // wrong key — a silent correctness bug for anyone importing
+    // openclaw agents that don't match their gini instance's provider.
+    const agent = buildAgent({ providerName: "openrouter", model: "openai/gpt-4o" });
+    const state = buildState({ agents: [agent], activeAgentId: agent.id });
+    const config = buildConfig({
+      name: "openai",
+      model: "gpt-5.4-mini",
+      baseUrl: "https://api.openai.com/v1",
+      apiKeyEnv: "OPENAI_API_KEY"
+    });
+    const ctx = resolveEffectiveContext(state, config);
+    expect(ctx.provider.name).toBe("openrouter");
+    expect(ctx.provider.baseUrl).toBe("https://openrouter.ai/api/v1");
+    expect(ctx.provider.apiKeyEnv).toBe("OPENROUTER_API_KEY");
+  });
+
+  test("same-provider agent override still inherits instance baseUrl/apiKeyEnv", () => {
+    // An operator pointing the instance at an OpenAI-compatible local
+    // server still wants their per-agent overrides (model only) to use
+    // the same endpoint. Only cross-provider overrides should drop the
+    // inheritance.
+    const agent = buildAgent({ providerName: "openai", model: "gpt-5.4-mini" });
+    const state = buildState({ agents: [agent], activeAgentId: agent.id });
+    const config = buildConfig({
+      name: "openai",
+      model: "gpt-5.4",
+      baseUrl: "http://localhost:8000/v1",
+      apiKeyEnv: "MY_LOCAL_KEY"
+    });
+    const ctx = resolveEffectiveContext(state, config);
+    expect(ctx.provider.name).toBe("openai");
+    expect(ctx.provider.model).toBe("gpt-5.4-mini");
+    expect(ctx.provider.baseUrl).toBe("http://localhost:8000/v1");
+    expect(ctx.provider.apiKeyEnv).toBe("MY_LOCAL_KEY");
+  });
+
   test("agent without providerName falls back to instance provider", () => {
     const agent = buildAgent({ providerName: undefined, model: undefined });
     const state = buildState({ agents: [agent], activeAgentId: agent.id });

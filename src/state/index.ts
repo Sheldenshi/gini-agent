@@ -101,6 +101,7 @@ export {
   createSubagentRecord,
   createMcpServerRecord,
   createMessagingBridgeRecord,
+  buildMessagingBridgeRecord,
   createMessagingMessageRecord,
   findOrCreateTelegramChatSession,
   findOrCreateDiscordChatSession,

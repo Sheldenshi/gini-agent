@@ -420,6 +420,23 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     toolset: "browser",
     type: "function",
     function: {
+      name: "browser_connect",
+      description: "Surface a Connect button in chat so the user can sign in to a third-party service in a visible Chrome window. Use this whenever a navigation lands on a sign-in / OAuth / auth-wall page (login screen, identity-provider redirect, 401/403, \"please sign in\" interstitial) — do NOT report sign-in as a blocker, call this tool instead. The user clicks Connect, signs in once, clicks \"I've signed in\", then the browser switches to headless and the agent continues with the persisted session. Always pass `url`: the page the agent was trying to reach (so the visible Chrome opens directly on the sign-in form).",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription')." },
+          url: { type: "string", description: "Absolute http(s) URL the agent was trying to reach. The visible Chrome opens directly on this page so the user lands on the sign-in form, and the agent retries this URL after sign-in." },
+          headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / \"I've signed in\" flow handles the headed→headless transition automatically.", default: false }
+        },
+        required: ["reason"]
+      }
+    }
+  },
+  {
+    toolset: "browser",
+    type: "function",
+    function: {
       name: "browser_vision",
       description: "Screenshot the current page and ask the configured vision model a question about what's visible. Returns the model's text answer. Use when the accessibility snapshot can't capture what you need (charts, image-only content, visual layout, captchas-by-description). One image per call.",
       parameters: {
@@ -449,7 +466,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         type: "object",
         properties: {
           provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
-          reason: { type: "string", description: "One sentence explaining why this connection is needed for the current request." }
+          reason: { type: "string", description: "The full user-visible message shown above the inline Connect form. You are responsible for producing the complete text — including any URLs, project IDs, click instructions, or step-by-step guidance the user needs. Substitute any real values (project ids, etc.) directly into the string; do not leave `${...}` placeholders. The skill body (when one applies) shows the exact format to follow; copy it line-for-line, fill in the real values, and pass the result here verbatim." }
         },
         required: ["provider", "reason"]
       }
@@ -919,8 +936,8 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // "tool didn't exist". Note: `send_message` (toolset `messaging`)
     // is deliberately NOT in this bypass — it's a surface-gateway tool
     // (outbound messaging) where the operator's toolset kill switch
-    // must work. Its toolset defaults disabled; flipping the toolset
-    // to enabled is how the operator turns it on.
+    // must work. Flipping the `messaging` toolset to disabled is how
+    // the operator turns it off.
     if (tool.function.name === "cancel_task") return true;
     if (tool.function.name === "install_skill") return true;
     if (tool.function.name === "enable_skill") return true;

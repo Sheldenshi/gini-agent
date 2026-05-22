@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -13,6 +14,7 @@ import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
 import { useConnectors, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
+import type { ChatSession } from "@/lib/view-types";
 import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 
 type ReloadReport = {
@@ -41,6 +43,7 @@ interface InlineDialogState {
 }
 
 export default function SkillsPage() {
+  const router = useRouter();
   const [search, setSearch] = useState("");
   const [debounced, setDebounced] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
@@ -133,6 +136,33 @@ export default function SkillsPage() {
     onSuccess: (result) => {
       toast.success(result.tombstoned ? "Disconnected (kept as tombstone)" : "Connector removed");
       invalidate(["connectors", "events", "skills"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  // "Set up via chat": some skills (notably the Google Workspace family)
+  // can't be wired up by entering a credential into a connector dialog —
+  // setup is an interactive CLI flow the agent walks the user through.
+  // For those, the right UX is to hand the user off to a fresh chat with
+  // a pre-sent prompt so the agent can drive the install + auth from
+  // there. We POST the session, send the seed message, then navigate.
+  const setupViaChat = useMutation({
+    mutationFn: async (skill: SkillRecord) => {
+      const session = await api<ChatSession>("/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: `Set up ${skill.name}` })
+      });
+      await api(`/chat/${session.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({
+          content: `Please help me set up the ${skill.name} skill.`
+        })
+      });
+      return session;
+    },
+    onSuccess: (session) => {
+      invalidate(["chat", "tasks"]);
+      router.push(`/chat?session=${session.id}`);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -377,7 +407,27 @@ export default function SkillsPage() {
                                   </div>
                                 );
                               })()
+                            ) : needsChatSetup(provider) ? (
+                              // OAuth-style or multi-field providers (e.g.
+                              // google-oauth-desktop with client_id +
+                              // client_secret) require real out-of-band
+                              // setup — Google Cloud Console clicks, CLI
+                              // installs, OAuth consent. Defer to the
+                              // agent in chat instead of popping a form
+                              // the user can't fill in.
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                disabled={setupViaChat.isPending}
+                                onClick={() => setupViaChat.mutate(detail)}
+                              >
+                                {setupViaChat.isPending ? "Opening chat…" : "Set up via chat"}
+                              </Button>
                             ) : (
+                              // Simple secret-only providers (e.g. linear
+                              // PAT). Original credential dialog works
+                              // fine — user pastes one token and submits.
                               <Button
                                 size="sm"
                                 variant="outline"
@@ -623,6 +673,14 @@ function ActivationRow({
       ) : null}
     </div>
   );
+}
+
+// Provider setup is "chat-grade" when it requires non-secret config the
+// user can't just paste from a settings page — typically OAuth Client ID
+// alongside Client Secret. The credential dialog only handles "paste one
+// secret", so anything multi-field gets routed to the agent instead.
+function needsChatSetup(provider: ProviderDescriptor): boolean {
+  return provider.fields.some((f) => !f.secret);
 }
 
 function connectorsByProvider(connectors: ConnectorRecord[]): Map<string, ConnectorRecord[]> {

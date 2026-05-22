@@ -229,6 +229,168 @@ describe("request_connector dispatch", () => {
       expect(approval!.payload.providerLabel).toBe("Linear");
       expect(approval!.payload.toolCallId).toBe("call_42");
       expect(approval!.payload.reason).toBe("list my open issues");
+      // The model's `reason` is persisted verbatim on both the approval
+      // row and the payload — no runtime templating.
+      expect(approval!.reason).toBe("list my open issues");
+    }
+  });
+
+  test("setupSkill provider: rejects request_connector when no prior read_skill is in task history", async () => {
+    // google-oauth-desktop declares `setupSkill: "google-workspace-setup"`.
+    // The dispatcher must refuse the bare shortcut and direct the model at
+    // the setup skill, which owns the multi-step prerequisite flow.
+    const instance = `req-connector-gated-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_1",
+      JSON.stringify({ provider: "google-oauth-desktop", reason: "connect google" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("google-workspace-setup");
+      expect(parsed.error).toContain("read_skill");
+    }
+    // The gate must short-circuit BEFORE any approval row is created.
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("setupSkill provider: proceeds when task history contains a read_skill for the setup skill", async () => {
+    // Once the model has read the setup skill body, the eventual
+    // request_connector call (whether emitted by the skill itself or by
+    // the model after following the instructions) must pass the gate.
+    const instance = `req-connector-allowed-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Seed the task's toolCallState with an assistant message whose
+    // tool_calls includes a read_skill for "google-workspace-setup".
+    await mutateState(instance, (state) => {
+      const task = state.tasks.find((t) => t.id === taskId)!;
+      task.toolCallState = {
+        toolsHash: "test",
+        iterations: 1,
+        pending: [],
+        messages: [
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "rs_1",
+                type: "function",
+                function: {
+                  name: "read_skill",
+                  arguments: JSON.stringify({ name: "google-workspace-setup" })
+                }
+              }
+            ]
+          },
+          {
+            role: "tool",
+            tool_call_id: "rs_1",
+            content: "(skill body)"
+          }
+        ]
+      };
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_2",
+      JSON.stringify({ provider: "google-oauth-desktop", reason: "Paste OAuth Desktop credentials for project gini-123" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("connector.request");
+      expect(approval!.target).toBe("google-oauth-desktop");
+      expect(approval!.payload.provider).toBe("google-oauth-desktop");
+    }
+  });
+
+  test("setupSkill provider: proceeds when read_skill is in this turn's in-flight workingMessages (not yet persisted)", async () => {
+    // The chat-task loop only writes `task.toolCallState.messages` when
+    // pausing for approval. Within a single task run, an earlier
+    // read_skill call lives only in the loop's local workingMessages
+    // until then. The gate must consult workingMessages (passed via
+    // the messageHistory arg) so the model isn't told to re-read the
+    // skill it just read in the same turn.
+    const instance = `req-connector-inflight-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Deliberately do NOT seed task.toolCallState — the read_skill
+    // evidence only exists in the in-flight buffer the loop passes in.
+    const inflight = [
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: "rs_inflight",
+            type: "function",
+            function: {
+              name: "read_skill",
+              arguments: JSON.stringify({ name: "google-workspace-setup" })
+            }
+          }
+        ]
+      },
+      {
+        role: "tool",
+        tool_call_id: "rs_inflight",
+        content: "(skill body)"
+      }
+    ];
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_inflight",
+      JSON.stringify({ provider: "google-oauth-desktop", reason: "Paste OAuth Desktop credentials for project gini-456" }),
+      inflight
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("connector.request");
+      expect(approval!.target).toBe("google-oauth-desktop");
+    }
+  });
+
+  test("non-setupSkill provider: gate does not apply regardless of read_skill history", async () => {
+    // Back-compat: providers without `setupSkill` (linear, generic, etc.)
+    // must keep the existing direct-approval shape. The gate only fires
+    // when the provider declares a setup skill.
+    const instance = `req-connector-bypass-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // No toolCallState — confirms the gate doesn't accidentally block
+    // providers that never had a setup skill in the first place.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_3",
+      JSON.stringify({ provider: "linear", reason: "list my open issues" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("connector.request");
+      expect(approval!.target).toBe("linear");
     }
   });
 });

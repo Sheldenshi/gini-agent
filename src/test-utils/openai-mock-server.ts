@@ -153,7 +153,7 @@ function handleChatCompletions(body: ChatRequestBody): Response {
   }
 
   const content = wantsJson
-    ? JSON.stringify({ echo: lastUser })
+    ? JSON.stringify(mockJsonResponse(lastUser))
     : `mock-echo: ${lastUser}`;
 
   return wantStream
@@ -169,6 +169,21 @@ function handleChatCompletions(body: ChatRequestBody): Response {
       }],
       usage: { prompt_tokens: lastUser.length, completion_tokens: content.length, total_tokens: lastUser.length + content.length }
     });
+}
+
+function mockJsonResponse(lastUser: string): Record<string, string> {
+  if (lastUser.includes("ChatTitle schema")) {
+    return { title: mockChatTitle(lastUser) };
+  }
+  return { echo: lastUser };
+}
+
+function mockChatTitle(prompt: string): string {
+  const lower = prompt.toLowerCase();
+  if (lower.includes("garden") && lower.includes("maintenance")) {
+    return "Garden Maintenance Plan";
+  }
+  return "Mock Chat Title";
 }
 
 function lastUserText(messages: ChatMessage[]): string {

@@ -6,7 +6,30 @@ import { join, resolve } from "node:path";
 // is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
 // it, every reconnect re-replays the entire event log.
 const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
-const PRIVILEGED_POST_ROUTES = new Set(["update", "update/check"]);
+// Routes the BFF must gate behind origin + sec-fetch-site checks.
+// The default forwarding path injects the gateway bearer token
+// server-side, so a cross-origin POST from a victim's browser
+// reaches the gateway authenticated. Without this guard, an
+// attacker page can trigger any non-listed POST as the operator.
+// `embedding/reembed` is destructive enough to belong here even
+// though it doesn't lose data — `allBanks: true` runs an expensive
+// embedding pass against every bank in the instance, a DoS vector
+// for any operator who's paying per-token for embeddings.
+// `messaging/<bridge>/<verb>` covers the operator-only bot allowlist
+// surface (allow / deny / pair / reject-pending / disable / health
+// /send/receive) — any of those forwarded cross-origin would let an
+// attacker page mutate the bot's allowlist or fire outbound messages
+// as the operator. The bare `messaging` POST creates a brand-new bridge
+// (with a bot token) under the operator's identity, so it has to land
+// in the same guard or a cross-origin page can plant attacker-supplied
+// ingress.
+const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
+  /^update$/,
+  /^update\/check$/,
+  /^embedding\/reembed$/,
+  /^messaging$/,
+  /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
+];
 
 // Cache the file-read values across requests but invalidate on mtime change,
 // so a gateway respawn that picks a different port doesn't strand the BFF
@@ -103,11 +126,30 @@ export async function proxyRequest(
   pathSegments: string[],
   options: ProxyOptions
 ): Promise<Response> {
-  const guard = guardPrivilegedRequest(request, pathSegments);
+  // Canonicalize before guard + forward. Without this, a request to
+  // /api/runtime/x/%252e%252e/messaging/<bridge>/allow reaches the BFF as
+  // pathSegments ["x", "%2e%2e", "messaging", "<bridge>", "allow"] — the
+  // guard regex misses (path doesn't start with "messaging"), the BFF
+  // forwards via fetch(), which collapses the dot-segment in flight, and
+  // the gateway happily executes allowChat under the operator's bearer.
+  // Recursively decoding each segment and rejecting traversal/slash
+  // markers closes the bypass before either the regex check or the
+  // outbound URL construction.
+  const canonical = canonicalizeSegments(pathSegments);
+  if (!canonical) return Response.json({ error: "Invalid path" }, { status: 400 });
+
+  const guard = guardPrivilegedRequest(request, canonical);
   if (guard) return guard;
 
   const upstreamUrl = new URL(request.url);
-  const target = `${options.runtimeUrl}/api/${pathSegments.join("/")}${upstreamUrl.search}`;
+  // Re-encode each canonicalized segment so URL-special characters that
+  // survived canonicalization (`?`, `#`, `;`, raw `%`, etc.) cannot
+  // re-acquire structural meaning when Bun's fetch parses the target. The
+  // BFF's view of the path now matches the upstream's byte-for-byte: if
+  // the guard didn't see "messaging/<bridge>/allow", the gateway won't
+  // either.
+  const encodedPath = canonical.map((segment) => encodeURIComponent(segment)).join("/");
+  const target = `${options.runtimeUrl}/api/${encodedPath}${upstreamUrl.search}`;
   const headers = pickForwardHeaders(request.headers);
   headers.set("authorization", `Bearer ${options.token}`);
   const init: RequestInit = { method: request.method, headers };
@@ -140,9 +182,44 @@ export async function proxyRequest(
   });
 }
 
+// Decode each segment until stable and reject anything that would let the
+// upstream see a different path than the BFF guard does — empty segments,
+// `.` / `..`, embedded `/`, or any non-printable byte. Returns null when the
+// request must be refused outright. Used by proxyRequest to keep the regex
+// match honest about what the gateway will execute.
+const MAX_DECODE_DEPTH = 5;
+function canonicalizeSegments(segments: string[]): string[] | null {
+  const out: string[] = [];
+  for (let segment of segments) {
+    let stabilized = false;
+    for (let depth = 0; depth < MAX_DECODE_DEPTH; depth += 1) {
+      let next: string;
+      try {
+        next = decodeURIComponent(segment);
+      } catch {
+        return null;
+      }
+      if (next === segment) {
+        stabilized = true;
+        break;
+      }
+      segment = next;
+    }
+    // A segment that is still decoding after MAX_DECODE_DEPTH iterations is
+    // adversarially encoded and we refuse to guess the canonical form.
+    if (!stabilized) return null;
+    if (segment === "" || segment === "." || segment === "..") return null;
+    if (segment.includes("/") || segment.includes("\\")) return null;
+    if (/[\x00-\x1f\x7f]/.test(segment)) return null;
+    out.push(segment);
+  }
+  return out;
+}
+
 function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
+  if (request.method !== "POST") return null;
   const route = pathSegments.join("/");
-  if (request.method !== "POST" || !PRIVILEGED_POST_ROUTES.has(route)) return null;
+  if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
 
   const requestOrigin = new URL(request.url).origin;
   const origin = request.headers.get("origin");

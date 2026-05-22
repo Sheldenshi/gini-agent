@@ -52,14 +52,30 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
   // Provider: agent wins when both name + model are populated. Otherwise we
   // fall back to the instance config so a partially-configured agent doesn't
   // break inference.
+  //
+  // Only inherit the instance's baseUrl / apiKeyEnv / extraBody when the
+  // agent is routing to the SAME provider as the instance. A cross-
+  // provider agent (e.g. an OpenRouter-routed agent on an OpenAI-
+  // configured instance) must take normalizeProvider's per-provider
+  // defaults — spreading config.provider unconditionally would carry the
+  // wrong baseUrl + apiKeyEnv onto the override and silently send the
+  // agent's requests to the instance's endpoint with the instance's key.
   let provider: ProviderConfig;
   let providerSource: "agent" | "instance";
   if (agent.providerName && agent.model) {
-    provider = normalizeProvider({
-      ...config.provider,
-      name: agent.providerName as ProviderConfig["name"],
-      model: agent.model
-    });
+    const sameProvider = agent.providerName === config.provider.name;
+    provider = normalizeProvider(
+      sameProvider
+        ? {
+            ...config.provider,
+            name: agent.providerName as ProviderConfig["name"],
+            model: agent.model
+          }
+        : {
+            name: agent.providerName as ProviderConfig["name"],
+            model: agent.model
+          }
+    );
     providerSource = "agent";
   } else {
     provider = config.provider;
