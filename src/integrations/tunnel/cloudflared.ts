@@ -206,13 +206,14 @@ async function parseUrlFromStderr(
       buffer = buffer.slice(nl + 1);
       const url = extractTunnelUrl(line);
       if (url) {
-        // Release the reader so the rest of stderr keeps flowing to the
-        // log file via the unread parts; node:streams will buffer until
-        // the reader is GC'd. We can't `releaseLock` on the underlying
-        // reader if cancel() was already issued, so we just stop reading
-        // here and let cloudflared continue logging.
+        // Release the reader and immediately re-acquire a drainer so
+        // stderr keeps flowing — either into the log file when one is
+        // configured, or just to /dev/null when not. Without draining,
+        // the OS pipe buffer (64 KiB on macOS and Linux) saturates and
+        // cloudflared's writer blocks, eventually deadlocking the
+        // subprocess.
         try { reader.releaseLock(); } catch { /* ignore */ }
-        if (log) keepDrainingTo(stream, log);
+        keepDraining(stream, log);
         return url;
       }
       nl = buffer.indexOf("\n");
@@ -221,16 +222,18 @@ async function parseUrlFromStderr(
   throw new Error("cloudflared stderr closed before a URL appeared");
 }
 
-function keepDrainingTo(stream: ReadableStream<Uint8Array>, log: FileHandle): void {
-  // Continue copying stderr into the log without blocking startup. Errors
-  // are swallowed so a closed log file can't keep the process alive.
+function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null): void {
+  // Continue reading stderr without blocking startup. When a log handle
+  // is provided we copy bytes into it; without one we discard. Errors
+  // are swallowed so a closed log or stream can't keep the process
+  // alive after exit.
   void (async () => {
     try {
       const reader = stream.getReader();
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        await log.write(Buffer.from(value));
+        if (log) await log.write(Buffer.from(value));
       }
     } catch {
       /* ignore */
