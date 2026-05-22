@@ -77,15 +77,15 @@ export function McpCard({
 export function MessagingCard({
   bridges,
   healthPending,
-  disablePending,
+  removePending,
   onHealth,
-  onDisable
+  onRemove
 }: {
   bridges: MessagingRow[];
   healthPending: boolean;
-  disablePending: boolean;
+  removePending: boolean;
   onHealth: (id: string) => void;
-  onDisable: (id: string) => void;
+  onRemove: (id: string) => void;
 }) {
   return (
     <Card>
@@ -113,7 +113,7 @@ export function MessagingCard({
                   <div className="flex items-center gap-2">
                     <StatusPill value={item.status} />
                     <Button size="sm" variant="outline" disabled={healthPending} onClick={() => onHealth(item.id)}>Health</Button>
-                    <Button size="sm" variant="outline" disabled={disablePending || item.status === "disabled"} onClick={() => onDisable(item.id)}>Disable</Button>
+                    <Button size="sm" variant="outline" disabled={removePending} onClick={() => onRemove(item.id)}>Remove</Button>
                   </div>
                 </div>
                 {item.kind === "telegram" && item.status === "configured" ? (

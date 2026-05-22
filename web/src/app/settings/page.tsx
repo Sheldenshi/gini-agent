@@ -73,9 +73,9 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const messagingDisable = useMutation({
-    mutationFn: (id: string) => api(`/messaging/${encodeURIComponent(id)}/disable`, { method: "POST" }),
-    onSuccess: () => { toast.success("Bridge disabled"); invalidate(["messaging", "state"]); },
+  const messagingRemove = useMutation({
+    mutationFn: (id: string) => api(`/messaging/${encodeURIComponent(id)}/remove`, { method: "POST" }),
+    onSuccess: () => { toast.success("Bridge removed"); invalidate(["messaging", "state", "events"]); },
     onError: (error: Error) => toast.error(error.message)
   });
 
@@ -136,9 +136,9 @@ export default function SettingsPage() {
         <MessagingCard
           bridges={messaging.data ?? []}
           healthPending={messagingHealth.isPending}
-          disablePending={messagingDisable.isPending}
+          removePending={messagingRemove.isPending}
           onHealth={(id) => messagingHealth.mutate(id)}
-          onDisable={(id) => messagingDisable.mutate(id)}
+          onRemove={(id) => messagingRemove.mutate(id)}
         />
 
         <DevicesCard
