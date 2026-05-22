@@ -35,7 +35,7 @@ function scratch(): { home: string; stateRoot: string; cleanup: () => void } {
 }
 
 describe("setup-api", () => {
-  let env: { HOME?: string; GINI_STATE_ROOT?: string; OPENAI_API_KEY?: string };
+  let env: { HOME?: string; GINI_STATE_ROOT?: string; OPENAI_API_KEY?: string; CODEX_AUTH_JSON?: string };
   let s: ReturnType<typeof scratch>;
   let config: RuntimeConfig;
 
@@ -45,12 +45,22 @@ describe("setup-api", () => {
     env = {
       HOME: process.env.HOME,
       GINI_STATE_ROOT: process.env.GINI_STATE_ROOT,
-      OPENAI_API_KEY: process.env.OPENAI_API_KEY
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+      CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON
     };
     s = scratch();
     process.env.HOME = s.home;
     process.env.GINI_STATE_ROOT = s.stateRoot;
     delete process.env.OPENAI_API_KEY;
+    // Point CODEX_AUTH_JSON at a non-existent scratch path so the codex
+    // credential probe in providerHealth() resolves into the test
+    // sandbox instead of falling back to ~/.codex/auth.json on the
+    // developer machine. node:os homedir() is initialized once at
+    // process start in Bun and ignores later mutations to process.env.HOME,
+    // so overriding HOME in beforeEach is NOT enough on a dev machine
+    // with a real ~/.codex/auth.json — the resolved path would still
+    // be the real one and providerConfigured would flip true.
+    process.env.CODEX_AUTH_JSON = join(s.stateRoot, "nonexistent-codex-auth.json");
     // Prevent the setSetupProvider path from spawning a real detached
     // `gini autostart enable` subprocess during tests — the production
     // path schedules one to refresh the launchd plist's EnvironmentVariables,
@@ -66,6 +76,8 @@ describe("setup-api", () => {
     else process.env.GINI_STATE_ROOT = env.GINI_STATE_ROOT;
     if (env.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
+    if (env.CODEX_AUTH_JSON === undefined) delete process.env.CODEX_AUTH_JSON;
+    else process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
     if (prevSkipRefresh === undefined) delete process.env.GINI_SKIP_PLIST_REFRESH;
     else process.env.GINI_SKIP_PLIST_REFRESH = prevSkipRefresh;
     s.cleanup();
@@ -77,9 +89,11 @@ describe("setup-api", () => {
     expect(status.providers).toEqual(["openai", "codex"]);
     // Platform default is "codex". providerHealth treats codex as
     // configured when the runtime can find an auth.json; in this
-    // scratch env there is none, so providerConfigured is false and
-    // the browser /setup gate still asks the user to finish onboarding.
+    // scratch env there is none (CODEX_AUTH_JSON is scrubbed in
+    // beforeEach), so providerConfigured is false and the browser
+    // /setup gate still asks the user to finish onboarding.
     expect(status.current).toBe("codex");
+    expect(status.providerConfigured).toBe(false);
   });
 
   test("POST openai with apiKey writes secrets.env, sets process.env, updates config", async () => {

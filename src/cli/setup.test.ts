@@ -115,7 +115,7 @@ describe("gini setup", () => {
     expect(result.stdout).toContain("Done.");
   }, 30_000);
 
-  test("--non-interactive with fresh echo config and OPENAI_API_KEY in env auto-configures openai", async () => {
+  test("--non-interactive with fresh config and OPENAI_API_KEY in env auto-configures openai", async () => {
     const stateRoot = scratch("fresh-yes");
     const home = scratch("fresh-yes-home");
     const instance = "dev";
@@ -147,7 +147,7 @@ describe("gini setup", () => {
     expect(mode).toBe(0o600);
   }, 30_000);
 
-  test("--non-interactive with fresh echo config and NO OPENAI_API_KEY exits 1 with helpful message", async () => {
+  test("--non-interactive with fresh config and NO OPENAI_API_KEY exits 1 with helpful message", async () => {
     const stateRoot = scratch("fresh-yes-nokey");
     const home = scratch("fresh-yes-nokey-home");
     const instance = "dev";
