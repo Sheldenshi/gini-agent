@@ -42,11 +42,9 @@
 // handler itself; the actual launchctl interaction is the detached
 // child's responsibility.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { writeFileSync } from "node:fs";
 import { configPath } from "../paths";
-import { normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -154,7 +152,7 @@ export async function setSetupProvider(
     };
   }
   // providerName === "codex"
-  if (!hasCodexAuth()) {
+  if (!hasUsableCodexCredentials(config.provider)) {
     return {
       ok: false,
       provider: providerHealth(config),
@@ -180,15 +178,4 @@ export async function setSetupProvider(
     provider: providerHealth(config),
     plistRefreshNeeded: false
   };
-}
-
-function hasCodexAuth(): boolean {
-  const envRaw = process.env.CODEX_AUTH_JSON;
-  if (envRaw && envRaw.length > 0) {
-    try { JSON.parse(envRaw); return true; } catch { /* fall through */ }
-  }
-  const home = process.env.HOME || homedir();
-  const authPath = join(home, ".codex", "auth.json");
-  if (!existsSync(authPath)) return false;
-  try { JSON.parse(readFileSync(authPath, "utf8")); return true; } catch { return false; }
 }

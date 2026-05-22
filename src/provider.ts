@@ -1706,9 +1706,30 @@ function readCodexCredentials(provider: ProviderConfig): {
   }
 }
 
+// Public helper for callers that need a yes/no on "are codex credentials
+// usable?" without the full credential record. Routes through the same
+// codexAuthPath() resolution providerHealth uses so CODEX_AUTH_JSON is
+// interpreted consistently (filesystem path, not raw JSON) everywhere.
+//
+// Pass a ProviderConfig if available; an empty {name:"codex"} is enough
+// when the caller just wants to gate a UI flow on credential presence.
+export function hasUsableCodexCredentials(provider?: ProviderConfig): boolean {
+  const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
+  return readCodexCredentials(probe).ok;
+}
+
 function codexAuthPath(provider: ProviderConfig): string {
-  const raw = provider.apiKeyEnv && process.env[provider.apiKeyEnv]
-    ? process.env[provider.apiKeyEnv]
+  // apiKeyEnv only makes sense for codex providers (where it would point at
+  // a CODEX_AUTH_JSON-style path env). For non-codex providers the field
+  // typically holds an OpenAI key env name (e.g. "OPENAI_API_KEY") whose
+  // value is an `sk-...` secret, not a filesystem path. Honoring it
+  // unconditionally would resolve to a nonsense path during openai→codex
+  // credential probes and produce false negatives. Gate on provider.name so
+  // hasUsableCodexCredentials() reads the real codex auth source regardless
+  // of which provider the caller's config currently names.
+  const apiKeyEnv = provider.name === "codex" ? provider.apiKeyEnv : undefined;
+  const raw = apiKeyEnv && process.env[apiKeyEnv]
+    ? process.env[apiKeyEnv]
     : process.env.CODEX_AUTH_JSON ?? DEFAULT_CODEX_AUTH_PATH;
   const path = raw ?? DEFAULT_CODEX_AUTH_PATH;
   return resolve(path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
