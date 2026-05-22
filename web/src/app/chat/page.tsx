@@ -356,11 +356,24 @@ export default function ChatPage() {
                       const showApprovalActions =
                         message.role === "assistant" &&
                         messageTask?.status === "waiting_approval";
+                      // Surface the task's tool-call breadcrumbs above the
+                      // assistant bubble so the work the agent did (navigate,
+                      // connect, snapshot, ...) stays visible after this turn
+                      // is no longer in-flight. recentToolCalls is persisted
+                      // on the task record and survives task completion. The
+                      // bottom placeholder block below only runs when there
+                      // is NO assistant message for the in-flight task, so
+                      // double-rendering isn't possible.
+                      const messageToolCalls =
+                        message.role === "assistant" && messageTask
+                          ? messageTask.recentToolCalls
+                          : undefined;
                       return (
                         <li key={message.id}>
                           <MessageBubble
                             message={message}
                             isStreaming={message.id === streamingAssistantMessageId}
+                            toolCalls={messageToolCalls}
                           />
                           {showApprovalActions && message.taskId ? (
                             <div className="ml-[46px] mt-1 max-w-[90%]">

@@ -1,14 +1,22 @@
 import type { ChatMessage } from "@/lib/view-types";
+import type { ToolCallSummary } from "@runtime/types";
 import { Avatar } from "./Avatar";
 import { MarkdownContent } from "./MarkdownContent";
+import { ToolCallRow } from "./ToolCallRow";
 import { formatMessageTimestamp } from "./relative-time";
 
 export function MessageBubble({
   message,
-  isStreaming
+  isStreaming,
+  toolCalls
 }: {
   message: ChatMessage;
   isStreaming?: boolean;
+  // Tool-call breadcrumbs from this message's task. Rendered above the
+  // bubble so the user can see what the agent did to arrive at the
+  // answer, even after newer turns push this one up. Empty / undefined
+  // hides the section.
+  toolCalls?: ToolCallSummary[];
 }) {
   const timestamp = formatMessageTimestamp(message.createdAt);
   const isUser = message.role === "user";
@@ -35,6 +43,13 @@ export function MessageBubble({
           <span className="font-semibold text-foreground">Gini</span>
           {timestamp ? <span className="text-muted-foreground">{timestamp}</span> : null}
         </div>
+        {toolCalls && toolCalls.length > 0 ? (
+          <div className="mb-1 flex flex-col gap-0.5">
+            {toolCalls.map((call) => (
+              <ToolCallRow key={call.id} call={call} />
+            ))}
+          </div>
+        ) : null}
         <div className="max-w-[90%] rounded-xl border bg-card px-3 py-2.5 text-card-foreground">
           <MarkdownContent text={message.content} streaming={isStreaming} />
         </div>
