@@ -19,11 +19,15 @@ const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "las
 // surface (allow / deny / pair / reject-pending / disable / health
 // /send/receive) — any of those forwarded cross-origin would let an
 // attacker page mutate the bot's allowlist or fire outbound messages
-// as the operator.
+// as the operator. The bare `messaging` POST creates a brand-new bridge
+// (with a bot token) under the operator's identity, so it has to land
+// in the same guard or a cross-origin page can plant attacker-supplied
+// ingress.
 const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
   /^update$/,
   /^update\/check$/,
   /^embedding\/reembed$/,
+  /^messaging$/,
   /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
 ];
 
