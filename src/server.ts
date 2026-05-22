@@ -3,6 +3,7 @@ import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
+import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { loadConfig, parseInstance, runtimePortPath } from "./paths";
@@ -127,6 +128,22 @@ runConnectorDetection(config)
   })
   .catch((error) => {
     appendLog(config.instance, "connector.detection.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+// Back-fill MCP server registrations for any connectors that were already
+// healthy before the connector↔MCP bridge shipped. Idempotent and
+// best-effort: errors are absorbed so a malformed provider descriptor
+// can't block startup.
+syncProviderMcpServers(config)
+  .then((created) => {
+    if (created.length > 0) {
+      appendLog(config.instance, "mcp.auto_register.startup", { created });
+    }
+  })
+  .catch((error) => {
+    appendLog(config.instance, "mcp.auto_register.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });

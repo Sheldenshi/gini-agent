@@ -1,6 +1,7 @@
 import type { ConnectorRecord, ConnectorSecretRef, RuntimeConfig, RuntimeState, SkillRecord } from "../../types";
 import { addAudit, id, mutateState, now, readState, updateConnectorHealth } from "../../state";
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../../state/secrets";
+import { syncProviderMcpServers } from "../mcp-sync";
 import { getProvider, listProviders } from "./registry";
 
 export interface CreateConnectorInput {
@@ -271,7 +272,7 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
     probeMessage = `Provider ${initial.provider} has no remote probe; presence-only.`;
   }
 
-  return mutateState(config.instance, (state) => {
+  const result = await mutateState(config.instance, (state) => {
     const connector = state.connectors.find((candidate) => candidate.id === connectorId);
     if (!connector) throw new Error(`Connector not found: ${connectorId}`);
     connector.lastHealthAt = now();
@@ -291,6 +292,19 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
     );
     return connector;
   });
+  // After a successful health write, materialize any provider-declared
+  // MCP server record so `mcp_call(server: "<provider>")` resolves. Safe
+  // to call on every probe — the sync is idempotent and skips providers
+  // whose MCP entry already exists.
+  if (result.health === "healthy") {
+    try {
+      await syncProviderMcpServers(config);
+    } catch {
+      // Best-effort. A failure here doesn't unwind the health update —
+      // the connector is still usable for env-based flows.
+    }
+  }
+  return result;
 }
 
 // A skill is active iff every required connector is satisfied by a

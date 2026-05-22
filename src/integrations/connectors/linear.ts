@@ -76,6 +76,18 @@ export const linearProvider: ProviderModule = {
     purposes: ["token"],
     envBindings: { LINEAR_API_KEY: "token" }
   },
+  // Auto-register the hosted Linear MCP server when a Linear connector
+  // becomes healthy. The `${LINEAR_API_KEY}` placeholder resolves at
+  // invoke-time via `resolveMcpHeaders()` against the same connector's
+  // env-binding, so the token never lands in state.json.
+  mcpServer: {
+    name: "linear",
+    url: "https://mcp.linear.app/mcp",
+    transport: "http",
+    headers: {
+      Authorization: "Bearer ${LINEAR_API_KEY}"
+    }
+  },
   async probe(ctx) {
     const token = await ctx.resolveSecret("token");
     if (!token) return { ok: false, message: "Missing token secret." };
