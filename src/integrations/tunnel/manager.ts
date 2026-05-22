@@ -295,7 +295,42 @@ export class TunnelManager {
    * it just resets the notes status without writing.
    */
   async refreshAppleNote(): Promise<TunnelSnapshot> {
+    // Share an in-flight refresh across overlapping callers. The HTTP
+    // handler can race the start()-time fire-and-forget refresh against
+    // a user-initiated GET /api/tunnel; without this gate both paths
+    // would invoke osascript concurrently and race two writes against
+    // Notes.app, producing duplicate notes or interleaved snapshot
+    // mutations.
+    if (this.notesRefresh) return this.notesRefresh;
+    const refresh = this.refreshAppleNoteInner();
+    this.notesRefresh = refresh;
+    try {
+      return await refresh;
+    } finally {
+      if (this.notesRefresh === refresh) this.notesRefresh = null;
+    }
+  }
+
+  private async refreshAppleNoteInner(): Promise<TunnelSnapshot> {
     if (!this.snapshot.publicUrl) {
+      return this.getSnapshot();
+    }
+    // Honour the operator's `tunnel apple-notes disable` flag here too.
+    // start() gates its fire-and-forget refresh on `appleNotes.enabled`,
+    // but the HTTP layer invokes this method directly via the tunnel
+    // hooks for the documented re-sync path — without this check, a
+    // single GET /api/tunnel would still drive an osascript write to
+    // Notes.app even after the operator disabled the mirror.
+    if (!this.config.appleNotes.enabled || this.disableAppleNotes) {
+      this.snapshot = {
+        ...this.snapshot,
+        appleNotes: {
+          ...this.snapshot.appleNotes,
+          enabled: false,
+          available: this.snapshot.appleNotes.available,
+          lastError: null
+        }
+      };
       return this.getSnapshot();
     }
     const available = await isICloudAccountAvailable({

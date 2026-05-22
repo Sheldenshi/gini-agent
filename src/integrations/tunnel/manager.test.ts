@@ -112,6 +112,62 @@ describe("TunnelManager", () => {
     await manager.stop();
   });
 
+  test("refreshAppleNote skips osascript entirely when appleNotes.enabled is false", async () => {
+    setupInstanceDir("tunnel-manager-notes-disabled");
+    let osascriptCalls = 0;
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-notes-disabled",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      spawn: () => scriptedChild(["INF https://gated-notes-1.trycloudflare.com\n"]),
+      osascript: async () => {
+        osascriptCalls += 1;
+        return { stdout: "yes\n", stderr: "", exitCode: 0 };
+      }
+    });
+    await manager.start();
+    const snapshot = await manager.refreshAppleNote();
+    // No osascript invocation should have happened on either the
+    // fire-and-forget refresh (gated at start()) or this explicit call.
+    expect(osascriptCalls).toBe(0);
+    expect(snapshot.appleNotes.lastSyncedAt).toBeNull();
+    await manager.stop();
+  });
+
+  test("refreshAppleNote is single-flight under concurrent callers", async () => {
+    setupInstanceDir("tunnel-manager-notes-singleflight");
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-notes-singleflight",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: true, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      spawn: () => scriptedChild(["INF https://singleflight-1.trycloudflare.com\n"]),
+      osascript: async (script) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await Bun.sleep(5);
+        inFlight -= 1;
+        if (script.includes("name of every account")) {
+          return { stdout: "yes\n", stderr: "", exitCode: 0 };
+        }
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+    });
+    await manager.start();
+    await Promise.all([manager.refreshAppleNote(), manager.refreshAppleNote(), manager.refreshAppleNote()]);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+    await manager.stop();
+  });
+
   test("Apple Notes is skipped when iCloud lookup reports no", async () => {
     setupInstanceDir("tunnel-manager-no-icloud");
     const manager = makeManager("tunnel-manager-no-icloud", {
