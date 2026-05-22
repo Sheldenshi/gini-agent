@@ -6,12 +6,13 @@
 
 export const theme = {
   // Surfaces. `bgRail` is the leftmost agent-rail column; `bg` is the
-  // wider chat-list / detail area. `rowSelected` is the highlighted chat
-  // row state (matches the screenshot's selected-row tint).
+  // wider chat-list / detail area. `rowSelected` is the highlighted-row
+  // tint used by the agent picker — a subtle step lighter than `bg` so
+  // selection reads without competing with the row text.
   bg: "#17212B",
   bgRail: "#0E1621",
   rowBg: "#17212B",
-  rowSelected: "#2B5278",
+  rowSelected: "#22303C",
   inputBg: "#242F3D",
 
   // Text.

@@ -154,6 +154,11 @@ export default function AgentsScreen() {
         agents={list}
         selectedAgentId={selectedAgentId}
         onPick={onPickAgent}
+        onNewAgent={() => {
+          // Hook into the create-agent flow added in the next change.
+          // Kept as a stub for now so the new footer row has a press
+          // target wired without touching the parent in this commit.
+        }}
         onClose={() => setPickerOpen(false)}
       />
     </SafeAreaView>
@@ -403,12 +408,14 @@ function AgentPickerModal({
   agents,
   selectedAgentId,
   onPick,
+  onNewAgent,
   onClose
 }: {
   visible: boolean;
   agents: AgentRecord[];
   selectedAgentId: string | null;
   onPick: (agent: AgentRecord) => void;
+  onNewAgent: () => void;
   onClose: () => void;
 }) {
   return (
@@ -445,7 +452,6 @@ function AgentPickerModal({
           <FlatList
             data={agents}
             keyExtractor={(a) => a.id}
-            ItemSeparatorComponent={ChatRowSeparator}
             renderItem={({ item }) => (
               <AgentPickerRow
                 agent={item}
@@ -453,6 +459,9 @@ function AgentPickerModal({
                 onPress={() => onPick(item)}
               />
             )}
+            ListFooterComponent={
+              <NewAgentFooterRow onPress={onNewAgent} />
+            }
           />
         </SafeAreaView>
       </View>
@@ -480,7 +489,7 @@ function AgentPickerRow({
     <TouchableOpacity
       onPress={onPress}
       activeOpacity={0.7}
-      style={styles.pickerRow}
+      style={[styles.pickerRow, selected && styles.pickerRowSelected]}
       accessibilityRole="button"
       accessibilityLabel={`Select agent ${agent.name}`}
       accessibilityState={{ selected }}
@@ -495,8 +504,24 @@ function AgentPickerRow({
           </Text>
         ) : null}
       </View>
-      {selected ? <Text style={styles.pickerCheck}>✓</Text> : null}
     </TouchableOpacity>
+  );
+}
+
+function NewAgentFooterRow({ onPress }: { onPress: () => void }) {
+  return (
+    <View>
+      <View style={styles.pickerFooterDivider} />
+      <TouchableOpacity
+        onPress={onPress}
+        activeOpacity={0.7}
+        style={styles.pickerRow}
+        accessibilityRole="button"
+        accessibilityLabel="Create new agent"
+      >
+        <Text style={styles.pickerNewAgentText}>+ New agent</Text>
+      </TouchableOpacity>
+    </View>
   );
 }
 
@@ -607,10 +632,15 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     paddingHorizontal: 16,
-    paddingVertical: 12
+    minHeight: 64
   },
+  pickerRowSelected: { backgroundColor: theme.rowSelected },
   pickerBody: { flex: 1, gap: 2 },
-  pickerTitle: { color: theme.text, fontSize: 16, fontWeight: "600" },
+  pickerTitle: { color: theme.text, fontSize: 16, fontWeight: "700" },
   pickerSubtitle: { color: theme.subtle, fontSize: 13 },
-  pickerCheck: { color: theme.accent, fontSize: 20, fontWeight: "600" }
+  pickerFooterDivider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: theme.border
+  },
+  pickerNewAgentText: { color: theme.accent, fontSize: 16, fontWeight: "600" }
 });
