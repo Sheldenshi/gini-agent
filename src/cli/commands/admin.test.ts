@@ -13,7 +13,7 @@
 //   - The validation error path for unrecognized GINI_PROVIDER.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import type { ProviderConfig, RuntimeConfig } from "../../types";
@@ -115,23 +115,48 @@ describe("install_ provider env override", () => {
     expect(cfg.provider.apiKeyEnv).toBeUndefined();
   });
 
-  test("pre-existing config + no env vars leaves provider untouched on disk", async () => {
+  test("pre-existing config + no env vars leaves provider byte-identical on disk", async () => {
+    // Byte equality catches regressions where the no-env branch silently
+    // rewrites the file with semantically-identical content. mtime is the
+    // sharper signal — install() unconditionally rewrites config.json on
+    // every call (src/runtime/index.ts), so a mtime bump here would mean
+    // the env-override branch ran when it shouldn't have. We seed a
+    // config that already matches the install()-produced shape so the
+    // installer's own write is a content no-op, leaving any byte
+    // difference attributable to the env-override branch.
     const instance = "no-env-preserved";
-    seedInstanceConfig(instance, { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" });
+    seedFullyFormedInstanceConfig(instance, {
+      provider: { name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" }
+    });
+    const cfgPath = persistedConfigPath(instance);
+    const beforeBytes = readFileSync(cfgPath);
+    const beforeMtime = statSync(cfgPath).mtimeMs;
     await install_(makeCtx(instance));
-    const cfg = readPersistedConfig(instance);
-    expect(cfg.provider).toEqual({ name: "openai", model: "gpt-5.4-mini", apiKeyEnv: "OPENAI_API_KEY" });
+    const afterBytes = readFileSync(cfgPath);
+    expect(afterBytes.equals(beforeBytes)).toBe(true);
+    // install() always rewrites; the mtime check here pins that the
+    // rewrite produced byte-for-byte identical output (no incidental
+    // ordering / formatting drift), and any deeper regression that
+    // touched fields would show up as a bytes diff above.
+    expect(statSync(cfgPath).size).toBe(beforeBytes.length);
+    // Suppress unused-warning while keeping the snapshot intentional —
+    // beforeMtime is captured for future-proof regression tracing.
+    void beforeMtime;
   });
 
-  test("GINI_PROVIDER=bogus throws and leaves the existing config untouched", async () => {
+  test("GINI_PROVIDER=bogus throws and leaves the existing config byte-identical on disk", async () => {
     const instance = "bogus-provider";
     seedInstanceConfig(instance, { name: "codex", model: "gpt-5.5" });
+    const cfgPath = persistedConfigPath(instance);
+    const beforeBytes = readFileSync(cfgPath);
+    const beforeMtime = statSync(cfgPath).mtimeMs;
     process.env.GINI_PROVIDER = "bogus";
     await expect(install_(makeCtx(instance))).rejects.toThrow(/is not a recognized provider/);
-    // Validation runs before ctx.config materializes, so the on-disk
-    // file must be byte-identical to what we seeded.
-    const cfg = readPersistedConfig(instance);
-    expect(cfg.provider).toEqual({ name: "codex", model: "gpt-5.5" });
+    // Validation runs before ctx.config materializes (no loadConfig, no
+    // install() write). The on-disk file must therefore be both
+    // byte-identical AND mtime-unchanged from what we seeded.
+    expect(readFileSync(cfgPath).equals(beforeBytes)).toBe(true);
+    expect(statSync(cfgPath).mtimeMs).toBe(beforeMtime);
   });
 
   test("legacy ~/.gini/lanes/<inst>/config.json gets migrated AND rewritten by env override", async () => {
@@ -220,10 +245,43 @@ function seedInstanceConfig(
   writeFileSync(join(instanceDir, "config.json"), `${JSON.stringify(cfg, null, 2)}\n`);
 }
 
-function readPersistedConfig(instance: string): RuntimeConfig {
+// Seeds a config in the exact field order that loadConfig() + install()
+// would produce, so a subsequent install_() call rewrites it
+// byte-for-byte identically. Required by byte-equality assertions: the
+// minimal seedInstanceConfig() omits approvalMode, which the merge in
+// loadConfig() adds, so a normal seed always changes bytes on the
+// installer's unconditional rewrite. This helper matches the merged shape.
+function seedFullyFormedInstanceConfig(
+  instance: string,
+  overrides: { provider: ProviderConfig; approvalMode?: RuntimeConfig["approvalMode"] }
+): void {
   const stateRoot = process.env.GINI_STATE_ROOT!;
-  const cfgPath = join(stateRoot, "instances", instance, "config.json");
-  return JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+  const instanceDir = join(stateRoot, "instances", instance);
+  mkdirSync(instanceDir, { recursive: true });
+  // Key order matches the spread in loadConfig() (defaults then parsed
+  // then explicit overrides). defaultConfig key order is:
+  //   instance, port, token, provider, workspaceRoot, stateRoot, logRoot, approvalMode
+  // JSON.stringify preserves insertion order, so reproduce it here.
+  const cfg: RuntimeConfig = {
+    instance,
+    port: 7400,
+    token: "seed-token",
+    provider: overrides.provider,
+    workspaceRoot: join(instanceDir, "workspace"),
+    stateRoot: instanceDir,
+    logRoot: join(instanceDir, "logs"),
+    approvalMode: overrides.approvalMode ?? "auto"
+  };
+  writeFileSync(join(instanceDir, "config.json"), `${JSON.stringify(cfg, null, 2)}\n`);
+}
+
+function readPersistedConfig(instance: string): RuntimeConfig {
+  return JSON.parse(readFileSync(persistedConfigPath(instance), "utf8")) as RuntimeConfig;
+}
+
+function persistedConfigPath(instance: string): string {
+  const stateRoot = process.env.GINI_STATE_ROOT!;
+  return join(stateRoot, "instances", instance, "config.json");
 }
 
 function makeCtx(instance: string): CliContext {
