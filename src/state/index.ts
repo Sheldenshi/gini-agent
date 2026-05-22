@@ -76,6 +76,16 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
+  insertChatBlock,
+  upsertAssistantTextBlock,
+  updateToolCallBlock,
+  listChatBlocks,
+  listChatBlocksAfter,
+  deleteChatBlocksForSession,
+  subscribeChatBlocks
+} from "./chat-blocks";
+export type { InsertChatBlockInput } from "./chat-blocks";
+export {
   taskCounts,
   upsertTask,
   appendTaskPartial,
