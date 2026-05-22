@@ -282,15 +282,6 @@ function HeaderActions({
           )}
         </TouchableOpacity>
       ) : null}
-      <TouchableOpacity
-        onPress={() => router.push("/settings")}
-        hitSlop={8}
-        style={styles.headerAction}
-        accessibilityRole="button"
-        accessibilityLabel="Settings"
-      >
-        <Text style={styles.headerActionText}>Settings</Text>
-      </TouchableOpacity>
     </View>
   );
 }
