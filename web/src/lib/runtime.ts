@@ -218,9 +218,8 @@ function canonicalizeSegments(segments: string[]): string[] | null {
 
 // Parse GINI_TRUSTED_ORIGINS into a Set of normalized origin strings
 // (scheme://host[:port], no trailing slash, no path). Each entry must be a
-// complete origin; bare hostnames are rejected. The Set is built once per
-// import — operators set the env var at startup and don't rotate it without
-// restarting the BFF.
+// complete origin; bare hostnames are rejected. See ADR bff-trust-boundary.md
+// for the trust-boundary decision and DNS-rebinding threat model.
 //
 // Tri-state return:
 //   null  → env var is unset; loopback-only Host-equality fallback applies.

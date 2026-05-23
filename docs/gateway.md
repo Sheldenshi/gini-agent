@@ -87,6 +87,8 @@ Privileged BFF routes (mutating POSTs like `messaging/add`, `messaging/<id>/remo
 
 Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
+See [BFF trust boundary ADR](adr/bff-trust-boundary.md) for the decision context, threat model, and alternatives considered.
+
 ## Lifecycle Commands
 
 | Command | Behavior |
