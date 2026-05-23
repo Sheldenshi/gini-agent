@@ -203,7 +203,7 @@ instance behind NAT works the same as one on a public host.
 
 4. **Enroll the user's chat.** Have the user DM the bot anything
    (including `/start`). The runtime mints a short verification code
-   (`AB-1A-22` format, 10-minute TTL), records it on
+   (`F971-8261` format, 10-minute TTL), records it on
    `bridge.metadata.recentDeniedChats[].verificationCode` for the
    originating chat, and DMs the same code back to the user. Fetch the
    pending list with `GET /api/messaging/my-bot/chats`, confirm the
@@ -216,7 +216,7 @@ instance behind NAT works the same as one on a public host.
    ```http
    POST /api/messaging/my-bot/allow
 
-   { "chatId": 123456789, "expectedCode": "AB-1A-22" }
+   { "chatId": 123456789, "expectedCode": "F971-8261" }
    ```
 
    Pass the `expectedCode` you confirmed in step 4. The server re-checks
