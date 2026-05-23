@@ -650,7 +650,7 @@ describe("messaging telegram wiring", () => {
     expect(listAllowedChats(config, bridge.id).allowedChatIds).toEqual([11]);
   });
 
-  test("fresh telegram bridge does not pre-mint any enrollment code; verification codes are minted per DM", async () => {
+  test("fresh telegram bridge does not pre-mint any verification code; codes are minted per DM", async () => {
     const config = testConfig("telegram-no-pre-mint");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
 
@@ -667,7 +667,7 @@ describe("messaging telegram wiring", () => {
     expect(bridge.metadata?.pairingCodeExpiresAt).toBeUndefined();
   });
 
-  test("recordDeniedChatAttempt mints a verification code in AB-1A-22 format for private DMs", async () => {
+  test("recordDeniedChatAttempt mints a verification code in F971-8261 format for private DMs", async () => {
     const config = testConfig("telegram-verify-mint");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
     const { recordDeniedChatAttempt } = await import("./messaging");
@@ -685,7 +685,7 @@ describe("messaging telegram wiring", () => {
       sender: "alice"
     });
 
-    expect(entry?.verificationCode).toMatch(/^[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}$/);
+    expect(entry?.verificationCode).toMatch(/^[0-9A-F]{4}-[0-9A-F]{4}$/);
     expect(typeof entry?.verificationCodeExpiresAt).toBe("string");
     expect(Date.parse(String(entry?.verificationCodeExpiresAt))).toBeGreaterThan(Date.now());
   });

@@ -493,7 +493,7 @@ export function findDiscordChatSession(
 //
 // Enrollment is a two-sided handshake. When a chat the bot doesn't
 // recognize sends any message (including /start), the poller mints a
-// short verification code in the `AB-1A-22` format, sends it back to
+// short verification code in the `F971-8261` format, sends it back to
 // the user via Telegram, and surfaces a matching pending-request
 // entry to the operator. The operator confirms the code matches what
 // the user sees and clicks Approve, at which point the chat lands on
@@ -506,13 +506,13 @@ export function findDiscordChatSession(
 
 const MAX_RECENT_DENIED_CHATS = 10;
 
-// Per-chat verification code parameters. Format is "AB-1A-22" — three
-// uppercase hex pairs separated by single dashes — chosen for easy
-// over-the-phone confirmation. 24 bits of entropy (16M combos) is
-// overkill against the 10-minute window; readability matters more
+// Per-chat verification code parameters. Format is "F971-8261" — two
+// uppercase 4-hex-digit groups separated by a single dash — chosen for
+// easy over-the-phone confirmation. 32 bits of entropy (4.29B combos)
+// is overkill against the 10-minute window; readability matters more
 // here than collision resistance. The code lives in the matching
 // `recentDeniedChats` entry; a DM after expiry mints a fresh one.
-const VERIFICATION_CODE_BYTES = 3;
+const VERIFICATION_CODE_BYTES = 4;
 const VERIFICATION_CODE_TTL_MS = 10 * 60 * 1000;
 
 export interface DeniedChatAttempt {
@@ -656,7 +656,7 @@ function readRecentDeniedChats(bridge: MessagingBridgeRecord): DeniedChatAttempt
 
 function generateVerificationCode(): string {
   const hex = randomBytes(VERIFICATION_CODE_BYTES).toString("hex").toUpperCase();
-  return `${hex.slice(0, 2)}-${hex.slice(2, 4)}-${hex.slice(4, 6)}`;
+  return `${hex.slice(0, 4)}-${hex.slice(4, 8)}`;
 }
 
 // Bounded retry for best-effort Telegram outbound sends — used to
@@ -683,8 +683,8 @@ async function sendMessagingOutputWithRetries(
     try {
       // parseMode "none" — these messages are short plain-text
       // operator-flow signals (verification codes, post-approve
-      // greetings). MarkdownV2 escaping would turn the dashes in
-      // "AB-1A-22" into "AB\-1A\-22" inside the chat client.
+      // greetings). MarkdownV2 escaping would turn the dash in
+      // "F971-8261" into "F971\-8261" inside the chat client.
       // skipTargetFilter: enrollment-flow sends must reach the
       // recipient regardless of the active agent's messagingTargets
       // policy — the chatId for a brand-new pending user will never
@@ -747,7 +747,7 @@ export async function deliverVerificationCode(
   const minutesRemaining = Number.isFinite(expiresAtRaw)
     ? Math.max(1, Math.round((expiresAtRaw - Date.now()) / 60_000))
     : Math.round(VERIFICATION_CODE_TTL_MS / 60_000);
-  const text = `Enrollment code: ${payload.code}\n\nShow this code to the operator so they can confirm it's you and approve. Expires in ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}.`;
+  const text = `Verification code: ${payload.code}\n\nUse this code to approve the bot for messaging. The code will expire in ${minutesRemaining} minute${minutesRemaining === 1 ? "" : "s"}.`;
   return sendMessagingOutputWithRetries(config, bridgeId, {
     text,
     target: String(payload.chatId)

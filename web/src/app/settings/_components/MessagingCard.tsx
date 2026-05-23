@@ -516,7 +516,7 @@ function BridgeAddedSummary({
             <p>
               Have anyone (yourself included) DM {botUsername ? `@${botUsername}` : "your bot"} on
               Telegram. The bot replies with a short verification code (e.g.{" "}
-              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">AB-1A-22</code>
+              <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">F971-8261</code>
               ); the same code appears as a pending request under this bridge.
             </p>
             <p className="text-[11px] text-muted-foreground">

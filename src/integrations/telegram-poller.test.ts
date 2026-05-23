@@ -526,7 +526,7 @@ describe("telegram poller supervisor", () => {
     )).toEqual([]);
     expect(sendCalls.length).toBeGreaterThan(0);
     expect(sendCalls[0]?.chatId).toBe("9999");
-    expect(sendCalls[0]?.text.toLowerCase()).toContain("enrollment code");
+    expect(sendCalls[0]?.text.toLowerCase()).toContain("verification code");
 
     // The denied attempt is recorded on the bridge metadata with the
     // matching verification code so the operator can confirm before
@@ -536,7 +536,7 @@ describe("telegram poller supervisor", () => {
     const stranger = view.recentDeniedChats.find((entry) => entry.chatId === 9999);
     expect(stranger).toBeDefined();
     expect(stranger?.sender).toBe("Stranger");
-    expect(stranger?.verificationCode).toMatch(/^[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}$/);
+    expect(stranger?.verificationCode).toMatch(/^[0-9A-F]{4}-[0-9A-F]{4}$/);
 
     await supervisor.stopAll();
   });
@@ -593,8 +593,8 @@ describe("telegram poller supervisor", () => {
     await waitFor(() => sendCalls.length > 0, "verification code reply dispatched", 3000);
     expect(sendCalls[0]?.chatId).toBe("12345");
     const text = sendCalls[0]?.text ?? "";
-    expect(text.toLowerCase()).toContain("enrollment code");
-    expect(text).toMatch(/[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}/);
+    expect(text.toLowerCase()).toContain("verification code");
+    expect(text).toMatch(/[0-9A-F]{4}-[0-9A-F]{4}/);
     expect(text.toLowerCase()).toContain("minute");
 
     // The chat is still denied (not enrolled, no task created); the
@@ -669,7 +669,7 @@ describe("telegram poller supervisor", () => {
     ]);
 
     await waitFor(() => sendCalls.length === 1, "first verification code reply dispatched", 3000);
-    const firstCode = sendCalls[0]?.text.match(/[0-9A-F]{2}-[0-9A-F]{2}-[0-9A-F]{2}/)?.[0];
+    const firstCode = sendCalls[0]?.text.match(/[0-9A-F]{4}-[0-9A-F]{4}/)?.[0];
     expect(firstCode).toBeDefined();
 
     // Second DM from the same chat — within the TTL window so the prior
