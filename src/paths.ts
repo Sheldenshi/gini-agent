@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, writeFileSync } from "node:fs";
 import type { Instance, RuntimeConfig } from "./types";
 
 // Per-instance default ports. The installed end-user instance (`default`,
@@ -180,14 +180,29 @@ export function configPath(instance: Instance): string {
 // and JSON.parse would throw — defaulting tunnel state to disabled
 // for the duration of the syscall, 404ing every in-flight tunneled
 // request. The same tmp+rename pattern that state/store.ts uses for
-// state.json applies here: writers stage to .tmp, then rename, and
-// readers either see the prior file or the next file, never both.
+// state.json applies here: writers stage to a per-call tmp file,
+// then rename, and readers either see the prior file or the next
+// file, never both.
+//
+// The tmp filename is salted with PID + a random suffix so two
+// concurrent writers (e.g. the runtime persisting tunnel state at
+// the same instant a CLI command writes the same config) cannot
+// collide on a single tmp path. Without the salt, writer A's tmp
+// could be overwritten by writer B mid-rename — leaving config.json
+// holding B's payload under A's logical commit semantics.
 export function writeConfigAtomic(instance: Instance, payload: unknown): void {
   ensureDir(instanceRoot(instance));
   const path = configPath(instance);
-  const tempPath = `${path}.tmp`;
-  writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`);
-  renameSync(tempPath, path);
+  const suffix = `${process.pid}.${Math.random().toString(36).slice(2)}`;
+  const tempPath = `${path}.${suffix}.tmp`;
+  try {
+    writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`);
+    renameSync(tempPath, path);
+  } catch (error) {
+    // Best-effort cleanup so a failed write doesn't leak the tmp.
+    try { rmSync(tempPath, { force: true }); } catch { /* ignore */ }
+    throw error;
+  }
 }
 
 export function statePath(instance: Instance): string {

@@ -19,15 +19,24 @@ const envSnapshot: { stateRoot: string | undefined; logRoot: string | undefined 
   stateRoot: process.env.GINI_STATE_ROOT,
   logRoot: process.env.GINI_LOG_ROOT
 };
+// Force `process.platform` to "darwin" for the duration of this
+// suite. apple-notes.ts short-circuits both the iCloud availability
+// probe and the Notes upsert on non-darwin hosts before the injected
+// osascript runner can be invoked. Without the override, tests that
+// rely on the injected runner firing (and on observing snapshot
+// mutations the runner drives) fail on Linux CI.
+const originalPlatform = process.platform;
 beforeAll(() => {
   envSnapshot.stateRoot = process.env.GINI_STATE_ROOT;
   envSnapshot.logRoot = process.env.GINI_LOG_ROOT;
+  Object.defineProperty(process, "platform", { value: "darwin", configurable: true });
 });
 afterAll(() => {
   if (envSnapshot.stateRoot === undefined) delete process.env.GINI_STATE_ROOT;
   else process.env.GINI_STATE_ROOT = envSnapshot.stateRoot;
   if (envSnapshot.logRoot === undefined) delete process.env.GINI_LOG_ROOT;
   else process.env.GINI_LOG_ROOT = envSnapshot.logRoot;
+  Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 });
 
 describe("resolveTunnelConfig", () => {

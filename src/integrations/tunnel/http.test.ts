@@ -124,7 +124,7 @@ describe("tunnel HTTP integration", () => {
     expect(refreshes).toBe(0);
   });
 
-  test("GET /api/tunnel?refreshNotes=1 invokes refreshAppleNote when the hook is provided", async () => {
+  test("POST /api/tunnel/refresh-notes invokes refreshAppleNote when the hook is provided", async () => {
     const config = testConfig("tunnel-http-refresh");
     let refreshes = 0;
     const handler = createHandler(config, {
@@ -138,7 +138,8 @@ describe("tunnel HTTP integration", () => {
       }
     });
     const response = await handler(
-      new Request("http://127.0.0.1:7337/api/tunnel?refreshNotes=1", {
+      new Request("http://127.0.0.1:7337/api/tunnel/refresh-notes", {
+        method: "POST",
         headers: { authorization: `Bearer ${config.token}` }
       })
     );
@@ -148,7 +149,7 @@ describe("tunnel HTTP integration", () => {
     expect(payload.appleNotes.lastSyncedAt).toBe("2026-02-02T00:00:00Z");
   });
 
-  test("GET /api/tunnel?refreshNotes=1 falls back to snapshot when refreshAppleNote throws", async () => {
+  test("POST /api/tunnel/refresh-notes falls back to snapshot when refreshAppleNote throws", async () => {
     const config = testConfig("tunnel-http-refresh-failure");
     const handler = createHandler(config, {
       tunnel: {
@@ -158,13 +159,40 @@ describe("tunnel HTTP integration", () => {
       }
     });
     const response = await handler(
-      new Request("http://127.0.0.1:7337/api/tunnel?refreshNotes=1", {
+      new Request("http://127.0.0.1:7337/api/tunnel/refresh-notes", {
+        method: "POST",
         headers: { authorization: `Bearer ${config.token}` }
       })
     );
     expect(response.status).toBe(200);
     const payload = (await response.json()) as TunnelSnapshot;
     expect(payload.publicUrl).toBe("https://example.trycloudflare.com/abcdefghij0123456789");
+  });
+
+  test("GET /api/tunnel ignores ?refreshNotes=1 (read-only, no CSRF surface)", async () => {
+    const config = testConfig("tunnel-http-no-csrf");
+    let refreshes = 0;
+    const handler = createHandler(config, {
+      tunnel: {
+        getSecret: () => "abcdefghij0123456789",
+        getSnapshot: () => stubSnapshot(),
+        refreshAppleNote: async () => {
+          refreshes += 1;
+          return stubSnapshot();
+        }
+      }
+    });
+    const response = await handler(
+      new Request("http://127.0.0.1:7337/api/tunnel?refreshNotes=1", {
+        headers: { authorization: `Bearer ${config.token}` }
+      })
+    );
+    expect(response.status).toBe(200);
+    // The CSRF-vulnerable form must NOT fire osascript even when the
+    // legacy query param is present — SameSite=Lax cookies attach on
+    // top-level cross-site GET, so any side-effect here is reachable
+    // without the operator's consent.
+    expect(refreshes).toBe(0);
   });
 
   test("PATCH /api/tunnel with { enabled: true } invokes applyConfig and returns the new snapshot", async () => {

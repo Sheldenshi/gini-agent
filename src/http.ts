@@ -80,32 +80,41 @@ export function createHandler(
 ): (request: Request) => Response | Promise<Response> {
   const tunnel = options.tunnel ?? null;
   const routes: Array<[string, RegExp, Handler]> = [
-    // GET /api/tunnel returns the live tunnel snapshot (URL + secret + Apple
-    // Notes mirror status).
-    //
-    // Side-effect contract: Apple Notes is re-synced ONLY when the caller
-    // passes `?refreshNotes=1`. The web Settings card polls this endpoint
-    // every 5s for status; firing an osascript pipeline on each poll
-    // would queue Notes.app writes faster than they can finish and
-    // burn TCC-prompt timeouts on permission-denied hosts. The CLI's
-    // `gini tunnel sync-notes` (and any operator hitting the URL by
-    // hand to retry after granting Automation permission) keeps the
-    // documented behaviour by adding the flag.
-    ["GET", /^\/api\/tunnel$/, async (request) => {
+    // GET /api/tunnel is strictly read-only. The Settings card polls
+    // this every 5s for status; queuing an osascript pipeline on every
+    // poll would saturate Notes.app writes and burn TCC-prompt
+    // timeouts on permission-denied hosts. Earlier revs accepted
+    // `?refreshNotes=1` here as a side-effect trigger, but
+    // `SameSite=Lax` session cookies attach on top-level cross-site
+    // GET navigations — an attacker that learned the trycloudflare
+    // hostname could redirect the operator to
+    // `https://<host>/api/runtime/tunnel?refreshNotes=1` and fire
+    // osascript on their machine without consent. The re-sync is now
+    // a POST (see below); browsers do not attach Lax cookies to
+    // cross-site POST.
+    ["GET", /^\/api\/tunnel$/, () => {
       if (!tunnel) return json({ enabled: false }, 200);
-      const refreshRequested = new URL(request.url).searchParams.get("refreshNotes") === "1";
-      if (refreshRequested && tunnel.refreshAppleNote) {
-        try {
-          const snapshot = await tunnel.refreshAppleNote();
-          return json(snapshot);
-        } catch {
-          // Refresh errors are already logged inside the manager; fall
-          // through to the snapshot so the caller still sees the
-          // current state and the `appleNotes.lastError` field.
-        }
-      }
       const snapshot = tunnel.getSnapshot();
       return json(snapshot ?? { enabled: false });
+    }],
+    // POST /api/tunnel/refresh-notes is the explicit Apple Notes
+    // resync trigger. Operators hit this after granting Automation
+    // permission, or via `gini tunnel sync-notes`. POST is the
+    // method choice precisely so SameSite=Lax cookies do NOT attach
+    // on cross-site POSTs (browser spec) — the CSRF surface that
+    // existed when this was a GET side-effect is closed.
+    ["POST", /^\/api\/tunnel\/refresh-notes$/, async () => {
+      if (!tunnel?.refreshAppleNote) return json({ error: "tunnel refresh not supported" }, 501);
+      try {
+        const snapshot = await tunnel.refreshAppleNote();
+        return json(snapshot);
+      } catch {
+        // Refresh errors are already logged inside the manager; fall
+        // through to the snapshot so the caller still sees the
+        // current state and the `appleNotes.lastError` field.
+        const snapshot = tunnel.getSnapshot();
+        return json(snapshot ?? { enabled: false });
+      }
     }],
     // SVG QR for the current public URL. Returns 404 when the tunnel hasn't
     // produced a URL yet (cloudflared still negotiating, tunnel disabled).

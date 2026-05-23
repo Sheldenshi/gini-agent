@@ -15,15 +15,14 @@ export const dynamic = "force-dynamic";
 
 async function forwardRedacted(
   method: "GET" | "PATCH",
-  body?: string,
-  search?: string
+  body?: string
 ): Promise<Response> {
-  // Forward the query string verbatim so the operator can opt into the
-  // documented `?refreshNotes=1` Apple Notes re-sync trigger. GET
-  // without the flag stays read-only — important because the Settings
-  // card polls this endpoint every 5s and we don't want to queue an
-  // osascript subprocess on each poll.
-  const upstream = await fetch(`${runtimeUrl()}/api/tunnel${search ?? ""}`, {
+  // GET is strictly read-only. The Apple Notes resync trigger moved
+  // to a sibling POST /api/runtime/tunnel/refresh-notes precisely so
+  // SameSite=Lax cookies cannot attach on a cross-site GET and fire
+  // osascript via CSRF. PATCH is mutate-only and accepts the same
+  // narrow `{ enabled?, appleNotes? }` shape it always has.
+  const upstream = await fetch(`${runtimeUrl()}/api/tunnel`, {
     method,
     headers: {
       authorization: `Bearer ${runtimeToken()}`,
@@ -82,10 +81,7 @@ function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
   };
 }
 
-export const GET = async (request: NextRequest) => {
-  const search = new URL(request.url).search;
-  return forwardRedacted("GET", undefined, search);
-};
+export const GET = async (_request: NextRequest) => forwardRedacted("GET");
 export const PATCH = async (request: NextRequest) => {
   let body = "";
   try { body = await request.text(); } catch { body = ""; }

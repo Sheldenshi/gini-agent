@@ -31,13 +31,26 @@ const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
   /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
 ];
 
-// Cache file-read values across requests, invalidated by mtime change so
+// Cache file-read values across requests, invalidated by mtime+size so
 // a gateway respawn that rotates the port (or a config edit that flips
-// the tunnel toggle) takes effect on the very next request. statSync on
-// a local file is sub-ms; we don't need a TTL on top of it to keep the
-// hot path cheap.
+// the tunnel toggle) takes effect on the very next request. statSync
+// on a local file is sub-ms; we don't need a TTL on top of it.
+//
+// The cache key compares BOTH mtime AND size. mtime alone is unsafe
+// because two distinct writes can share the same `mtimeMs`:
+//   - coarse-resolution filesystems (HFS+, FAT, some SMB/NFS mounts)
+//     report mtime at second-level granularity.
+//   - even on APFS, two rapid `writeFileSync` calls within a fractional
+//     millisecond can round to the same float.
+//   - atomic-rename swaps that preserve mtime (cp -p, restore tooling)
+//     leave the cache pointing at the prior payload.
+// With no TTL the staleness would be unbounded — adding size to the
+// comparison breaks any case where the new payload has a different
+// length, which covers the realistic ones (config edits change byte
+// counts, port-file content varies).
 interface FileCache {
   mtime: number;
+  size: number;
   value: string;
 }
 const fileCache: Map<string, FileCache> = new Map();
@@ -45,16 +58,21 @@ const fileCache: Map<string, FileCache> = new Map();
 function readFileWithMtimeCache(path: string): string | null {
   if (!existsSync(path)) return null;
   let mtime: number;
+  let size: number;
   try {
-    mtime = statSync(path).mtimeMs;
+    const s = statSync(path);
+    mtime = s.mtimeMs;
+    size = s.size;
   } catch {
     return null;
   }
   const cached = fileCache.get(path);
-  if (cached && cached.mtime === mtime) return cached.value || null;
+  if (cached && cached.mtime === mtime && cached.size === size) {
+    return cached.value || null;
+  }
   try {
     const value = readFileSync(path, "utf8").trim();
-    fileCache.set(path, { mtime, value });
+    fileCache.set(path, { mtime, size, value });
     return value || null;
   } catch {
     return null;

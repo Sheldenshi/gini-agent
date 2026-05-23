@@ -95,12 +95,11 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   }
 
   if (sub === "sync-notes") {
-    // Explicit re-sync trigger. GET /api/tunnel is read-only by default
-    // (so the web Settings card's 5s poll doesn't queue osascript
-    // subprocesses); passing `?refreshNotes=1` is the documented
-    // contract for the operator's "I just granted Automation
-    // permission" flow.
-    const snapshot = await api(config, "/api/tunnel?refreshNotes=1");
+    // Explicit re-sync trigger. The endpoint is POST (not GET) so
+    // SameSite=Lax tunnel cookies do not attach to it on cross-site
+    // navigation — the resync would otherwise be a CSRF target since
+    // it shells out to osascript on the operator's machine.
+    const snapshot = await api(config, "/api/tunnel/refresh-notes", { method: "POST" });
     print({
       ok: true,
       snapshot,

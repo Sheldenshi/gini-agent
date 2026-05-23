@@ -255,18 +255,29 @@ let pendingApply: Promise<void> = Promise.resolve();
 async function runApplyConfig(
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
 ): Promise<ReturnType<typeof tunnelManager.getSnapshot>> {
-  const next: PersistedTunnelConfig = { ...(config.tunnel ?? {}) };
-  if (typeof update.enabled === "boolean") next.enabled = update.enabled;
-  if (update.appleNotes) {
-    next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
-  }
   // Persist BEFORE mutating in-memory state so a write failure (disk
   // full, perms, torn JSON on read-back) aborts the PATCH with a real
   // 5xx instead of returning success + losing the toggle on next
   // restart. Atomic tmp+rename means a reader sees either the prior
   // or next state, never both.
+  //
+  // Critical: `next` is computed by merging onto the on-disk tunnel
+  // slot, NOT onto the runtime's in-memory `config.tunnel`. The
+  // in-memory copy was loaded at boot and never refreshes from disk,
+  // so `gini tunnel rotate-secret` (which writes the new secret to
+  // disk while the runtime is alive) leaves `config.tunnel.secret`
+  // stale. If we built `next` from the in-memory copy and persisted
+  // it back, PATCH enable would silently overwrite the rotated
+  // secret with the boot-time value.
+  let next: PersistedTunnelConfig;
   try {
     const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
+    const existingTunnel = (onDisk.tunnel ?? {}) as PersistedTunnelConfig;
+    next = { ...existingTunnel };
+    if (typeof update.enabled === "boolean") next.enabled = update.enabled;
+    if (update.appleNotes) {
+      next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
+    }
     onDisk.tunnel = next;
     writeConfigAtomic(config.instance, onDisk);
   } catch (error) {
@@ -315,12 +326,14 @@ async function runApplyConfig(
     // public internet without the BFF's cookie auth, redaction, or
     // proxy.ts secret gate.
     let resolvedTarget: string | null = null;
+    let resolveError: Error | null = null;
     try {
       resolvedTarget = await resolveWebTarget();
       tunnelManager.setTargetUrl(resolvedTarget);
     } catch (error) {
+      resolveError = error instanceof Error ? error : new Error(String(error));
       appendLog(config.instance, "tunnel.start.error", {
-        error: error instanceof Error ? error.message : String(error),
+        error: resolveError.message,
         reason: "web target unresolved — refusing to spawn cloudflared against the raw runtime port"
       });
     }
@@ -330,6 +343,15 @@ async function runApplyConfig(
           error: error instanceof Error ? error.message : String(error)
         });
       });
+    } else if (resolveError !== null) {
+      // Propagate the target-resolution failure to the PATCH caller so
+      // the client gets a real error (500) with a useful message
+      // instead of a misleading 200 + "tunnel enabled" toast for a
+      // tunnel that never actually came up. The persisted enabled=true
+      // is intentional — the operator's intent is recorded so the next
+      // restart attempts again — but the response signals the
+      // immediate failure.
+      throw new Error(`Failed to bring tunnel up: ${resolveError.message}`);
     }
   }
   if (becameDisabled) {
