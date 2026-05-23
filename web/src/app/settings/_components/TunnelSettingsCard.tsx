@@ -52,16 +52,28 @@ export function TunnelSettingsCard() {
 
   const tunnelEnabled = snapshot.data?.enabled === true;
   const liveUrl = snapshot.data?.cloudflareUrl ?? null;
+  const tunnelLastError = snapshot.data?.lastError ?? null;
+  // When the runtime records a startup failure (resolveWebTarget
+  // timeout, cloudflared spawn crash) the snapshot's lastError is
+  // set and the operator deserves to see WHY the tunnel didn't come
+  // up instead of staring at "Connecting…" forever. The error wins
+  // over the pending state but only while the tunnel is enabled and
+  // no URL has arrived; once a live URL lands we trust the live
+  // state regardless of what an older error message says.
   const tunnelStatus = !tunnelEnabled
     ? "disabled"
     : liveUrl
       ? "active"
-      : "pending";
+      : tunnelLastError
+        ? "error"
+        : "pending";
   const tunnelDescription = !tunnelEnabled
     ? "Off — the gateway is reachable on localhost only."
     : liveUrl
       ? `Live at ${liveUrl}`
-      : "Connecting…";
+      : tunnelLastError
+        ? tunnelLastError
+        : "Connecting…";
 
   const notesAvailable = snapshot.data?.appleNotes?.available;
   const notesEnabled = snapshot.data?.appleNotes?.enabled === true;

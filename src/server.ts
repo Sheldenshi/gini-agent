@@ -525,7 +525,17 @@ console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=
 // snapshot. The manager is told to stay quiet when the user hasn't
 // opted in.
 if (tunnelResolved.config.enabled) {
-  void (async () => {
+  // Fold the boot bring-up through the same pendingApply chain
+  // PATCH /api/tunnel uses. Without this serialization, a PATCH
+  // that landed while this IIFE was sitting in resolveWebTarget
+  // ran concurrently — manager.start() short-circuits on
+  // `this.starting !== null` and returns the boot's in-flight
+  // promise, so the PATCH's `setTargetUrl(newPort)` was silently
+  // lost (boot's `startInner` captured the old targetUrl
+  // synchronously when its frame opened). Chaining boot through
+  // pendingApply means the PATCH's runApplyConfig awaits boot's
+  // completion before computing its own becameEnabled decision.
+  pendingApply = pendingApply.then(async () => {
     try {
       const target = await resolveWebTarget();
       // Race protection: if applyConfig flipped `enabled` to false while
@@ -557,7 +567,11 @@ if (tunnelResolved.config.enabled) {
       // indefinitely with no diagnostic.
       tunnelManager.recordStartFailure(message);
     }
-  })();
+  });
+  // The chain itself swallows rejections (it can't; the inner
+  // try/catch is exhaustive) so future PATCH .then()s aren't
+  // poisoned even on the unlikely case of a thrown-error escape.
+  pendingApply = pendingApply.then(() => undefined, () => undefined);
 }
 
 // Recycle cloudflared when the web port rebinds. `gini start` can
