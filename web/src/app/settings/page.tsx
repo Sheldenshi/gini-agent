@@ -9,7 +9,8 @@ import type { AgentRow } from "@/lib/view-types";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
 import { AgentCard } from "./_components/AgentCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
-import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
+import { McpCard, type McpRow } from "./_components/McpCard";
+import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
 
