@@ -612,13 +612,24 @@ const runRecycle = async (): Promise<void> => {
   try {
     do {
       recyclePending = false;
+      // Stop BEFORE resolving the new target. The web.port file
+      // changed, which means the previous web rebound (or another
+      // gini start replaced it). The freed port may already have
+      // been grabbed by a co-tenant local service; keeping
+      // cloudflared forwarding to it while we probe the new port
+      // would briefly expose that squatter through the public URL.
+      // Stopping first means the worst case is a 502 (tunnel
+      // closed) for the resolve+spawn window — much safer than
+      // a wrong target.
+      await tunnelManager.stop();
+      const previousTarget = currentWebTarget;
+      currentWebTarget = null;
+      if (shutdownStarted || !tunnelResolved.config.enabled) return;
       const target = await resolveWebTarget();
-      if (target === currentWebTarget) continue;
       appendLog(config.instance, "tunnel.target.changed", {
-        from: currentWebTarget,
+        from: previousTarget,
         to: target
       });
-      await tunnelManager.stop();
       if (shutdownStarted || !tunnelResolved.config.enabled) return;
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
