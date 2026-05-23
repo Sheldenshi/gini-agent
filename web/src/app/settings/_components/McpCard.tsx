@@ -141,10 +141,15 @@ function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
     refetchInterval: 3_000
   });
   const approve = useMutation({
-    mutationFn: (chatId: number) =>
+    // Forward the verification code the operator just confirmed
+    // against alongside the chatId so the server can reject if the
+    // pending entry's code rotated (race against the user re-DMing
+    // after the previous code expired) or expired between when the
+    // page rendered and when the button was clicked.
+    mutationFn: ({ chatId, expectedCode }: { chatId: number; expectedCode?: string }) =>
       api(`/messaging/${encodeURIComponent(bridgeId)}/allow`, {
         method: "POST",
-        body: JSON.stringify({ chatId })
+        body: JSON.stringify({ chatId, ...(expectedCode ? { expectedCode } : {}) })
       }),
     onSuccess: () => {
       toast.success("Chat approved");
@@ -221,7 +226,7 @@ function TelegramPendingRequests({ bridgeId }: { bridgeId: string }) {
               size="sm"
               className="h-7 rounded-full bg-sky-500 px-3 text-xs font-semibold text-white hover:bg-sky-600"
               disabled={busy}
-              onClick={() => approve.mutate(entry.chatId)}
+              onClick={() => approve.mutate({ chatId: entry.chatId, expectedCode: entry.verificationCode })}
             >
               <Check className="mr-1 h-3.5 w-3.5" />
               Approve

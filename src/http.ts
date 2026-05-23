@@ -616,7 +616,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/messaging\/([^/]+)\/allow$/, async (request, params) => {
       const payload = await body(request);
       const chatId = parseChatIdStrict(payload.chatId);
-      return json(await allowChat(config, params[0], chatId));
+      const expectedCode = typeof payload.expectedCode === "string" && payload.expectedCode.length > 0
+        ? payload.expectedCode
+        : undefined;
+      return json(await allowChat(config, params[0], chatId, { expectedCode }));
     }],
     ["POST", /^\/api\/messaging\/([^/]+)\/deny$/, async (request, params) => {
       const payload = await body(request);

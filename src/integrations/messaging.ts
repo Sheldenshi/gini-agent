@@ -661,7 +661,27 @@ async function sendMessagingOutputWithRetries(
       // operator-flow signals (verification codes, post-approve
       // greetings). MarkdownV2 escaping would turn the dashes in
       // "AB-1A-22" into "AB\-1A\-22" inside the chat client.
-      await sendMessagingOutput(config, bridgeId, { ...payload, parseMode: "none" });
+      // skipTargetFilter: enrollment-flow sends must reach the
+      // recipient regardless of the active agent's messagingTargets
+      // policy — the chatId for a brand-new pending user will never
+      // be on a curated allowlist.
+      const record = await sendMessagingOutput(
+        config,
+        bridgeId,
+        { ...payload, parseMode: "none" },
+        { skipTargetFilter: true }
+      );
+      // sendMessagingOutput swallows Telegram/Discord API errors and
+      // records the outbound row with status:"failed" instead of
+      // rethrowing, so a transient API error otherwise reaches us as
+      // a successful return. Inspect the record and treat "failed"
+      // as a retry-able outcome so the backoff loop actually fires.
+      if (record.status === "failed") {
+        lastError = new Error(record.error ?? "messaging send returned status=failed");
+        if (attempt === OUTBOUND_RETRY_BACKOFFS_MS.length) break;
+        await new Promise((resolve) => setTimeout(resolve, OUTBOUND_RETRY_BACKOFFS_MS[attempt]));
+        continue;
+      }
       return { ok: true };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
@@ -694,13 +714,43 @@ export async function deliverVerificationCode(
   });
 }
 
-export async function allowChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+export async function allowChat(
+  config: RuntimeConfig,
+  idOrName: string,
+  chatId: number,
+  options: { expectedCode?: string } = {}
+) {
   if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
   const result = await mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
     if (!live) throw new Error(`Messaging bridge not found: ${idOrName}`);
     if (live.kind !== "telegram") {
       throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
+    }
+    // Server-enforced verification handshake. When the caller (the
+    // operator UI) supplies the code it saw in the pending row, the
+    // server confirms it matches the still-live `verificationCode`
+    // on `recentDeniedChats` for this chat and hasn't expired. This
+    // closes the stale-UI / racing-DM window where the operator
+    // could approve based on a code that no longer reflects the
+    // current pending entry. Callers that don't supply a code
+    // (legacy CLI `gini messaging allow`) keep the prior trust
+    // model — the explicit CLI call already proves operator intent.
+    if (options.expectedCode !== undefined) {
+      const pending = readRecentDeniedChats(live).find((entry) => entry.chatId === chatId);
+      if (!pending) {
+        throw new Error(`Invalid input: No pending request for chat ${chatId} on bridge '${idOrName}'.`);
+      }
+      if (!pending.verificationCode) {
+        throw new Error(`Invalid input: Pending request for chat ${chatId} has no verification code (group chats cannot be approved by code).`);
+      }
+      const expiresAt = pending.verificationCodeExpiresAt ? Date.parse(pending.verificationCodeExpiresAt) : Number.NaN;
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        throw new Error(`Verification code for chat ${chatId} has expired — have the user DM the bot again to mint a fresh code.`);
+      }
+      if (pending.verificationCode.toLowerCase() !== options.expectedCode.trim().toLowerCase()) {
+        throw new Error(`Verification code mismatch — the pending request's code has rotated. Reload the page and confirm again before approving.`);
+      }
     }
     const meta = { ...(live.metadata ?? {}) };
     const allowed = readAllowedChatIds(live);
@@ -847,13 +897,16 @@ function parseInboundMedia(raw: unknown): MessagingMessageMedia | undefined {
   };
 }
 
-// In-process options that don't travel over HTTP. Today this carries
-// only an AbortSignal so the supervisor's stopAll can cancel an
-// in-flight Discord POST instead of waiting it out. HTTP callers
-// (POST /api/messaging/:id/send) pass undefined; internal callers
-// (the poller's detached reply mirror) pass the loop's signal.
+// In-process options that don't travel over HTTP. HTTP callers (POST
+// /api/messaging/:id/send) pass undefined; internal callers pass any
+// of: the supervisor's stopAll signal (so an in-flight Discord POST
+// can be cancelled instead of waited out), or `skipTargetFilter`
+// (for system-driven sends like verification codes and post-approve
+// greetings that must reach the user regardless of the active
+// agent's messagingTargets policy).
 export interface SendMessagingOptions {
   signal?: AbortSignal;
+  skipTargetFilter?: boolean;
 }
 
 export async function sendMessagingOutput(
@@ -896,16 +949,22 @@ export async function sendMessagingOutput(
   // with no agent restriction.
   const state = readState(config.instance);
   const effective = resolveEffectiveContext(state, config);
+  // System-driven sends (verification codes, post-approve greetings)
+  // bypass the active-agent target filter — they're enrollment-flow
+  // signals the user MUST receive regardless of operator policy, and
+  // the chatId for a brand-new pending user will never be on the
+  // agent's curated messagingTargets list.
+  const targetFilter = options.skipTargetFilter ? undefined : effective.messagingTargetFilter;
   const requested = typeof input.target === "string" && input.target.length > 0 ? input.target : undefined;
   let target: string;
   if (requested !== undefined) {
-    if (effective.messagingTargetFilter && !effective.messagingTargetFilter.has(requested)) {
+    if (targetFilter && !targetFilter.has(requested)) {
       const agentLabel = effective.agentId ?? "active agent";
       throw new Error(`Target '${requested}' not permitted by active agent '${agentLabel}'`);
     }
     target = requested;
-  } else if (effective.messagingTargetFilter) {
-    const permitted = bridge.deliveryTargets.find((t) => effective.messagingTargetFilter!.has(t));
+  } else if (targetFilter) {
+    const permitted = bridge.deliveryTargets.find((t) => targetFilter.has(t));
     target = permitted ?? bridge.deliveryTargets[0] ?? "local";
   } else {
     target = bridge.deliveryTargets[0] ?? "local";
