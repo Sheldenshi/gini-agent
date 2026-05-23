@@ -707,6 +707,82 @@ describe("messaging telegram wiring", () => {
     expect(entry?.verificationCodeExpiresAt).toBeUndefined();
   });
 
+  test("deliverVerificationCode threads its signal through to the Telegram client", async () => {
+    // The poller composes AbortSignal.timeout(10_000) with its loop
+    // signal and passes the result down so a hung outbound Telegram
+    // socket can't pin the poll loop. Without end-to-end threading,
+    // the signal stops at sendMessagingOutputWithRetries and the
+    // underlying fetch sits in `await response.json()` for the OS-
+    // default window. Pin the threading at every hop.
+    const config = testConfig("telegram-verify-signal");
+    const observedSignals: Array<AbortSignal | undefined> = [];
+    const { client } = stubClient({
+      sendMessage: async (chatId, text, opts) => {
+        observedSignals.push(opts?.signal);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      }
+    });
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const { deliverVerificationCode } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    const controller = new AbortController();
+    const result = await deliverVerificationCode(config, bridge.id, {
+      chatId: 9001,
+      code: "AB-CD-EF",
+      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      signal: controller.signal
+    });
+    expect(result.ok).toBe(true);
+    expect(observedSignals.length).toBe(1);
+    expect(observedSignals[0]).toBe(controller.signal);
+  });
+
+  test("sendMessagingOutputWithRetries returns ok:false fast when the caller signal is already aborted", async () => {
+    // A hung Telegram socket landing late shouldn't have the retry
+    // helper keep spinning past the caller's abort — when the poller
+    // shuts down or the per-call timeout fires, the helper exits with
+    // ok:false on the very next attempt boundary instead of sleeping
+    // through the backoff window.
+    const config = testConfig("telegram-verify-aborted");
+    const observedSignals: Array<AbortSignal | undefined> = [];
+    const { client } = stubClient({
+      sendMessage: async (chatId, text, opts) => {
+        observedSignals.push(opts?.signal);
+        return { message_id: 1, date: 0, chat: { id: Number(chatId), type: "private" }, text };
+      }
+    });
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const { deliverVerificationCode } = await import("./messaging");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+
+    const controller = new AbortController();
+    controller.abort(new Error("test-cancel"));
+    const result = await deliverVerificationCode(config, bridge.id, {
+      chatId: 9002,
+      code: "AB-CD-EF",
+      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      signal: controller.signal
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.message).toMatch(/abort/i);
+    }
+    expect(observedSignals.length).toBe(0);
+  });
+
   test("disableMessagingBridge erases the stored bot token", async () => {
     const config = testConfig("telegram-disable");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });

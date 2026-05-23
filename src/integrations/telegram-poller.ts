@@ -254,10 +254,20 @@ async function runLoop(
           // audit tables one row per DM. The user can always reload
           // the original DM to see the same code they were sent.
           if (entry?.verificationCode && entry.mintedFreshCode) {
+            // Compose the poller's lifecycle signal with a 10-second
+            // timeout so a hung Telegram outbound socket can't pin the
+            // per-update loop. Without this, a fetch that's TCP-accepted
+            // but never resolves would block the awaited
+            // deliverVerificationCode here (and the surrounding
+            // for-of loop) until the OS default teardown — pinning
+            // shutdown past `await Promise.all(loop.done)` in the
+            // supervisor and starving every other update on this bridge.
+            const sendSignal = AbortSignal.any([signal, AbortSignal.timeout(10_000)]);
             const result = await deliverVerificationCode(config, bridgeId, {
               chatId: incoming.chatId,
               code: entry.verificationCode,
-              expiresAt: entry.verificationCodeExpiresAt
+              expiresAt: entry.verificationCodeExpiresAt,
+              signal: sendSignal
             });
             if (!result.ok) {
               appendLog(config.instance, "messaging.telegram.verification_send_error", {

@@ -656,13 +656,38 @@ function generateVerificationCode(): string {
 // the UI side; if Telegram is still unreachable after one second
 // we stop and surface the failure in the runtime log.
 const OUTBOUND_RETRY_BACKOFFS_MS: ReadonlyArray<number> = [250, 750];
+
+// Resolves after `ms` unless the signal aborts first. Used between
+// retry attempts so a long-running poller shutdown — or a per-call
+// timeout race composed at the call site — interrupts the wait
+// promptly instead of pinning the loop until the OS tears the
+// socket down.
+function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function sendMessagingOutputWithRetries(
   config: RuntimeConfig,
   bridgeId: string,
-  payload: { text: string; target: string }
+  payload: { text: string; target: string },
+  options: { signal?: AbortSignal } = {}
 ): Promise<{ ok: true } | { ok: false; error: Error }> {
   let lastError: Error | undefined;
   for (let attempt = 0; attempt <= OUTBOUND_RETRY_BACKOFFS_MS.length; attempt++) {
+    if (options.signal?.aborted) {
+      return { ok: false, error: lastError ?? new Error("aborted before send") };
+    }
     try {
       // parseMode "none" — these messages are short plain-text
       // operator-flow signals (verification codes, post-approve
@@ -672,11 +697,15 @@ async function sendMessagingOutputWithRetries(
       // recipient regardless of the active agent's messagingTargets
       // policy — the chatId for a brand-new pending user will never
       // be on a curated allowlist.
+      // signal threads end-to-end into the underlying Telegram /
+      // Discord client fetch so a hung outbound — TCP-accepted but
+      // no response — gets cancelled at the timeout rather than
+      // sitting in `await response.json()` for the OS-default window.
       const record = await sendMessagingOutput(
         config,
         bridgeId,
         { ...payload, parseMode: "none" },
-        { skipTargetFilter: true }
+        { skipTargetFilter: true, signal: options.signal }
       );
       // sendMessagingOutput swallows Telegram/Discord API errors and
       // records the outbound row with status:"failed" instead of
@@ -686,14 +715,23 @@ async function sendMessagingOutputWithRetries(
       if (record.status === "failed") {
         lastError = new Error(record.error ?? "messaging send returned status=failed");
         if (attempt === OUTBOUND_RETRY_BACKOFFS_MS.length) break;
-        await new Promise((resolve) => setTimeout(resolve, OUTBOUND_RETRY_BACKOFFS_MS[attempt]));
+        try {
+          await sleepUnlessAborted(OUTBOUND_RETRY_BACKOFFS_MS[attempt], options.signal);
+        } catch {
+          return { ok: false, error: lastError };
+        }
         continue;
       }
       return { ok: true };
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
+      if (options.signal?.aborted) return { ok: false, error: lastError };
       if (attempt === OUTBOUND_RETRY_BACKOFFS_MS.length) break;
-      await new Promise((resolve) => setTimeout(resolve, OUTBOUND_RETRY_BACKOFFS_MS[attempt]));
+      try {
+        await sleepUnlessAborted(OUTBOUND_RETRY_BACKOFFS_MS[attempt], options.signal);
+      } catch {
+        return { ok: false, error: lastError };
+      }
     }
   }
   return { ok: false, error: lastError ?? new Error("send failed") };
@@ -704,11 +742,14 @@ async function sendMessagingOutputWithRetries(
 // same code on the pending-request row and confirms it matches what
 // the user reports before clicking Approve. Wraps the bounded retry
 // helper so a transient Telegram blip doesn't strand the operator
-// staring at a code the user never got.
+// staring at a code the user never got. The caller is expected to
+// supply a bounded `signal` (e.g. AbortSignal.timeout(10_000)
+// composed with the poller's lifecycle signal) so a hung Telegram
+// API socket can't pin the poll loop or block shutdown.
 export async function deliverVerificationCode(
   config: RuntimeConfig,
   bridgeId: string,
-  payload: { chatId: number; code: string; expiresAt?: string }
+  payload: { chatId: number; code: string; expiresAt?: string; signal?: AbortSignal }
 ): Promise<{ ok: true } | { ok: false; error: Error }> {
   const expiresAtRaw = payload.expiresAt ? Date.parse(payload.expiresAt) : Number.NaN;
   const minutesRemaining = Number.isFinite(expiresAtRaw)
@@ -718,7 +759,7 @@ export async function deliverVerificationCode(
   return sendMessagingOutputWithRetries(config, bridgeId, {
     text,
     target: String(payload.chatId)
-  });
+  }, { signal: payload.signal });
 }
 
 export async function allowChat(
@@ -790,11 +831,15 @@ export async function allowChat(
   // Best-effort greeting back to the chat so the user knows they
   // were approved without having to send another message and wait
   // for an agent reply. The mutation is already committed; a failed
-  // send leaves the chat enrolled but quietly logs the error.
+  // send leaves the chat enrolled but quietly logs the error. The
+  // 10-second AbortSignal caps how long an unresponsive Telegram API
+  // can hold the operator's POST /allow request — without it a hung
+  // socket would block the HTTP handler until the OS default tear-
+  // down (many minutes) and stall the UI in a spinner.
   const greeting = await sendMessagingOutputWithRetries(config, result.bridgeId, {
     text: "Paired. You can chat with the bot now.",
     target: String(chatId)
-  });
+  }, { signal: AbortSignal.timeout(10_000) });
   if (!greeting.ok) {
     appendLog(config.instance, "messaging.telegram.greeting_send_error", {
       bridgeId: result.bridgeId,
