@@ -174,6 +174,22 @@ export function configPath(instance: Instance): string {
   return join(instanceRoot(instance), "config.json");
 }
 
+// Atomic config.json write. Concurrent readers (the web BFF reads on
+// every tunneled request, the runtime reloads on certain operations)
+// would otherwise observe a torn JSON during the writeFileSync call
+// and JSON.parse would throw — defaulting tunnel state to disabled
+// for the duration of the syscall, 404ing every in-flight tunneled
+// request. The same tmp+rename pattern that state/store.ts uses for
+// state.json applies here: writers stage to .tmp, then rename, and
+// readers either see the prior file or the next file, never both.
+export function writeConfigAtomic(instance: Instance, payload: unknown): void {
+  ensureDir(instanceRoot(instance));
+  const path = configPath(instance);
+  const tempPath = `${path}.tmp`;
+  writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`);
+  renameSync(tempPath, path);
+}
+
 export function statePath(instance: Instance): string {
   return join(instanceRoot(instance), "state.json");
 }
@@ -261,7 +277,7 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   const path = configPath(instance);
   if (!existsSync(path)) {
     const config = defaultConfig(instance);
-    writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+    writeConfigAtomic(instance, config);
     return config;
   }
 

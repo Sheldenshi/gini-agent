@@ -5,7 +5,7 @@ import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
-import { configPath, loadConfig, parseInstance, runtimePortPath, tunnelLogPath, webPortPath } from "./paths";
+import { configPath, loadConfig, parseInstance, runtimePortPath, tunnelLogPath, webPortPath, writeConfigAtomic } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
 import { applyLegacyTelegramPairingMigration } from "./state/store";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
@@ -147,19 +147,37 @@ runConnectorDetection(config)
 // `gini tunnel enable` (or by editing config.json directly).
 const tunnelResolved = resolveTunnelConfig(config);
 if (tunnelResolved.mutated) {
-  // Persist the freshly-minted secret BOTH to disk and into the
+  // Persist the resolved tunnel state BOTH to disk and into the
   // in-memory `config` object. Other handlers (e.g.
   // updateAutoApproveSettings in src/runtime/index.ts) write the
   // in-memory config back to disk wholesale on settings changes; if we
   // skipped the in-memory copy here, the next such write would
   // overwrite the disk file's `tunnel.secret` with `undefined` and
   // break every bookmarked URL prefix.
-  config.tunnel = { ...(config.tunnel ?? {}), secret: tunnelResolved.config.secret };
+  //
+  // We write the FULL resolved shape (secret + enabled + appleNotes),
+  // not just the secret. `mutated` is set both for a freshly-minted
+  // secret AND when GINI_TUNNEL flipped enabled from default-off to
+  // on. The BFF (web/src/lib/runtime.ts:runtimeTunnelState) reads
+  // config.json exclusively — it has no view of the runtime's env —
+  // so without persisting the env-derived enabled flag the proxy
+  // would 404 every tunneled request even though cloudflared is up.
+  config.tunnel = {
+    ...(config.tunnel ?? {}),
+    secret: tunnelResolved.config.secret,
+    enabled: tunnelResolved.config.enabled,
+    appleNotes: tunnelResolved.config.appleNotes
+  };
   try {
     const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
     const existingTunnel = (onDisk.tunnel ?? {}) as Record<string, unknown>;
-    onDisk.tunnel = { ...existingTunnel, secret: tunnelResolved.config.secret };
-    writeFileSync(configPath(config.instance), `${JSON.stringify(onDisk, null, 2)}\n`);
+    onDisk.tunnel = {
+      ...existingTunnel,
+      secret: tunnelResolved.config.secret,
+      enabled: tunnelResolved.config.enabled,
+      appleNotes: tunnelResolved.config.appleNotes
+    };
+    writeConfigAtomic(config.instance, onDisk);
   } catch (error) {
     appendLog(config.instance, "tunnel.secret.persist.error", {
       error: error instanceof Error ? error.message : String(error)
@@ -183,15 +201,45 @@ const tunnelManager = new TunnelManager({
 
 async function resolveWebTarget(): Promise<string> {
   const path = webPortPath(config.instance);
-  for (let attempt = 0; attempt < 60; attempt += 1) {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    let port: number | null = null;
     try {
       const raw = readFileSync(path, "utf8").trim();
-      const port = Number(raw);
-      if (Number.isFinite(port) && port > 0) return `http://127.0.0.1:${port}`;
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed > 0) port = parsed;
     } catch { /* file not yet written */ }
-    await Bun.sleep(1000);
+    if (port !== null) {
+      // Trust-but-verify the port file. A stale file from a crashed
+      // prior run, or a fresh file written by Next.js spawn before
+      // `waitForWebHealthz` confirms the server is serving, would
+      // otherwise route cloudflared at a dead or half-booted bundle.
+      // Hit the runtime's own marker endpoint and only accept the
+      // port when it answers with the matching service + instance.
+      const url = `http://127.0.0.1:${port}`;
+      if (await probeWebHealthy(url)) return url;
+    }
+    await Bun.sleep(250);
   }
-  throw new Error("web port did not appear within 60s — the Next.js dev server may have failed to start");
+  throw new Error("web port did not appear within 60s — the Next.js server may have failed to start");
+}
+
+async function probeWebHealthy(webUrl: string): Promise<boolean> {
+  try {
+    const response = await fetch(`${webUrl}/api/runtime/__healthz`, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(1000)
+    });
+    if (!response.ok) return false;
+    const body = await response.json().catch(() => null) as
+      | { ok?: boolean; service?: string; instance?: string }
+      | null;
+    return Boolean(
+      body && body.ok === true && body.service === "gini-web" && body.instance === config.instance
+    );
+  } catch {
+    return false;
+  }
 }
 
 // Serializes /api/tunnel PATCH calls. Each new applyConfig invocation
@@ -219,7 +267,7 @@ async function runApplyConfig(
   try {
     const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
     onDisk.tunnel = next;
-    writeFileSync(configPath(config.instance), `${JSON.stringify(onDisk, null, 2)}\n`);
+    writeConfigAtomic(config.instance, onDisk);
   } catch (error) {
     appendLog(config.instance, "tunnel.config.persist.error", {
       error: error instanceof Error ? error.message : String(error)
@@ -244,23 +292,32 @@ async function runApplyConfig(
     appleNotes: tunnelResolved.config.appleNotes
   });
   if (becameEnabled) {
-    // Resolve the live web port before spawning cloudflared so the
+    // Resolve the live web port BEFORE spawning cloudflared so the
     // tunnel targets the Next.js UI (full settings/chat surface)
     // rather than the placeholder runtime port (raw /api/* + the
-    // bare landing). The boot-time path does the same.
+    // bare landing). If resolution fails we MUST NOT fall through
+    // to start() — the manager's targetUrl still holds the
+    // constructor-time placeholder pointing at the runtime gateway,
+    // and spawning cloudflared against that exposes /api/* over the
+    // public internet without the BFF's cookie auth, redaction, or
+    // proxy.ts secret gate.
+    let resolvedTarget: string | null = null;
     try {
-      const target = await resolveWebTarget();
-      tunnelManager.setTargetUrl(target);
+      resolvedTarget = await resolveWebTarget();
+      tunnelManager.setTargetUrl(resolvedTarget);
     } catch (error) {
       appendLog(config.instance, "tunnel.start.error", {
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        reason: "web target unresolved — refusing to spawn cloudflared against the raw runtime port"
       });
     }
-    await tunnelManager.start().catch((error) => {
-      appendLog(config.instance, "tunnel.start.error", {
-        error: error instanceof Error ? error.message : String(error)
+    if (resolvedTarget !== null) {
+      await tunnelManager.start().catch((error) => {
+        appendLog(config.instance, "tunnel.start.error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
       });
-    });
+    }
   }
   if (becameDisabled) {
     await tunnelManager.stop();

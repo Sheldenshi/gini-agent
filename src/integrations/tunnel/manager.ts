@@ -543,6 +543,13 @@ export function resolveTunnelConfig(
     mutated = true;
   }
   const enabled = raw?.enabled ?? truthyEnv(env.GINI_TUNNEL);
+  // When env (GINI_TUNNEL=1) flips enabled from the default-off, the
+  // resolved value diverges from what's on disk. The BFF reads only
+  // config.json (it has no view of the runtime's env), so without
+  // persisting we'd spawn cloudflared but the proxy would 404 every
+  // tunneled request. Flag the write here so server.ts saves the
+  // resolved state alongside the secret.
+  if (raw?.enabled === undefined && enabled !== false) mutated = true;
   const notesRaw = raw?.appleNotes;
   const notesEnabledDefault = process.platform === "darwin";
   const appleNotes = {

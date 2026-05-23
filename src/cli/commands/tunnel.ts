@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { api } from "../api";
 import { print } from "../output";
-import { configPath } from "../../paths";
+import { configPath, writeConfigAtomic } from "../../paths";
 import { generateSecret } from "../../integrations/tunnel";
 import type { PersistedTunnelConfig } from "../../types";
 
@@ -161,7 +161,7 @@ function mutateTunnelConfig(
     appleNotes: { ...(current.appleNotes ?? {}) }
   };
   raw.tunnel = mutate(normalized);
-  writeFileSync(path, `${JSON.stringify(raw, null, 2)}\n`);
+  writeConfigAtomic(ctx.config.instance, raw);
 }
 
 // Prefer the live runtime PATCH path so a `gini tunnel enable` against a

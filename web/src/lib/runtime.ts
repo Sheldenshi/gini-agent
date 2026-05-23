@@ -204,9 +204,20 @@ export async function proxyRequest(
     });
   }
   const text = await upstream.text();
+  const responseHeaders: Record<string, string> = {
+    "content-type": upstream.headers.get("content-type") ?? "application/json"
+  };
+  // Forward Cache-Control verbatim. The tunnel QR endpoint sets
+  // `no-store` because its body pixels encode the secret-bearing
+  // URL; dropping it here would let browsers and intermediaries
+  // cache the credential. Future endpoints that opt into longer
+  // caching for non-sensitive payloads also need their directive
+  // preserved.
+  const cacheControl = upstream.headers.get("cache-control");
+  if (cacheControl) responseHeaders["cache-control"] = cacheControl;
   return new Response(text, {
     status: upstream.status,
-    headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" }
+    headers: responseHeaders
   });
 }
 

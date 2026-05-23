@@ -45,7 +45,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { configPath } from "../paths";
+import { configPath, writeConfigAtomic } from "../paths";
 import { normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
@@ -133,7 +133,7 @@ export async function setSetupProvider(
       ? payload.model
       : (config.provider?.name === "openai" && config.provider.model ? config.provider.model : "gpt-5.4-mini");
     config.provider = normalizeProvider({ name: "openai", model });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeConfigAtomic(config.instance, config);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
@@ -167,7 +167,7 @@ export async function setSetupProvider(
     ? payload.model
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
   config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeConfigAtomic(config.instance, config);
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's
   // already updated. But the plist still has GINI_INSTANCE etc — no env

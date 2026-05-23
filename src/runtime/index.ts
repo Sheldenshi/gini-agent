@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
-import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot } from "../paths";
+import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot, writeConfigAtomic } from "../paths";
 import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
 import { addAudit } from "../state/audit";
 import { resolveEffectiveContext } from "../execution/effective-context";
@@ -101,7 +101,7 @@ export function install(config: RuntimeConfig): void {
   // `config.migrated` event so the trail captures the silent
   // behavior change from "gate everything" to "auto-approve safe
   // actions" for this instance.
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeConfigAtomic(config.instance, config);
   readState(config.instance);
   // Audit + side-effects of the migration. Fire-and-forget; the
   // synchronous patch above is what the policy seam actually consults.
@@ -227,8 +227,7 @@ export function updateAutoApproveSettings(
       .filter((p) => p.length > 0);
     config.dangerousTerminalPatterns = cleaned;
   }
-  ensureDir(instanceRoot(config.instance));
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeConfigAtomic(config.instance, config);
   const effectiveMode: ApprovalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
   return {
     patterns: config.autoApproveCommands ?? [],

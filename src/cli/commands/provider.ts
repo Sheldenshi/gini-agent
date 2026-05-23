@@ -1,7 +1,7 @@
 import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
-import { configPath } from "../../paths";
+import { configPath, writeConfigAtomic } from "../../paths";
 import { normalizeProvider, providerHealth } from "../../provider";
 import { api } from "../api";
 import { print } from "../output";
@@ -85,7 +85,7 @@ export async function provider(ctx: CliContext): Promise<void> {
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
       ...(extraBody ? { extraBody } : {})
     });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeConfigAtomic(config.instance, config);
     // If an autostart plist already exists for this instance, refresh it
     // so the new provider (and any secrets.env values that came along
     // with it) are picked up on the next launchd respawn. No-op on
