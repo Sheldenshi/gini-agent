@@ -351,7 +351,7 @@ export function loadConfig(instance: Instance): RuntimeConfig {
     // so it never lands on disk.
     (merged as unknown as Record<symbol, unknown>)[PRE_FLIP_MIGRATION_MARKER] = true;
   }
-  if (needsRewrite) writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`);
+  if (needsRewrite) writeConfigAtomic(instance, merged);
   return merged;
 }
 

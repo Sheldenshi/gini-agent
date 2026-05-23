@@ -508,7 +508,12 @@ function buildWebShim(instance: Instance, bunPath: string): string {
     `echo $$ > "$instance_root/web.pid"`,
     `if [ -n "$PORT" ]; then echo "$PORT" > "$instance_root/web.port"; fi`,
     // 4) Hand off to Next.js. exec so launchd tracks dev server PID.
-    `exec "${bunPath}" run dev`
+    //    -H 127.0.0.1 pins the bind to loopback (Next 16 defaults to
+    //    0.0.0.0). With proxy.ts using the client Host header to
+    //    decide localhost, a LAN bind would let any LAN client spoof
+    //    `Host: localhost:<port>` and skip the tunnel gate. Mirror
+    //    the same flag the foreground spawn in cli/process.ts uses.
+    `exec "${bunPath}" run dev -- -H 127.0.0.1`
   ].join("\n");
 }
 

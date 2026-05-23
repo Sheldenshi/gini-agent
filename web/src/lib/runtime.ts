@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -31,48 +31,22 @@ const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
   /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
 ];
 
-// Cache file-read values across requests, invalidated by mtime+size so
-// a gateway respawn that rotates the port (or a config edit that flips
-// the tunnel toggle) takes effect on the very next request. statSync
-// on a local file is sub-ms; we don't need a TTL on top of it.
-//
-// The cache key compares BOTH mtime AND size. mtime alone is unsafe
-// because two distinct writes can share the same `mtimeMs`:
+// Always read the file fresh. The earlier mtime[+size]-keyed cache
+// kept returning stale values in three reachable scenarios:
 //   - coarse-resolution filesystems (HFS+, FAT, some SMB/NFS mounts)
 //     report mtime at second-level granularity.
-//   - even on APFS, two rapid `writeFileSync` calls within a fractional
-//     millisecond can round to the same float.
-//   - atomic-rename swaps that preserve mtime (cp -p, restore tooling)
-//     leave the cache pointing at the prior payload.
-// With no TTL the staleness would be unbounded — adding size to the
-// comparison breaks any case where the new payload has a different
-// length, which covers the realistic ones (config edits change byte
-// counts, port-file content varies).
-interface FileCache {
-  mtime: number;
-  size: number;
-  value: string;
-}
-const fileCache: Map<string, FileCache> = new Map();
-
+//   - even on APFS, two rapid writes can round to the same fractional
+//     mtimeMs float.
+//   - same-byte-length rewrites (a 32-char secret rotation in the same
+//     config shape) collide on size too.
+// With no TTL, a stale cache entry survives indefinitely until something
+// changes the mtime+size tuple, which on a quiescent config file might
+// be never. A bare readFileSync on a small local file is sub-ms — the
+// "cache" was a TTL-era optimization that no longer pulls its weight.
 function readFileWithMtimeCache(path: string): string | null {
   if (!existsSync(path)) return null;
-  let mtime: number;
-  let size: number;
-  try {
-    const s = statSync(path);
-    mtime = s.mtimeMs;
-    size = s.size;
-  } catch {
-    return null;
-  }
-  const cached = fileCache.get(path);
-  if (cached && cached.mtime === mtime && cached.size === size) {
-    return cached.value || null;
-  }
   try {
     const value = readFileSync(path, "utf8").trim();
-    fileCache.set(path, { mtime, size, value });
     return value || null;
   } catch {
     return null;

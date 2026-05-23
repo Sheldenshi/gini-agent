@@ -299,7 +299,17 @@ async function runApplyConfig(
   //  - Just-enabled: spin cloudflared up now.
   //  - Just-disabled: tear it down.
   //  - Enabled + appleNotes flipped: nothing process-level to do.
-  const becameEnabled = next.enabled === true && tunnelResolved.config.enabled !== true;
+  // Also re-spawn cloudflared if config says enabled but no live URL
+  // exists (e.g., the previous start() failed, cloudflared crashed
+  // and the manager's exit monitor nulled the handle, or the boot-
+  // time start aborted from the shutdown guard and the runtime is
+  // now back up). Without this, a re-PATCH of `enabled: true` is a
+  // no-op and the operator has no UI path to recover short of
+  // restarting the runtime.
+  const liveHandleMissing = tunnelManager.getSnapshot().publicUrl === null;
+  const becameEnabled =
+    next.enabled === true
+    && (tunnelResolved.config.enabled !== true || liveHandleMissing);
   const becameDisabled = next.enabled === false && tunnelResolved.config.enabled === true;
   // Detect Apple Notes mirror flipping ON. If the tunnel was already
   // running, a flip from false→true via PATCH must immediately push
@@ -488,6 +498,16 @@ if (tunnelResolved.config.enabled) {
       // would put the snapshot back into a live state that contradicts
       // the config and prevents the next disable-toggle from working.
       if (!tunnelResolved.config.enabled) return;
+      // Same shutdown guard the PATCH path uses. If SIGTERM arrived
+      // while resolveWebTarget was polling, the drain handler already
+      // ran tunnelManager.stop() finding nothing to stop; spawning
+      // here would leak a child past the drain deadline.
+      if (shutdownStarted) {
+        appendLog(config.instance, "tunnel.start.aborted", {
+          reason: "shutdown in progress (boot path)"
+        });
+        return;
+      }
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
     } catch (error) {

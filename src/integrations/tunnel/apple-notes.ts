@@ -53,11 +53,25 @@ export type RunOsascript = (script: string, options?: RunOsascriptOptions) => Pr
 export const OSASCRIPT_TIMEOUT_MS = 15_000;
 
 export const defaultOsascriptRunner: RunOsascript = async (script, options) => {
-  const proc = Bun.spawn(["osascript", "-l", "AppleScript", "-e", script], {
-    stdin: "ignore",
+  // Stream the script through stdin instead of `-e <script>` so the
+  // secret-bearing publicUrl embedded in the AppleScript body does NOT
+  // appear in process argv. `ps -o args` and /proc/<pid>/cmdline are
+  // readable to any same-uid process; with `-e` the secret would leak
+  // across processes the operator owns. The `-` argument tells
+  // osascript to read its program text from stdin.
+  const proc = Bun.spawn(["osascript", "-l", "AppleScript", "-"], {
+    stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe"
   });
+  try {
+    proc.stdin.write(script);
+    await proc.stdin.end();
+  } catch {
+    // stdin can fail to write if the child died immediately (binary
+    // missing, etc). The proc.exited await below surfaces the error
+    // through the normal exit-code path.
+  }
   let timedOut = false;
   let aborted = false;
   const timer = setTimeout(() => {
