@@ -195,8 +195,14 @@ export function writeConfigAtomic(instance: Instance, payload: unknown): void {
   const path = configPath(instance);
   const suffix = `${process.pid}.${Math.random().toString(36).slice(2)}`;
   const tempPath = `${path}.${suffix}.tmp`;
+  // mode 0o600: config.json holds the runtime bearer token and the
+  // tunnel secret. Default umask on most systems would leave the new
+  // file at 0o644 (world-readable), which exposes both credentials
+  // to any other user on the host. The atomic rename preserves the
+  // tmp file's mode on the destination, so setting 0o600 here means
+  // the live config.json is also 0o600.
   try {
-    writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`);
+    writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
     renameSync(tempPath, path);
   } catch (error) {
     // Best-effort cleanup so a failed write doesn't leak the tmp.

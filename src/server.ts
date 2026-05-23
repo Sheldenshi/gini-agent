@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
@@ -260,6 +260,13 @@ let pendingApply: Promise<void> = Promise.resolve();
 // stop, and would now leak a child past the shutdown deadline.
 let shutdownStarted = false;
 
+// Last resolved web target the tunnel was pointed at. The webPortPath
+// watcher compares incoming changes to this so a no-op rewrite (gini
+// start writing the same port back) doesn't trigger an unnecessary
+// cloudflared recycle.
+let currentWebTarget: string | null = null;
+let webPortWatcher: FSWatcher | null = null;
+
 async function runApplyConfig(
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
 ): Promise<ReturnType<typeof tunnelManager.getSnapshot>> {
@@ -379,6 +386,7 @@ async function runApplyConfig(
             error: error instanceof Error ? error.message : String(error)
           });
         });
+        currentWebTarget = resolvedTarget;
       }
     } else if (resolveError !== null) {
       // Propagate the target-resolution failure to the PATCH caller so
@@ -510,12 +518,56 @@ if (tunnelResolved.config.enabled) {
       }
       tunnelManager.setTargetUrl(target);
       await tunnelManager.start();
+      currentWebTarget = target;
     } catch (error) {
       appendLog(config.instance, "tunnel.start.error", {
         error: error instanceof Error ? error.message : String(error)
       });
     }
   })();
+}
+
+// Recycle cloudflared when the web port rebinds. `gini start` can
+// relaunch web on a different port while the runtime is still alive;
+// without this watcher cloudflared would keep forwarding to the old
+// port, exposing whatever process now binds it. fs.watch fires on the
+// file replace, we re-resolve the live target, and if it diverges we
+// stop+start the manager so the public URL points at the new port.
+//
+// Only relevant while the tunnel is enabled. The watcher itself is
+// cheap and stays attached across enable/disable cycles; the gate is
+// inside the handler so disable+re-enable goes through the same
+// resolveWebTarget path as the boot flow.
+try {
+  webPortWatcher = watch(webPortPath(config.instance), { persistent: false }, () => {
+    void (async () => {
+      if (shutdownStarted) return;
+      if (!tunnelResolved.config.enabled) return;
+      try {
+        const target = await resolveWebTarget();
+        if (target === currentWebTarget) return;
+        appendLog(config.instance, "tunnel.target.changed", {
+          from: currentWebTarget,
+          to: target
+        });
+        await tunnelManager.stop();
+        if (shutdownStarted || !tunnelResolved.config.enabled) return;
+        tunnelManager.setTargetUrl(target);
+        await tunnelManager.start();
+        currentWebTarget = target;
+      } catch (error) {
+        appendLog(config.instance, "tunnel.target.recycle.error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    })();
+  });
+} catch {
+  // The file may not exist yet — fs.watch on a missing path throws on
+  // some platforms. The boot block above is what populates the initial
+  // resolveWebTarget; subsequent rotations only matter once the file
+  // exists, and operators who `gini start` after the runtime is up will
+  // re-create it, triggering this branch's path on next runtime boot.
 }
 
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
@@ -697,7 +749,11 @@ process.on("SIGTERM", async () => {
       // Tear down the cloudflared subprocess. The manager swallows its own
       // errors; we still wrap the await defensively so a slow kill can't
       // keep the runtime from exiting.
-      tunnelManager.stop().catch(() => {})
+      tunnelManager.stop().catch(() => {}),
+      // Close the web-port watcher so its fs handle doesn't keep the
+      // process alive past the drain. Synchronous; the close() promise
+      // is just wrapped to fit the Promise.all shape.
+      Promise.resolve().then(() => { try { webPortWatcher?.close(); } catch { /* ignore */ } })
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);

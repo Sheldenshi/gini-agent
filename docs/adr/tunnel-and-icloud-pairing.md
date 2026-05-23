@@ -61,15 +61,26 @@ shape that depends on memorising the URL breaks at the next reboot.
    **Where the strip happens**: the secret is stripped at the **Next.js
    proxy layer** (`web/src/proxy.ts`) for tunneled requests, NOT at the
    gateway. The proxy reads the live `tunnel.enabled` + `tunnel.secret`
-   slot from `config.json` on every request (mtime-cached), gates the
-   tunnelled host on a match, mints an HttpOnly session cookie on the
-   first valid request so subsequent navigations don't need the prefix,
-   and rewrites the path before handing off to Next.js. The BFF then
-   forwards the prefix-less path to the runtime with the gateway bearer
-   it already injects. The gateway's own secret-path guard (in
-   `src/http.ts`) stays in place as a defence in depth — direct
-   localhost hits to `/<secret>/api/*` still work the same way they
-   used to, which is what the CLI smoke tests rely on.
+   slot from `config.json` on every request, gates the tunnelled host
+   on a match, mints an HttpOnly session cookie on the first valid
+   request so subsequent navigations don't need the prefix, and
+   rewrites the path before handing off to Next.js. The web layer
+   then forwards `/api/runtime/*` to the runtime via the BFF (which
+   injects the gateway bearer); all other paths are served by Next.js
+   itself.
+
+   **Path shape through the tunnel**: the canonical tunneled API
+   path is `/<secret>/api/runtime/<endpoint>`. The proxy strips the
+   secret to `/api/runtime/<endpoint>`, which the BFF catch-all then
+   forwards to the runtime as `/api/<endpoint>`. The legacy
+   `/<secret>/api/*` shape only works against the gateway directly
+   (e.g., the CLI smoke tests on localhost); over the tunnel that
+   form stops at the Next.js app because nothing maps it.
+
+   The gateway's own secret-path guard (in `src/http.ts`) stays in
+   place as a defence-in-depth — direct localhost hits to
+   `/<secret>/api/*` still work the same way they used to, which is
+   what the CLI smoke tests rely on.
 
 4. The bearer-token gate stays the only authorization path for direct
    localhost requests. `/api/pairing/claim` remains the existing public
