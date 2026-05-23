@@ -47,7 +47,7 @@ function originHostMatchesRequest(request: NextRequest): boolean {
 
 export const POST = async (request: NextRequest): Promise<Response> => {
   if (!originHostMatchesRequest(request)) {
-    return new Response("Forbidden", { status: 403 });
+    return Response.json({ error: "Origin/Referer must match Host for tunnel mutations." }, { status: 403 });
   }
   const upstream = await fetch(`${runtimeUrl()}/api/tunnel/refresh-notes`, {
     method: "POST",

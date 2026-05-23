@@ -110,7 +110,7 @@ export const GET = async (_request: NextRequest) => forwardRedacted("GET");
 // the CLI bypasses the BFF entirely and hits the runtime directly.
 export const PATCH = async (request: NextRequest) => {
   if (!originHostMatchesRequest(request)) {
-    return new Response("Forbidden", { status: 403 });
+    return Response.json({ error: "Origin/Referer must match Host for tunnel mutations." }, { status: 403 });
   }
   let body = "";
   try { body = await request.text(); } catch { body = ""; }

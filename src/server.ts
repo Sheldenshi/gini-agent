@@ -637,7 +637,13 @@ const tryRegisterWebPortWatcher = (): void => {
   if (shutdownStarted) return;
   try {
     webPortWatcher = watch(webPortPath(config.instance), { persistent: false }, () => {
-      void runRecycle();
+      // Chain recycles through the same pendingApply queue as
+      // boot/PATCH so the watcher can't kick off a stop() while a
+      // PATCH is mid-start. Without this, a port-rotation event
+      // racing a PATCH enable could tear down cloudflared after
+      // the manager's start() committed, leaving the snapshot
+      // inconsistent with the spawned subprocess.
+      pendingApply = pendingApply.then(runRecycle, () => undefined);
     });
   } catch {
     // File doesn't exist yet (common at boot — gini start spawns

@@ -227,7 +227,32 @@ function canonicalizeForGate(pathname: string): string | null {
 // localhost to skip the tunnel-secret gate.
 function isLocalHostName(host: string): boolean {
   const lower = host.toLowerCase();
-  const bare = lower.includes(":") ? lower.slice(0, lower.lastIndexOf(":")) : lower;
+  let bare = lower;
+  let portPart: string | null = null;
+  // IPv6 literals are bracketed: `[::1]` bare, `[::1]:3072` with port.
+  // Strip the brackets and split off the port (if any) only when the
+  // port parses as a positive integer. Without that guard,
+  // `localhost:evil` would canonicalize to `localhost` and slip
+  // through the loopback check. Next is pinned to 127.0.0.1 so only
+  // a co-tenant can forge Host headers, but a malformed value should
+  // still fail closed.
+  if (lower.startsWith("[")) {
+    const close = lower.indexOf("]");
+    if (close === -1) return false;
+    bare = lower.slice(0, close + 1);
+    const rest = lower.slice(close + 1);
+    if (rest.length > 0) {
+      if (!rest.startsWith(":")) return false;
+      portPart = rest.slice(1);
+    }
+  } else {
+    const colon = lower.lastIndexOf(":");
+    if (colon > -1) {
+      bare = lower.slice(0, colon);
+      portPart = lower.slice(colon + 1);
+    }
+  }
+  if (portPart !== null && !/^\d+$/.test(portPart)) return false;
   return bare === "localhost" || bare === "127.0.0.1" || bare === "::1" || bare === "[::1]";
 }
 
