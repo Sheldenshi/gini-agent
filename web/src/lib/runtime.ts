@@ -236,6 +236,21 @@ function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | nul
     if (!trimmed) continue;
     try {
       const parsed = new URL(trimmed);
+      // Origins are scheme + host[+port] only. An operator who pasted a
+      // full URL like `https://gini-server.tail.ts.net/path?q=1` would
+      // silently get a broader allowlist than they meant (the path/query
+      // are dropped by .host). Reject those entries individually so the
+      // operator either fixes the env var or — if every entry is malformed
+      // — sees the fail-closed posture at the outer caller.
+      if (
+        (parsed.pathname !== "" && parsed.pathname !== "/")
+        || parsed.search !== ""
+        || parsed.hash !== ""
+        || parsed.username !== ""
+        || parsed.password !== ""
+      ) {
+        continue;
+      }
       out.add(`${parsed.protocol}//${parsed.host}`);
     } catch {
       // Skip malformed entries individually; the outer caller decides what
@@ -278,8 +293,20 @@ function guardPrivilegedRequest(request: Request, pathSegments: string[]): Respo
   const route = pathSegments.join("/");
   if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
 
+  // Fail closed when Origin is missing. Modern browsers always send Origin
+  // on POST, so a request without it is either an older browser (pre-2018)
+  // or a non-browser client (curl/scripts/misconfigured proxies that strip
+  // Origin/service-worker bugs). None of those should be talking to the
+  // BFF's privileged surface — the BFF's purpose is to inject the gateway
+  // bearer for the operator's browser. Non-browser clients should hit the
+  // gateway directly with their own token. Without this gate, an attacker
+  // who could induce an Origin-less POST against an exposed BFF would have
+  // the privileged route execute under the operator's bearer.
   const origin = request.headers.get("origin");
-  if (origin) {
+  if (!origin) {
+    return Response.json({ error: "Forbidden" }, { status: 403 });
+  }
+  {
     let originUrl: URL;
     try {
       originUrl = new URL(origin);

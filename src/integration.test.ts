@@ -161,6 +161,41 @@ describe("runtime proxy", () => {
     expect(response.status).toBe(403);
   });
 
+  test("privileged POST with no Origin header fails closed", async () => {
+    // Modern browsers always send Origin on POST. A request without it
+    // is either a non-browser client (curl, scripts) that should hit the
+    // gateway directly with its own token, or a misconfigured proxy
+    // stripping the header — neither should drive the operator's
+    // bearer-injected privileged path.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://localhost/api/runtime/update", { method: "POST" });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(403);
+  });
+
+  test("allowlist entries with a path or query are rejected so the operator's intent isn't silently broadened", async () => {
+    // An operator who pastes a full URL — say https://host/some-path —
+    // would otherwise silently get an allowlist for the entire host
+    // (the URL parser drops the path on .host). Refuse those entries
+    // so a copy-paste mistake either produces an empty (fail-closed)
+    // allowlist or a deliberately narrow one.
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini-server.tail.ts.net/some-path?token=secret";
+
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("https://gini-server.tail.ts.net/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "https://gini-server.tail.ts.net", host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(403);
+  });
+
   test("supports PATCH and DELETE methods", async () => {
     const seen: string[] = [];
     const fetcher = mockFetcher(async (_url, init) => {
