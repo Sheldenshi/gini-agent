@@ -257,9 +257,9 @@ auto-approves with a full audit trail, `yolo` skips the queue).
 ### Inspecting state
 
 API: `GET /api/messaging`, `GET /api/messaging/<id>/{chats,messages}`,
-`POST /api/messaging/<id>/{health,disable}`.
+`POST /api/messaging` (create), `POST /api/messaging/<id>/{health,disable,remove,allow,deny,reject-pending,send,receive}`.
 
-Human-operator CLI mirror: `gini messaging {list|chats|messages|health|disable|deny}`.
+Human-operator CLI mirror: `gini messaging {list|add|health|disable|remove|receive|send|messages|allow|deny|reject-pending|chats}`. `disable` keeps the bridge row with status `"disabled"`; `remove` drops it. Telegram per-chat enrollment uses `allow`/`deny`/`reject-pending`/`chats`; Discord uses channel-as-auth via `deliveryTargets` (no per-chat allowlist).
 
 ## MCP Servers
 
