@@ -81,14 +81,38 @@ shape that depends on memorising the URL breaks at the next reboot.
    access; a tunneled POST without the prefix is treated like any other
    wrong path and 404s.
 
-5. The gateway exposes three additional routes that are reachable through
-   either the bearer-token path or the tunnel path:
+5. The gateway exposes five tunnel-related routes that are reachable
+   through either the bearer-token path or the tunnel path:
    - `GET /api/tunnel` returns the snapshot (current public URL + secret
-     + Apple Notes mirror status + last error).
+     + Apple Notes mirror status + last error). Strictly read-only.
+   - `PATCH /api/tunnel` mutates the persisted tunnel config.
+     Accepts the partial shape `{ enabled?: boolean; appleNotes?: {
+     enabled?: boolean } }`; rejects non-boolean fields with 400. The
+     runtime serializes every PATCH through a single applyConfig
+     chain so concurrent enables/disables can't race. Both the live
+     UI toggle in the Settings card and `gini tunnel enable|disable`
+     route through this endpoint when the runtime is reachable;
+     when the gateway is offline the CLI falls back to a direct
+     `config.json` mutation that the next start picks up.
+   - `POST /api/tunnel/refresh-notes` is the explicit Apple Notes
+     resync trigger (CLI: `gini tunnel sync-notes`). POST is chosen
+     so `SameSite=Lax` session cookies don't attach on cross-site
+     navigation; the BFF additionally checks Origin/Referer matches
+     Host to block a co-tenant localhost POST from firing osascript.
    - `GET /api/tunnel/qr.svg` returns an SVG QR code for the current
-     public URL. 404 when the snapshot has no URL.
+     public URL. 404 when the snapshot has no URL. Served with
+     `Cache-Control: no-store` (the pixels encode the secret); the
+     BFF forwards that header so neither browser nor intermediary
+     caches the credential.
    - `GET /api/tunnel/qr.txt` returns an ANSI half-block QR for terminal
      rendering. 404 when the snapshot has no URL.
+
+   The BFF (`web/src/app/api/runtime/tunnel/route.ts`) sits in front of
+   `GET /api/tunnel` and `PATCH /api/tunnel`, redacting `secret` and
+   `publicUrl` to `null` before forwarding the snapshot to the browser
+   — the catch-all proxy at `web/src/app/api/runtime/[...path]/route.ts`
+   refuses every other `/api/runtime/tunnel/*` path so a new endpoint
+   added to the gateway doesn't accidentally bypass the redactor.
 
 6. When the runtime is on macOS and the iCloud account is signed in
    under Notes.app, the manager mirrors the current tunnel URL into a

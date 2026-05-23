@@ -82,11 +82,16 @@ export async function tunnel(ctx: CliContext): Promise<void> {
     //
     // Three commands but no in-memory/on-disk divergence at any
     // point.
-    let runtimeReachable = false;
+    let runtimeReachable = true;
     try {
       await api(config, "/api/tunnel");
-      runtimeReachable = true;
-    } catch { /* runtime not reachable — disk-only rotation is safe */ }
+    } catch (error) {
+      // Only treat ECONNREFUSED as "really offline" — a slow or
+      // hanging runtime would otherwise classify itself as offline
+      // on any transient error and let us proceed with a destructive
+      // disk write that races the live in-memory state.
+      runtimeReachable = !isConnectionRefused(error);
+    }
     if (runtimeReachable) {
       throw new Error(
         "Refusing to rotate the tunnel secret while the runtime is running. Run `gini stop` first to avoid racing the runtime's in-memory tunnel state, then `gini tunnel rotate-secret`, then `gini start`."
@@ -156,11 +161,14 @@ export async function tunnel(ctx: CliContext): Promise<void> {
       // the read-modify-write window, not the file syscall.
       const folder = cliArgs[3];
       if (!folder) throw new Error("Usage: gini tunnel apple-notes folder <folder-name>");
-      let runtimeReachable = false;
+      let runtimeReachable = true;
       try {
         await api(config, "/api/tunnel");
-        runtimeReachable = true;
-      } catch { /* runtime offline — disk-only write is safe */ }
+      } catch (error) {
+        // Same shape as rotate-secret: only treat ECONNREFUSED as
+        // truly offline so a slow runtime can't mask the race.
+        runtimeReachable = !isConnectionRefused(error);
+      }
       if (runtimeReachable) {
         throw new Error(
           "Refusing to update the Apple Notes folder while the runtime is running. Run `gini stop` first, then `gini tunnel apple-notes folder <name>`, then `gini start`. The PATCH surface does not accept folder changes, so the disk write would race the runtime's in-memory state."
@@ -206,39 +214,40 @@ function mutateTunnelConfig(
 
 // Prefer the live runtime PATCH path so a `gini tunnel enable` against a
 // running gateway brings cloudflared up immediately (and the inverse
-// disable tears it down) without waiting for a restart. We probe with a
-// short-timeout GET /api/tunnel; if the runtime is reachable, hand the
-// update over to its applyConfig hook which serializes through
-// pendingApply in src/server.ts. If the gateway is not running, return
-// null so the caller falls back to the direct disk mutation — same
-// disk shape, same key set, so the next start picks up where the
-// runtime would have left off.
+// disable tears it down) without waiting for a restart. We attempt the
+// PATCH directly: if the runtime is reachable, its applyConfig hook
+// serializes through pendingApply in src/server.ts. If the gateway
+// process is not running at all (ECONNREFUSED), return null so the
+// caller falls back to a direct disk mutation — same disk shape,
+// same key set, so the next start picks up where the runtime would
+// have left off.
+//
+// We deliberately do NOT short-circuit on a separate /api/status
+// probe with a tight timeout: a slow or still-booting runtime would
+// trip the timeout, classify itself as offline, and disk-mutate
+// while the runtime is actually up — splitting on-disk config from
+// the live TunnelManager. Distinguishing ECONNREFUSED from other
+// errors at PATCH time means a hanging runtime surfaces a real
+// error instead of silently bypassing the serialized chain.
+function isConnectionRefused(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const cause = (error as Error & { cause?: { code?: string } }).cause;
+  if (cause && typeof cause.code === "string" && cause.code === "ECONNREFUSED") return true;
+  return /ECONNREFUSED|connection refused|fetch failed/i.test(error.message);
+}
+
 async function applyTunnelToggle(
   ctx: CliContext,
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
 ): Promise<unknown | null> {
   const { config } = ctx;
-  // Short-circuit on a quick probe so an offline runtime fails fast
-  // instead of blocking on the full PATCH timeout. /api/status is
-  // bearer-token gated AND in-memory, so a healthy gateway answers
-  // sub-ms on localhost.
   try {
-    const probe = await fetch(`http://127.0.0.1:${config.port}/api/status`, {
-      headers: { authorization: `Bearer ${config.token}` },
-      signal: AbortSignal.timeout(750)
+    return await api(config, "/api/tunnel", {
+      method: "PATCH",
+      body: JSON.stringify(update)
     });
-    if (!probe.ok) return null;
-  } catch {
-    return null;
+  } catch (error) {
+    if (isConnectionRefused(error)) return null;
+    throw error;
   }
-  // The probe confirmed the runtime is up. From here the PATCH should
-  // either succeed or surface its failure verbatim — silently falling
-  // back to disk mutation would hide real errors ("cloudflared binary
-  // missing", "web target unresolved") and leave the runtime out of
-  // sync with disk. Let the api() helper's thrown Error propagate so
-  // the CLI prints it and the operator can act.
-  return await api(config, "/api/tunnel", {
-    method: "PATCH",
-    body: JSON.stringify(update)
-  });
 }
