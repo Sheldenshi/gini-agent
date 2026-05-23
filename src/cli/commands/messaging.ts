@@ -5,9 +5,29 @@ import { print } from "../output";
 
 const ADD_VALUE_FLAGS = new Set(["--bot-token"]);
 
+const KNOWN_SUBS = new Set([
+  "list",
+  "add",
+  "health",
+  "disable",
+  "remove",
+  "receive",
+  "send",
+  "messages",
+  "allow",
+  "deny",
+  "reject-pending",
+  "chats"
+]);
+
 export async function messaging(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
   const sub = cliArgs[1] ?? "list";
+  if (!KNOWN_SUBS.has(sub)) {
+    throw new Error(
+      `Unknown messaging subcommand '${sub}'. Available: ${Array.from(KNOWN_SUBS).join(", ")}.`
+    );
+  }
   if (sub === "add") {
     const tail = restAfter(cliArgs, sub);
     const parsed = parseSubArgs(tail, ADD_VALUE_FLAGS);

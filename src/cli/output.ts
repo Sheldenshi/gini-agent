@@ -97,7 +97,7 @@ Usage:
   bun run gini browser status|connect [--url WSURL]|disconnect
   bun run gini subagents list|spawn
   bun run gini mcp list|add|health|invoke|disable
-  bun run gini messaging list|add|health|pair|disable|allow|deny|reject-pending|chats
+  bun run gini messaging list|add|health|disable|remove|allow|deny|reject-pending|chats|receive|send|messages
   bun run gini import inspect openclaw <path>
   bun run gini import plan openclaw [path]
   bun run gini import apply openclaw [path] [--force]
