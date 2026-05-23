@@ -714,6 +714,71 @@ describe("messaging telegram wiring", () => {
     expect(readBridgeBotToken(config, live!)).toBeUndefined();
   });
 
+  test("removeMessagingBridge drops the record + deletes secrets, leaves history alone, emits audit", async () => {
+    const config = testConfig("telegram-remove");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { removeMessagingBridge } = await import("./messaging");
+    const { readState: readStateLocal } = await import("../state");
+    const { existsSync, readdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+
+    // Confirm the secret file is on disk before remove.
+    const secretsDir = join(config.stateRoot, "secrets");
+    const beforeFiles = existsSync(secretsDir)
+      ? readdirSync(secretsDir).filter((f) => f.startsWith(`messaging.${bridge.id}.`))
+      : [];
+    expect(beforeFiles.length).toBeGreaterThan(0);
+
+    const result = await removeMessagingBridge(config, bridge.id);
+    expect(result).toEqual({ id: bridge.id, removed: true });
+
+    // State no longer carries the bridge.
+    const live = readStateLocal(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live).toBeUndefined();
+
+    // Secret files swept.
+    const afterFiles = existsSync(secretsDir)
+      ? readdirSync(secretsDir).filter((f) => f.startsWith(`messaging.${bridge.id}.`))
+      : [];
+    expect(afterFiles).toEqual([]);
+
+    // Audit row recorded with the documented action + risk + evidence.
+    const audit = readStateLocal(config.instance).audit.find(
+      (e) => e.action === "messaging.removed" && e.target === bridge.id
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.risk).toBe("medium");
+    expect((audit?.evidence as { kind?: string; name?: string } | undefined)?.kind).toBe("telegram");
+    expect((audit?.evidence as { kind?: string; name?: string } | undefined)?.name).toBe("tg");
+  });
+
+  test("removeMessagingBridge throws on an unknown id and leaves state untouched", async () => {
+    const config = testConfig("telegram-remove-unknown");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { removeMessagingBridge } = await import("./messaging");
+    const { readState: readStateLocal } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: ["1"],
+      botToken: "TOK"
+    });
+
+    await expect(removeMessagingBridge(config, "bridge_does_not_exist"))
+      .rejects.toThrow(/Messaging bridge not found/);
+    // The real bridge is untouched.
+    const live = readStateLocal(config.instance).messagingBridges.find((b) => b.id === bridge.id);
+    expect(live?.id).toBe(bridge.id);
+  });
+
   test("sendMessagingOutput rejects a disabled bridge up front (closes the disable-vs-send race)", async () => {
     // Without the status guard, sendMessagingOutput would proceed
     // to the photo-parse + agent-filter work and ultimately fail
