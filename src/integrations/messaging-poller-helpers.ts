@@ -195,6 +195,27 @@ export function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<voi
   return promise;
 }
 
+// Same sleep but REJECTS on abort, threading the signal's reason
+// through. Used by the outbound-retry helper where an aborted signal
+// (e.g. operator-side timeout, supervisor shutdown) must short-circuit
+// the backoff window with a failure result, not silently treat the
+// retry-window as expired. The aborted-on-entry path also rejects so
+// the caller's try/catch fires consistently regardless of timing.
+export function sleepUnlessAbortedThrow(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const onAbort = () => {
+    clearTimeout(timer);
+    reject(signal?.reason ?? new Error("aborted"));
+  };
+  const timer = setTimeout(() => {
+    signal?.removeEventListener("abort", onAbort);
+    resolve();
+  }, ms);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  return promise;
+}
+
 // Same sleep but resolves early if EITHER signal fires. Used by the
 // Discord poller so a Gateway-pushed MESSAGE_CREATE can collapse the
 // next REST-poll sleep down to ~0ms — REST polling stays the source

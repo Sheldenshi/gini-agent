@@ -57,7 +57,7 @@ export function assertHeaderSafeToken(kind: string, raw: string): void {
 // stay readable. The helper covers Discord auth-header tokens,
 // Telegram URL-path tokens, and filesystem paths under <root>/secrets/
 // — see messaging-poller-helpers.ts for the full pattern list.
-import { sanitizeBridgeStatusMessage as sanitizeBridgeError } from "./messaging-poller-helpers";
+import { sanitizeBridgeStatusMessage as sanitizeBridgeError, sleepUnlessAbortedThrow } from "./messaging-poller-helpers";
 
 // Test seam: production code calls Telegram / Discord for real, but tests
 // inject stubbed clients so we can exercise send/health/poll without
@@ -657,26 +657,6 @@ function generateVerificationCode(): string {
 // we stop and surface the failure in the runtime log.
 const OUTBOUND_RETRY_BACKOFFS_MS: ReadonlyArray<number> = [250, 750];
 
-// Resolves after `ms` unless the signal aborts first. Used between
-// retry attempts so a long-running poller shutdown — or a per-call
-// timeout race composed at the call site — interrupts the wait
-// promptly instead of pinning the loop until the OS tears the
-// socket down.
-function sleepUnlessAborted(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(signal.reason ?? new Error("aborted"));
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(signal?.reason ?? new Error("aborted"));
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
 async function sendMessagingOutputWithRetries(
   config: RuntimeConfig,
   bridgeId: string,
@@ -716,7 +696,7 @@ async function sendMessagingOutputWithRetries(
         lastError = new Error(record.error ?? "messaging send returned status=failed");
         if (attempt === OUTBOUND_RETRY_BACKOFFS_MS.length) break;
         try {
-          await sleepUnlessAborted(OUTBOUND_RETRY_BACKOFFS_MS[attempt], options.signal);
+          await sleepUnlessAbortedThrow(OUTBOUND_RETRY_BACKOFFS_MS[attempt], options.signal);
         } catch {
           return { ok: false, error: lastError };
         }
@@ -728,7 +708,7 @@ async function sendMessagingOutputWithRetries(
       if (options.signal?.aborted) return { ok: false, error: lastError };
       if (attempt === OUTBOUND_RETRY_BACKOFFS_MS.length) break;
       try {
-        await sleepUnlessAborted(OUTBOUND_RETRY_BACKOFFS_MS[attempt], options.signal);
+        await sleepUnlessAbortedThrow(OUTBOUND_RETRY_BACKOFFS_MS[attempt], options.signal);
       } catch {
         return { ok: false, error: lastError };
       }
