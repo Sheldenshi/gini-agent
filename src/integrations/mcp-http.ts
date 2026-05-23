@@ -42,6 +42,129 @@ export interface McpCallToolResult {
   error?: string;
 }
 
+// Strip authentication-bearing headers from a string snippet (typically a
+// captured upstream HTTP response body that an MCP server echoed back to
+// us). Servers sometimes mirror the request — including the
+// `Authorization` header — into error responses, which we then persist
+// into `mcpServers[*].message` and `mcp.health` audits. Redact before
+// the value lands in state.json or audit evidence.
+//
+// The redaction is best-effort, not exhaustive: it targets well-known
+// auth header names plus any `*-Token` / `*-Key` variant, in both
+// header-style (`Name: value`), URL/form-encoded (`?token=` / `&api_key=`),
+// and JSON-quoted (`"x-api-key":"value"`) forms. All name matches are
+// case-insensitive.
+const AUTH_HEADER_NAMES = [
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "proxy-authorization",
+  "x-api-key",
+  "x-auth-token"
+];
+
+// Query/form-style secret parameter names. Matched after `?` or `&`, or as
+// a `name=value` segment at a delimiter boundary (start-of-string, whitespace,
+// `&`, `;`, or `,`). Case-insensitive.
+const SECRET_QUERY_PARAMS = [
+  "token",
+  "access_token",
+  "refresh_token",
+  "id_token",
+  "api_key",
+  "api-key",
+  "apikey",
+  "client_secret"
+];
+
+export function redactSecretsInText(input: string): string {
+  if (!input) return input;
+  let out = input;
+
+  // 1) JSON-quoted form first: `"name"\s*:\s*"value"`. Cover known
+  //    auth-bearing header names plus the *-token/*-key tail. Doing
+  //    this before the generic header pass means we redact the *contents*
+  //    of the quoted value (not just up to the closing quote via the
+  //    `[^"]` exclusion in the generic pass, which would still leave
+  //    nothing — but the generic pass treats the surrounding `"` as a
+  //    stop char and misses this form entirely).
+  //
+  //    Two variants per name: plain (`"name":"value"`) and escaped
+  //    (`\"name\":\"value\"`). The escaped form shows up when an upstream
+  //    error embeds a JSON-encoded body inside another JSON string, e.g.
+  //    `{"error":"{\"x-api-key\":\"SECRET\"}"}` — the inner JSON arrives
+  //    backslash-quoted and the plain variant misses it.
+  for (const name of AUTH_HEADER_NAMES) {
+    const plain = new RegExp(`("${name}"\\s*:\\s*)"[^"]*"`, "gi");
+    out = out.replace(plain, '$1"[REDACTED]"');
+    // Escaped form: `\"name\":\"value\"` embedded inside another JSON
+    // string. The value must allow JSON-escaped characters — `\\/`, `\\u00xx`,
+    // backslash-escaped quotes — so use `(?:[^"\\]|\\.)*` instead of
+    // `[^"\\]*`, otherwise the match bails at the first `\\`.
+    //
+    // Regex source we want: (\\"NAME\\"\s*:\s*)\\"(?:[^"\\]|\\.)*\\"
+    // In a string passed to new RegExp, every `\\` doubles to `\\\\`.
+    const escaped = new RegExp(`(\\\\"${name}\\\\"\\s*:\\s*)\\\\"(?:[^"\\\\]|\\\\.)*\\\\"`, "gi");
+    out = out.replace(escaped, '$1\\"[REDACTED]\\"');
+  }
+  out = out.replace(/("[A-Za-z][\w-]*-(?:token|key)"\s*:\s*)"[^"]*"/gi, '$1"[REDACTED]"');
+  out = out.replace(/(\\"[A-Za-z][\w-]*-(?:token|key)\\"\s*:\s*)\\"(?:[^"\\]|\\.)*\\"/gi, '$1\\"[REDACTED]\\"');
+
+  // 2) Cookie header: redact the entire value up to newline / end-of-string,
+  //    not just up to the first `;`. A `Cookie:` header is a single
+  //    header whose value is a `; `-delimited list of `name=value` pairs,
+  //    every one of which can be a session token. Same applies to
+  //    `Set-Cookie:`.
+  //
+  //    Not anchored to line start: upstream error strings often paste a
+  //    `Cookie: …` fragment mid-prose (e.g. "upstream echoed Cookie:
+  //    theme=light; session=SECRET"). Match anywhere; consume until the
+  //    next newline OR end-of-string OR a closing JSON token (`"` followed
+  //    by `,` or `}`) so we don't accidentally swallow trailing JSON
+  //    structure when the header is embedded in a quoted value.
+  // Stop on newline, EOS, a literal `]` (so a Cookie fragment embedded in a
+  // JSON array like `{"errors":["Cookie: x=Y"], …}` doesn't swallow the
+  // closing bracket and everything after it), or a `"` followed by a JSON
+  // structural terminator (`,` / `}` / `]`).
+  out = out.replace(/((?:set-)?cookie\s*:\s*)(?:(?!"[,}\]])[^\r\n\]])+/gi, "$1[REDACTED]");
+
+  // 3) Header-style well-known auth headers (after Cookie handling so the
+  //    Cookie line is already fully redacted). Stops at line terminators
+  //    and structural delimiters typical of header dumps.
+  for (const name of AUTH_HEADER_NAMES) {
+    if (name === "cookie" || name === "set-cookie") continue; // handled above
+    const re = new RegExp(`(${name}\\s*[:=]\\s*)([^\\r\\n,;"']+)`, "gi");
+    out = out.replace(re, "$1[REDACTED]");
+  }
+
+  // 4) Any header-style line that ends in `-token` or `-key` (e.g.
+  //    `X-Service-Token: …`). Conservative: requires the name to be at
+  //    the start of a line or after `, ` / `; ` to avoid mangling JSON
+  //    values that happen to contain "key".
+  out = out.replace(/(^|[\r\n,;])([A-Za-z][\w-]*-(?:token|key))\s*:\s*[^\r\n,;"']+/gi, "$1$2: [REDACTED]");
+
+  // 5) URL / form-encoded secret query params (`?token=…`, `&access_token=…`,
+  //    `api_key=…`). Value runs until the next `&`, `;`, whitespace, or
+  //    end-of-string. Case-insensitive.
+  for (const param of SECRET_QUERY_PARAMS) {
+    const re = new RegExp(`(^|[?&;,\\s])(${param})=([^&;\\s"'<>\\r\\n]+)`, "gi");
+    out = out.replace(re, "$1$2=[REDACTED]");
+  }
+
+  // 6) Bearer tokens that appear without a header name (e.g. echoed in a
+  //    JSON `"authorization":"Bearer …"` body or in prose). Fully
+  //    case-insensitive so `BEARER`, `bEaReR`, etc. are also caught.
+  //    Only the immediately following token is consumed — not arbitrary
+  //    trailing prose — so a sentence like "Bearer ABC123 then more text"
+  //    leaves "then more text" untouched.
+  // RFC 6750 b64token: 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"=".
+  // The `~` was previously missing; tokens that include it (e.g. PASETO-ish
+  // formats) leaked the tail past the first `~`.
+  out = out.replace(/\bbearer\s+[A-Za-z0-9._~+/-]+=*/gi, "Bearer [REDACTED]");
+
+  return out;
+}
+
 // Resolve `${VAR}` placeholders inside a header value against the supplied
 // env map. Returns undefined when any referenced var is missing; callers
 // treat that as a missing-credential error rather than sending the literal
@@ -95,14 +218,23 @@ async function postRpc(url: string, headers: Record<string, string>, method: str
     } catch {
       body = "";
     }
-    return { ok: false, error: `MCP HTTP ${response.status}${body ? `: ${body}` : ""}` };
+    // Upstream may echo the request headers (including `Authorization`)
+    // back in its error body. The body lands in `mcpServers[*].message`
+    // and `mcp.health` audit evidence on disk, so we must scrub before
+    // returning. See `redactSecretsInText`.
+    const safeBody = redactSecretsInText(body);
+    return { ok: false, error: `MCP HTTP ${response.status}${safeBody ? `: ${safeBody}` : ""}` };
   }
   const raw = await response.text();
   const payload = parseRpcPayload(raw, id);
   if (!payload.ok) return payload;
   if (payload.body && typeof payload.body === "object" && "error" in payload.body) {
     const err = (payload.body as { error: { message?: string; code?: number } }).error;
-    return { ok: false, error: err.message ?? `MCP error code ${err.code ?? "?"}` };
+    // JSON-RPC error messages can include echoed request metadata (including
+    // Authorization), same hazard as the non-2xx HTTP body above. Scrub
+    // before returning so the message never lands in audit evidence raw.
+    const safeMessage = err.message ? redactSecretsInText(err.message) : undefined;
+    return { ok: false, error: safeMessage ?? `MCP error code ${err.code ?? "?"}` };
   }
   if (payload.body && typeof payload.body === "object" && "result" in payload.body) {
     return { ok: true, result: (payload.body as { result: unknown }).result };

@@ -3,38 +3,22 @@ import { restAfter, flagValue } from "../args";
 import { api } from "../api";
 import { print } from "../output";
 
+// `gini memory list|add|approve|reject|edit|archive|delete` were removed
+// alongside the state.memories consolidation (see ADR
+// runtime-identity-files.md). The remaining subcommands are all
+// Hindsight surfaces (retain / recall / reflect / units / banks /
+// migrate).
 export async function memory(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
-  const sub = cliArgs[1] ?? "list";
+  const sub = cliArgs[1];
 
-  if (sub === "add") {
-    const content = restAfter(cliArgs, sub).join(" ").trim();
-    if (!content) throw new Error("Usage: gini memory add <content>");
-    print(await api(config, "/api/memory", { method: "POST", body: JSON.stringify({ content, status: "active" }) }));
-    return;
-  }
-  if (sub === "approve" || sub === "reject") {
-    const id = restAfter(cliArgs, sub)[0];
-    if (!id) throw new Error(`Usage: gini memory ${sub} <memory-id>`);
-    print(await api(config, `/api/memory/${id}/${sub}`, { method: "POST" }));
-    return;
-  }
-  if (sub === "edit") {
-    const [id, ...contentParts] = restAfter(cliArgs, sub);
-    if (!id || contentParts.length === 0) throw new Error("Usage: gini memory edit <memory-id> <content>");
-    print(await api(config, `/api/memory/${id}`, { method: "PATCH", body: JSON.stringify({ content: contentParts.join(" ") }) }));
-    return;
-  }
-  if (sub === "archive" || sub === "delete") {
-    const id = restAfter(cliArgs, sub)[0];
-    if (!id) throw new Error(`Usage: gini memory ${sub} <memory-id>`);
-    print(await api(config, `/api/memory/${id}`, { method: "DELETE" }));
-    return;
+  if (!sub) {
+    throw new Error(
+      "Usage: gini memory retain|recall|reflect|units|banks|migrate <args>"
+    );
   }
 
-  // Hindsight surfaces. The legacy `gini memory list` (the `default` branch
-  // below) keeps showing legacy MemoryRecord rows; new subcommands are
-  // additive.
+  // Hindsight surfaces.
   if (sub === "retain") {
     const text = restAfter(cliArgs, sub).filter((arg) => !arg.startsWith("--")).join(" ").trim();
     if (!text) throw new Error("Usage: gini memory retain <text> [--bank ID] [--task ID]");
@@ -116,5 +100,8 @@ export async function memory(ctx: CliContext): Promise<void> {
     return;
   }
 
-  print(await api(config, "/api/memory"));
+  throw new Error(
+    `Unknown subcommand: gini memory ${sub}. ` +
+      `Available: retain | recall | reflect | units | banks | migrate.`
+  );
 }

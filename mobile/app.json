@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Gini",
+    "slug": "gini-mobile",
+    "version": "0.0.1",
+    "orientation": "portrait",
+    "scheme": "gini",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "ai.lilaclabs.gini.mobile"
+    },
+    "android": {
+      "package": "ai.lilaclabs.gini.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

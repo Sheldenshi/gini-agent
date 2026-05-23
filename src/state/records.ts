@@ -10,7 +10,6 @@ import type {
   JobRunRecord,
   Instance,
   McpServerRecord,
-  MemoryRecord,
   MessagingBridgeRecord,
   MessagingMessageRecord,
   NotificationRecord,
@@ -29,6 +28,7 @@ import type {
 } from "../types";
 import { id, now } from "./ids";
 import { addAudit, appendEvent, type AgentContext } from "./audit";
+import { deleteChatBlocksForSession } from "./chat-blocks";
 import { tracePath } from "./trace";
 import { hashSecret, randomPairingCode } from "./security";
 import { expirePairingCodes } from "./store";
@@ -87,7 +87,6 @@ export function createTask(
     tracePath: tracePath(instance, taskId),
     auditIds: [],
     approvalIds: [],
-    memoryIds: [],
     skillIds: [],
     jobId,
     parentTaskId,
@@ -286,6 +285,21 @@ export function deleteChatSession(state: RuntimeState, id: string): ChatSessionR
   const session = state.chatSessions[index]!;
   state.chatSessions.splice(index, 1);
   state.chatMessages = state.chatMessages.filter((message) => message.sessionId !== id);
+  // ChatBlock rows (ADR chat-block-protocol.md) live in SQLite, parallel
+  // to the legacy ChatMessageRecord list above. Drop them at the same
+  // boundary so a deleted session doesn't leave orphan block rows the
+  // /blocks endpoint would surface after re-create. Best-effort: a SQLite
+  // open failure here must not abort the in-memory state delete (the
+  // rest of the cleanup is irreversibly written above), so we swallow
+  // errors and log via console.warn so operators can spot drift.
+  try {
+    deleteChatBlocksForSession(state.instance, id);
+  } catch (error) {
+    console.warn(
+      `[chat-blocks] cascade delete failed for session ${id}:`,
+      error instanceof Error ? error.message : String(error)
+    );
+  }
   // Identity snapshots are keyed on conversationId (the chat session id),
   // so removing the session must drop the matching snapshot or we leak
   // one IdentitySnapshotRecord per deleted chat forever.
@@ -388,22 +402,6 @@ export function createApproval(
         ? { agentId: item.agentId }
         : { system: true }
   );
-  return item;
-}
-
-export function createMemory(
-  state: RuntimeState,
-  memory: Omit<MemoryRecord, "id" | "instance" | "createdAt" | "updatedAt">
-): MemoryRecord {
-  const at = now();
-  const item: MemoryRecord = {
-    id: id("mem"),
-    instance: state.instance,
-    createdAt: at,
-    updatedAt: at,
-    ...memory
-  };
-  state.memories.unshift(item);
   return item;
 }
 
@@ -736,7 +734,8 @@ export function createSubagentRecord(
 
 export function createMcpServerRecord(
   state: RuntimeState,
-  server: Omit<McpServerRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  server: Omit<McpServerRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">,
+  options: { actor?: "user" | "runtime" | "agent" } = {}
 ): McpServerRecord {
   const at = now();
   const item: McpServerRecord = {
@@ -749,11 +748,14 @@ export function createMcpServerRecord(
   };
   state.mcpServers.unshift(item);
   // MCP servers are configured at the instance level; tool invocations
-  // later attribute to the calling task.
+  // later attribute to the calling task. `actor` defaults to "user"
+  // because the CRUD path (`gini mcp add`, POST /api/mcp/servers) is the
+  // common case; runtime-driven creation (auto-register from a connector)
+  // overrides this so the audit row honestly attributes to the system.
   addAudit(
     state,
     {
-      actor: "user",
+      actor: options.actor ?? "user",
       action: "mcp.configured",
       target: item.id,
       risk: "medium",

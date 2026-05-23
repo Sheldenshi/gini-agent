@@ -29,9 +29,9 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       id: "toolset_memory",
       instance,
       name: "memory",
-      description: "Inspectable memory proposal, activation, retrieval, and rejection flows.",
+      description: "On-demand recall against the Hindsight per-agent bank (recall_memory). Auto-retain populates the bank from chat tasks automatically; this toolset gates the agent's ability to query it.",
       status: "enabled",
-      toolNames: ["memory.search", "memory.propose", "memory.activate"],
+      toolNames: ["memory.recall"],
       scopes: ["task", "job", "skill", "subagent"],
       createdAt: at,
       updatedAt: at

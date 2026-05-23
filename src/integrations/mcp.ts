@@ -2,6 +2,7 @@ import type { McpServerRecord, RuntimeConfig } from "../types";
 import { addAudit, appendEvent, createMcpServerRecord, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
 import { envBindingsForProviders, resolveConnectorSecret } from "./connectors";
+import { getProvider, listProviders } from "./connectors/registry";
 import { httpMcpCallTool, httpMcpInitialize, httpMcpListTools, resolveHeaderValue } from "./mcp-http";
 
 export async function addMcpServer(config: RuntimeConfig, input: Record<string, unknown>) {
@@ -160,9 +161,27 @@ export async function removeMcpServer(config: RuntimeConfig, idOrName: string) {
 
 // Resolve each header value's `${VAR}` placeholders against the union of:
 //  - active connector secrets (via envBindingsForProviders), and
-//  - process.env (fallback for non-secret env like Accept-Language).
+//  - process.env (fallback ONLY for vars no provider claims as a secret
+//    envBinding).
 // Throws when any placeholder can't resolve so the caller surfaces a
 // "missing credential" error before the request goes out.
+//
+// Two trust properties this function preserves:
+//
+//  1. Probe-based providers (e.g. `linear`) must have `health === "healthy"`
+//     to contribute their secret. A freshly-created, never-probed second
+//     connector with a bad token must not supply credentials to an MCP row
+//     that an older healthy connector originally enabled. (Mirrors the same
+//     gate in `isSkillActive` and `resolveSkillEnv`.)
+//
+//  2. Variables that any provider declares as a secret envBinding can ONLY
+//     be supplied by a live connector. Falling back to `process.env` for
+//     these would silently keep an MCP row authenticated after the
+//     connector is deleted/disabled (the user's shell still exports
+//     `LINEAR_API_KEY`), bypassing the `connector.secret.use` audit. We
+//     still permit `process.env` for vars no provider owns (e.g.
+//     `MCP-Protocol-Version`-style passthrough that the user wired by hand
+//     into the header map).
 export async function resolveMcpHeaders(
   config: RuntimeConfig,
   server: McpServerRecord,
@@ -170,28 +189,44 @@ export async function resolveMcpHeaders(
 ): Promise<Record<string, string>> {
   const raw = server.headers ?? {};
   if (Object.keys(raw).length === 0) return {};
-  // Discover which env vars the registered providers can supply. We pass
-  // every provider id so an MCP server can reference any connector's env
-  // binding (e.g. `${LINEAR_API_KEY}` from the linear provider).
+  // Bindings owned by ANY known provider — used both to populate
+  // credentials from live connectors and to block process.env fallback
+  // for those same variable names.
+  const allBindings = envBindingsForProviders(listProviders().map((p) => p.id));
   const state = readState(config.instance);
-  const providers = Array.from(new Set(state.connectors.map((c) => c.provider)));
-  const bindings = envBindingsForProviders(providers);
   const env: Record<string, string> = {};
-  for (const [envName, binding] of Object.entries(bindings)) {
+  for (const [envName, binding] of Object.entries(allBindings)) {
+    const providerModule = getProvider(binding.provider);
+    const hasProbe = Boolean(providerModule?.probe);
     const match = state.connectors.find(
-      (c) => c.provider === binding.provider && c.status === "configured" && (c.health === "healthy" || c.health === "unknown")
+      (c) =>
+        c.provider === binding.provider
+        && c.status === "configured"
+        && (c.health === "healthy" || (!hasProbe && c.health === "unknown"))
     );
     if (!match) continue;
     const value = await resolveConnectorSecret(config, match.id, binding.purpose, taskId);
     if (value) env[envName] = value;
   }
-  // Allow non-secret env passthrough (e.g. MCP-Protocol-Version isn't a
-  // secret). process.env values are still gated to specific patterns the
-  // user wired into the header map; we never auto-inject anything they
-  // didn't ask for.
+  // Build the resolution env per header: connector-bound vars come ONLY
+  // from `env` (above); other `${VAR}` placeholders may fall back to
+  // process.env so users can wire in non-secret values like
+  // `MCP-Protocol-Version` by hand. The fallback never overrides a
+  // connector-bound value because the env map shadows process.env for
+  // any name in `allBindings`.
   const resolved: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
-    const usedEnv = /\$\{([A-Z0-9_]+)\}/.test(value) ? { ...process.env as Record<string, string>, ...env } : env;
+    const referencedVars = Array.from(value.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((m) => m[1] as string);
+    let usedEnv: Record<string, string> = env;
+    const fallbackCandidates = referencedVars.filter((name) => !(name in allBindings));
+    if (fallbackCandidates.length > 0) {
+      const fallback: Record<string, string> = {};
+      for (const name of fallbackCandidates) {
+        const v = process.env[name];
+        if (typeof v === "string") fallback[name] = v;
+      }
+      usedEnv = { ...fallback, ...env };
+    }
     const out = resolveHeaderValue(value, usedEnv);
     if (out === undefined) {
       throw new Error(`Missing credential for MCP header '${key}'. Configure the connector that supplies it via 'gini connectors add'.`);

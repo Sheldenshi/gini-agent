@@ -30,7 +30,21 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
-import { createMemoryFromInput, editMemory, recall } from "../memory";
+import { recall } from "../memory";
+import {
+  dedupeAppendLines,
+  loadSoul,
+  loadUserProfile,
+  previewRemoveUserProfileSection,
+  removeSoulSection,
+  removeUserProfileSection,
+  scanForInjection,
+  soulPath,
+  userProfilePath,
+  writeSoul,
+  writeUserProfile,
+  type IdentityFileStatus
+} from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
@@ -113,10 +127,10 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await runJobTool(config, taskId, args) };
     case "recall_memory":
       return { kind: "sync", result: await recallMemoryTool(config, taskId, args) };
-    case "add_memory":
-      return { kind: "sync", result: await addMemoryTool(config, taskId, args) };
-    case "update_memory":
-      return { kind: "sync", result: await updateMemoryTool(config, taskId, args) };
+    case "edit_soul":
+      return { kind: "sync", result: await editSoulTool(config, taskId, args) };
+    case "edit_user_profile":
+      return { kind: "sync", result: await editUserProfileTool(config, taskId, args) };
     case "search_history":
       return { kind: "sync", result: await searchHistoryTool(config, taskId, args) };
     case "send_message":
@@ -221,6 +235,19 @@ function parseArgs(raw: string): Record<string, unknown> {
     throw new Error("Tool arguments must be a JSON object.");
   }
   return parsed as Record<string, unknown>;
+}
+
+// Forgiving variant of parseArgs for ChatBlock emission. The strict
+// parseArgs above throws on malformed JSON to keep dispatch correct;
+// emission must never abort the loop, so this helper returns an empty
+// object on failure and lets the chat-task loop continue. Used by
+// emitToolCallRunning in chat-task.ts.
+export function parseToolArgsLenient(raw: string): Record<string, unknown> {
+  try {
+    return parseArgs(raw);
+  } catch {
+    return {};
+  }
 }
 
 function requireString(args: Record<string, unknown>, key: string): string {
@@ -1437,63 +1464,136 @@ async function recallMemoryTool(
   });
 }
 
-// Propose a new memory item. Always lands as `status: "proposed"` —
-// the agent does not pin its own memory active. The user reviews via
-// the existing memory approval flow (`POST /api/memory/<id>/approve`).
-async function addMemoryTool(
+// Propose an edit to the active agent's SOUL.md. The body always lands
+// as SOUL.md.proposed; the user approves via the identity-files
+// approval API before the new content rides the next system prompt.
+// `set` replaces the body; `append` layers a new section under the
+// existing approved body; `remove` drops the first paragraph containing
+// a substring (`needle`) from the existing approved body. All three
+// route through the same propose-vs-approve gate.
+// See ADR runtime-identity-files.md.
+async function editSoulTool(
   config: RuntimeConfig,
   taskId: string,
   args: Record<string, unknown>
 ): Promise<string> {
+  const action = optionalString(args, "action", "set");
+  if (action !== "set" && action !== "append" && action !== "remove") {
+    throw new Error("Invalid input: action must be 'set', 'append', or 'remove'.");
+  }
+  const state = readState(config.instance);
+  const effective = resolveEffectiveContext(state, config);
+  const agentId = effective.agentId;
+  if (!agentId) {
+    throw new Error("Cannot edit SOUL.md: no active agent.");
+  }
+  if (action === "remove") {
+    const needle = requireString(args, "needle");
+    const removeResult = removeSoulSection(config.instance, agentId, needle, "proposed");
+    if (!removeResult.ok) {
+      // No mutation hit disk — surface a clean failure to the model so
+      // it can retry with a different needle instead of assuming the
+      // proposal landed. We deliberately do NOT throw: an invalid input
+      // should leave the conversation intact.
+      const reason = removeResult.reason === "no source"
+        ? "no approved SOUL.md exists to remove from"
+        : `no paragraph matched needle "${needle}"`;
+      return `Could not remove SOUL.md section: ${reason}.`;
+    }
+    await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "identity.soul.proposed",
+          target: removeResult.path,
+          risk: "low",
+          taskId: item.id,
+          runId: item.runId,
+          evidence: {
+            agentId,
+            action,
+            needle,
+            path: removeResult.path,
+            scanFindings: removeResult.scanFindings
+          }
+        },
+        { taskId: item.id }
+      );
+      item.updatedAt = now();
+    });
+    appendTrace(config.instance, taskId, {
+      type: "model",
+      message: "Proposed SOUL.md remove",
+      data: { agentId, action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings }
+    });
+    return `Proposed SOUL.md edit at ${removeResult.path} (removed paragraph matching "${needle}"). Awaiting user approval via POST /api/identity-files/soul/approve.`;
+  }
   const content = requireString(args, "content");
-  let confidence = 1;
-  if (args.confidence !== undefined && args.confidence !== null) {
-    if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
-      throw new Error("Invalid input: confidence must be a number.");
+  // For 'append', the new proposal carries the existing approved body
+  // followed by a blank line and the new content. The approved file
+  // stays the source of truth — proposals are not chained on top of
+  // earlier unapproved proposals. Lines from `content` that already
+  // exist verbatim in the existing body are dropped so a model that
+  // re-emits the current file alongside the new fact doesn't duplicate.
+  let body = content;
+  let appendDedupeDropped = 0;
+  if (action === "append") {
+    const existing = loadSoul(config.instance, agentId);
+    if (existing && existing.trim().length > 0 && !existing.startsWith("[BLOCKED:")) {
+      const dedupe = dedupeAppendLines(existing, content);
+      appendDedupeDropped = dedupe.droppedLineCount;
+      if (dedupe.empty) {
+        // Nothing new to append — surface a no-op so the model knows the
+        // write was redundant and the file stays clean. Audit + trace
+        // record the suppression so it stays observable.
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          addAudit(
+            state,
+            {
+              actor: "agent",
+              action: "identity.soul.append.noop",
+              target: soulPath(config.instance, agentId),
+              risk: "low",
+              taskId: item.id,
+              runId: item.runId,
+              evidence: { agentId, droppedLineCount: appendDedupeDropped }
+            },
+            { taskId: item.id }
+          );
+          item.updatedAt = now();
+        });
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "SOUL.md append no-op (all lines already present)",
+          data: { agentId, droppedLineCount: appendDedupeDropped }
+        });
+        return `No SOUL.md change: all appended lines already exist in the approved body.`;
+      }
+      body = `${existing.trim()}\n\n${dedupe.residual}`;
     }
-    confidence = Math.max(0, Math.min(1, args.confidence));
   }
-  let sensitivity: "normal" | "sensitive" = "normal";
-  if (args.sensitivity !== undefined && args.sensitivity !== null) {
-    if (args.sensitivity !== "normal" && args.sensitivity !== "sensitive") {
-      throw new Error("Invalid input: sensitivity must be 'normal' or 'sensitive'.");
-    }
-    sensitivity = args.sensitivity;
-  }
-  let provenance = "Proposed by agent";
-  if (args.provenance !== undefined && args.provenance !== null) {
-    if (typeof args.provenance !== "string") {
-      throw new Error("Invalid input: provenance must be a string.");
-    }
-    provenance = args.provenance;
-  }
-  // Agent-proposed memory ALWAYS starts proposed — the user reviews
-  // before pinning. We deliberately don't honor an inbound `status`
-  // override; the catalog signature reflects that.
-  const memory = await createMemoryFromInput(config, {
-    content,
-    confidence,
-    sensitivity,
-    provenance,
-    status: "proposed"
-  });
+  const result = writeSoul(config.instance, agentId, body, "proposed");
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(
       state,
       {
         actor: "agent",
-        action: "memory.added",
-        target: memory.id,
+        action: "identity.soul.proposed",
+        target: result.path,
         risk: "low",
         taskId: item.id,
         runId: item.runId,
         evidence: {
-          memoryId: memory.id,
-          contentExcerpt: content.length > 200 ? `${content.slice(0, 200)}…` : content,
-          status: memory.status,
-          confidence,
-          sensitivity
+          agentId,
+          action,
+          path: result.path,
+          contentBytes: body.length,
+          scanFindings: result.scanFindings,
+          ...(appendDedupeDropped > 0 ? { droppedLineCount: appendDedupeDropped } : {})
         }
       },
       { taskId: item.id }
@@ -1501,56 +1601,181 @@ async function addMemoryTool(
     item.updatedAt = now();
   });
   appendTrace(config.instance, taskId, {
-    type: "memory",
-    message: "Proposed new memory",
-    data: { memoryId: memory.id, status: memory.status, contentBytes: content.length }
+    type: "model",
+    message: "Proposed SOUL.md edit",
+    data: { agentId, action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings }
   });
-  return `Proposed memory ${memory.id} (status: ${memory.status}). Awaiting user approval via /api/memory/${memory.id}/approve.`;
+  const scanNote = result.scanFindings.length > 0
+    ? ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`
+    : "";
+  return `Proposed SOUL.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/soul/approve.`;
 }
 
-// Edit an existing memory in place. Use sparingly — `add_memory` is the
-// usual path. The audit trail records every edit; the user can archive
-// a bad edit via `DELETE /api/memory/<id>`.
-async function updateMemoryTool(
+// Propose an edit to the instance-scoped USER.md. Same propose →
+// approve flow as edit_soul. Instance-scoped so user identity carries
+// across agent switches.
+async function editUserProfileTool(
   config: RuntimeConfig,
   taskId: string,
   args: Record<string, unknown>
 ): Promise<string> {
-  const memoryId = requireString(args, "memoryId");
-  const input: Record<string, unknown> = {};
-  if (args.content !== undefined && args.content !== null) {
-    if (typeof args.content !== "string") {
-      throw new Error("Invalid input: content must be a string.");
+  const action = optionalString(args, "action", "set");
+  if (action !== "set" && action !== "append" && action !== "remove") {
+    throw new Error("Invalid input: action must be 'set', 'append', or 'remove'.");
+  }
+  if (action === "remove") {
+    const needle = requireString(args, "needle");
+    // Pre-scan the post-remove body so a hostile pattern that survives
+    // the deletion still routes through the propose path. Without the
+    // pre-scan a remove against a file whose remaining paragraphs trip
+    // the scanner would auto-approve a tainted body.
+    const preview = previewRemoveUserProfileSection(config.instance, needle);
+    if (!preview.ok) {
+      const reason = preview.reason === "no source"
+        ? "no approved USER.md exists to remove from"
+        : `no paragraph matched needle "${needle}"`;
+      return `Could not remove USER.md section: ${reason}.`;
     }
-    input.content = args.content;
-  }
-  if (args.confidence !== undefined && args.confidence !== null) {
-    if (typeof args.confidence !== "number" || !Number.isFinite(args.confidence)) {
-      throw new Error("Invalid input: confidence must be a number.");
+    const targetStatus: IdentityFileStatus = preview.scanFindings.length > 0 ? "proposed" : "approved";
+    const removeResult = removeUserProfileSection(config.instance, needle, targetStatus);
+    if (!removeResult.ok) {
+      // The pre-scan already confirmed there is a source and a match — a
+      // fall-through here is only reachable on a concurrent filesystem
+      // race; surface the same clean failure shape.
+      const reason = removeResult.reason === "no source"
+        ? "no approved USER.md exists to remove from"
+        : `no paragraph matched needle "${needle}"`;
+      return `Could not remove USER.md section: ${reason}.`;
     }
-    input.confidence = args.confidence;
-  }
-  if (args.sensitivity !== undefined && args.sensitivity !== null) {
-    if (args.sensitivity !== "normal" && args.sensitivity !== "sensitive") {
-      throw new Error("Invalid input: sensitivity must be 'normal' or 'sensitive'.");
+    const autoApproved = removeResult.status === "approved";
+    const auditAction = autoApproved
+      ? "identity.user_profile.approved"
+      : "identity.user_profile.proposed";
+    await mutateState(config.instance, (state) => {
+      const item = findTask(state, taskId);
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: auditAction,
+          target: removeResult.path,
+          risk: autoApproved ? "low" : "medium",
+          taskId: item.id,
+          runId: item.runId,
+          evidence: {
+            action,
+            needle,
+            path: removeResult.path,
+            scanFindings: removeResult.scanFindings,
+            autoApproved
+          }
+        },
+        { taskId: item.id }
+      );
+      item.updatedAt = now();
+    });
+    appendTrace(config.instance, taskId, {
+      type: "model",
+      message: autoApproved
+        ? "USER.md remove (auto-approved)"
+        : "USER.md remove blocked from prompt (proposed)",
+      data: { action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings, autoApproved }
+    });
+    if (!autoApproved) {
+      const scanNote = ` (scan flagged: ${removeResult.scanFindings.join(", ")}; content blocked from prompt until approved)`;
+      return `Proposed USER.md remove at ${removeResult.path}${scanNote}. Awaiting user approval via POST /api/identity-files/user/approve.`;
     }
-    input.sensitivity = args.sensitivity;
+    return `Updated USER.md at ${removeResult.path} (removed paragraph matching "${needle}").`;
   }
-  if (Object.keys(input).length === 0) {
-    throw new Error("Invalid input: update_memory requires at least one field to change.");
+  const content = requireString(args, "content");
+  let body = content;
+  let appendDedupeDropped = 0;
+  if (action === "append") {
+    const existing = loadUserProfile(config.instance);
+    if (existing && existing.trim().length > 0 && !existing.startsWith("[BLOCKED:")) {
+      // Drop lines from `content` that already live verbatim in the
+      // existing body so a model that re-emits the current file
+      // alongside the new fact doesn't duplicate (the dominant
+      // overshoot pattern on weaker tool-calling models). When the
+      // residual is empty no write happens — the file is already
+      // current.
+      const dedupe = dedupeAppendLines(existing, content);
+      appendDedupeDropped = dedupe.droppedLineCount;
+      if (dedupe.empty) {
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          addAudit(
+            state,
+            {
+              actor: "agent",
+              action: "identity.user_profile.append.noop",
+              target: userProfilePath(config.instance),
+              risk: "low",
+              taskId: item.id,
+              runId: item.runId,
+              evidence: { droppedLineCount: appendDedupeDropped }
+            },
+            { taskId: item.id }
+          );
+          item.updatedAt = now();
+        });
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: "USER.md append no-op (all lines already present)",
+          data: { droppedLineCount: appendDedupeDropped }
+        });
+        return `No USER.md change: all appended lines already exist.`;
+      }
+      body = `${existing.trim()}\n\n${dedupe.residual}`;
+    }
   }
-  // `editMemory` already writes the canonical `memory.edited` audit row
-  // (medium risk, actor user) — that's the safeguard the memory module
-  // owns. Writing a second row from the tool wrapper would just obscure
-  // the medium-risk gate with low-risk agent noise. The per-task trace
-  // below carries the agent's narrative.
-  const memory = await editMemory(config, memoryId, input);
-  appendTrace(config.instance, taskId, {
-    type: "memory",
-    message: "Edited memory",
-    data: { memoryId, appliedFields: Object.keys(input) }
+  // Pre-scan the proposed body. When the scan flags a threat the write
+  // is routed to `.proposed` (matching edit_soul semantics) so a hostile
+  // body never lands at the approved path. Only clean bodies auto-approve.
+  // See ADR runtime-identity-files.md.
+  const previewScan = scanForInjection(body, "USER.md");
+  const targetStatus: IdentityFileStatus = previewScan.findings.length > 0 ? "proposed" : "approved";
+  const result = writeUserProfile(config.instance, body, targetStatus);
+  const autoApproved = result.status === "approved";
+  const auditAction = autoApproved
+    ? "identity.user_profile.approved"
+    : "identity.user_profile.proposed";
+  await mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    addAudit(
+      state,
+      {
+        actor: "agent",
+        action: auditAction,
+        target: result.path,
+        risk: autoApproved ? "low" : "medium",
+        taskId: item.id,
+        runId: item.runId,
+        evidence: {
+          action,
+          path: result.path,
+          contentBytes: body.length,
+          scanFindings: result.scanFindings,
+          autoApproved,
+          ...(appendDedupeDropped > 0 ? { droppedLineCount: appendDedupeDropped } : {})
+        }
+      },
+      { taskId: item.id }
+    );
+    item.updatedAt = now();
   });
-  return `Updated memory ${memory.id}: ${Object.keys(input).join(", ")}.`;
+  appendTrace(config.instance, taskId, {
+    type: "model",
+    message: autoApproved
+      ? "USER.md edit (auto-approved)"
+      : "USER.md edit blocked from prompt (proposed)",
+    data: { action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings, autoApproved }
+  });
+  if (!autoApproved) {
+    const scanNote = ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`;
+    return `Proposed USER.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/user/approve.`;
+  }
+  return `Updated USER.md at ${result.path}.`;
 }
 
 // Cross-session lookup wrapping `searchSessions`. Returns up to `limit`

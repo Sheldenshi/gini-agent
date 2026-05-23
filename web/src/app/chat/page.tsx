@@ -15,37 +15,28 @@ import {
   DialogHeader,
   DialogTitle
 } from "@/components/ui/dialog";
-import { ApprovalActions } from "@/components/chat/ApprovalActions";
-import { Avatar } from "@/components/chat/Avatar";
+import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { Composer } from "@/components/chat/Composer";
-import { MessageBubble } from "@/components/chat/MessageBubble";
-import { PhaseIndicator, type PhaseIndicatorPhase } from "@/components/chat/PhaseIndicator";
 import { SessionItem } from "@/components/chat/SessionItem";
-import { ToolCallRow } from "@/components/chat/ToolCallRow";
 import { api } from "@/lib/api";
 import {
   useCancelTask,
-  useChatSession,
+  useChatBlocks,
   useChatSessions,
   useDeleteChatSession,
   useInvalidate,
   useRenameChatSession
 } from "@/lib/queries";
 import { useChatReadState } from "@/lib/use-chat-read-state";
-import type { ChatMessage, ChatSession } from "@/lib/view-types";
+import type { ChatSession } from "@/lib/view-types";
 
-// Review P1 #3: waiting_approval is intentionally NOT terminal here. It's
-// in-flight from the chat UI's perspective — getChatSession synthesizes
-// an ephemeral assistant placeholder for it, and the runtime only persists
-// a real synced ChatMessageRecord once the task hits completed / failed /
-// cancelled. Triggering auto-sync on waiting_approval would (a) blow up
-// because syncChatTaskResult now rejects that status, and (b) freeze the
-// placeholder text on the previous "Waiting for approval" string.
-const TERMINAL_TASK_STATUSES = new Set([
-  "completed",
-  "failed",
-  "cancelled"
-]);
+// Terminal phase labels. The runtime emits `phase("Completed" | "Cancelled"
+// | "Failed")` as the final block on a task, so the in-flight check below
+// can use the latest phase block to decide whether the cancel button is
+// active. Keeping the set local (rather than importing TaskStatus) keeps
+// the page free of legacy Task derivations — the block stream is the only
+// signal we care about.
+const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
 
 export default function ChatPage() {
   const sessions = useChatSessions();
@@ -55,13 +46,9 @@ export default function ChatPage() {
   const [selected, setSelectedState] = useState<string | null>(initial);
   const [text, setText] = useState("");
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
-  const session = useChatSession(selected);
+  const { blocks, isLoading: blocksLoading } = useChatBlocks(selected);
   const invalidate = useInvalidate();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  // Tracks taskIds that have already been auto-synced (or are in flight) for
-  // the current session view, so the polling effect doesn't refire sync on
-  // every 3s tick once the task hits a terminal state.
-  const syncedTaskIdsRef = useRef<Set<string>>(new Set());
   // Apply the URL ?session= param ONCE on mount (and again only if the URL
   // itself changes). Using `selected` as a dep would force the user back to
   // the URL session every time they switch chats.
@@ -118,10 +105,6 @@ export default function ChatPage() {
     setSelected(target.id);
   }, [selected, orderedSessions, setSelected]);
 
-  useEffect(() => {
-    syncedTaskIdsRef.current = new Set();
-  }, [selected]);
-
   const create = useMutation({
     mutationFn: () =>
       api<ChatSession>("/chat", { method: "POST", body: JSON.stringify({ title: "" }) }),
@@ -145,48 +128,13 @@ export default function ChatPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const sync = useMutation({
-    mutationFn: (taskId: string) =>
-      api<ChatMessage>(`/chat/${selected}/tasks/${taskId}/sync`, { method: "POST" }),
-    onSuccess: () => invalidate(["chat"]),
-    onError: (error: Error) => toast.error(error.message)
-  });
-
   const deleteSession = useDeleteChatSession();
   const renameSession = useRenameChatSession();
   const cancel = useCancelTask();
 
-  const messages = session.data?.messages;
-  const tasks = session.data?.tasks;
-
-  useEffect(() => {
-    if (!messages || !tasks) return;
-    // The "task already has its assistant reply" check must ignore
-    // approval-reason rows (kind:"approval_reason"), which the runtime
-    // persists for a task when it pauses on a connector.request approval.
-    // Treating those as the final reply means we skip the post-completion
-    // sync that turns task.summary into a user-visible bubble — the user
-    // would see the streamed text mid-flight but no durable assistant
-    // message after the task terminates, and inflightTaskId stays wedged.
-    const assistantTaskIds = new Set(
-      messages
-        .filter((m) => m.role === "assistant" && m.taskId && m.kind !== "approval_reason")
-        .map((m) => m.taskId as string)
-    );
-    for (const message of messages) {
-      if (message.role !== "user" || !message.taskId) continue;
-      if (assistantTaskIds.has(message.taskId)) continue;
-      if (syncedTaskIdsRef.current.has(message.taskId)) continue;
-      const task = tasks.find((t) => t.id === message.taskId);
-      if (!task || !TERMINAL_TASK_STATUSES.has(task.status)) continue;
-      syncedTaskIdsRef.current.add(message.taskId);
-      sync.mutate(message.taskId);
-    }
-  }, [messages, tasks, sync]);
-
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages?.length, selected]);
+  }, [blocks.length, selected]);
 
   const submit = () => {
     const trimmed = text.trim();
@@ -194,67 +142,26 @@ export default function ChatPage() {
     send.mutate(trimmed);
   };
 
-  const tasksById = useMemo(
-    () => new Map((tasks ?? []).map((t) => [t.id, t])),
-    [tasks]
-  );
-
-  // The "in-flight task" is the latest user message's task whose status is
-  // non-terminal. It stays set even once a paired assistant message appears,
-  // so streaming/cursor + busy state remain wired until the task is terminal.
+  // The in-flight task id is derived from the block stream: scan from the
+  // end for the latest phase block — if its label is non-terminal, that
+  // task is in flight. Falls back to scanning tool_call blocks in case
+  // the loop emitted a tool_call but the next phase hasn't landed yet.
+  // The runtime emits a terminal phase("Completed"/"Cancelled"/"Failed")
+  // on every task end, so a non-terminal latest phase is a reliable
+  // signal that a task is still in motion.
   const inflightTaskId: string | null = useMemo(() => {
-    if (!messages) return null;
-    let userTaskId: string | undefined;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i]!;
-      if (m.role === "user" && m.taskId) {
-        userTaskId = m.taskId;
-        break;
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i]!;
+      if (b.kind === "phase") {
+        if (TERMINAL_PHASE_LABELS.has(b.label)) return null;
+        return b.taskId ?? null;
+      }
+      if (b.kind === "tool_call" && b.status === "running") {
+        return b.taskId ?? null;
       }
     }
-    if (!userTaskId) return null;
-    const task = tasksById.get(userTaskId);
-    if (task && TERMINAL_TASK_STATUSES.has(task.status)) return null;
-    return userTaskId;
-  }, [messages, tasksById]);
-
-  // Determine the pending assistant phase from the in-flight task. We prefer
-  // `currentStep` (which the runtime flips to "Working" before tool dispatch)
-  // because plain text generation and tool execution both have status
-  // "running"; only currentStep distinguishes them.
-  const pendingPhase: PhaseIndicatorPhase | null = useMemo(() => {
-    if (!inflightTaskId) return null;
-    const task = tasksById.get(inflightTaskId);
-    if (!task) return "thinking";
-    if (task.currentStep === "Thinking") return "thinking";
-    if (task.currentStep === "Working") return "working";
-    if (task.currentStep === "Waiting for approval") return "working";
-    if (task.status === "queued") return "thinking";
-    // Any other tool-specific currentStep ("Reading file", "Executing", …)
-    // counts as working.
-    return "working";
-  }, [inflightTaskId, tasksById]);
-
-  // Tool calls dispatched by the in-flight task, surfaced as inline rows
-  // above the PhaseIndicator while the agent is mid-loop. Empty when the
-  // task hasn't dispatched any tools yet, or when there's no in-flight
-  // task at all.
-  const inflightToolCalls = useMemo(() => {
-    if (!inflightTaskId) return [];
-    const task = tasksById.get(inflightTaskId);
-    return task?.recentToolCalls ?? [];
-  }, [inflightTaskId, tasksById]);
-
-  // The assistant message (if any) belonging to the in-flight task — its
-  // bubble shows the streaming cursor.
-  const streamingAssistantMessageId: string | null = useMemo(() => {
-    if (!inflightTaskId || !messages) return null;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i]!;
-      if (m.role === "assistant" && m.taskId === inflightTaskId) return m.id;
-    }
     return null;
-  }, [messages, inflightTaskId]);
+  }, [blocks]);
 
   const confirmDelete = () => {
     const id = pendingDeleteId;
@@ -284,6 +191,33 @@ export default function ChatPage() {
       { onError: (error) => toast.error(error.message) }
     );
   };
+
+  // Phase blocks are transient indicators — only render the latest one,
+  // and only while it's still active (non-terminal). Historical phase
+  // markers ("Thinking" mid-conversation, "Completed" at the end) are
+  // internal state transitions; surfacing them in the transcript turns
+  // them into permanent noise. Non-phase blocks always render.
+  const visibleBlocks = useMemo(() => {
+    return blocks.filter((b, i) => {
+      if (b.kind !== "phase") return true;
+      const isLast = i === blocks.length - 1;
+      return isLast && !TERMINAL_PHASE_LABELS.has(b.label);
+    });
+  }, [blocks]);
+
+  // Map each tool_call's callId to its paired tool_result block so the
+  // BlockToolCall renderer can expand-on-click without re-walking the
+  // list per row. Tool results don't render as standalone blocks.
+  const toolResultsByCallId = useMemo(() => {
+    const map = new Map<string, (typeof blocks)[number] & { kind: "tool_result" }>();
+    for (const b of blocks) {
+      if (b.kind === "tool_result") map.set(b.callId, b);
+    }
+    return map;
+  }, [blocks]);
+
+  const sessionTitle = selectedSession?.title || "New chat";
+  const hasBlocks = visibleBlocks.length > 0;
 
   return (
     <div className="flex flex-1 overflow-hidden">
@@ -325,93 +259,36 @@ export default function ChatPage() {
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
             {orderedSessions.length === 0 ? "No chats yet — start a new one" : "Select a chat"}
           </div>
-        ) : !session.data ? (
+        ) : blocksLoading && !hasBlocks ? (
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
             Loading…
           </div>
         ) : (
           <>
             <header className="sticky top-0 z-10 bg-background px-4 py-3">
-              <h1 className="truncate text-base font-semibold">
-                {session.data.title || "New chat"}
-              </h1>
+              <h1 className="truncate text-base font-semibold">{sessionTitle}</h1>
             </header>
 
             <ScrollArea className="min-h-0 flex-1">
               <div className="mx-auto w-full max-w-3xl px-4 py-6">
-                {!messages || messages.length === 0 ? (
+                {!hasBlocks ? (
                   <div className="flex min-h-[40vh] items-center justify-center">
                     <h2 className="text-2xl font-semibold">What can I help with?</h2>
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {messages.map((message) => {
-                      // Render inline Approve / Deny on the synthetic
-                      // "Waiting for approval..." placeholder — when the
-                      // message's task is in waiting_approval state, the user
-                      // can resolve the approval without leaving the chat.
-                      const messageTask = message.taskId
-                        ? tasksById.get(message.taskId)
-                        : undefined;
-                      const showApprovalActions =
-                        message.role === "assistant" &&
-                        messageTask?.status === "waiting_approval";
-                      // Surface the task's tool-call breadcrumbs above the
-                      // assistant bubble so the work the agent did (navigate,
-                      // connect, snapshot, ...) stays visible after this turn
-                      // is no longer in-flight. recentToolCalls is persisted
-                      // on the task record and survives task completion. The
-                      // bottom placeholder block below only runs when there
-                      // is NO assistant message for the in-flight task, so
-                      // double-rendering isn't possible.
-                      const messageToolCalls =
-                        message.role === "assistant" && messageTask
-                          ? messageTask.recentToolCalls
-                          : undefined;
-                      return (
-                        <li key={message.id}>
-                          <MessageBubble
-                            message={message}
-                            isStreaming={message.id === streamingAssistantMessageId}
-                            toolCalls={messageToolCalls}
-                          />
-                          {showApprovalActions && message.taskId ? (
-                            <div className="ml-[46px] mt-1 max-w-[90%]">
-                              <ApprovalActions taskId={message.taskId} />
-                            </div>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                    {pendingPhase && !streamingAssistantMessageId ? (
-                      <li>
-                        <div className="flex items-start gap-2.5">
-                          <Avatar />
-                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                            {inflightToolCalls.map((call) => (
-                              <ToolCallRow key={call.id} call={call} />
-                            ))}
-                            <PhaseIndicator phase={pendingPhase} />
-                          </div>
-                        </div>
-                        {/*
-                          Some approval types (browser.connect) suppress the
-                          "Waiting for approval..." placeholder bubble because
-                          their inline card is self-describing. Render the
-                          card here — sibling of the avatar block, indented
-                          by ml-[46px] to align with the message body — so it
-                          sits at the same visual level as the connector
-                          inline form (which renders as a sibling of the
-                          approval_reason MessageBubble in the messages.map
-                          branch above), not nested inside the avatar body.
-                        */}
-                        {inflightTaskId && tasksById.get(inflightTaskId)?.status === "waiting_approval" ? (
-                          <div className="ml-[46px] mt-1 max-w-[90%]">
-                            <ApprovalActions taskId={inflightTaskId} />
-                          </div>
-                        ) : null}
+                    {visibleBlocks.map((block) => (
+                      <li key={block.id}>
+                        <BlockRenderer
+                          block={block}
+                          toolResult={
+                            block.kind === "tool_call"
+                              ? toolResultsByCallId.get(block.callId)
+                              : undefined
+                          }
+                        />
                       </li>
-                    ) : null}
+                    ))}
                   </ul>
                 )}
                 <div ref={messagesEndRef} />

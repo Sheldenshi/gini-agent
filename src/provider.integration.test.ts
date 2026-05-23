@@ -189,7 +189,7 @@ describe("provider integration (against in-process mock server)", () => {
         apiKeyEnv: keyEnv,
         extraBody: { chat_template_kwargs: { enable_thinking: true } }
       });
-      const result = await generateTaskSummary(cfg(provider), "summarize me", []);
+      const result = await generateTaskSummary(cfg(provider), "summarize me");
       expect(result.text).toBe("mock-echo: summarize me");
       const captured = server.received[0]!;
       expect(captured.headers["http-referer"]).toBe("http://127.0.0.1:7337");

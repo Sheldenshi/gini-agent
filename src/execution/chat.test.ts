@@ -209,7 +209,6 @@ describe("chat session waiting-approval placeholder", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: [],
         chatSessionId: session.id,
         currentStep: "running tool"
@@ -285,7 +284,6 @@ describe("chat session waiting-approval placeholder", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: [],
         chatSessionId: session.id,
         partialSummary: "Running gws auth login..."
@@ -334,7 +332,6 @@ describe("chat session waiting-approval placeholder", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: [],
         chatSessionId: session.id,
         currentStep: "preparing file write"

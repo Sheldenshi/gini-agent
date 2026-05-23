@@ -28,31 +28,79 @@ import { api } from "../api";
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
   // install path (`curl … | bash`) has no GINI_PROVIDER env, and the
-  // browser /setup flow is responsible for picking a provider. If no env
-  // is set and no config exists yet, materialize a placeholder ("echo")
-  // config; the runtime starts, /api/setup/status reports
-  // providerConfigured:false, and the browser /setup page replaces the
-  // placeholder. Existing configs are not overwritten.
+  // browser /setup flow is responsible for picking a provider when the
+  // user lands on a fresh instance without env vars set. When no env
+  // is set the platform default in defaultConfig() (codex/gpt-5.5)
+  // takes over for a brand-new instance; `gini setup --yes` and the
+  // browser /setup page can still rewrite that later.
   //
-  // For users who want to skip the browser flow, GINI_PROVIDER=openai|codex
-  // is still honored — it short-circuits the placeholder and writes the
-  // real provider directly.
+  // GINI_PROVIDER=openai|codex (optionally with GINI_MODEL) always
+  // wins when set, whether or not a config already exists on disk. This
+  // is load-bearing for the conductor `setup` script: if a worktree's
+  // instance dir was materialized earlier (e.g. by a tmux `gini run`
+  // racing the install, or by a legacy `~/.gini/lanes/<inst>/config.json`
+  // that loadConfig migrates into place) the existing config would
+  // otherwise pin a stale provider and the env vars in `setup` would
+  // be silently ignored. We unconditionally apply the env override
+  // after ctx.config: on a fresh install defaultConfig() already used
+  // the env vars so the rewrite is a no-op; on a pre-existing or
+  // migrated config it brings the on-disk shape into agreement with
+  // the env.
+  //
+  // GINI_MODEL alone (no GINI_PROVIDER) on an existing config also
+  // wins — defaultConfig() honors GINI_MODEL on a fresh install, so the
+  // existing-config path must match that contract or users get an
+  // asymmetric "model env ignored after first install" surprise.
+  //
+  // The validator and override branch deliberately reject `echo`. Echo
+  // is a test-only provider: it's reachable through the ephemeral smoke
+  // path (src/cli/args.ts pins GINI_PROVIDER=echo and smoke bypasses
+  // install_), but not as a user-facing install option. The allow-list
+  // in defaultConfig() is wider than this one for that reason.
   const instance = parseInstance(ctx.rawArgs);
-  if (!existsSync(configPath(instance))) {
-    const envProvider = process.env.GINI_PROVIDER;
-    if (envProvider && envProvider !== "openai" && envProvider !== "codex") {
-      throw new Error(
-        `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
-        `Use 'openai' or 'codex', leave it unset for a placeholder config that the /setup page replaces, ` +
-        `or run \`gini provider set <name> [model]\` after install.`
-      );
-    }
-    // envProvider is undefined → placeholder config will materialize via
-    // defaultConfig() inside install(); /api/setup/status will report
-    // providerConfigured:false; the browser /setup flow takes over.
+  const envProvider = process.env.GINI_PROVIDER;
+  if (envProvider !== undefined && envProvider !== "openai" && envProvider !== "codex") {
+    throw new Error(
+      `GINI_PROVIDER='${envProvider}' is not a recognized provider. ` +
+      `Use 'openai' or 'codex', leave it unset to accept the platform default, ` +
+      `or run \`gini provider set <name> [model]\` after install.`
+    );
   }
   const { config } = ctx;
-  install(config);
+  const envModel = process.env.GINI_MODEL;
+  if (envProvider === "openai" || envProvider === "codex") {
+    // Mirror defaultConfig()'s provider field shape so the on-disk form
+    // is identical whether the env vars hit the fresh-config branch in
+    // defaultConfig() or this rewrite path on a pre-existing/migrated
+    // config. Model resolution:
+    //   - GINI_MODEL set → use it.
+    //   - GINI_MODEL unset AND provider changed → use new provider's
+    //     default (mirrors defaultConfig).
+    //   - GINI_MODEL unset AND provider unchanged → preserve the
+    //     existing model so a user with codex/gpt-custom doesn't get
+    //     clobbered to gpt-5.5 by a re-run of `gini install` with the
+    //     same GINI_PROVIDER.
+    const providerChanged = config.provider?.name !== envProvider;
+    const providerDefaultModel = envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini";
+    const model = envModel
+      ?? (providerChanged ? providerDefaultModel : (config.provider?.model ?? providerDefaultModel));
+    config.provider = {
+      name: envProvider,
+      model,
+      apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined
+    };
+    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+  } else if (envModel !== undefined && config.provider) {
+    // Asymmetry fix: fresh configs honor GINI_MODEL alone via
+    // defaultConfig(), but the existing-config branch above only fires
+    // when GINI_PROVIDER is set. If only GINI_MODEL is set on an
+    // existing config, apply the model update in place — keep the
+    // current provider name and apiKeyEnv untouched so a stale
+    // OPENAI_API_KEY value (or absence) survives the rewrite.
+    config.provider = { ...config.provider, model: envModel };
+    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+  }
+  await install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
 }
 
@@ -74,8 +122,8 @@ export async function doctorCmd(ctx: CliContext): Promise<void> {
   print(await doctor(ctx.config, ctx.web));
 }
 
-export function reset(ctx: CliContext): void {
-  resetInstance(ctx.config);
+export async function reset(ctx: CliContext): Promise<void> {
+  await resetInstance(ctx.config);
   print({ reset: true, instance: ctx.config.instance, stateRoot: ctx.config.stateRoot });
 }
 

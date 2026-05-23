@@ -54,6 +54,60 @@ describe("default port helpers", () => {
   });
 });
 
+describe("GINI_PROVIDER env recognition", () => {
+  function withProviderEnv<T>(
+    overrides: { provider?: string; model?: string },
+    fn: (root: string) => T
+  ): T {
+    const root = mkdtempSync(join(tmpdir(), "gini-paths-env-"));
+    const prev = {
+      state: process.env.GINI_STATE_ROOT,
+      log: process.env.GINI_LOG_ROOT,
+      provider: process.env.GINI_PROVIDER,
+      model: process.env.GINI_MODEL,
+      port: process.env.GINI_PORT
+    };
+    process.env.GINI_STATE_ROOT = root;
+    delete process.env.GINI_LOG_ROOT;
+    delete process.env.GINI_PORT;
+    if (overrides.provider === undefined) delete process.env.GINI_PROVIDER;
+    else process.env.GINI_PROVIDER = overrides.provider;
+    if (overrides.model === undefined) delete process.env.GINI_MODEL;
+    else process.env.GINI_MODEL = overrides.model;
+    try {
+      return fn(root);
+    } finally {
+      if (prev.state === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = prev.state;
+      if (prev.log === undefined) delete process.env.GINI_LOG_ROOT;
+      else process.env.GINI_LOG_ROOT = prev.log;
+      if (prev.provider === undefined) delete process.env.GINI_PROVIDER;
+      else process.env.GINI_PROVIDER = prev.provider;
+      if (prev.model === undefined) delete process.env.GINI_MODEL;
+      else process.env.GINI_MODEL = prev.model;
+      if (prev.port === undefined) delete process.env.GINI_PORT;
+      else process.env.GINI_PORT = prev.port;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("defaultConfig honors GINI_PROVIDER=echo for the smoke ephemeral path", () => {
+    // Echo is a test-only provider. The user-facing `gini install`
+    // validator rejects it (see admin.ts); the only legitimate way to
+    // land on echo through defaultConfig() is the ephemeral smoke
+    // runner in src/cli/args.ts, which pins GINI_PROVIDER=echo and
+    // bypasses install_. Without this branch, smoke would fall through
+    // to the codex default and call the real backend with a nonsense
+    // model.
+    withProviderEnv({ provider: "echo" }, () => {
+      const config = loadConfig("smoke-echo-default");
+      expect(config.provider.name).toBe("echo");
+      expect(config.provider.model).toBe("gini-echo-v0");
+      expect(config.provider.apiKeyEnv).toBeUndefined();
+    });
+  });
+});
+
 describe("legacy on-disk layout migration", () => {
   function withTempStateRoot<T>(fn: (root: string) => T): T {
     const root = mkdtempSync(join(tmpdir(), "gini-paths-"));

@@ -183,7 +183,6 @@ describe("subagent runtime (Slice 4)", () => {
           tracePath: "",
           auditIds: [],
           approvalIds: [],
-          memoryIds: [],
           skillIds: [],
           parentTaskId,
           subagentId,

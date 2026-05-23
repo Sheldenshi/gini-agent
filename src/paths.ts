@@ -222,16 +222,34 @@ export function workspaceDir(instance: Instance): string {
 }
 
 export function defaultConfig(instance: Instance): RuntimeConfig {
-  const providerName = process.env.GINI_PROVIDER === "openai" || process.env.GINI_PROVIDER === "codex"
-    ? process.env.GINI_PROVIDER
-    : "echo";
+  // Platform default fallback is codex/gpt-5.5. Users without `codex` CLI
+  // auth will hit a runtime error on first prompt — that's the accepted
+  // tradeoff for not landing on the placeholder `echo` provider.
+  //
+  // The allow-list here is intentionally wider than the `gini install`
+  // validator: `echo` is recognized here ONLY because the ephemeral smoke
+  // path pins GINI_PROVIDER=echo (src/cli/args.ts) and smoke materializes
+  // its config directly through defaultConfig() — it does NOT flow through
+  // install_(). Without this branch, smoke would fall through to the
+  // codex default and call the real codex backend with a nonsense model.
+  // The user-facing `gini install` path forbids echo; see admin.ts.
+  const envProvider = process.env.GINI_PROVIDER;
+  const providerName: "openai" | "codex" | "echo" =
+    envProvider === "openai" || envProvider === "codex" || envProvider === "echo"
+      ? envProvider
+      : "codex";
+  const defaultModelFor: Record<"openai" | "codex" | "echo", string> = {
+    codex: "gpt-5.5",
+    openai: "gpt-5.4-mini",
+    echo: "gini-echo-v0"
+  };
   return {
     instance,
     port: Number(process.env.GINI_PORT ?? defaultRuntimePort(instance)),
     token: crypto.randomUUID(),
     provider: {
       name: providerName,
-      model: process.env.GINI_MODEL ?? (providerName === "echo" ? "gini-echo-v0" : providerName === "codex" ? "gpt-5.5" : "gpt-5.4-mini"),
+      model: process.env.GINI_MODEL ?? defaultModelFor[providerName],
       apiKeyEnv: providerName === "openai" ? "OPENAI_API_KEY" : undefined
     },
     workspaceRoot: workspaceDir(instance),

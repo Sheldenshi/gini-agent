@@ -377,3 +377,55 @@ describe("backfillDefaultAgentToolsets", () => {
     expect(audits.length).toBe(0);
   });
 });
+describe("dropDeadMemoryImprovements", () => {
+  test("strips improvements with the legacy kind: memory and audits each removal", () => {
+    const state = createEmptyState("legacy-memory-improvements");
+    // Inject legacy proposals via the dynamic shape — the type-level
+    // ImprovementKind dropped "memory" alongside the state.memories
+    // consolidation, but persisted state files still carry them.
+    state.improvements = [
+      ...state.improvements,
+      {
+        id: "imp_mem_1",
+        instance: state.instance,
+        // Cast through unknown because the field is no longer typed.
+        kind: "memory" as unknown as "skill",
+        title: "remember preferences",
+        rationale: "legacy",
+        status: "proposed",
+        sourceTaskId: undefined,
+        sourceTraceIds: [],
+        payload: { content: "x" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      },
+      {
+        id: "imp_skill_1",
+        instance: state.instance,
+        kind: "skill",
+        title: "real skill",
+        rationale: "ok",
+        status: "proposed",
+        sourceTaskId: undefined,
+        sourceTraceIds: [],
+        payload: { name: "real skill" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
+      }
+    ];
+
+    const normalized = normalizeState(state.instance, state);
+
+    // The legacy memory proposal is gone; the skill proposal stays.
+    expect(normalized.improvements.find((p) => p.id === "imp_mem_1")).toBeUndefined();
+    expect(normalized.improvements.find((p) => p.id === "imp_skill_1")).toBeDefined();
+
+    // The removal landed an audit row so operators can see why the
+    // proposal disappeared.
+    const audit = normalized.audit.find(
+      (event) => event.action === "improvement.memory-kind.removed" && event.target === "imp_mem_1"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.title).toBe("remember preferences");
+  });
+});

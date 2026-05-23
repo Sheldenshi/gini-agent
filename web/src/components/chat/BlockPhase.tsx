@@ -1,0 +1,27 @@
+import type { PhaseBlock } from "@runtime/types";
+
+// Phase indicator driven by the block's `label`. The runtime emits phase
+// strings ("Thinking", "Working: <tool>", "Completed", "Cancelled",
+// "Failed") — we render them verbatim so the vocabulary stays server-
+// owned.
+//
+// The bouncing-dots animation only renders for non-terminal phases. A
+// completed/cancelled/failed phase is a historical marker and should sit
+// quietly in the transcript without pulling the eye.
+const TERMINAL_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
+
+export function BlockPhase({ block }: { block: PhaseBlock }) {
+  const isTerminal = TERMINAL_LABELS.has(block.label);
+  return (
+    <div className="flex min-h-8 items-center gap-1.5">
+      <span className="text-xs text-muted-foreground">{block.label}</span>
+      {isTerminal ? null : (
+        <div className="inline-flex items-center gap-1" aria-hidden="true">
+          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:0ms]" />
+          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:150ms]" />
+          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:300ms]" />
+        </div>
+      )}
+    </div>
+  );
+}

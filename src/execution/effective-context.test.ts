@@ -66,7 +66,6 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     tasks: [],
     approvals: [],
     audit: [],
-    memories: [],
     skills: [],
     jobs: [],
     connectors: [],

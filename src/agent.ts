@@ -21,8 +21,8 @@ import {
   appendTrace,
   assertInsideWorkspace,
   assertInsideWorkspaceNoSymlinkEscape,
-  createMemory,
   createTask,
+  findInFlightAssistantTextForTask,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -48,6 +48,13 @@ import { requestCodeExecution } from "./tools/code";
 import { recall, retain } from "./memory";
 import { updateRunFromTask } from "./execution/runs";
 import { runChatTask, resumeChatTask } from "./execution/chat-task";
+import {
+  emitPhase,
+  emitSystemNote,
+  emitToolCallStatus,
+  finalizeAssistantText,
+  resolveEmitContext
+} from "./execution/chat-task-emit";
 import { approvalToolCallId } from "./execution/tool-dispatch";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
@@ -255,6 +262,28 @@ export async function cancelTask(
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
+  // Chat-block emission for cancellation (ADR chat-block-protocol.md
+  // risks §4). Flip any in-flight streaming assistant_text to
+  // `streaming: false` while keeping the partial text the user already
+  // saw, THEN emit a system_note("Cancelled") and the terminal
+  // "Cancelled" phase. Best-effort: a chat-blocks read/write failure
+  // here must not block the rest of the cancellation lifecycle.
+  try {
+    const emitCtx = resolveEmitContext(config, taskId);
+    if (emitCtx) {
+      const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
+      if (inFlight) {
+        finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+      }
+      emitSystemNote(emitCtx, "Cancelled");
+      emitPhase(emitCtx, "Cancelled");
+    }
+  } catch (error) {
+    appendLog(config.instance, "chat.cancel_block.emit_failed", {
+      taskId,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
   // Cascade cancellation to descendant subagent tasks. If the cancelled
   // task spawned subagents (whose taskIds are children), cancel each one
   // recursively. Walk the runtime state for any task whose parentTaskId is
@@ -501,14 +530,14 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
   }
 
   // No tool matched: fall through to provider summarization.
-  // Phase C — resolve the active agent so memory access (pinned + recall +
-  // proposed) all use the same isolation key.
+  // Phase C — resolve the active agent so Hindsight recall uses the
+  // right isolation key. Legacy `state.memories` pinned-memory access
+  // was removed as part of the memory-surface consolidation; identity
+  // facts live in USER.md and recalled-from-Hindsight memory now. See
+  // ADR runtime-identity-files.md.
   const memoryState = await mutateState(config.instance, (state) => state);
   const memoryEffective = resolveEffectiveContext(memoryState, config);
   const activeAgentId = memoryEffective.agentId;
-  const activeMemory = memoryState.memories.filter((memory) =>
-    memory.status === "active" && (!activeAgentId || memory.agentId === activeAgentId)
-  );
 
   // Hindsight phase 5: auto-recall. Pull relevant facts/opinions from the
   // four-network store and inject as additional context. Best-effort — if
@@ -564,7 +593,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     }
   };
 
-  const providerResult = await generateTaskSummary(config, task.input, activeMemory, recalledContext, onDelta);
+  const providerResult = await generateTaskSummary(config, task.input, recalledContext, onDelta, undefined, taskId);
   await flush();
   appendTrace(config.instance, taskId, {
     type: "model",
@@ -573,7 +602,6 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       provider: providerResult.provider,
       responseId: providerResult.responseId,
       usage: providerResult.usage,
-      memoryUsed: activeMemory.map((memory) => memory.id),
       hindsightUnitsRecalled
     }
   });
@@ -582,43 +610,14 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
     const item = findTask(state, taskId);
     // Respect a terminal status set while `generateTaskSummary` was
     // awaiting. Without this guard a cancel landing during the
-    // provider call would be silently overwritten with `completed`,
-    // and the `remember` branch would also create a memory + audit
-    // row against a cancelled task.
+    // provider call would be silently overwritten with `completed`.
     if (isTerminalTaskStatus(item.status)) return item;
-    if (lower.includes("remember ")) {
-      // Phase C — reject loud when no active agent so we don't silently
-      // leak into a default pool. Message matches createMemoryFromInput
-      // so the gateway's statusFromErrorMessage mapping to 400 applies
-      // uniformly across the legacy + remember-prefix create paths.
-      if (!activeAgentId) {
-        throw new Error("Cannot create memory: no active agent.");
-      }
-      const content = item.input.split(/remember\s+/i).at(-1)?.trim() || item.input;
-      const memory = createMemory(state, {
-        agentId: activeAgentId,
-        content,
-        sourceTaskId: item.id,
-        confidence: 0.7,
-        status: "proposed",
-        sensitivity: "normal",
-        provenance: `Proposed from task ${item.id}`
-      });
-      item.memoryIds.push(memory.id);
-      addAudit(
-        state,
-        {
-          actor: "agent",
-          action: "memory.proposed",
-          target: memory.id,
-          risk: "medium",
-          taskId: item.id,
-          evidence: { content }
-        },
-        { taskId: item.id }
-      );
-      appendTrace(config.instance, taskId, { type: "memory", message: "Memory proposed", data: { memoryId: memory.id } });
-    }
+    // The legacy "remember <fact>" prefix used to create a proposed
+    // MemoryRecord row at task completion. That path was removed when
+    // `state.memories` was consolidated into USER.md / SOUL.md /
+    // Hindsight. Long-term retention now flows through auto-retain
+    // (scheduleAutoRetain below); identity facts route through
+    // `edit_user_profile`. See ADR runtime-identity-files.md.
     item.status = "completed";
     item.currentStep = "Completed";
     item.summary = providerResult.text;
@@ -763,6 +762,30 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
   await syncSubagentFromTask(config, task);
+  // Chat-block emission for failure. Mirrors cancelTask's invariant:
+  // partial assistant_text stays visible (we flip to streaming: false
+  // rather than dropping), then a system_note carries the error
+  // message and a "Failed" phase marks the terminal state. Best-effort
+  // — failures during chat-block emission would otherwise mask the
+  // task-failure caller's view.
+  if (task.status === "failed") {
+    try {
+      const emitCtx = resolveEmitContext(config, taskId);
+      if (emitCtx) {
+        const inFlight = findInFlightAssistantTextForTask(config.instance, taskId);
+        if (inFlight) {
+          finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+        }
+        emitSystemNote(emitCtx, message);
+        emitPhase(emitCtx, "Failed");
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.fail_block.emit_failed", {
+        taskId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
   // Cascade cancellation to descendant subagent tasks when a parent
   // task is failed (e.g. via approval denial or a runtime exception).
   // Without this, a failed parent leaves running children executing
@@ -934,6 +957,35 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
   if (approval.item.taskId) {
     appendTrace(config.instance, approval.item.taskId, { type: "approval", message: `Approval ${approval.item.status}`, data: { approvalId } });
     appendTrace(config.instance, approval.item.taskId, { type: "error", message: `Approval denied: ${approval.item.target}`, data: {} });
+    // Chat-block emission for the denial path. Flip the matching
+    // tool_call row to `denied` (callId lives on approval.payload as
+    // `toolCallId`), emit the system_note, and mark the terminal
+    // phase. The denial bypasses failTask's emission path so we do
+    // the equivalent inline. Best-effort: a SQLite failure here
+    // doesn't block the rest of the lifecycle.
+    try {
+      const taskIdForEmit = approval.item.taskId;
+      const emitCtx = resolveEmitContext(config, taskIdForEmit);
+      if (emitCtx) {
+        const toolCallId = approvalToolCallId(approval.item.payload);
+        if (toolCallId) {
+          emitToolCallStatus(emitCtx, { callId: toolCallId, status: "denied" });
+        }
+        if (approval.task) {
+          const inFlight = findInFlightAssistantTextForTask(config.instance, taskIdForEmit);
+          if (inFlight) {
+            finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
+          }
+          emitSystemNote(emitCtx, `Approval denied: ${approval.item.target}`);
+          emitPhase(emitCtx, "Failed");
+        }
+      }
+    } catch (error) {
+      appendLog(config.instance, "chat.deny_block.emit_failed", {
+        approvalId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
     if (approval.task) {
       await updateRunFromTask(config, approval.task);
       if (approval.task.jobId) await finalizeJobRunFromTask(config, approval.task);

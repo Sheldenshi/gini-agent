@@ -15,9 +15,16 @@ import type { RuntimeState } from "../types";
 // each entry small and self-documenting so models with weaker tool-calling
 // (local Llamas, some compat providers) still understand what each tool
 // does without extra system-prompt context.
-const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
+//
+// `displayLabel` is the human-readable short label clients render in
+// tool_call ChatBlocks. Server-side ownership keeps the labels consistent
+// across web / mobile / CLI bridges (see ADR chat-block-protocol.md).
+// When omitted on a TOOL_DEFS entry, `chatBlockLabelFor` falls back to a
+// humanized version of the tool name.
+const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string }> = [
   {
     toolset: "file",
+    displayLabel: "Read file",
     type: "function",
     function: {
       name: "file_read",
@@ -33,6 +40,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "List directory",
     type: "function",
     function: {
       name: "file_list",
@@ -47,6 +55,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "Search files",
     type: "function",
     function: {
       name: "file_search",
@@ -63,6 +72,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "Write file",
     type: "function",
     function: {
       name: "file_write",
@@ -79,6 +89,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "file",
+    displayLabel: "Patch file",
     type: "function",
     function: {
       name: "file_patch",
@@ -96,6 +107,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "messaging",
+    displayLabel: "Fetch URL",
     type: "function",
     function: {
       name: "web_fetch",
@@ -111,6 +123,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "terminal",
+    displayLabel: "Run shell command",
     type: "function",
     function: {
       name: "terminal_exec",
@@ -128,6 +141,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "terminal",
+    displayLabel: "Run code",
     type: "function",
     function: {
       name: "code_exec",
@@ -148,6 +162,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // the user to enable a toolset. Sync, low-risk, no approval needed: the
     // body is just text content that already lives in state.
     toolset: "skills",
+    displayLabel: "Read skill",
     type: "function",
     function: {
       name: "read_skill",
@@ -169,6 +184,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // result. Medium-risk: no approval, but every call is audited and
     // traced; depth-capped at 3 levels.
     toolset: "subagents",
+    displayLabel: "Spawn subagent",
     type: "function",
     function: {
       name: "spawn_subagent",
@@ -189,6 +205,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Open page",
     type: "function",
     function: {
       name: "browser_navigate",
@@ -204,6 +221,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Snapshot page",
     type: "function",
     function: {
       name: "browser_snapshot",
@@ -218,6 +236,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Click element",
     type: "function",
     function: {
       name: "browser_click",
@@ -233,6 +252,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Type text",
     type: "function",
     function: {
       name: "browser_type",
@@ -249,6 +269,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Press key",
     type: "function",
     function: {
       name: "browser_press",
@@ -264,6 +285,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Scroll page",
     type: "function",
     function: {
       name: "browser_scroll",
@@ -279,6 +301,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Go back",
     type: "function",
     function: {
       name: "browser_back",
@@ -288,6 +311,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Read console",
     type: "function",
     function: {
       name: "browser_console",
@@ -303,6 +327,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Close browser",
     type: "function",
     function: {
       name: "browser_close",
@@ -312,6 +337,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Hover element",
     type: "function",
     function: {
       name: "browser_hover",
@@ -327,6 +353,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Drag element",
     type: "function",
     function: {
       name: "browser_drag",
@@ -343,6 +370,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Select option",
     type: "function",
     function: {
       name: "browser_select_option",
@@ -360,6 +388,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Wait for element",
     type: "function",
     function: {
       name: "browser_wait_for",
@@ -381,6 +410,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Manage tabs",
     type: "function",
     function: {
       name: "browser_tabs",
@@ -402,6 +432,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "Upload file",
     type: "function",
     function: {
       name: "browser_upload_file",
@@ -418,6 +449,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
   },
   {
     toolset: "browser",
+    displayLabel: "See page",
     type: "function",
     function: {
       name: "browser_connect",
@@ -458,6 +490,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // the model needs this path even on a fresh instance with no toolsets
     // toggled.
     toolset: "connectors",
+    displayLabel: "Request connector",
     type: "function",
     function: {
       name: "request_connector",
@@ -482,6 +515,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // based on the tool's `annotations.destructiveHint`; for v0 every call
     // auto-executes.
     toolset: "mcp",
+    displayLabel: "Call MCP tool",
     type: "function",
     function: {
       name: "mcp_call",
@@ -506,6 +540,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // modal). Always exposed (like read_skill / spawn_subagent) so a
     // fresh instance can schedule reminders without toolset toggling.
     toolset: "jobs",
+    displayLabel: "Schedule job",
     type: "function",
     function: {
       name: "create_job",
@@ -559,6 +594,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // existing scheduled job, so update_job / delete_job target the right
     // id instead of accidentally creating a duplicate via create_job.
     toolset: "jobs",
+    displayLabel: "List jobs",
     type: "function",
     function: {
       name: "list_jobs",
@@ -579,6 +615,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // Low-risk / no approval for the same reason as create_job: the user
     // can always pause/delete from /jobs.
     toolset: "jobs",
+    displayLabel: "Update job",
     type: "function",
     function: {
       name: "update_job",
@@ -608,6 +645,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // (the agent should be able to do delete+create or update smoothly).
     // The user can always restore via re-creation; audit trail is preserved.
     toolset: "jobs",
+    displayLabel: "Delete job",
     type: "function",
     function: {
       name: "delete_job",
@@ -628,6 +666,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // API path — use it when you already have the SKILL.md text in hand
     // and just need to land it on the runtime.
     toolset: "skills",
+    displayLabel: "Install skill",
     type: "function",
     function: {
       name: "install_skill",
@@ -660,6 +699,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // `setSkillStatus(config, idOrName, "enabled")` and writes a
     // skill.enabled audit row.
     toolset: "skills",
+    displayLabel: "Enable skill",
     type: "function",
     function: {
       name: "enable_skill",
@@ -678,6 +718,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // read_skill refuses to fetch its body. Low-risk; underlying handler
     // writes a skill.disabled audit row.
     toolset: "skills",
+    displayLabel: "Disable skill",
     type: "function",
     function: {
       name: "disable_skill",
@@ -699,6 +740,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // cannot cancel itself — that would terminate the running
     // conversation).
     toolset: "subagents",
+    displayLabel: "Cancel task",
     type: "function",
     function: {
       name: "cancel_task",
@@ -718,6 +760,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // policy seam auto-approves; "strict" gates every call. The user
     // can pre-approve specific bridges or flip approvalMode at runtime.
     toolset: "messaging",
+    displayLabel: "Send message",
     type: "function",
     function: {
       name: "send_message",
@@ -734,13 +777,16 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Cross-session lookup. Scans past tasks, traces, memories, skills,
-    // and audit rows for a substring match. Low-risk; read-only.
+    // Cross-session lookup. Scans past tasks, traces, skills, and audit
+    // rows for a substring match. Low-risk; read-only. (Pinned memories
+    // were dropped in the state.memories consolidation — for memory
+    // recall use `recall_memory` against the Hindsight bank instead.)
     toolset: "session_search",
+    displayLabel: "Search history",
     type: "function",
     function: {
       name: "search_history",
-      description: "Search past chat sessions, task traces, stored memories, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/memory/skill/audit), title, excerpt, and taskId when applicable.",
+      description: "Search past chat sessions, task traces, skill text, and audit events for a substring. Use when the user references something they did before ('did I ever ask about X?', 'find that conversation about Y'). Returns up to `limit` snippets ordered by score, each with kind (task/trace/skill/audit), title, excerpt, and taskId when applicable. For memory recall use `recall_memory` instead — it queries the Hindsight bank where auto-retain persists facts.",
       parameters: {
         type: "object",
         properties: {
@@ -759,6 +805,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // compact summary so the model can decide whether to dig deeper or
     // ask the user for clarification. Low-risk / no approval.
     toolset: "memory",
+    displayLabel: "Recall memory",
     type: "function",
     function: {
       name: "recall_memory",
@@ -775,48 +822,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     }
   },
   {
-    // Add a new memory item. Defaults `status: "proposed"` — the agent
-    // doesn't pin its own memory active; the user reviews via the existing
-    // approval flow (`POST /api/memory/<id>/approve`).
-    toolset: "memory",
-    type: "function",
-    function: {
-      name: "add_memory",
-      description: "Propose a new memory item. Memory items added by the agent start as `proposed` and require user approval via the memory review flow (`POST /api/memory/<id>/approve`). Use when the user shares a stable fact about themselves or their preferences that should ride the system prompt on future tasks. Avoid noting ephemeral context (it's already in the conversation) — propose only things worth remembering across sessions.",
-      parameters: {
-        type: "object",
-        properties: {
-          content: { type: "string", description: "The memory text (1-2 sentences). Keep it concise — pinned memories cost context every turn." },
-          confidence: { type: "number", description: "Confidence in the fact, 0-1. Defaults to 1. Lower for inferred facts." },
-          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Mark `sensitive` for items the user wouldn't want surfaced in default UI views. Defaults to `normal`." },
-          provenance: { type: "string", description: "Short note about where the fact came from (e.g. 'User said in chat'). Defaults to 'Proposed by agent'." }
-        },
-        required: ["content"]
-      }
-    }
-  },
-  {
-    // Edit an existing memory in place. Use sparingly — `add_memory` is
-    // the usual path. The audit trail records every edit; the user can
-    // archive a bad edit via `DELETE /api/memory/<id>`.
-    toolset: "memory",
-    type: "function",
-    function: {
-      name: "update_memory",
-      description: "Edit an existing memory item in place (content / confidence / sensitivity). Use sparingly — `add_memory` is the usual path. The audit trail records every edit, and the user can archive a bad edit via `DELETE /api/memory/<id>`. Supply only the fields you want to change.",
-      parameters: {
-        type: "object",
-        properties: {
-          memoryId: { type: "string", description: "Id of the memory to edit (e.g. 'mem_abc123')." },
-          content: { type: "string", description: "Optional new memory text." },
-          confidence: { type: "number", description: "Optional new confidence value, 0-1." },
-          sensitivity: { type: "string", enum: ["normal", "sensitive"], description: "Optional new sensitivity classification." }
-        },
-        required: ["memoryId"]
-      }
-    }
-  },
-  {
     // Manually trigger an existing scheduled job. Wraps the same
     // `runJobNow` entrypoint that `POST /api/jobs/<id>/run` calls. Low-risk
     // / no approval: the spawned task itself still flows through the job's
@@ -825,6 +830,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
     // tool only fires an EXISTING job — for one-off prompts use create_job
     // with intervalSeconds + oneShot=true instead.
     toolset: "jobs",
+    displayLabel: "Run job",
     type: "function",
     function: {
       name: "run_job",
@@ -837,10 +843,73 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string }> = [
         required: ["jobId"]
       }
     }
+  },
+  {
+    // Propose an edit to the active agent's SOUL.md (per-agent persona).
+    // The tool writes the new body to SOUL.md.proposed; the runtime
+    // continues to read the approved SOUL.md (if any) until the user
+    // approves the proposal via `POST /api/identity-files/soul/approve`.
+    // Always exposed alongside add_memory — the "identity" toolset is
+    // not part of the legacy default set; gating on enable would silently
+    // hide the per-agent persona surface on fresh instances.
+    // See ADR runtime-identity-files.md.
+    toolset: "identity",
+    displayLabel: "Edit persona",
+    type: "function",
+    function: {
+      name: "edit_soul",
+      description: "Propose an edit to the active agent's SOUL.md — the agent's persona / character / identity, as ASSIGNED BY THE USER. Rare: most chat sessions never call this. Only fire when the user is explicitly sculpting WHO the agent IS, not WHAT TO DO for them. Example phrasings that DO trigger this tool: \"You are Athena, a research assistant\"; \"Act as a stoic critic with strong opinions\"; \"You're a sardonic, witty assistant who doesn't hedge\"; \"Speak like a pirate from now on\". Example phrasings that DO NOT trigger this tool: \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points\" — those are USER preferences about how the user wants replies and route to `edit_user_profile`. When in doubt, default to `edit_user_profile`; SOUL.md is a deliberate opt-in. Prefer `action: \"set\"` with the full consolidated SOUL.md body under H2 sections (`## Voice`, `## Style`, `## Boundaries`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section. Write entries as facts about the agent's identity, not directives to yourself (\"Voice is terse\" ✓ — \"Always be terse\" ✗). Aim to keep the file under the soft cap shown in the SOUL persona header (1500 chars); when near or over cap, consolidate. The proposed body lands as SOUL.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/soul/approve`. After calling, you MAY briefly mention the approval step but do NOT otherwise narrate the tool call. `action: \"append\"` adds a new section below existing content (prefer set; append is a legacy fallback). `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing approved body; requires `needle`. Requires an active agent — there is no per-instance SOUL.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "append", "remove"],
+            description: "Whether to replace the whole SOUL.md body (set), append a new section below the existing approved content (append), or drop the first paragraph containing `needle` from the existing approved content (remove).",
+            default: "set"
+          },
+          content: { type: "string", description: "The new SOUL.md body (action=set) or the section to append (action=append). Keep it concise — every turn pays for this in tokens. Not required for action=remove." },
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing approved SOUL.md that contains this substring is dropped." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    // Edit the instance-scoped USER.md. Auto-approved: writes land at
+    // USER.md directly and ride the system prompt on the next turn.
+    // USER.md is instance-scoped so the user's identity carries across
+    // agent switches. Distinct from edit_soul (per-agent persona, still
+    // propose → approve). Always exposed. See ADR
+    // runtime-identity-files.md.
+    toolset: "identity",
+    displayLabel: "Edit user profile",
+    type: "function",
+    function: {
+      name: "edit_user_profile",
+      description: "Edit the instance-scoped USER.md — facts and preferences ABOUT THE USER. Two kinds of content fire this tool: (1) facts about the user — name, role, location, employer, languages, family; (2) preferences for how the user wants you to communicate — \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points for lists\", \"wants detailed technical explanations\". Even when the user phrases a preference as an imperative (\"be direct with me\", \"skip the preamble\"), it is a preference about how the user wants replies → this tool, NOT `edit_soul`. If the user is talking about themselves OR about how they want replies, use this tool. `edit_soul` is reserved for the rare case where the user is explicitly assigning the agent a persona (\"You are X\", \"Act as X\"). When in doubt, default to this tool. Prefer `action: \"set\"` with the full consolidated USER.md content under H2 sections (`## Identity`, `## Preferences`, `## Background`, `## Goals`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section rather than appending a chunk below. Only call when the user's CURRENT message contains a NEW durable fact or preference NOT already in USER.md. Write entries as facts ABOUT the user, not directives to yourself (\"User prefers concise replies\" ✓ — \"Always reply concisely\" ✗); imperative phrasing in USER.md gets re-read next session as a system directive. Casual chat and follow-up questions are NOT identity facts — most turns should produce ZERO calls. Aim to keep the file under the soft cap shown in the USER profile header (1500 chars); when near or over cap, consolidate. DO NOT save task progress, PR/issue/commit IDs, completed-work logs, or other transient state — those belong in long-term memory (auto-retain handles them silently). Do NOT narrate the call: just acknowledge briefly (\"Got it, X.\", \"Noted.\"). Auto-approved: writes go straight to USER.md and ride the system prompt on the next turn. USER.md is instance-scoped so the user's identity bridges across agent switches. The injection scan still gates content that trips a threat pattern. `action: \"append\"` adds a new section (legacy fallback; the storage layer de-duplicates lines that already exist); `action: \"remove\"` drops the first paragraph containing the `needle` substring (requires `needle`). Distinct from edit_soul which still requires user approval.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["set", "append", "remove"],
+            description: "Whether to replace the whole USER.md body (set), append a new section below the existing content (append), or drop the first paragraph containing `needle` from the existing content (remove).",
+            default: "set"
+          },
+          content: { type: "string", description: "The new USER.md body (action=set) or the section to append (action=append). Not required for action=remove." },
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing USER.md that contains this substring is dropped." }
+        },
+        required: []
+      }
+    }
   }
 ];
 
-export type ToolCatalogTool = ToolFunctionSpec & { toolset: string };
+export type ToolCatalogTool = ToolFunctionSpec & {
+  toolset: string;
+  displayLabel?: string;
+};
 
 // Public read-only copy. Returned ordering is stable so the toolsHash is
 // deterministic across boots (used for resume after approval).
@@ -924,6 +993,14 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "install_skill") return true;
     if (tool.function.name === "enable_skill") return true;
     if (tool.function.name === "disable_skill") return true;
+    // Identity-file edit tools. The "identity" toolset is not part of
+    // the legacy default set; gating on enable would silently hide the
+    // per-agent SOUL.md / instance USER.md edit surface on fresh
+    // instances. The proposed-vs-approved file split (see ADR
+    // runtime-identity-files.md) keeps unreviewed content out of the
+    // prompt regardless of toolset state, so always-on here is safe.
+    if (tool.function.name === "edit_soul") return true;
+    if (tool.function.name === "edit_user_profile") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
@@ -939,8 +1016,151 @@ export function hashCatalog(tools: ToolCatalogTool[]): string {
   return createHash("sha1").update(summary).digest("hex").slice(0, 16);
 }
 
-// Return the OpenAI tool spec without the `toolset` annotation we use for
-// filtering. The provider only knows the `type/function` shape.
+// Return the OpenAI tool spec without the `toolset` / `displayLabel`
+// annotations we use for filtering and chat rendering. The provider
+// only knows the `type/function` shape.
 export function toProviderTools(tools: ToolCatalogTool[]): ToolFunctionSpec[] {
-  return tools.map(({ toolset: _toolset, ...rest }) => rest);
+  return tools.map(({ toolset: _toolset, displayLabel: _displayLabel, ...rest }) => rest);
+}
+
+// Display-label lookup for ChatBlock rendering. Returns the catalog
+// entry's explicit `displayLabel` when set; otherwise humanizes the
+// tool's machine name (`file_read` → `File read`) as a stable fallback.
+// Centralized server-side so web, mobile, and CLI bridges render the
+// same vocabulary in tool_call ChatBlocks (ADR chat-block-protocol.md).
+export function chatBlockLabelFor(toolName: string): string {
+  const entry = TOOL_DEFS.find((t) => t.function.name === toolName);
+  if (entry?.displayLabel) return entry.displayLabel;
+  // Fallback: split underscores, capitalize the first word, lowercase
+  // the rest. `file_read` → `File read`, `mcp_call` → `Mcp call`. We
+  // intentionally don't title-case every word — `Search History` looks
+  // like a marketing label rather than a compact verb phrase.
+  const tokens = toolName.split(/[._]/).filter(Boolean);
+  if (tokens.length === 0) return toolName;
+  const first = tokens[0]!;
+  const head = first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+  const tail = tokens.slice(1).map((t) => t.toLowerCase()).join(" ");
+  return tail ? `${head} ${tail}` : head;
+}
+
+// Truncate a short headline string to 80 chars with an ellipsis. Picked
+// to fit one bubble line on a phone (mobile is the narrowest target);
+// web can expand the bubble for the full args object via `argsFull`.
+function truncatePreview(value: string, maxLen = 80): string {
+  if (value.length <= maxLen) return value;
+  return value.slice(0, maxLen - 1) + "…";
+}
+
+// Stringify the value half of an args entry compactly: strings pass
+// through, numbers/booleans are coerced, objects/arrays are JSON-encoded
+// with a hard length cap so a giant blob doesn't blow out the preview.
+function previewValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+// Per-tool argsPreview override — returns the most useful 1-line
+// representation of the call's headline argument. Falls back to a
+// generic "key=value, ..." dump of all top-level args when no specific
+// mapping fires. Always truncated to 80 chars (see truncatePreview).
+//
+// Add new entries here as new tools land; the helper deliberately
+// covers all the current first-class tools so clients render a useful
+// inline preview without each one rebuilding the per-tool mapping.
+export function chatBlockArgsPreviewFor(
+  toolName: string,
+  args: Record<string, unknown> | null | undefined
+): string {
+  const safe = args ?? {};
+  // Headline-arg mapping per tool. Order matters within an entry only
+  // when multiple alt sources are queried (e.g. `browser_*` may have
+  // `url` OR `ref`).
+  switch (toolName) {
+    case "file_read":
+    case "file_list":
+    case "file_search":
+    case "file_write":
+    case "file_patch":
+      return truncatePreview(previewValue(safe.path) || previewValue(safe.pattern));
+    case "web_fetch":
+      return truncatePreview(previewValue(safe.url));
+    case "terminal_exec":
+      return truncatePreview(previewValue(safe.command));
+    case "code_exec":
+      return truncatePreview(`${previewValue(safe.language) || "code"}: ${previewValue(safe.code)}`);
+    case "read_skill":
+    case "enable_skill":
+    case "disable_skill":
+      return truncatePreview(previewValue(safe.name) || previewValue(safe.skillId));
+    case "install_skill":
+      return truncatePreview(previewValue(safe.category) || "skill");
+    case "spawn_subagent":
+      return truncatePreview(previewValue(safe.name) || previewValue(safe.prompt));
+    case "browser_navigate":
+      return truncatePreview(previewValue(safe.url));
+    case "browser_click":
+    case "browser_type":
+    case "browser_hover":
+    case "browser_select_option":
+    case "browser_upload_file":
+      return truncatePreview(previewValue(safe.ref));
+    case "browser_press":
+      return truncatePreview(previewValue(safe.key));
+    case "browser_scroll":
+      return truncatePreview(previewValue(safe.direction));
+    case "browser_wait_for":
+      return truncatePreview(previewValue(safe.ref) || previewValue(safe.text));
+    case "browser_tabs":
+      return truncatePreview(previewValue(safe.action));
+    case "browser_vision":
+      return truncatePreview(previewValue(safe.question));
+    case "browser_drag":
+      return truncatePreview(
+        `${previewValue(safe.fromRef)} → ${previewValue(safe.toRef)}`
+      );
+    case "browser_snapshot":
+    case "browser_back":
+    case "browser_close":
+    case "browser_console":
+      return "";
+    case "mcp_call":
+      return truncatePreview(
+        `${previewValue(safe.server)}.${previewValue(safe.tool)}`
+      );
+    case "request_connector":
+      return truncatePreview(previewValue(safe.provider));
+    case "create_job":
+    case "run_job":
+    case "delete_job":
+    case "update_job":
+      return truncatePreview(previewValue(safe.name) || previewValue(safe.jobId));
+    case "list_jobs":
+      return truncatePreview(previewValue(safe.nameContains) || "");
+    case "cancel_task":
+      return truncatePreview(previewValue(safe.taskId));
+    case "send_message":
+      return truncatePreview(previewValue(safe.text));
+    case "search_history":
+      return truncatePreview(previewValue(safe.query));
+    case "recall_memory":
+      return truncatePreview(previewValue(safe.query));
+    case "add_memory":
+      return truncatePreview(previewValue(safe.content));
+    case "update_memory":
+      return truncatePreview(previewValue(safe.memoryId));
+    default: {
+      // Generic fallback: key=value, ... for the first few entries.
+      // Keeps unmapped or future tools from emitting an empty preview.
+      const parts = Object.entries(safe)
+        .slice(0, 3)
+        .map(([key, value]) => `${key}=${previewValue(value)}`);
+      return truncatePreview(parts.join(", "));
+    }
+  }
 }

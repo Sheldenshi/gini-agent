@@ -270,17 +270,17 @@ describe("runtime proxy", () => {
       seen.push(String(init.method));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
     });
-    const patchRequest = new Request("http://localhost/api/runtime/memory/m_1", {
+    const patchRequest = new Request("http://localhost/api/runtime/skills/s_1", {
       method: "PATCH",
       headers: { "content-type": "application/json", origin: "http://localhost" },
       body: JSON.stringify({ content: "x" })
     });
-    const deleteRequest = new Request("http://localhost/api/runtime/memory/m_1", {
+    const deleteRequest = new Request("http://localhost/api/runtime/skills/s_1", {
       method: "DELETE",
       headers: { origin: "http://localhost" }
     });
-    await proxyRequest(patchRequest, ["memory", "m_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
-    await proxyRequest(deleteRequest, ["memory", "m_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    await proxyRequest(patchRequest, ["skills", "s_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    await proxyRequest(deleteRequest, ["skills", "s_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
 
     expect(seen).toEqual(["PATCH", "DELETE"]);
   });

@@ -1,6 +1,8 @@
 import type { ConnectorRecord, ConnectorSecretRef, RuntimeConfig, RuntimeState, SkillRecord } from "../../types";
-import { addAudit, id, mutateState, now, readState, updateConnectorHealth } from "../../state";
+import { addAudit, appendLog, id, mutateState, now, readState, updateConnectorHealth } from "../../state";
 import { deleteConnectorSecrets, readSecret, writeSecret } from "../../state/secrets";
+import { syncProviderMcpServers } from "../mcp-sync";
+import { redactSecretsInText } from "../mcp-http";
 import { getProvider, listProviders } from "./registry";
 
 export interface CreateConnectorInput {
@@ -271,7 +273,7 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
     probeMessage = `Provider ${initial.provider} has no remote probe; presence-only.`;
   }
 
-  return mutateState(config.instance, (state) => {
+  const result = await mutateState(config.instance, (state) => {
     const connector = state.connectors.find((candidate) => candidate.id === connectorId);
     if (!connector) throw new Error(`Connector not found: ${connectorId}`);
     connector.lastHealthAt = now();
@@ -291,6 +293,41 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
     );
     return connector;
   });
+  // After a successful health write, materialize any provider-declared
+  // MCP server record so `mcp_call(server: "<provider>")` resolves. Safe
+  // to call on every probe — the sync is idempotent and skips providers
+  // whose MCP entry already exists.
+  if (result.health === "healthy") {
+    try {
+      await syncProviderMcpServers(config);
+    } catch (error) {
+      // Best-effort. A failure here doesn't unwind the health update —
+      // the connector is still usable for env-based flows. But we MUST
+      // make the failure observable so a regression isn't silent:
+      // operators see `mcp.auto_register_failed` in the audit log and
+      // can diagnose without re-running the probe locally.
+      const message = redactSecretsInText(error instanceof Error ? error.message : String(error));
+      appendLog(config.instance, "mcp.auto_register.error", {
+        connectorId,
+        provider: result.provider,
+        error: message
+      });
+      await mutateState(config.instance, (state) => {
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "mcp.auto_register_failed",
+            target: connectorId,
+            risk: "low",
+            evidence: { provider: result.provider, error: message }
+          },
+          { system: true }
+        );
+      });
+    }
+  }
+  return result;
 }
 
 // A skill is active iff every required connector is satisfied by a

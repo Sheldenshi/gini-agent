@@ -764,7 +764,6 @@ describe("discord poller supervisor", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
       const session: ChatSessionRecord = {

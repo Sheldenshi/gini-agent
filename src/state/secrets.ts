@@ -82,7 +82,27 @@ export function writeSecret(
 
 export function readSecret(instance: Instance, ref: ConnectorSecretRef): string {
   const key = getInstanceKey(instance);
-  const raw = readFileSync(ref.path, "utf8");
+  // Don't leak the absolute filesystem path. The thrown message bubbles
+  // up through `resolveConnectorSecret` → probe → `mcpServers[*].message`
+  // / audit `evidence.probe.message`, all of which are persisted to
+  // state.json. The connector id + purpose are already attributed in the
+  // surrounding `connector.secret.use` audit row, which is enough for
+  // diagnostics without exposing `/Users/<name>/.gini/...`.
+  let raw: string;
+  try {
+    raw = readFileSync(ref.path, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    // We can recover the connector id + purpose from the basename
+    // (`<connectorId>.<purpose>.json`) without including the absolute
+    // directory.
+    const base = ref.path.split("/").pop() ?? "";
+    const label = base.endsWith(".json") ? base.slice(0, -5) : base;
+    if (code === "ENOENT") {
+      throw new Error(`secret file missing for ${label}`);
+    }
+    throw new Error(`secret read failed for ${label} (${code ?? "unknown error"})`);
+  }
   const payload = JSON.parse(raw) as EncryptedPayload;
   const iv = Buffer.from(payload.iv, "base64");
   const ciphertext = Buffer.from(payload.ciphertext, "base64");
