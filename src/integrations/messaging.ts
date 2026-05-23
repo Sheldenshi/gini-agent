@@ -780,9 +780,18 @@ export async function allowChat(
         throw new Error(`Verification code mismatch — the pending request's code has rotated. Reload the page and confirm again before approving.`);
       }
     }
+    const allowedBefore = readAllowedChatIds(live);
+    const alreadyAllowed = allowedBefore.includes(chatId);
+    // Idempotency: a second allow call (operator double-click, UI race
+    // refreshing the pending list) finds the chat already enrolled and
+    // exits without writing another audit row or bumping updatedAt. The
+    // outer wrapper checks the flag before sending the greeting so the
+    // user doesn't receive duplicate "Paired" messages either.
+    if (alreadyAllowed) {
+      return { bridgeId: live.id, view: chatAllowlistView(live), alreadyAllowed };
+    }
     const meta = { ...(live.metadata ?? {}) };
-    const allowed = readAllowedChatIds(live);
-    if (!allowed.includes(chatId)) allowed.push(chatId);
+    const allowed = [...allowedBefore, chatId];
     meta.allowedChatIds = allowed;
     // First enrollment also becomes the recorded owner. After that the
     // field stays stable — `allow` of additional chats doesn't change
@@ -806,7 +815,7 @@ export async function allowChat(
       },
       { system: true }
     );
-    return { bridgeId: live.id, view: chatAllowlistView(live) };
+    return { bridgeId: live.id, view: chatAllowlistView(live), alreadyAllowed };
   });
   // Best-effort greeting back to the chat so the user knows they
   // were approved without having to send another message and wait
@@ -816,16 +825,22 @@ export async function allowChat(
   // can hold the operator's POST /allow request — without it a hung
   // socket would block the HTTP handler until the OS default tear-
   // down (many minutes) and stall the UI in a spinner.
-  const greeting = await sendMessagingOutputWithRetries(config, result.bridgeId, {
-    text: "Paired. You can chat with the bot now.",
-    target: String(chatId)
-  }, { signal: AbortSignal.timeout(10_000) });
-  if (!greeting.ok) {
-    appendLog(config.instance, "messaging.telegram.greeting_send_error", {
-      bridgeId: result.bridgeId,
-      chatId,
-      error: greeting.error.message
-    });
+  //
+  // Skip the greeting when the chat was already enrolled; otherwise a
+  // double-clicked Approve sends the user two "Paired" messages for
+  // one logical enrollment.
+  if (!result.alreadyAllowed) {
+    const greeting = await sendMessagingOutputWithRetries(config, result.bridgeId, {
+      text: "Paired. You can chat with the bot now.",
+      target: String(chatId)
+    }, { signal: AbortSignal.timeout(10_000) });
+    if (!greeting.ok) {
+      appendLog(config.instance, "messaging.telegram.greeting_send_error", {
+        bridgeId: result.bridgeId,
+        chatId,
+        error: greeting.error.message
+      });
+    }
   }
   return result.view;
 }

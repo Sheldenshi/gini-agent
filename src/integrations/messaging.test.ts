@@ -481,6 +481,48 @@ describe("messaging telegram wiring", () => {
     expect(listAllowedChats(config, bridge.id).ownerChatId).toBe(4242);
   });
 
+  test("allowChat is idempotent for an already-allowlisted chatId: no duplicate audit, no duplicate greeting", async () => {
+    // A double-clicked Approve (or any caller invoking allowChat twice
+    // on a chat that's already enrolled) would otherwise write a second
+    // messaging.chat.allowed audit row, bump updatedAt, and re-send the
+    // "Paired" greeting. None of those reflect a state change, and the
+    // duplicate audit row pollutes the trail. Pin the idempotency.
+    const config = testConfig("telegram-allow-idempotent");
+    const { client, calls } = stubClient();
+    setMessagingDeps({ telegramClientFactory: () => client });
+    const { allowChat, recordDeniedChatAttempt } = await import("./messaging");
+    const { readState: readStateLocal } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 4242, chatType: "private", sender: "@shelden" });
+
+    await allowChat(config, bridge.id, 4242);
+    const auditAfterFirst = readStateLocal(config.instance).audit.filter(
+      (entry) => entry.action === "messaging.chat.allowed" && entry.target === bridge.id
+    ).length;
+    const greetingCallsAfterFirst = calls.filter((c) => c.method === "sendMessage").length;
+    const updatedAtAfterFirst = readStateLocal(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.updatedAt;
+    expect(auditAfterFirst).toBe(1);
+    expect(greetingCallsAfterFirst).toBe(1);
+
+    // Second allow on the same chatId — already enrolled — must no-op.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await allowChat(config, bridge.id, 4242);
+    const auditAfterSecond = readStateLocal(config.instance).audit.filter(
+      (entry) => entry.action === "messaging.chat.allowed" && entry.target === bridge.id
+    ).length;
+    const greetingCallsAfterSecond = calls.filter((c) => c.method === "sendMessage").length;
+    const updatedAtAfterSecond = readStateLocal(config.instance).messagingBridges.find((b) => b.id === bridge.id)?.updatedAt;
+    expect(auditAfterSecond).toBe(1);
+    expect(greetingCallsAfterSecond).toBe(1);
+    expect(updatedAtAfterSecond).toBe(updatedAtAfterFirst);
+  });
+
   test("rejectPendingChat clears the row from recentDeniedChats without granting allowlist access", async () => {
     const config = testConfig("telegram-reject-pending-keeps-allowlist");
     setMessagingDeps({ telegramClientFactory: () => stubClient().client });
