@@ -110,6 +110,26 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     const stripped = hasPrefix
       ? (pathname === prefix ? "/" : pathname.slice(prefix.length) || "/")
       : pathname;
+    // Credential-minting routes MUST NOT be reachable via the tunnel,
+    // including through the BFF's auto-injected bearer. POST
+    // /api/runtime/pairing creates a code that the public
+    // /api/pairing/claim trades for a durable device token; chaining
+    // them on a tunnel-secret-authorized session yields a permanent
+    // credential that outlives the next secret rotation. The runtime
+    // itself ALSO refuses direct tunneled pairing creation, but only
+    // when it observes `tunneled === true` — the BFF strips the
+    // prefix before forwarding so the runtime sees a plain bearer
+    // request. We have to close it here, before the BFF gets to
+    // forward.
+    if (
+      request.method === "POST"
+      && (stripped === "/api/runtime/pairing" || stripped === "/api/runtime/pairing/")
+    ) {
+      return new NextResponse(
+        JSON.stringify({ error: "Pairing creation is not available through the tunnel. Run `gini tunnel apple-notes ...` or pair from localhost." }),
+        { status: 403, headers: { "content-type": "application/json" } }
+      );
+    }
 
     // Apply the same setup gate localhost requests get, but only on
     // page navigations (not API or _next/* asset fetches that the page

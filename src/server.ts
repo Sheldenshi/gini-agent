@@ -287,8 +287,25 @@ async function runApplyConfig(
   let next: PersistedTunnelConfig;
   try {
     const onDisk = JSON.parse(readFileSync(configPath(config.instance), "utf8")) as Record<string, unknown>;
-    const existingTunnel = (onDisk.tunnel ?? {}) as PersistedTunnelConfig;
-    next = { ...existingTunnel };
+    const existingTunnel = (onDisk.tunnel ?? {}) as Record<string, unknown>;
+    // Apply the same coercion as resolveTunnelConfig at boot. A
+    // hand-edited `tunnel.enabled: "false"` (string) on disk would
+    // otherwise slip through into `next` and the in-memory state
+    // would diverge from what the BFF's strict `=== true` check
+    // produces — cloudflared would run while every tunneled request
+    // 404s. Strip non-boolean values from the read so the update
+    // overwrites the bad data instead of preserving it.
+    next = {};
+    if (typeof existingTunnel.enabled === "boolean") next.enabled = existingTunnel.enabled;
+    if (typeof existingTunnel.secret === "string") next.secret = existingTunnel.secret;
+    const existingNotes = existingTunnel.appleNotes as Record<string, unknown> | undefined;
+    if (existingNotes) {
+      next.appleNotes = {};
+      if (typeof existingNotes.enabled === "boolean") next.appleNotes.enabled = existingNotes.enabled;
+      if (typeof existingNotes.folder === "string") next.appleNotes.folder = existingNotes.folder;
+      if (typeof existingNotes.noteName === "string") next.appleNotes.noteName = existingNotes.noteName;
+      if (typeof existingNotes.account === "string") next.appleNotes.account = existingNotes.account;
+    }
     if (typeof update.enabled === "boolean") next.enabled = update.enabled;
     if (update.appleNotes) {
       next.appleNotes = { ...(next.appleNotes ?? {}), ...update.appleNotes };
@@ -381,11 +398,22 @@ async function runApplyConfig(
           reason: "shutdown in progress"
         });
       } else {
+        let startError: Error | null = null;
         await tunnelManager.start().catch((error) => {
+          startError = error instanceof Error ? error : new Error(String(error));
           appendLog(config.instance, "tunnel.start.error", {
-            error: error instanceof Error ? error.message : String(error)
+            error: startError.message
           });
         });
+        if (startError !== null) {
+          // The persisted enabled=true is still correct (operator
+          // intent recorded for next boot), but the immediate PATCH
+          // response should reflect that cloudflared did not come
+          // up — propagating the error makes the toast/CLI surface
+          // the actual reason ("cloudflared binary missing",
+          // "port in use", etc.) instead of a misleading success.
+          throw new Error(`Failed to start cloudflared: ${(startError as Error).message}`);
+        }
         currentWebTarget = resolvedTarget;
       }
     } else if (resolveError !== null) {
@@ -546,36 +574,51 @@ if (tunnelResolved.config.enabled) {
 // and run setTargetUrl + start against a manager whose stop is
 // still in flight.
 let recycleInFlight = false;
+let recyclePending = false;
+const runRecycle = async (): Promise<void> => {
+  if (shutdownStarted) return;
+  if (!tunnelResolved.config.enabled) return;
+  if (recycleInFlight) {
+    // A change landed while we were already recycling. Flag the
+    // re-run so the in-flight handler picks it up on completion;
+    // dropping it would leave the tunnel on a stale target if the
+    // last write happened during a cycle. The flag coalesces
+    // multiple events into a single follow-up run, which is fine
+    // because the only signal we care about is "current port may
+    // have moved" — resolveWebTarget always reads the latest.
+    recyclePending = true;
+    return;
+  }
+  recycleInFlight = true;
+  try {
+    do {
+      recyclePending = false;
+      const target = await resolveWebTarget();
+      if (target === currentWebTarget) continue;
+      appendLog(config.instance, "tunnel.target.changed", {
+        from: currentWebTarget,
+        to: target
+      });
+      await tunnelManager.stop();
+      if (shutdownStarted || !tunnelResolved.config.enabled) return;
+      tunnelManager.setTargetUrl(target);
+      await tunnelManager.start();
+      currentWebTarget = target;
+    } while (recyclePending && !shutdownStarted && tunnelResolved.config.enabled);
+  } catch (error) {
+    appendLog(config.instance, "tunnel.target.recycle.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  } finally {
+    recycleInFlight = false;
+  }
+};
 const tryRegisterWebPortWatcher = (): void => {
   if (webPortWatcher !== null) return;
   if (shutdownStarted) return;
   try {
     webPortWatcher = watch(webPortPath(config.instance), { persistent: false }, () => {
-      void (async () => {
-        if (shutdownStarted) return;
-        if (!tunnelResolved.config.enabled) return;
-        if (recycleInFlight) return;
-        recycleInFlight = true;
-        try {
-          const target = await resolveWebTarget();
-          if (target === currentWebTarget) return;
-          appendLog(config.instance, "tunnel.target.changed", {
-            from: currentWebTarget,
-            to: target
-          });
-          await tunnelManager.stop();
-          if (shutdownStarted || !tunnelResolved.config.enabled) return;
-          tunnelManager.setTargetUrl(target);
-          await tunnelManager.start();
-          currentWebTarget = target;
-        } catch (error) {
-          appendLog(config.instance, "tunnel.target.recycle.error", {
-            error: error instanceof Error ? error.message : String(error)
-          });
-        } finally {
-          recycleInFlight = false;
-        }
-      })();
+      void runRecycle();
     });
   } catch {
     // File doesn't exist yet (common at boot — gini start spawns
