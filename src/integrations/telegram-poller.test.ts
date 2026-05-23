@@ -608,7 +608,13 @@ describe("telegram poller supervisor", () => {
     const supervisor = createTelegramPollerSupervisor(config, { clientFactory: () => client });
     supervisor.reconcile();
 
-    queue.shift()?.resolve([
+    // Wait for the first getUpdates promise to land in the queue before
+    // resolving it. Without this, the poller may not have armed yet on a
+    // slow scheduler tick and the shift returns undefined silently.
+    await waitFor(() => queue.length > 0, "poller armed for first update", 3000);
+    const firstPending = queue.shift();
+    if (!firstPending) throw new Error("queue empty after waitFor — poller did not arm");
+    firstPending.resolve([
       {
         update_id: 100,
         message: {
@@ -627,8 +633,15 @@ describe("telegram poller supervisor", () => {
 
     // Second DM from the same chat — within the TTL window so the prior
     // code is still valid. The poller mints nothing new and skips the
-    // outbound send.
-    queue.shift()?.resolve([
+    // outbound send. sendCalls.length === 1 going true does not prove the
+    // poller has looped back and pushed its next getUpdates promise into
+    // the queue (the push happens after the deliverVerificationCode that
+    // increments sendCalls, but inside the same iteration's tail). Wait
+    // for queue.length > 0 so the second shift can't silently no-op.
+    await waitFor(() => queue.length > 0, "poller re-armed for second update", 3000);
+    const secondPending = queue.shift();
+    if (!secondPending) throw new Error("queue empty after waitFor — poller did not re-arm");
+    secondPending.resolve([
       {
         update_id: 101,
         message: {
