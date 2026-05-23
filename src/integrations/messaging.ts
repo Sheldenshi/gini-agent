@@ -8,6 +8,7 @@ import {
   createMessagingMessageRecord,
   findOrCreateDiscordChatSession,
   findOrCreateTelegramChatSession,
+  id,
   mutateState,
   now,
   readState
@@ -181,25 +182,36 @@ export async function addMessagingBridge(config: RuntimeConfig, input: Record<st
     assertHeaderSafeToken(kind, botToken);
   }
 
-  const bridge = await mutateState(config.instance, (state) => createMessagingBridgeRecord(state, {
-    name,
-    kind,
-    deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : []
-  }));
+  // Pre-generate the bridge id outside mutateState so the secret can be
+  // written under a known namespace BEFORE the single state mutation
+  // lands. Previously add called mutateState twice (create row, then
+  // attach secret ref) with the writeSecret in between, which let a
+  // concurrent removeMessagingBridge observe the row from the first
+  // mutation, delete the namespace, and drop the row — then add's
+  // second mutation threw "bridge not found" with an orphaned encrypted
+  // secret file on disk. Collapsing to one mutation closes the window.
+  const bridgeId = id("bridge");
+  const secretRef = requiresToken
+    ? writeSecret(config.instance, bridgeSecretNamespace(bridgeId), "bot-token", botToken)
+    : undefined;
 
-  if (requiresToken) {
-    const ref = writeSecret(config.instance, bridgeSecretNamespace(bridge.id), "bot-token", botToken);
-    await mutateState(config.instance, (state) => attachSecretRef(state.messagingBridges, bridge.id, ref));
-    // Telegram + Discord both store the token here; enrollment is
-    // per-chat from this point on. For telegram, the poller mints a
-    // verification code when any unrecognized chat DMs the bot and
-    // surfaces a matching entry to the operator UI. Discord uses
-    // channel-as-auth (see ADR discord-bridge.md) so the operator
-    // configured the target channel IDs at create time.
-    const refreshed = readState(config.instance).messagingBridges.find((b) => b.id === bridge.id);
-    return refreshed ?? bridge;
-  }
+  const bridge = await mutateState(config.instance, (state) => {
+    const item = createMessagingBridgeRecord(state, {
+      id: bridgeId,
+      name,
+      kind,
+      deliveryTargets: Array.isArray(input.deliveryTargets) ? input.deliveryTargets.map(String) : []
+    });
+    if (secretRef) attachSecretRef(state.messagingBridges, item.id, secretRef);
+    return item;
+  });
 
+  // Telegram + Discord both store the token here; enrollment is per-chat
+  // from this point on. For telegram, the poller mints a verification
+  // code when any unrecognized chat DMs the bot and surfaces a matching
+  // entry to the operator UI. Discord uses channel-as-auth (see ADR
+  // discord-bridge.md) so the operator configured the target channel
+  // IDs at create time.
   return bridge;
 }
 

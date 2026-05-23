@@ -789,9 +789,13 @@ export function buildMessagingBridgeRecord(
 
 export function createMessagingBridgeRecord(
   state: RuntimeState,
-  bridge: Omit<MessagingBridgeRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message">
+  bridge: Omit<MessagingBridgeRecord, "id" | "instance" | "status" | "createdAt" | "updatedAt" | "lastHealthAt" | "message"> & { id?: string }
 ): MessagingBridgeRecord {
-  const item = buildMessagingBridgeRecord(state, { id: id("bridge"), ...bridge });
+  // Callers may pre-generate the id and pass it in (e.g. addMessagingBridge
+  // does so to write the bot-token secret under the same namespace before
+  // the state mutation lands, collapsing the create+attach-ref dance into
+  // one atomic mutation). When omitted, mint a fresh id here.
+  const item = buildMessagingBridgeRecord(state, { id: bridge.id ?? id("bridge"), ...bridge });
   state.messagingBridges.unshift(item);
   // Messaging bridges live at the instance level; per-agent target
   // filtering happens at send time.
