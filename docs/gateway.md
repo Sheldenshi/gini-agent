@@ -73,6 +73,14 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
 
+Privileged BFF routes (mutating POSTs like `messaging/add`, `messaging/<id>/remove`, `runtime/update`) carry a CSRF guard that compares the `Origin` header against the request `Host`. For local development that's sufficient, but operators exposing the BFF on a tailnet or public hostname should lock the guard down by setting `GINI_TRUSTED_ORIGINS` in the BFF process environment. It's a comma-separated list of full origins (scheme + host + port), e.g.
+
+```
+GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000
+```
+
+When set, the guard accepts an `Origin` only if it exactly matches one of the listed entries. This blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison passes, but the explicit allowlist does not. When `GINI_TRUSTED_ORIGINS` is unset the legacy Host-equality fallback applies.
+
 ## Lifecycle Commands
 
 | Command | Behavior |

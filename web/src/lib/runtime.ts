@@ -216,37 +216,79 @@ function canonicalizeSegments(segments: string[]): string[] | null {
   return out;
 }
 
+// Parse GINI_TRUSTED_ORIGINS into a Set of normalized origin strings
+// (scheme://host[:port], no trailing slash, no path). Each entry must be a
+// complete origin; bare hostnames are rejected. The Set is built once per
+// import — operators set the env var at startup and don't rotate it without
+// restarting the BFF.
+function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | null {
+  if (!raw) return null;
+  const out = new Set<string>();
+  for (const candidate of raw.split(",")) {
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      out.add(`${parsed.protocol}//${parsed.host}`);
+    } catch {
+      // Skip malformed entries silently rather than crash boot — surfacing
+      // a bad env var as a 403 on every privileged POST is louder than a
+      // dropped allowlist entry, and operators iterating on the env value
+      // should not have the process refuse to start.
+    }
+  }
+  return out.size > 0 ? out : null;
+}
+
+const TRUSTED_ORIGINS = parseTrustedOrigins(process.env.GINI_TRUSTED_ORIGINS);
+
 function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
   if (request.method !== "POST") return null;
   const route = pathSegments.join("/");
   if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
 
-  // Compare the browser-supplied Origin against the Host header the
-  // browser actually used. Next.js dev (and most reverse-proxy /
-  // tunnel setups) carry a stale internal hostname in `request.url`
-  // — typically `localhost:<port>` — regardless of the public URL,
-  // so the old strict `Origin === new URL(request.url).origin`
-  // comparison rejected every legitimate non-localhost client.
-  // Matching against Host preserves the CSRF defense (a cross-origin
-  // attacker page has a different Origin host than the BFF's own
-  // Host header) while letting tailnet / tunnel / hostname access
-  // through. When the Host header is absent (synthetic Request
-  // objects in tests, non-browser HTTP/2 clients that send :authority
-  // instead) we fall back to request.url's host so the legacy
-  // localhost-equality check still applies. Sec-Fetch-Site below
-  // remains the primary signal — the browser sets it and JS can't
-  // spoof it.
   const origin = request.headers.get("origin");
   if (origin) {
-    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-    let originHost: string;
+    let originUrl: URL;
     try {
-      originHost = new URL(origin).host;
+      originUrl = new URL(origin);
     } catch {
       return Response.json({ error: "Forbidden" }, { status: 403 });
     }
-    if (originHost !== expectedHost) {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
+    // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS
+    // rebinding. When set, only requests whose Origin exactly matches one
+    // of the listed scheme+host[+port] entries pass. A rebinding attack
+    // would still set Origin to the attacker-controlled hostname (the
+    // browser sets Origin honestly to the URL the operator visited), so
+    // an explicit allowlist breaks the bypass that a Host-equality check
+    // alone cannot — the browser legitimately sends Host equal to
+    // attacker.example after a rebind, and the Host comparison accepts
+    // it. The allowlist takes that codepath off the table for any
+    // operator who configures it.
+    if (TRUSTED_ORIGINS) {
+      const normalized = `${originUrl.protocol}//${originUrl.host}`;
+      if (!TRUSTED_ORIGINS.has(normalized)) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
+    } else {
+      // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset. Compare the
+      // browser-supplied Origin host against the Host header the browser
+      // actually used. Next.js dev (and most reverse-proxy / tunnel
+      // setups) carry a stale internal hostname in `request.url` —
+      // typically `localhost:<port>` — so the strict
+      // `Origin === new URL(request.url).origin` comparison rejected
+      // every legitimate non-localhost client. Matching against Host
+      // preserves the bulk of the CSRF defense for browser-driven
+      // attackers (a cross-origin attacker page has a different Origin
+      // host than the BFF's own Host header) while letting tailnet /
+      // tunnel / hostname access through during dev. DNS rebinding is
+      // the residual hazard this fallback does NOT cover — operators
+      // who expose the BFF beyond loopback should set
+      // GINI_TRUSTED_ORIGINS to lock the guard down.
+      const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+      if (originUrl.host !== expectedHost) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
     }
   }
 
