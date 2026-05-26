@@ -42,12 +42,17 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   }
 
   if (sub === "enable") {
+    // Quick tunnels degrade SSE (events feed, chat token stream) — flag
+    // it on enable so the operator knows live-tail UX is local-only.
+    // See docs/adr/tunnel-and-icloud-pairing.md for the workaround
+    // (named tunnel).
+    const sseHint = "Note: Cloudflare quick tunnels buffer SSE responses, so live activity tail and chat token streaming work locally but not through the tunnel URL.";
     const snapshot = await applyTunnelToggle(ctx, { enabled: true });
     if (snapshot) {
-      print({ ok: true, snapshot, message: "Tunnel enabled. cloudflared is starting now." });
+      print({ ok: true, snapshot, message: `Tunnel enabled. cloudflared is starting now. ${sseHint}` });
     } else {
       mutateTunnelConfig(ctx, (tunnelCfg) => ({ ...tunnelCfg, enabled: true }));
-      print({ ok: true, message: "Tunnel enabled in config.json. Start the runtime (`gini start`) to bring cloudflared up." });
+      print({ ok: true, message: `Tunnel enabled in config.json. Start the runtime (\`gini start\`) to bring cloudflared up. ${sseHint}` });
     }
     return;
   }

@@ -494,6 +494,14 @@ export class TunnelManager {
       run: this.osascript,
       signal
     });
+    // Re-check the abort signal after the osascript await. A disable
+    // PATCH that fired ACA.abort() while we were sitting in
+    // isICloudAccountAvailable means a fresh refresh has taken over
+    // this slot. Writing our (likely false) probe result here would
+    // clobber the fresh refresh's eventual successful write.
+    if (signal?.aborted) {
+      return this.getSnapshot();
+    }
     this.snapshot = {
       ...this.snapshot,
       appleNotes: {
@@ -558,6 +566,16 @@ export class TunnelManager {
         cloudflareUrl: this.snapshot.cloudflareUrl
       });
     } catch (error) {
+      // Don't write to the snapshot if our signal was aborted — a
+      // fresh refresh has taken our slot (the disable-then-reenable
+      // case), and writing an "aborted" error here would clobber a
+      // newer successful sync's lastSyncedAt+lastError=null with a
+      // stale failure. The aborted path is intentional and the
+      // operator's most recent intent is reflected by the fresh
+      // refresh's writes.
+      if (signal?.aborted) {
+        return this.getSnapshot();
+      }
       const message = error instanceof Error ? error.message : String(error);
       // osascript surfaces AppleScript runtime errors with literal source
       // text quoted in the message (e.g. `Can't get folder "..."`). When

@@ -263,6 +263,30 @@ the prompt:
   layer has an integration test that exercises the secret-path guard,
   the landing page, both QR endpoints, and the bearer-token path.
 
+## Known limitations
+
+- **SSE over the tunnel is degraded.** Cloudflare's TryCloudflare quick
+  tunnels do not support Server-Sent Events: they buffer the entire
+  stream until the server closes the connection, so the live activity
+  feed (`/api/events/stream`) and the per-session chat block stream
+  (`/api/chat/:id/stream`) do not stream in real time to a browser
+  reaching the gateway through the public URL. The browser still
+  receives the events when the server eventually closes the stream,
+  and React Query's invalidation cadence picks up most state changes
+  on the next refetch, but live-tail UX (token-by-token chat output,
+  rolling activity log) only works locally. Operators who need
+  real-time streaming over a public URL should set up a named
+  Cloudflare Tunnel (Cloudflare account + domain required) — the
+  paid surface does not have the SSE restriction. The quick-tunnel
+  path is unaffected for all non-SSE `/api/*` traffic and for the
+  Apple Notes mirror path.
+- **200 concurrent in-flight requests.** Quick tunnels reject requests
+  beyond 200 simultaneous in-flight with a 429. In practice the
+  Settings card and the Notes mirror sit well under that ceiling, but
+  a chat session driving many parallel `/api/*` calls plus the SSE
+  buffered stream can approach it. Same workaround as the SSE
+  limitation: switch to a named tunnel for higher ceilings.
+
 ## Alternatives considered
 
 - **Run cloudflared as a named tunnel** (with a stable hostname tied to

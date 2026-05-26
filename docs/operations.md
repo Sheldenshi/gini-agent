@@ -87,6 +87,20 @@ appear, find the entry for the process that started the runtime (Bun or
 prompt; the snapshot's `appleNotes.lastError` field reports whether the
 last sync succeeded.
 
+Quick-tunnel limitations to know about before opening the URL on a
+remote device:
+
+- Server-Sent Events are buffered, not streamed. Cloudflare flushes the
+  entire SSE response only when the server closes the connection, so
+  the live activity feed and per-session chat block stream cannot
+  stream token-by-token through the tunnel. The events still arrive
+  on stream close and React Query refetches keep most state fresh, but
+  live-tail UX is local-only. Switch to a named Cloudflare Tunnel
+  (account + domain required) when real-time streaming over the
+  public URL matters.
+- 200 concurrent in-flight requests. Beyond that, the tunnel returns
+  HTTP 429. Same upgrade path as the SSE limitation.
+
 For the full design + threat model see
 [Cloudflare Quick Tunnel With Secret-Path Auth And iCloud Notes Mirror](adr/tunnel-and-icloud-pairing.md).
 
