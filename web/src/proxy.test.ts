@@ -12,10 +12,10 @@ import { proxy } from "./proxy";
 // particular reads the same exports and breaks if it sees a stale
 // in-memory stub.
 //
-// Test layout: per-test instance + scratch root via mkdtempSync, so the
-// module-level mtime cache in lib/runtime.ts cannot return a stale
-// entry from a prior test (two writes within the same millisecond
-// would otherwise share a cache entry).
+// Test layout: per-test instance + scratch root via mkdtempSync, so
+// filesystem state from a prior test cannot leak into the current one
+// (two writes within the same millisecond could otherwise share an
+// indistinguishable mtime).
 
 let suiteRoot: string;
 const TOKEN = "test-token";

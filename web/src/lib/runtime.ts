@@ -68,8 +68,8 @@ export function runtimeToken(): string {
 }
 
 // Resolve the per-instance tunnel state from config.json on demand. Reading
-// from disk on each request (with the same 2s mtime cache the other runtime
-// helpers use) avoids the env-injection race that bit first-boot autostart:
+// from disk on each request (uncached — see readFileFreshTrim) avoids the
+// env-injection race that bit first-boot autostart:
 //
 //   * `gini start` spawns the web process BEFORE the runtime persists a
 //     freshly-minted tunnel secret — the env var the child inherits is

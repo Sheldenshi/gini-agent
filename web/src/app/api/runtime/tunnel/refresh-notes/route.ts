@@ -23,27 +23,10 @@
 import { NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
 import { redactTunnelSnapshot } from "../route";
+import { originHostMatchesRequest } from "../guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function originHostMatchesRequest(request: NextRequest): boolean {
-  const host = request.headers.get("host");
-  if (!host) return false;
-  const originRaw = request.headers.get("origin") ?? request.headers.get("referer");
-  if (!originRaw) return false;
-  try {
-    const origin = new URL(originRaw);
-    // Match host (which can be `name:port`) against the parsed
-    // origin's authority (host:port, with port elided when default).
-    const originHost = origin.port
-      ? `${origin.hostname}:${origin.port}`
-      : origin.hostname;
-    return originHost === host || origin.host === host;
-  } catch {
-    return false;
-  }
-}
 
 export const POST = async (request: NextRequest): Promise<Response> => {
   if (!originHostMatchesRequest(request)) {

@@ -9,6 +9,7 @@
 
 import { NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
+import { originHostMatchesRequest } from "./guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -49,6 +50,19 @@ async function forwardRedacted(
 export function redactTunnelSnapshot(payload: unknown): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
   const record = payload as Record<string, unknown>;
+  // Capture the raw secret-bearing values BEFORE we null them out below
+  // so we can scrub any error strings that may have quoted them inline.
+  // osascript surfaces AppleScript runtime errors with literal source
+  // text — a failure touching the `body:` attribute can echo the
+  // bodyHtml fragment carrying the publicUrl. The manager already
+  // scrubs these strings before storing, but we run the same pass
+  // here as defence in depth: a regression in the manager (or a new
+  // error path that forgets to call sanitizeError) must not leak the
+  // credential through this BFF.
+  const rawSecrets: string[] = [];
+  if (typeof record.publicUrl === "string" && record.publicUrl.length > 0) rawSecrets.push(record.publicUrl);
+  if (typeof record.secret === "string" && record.secret.length > 0) rawSecrets.push(record.secret);
+  if (typeof record.cloudflareUrl === "string" && record.cloudflareUrl.length > 0) rawSecrets.push(record.cloudflareUrl);
   // Allow-list projection. The upstream snapshot may grow new fields over
   // time; this DTO opts each safe field in explicitly so any new
   // credential-bearing field (e.g. a future signed-redirect URL) fails
@@ -63,12 +77,17 @@ export function redactTunnelSnapshot(payload: unknown): unknown {
     secret: null,
     targetUrl: typeof record.targetUrl === "string" ? record.targetUrl : null,
     observedAt: typeof record.observedAt === "string" ? record.observedAt : null,
-    appleNotes: redactAppleNotes(record.appleNotes),
-    lastError: typeof record.lastError === "string" ? record.lastError : null
+    appleNotes: redactAppleNotes(record.appleNotes, rawSecrets),
+    lastError: typeof record.lastError === "string"
+      ? scrubSecrets(record.lastError, rawSecrets)
+      : null
   };
 }
 
-function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
+function redactAppleNotes(
+  payload: unknown,
+  secrets: readonly string[]
+): Record<string, unknown> | null {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const record = payload as Record<string, unknown>;
   return {
@@ -77,24 +96,38 @@ function redactAppleNotes(payload: unknown): Record<string, unknown> | null {
     noteName: typeof record.noteName === "string" ? record.noteName : null,
     available: typeof record.available === "boolean" ? record.available : null,
     lastSyncedAt: typeof record.lastSyncedAt === "string" ? record.lastSyncedAt : null,
-    lastError: typeof record.lastError === "string" ? record.lastError : null
+    lastError: typeof record.lastError === "string"
+      ? scrubSecrets(record.lastError, secrets)
+      : null
   };
 }
 
-function originHostMatchesRequest(request: NextRequest): boolean {
-  const host = request.headers.get("host");
-  if (!host) return false;
-  const originRaw = request.headers.get("origin") ?? request.headers.get("referer");
-  if (!originRaw) return false;
-  try {
-    const origin = new URL(originRaw);
-    const originHost = origin.port
-      ? `${origin.hostname}:${origin.port}`
-      : origin.hostname;
-    return originHost === host || origin.host === host;
-  } catch {
-    return false;
+/**
+ * Strip secret-bearing substrings from an error string. Mirrors the
+ * manager-side `sanitizeError` so the BFF can't leak a credential even
+ * if a future upstream error path forgets to sanitise. Exported so the
+ * route's tests can pin the behaviour without spinning up the full
+ * forward pipeline.
+ */
+export function scrubSecrets(message: string, secrets: readonly string[]): string {
+  let result = message;
+  let scrubbed = false;
+  // Replace longest substrings first so the publicUrl (which contains
+  // the bare secret) is scrubbed before its inner secret pass, which
+  // would otherwise leave a `${cloudflareUrl}/` fragment behind.
+  const candidates = secrets
+    .filter((value) => typeof value === "string" && value.length > 0)
+    .slice()
+    .sort((a, b) => b.length - a.length);
+  for (const value of candidates) {
+    if (!result.includes(value)) continue;
+    result = result.split(value).join("[redacted]");
+    scrubbed = true;
   }
+  if (scrubbed && !result.endsWith("(secret values redacted)")) {
+    result = `${result} (secret values redacted)`;
+  }
+  return result;
 }
 
 export const GET = async (_request: NextRequest) => forwardRedacted("GET");

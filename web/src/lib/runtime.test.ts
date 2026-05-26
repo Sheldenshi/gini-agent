@@ -14,17 +14,15 @@ import { proxyRequest, runtimeTunnelState } from "./runtime";
 //   2. Autostart: the launchd web plist did not propagate runtime env
 //      variables at all, so the supervised web never saw the secret.
 //
-// Reading from config.json on each request (with the helper's mtime
-// cache for cheap repeated reads) keeps the proxy in lockstep with the
-// gateway's source of truth.
+// Reading from config.json on each request (uncached — see
+// readFileFreshTrim in lib/runtime.ts) keeps the proxy in lockstep with
+// the gateway's source of truth.
 //
 // Test layout: each test runs against a UNIQUE state root + UNIQUE
-// instance name so the production-side mtime cache (a module-level Map
-// keyed by absolute config path in lib/runtime.ts) cannot return a
-// stale entry from a prior test. Reusing one path with sequential
-// rmSync+write cycles risked a flake on filesystems where two writes
-// within the same millisecond produced identical statSync().mtimeMs —
-// the cache would serve the previous test's body.
+// instance name so a prior test's filesystem state cannot leak into
+// the current one. Reusing one path with sequential rmSync+write
+// cycles risked a flake on filesystems where two writes within the
+// same millisecond produced identical statSync().mtimeMs.
 
 let suiteRoot: string;
 const envSnapshot: { instance: string | undefined; root: string | undefined } = {
