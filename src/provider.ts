@@ -1798,7 +1798,7 @@ function readCodexBearer(provider: ProviderConfig): string {
 // onDelta has fired or a tool call has been buffered, a transparent
 // retry would double-deliver, so the stream readers fall through to the
 // generic Error path in that case.
-export class CodexSessionExpiredError extends Error {
+class CodexSessionExpiredError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "CodexSessionExpiredError";
