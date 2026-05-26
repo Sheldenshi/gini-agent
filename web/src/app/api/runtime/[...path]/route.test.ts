@@ -1,23 +1,7 @@
 // Note: this test asserts only the canonicalization helper, isolated from
 // Next.js routing. Hitting the full handler requires booting the BFF.
 import { describe, expect, test } from "bun:test";
-
-// Re-implementation of the helper used in route.ts, kept in sync with that
-// file. We can't import it directly because route.ts only exports HTTP
-// handlers — TypeScript treats the file as a route module, not a library.
-// The duplication is intentional and asserted-against here so a future
-// drift between this test and the route diverges in CI.
-function canonicalFirstSegmentIsTunnel(path: readonly string[]): boolean {
-  if (path.length === 0) return false;
-  let segment = path[0] ?? "";
-  for (let i = 0; i < 5; i += 1) {
-    let next: string;
-    try { next = decodeURIComponent(segment); } catch { return false; }
-    if (next === segment) break;
-    segment = next;
-  }
-  return segment.toLowerCase() === "tunnel";
-}
+import { canonicalFirstSegmentIsTunnel } from "./canonical";
 
 describe("BFF catch-all tunnel guard", () => {
   test("literal tunnel segment is recognized", () => {

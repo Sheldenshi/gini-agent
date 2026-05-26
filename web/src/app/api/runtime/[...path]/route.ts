@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import { proxyRequest, runtimeInstance, runtimeToken, runtimeUrl } from "@/lib/runtime";
+import { canonicalFirstSegmentIsTunnel, canonicalSecondSegmentIsQrSvg } from "./canonical";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -38,32 +39,6 @@ async function forward(request: NextRequest, params: Promise<{ path: string[] }>
     token: runtimeToken(),
     signal: request.signal
   });
-}
-
-function canonicalFirstSegmentIsTunnel(path: readonly string[]): boolean {
-  if (path.length === 0) return false;
-  return decodeAndLower(path[0] ?? "") === "tunnel";
-}
-
-function canonicalSecondSegmentIsQrSvg(path: readonly string[]): boolean {
-  if (path.length < 2) return false;
-  return decodeAndLower(path[1] ?? "") === "qr.svg";
-}
-
-function decodeAndLower(input: string): string {
-  let segment = input;
-  // Decode up to a few times so an encoded segment (`%74unnel`,
-  // `%71r%2Esvg`, double-encoded variants) collapses to its canonical
-  // value before the comparison. Five iterations is enough to outrun
-  // any realistic nesting and matches the canonicalizer depth used
-  // downstream.
-  for (let i = 0; i < 5; i += 1) {
-    let next: string;
-    try { next = decodeURIComponent(segment); } catch { return ""; }
-    if (next === segment) break;
-    segment = next;
-  }
-  return segment.toLowerCase();
 }
 
 export const GET = (request: NextRequest, ctx: { params: Promise<{ path: string[] }> }) => forward(request, ctx.params);
