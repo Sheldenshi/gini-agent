@@ -1,8 +1,18 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createHandler } from "../../http";
 import type { RuntimeConfig } from "../../types";
 import type { TunnelSnapshot } from "./manager";
+
+// Per-process unique scratch root. Two concurrent test runs (or two
+// parallel test files in one process) on a fixed path would step on
+// each other's state files — `mkdtempSync` gives each invocation a
+// fresh directory we own outright.
+const scratchRoot = mkdtempSync(join(tmpdir(), "gini-tunnel-http-tests-"));
+const stateRootDir = join(scratchRoot, "state");
+const logRootDir = join(scratchRoot, "logs");
 
 // Snapshot the env keys this suite mutates so we can restore them in
 // afterAll. testConfig() reassigns GINI_STATE_ROOT / GINI_LOG_ROOT for
@@ -22,6 +32,7 @@ afterAll(() => {
   else process.env.GINI_STATE_ROOT = envSnapshot.stateRoot;
   if (envSnapshot.logRoot === undefined) delete process.env.GINI_LOG_ROOT;
   else process.env.GINI_LOG_ROOT = envSnapshot.logRoot;
+  rmSync(scratchRoot, { recursive: true, force: true });
 });
 
 describe("tunnel HTTP integration", () => {
@@ -399,18 +410,17 @@ describe("tunnel HTTP integration", () => {
 });
 
 function testConfig(instance: string): RuntimeConfig {
-  const root = "/tmp/gini-tunnel-http-tests";
-  process.env.GINI_STATE_ROOT = root;
-  process.env.GINI_LOG_ROOT = `${root}-logs`;
-  rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
+  process.env.GINI_STATE_ROOT = stateRootDir;
+  process.env.GINI_LOG_ROOT = logRootDir;
+  rmSync(join(stateRootDir, "instances", instance), { recursive: true, force: true });
   return {
     instance,
     port: 7337,
     token: "test-token",
     provider: { name: "echo", model: "gini-echo-v0" },
     workspaceRoot: "/tmp",
-    stateRoot: `${root}/instances/${instance}`,
-    logRoot: `${root}-logs/${instance}`,
+    stateRoot: join(stateRootDir, "instances", instance),
+    logRoot: join(logRootDir, instance),
     approvalMode: "auto"
   };
 }

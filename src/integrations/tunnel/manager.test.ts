@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   composeAppleNoteBody,
@@ -11,11 +12,18 @@ import {
 } from "./manager";
 import type { RuntimeConfig } from "../../types";
 
+// Per-process unique scratch root. Two concurrent test runs (or two
+// parallel test files in one process) on a fixed path would step on
+// each other's state files — `mkdtempSync` gives each invocation a
+// fresh directory we own outright.
+const scratchRoot = mkdtempSync(join(tmpdir(), "gini-tunnel-tests-"));
+const stateRootDir = join(scratchRoot, "state");
+const logRootDir = join(scratchRoot, "logs");
+
 // Snapshot the env keys this suite mutates so we can restore them in
 // afterAll. Without this, a sibling suite that depends on the original
 // process-wide GINI_STATE_ROOT / GINI_LOG_ROOT (or the absence thereof)
-// would inherit our /tmp/gini-tunnel-tests overrides when run in the
-// same Bun process.
+// would inherit our scratch overrides when run in the same Bun process.
 const envSnapshot: { stateRoot: string | undefined; logRoot: string | undefined } = {
   stateRoot: process.env.GINI_STATE_ROOT,
   logRoot: process.env.GINI_LOG_ROOT
@@ -38,6 +46,7 @@ afterAll(() => {
   if (envSnapshot.logRoot === undefined) delete process.env.GINI_LOG_ROOT;
   else process.env.GINI_LOG_ROOT = envSnapshot.logRoot;
   Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+  rmSync(scratchRoot, { recursive: true, force: true });
 });
 
 describe("resolveTunnelConfig", () => {
@@ -181,7 +190,7 @@ describe("TunnelManager", () => {
     // The runtime log must never contain the secret-bearing public URL.
     // The credential bypasses bearer auth, so persisting it to disk
     // would make stale logs equivalent to a leaked token.
-    const logPath = join("/tmp/gini-tunnel-tests-logs/tunnel-manager-notes/runtime.jsonl");
+    const logPath = join(logRootDir, "tunnel-manager-notes/runtime.jsonl");
     if (existsSync(logPath)) {
       const contents = readFileSync(logPath, "utf8");
       expect(contents).not.toContain(snapshot.secret);
@@ -623,6 +632,57 @@ describe("TunnelManager", () => {
     expect(manager.getSnapshot().publicUrl).toBeNull();
   });
 
+  test("start() after a stop()-during-spawn rebuilds spawnAbort and succeeds", async () => {
+    // Pins the rapid-fire enable → disable-mid-spawn → enable sequence
+    // applyConfig's fire-and-forget disable.preempt.stop() depends on.
+    // The PATCH-disable path aborts an in-flight cloudflared spawn to
+    // close the 25s residual-damage window where the URL could be
+    // advertised after the operator clicked "off"; a subsequent enable
+    // PATCH then queues a fresh start(). If startInner did not allocate
+    // a brand-new AbortController on each call, the second start would
+    // observe the already-aborted signal from the first stop and
+    // immediately reject, leaving the operator unable to re-enable the
+    // tunnel without a runtime restart. The check here is that the
+    // second start spawns a new cloudflared and lands the URL on the
+    // snapshot — i.e. the abort state was not carried forward.
+    setupInstanceDir("tunnel-manager-restart-after-abort");
+    let spawnCount = 0;
+    const manager = new TunnelManager({
+      instance: "tunnel-manager-restart-after-abort",
+      config: {
+        enabled: true,
+        secret: "abcd1234efgh5678ijkl9012mnop3456",
+        appleNotes: { enabled: false, folder: "g", noteName: "n", account: "iCloud" }
+      },
+      targetUrl: "http://127.0.0.1:7778",
+      disableAppleNotes: true,
+      spawn: () => {
+        spawnCount += 1;
+        // First spawn lags so stop() catches it mid-flight; subsequent
+        // spawns resolve immediately so the test doesn't race the
+        // ambient deadline.
+        const urlDelayMs = spawnCount === 1 ? 200 : 0;
+        return scriptedChild(
+          [`INF https://restart-after-abort-${spawnCount}.trycloudflare.com\n`],
+          { urlDelayMs }
+        );
+      }
+    });
+    const firstStart = manager.start();
+    await manager.stop();
+    await expect(firstStart).rejects.toThrow(/aborted/);
+    // Re-enable. A stale aborted spawnAbort would surface immediately
+    // through spawnQuickTunnel's abortPromise race, rejecting before
+    // the URL could ever land on the snapshot.
+    const secondSnapshot = await manager.start();
+    expect(spawnCount).toBe(2);
+    expect(secondSnapshot.cloudflareUrl).toBe(
+      "https://restart-after-abort-2.trycloudflare.com"
+    );
+    expect(secondSnapshot.publicUrl).toContain("restart-after-abort-2");
+    await manager.stop();
+  });
+
   test("renderSnapshotQr returns ANSI + SVG when a URL is set", () => {
     const out = renderSnapshotQr({
       enabled: true,
@@ -654,21 +714,20 @@ function baseConfig(): RuntimeConfig {
     token: "test-token",
     provider: { name: "echo", model: "gini-echo-v0" },
     workspaceRoot: "/tmp",
-    stateRoot: "/tmp/gini-tunnel-tests/instances/tunnel-test",
-    logRoot: "/tmp/gini-tunnel-tests-logs/tunnel-test",
+    stateRoot: join(stateRootDir, "instances/tunnel-test"),
+    logRoot: join(logRootDir, "tunnel-test"),
     approvalMode: "auto"
   };
 }
 
 function setupInstanceDir(instance: string): void {
-  const root = "/tmp/gini-tunnel-tests";
-  process.env.GINI_STATE_ROOT = root;
-  process.env.GINI_LOG_ROOT = `${root}-logs`;
-  rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
+  process.env.GINI_STATE_ROOT = stateRootDir;
+  process.env.GINI_LOG_ROOT = logRootDir;
+  rmSync(join(stateRootDir, "instances", instance), { recursive: true, force: true });
   // Clean the log dir too. Historical runtime.jsonl entries from earlier
   // runs would otherwise be visible to credential-leak regression
   // assertions and confuse "is this a fresh write or stale residue?".
-  rmSync(`${root}-logs/${instance}`, { recursive: true, force: true });
+  rmSync(join(logRootDir, instance), { recursive: true, force: true });
 }
 
 interface ScriptedSpawnOptions {
