@@ -215,13 +215,14 @@ export interface RuntimeConfig {
     maxIterations?: number;
   };
   // Optional Cloudflare Quick Tunnel mirror. When `enabled: true`, the
-  // runtime spawns `cloudflared tunnel --url <runtime>` at startup so the
-  // gateway is reachable from outside the local network through the
-  // returned `https://*.trycloudflare.com` URL. Authorization for tunneled
-  // requests is by URL path: requests whose pathname begins with
-  // `/<secret>/` are treated as fully authorized. The secret is persisted
-  // so the URL prefix stays stable across restarts even though the
-  // cloudflared hostname rotates.
+  // runtime spawns `cloudflared tunnel --url <web>` at startup pointed at
+  // the Next.js web port (not the raw runtime), so a phone scanning the
+  // QR lands on the full product surface; the web BFF then proxies
+  // `/api/*` back to the runtime. Authorization for tunneled requests is
+  // by URL path: requests whose pathname begins with `/<secret>/` are
+  // treated as fully authorized. The secret is persisted so the URL
+  // prefix stays stable across restarts even though the cloudflared
+  // hostname rotates.
   tunnel?: PersistedTunnelConfig;
 }
 
