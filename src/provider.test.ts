@@ -100,7 +100,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
@@ -263,7 +263,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -402,7 +402,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -478,7 +478,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -578,7 +578,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -629,7 +629,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
@@ -684,7 +684,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "openrouter", model: "or-model" });
@@ -741,7 +741,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -788,7 +788,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -833,7 +833,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -875,7 +875,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -918,7 +918,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1008,7 +1008,7 @@ describe("provider", () => {
         id: "resp_summary_empty_tools",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "summary." } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1049,7 +1049,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const original = process.env.OPENROUTER_API_KEY;
@@ -1097,7 +1097,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1137,7 +1137,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "{}" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1196,7 +1196,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const original = process.env.OPENAI_API_KEY;
@@ -1251,7 +1251,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const polluted = JSON.parse('{"__proto__":{"model":"hijacked"},"constructor":1,"prototype":2,"chat_template_kwargs":{"x":1}}');
@@ -1303,7 +1303,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       // Skip normalizeProvider so the empty baseUrl actually persists
@@ -1328,7 +1328,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = { name: "openrouter" as const, model: "m", baseUrl: "" };
@@ -1352,7 +1352,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = { name: "openai" as const, model: "m", baseUrl: "" };
@@ -1394,7 +1394,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = { name: "codex" as const, model: "m", baseUrl: "" };
@@ -1424,7 +1424,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1455,7 +1455,7 @@ describe("provider", () => {
         id: "x",
         choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
       }), { status: 200, headers: { "content-type": "application/json" } }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1486,7 +1486,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "application/json" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({
@@ -1747,7 +1747,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -1794,7 +1794,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -1846,7 +1846,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -1880,7 +1880,7 @@ describe("provider", () => {
         JSON.stringify({ error: { message: "Internal server error" } }),
         { status: 500, headers: { "content-type": "application/json" } }
       ));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -1933,7 +1933,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -1967,7 +1967,7 @@ describe("provider", () => {
         JSON.stringify({ error: { message: "Unauthorized: session expired" } }),
         { status: 401, headers: { "content-type": "application/json" } }
       ));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
@@ -2010,7 +2010,7 @@ describe("provider", () => {
         status: 200,
         headers: { "content-type": "text/event-stream" }
       }));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     try {
       const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
