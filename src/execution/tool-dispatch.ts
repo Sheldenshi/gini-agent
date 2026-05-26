@@ -2559,11 +2559,19 @@ async function browserFillSecretsTool(
     : `The agent is asking you to fill ${slots.length} field${slots.length === 1 ? "" : "s"} on the current page.`;
 
   // Build a stable target string so the approval card can show
-  // which page the fill targets. Pull the live URL from the
-  // browser session if one exists; fall back to the locator list.
+  // which page the fill targets. Pull the live URL from the browser
+  // session if one exists; strip the query string and fragment
+  // before recording — query strings on the live URL frequently
+  // carry tokens (OAuth `code`/`state`, password-reset `token`,
+  // session ids, magic-link nonces). The `target` field is
+  // preserved by the redacted-writer-boundary in src/state/audit.ts
+  // (only `evidence` is dropped on redacted:true), so a raw URL
+  // with a query token would land verbatim in state.audit[].target
+  // and state.events[].target. Use origin+pathname only.
   const liveUrl = peekCurrentBrowserUrl(taskId);
-  const target = liveUrl
-    ? `${liveUrl}#${slots.map((s) => s.locator).join(",")}`
+  const sanitizedUrl = sanitizeUrlForAuditTarget(liveUrl);
+  const target = sanitizedUrl
+    ? `${sanitizedUrl}#${slots.map((s) => s.locator).join(",")}`
     : slots.map((s) => s.locator).join(",");
 
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
@@ -2758,6 +2766,32 @@ async function requestCodeExecPrebuilt(
 export function approvalToolCallId(payload: Record<string, unknown>): string | undefined {
   const id = payload.toolCallId;
   return typeof id === "string" ? id : undefined;
+}
+
+// Returns origin + pathname for a raw URL, dropping the query string,
+// fragment, userinfo, and any other component that may carry secrets
+// (OAuth `code`/`state`, password-reset `token`, magic-link nonces,
+// embedded session ids). Used by browser.fill_secret to:
+//   1) build a redaction-safe `target` for the approval row + audit
+//      row — the audit writer-boundary only drops `evidence` on
+//      redacted:true, so an unsanitized URL with a token in the
+//      query would land verbatim in state.audit[].target and the
+//      mirrored state.events[].target.
+//   2) compare the live page URL against the approved page URL at
+//      /connect time, so a navigation between approval creation
+//      and submission lands the secrets on a fresh approval rather
+//      than on whatever origin the page happens to be on now.
+// Returns undefined for invalid / non-http(s) URLs so the caller can
+// fall back to a locator-only target.
+export function sanitizeUrlForAuditTarget(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return undefined;
+  }
 }
 
 // ---------------- pendingOrAuto ----------------

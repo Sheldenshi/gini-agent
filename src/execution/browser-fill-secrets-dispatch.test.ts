@@ -21,7 +21,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { dispatchToolCall } from "./tool-dispatch";
+import { dispatchToolCall, sanitizeUrlForAuditTarget } from "./tool-dispatch";
 import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
 
@@ -137,6 +137,27 @@ describe("browser_fill_secrets dispatch surface guard", () => {
 
     const state = readState(config.instance);
     expect(state.approvals.length).toBe(0);
+  });
+
+  test("sanitizeUrlForAuditTarget strips query and fragment, keeps origin+pathname", () => {
+    // Pin the redaction surface for SEC-3. The audit writer-boundary
+    // only drops `evidence` on redacted:true (see src/state/audit.ts);
+    // `target` is kept intact. Any URL with a token in the query
+    // string would otherwise land verbatim in state.audit[].target,
+    // so the dispatcher uses this helper to normalize URLs to
+    // origin+pathname before writing them onto an approval.
+    expect(sanitizeUrlForAuditTarget("https://example.com/login")).toBe("https://example.com/login");
+    expect(sanitizeUrlForAuditTarget("https://example.com/oauth/callback?code=secret&state=xyz")).toBe("https://example.com/oauth/callback");
+    expect(sanitizeUrlForAuditTarget("https://example.com/reset?token=top-secret-bytes#fragment")).toBe("https://example.com/reset");
+    expect(sanitizeUrlForAuditTarget("https://user:pw@example.com/path?q=1")).toBe("https://example.com/path");
+    expect(sanitizeUrlForAuditTarget("http://localhost:8080/admin")).toBe("http://localhost:8080/admin");
+    // Non-http(s) and malformed inputs fall through to undefined so
+    // the caller can use a locator-only target.
+    expect(sanitizeUrlForAuditTarget("javascript:alert(1)")).toBeUndefined();
+    expect(sanitizeUrlForAuditTarget("file:///etc/passwd")).toBeUndefined();
+    expect(sanitizeUrlForAuditTarget("not a url at all")).toBeUndefined();
+    expect(sanitizeUrlForAuditTarget("")).toBeUndefined();
+    expect(sanitizeUrlForAuditTarget(undefined)).toBeUndefined();
   });
 
   test("mints a pending approval when chat session has no messaging source (web chat)", async () => {

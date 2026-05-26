@@ -956,6 +956,61 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/connect refuses fill_secret when page navigated away from approved origin", async () => {
+    // The approval.target encodes the origin+pathname the user
+    // consented to fill into. If the page has navigated (agent
+    // action, user click, JS redirect, phishing redirect) between
+    // approval creation and Submit, the live URL no longer matches
+    // and we refuse with 409 so a fresh approval is required for
+    // the new destination. In this test the browser session was
+    // never opened so peekCurrentBrowserUrl returns undefined,
+    // which the handler treats as "no live page to fill" — same
+    // refusal path.
+    const config = testConfig("connect-fill-secret-origin-mismatch");
+    const handler = createHandler(config);
+    const { createTask, upsertTask, createApproval } = await import("./state");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "test");
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        taskId,
+        action: "browser.fill_secret",
+        target: "https://example.com/login#@e1,@e2",
+        risk: "high",
+        reason: "Sign in",
+        payload: {
+          slots: [
+            { name: "username", locator: "@e1", label: "Username", kind: "text" },
+            { name: "password", locator: "@e2", label: "Password", kind: "password" }
+          ],
+          reason: "Sign in",
+          toolCallId: "call_fill"
+        }
+      })
+    );
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${approval.id}/connect`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
+      },
+      config.token
+    );
+    expect(response.status).toBe(409);
+    const body = await response.json();
+    expect(body.ok).toBe(false);
+    expect(body.message).toContain("navigated");
+    expect(body.message).toContain("https://example.com/login");
+    // Approval stayed pending — no resolveApproval call ran.
+    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    expect(after?.status).toBe("pending");
+  });
+
   // Round-1 review fix: browser-connect throws with prefixes that the
   // gateway's catch-all previously mapped to 500. The webapp needs them as
   // 4xx so it can render the original message instead of "internal error".

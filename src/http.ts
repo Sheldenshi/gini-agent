@@ -12,7 +12,8 @@ import {
   readTrace,
   subscribeChatBlocks
 } from "./state";
-import { browserFillByLocator, browserNavigate, safetyCheck } from "./tools/browser";
+import { browserFillByLocator, browserNavigate, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
+import { sanitizeUrlForAuditTarget } from "./execution/tool-dispatch";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -277,6 +278,33 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const taskId = approval.taskId;
         if (!taskId) {
           return json({ ok: false, message: "Approval is not bound to a task; cannot fill." }, 400);
+        }
+        // Bind the fill to the page the user actually approved. The
+        // approval.target encodes the origin+pathname captured at
+        // approval creation (see sanitizeUrlForAuditTarget in
+        // src/execution/tool-dispatch.ts). Between then and now the
+        // page can navigate (agent action, user click on a card-side
+        // link, JS-driven redirect, a phishing redirect from the
+        // same window). Compare against the live page URL — if the
+        // origin+pathname no longer match what the user approved,
+        // refuse: a fresh approval would be needed to authorize the
+        // new destination. Without this check the user's typed
+        // credential could land on whatever origin the page happens
+        // to be on at fill time, not the origin they consented to.
+        const approvedTargetUrl = (() => {
+          const t = approval.target ?? "";
+          const hashIndex = t.indexOf("#");
+          return hashIndex >= 0 ? t.slice(0, hashIndex) : t;
+        })();
+        if (approvedTargetUrl) {
+          const liveUrl = peekCurrentBrowserUrl(taskId);
+          const liveSanitized = sanitizeUrlForAuditTarget(liveUrl);
+          if (!liveSanitized || liveSanitized !== approvedTargetUrl) {
+            return json({
+              ok: false,
+              message: `Page navigated since the approval was created (approved: ${approvedTargetUrl}, live: ${liveSanitized ?? "no session"}). Refusing to fill on an unapproved origin.`
+            }, 409);
+          }
         }
         // Close the deny-mid-fill race by resolving the approval
         // atomically BEFORE the per-slot loop. resolveApproval flips
