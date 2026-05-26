@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { redactTunnelSnapshot } from "./route";
+import { redactTunnelSnapshot, scrubSecrets } from "./route";
 
 describe("BFF tunnel snapshot redaction", () => {
   test("nulls the secret and publicUrl fields before forwarding", () => {
