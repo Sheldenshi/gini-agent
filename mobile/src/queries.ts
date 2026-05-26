@@ -178,9 +178,14 @@ export function isTaskInFlight(blocks: ChatBlock[]): boolean {
 //     EventSource open via resolveStreamEndpoint; a 401 from the initial
 //     /blocks fetch surfaces as ApiError so the screen's redirect-to-setup
 //     effect still fires.
-//   - react-native-sse retransmits Last-Event-ID on its own polling-based
-//     reconnect, and the gateway honors it via listChatBlocksAfter — the
-//     client never has to track a cursor manually.
+//   - We manage Last-Event-ID ourselves. react-native-sse only retains
+//     its `lastEventId` for the life of one EventSource instance; every
+//     reconstruction (sessionId change, AppState toggle, error-driven
+//     reopen, initial connect after seed) would otherwise reset it. We
+//     stash the wire id (`<block_id>:<ts>` for SSE frames, the bare id
+//     for the /blocks seed) in lastSeenIdRef and rewrite the header on
+//     every open; the gateway parses the suffix in listChatBlocksAfter
+//     to replay in-place upserts to the cursor row.
 //   - AppState 'background' tears the connection down so an idle device
 //     doesn't hold an open XHR; 'active' rebuilds it and the same
 //     Last-Event-ID path replays only what was missed.
@@ -372,13 +377,15 @@ export function useChatBlocks(sessionId: string | null): {
     };
 
     // Seed the list before opening the stream so the chat renders with
-    // its persisted history immediately. After seeding, the EventSource
-    // sends Last-Event-ID = <most-recent-block-id> on its first connect
-    // (by way of the message replay path the library already implements)
-    // — but on the very first open the library has no cursor, so the
-    // gateway will replay backfill via listChatBlocksAfter(null) which
-    // resolves to the full list. The seen-id dedup in upsert() collapses
-    // those into the same row.
+    // its persisted history immediately. The seed resolve stashes the
+    // last block's id into lastSeenIdRef; openStream() reads that ref
+    // and injects it as `Last-Event-ID` on the first SSE connect, so
+    // the gateway's listChatBlocksAfter only replays what's actually
+    // new (typically nothing, since the seed just covered everything).
+    // If the seed never lands (a `merged` of length 0 — fresh chat
+    // with no blocks), the header is omitted and the gateway falls
+    // back to full backfill; the id-keyed upsert collapses any
+    // duplicates.
     (async () => {
       try {
         const blocks = await api<ChatBlock[]>(`/chat/${sessionId}/blocks`);
