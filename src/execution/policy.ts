@@ -101,13 +101,11 @@ export function resolveApprovalPolicy(
   // agent decides on its own" intent does not apply to user-typed
   // input. Without this guard, a yolo-mode operator would silently
   // approve an empty fill_secret (no values submitted) and the
-  // agent would be told the fields were filled — see runApprovedAction
-  // and the BUG-1 finding from the codex round-1 review. Browser
-  // fill_secret bypasses pendingOrAuto today (createApproval is
-  // called directly from src/execution/tool-dispatch.ts:browserFillSecretsTool),
-  // but the guard lives here for defense — if a future refactor
-  // routes fill_secret through pendingOrAuto, the contract still
-  // holds.
+  // agent would be told the fields were filled. fill_secret bypasses
+  // pendingOrAuto today (createApproval is called directly from
+  // src/execution/tool-dispatch.ts:browserFillSecretsTool), but the
+  // guard lives here for defense — if a future refactor routes
+  // fill_secret through pendingOrAuto, the contract still holds.
   if (action === "browser.fill_secret") {
     return { mode: "gate", reason: "fill-secret-always-gate" };
   }

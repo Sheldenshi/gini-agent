@@ -328,11 +328,11 @@ describe("chat-task loop", () => {
   });
 
   // One-pending-per-turn regression. When the LLM emits multiple
-  // tool calls in a single assistant turn and the first one returns a
-  // pending approval, all subsequent dispatches MUST be deferred so
-  // their side effects don't race the user's approval decision
-  // (RACE-2). The chat-task loop skips remaining calls and synthesizes
-  // a "skipped" tool_result for message-history symmetry; the LLM
+  // tool calls in a single assistant turn and the first one returns
+  // a pending approval, all subsequent dispatches MUST be deferred
+  // so their side effects don't race the user's approval decision.
+  // The chat-task loop skips remaining calls and synthesizes a
+  // "skipped" tool_result for message-history symmetry; the LLM
   // re-evaluates from the new state on the next turn after the
   // approval resolves.
   test("pending approval halts the rest of the turn — later calls are skipped, not dispatched", async () => {

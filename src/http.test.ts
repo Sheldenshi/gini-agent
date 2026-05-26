@@ -974,8 +974,8 @@ describe("runtime api", () => {
       return task.id;
     });
     // Approval target carries only the locator list (no URL) so the
-    // SEC-2 origin check is bypassed; the test exercises the audit /
-    // trace / log writers, not the page-binding guard which is
+    // page-binding origin check is bypassed; the test exercises the
+    // audit / trace / log writers, not the origin guard which is
     // covered by its own test.
     const approval = await mutateState(config.instance, (state) =>
       createApproval(state, {
@@ -1009,9 +1009,9 @@ describe("runtime api", () => {
     // No browser session exists, so browserFillByLocator returns
     // errors for both slots and the audit row evidence carries
     // `errors[]` (no values) + filledSlots = []. The approval is
-    // still resolved (atomic resolveApproval-before-fill from
-    // RACE-1) so the deny race is closed; the agent gets a
-    // partial-fill error result via resumeChatTask.
+    // still resolved atomically before the fill loop so the deny
+    // race is closed; the agent gets a partial-fill error result
+    // via resumeChatTask.
 
     // Raw state.json bytes must not contain either marker.
     const stateJsonPath = `${config.stateRoot}/state.json`;
@@ -1040,8 +1040,8 @@ describe("runtime api", () => {
     // The audit row itself: defense-in-depth. Both `evidence` (would
     // be undefined after redaction) and `target` must not contain
     // the markers. `target` is preserved across redaction; this pin
-    // catches a future regression that would forget to sanitize URLs
-    // (SEC-3) or stuff secrets into the target field.
+    // catches a future regression that would forget to sanitize URL
+    // query strings or stuff secrets into the target field.
     const auditRows = readState(config.instance).audit.filter(
       (a) => a.action === "browser.fill_secret" && a.approvalId === approval.id
     );

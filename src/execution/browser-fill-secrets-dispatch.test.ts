@@ -140,11 +140,11 @@ describe("browser_fill_secrets dispatch surface guard", () => {
   });
 
   test("sanitizeUrlForAuditTarget strips query and fragment, keeps origin+pathname", () => {
-    // Pin the redaction surface for SEC-3. The audit writer-boundary
-    // only drops `evidence` on redacted:true (see src/state/audit.ts);
-    // `target` is kept intact. Any URL with a token in the query
-    // string would otherwise land verbatim in state.audit[].target,
-    // so the dispatcher uses this helper to normalize URLs to
+    // The audit writer-boundary only drops `evidence` on
+    // redacted:true (see src/state/audit.ts); `target` is kept
+    // intact. Any URL with a token in the query string would
+    // otherwise land verbatim in state.audit[].target, so the
+    // dispatcher uses this helper to normalize URLs to
     // origin+pathname before writing them onto an approval.
     expect(sanitizeUrlForAuditTarget("https://example.com/login")).toBe("https://example.com/login");
     expect(sanitizeUrlForAuditTarget("https://example.com/oauth/callback?code=secret&state=xyz")).toBe("https://example.com/oauth/callback");

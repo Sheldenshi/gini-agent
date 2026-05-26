@@ -273,11 +273,10 @@ describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
   }, 60_000);
 
   it("snapshot redaction — password input values and data-gini-secret marked fields never appear in the snapshot", async () => {
-    // SEC-1 from the codex round-1 review: without this redaction the
-    // value the user typed into the fill_secret amber card would
-    // round-trip back into the LLM the next time the agent called
-    // browser_snapshot. The walker now substitutes "[redacted]" for
-    // any non-empty value on:
+    // Without this redaction the value the user typed into the
+    // fill_secret amber card would round-trip back into the LLM the
+    // next time the agent called browser_snapshot. The walker
+    // substitutes "[redacted]" for any non-empty value on:
     //   - type="password"
     //   - autocomplete=current-password / new-password / one-time-code
     //   - any element stamped with data-gini-secret (set by
