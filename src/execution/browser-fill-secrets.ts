@@ -27,12 +27,11 @@
 
 import type { Approval, RuntimeConfig } from "../types";
 import { resolveApproval } from "../agent";
-import { addAudit, mutateState, readState } from "../state";
+import { addAudit, appendTrace, mutateState, readState } from "../state";
 import { browserFillByLocator, peekCurrentBrowserUrl } from "../tools/browser";
 import { isTerminalTaskStatus } from "../state";
 import { resumeChatTask } from "./chat-task";
-import { sanitizeUrlForAuditTarget } from "./tool-dispatch";
-import { parseFillSecretSlots } from "./browser-fill-secrets-types";
+import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
 
 export interface FillSecretConnectResult {
   status: number;
@@ -146,7 +145,7 @@ export async function runFillSecretConnect(
     const result = await browserFillByLocator(taskId, {
       locator: slot.locator,
       value,
-      expectedOrigin: approvedUrl
+      expectedUrl: approvedUrl
     });
     if (result.ok) {
       filledSlots.push(slot.name);
@@ -164,10 +163,12 @@ export async function runFillSecretConnect(
     }
   }
 
-  // Audit row carries metadata only. The values themselves never
-  // appear in evidence (only slot names + per-slot success/error
-  // strings) and redacted: true is defense-in-depth that drops
-  // evidence at the writer boundary anyway.
+  // Audit row carries contract-fields only. The redacted: true flag
+  // tells the writer-boundary to drop `evidence` entirely as
+  // defense-in-depth — slot values were never going to be in
+  // evidence (only names + error strings), but the flag protects
+  // against a future bug that puts them there. See ADR
+  // browser-fill-secret.md.
   await mutateState(config.instance, (mutable) => {
     addAudit(
       mutable,
@@ -188,6 +189,27 @@ export async function runFillSecretConnect(
       },
       { taskId }
     );
+  });
+  // Append the per-slot outcome to the trace JSONL. Because the
+  // audit row's `evidence` gets dropped by the redacted-writer
+  // boundary, operators debugging "which slots filled? which
+  // errored?" need a non-redacted artifact to read. Slot NAMES
+  // are safe (the agent emitted them on the original tool call);
+  // slot VALUES never reach this point. The end-to-end leak test
+  // (src/http.test.ts) greps trace JSONL for absence of submitted
+  // marker bytes — adding this trace must NOT change that
+  // invariant, only slot.name / error-message strings (no value
+  // substring) live here.
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "browser.fill_secret completed",
+    data: {
+      approvalId: approval.id,
+      filledSlots,
+      errors,
+      ...(bailedOnCancel ? { aborted: "task-cancelled-mid-fill" } : {}),
+      ...(bailedOnOriginDrift ? { aborted: "origin-drift-mid-fill" } : {})
+    }
   });
 
   // Build the resume result. The agent gets the truth: which slots
@@ -220,10 +242,22 @@ export async function runFillSecretConnect(
     // resume that the operator wouldn't act on anyway.
     try {
       await resumeChatTask(config, taskId, toolCallId, resumeResult);
-    } catch {
+    } catch (resumeError) {
       // resumeChatTask failures are bookkeeping — the next external
       // trigger reconciles task state. Audit row already records
-      // the fill outcome.
+      // the fill outcome. Log the throw to the task's trace so a
+      // future debugger asking "why didn't chat resume after my
+      // fill?" can find the cause; without the trace the error is
+      // unobservable.
+      appendTrace(config.instance, taskId, {
+        type: "error",
+        message: "resumeChatTask threw during fill_secret completion",
+        data: {
+          approvalId: approval.id,
+          toolCallId,
+          error: resumeError instanceof Error ? resumeError.message : String(resumeError)
+        }
+      });
     }
   }
 

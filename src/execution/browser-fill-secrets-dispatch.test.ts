@@ -21,7 +21,8 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { dispatchToolCall, sanitizeUrlForAuditTarget } from "./tool-dispatch";
+import { dispatchToolCall } from "./tool-dispatch";
+import { sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
 import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
 import { __test as browserTest } from "../tools/browser";
 import type { RuntimeConfig } from "../types";

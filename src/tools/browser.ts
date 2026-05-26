@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { instanceRoot } from "../paths";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
+import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
@@ -1358,7 +1359,7 @@ export function redactSecretValuesDeep(value: unknown, secrets: readonly string[
 // taking a snapshot per slot is wasted work.
 export async function browserFillByLocator(
   taskId: string,
-  args: { locator: string; value: string; expectedOrigin?: string }
+  args: { locator: string; value: string; expectedUrl?: string }
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (typeof args.locator !== "string" || args.locator.length === 0) {
     return { ok: false, error: "Missing required string argument: locator" };
@@ -1368,30 +1369,27 @@ export async function browserFillByLocator(
   }
   try {
     return await withSession(taskId, async (session) => {
-      // Per-slot origin re-check immediately before the playwright
+      // Per-slot URL re-check immediately before the playwright
       // .fill() call. The /connect handler's pre-loop URL check is
       // TOCTOU on its own: a navigation between the pre-loop check
       // and any subsequent slot's .fill() would land the secret on
       // a new origin. Re-reading session.page.url() inside the
       // same withSession callback closes the window to the depth
       // of one playwright API call. Callers that don't supply
-      // expectedOrigin skip the check (existing browser tool
-      // callers that don't need the binding).
-      if (args.expectedOrigin) {
-        const liveUrl = session.page.url();
-        let liveOrigin: string | undefined;
-        try {
-          const parsed = new URL(liveUrl);
-          if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-            liveOrigin = `${parsed.origin}${parsed.pathname}`;
-          }
-        } catch {
-          /* invalid URL falls through to the mismatch error below */
-        }
-        if (liveOrigin !== args.expectedOrigin) {
+      // expectedUrl skip the check (existing browser tool callers
+      // that don't need the binding).
+      //
+      // expectedUrl is origin+pathname (matching the producer-side
+      // approvedUrl on the approval payload and the central
+      // sanitizeUrlForAuditTarget helper). The name is "URL" not
+      // "origin" because it includes the pathname — web-platform
+      // `origin` is protocol+host+port only.
+      if (args.expectedUrl) {
+        const liveUrl = sanitizeUrlForAuditTarget(session.page.url());
+        if (liveUrl !== args.expectedUrl) {
           return {
             ok: false,
-            error: `origin-mismatch: live=${liveOrigin ?? "invalid"} expected=${args.expectedOrigin}`
+            error: `origin-mismatch: live=${liveUrl ?? "invalid"} expected=${args.expectedUrl}`
           } as const;
         }
       }

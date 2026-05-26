@@ -520,7 +520,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "browser_fill_secrets",
-      description: "Ask the user to fill one or more input fields on the active browser page. Use this for credentials, OTPs, account ids, or any value the user must type — NEVER attempt to fill these fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Your tool result is `{ ok, filledSlots, errors }` — you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
+      description: "Ask the user to fill one or more input fields on the active browser page. Use this for credentials, OTPs, account ids, or any value the user must type — NEVER attempt to fill these fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
       parameters: {
         type: "object",
         properties: {

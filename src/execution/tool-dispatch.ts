@@ -71,7 +71,7 @@ import {
   peekCurrentBrowserUrl,
   resolveUploadPath
 } from "../tools/browser";
-import { parseFillSecretSlots } from "./browser-fill-secrets-types";
+import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -2786,31 +2786,6 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
   return typeof id === "string" ? id : undefined;
 }
 
-// Returns origin + pathname for a raw URL, dropping the query string,
-// fragment, userinfo, and any other component that may carry secrets
-// (OAuth `code`/`state`, password-reset `token`, magic-link nonces,
-// embedded session ids). Used by browser.fill_secret to:
-//   1) build a redaction-safe `target` for the approval row + audit
-//      row — the audit writer-boundary only drops `evidence` on
-//      redacted:true, so an unsanitized URL with a token in the
-//      query would land verbatim in state.audit[].target and the
-//      mirrored state.events[].target.
-//   2) compare the live page URL against the approved page URL at
-//      /connect time, so a navigation between approval creation
-//      and submission lands the secrets on a fresh approval rather
-//      than on whatever origin the page happens to be on now.
-// Returns undefined for invalid / non-http(s) URLs so the caller can
-// fall back to a locator-only target.
-export function sanitizeUrlForAuditTarget(raw: string | undefined): string | undefined {
-  if (!raw) return undefined;
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
-    return `${parsed.origin}${parsed.pathname}`;
-  } catch {
-    return undefined;
-  }
-}
 
 // ---------------- pendingOrAuto ----------------
 //

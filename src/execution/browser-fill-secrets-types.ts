@@ -57,3 +57,29 @@ export function parseFillSecretSlots(raw: unknown): FillSecretSlot[] {
     return [{ name: e.name, locator: e.locator, label, kind }];
   });
 }
+
+// Returns origin + pathname for a raw URL, dropping the query string,
+// fragment, userinfo, and any other component that may carry secrets
+// (OAuth `code`/`state`, password-reset `token`, magic-link nonces,
+// embedded session ids). Used by the dispatcher to build a
+// redaction-safe `target` on the approval row, by the bounded
+// fill_secret handler to compare live URL against approvedUrl, and
+// by browserFillByLocator to re-check the page URL just before the
+// playwright .fill(). Lives in this leaf module (no Node-only
+// imports) so all three callers share the same normalization
+// without crossing the dispatcher → browser tool dependency
+// boundary.
+//
+// Returns undefined for invalid / non-http(s) URLs so the caller
+// can either refuse the operation (dispatcher: refuse to mint an
+// approval) or fall back to a locator-only target.
+export function sanitizeUrlForAuditTarget(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return undefined;
+  }
+}
