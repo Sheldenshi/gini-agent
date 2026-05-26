@@ -14,6 +14,7 @@ import {
   closeAll,
   currentDisconnectGeneration,
   disconnectSharedBrowser,
+  redactSecretValuesFromString,
   safetyCheck,
   setBrowserInstance,
   withTeardownLock
@@ -317,6 +318,34 @@ describe("browser disconnect lifecycle", () => {
 // hand-built fake document. The walker only relies on a small slice of DOM
 // APIs (tagName, attributes, children, computed style, bounding rect), so
 // the stubs stay compact.
+describe("redactSecretValuesFromString", () => {
+  test("replaces every occurrence of every secret with [redacted]", () => {
+    const text = "Login attempt with username=tomsmith and password=SuperSecret123. Retried with SuperSecret123 again.";
+    const result = redactSecretValuesFromString(text, ["tomsmith", "SuperSecret123"]);
+    expect(result).toBe("Login attempt with username=[redacted] and password=[redacted]. Retried with [redacted] again.");
+  });
+
+  test("longer secrets are replaced before shorter prefixes (no partial leakage)", () => {
+    // If the shorter secret were replaced first, "abc" → "[redacted]"
+    // would leave "def" exposed when the agent had typed "abcdef".
+    const text = "input was abcdef and another abcdef";
+    const result = redactSecretValuesFromString(text, ["abc", "abcdef"]);
+    expect(result).toBe("input was [redacted] and another [redacted]");
+  });
+
+  test("no-op on empty inputs", () => {
+    expect(redactSecretValuesFromString("", ["abc"])).toBe("");
+    expect(redactSecretValuesFromString("text", [])).toBe("text");
+    expect(redactSecretValuesFromString("text", ["", ""])).toBe("text");
+  });
+
+  test("treats secret as literal string, not regex (metacharacters do not break)", () => {
+    const text = "user[1]=root password=.*";
+    const result = redactSecretValuesFromString(text, ["root", ".*"]);
+    expect(result).toBe("user[1]=[redacted] password=[redacted]");
+  });
+});
+
 describe("snapshot walker — <select> option surfacing", () => {
   test("emits <option> children as @eN-refed siblings after the select", async () => {
     type FakeEl = {

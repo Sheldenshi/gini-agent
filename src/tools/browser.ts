@@ -1262,6 +1262,56 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
   }
 }
 
+// Collects the values of every element on the live page that
+// carries the data-gini-secret attribute (stamped by
+// browserFillByLocator after a successful fill_secret submission).
+// Used by browser_console and browser_vision to redact secret bytes
+// from their tool results: the snapshot walker handles
+// browser_snapshot, but the agent can still call console.eval with
+// `document.querySelector('input').value` to read the same value,
+// or screenshot a non-password input filled via fill_secret and
+// have the vision model OCR it out. Collecting the values stays
+// inside the playwright session — the values never leave the
+// gateway process except through the post-redaction tool result.
+async function collectSecretValuesFromPage(taskId: string): Promise<string[]> {
+  try {
+    return await withSession(taskId, async (session) => {
+      const values = await session.page.evaluate(() => {
+        const nodes = Array.from(document.querySelectorAll("[data-gini-secret]"));
+        return nodes
+          .map((el) => {
+            const value = (el as HTMLInputElement).value;
+            return typeof value === "string" ? value : "";
+          })
+          .filter((v) => v.length > 0);
+      });
+      return values;
+    });
+  } catch {
+    // No active session yet, or evaluate failed — no secrets to
+    // redact. Return empty so the redactor is a no-op.
+    return [];
+  }
+}
+
+// Replace every occurrence of any secret value in `text` with
+// "[redacted]". Sorts secrets by length descending so longer
+// secrets are replaced before shorter prefixes (avoids leaking a
+// suffix when one secret contains another). Empty / zero-length
+// secrets are skipped to prevent global replacement runaway.
+export function redactSecretValuesFromString(text: string, secrets: readonly string[]): string {
+  if (!text || secrets.length === 0) return text;
+  let out = text;
+  for (const s of [...secrets].sort((a, b) => b.length - a.length)) {
+    if (s.length === 0) continue;
+    // String.replaceAll is preferred over global-regex because the
+    // secret may contain regex metacharacters that would otherwise
+    // need escaping.
+    out = out.split(s).join("[redacted]");
+  }
+  return out;
+}
+
 // browser.fill_secret slot writer. Takes a raw playwright selector
 // (CSS, text=, role=, or an ARIA snapshot ref token like "@e2"
 // which resolveLocator translates to [data-gini-ref="e2"]) plus the
@@ -1441,11 +1491,29 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
         }
       }
       const messages = consoleLogs.get(taskId) ?? [];
+      // Redact data-gini-secret values from anywhere they could
+      // surface to the LLM. The agent could otherwise call
+      // `document.querySelector("input").value` to read a
+      // credential filled via fill_secret, or read a console.log
+      // line that the page itself printed containing the value.
+      // Collecting the live secrets inside the same playwright
+      // session keeps them in gateway memory; the redactor walks
+      // the response strings before they leave this function. The
+      // snapshot walker's redaction handles the structured snapshot
+      // path; this catches the eval/console-log paths.
+      const secretValues = await collectSecretValuesFromPage(taskId);
+      const redactedMessages = messages.map((m) => ({
+        ...m,
+        text: redactSecretValuesFromString(m.text, secretValues)
+      }));
+      const evalResultString = typeof evalResult === "string"
+        ? redactSecretValuesFromString(evalResult, secretValues)
+        : (evalResult === undefined ? null : evalResult);
       return ok({
         url: session.page.url(),
-        messages,
-        evalResult: evalResult === undefined ? null : evalResult,
-        evalError: evalError ?? null
+        messages: redactedMessages,
+        evalResult: evalResultString,
+        evalError: evalError ? redactSecretValuesFromString(evalError, secretValues) : null
       });
     });
   } catch (error) {
@@ -1837,7 +1905,38 @@ export async function browserVision(
       // a disconnect mid-await would otherwise slip past the post-fetch
       // check and let us forward stale bytes from a torn-down browser.
       const capturedGeneration = currentDisconnectGeneration();
-      const buf = await session.page.screenshot({ type: "png", fullPage: full });
+      // Blur every data-gini-secret element before the screenshot so
+      // the vision model can't OCR a credential the user typed via
+      // fill_secret. Native browser rendering already masks
+      // type="password" inputs, but non-password inputs filled via
+      // fill_secret (OTP/recovery-code text inputs) would otherwise
+      // render in cleartext. The blur is applied via inline style
+      // immediately before the screenshot and restored immediately
+      // after — the user's actual page never sees the blur because
+      // the headless render happens in the same DOM frame.
+      await session.page.evaluate(() => {
+        const els = document.querySelectorAll("[data-gini-secret]");
+        for (const el of Array.from(els)) {
+          const h = el as HTMLElement;
+          h.dataset.giniBlurRestore = h.style.filter || "";
+          h.style.filter = "blur(12px)";
+        }
+      }).catch(() => { /* best-effort */ });
+      let buf: Buffer;
+      try {
+        buf = await session.page.screenshot({ type: "png", fullPage: full });
+      } finally {
+        // Always restore even if screenshot threw — otherwise the
+        // page would be left visibly blurred for the user.
+        await session.page.evaluate(() => {
+          const els = document.querySelectorAll("[data-gini-secret]");
+          for (const el of Array.from(els)) {
+            const h = el as HTMLElement;
+            h.style.filter = h.dataset.giniBlurRestore ?? "";
+            delete h.dataset.giniBlurRestore;
+          }
+        }).catch(() => { /* best-effort */ });
+      }
       if (buf.length > MAX_SCREENSHOT_BYTES) {
         return fail(
           `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
@@ -1856,9 +1955,16 @@ export async function browserVision(
       if (currentDisconnectGeneration() !== capturedGeneration) {
         return fail("Browser disconnecting, retry shortly.");
       }
+      // Defense in depth: even with the blur, post-process the
+      // vision answer to redact any literal occurrence of a known
+      // secret value — covers a model that pre-cached the value
+      // from an earlier turn or somehow recovered it from a
+      // partial blur (very small screenshot, tiny font, etc.).
+      const secretValues = await collectSecretValuesFromPage(taskId);
+      const redactedAnswer = redactSecretValuesFromString(result.text, secretValues);
       return ok({
         url: session.page.url(),
-        answer: result.text,
+        answer: redactedAnswer,
         bytes: buf.length,
         full,
         cost: result.cost ?? null,
