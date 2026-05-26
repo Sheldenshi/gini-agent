@@ -10,7 +10,7 @@ import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddCo
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
 import type { Approval, ApprovalRequestedBlock } from "@runtime/types";
-import { parseFillSecretSlots, type FillSecretSlot } from "@runtime/execution/browser-fill-secrets-types";
+import { parseFillSecretSlots, type FillSecretSlot } from "@/lib/fill-secrets-types";
 
 // Inline Approve / Deny / Connect actions for an approval_requested block.
 // The block itself carries `approvalId`, `action`, `risk`, and `summary`
