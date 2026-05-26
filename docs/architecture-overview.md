@@ -125,7 +125,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/parity/hermes`, `/api/readiness/v1`
-- `/api/tunnel`, `/api/tunnel/refresh-notes`, `/api/tunnel/qr.svg`
+- `/api/tunnel`, `/api/tunnel/refresh-notes`, `/api/tunnel/qr.svg`, `/api/tunnel/qr.txt`
 
 ## Not Yet Built
 
