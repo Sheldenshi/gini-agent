@@ -98,6 +98,11 @@ export {
 } from "./devices";
 export type { PushDevice, UpsertDeviceInput } from "./devices";
 export {
+  addSseSubscription,
+  isCredentialWatching,
+  hasAnyActiveSubscription
+} from "./sse-subscriptions";
+export {
   taskCounts,
   upsertTask,
   appendTaskPartial,

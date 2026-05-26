@@ -4,6 +4,7 @@ import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } fr
 import { pidPath } from "./paths";
 import {
   addAudit,
+  addSseSubscription,
   appendTrace,
   listChatBlocks,
   listChatBlocksAfter,
@@ -161,7 +162,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return json(listChatBlocks(config.instance, sessionId));
     }],
-    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, (request, params) => chatBlockStream(config, request, params[0])],
+    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {
+      // Resolve the credential before opening the SSE stream so the
+      // active-subscription registry knows who is watching. Used by the
+      // APNs dispatcher to suppress completion silent pushes when the
+      // user is already on the session. The `authorized` gate above
+      // already accepted the bearer, so a null here means the bearer is
+      // valid for `authorizedBearer` but not for credential resolution —
+      // treat as unauthenticated rather than falling through anonymously.
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      return chatBlockStream(config, request, params[0], credential);
+    }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
     ["GET", /^\/api\/tasks$/, (request) => {
@@ -1197,10 +1209,11 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
 // insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
 // inserts and upserts both fire AFTER the SQLite commit so subscribers
 // observe durable rows.
-function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string): Response {
+function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string, credentialId: string): Response {
   let closed = false;
   let keepalive: Timer | undefined;
   let unsubscribe: (() => void) | undefined;
+  let unregisterSubscription: (() => void) | undefined;
   const encoder = new TextEncoder();
   const seen = new Set<string>();
   const lastEventId =
@@ -1222,6 +1235,14 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
 
   const stream = new ReadableStream({
     start(controller) {
+      // Record this subscription on the active-watch registry so the
+      // APNs dispatcher can skip terminal-phase silent pushes for the
+      // credential currently watching this session. Registered inside
+      // `start` (rather than at the route handler) so it always pairs
+      // with `cancel` — if the response is created but never consumed
+      // (rare, but possible on certain client disconnects), the
+      // registry doesn't pick up a phantom entry.
+      unregisterSubscription = addSseSubscription(config.instance, credentialId, sessionId);
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay
       //     doesn't double-send a row that we already sent (relevant
@@ -1294,6 +1315,9 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
       closed = true;
       if (keepalive) clearInterval(keepalive);
       if (unsubscribe) unsubscribe();
+      // Drop the active-watch entry. The cleanup helper is idempotent
+      // so a duplicate call from an error path is a no-op.
+      if (unregisterSubscription) unregisterSubscription();
     }
   });
   return new Response(stream, {
