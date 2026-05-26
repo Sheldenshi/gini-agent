@@ -9,7 +9,7 @@
 //     the token in place — operator may recover the configuration
 
 import { describe, expect, test } from "bun:test";
-import { createApnsDispatcher, buildApprovalPayload } from "./dispatcher";
+import { buildApprovalPayload, buildPhaseSilentPayload, createApnsDispatcher } from "./dispatcher";
 import type { APNsClient, APNsPayload, APNsSendOptions, APNsSendResult } from "./client";
 import type { ChatBlock, Instance } from "../../types";
 import type { PushDevice } from "../../state";
@@ -169,6 +169,164 @@ describe("apns dispatcher", () => {
 
     expect(invalidated.length).toBe(0);
     expect(warnings.some((w) => w.includes("BadDeviceToken"))).toBe(true);
+  });
+
+  test("terminal-phase Completed fires a silent background push when the user isn't watching", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a", credentialId: "owner" })],
+      isWatching: () => false,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed"
+    });
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.opts.pushType).toBe("background");
+    expect(call.opts.priority).toBe(5);
+    expect(call.opts.collapseId).toBe("chat_xyz");
+    // Wire payload: content-available is the literal number 1.
+    const aps = call.payload.aps as Record<string, unknown>;
+    expect(aps["content-available"]).toBe(1);
+    // No alert envelope on silent pushes — iOS would treat the
+    // presence of an alert as a regular notification, defeating the
+    // wake-up-only intent.
+    expect(aps.alert).toBeUndefined();
+    expect(call.payload.event).toBe("phase_completed");
+    expect(call.payload.sessionId).toBe("chat_xyz");
+    expect(call.payload.blockId).toBe("block_phase_done");
+    dispatcher.stop();
+  });
+
+  test("terminal-phase Failed fires a silent push with event=phase_failed", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_fail",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 11,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Failed"
+    });
+
+    expect(calls.length).toBe(1);
+    expect(calls[0]!.payload.event).toBe("phase_failed");
+    dispatcher.stop();
+  });
+
+  test("terminal-phase push is suppressed when the credential is watching the session", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a", credentialId: "cred_active" })],
+      // Active SSE subscription for this credential + session → skip.
+      isWatching: (_inst, cred, sess) => cred === "cred_active" && sess === "chat_xyz",
+      subscribe: () => () => { /* noop */ }
+    });
+
+    await dispatcher.dispatch({
+      id: "block_phase_done",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 10,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed"
+    });
+
+    expect(calls.length).toBe(0);
+
+    // Drop the watch → next dispatch sends.
+    let watching = false;
+    const dispatcher2 = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a", credentialId: "cred_active" })],
+      isWatching: () => watching,
+      subscribe: () => () => { /* noop */ }
+    });
+    watching = false;
+    await dispatcher2.dispatch({
+      id: "block_phase_done2",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 11,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed"
+    });
+    expect(calls.length).toBe(1);
+    dispatcher.stop();
+    dispatcher2.stop();
+  });
+
+  test("non-terminal phase blocks (Thinking, Working) are ignored", async () => {
+    const { client, calls } = buildFakeClient();
+    const dispatcher = createApnsDispatcher("test-inst" as Instance, {
+      client,
+      listDevices: () => [buildDevice({ token: "tok_a" })],
+      isWatching: () => false,
+      subscribe: () => () => { /* noop */ }
+    });
+    await dispatcher.dispatch({
+      id: "phase_thinking",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 1,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Thinking"
+    });
+    await dispatcher.dispatch({
+      id: "phase_cancelled",
+      sessionId: "chat_xyz",
+      instance: "test-inst" as Instance,
+      ordinal: 2,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Cancelled"
+    });
+    expect(calls.length).toBe(0);
+    dispatcher.stop();
+  });
+
+  test("buildPhaseSilentPayload carries only routing fields and a number-typed content-available", () => {
+    const payload = buildPhaseSilentPayload({
+      id: "b1",
+      sessionId: "chat_x",
+      instance: "test-inst" as Instance,
+      ordinal: 1,
+      createdAt: new Date().toISOString(),
+      kind: "phase",
+      label: "Completed"
+    });
+    // Round-tripping through JSON preserves the numeric 1.
+    const wire = JSON.parse(JSON.stringify(payload));
+    expect(wire.aps["content-available"]).toBe(1);
+    expect(typeof wire.aps["content-available"]).toBe("number");
+    expect(wire.aps.alert).toBeUndefined();
+    expect(wire.aps.sound).toBeUndefined();
+    expect(wire.aps.badge).toBeUndefined();
+    expect(wire.event).toBe("phase_completed");
+    expect(wire.sessionId).toBe("chat_x");
+    expect(wire.blockId).toBe("b1");
   });
 
   test("buildApprovalPayload produces a stable, privacy-safe shape", () => {
