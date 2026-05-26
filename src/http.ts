@@ -1136,9 +1136,15 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
 }
 
 // ChatBlock SSE stream. Per ADR chat-block-protocol.md, each frame is
-// `id: <blockId>\nevent: chat_block\ndata: <json>\n\n` so a browser
-// EventSource auto-attaches Last-Event-ID on reconnect and the runtime
-// resumes from the cursor instead of re-replaying the full list.
+// `id: <block_id>:<ts>\nevent: chat_block\ndata: <json>\n\n` where `ts`
+// is the row's `updated_at` snapshot at emit time (or `created_at` for
+// insert-only kinds; they're equal at insert). The browser/EventSource
+// client auto-attaches the composite string as `Last-Event-ID` on
+// reconnect, and `listChatBlocksAfter` in src/state/chat-blocks.ts
+// parses the `:<ts>` suffix to detect in-place updates that happened on
+// the cursor row itself (e.g. an `assistant_text` streaming:false flip
+// or a `tool_call` status flip) since the client last saw it — without
+// requiring a per-row version bump or a separate ack channel.
 //
 // Differs from `eventStream` above: that route polls the global ring
 // buffer at 1s. Here we use the in-process EventEmitter wired into

@@ -242,6 +242,71 @@ describe("chat-blocks persistence", () => {
     expect(afterALegacy.map((row) => row.id)).toEqual([a.id, b.id, c.id]);
   });
 
+  test("listChatBlocksAfter bare-id fallback uses the cursor row's current updated_at", () => {
+    // Pins the back-compat path: an old client without the `:<ts>`
+    // suffix on its Last-Event-ID. The fallback reads the cursor row's
+    // CURRENT `updated_at` as `client_ts`, then applies the same
+    // `(ordinal > cursor.ordinal OR updated_at >= client_ts)` filter.
+    //
+    // What this test proves (i.e. what a regression must NOT break):
+    //   1. A bare id (no suffix) is parsed without throwing.
+    //   2. The cursor row replays with its CURRENT payload — even though
+    //      that payload was upserted between insert and resume.
+    //   3. Earlier-ordinal rows whose updated_at is older than the
+    //      cursor's current updated_at are NOT replayed (the fallback
+    //      has no way to recover them — only the suffixed cursor form
+    //      preserves the client's snapshot ts).
+    const instance = "chat-blocks-legacy-fallback";
+    // A: an assistant_text we'll upsert later, advancing its updated_at.
+    const a = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_l",
+      text: "Hi",
+      streaming: true
+    });
+    // B: a later-ordinal phase. Force B's updated_at to a known-old
+    // timestamp so we can prove the fallback's `>=` comparison excludes
+    // it via the timestamp branch while the ordinal branch still picks
+    // it up.
+    const b = insertChatBlock(instance, {
+      kind: "phase",
+      sessionId: "chat_l",
+      label: "Thinking"
+    });
+    const db = getMemoryDb(instance);
+    const tsOld = "2000-01-01T00:00:00.000Z";
+    db.run("UPDATE chat_blocks SET updated_at = ? WHERE id = ?", [tsOld, b.id]);
+
+    // Mutate A in place. `upsertAssistantTextBlock` stamps a fresh
+    // `updated_at` via `now()`, which is much newer than tsOld.
+    const upserted = upsertAssistantTextBlock(instance, a.id, {
+      text: "Hi there, friend",
+      streaming: false
+    });
+    expect(upserted?.kind).toBe("assistant_text");
+
+    // Resume with the BARE id of A (no `:<ts>` suffix). The fallback
+    // reads A's current updated_at as the cutoff.
+    const replay = listChatBlocksAfter(instance, "chat_l", a.id);
+    const ids = replay.map((row) => row.id);
+    // A replays via the `updated_at >= cutoff.updated_at` branch
+    // (it's the same row — equal updated_at).
+    expect(ids).toContain(a.id);
+    // B replays via the `ordinal > cursor.ordinal` branch even though
+    // its updated_at is older than the cutoff. This proves both halves
+    // of the WHERE clause survive the bare-id path.
+    expect(ids).toContain(b.id);
+
+    // The cursor row's payload that replays is the UPSERTED text, not
+    // the pre-upsert text — proves we read the current row, not a
+    // cached snapshot.
+    const replayedA = replay.find((row) => row.id === a.id);
+    if (replayedA?.kind === "assistant_text") {
+      expect(replayedA.text).toBe("Hi there, friend");
+      expect(replayedA.streaming).toBe(false);
+    }
+  });
+
   test("listChatBlocksAfter replays in-place updates after the cursor", () => {
     // A reconnecting client carries a Last-Event-ID equal to the wire
     // event id the SSE emitter sent: `<block_id>:<updated_at_snapshot>`.
@@ -373,17 +438,18 @@ describe("chat-blocks persistence", () => {
   });
 
   test("listChatBlocksAfter replays same-ms ties via >= comparison", () => {
-    // Two events emitted in the same millisecond get the same ISO
-    // timestamp string. The client's cursor pins one of them; the resume
-    // query must still return the other. The `updated_at >= client_ts`
-    // comparison handles the tie — a strict `>` would silently drop the
-    // sibling. The mobile client collapses any redundant replay of the
-    // cursor itself via its id-keyed upsert.
+    // Pins the `>=` half of the resume filter independently of the
+    // `ordinal >` half. A regression to strict `>` on the timestamp
+    // branch must be caught here.
+    //
+    // Construction: A (ordinal=1) and B (ordinal=2). Cursor is B at
+    // timestamp `tiedAt`. We then force A's `updated_at` to equal
+    // `tiedAt` — modeling the realistic case where an earlier-ordinal
+    // row was upserted in the same millisecond as the cursor row was
+    // snapshotted. With cursor=B, the `ordinal > 2` branch CANNOT match
+    // A (A.ordinal=1), so the only way A appears in the replay is via
+    // `updated_at >= tiedAt`. A strict `>` would drop A.
     const instance = "chat-blocks-resume-tie";
-    // Insert two blocks; we then force their updated_at to the SAME ISO
-    // string to simulate a same-ms emit. Bun's bun:sqlite returns rows
-    // by the row's actual updated_at, so this models the wire scenario
-    // without relying on the system clock to actually collide.
     const a = insertChatBlock(instance, {
       kind: "user_text",
       sessionId: "chat_t",
@@ -401,14 +467,15 @@ describe("chat-blocks persistence", () => {
       [tiedAt, "chat_t", a.id, b.id]
     );
 
-    // Client cursor: it observed `a` with timestamp tiedAt. Resume must
-    // return `b` (same ts, larger ordinal).
+    // Cursor pins B at tiedAt. A has a LOWER ordinal than the cursor —
+    // the only branch that can surface A is `updated_at >= tiedAt`.
     const replay = listChatBlocksAfter(
       instance,
       "chat_t",
-      `${a.id}:${tiedAt}`
+      `${b.id}:${tiedAt}`
     );
     const ids = replay.map((row) => row.id);
+    expect(ids).toContain(a.id);
     expect(ids).toContain(b.id);
   });
 

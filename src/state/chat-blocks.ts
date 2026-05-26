@@ -479,9 +479,15 @@ export function listChatBlocks(instance: Instance, sessionId: string): ChatBlock
 //                     comparison must be against the older snapshot.
 //
 // Back-compat: an old client without the `:<ts>` suffix falls back to
-// reading the cursor row's current `updated_at` as `client_ts`. That
-// preserves the prior behavior (in-place updates to the cursor row are
-// missed) but doesn't regress for clients that already shipped.
+// reading the cursor row's CURRENT `updated_at` as `client_ts`. Combined
+// with the `>=` comparison below, this means the cursor row itself is
+// still replayed with whatever payload it currently holds. The semantic
+// gap vs. the suffixed path: if the cursor row was upserted between the
+// snapshot the client saw and the resume, the bare-id client receives
+// the latest payload (correct) but cannot prove which version it had.
+// Earlier-ordinal in-place mutations that landed strictly before the
+// fallback's `cutoff.updated_at` are not replayed — only the suffixed
+// `<id>:<ts>` form preserves the client's actual snapshot timestamp.
 //
 // Resume filter: `(ordinal > cursor.ordinal OR updated_at >= client_ts)`.
 // The `>=` handles same-ms ties — two events sharing an ISO timestamp
@@ -514,9 +520,11 @@ export function listChatBlocksAfter(
     return listChatBlocks(instance, sessionId);
   }
   // If the client sent a snapshot timestamp, use it; otherwise (legacy
-  // client) compare against the cursor row's current updated_at. The
-  // legacy fallback misses in-place updates to the cursor row itself,
-  // but keeps the rest of the resume semantics intact.
+  // client) compare against the cursor row's CURRENT updated_at. With the
+  // `>=` filter that follows, the cursor row still replays with its
+  // current payload — but the fallback can't recover earlier-ordinal
+  // in-place mutations that landed strictly before the cursor's current
+  // updated_at, because no older snapshot is available.
   const clientTs = clientTsFromCursor ?? cutoff.updated_at;
   return db
     .query<ChatBlockRow, [string, number, string]>(

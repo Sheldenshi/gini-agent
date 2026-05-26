@@ -1868,6 +1868,66 @@ describe("runtime api", () => {
     expect(buffer).toContain("stream this");
   });
 
+  test("GET /api/chat/:id/stream emits id frames as <block_id>:<iso_ts>", async () => {
+    // Pins the SSE wire contract: each chat_block frame's `id:` line
+    // carries `<block_id>:<iso_timestamp>`. The mobile/browser client
+    // round-trips that string as Last-Event-ID on reconnect, and the
+    // gateway parses the `:<ts>` suffix to detect in-place updates on
+    // the cursor row (see listChatBlocksAfter). A regression that
+    // strips the suffix would silently break resume semantics for the
+    // streaming assistant_text case, so we pin the format at the HTTP
+    // boundary.
+    const config = testConfig("chat-blocks-stream-id-format");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stream id format" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "id format check" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_block")) break;
+      }
+      await reader.cancel();
+    }
+    // Frame shape: `id: <block_id>:<iso_ts>\nevent: chat_block\n...`.
+    // Block ids are `block_<random>` (no `:`); ISO timestamps look like
+    // `YYYY-MM-DDTHH:MM:SS.sssZ`. The whole line must match this pattern.
+    const idLineMatch = buffer.match(
+      /^id: ([A-Za-z0-9_-]+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/m
+    );
+    expect(idLineMatch).not.toBeNull();
+    // Sanity: the captured block id portion does not itself contain `:`,
+    // so splitting on the first colon in listChatBlocksAfter is safe.
+    expect(idLineMatch?.[1]).not.toContain(":");
+  });
+
   test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
     const config = testConfig("chat-blocks-stream-404");
     const handler = createHandler(config);
