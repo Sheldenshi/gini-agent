@@ -103,6 +103,13 @@ export {
   hasAnyActiveSubscription
 } from "./sse-subscriptions";
 export {
+  markRead,
+  getLastReadByCredential,
+  getReadState,
+  unreadCountForCredential
+} from "./chat-read-state";
+export type { ChatReadState } from "./chat-read-state";
+export {
   taskCounts,
   upsertTask,
   appendTaskPartial,

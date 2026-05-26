@@ -33,7 +33,7 @@ import { id, now } from "./ids";
 // memory_units for per-agent memory isolation. New SQLite installs add the
 // columns through CREATE TABLE; existing installs add them via the additive
 // migration in applyMigrations().
-export const MEMORY_SCHEMA_VERSION = 4;
+export const MEMORY_SCHEMA_VERSION = 5;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -367,6 +367,24 @@ function applyMigrations(db: Database): void {
       last_seen_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
+  `);
+
+  // Step 6 — chat_read_state table (schema version 5). Tracks the last
+  // block id each credential has acknowledged seeing on a given chat
+  // session. Used to compute the iOS app's badge count and to drive
+  // silent-push suppression for completion phases. Composite primary
+  // key on (session_id, credential_id) makes upsert idempotent and
+  // gives the per-credential aggregate query an index-only path through
+  // `chat_read_state_by_credential`.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_read_state (
+      session_id TEXT NOT NULL,
+      credential_id TEXT NOT NULL,
+      last_read_block_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (session_id, credential_id)
+    );
+    CREATE INDEX IF NOT EXISTS chat_read_state_by_credential ON chat_read_state(credential_id);
   `);
 
   db.run(
