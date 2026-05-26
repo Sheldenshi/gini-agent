@@ -117,8 +117,9 @@ export function useChatSession(id: string | null) {
 const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
 
 // Derives "is the runtime still doing work?" from the block list. The
-// web client gets this for free from SSE; on mobile we poll, so the
-// cadence below is what makes streaming text feel live.
+// chat detail screen drives its composer busy state off this — block
+// deltas now arrive over SSE, so the signal updates as soon as the
+// gateway emits, without any polling cadence in the loop.
 //
 // Rules (mirror src/execution/chat-task.ts emission anchors):
 //   - The most recent phase block dictates the high-level state. If its
@@ -129,8 +130,8 @@ const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed
 //     is still going). callId pairs the running entry with its terminal
 //     status, so we count distinct callIds with no later non-running row.
 //   - An approval_requested block whose tool_call still reads "running"
-//     means we're paused on the user — keep polling at the brisk cadence
-//     so the bubble reflects the eventual approve/deny flip.
+//     means we're paused on the user — the composer stays busy until
+//     the eventual approve/deny flip arrives on the stream.
 export function isTaskInFlight(blocks: ChatBlock[]): boolean {
   if (blocks.length === 0) return false;
 

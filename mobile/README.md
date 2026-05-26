@@ -53,12 +53,15 @@ to the agent picker.
 - **Chats** lists `GET /api/chat?agentId=<id>` sorted by `updatedAt`.
   The `+` header button creates a new chat (`POST /api/chat`) and opens
   it immediately.
-- **Chat detail** polls `GET /api/chat/:id` — 800ms while a task is
-  in flight, 3s when idle — and renders messages bottom-aligned. After
-  a send, the assistant placeholder shows the task's `currentStep`
-  ("Thinking" / "Working" / …) until the task hits a terminal state,
-  at which point the client calls `POST /api/chat/:id/tasks/:taskId/sync`
-  if no paired assistant `ChatMessage` materialised on its own.
+- **Chat detail** seeds with one `GET /api/chat/:id/blocks` fetch and
+  then subscribes to `GET /api/chat/:id/stream` (Server-Sent Events via
+  `react-native-sse`) for live block updates. Reconnects carry a
+  `Last-Event-ID` header so the gateway only replays what was missed.
+  Messages render bottom-aligned; the assistant placeholder shows the
+  task's `currentStep` ("Thinking" / "Working" / …) until the task
+  reaches a terminal state, at which point the client calls
+  `POST /api/chat/:id/tasks/:taskId/sync` if no paired assistant block
+  materialised on its own.
 
 ## Known limitations (v1)
 
@@ -66,8 +69,9 @@ to the agent picker.
   token directly. The runtime exposes `POST /api/pairing/claim` for
   the proper short-code flow; adding a "Claim with pairing code"
   button is a small follow-up.
-- No streaming. The chat poll is good enough at runtime cadence; SSE
-  is the next obvious upgrade.
+- The chat list (`useChats`) still polls `GET /api/chat?agentId=…`
+  every 3s. There's no per-agent SSE endpoint yet; chat detail uses
+  SSE but the sidebar's "Chats" list does not.
 - No tool / approval UI. If a task lands on `waiting_approval`, the
   chat just sticks on "Working…" — resolve the approval from the web
   client.
