@@ -599,6 +599,28 @@ const server = Bun.serve({
         // next boot/recycle isn't preempted by a stale signal.
         if (update?.enabled === false) {
           pendingDisable = true;
+          // Fire-and-forget stop OUTSIDE pendingApply to abort an
+          // in-flight cloudflared spawn synchronously. Without this,
+          // a disable PATCH that arrives while a prior enable's
+          // `await tunnelManager.start()` is mid-spawn has to wait for
+          // the spawn to settle (up to cloudflared's 25s
+          // startupTimeoutMs) before the queued runApplyConfig reaches
+          // its becameDisabled branch — and during that window
+          // spawnQuickTunnel can advertise a public URL, putting the
+          // tunnel publicly online against the operator's wishes.
+          // tunnelManager.stop() aborts spawnAbort immediately so the
+          // in-flight spawn rejects with "cloudflared spawn aborted"
+          // and the child is killed inside the spawn's catch path.
+          // stop() is idempotent: the queued runApplyConfig's own
+          // becameDisabled stop() call observes a stopped manager and
+          // no-ops the second teardown. Errors are logged but not
+          // propagated — the queued runApplyConfig is the source of
+          // truth for the PATCH response.
+          void tunnelManager.stop().catch((error) => {
+            appendLog(config.instance, "tunnel.disable.preempt.stop.error", {
+              error: error instanceof Error ? error.message : String(error)
+            });
+          });
         } else if (update?.enabled === true) {
           pendingDisable = false;
         }
