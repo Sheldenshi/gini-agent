@@ -17,6 +17,12 @@ import type { Instance } from "../types";
 import { instanceRoot } from "../paths";
 import { id, now } from "./ids";
 
+// Bumped to 4 for the push-device registry: adds the `devices` table used
+// by src/state/devices.ts to persist iOS APNs push tokens. Lookup is keyed
+// by credential_id (the paired-device id or "owner" for the runtime
+// config token) so the APNs dispatcher can fan a notification out to every
+// iOS install that belongs to the same human credential.
+//
 // Bumped to 3 for the ChatBlock protocol (ADR chat-block-protocol.md):
 // adds the `chat_blocks` table used by src/state/chat-blocks.ts to
 // persist runtime-emitted semantic conversation blocks (user_text,
@@ -27,7 +33,7 @@ import { id, now } from "./ids";
 // memory_units for per-agent memory isolation. New SQLite installs add the
 // columns through CREATE TABLE; existing installs add them via the additive
 // migration in applyMigrations().
-export const MEMORY_SCHEMA_VERSION = 3;
+export const MEMORY_SCHEMA_VERSION = 4;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -340,6 +346,27 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_session ON chat_blocks(session_id, ordinal);
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_task ON chat_blocks(task_id) WHERE task_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
+  `);
+
+  // Step 5 — devices table (schema version 4). Stores APNs push tokens
+  // per credential so the runtime can fan an `approval_requested` block
+  // out to every iOS install that belongs to the same paired credential.
+  // `credential_id` is the upstream caller's identity as resolved by
+  // governance/pairing.ts:authorizedBearer — the PairedDevice id for
+  // mobile clients or the literal "owner" string for the runtime's
+  // config token. Indexed on credential_id because the dispatcher's hot
+  // path is "give me every device for this credential". The CHECK on
+  // platform pins us to iOS for now; Step 2/3/4 are iOS-only this round.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS devices (
+      token TEXT PRIMARY KEY,
+      credential_id TEXT NOT NULL,
+      platform TEXT NOT NULL CHECK (platform IN ('ios')),
+      bundle_id TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
   `);
 
   db.run(

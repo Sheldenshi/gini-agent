@@ -88,6 +88,14 @@ export {
 } from "./chat-blocks";
 export type { InsertChatBlockInput } from "./chat-blocks";
 export {
+  upsertDevice,
+  listDevicesForCredential,
+  getDevice,
+  removeDevice,
+  removeDeviceForCredential
+} from "./devices";
+export type { PushDevice, UpsertDeviceInput } from "./devices";
+export {
   taskCounts,
   upsertTask,
   appendTaskPartial,
