@@ -1228,6 +1228,21 @@ process.on("SIGTERM", async () => {
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
+  // Fire tunnelManager.stop() SYNCHRONOUSLY (before server.stop's up-to-
+  // SERVER_DRAIN_TIMEOUT_MS wait). The manager's stop() triggers
+  // spawnAbort, which makes any in-flight cloudflared spawn reject
+  // BEFORE its URL banner reaches stderr. Without this, the 5s server-
+  // drain window could let an in-flight spawn complete and publish a
+  // public URL while we're already shutting down. Mirrors the
+  // applyConfig's disable preemption pattern (fire-and-forget stop
+  // outside pendingApply). The later tunnelManager.stop() inside the
+  // Promise.all drain is idempotent thanks to the manager's stopPromise
+  // cache, so this isn't a double-stop.
+  void tunnelManager.stop().catch((error) => {
+    appendLog(config.instance, "tunnel.shutdown.preempt.stop.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
   // Abort all in-flight Telegram long-polls so they don't keep us alive
   // waiting out their 25s timeout, and abort every Discord poll cycle
   // so the runtime exits promptly even if a fetch is in-flight. The
