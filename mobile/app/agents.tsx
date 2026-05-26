@@ -277,6 +277,20 @@ function ChatList({
   // fall back to "New chat" for untitled sessions so empty-title rows
   // remain reachable via search.
   const [query, setQuery] = useState("");
+  // User-initiated pull-to-refresh state. `isChatsFetching` from React
+  // Query also flips during the 3s background poll, so binding the
+  // RefreshControl to it directly makes the spinner pop at the top of
+  // the list on every poll tick — looks like the chat is "pulling down"
+  // by itself. Track the user's gesture separately and clear it when
+  // the in-flight fetch settles.
+  const [pulling, setPulling] = useState(false);
+  useEffect(() => {
+    if (pulling && !isChatsFetching) setPulling(false);
+  }, [pulling, isChatsFetching]);
+  const onPullToRefresh = useCallback(() => {
+    setPulling(true);
+    onRetryChats();
+  }, [onRetryChats]);
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return chats;
@@ -380,8 +394,8 @@ function ChatList({
           contentContainerStyle={styles.chatListContent}
           refreshControl={
             <RefreshControl
-              refreshing={isChatsFetching && !isChatsLoading}
-              onRefresh={onRetryChats}
+              refreshing={pulling}
+              onRefresh={onPullToRefresh}
               tintColor={theme.muted}
             />
           }
