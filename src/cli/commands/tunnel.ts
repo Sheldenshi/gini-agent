@@ -2,7 +2,7 @@
 // /api/tunnel endpoints to humans and persists config flips into the on-disk
 // config.json so a future restart picks them up.
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { api } from "../api";
 import { print } from "../output";

@@ -322,6 +322,19 @@ export class TunnelManager {
     });
 
     if (this.config.appleNotes.enabled && !this.disableAppleNotes) {
+      // Abort any refresh that may still be in flight from the
+      // previous cloudflared incarnation. Without this, an unexpected
+      // exit followed by a fresh start() can leave the OLD refresh
+      // running with the OLD publicUrl already captured in its
+      // body-compose step (manager.ts:535-538). The single-flight
+      // gate (refreshAppleNote line 454) would then return that
+      // doomed promise to the new fire-and-forget caller, and Notes
+      // ends up pinned to the prior dead URL. Stop() aborts on the
+      // tear-down side; we mirror it here so an unexpected-exit
+      // recovery is symmetric.
+      if (this.notesAbort) {
+        try { this.notesAbort.abort(); } catch { /* ignore */ }
+      }
       // Fire-and-forget refresh, but do NOT store the catch-wrapped
       // promise on `this.notesRefresh` — `refreshAppleNote()` already
       // owns that slot and clears it on settle by identity comparison.

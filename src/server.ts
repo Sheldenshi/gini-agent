@@ -1,4 +1,5 @@
 import { readFileSync, watch, writeFileSync, type FSWatcher } from "node:fs";
+import { basename, dirname } from "node:path";
 import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
@@ -744,9 +745,25 @@ const runRecycle = async (): Promise<void> => {
       currentWebTarget = target;
     } while (recyclePending && !shutdownStarted && tunnelResolved.config.enabled);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
     appendLog(config.instance, "tunnel.target.recycle.error", {
-      error: error instanceof Error ? error.message : String(error)
+      error: message
     });
+    // Mirror the boot-failure recovery path. The recycle ran `stop()`
+    // before `resolveWebTarget()` to preserve the stop-before-resolve
+    // invariant; if resolve (or the subsequent start) threw, the
+    // tunnel is now down while config still says `enabled: true`. Without
+    // surfacing the error AND scheduling a retry, the operator's
+    // Settings card would sit on "Off" with no diagnostic and no path
+    // back to a live tunnel short of a manual disable/re-enable.
+    //
+    // `bootFailureRecorded` is the same latch the boot path sets — the
+    // interval's terminal conditions (cloudflareUrl !== null /
+    // !enabled / shutdownStarted) all apply equally to a stranded
+    // recycle, so reusing the polling loop is correct.
+    tunnelManager.recordStartFailure(message);
+    bootFailureRecorded = true;
+    startBootRecoveryPolling();
   } finally {
     recycleInFlight = false;
   }
@@ -850,7 +867,26 @@ const tryRegisterWebPortWatcher = (): void => {
     } catch {
       lastSeenWebPortContent = null;
     }
-    webPortWatcher = watch(webPortPath(config.instance), { persistent: false }, () => {
+    // Watch the PARENT DIRECTORY, not the file. fs.watch on Linux/macOS
+    // resolves the path to an inode at watch() time and continues
+    // watching that inode forever. `gini stop` deletes web.port; the
+    // subsequent `gini start` writes a new web.port with a NEW inode,
+    // which the old watcher never sees — port changes silently miss
+    // and cloudflared keeps forwarding to the previous port (or to a
+    // nothing-there target the freed port now points at).
+    //
+    // Watching the directory instead means we see every event in the
+    // directory; we filter the callback by basename so a sibling file
+    // (config.json rewrites, state.json updates, etc.) doesn't kick
+    // off a spurious tunnel recycle.
+    const portFile = webPortPath(config.instance);
+    const watchDir = dirname(portFile);
+    const portFileName = basename(portFile);
+    webPortWatcher = watch(watchDir, { persistent: false }, (_event, filename) => {
+      // Filter to our file only. fs.watch fires for every sibling
+      // change in the directory; recycling on a config.json rewrite
+      // would be a needless cloudflared rotation.
+      if (filename !== portFileName) return;
       // Dedup at the watcher level so a duplicate fs.watch event for
       // a single write (APFS commonly fires rename+change pairs) does
       // not tear down a live tunnel. Read the current port file
@@ -867,7 +903,7 @@ const tryRegisterWebPortWatcher = (): void => {
       // port while cloudflared still forwards to it.
       let currentContent: string | null;
       try {
-        currentContent = readFileSync(webPortPath(config.instance), "utf8").trim();
+        currentContent = readFileSync(portFile, "utf8").trim();
       } catch {
         currentContent = null;
       }
@@ -889,9 +925,11 @@ const tryRegisterWebPortWatcher = (): void => {
       pendingApply = pendingApply.then(runRecycle, () => undefined);
     });
   } catch {
-    // File doesn't exist yet (common at boot — gini start spawns
-    // the runtime before writing web.port). Schedule a retry; the
-    // chain stops once the file appears or SIGTERM lands.
+    // Instance directory missing or not yet created. We watch the
+    // directory rather than the file (see above) so this catch
+    // covers the cold-boot case where the runtime started before
+    // ensureDir(instanceRoot) ran for some reason; retry until the
+    // path is available or SIGTERM lands.
     setTimeout(tryRegisterWebPortWatcher, 500).unref?.();
   }
 };
