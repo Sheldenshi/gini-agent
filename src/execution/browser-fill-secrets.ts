@@ -172,11 +172,13 @@ export async function runFillSecretConnect(
     if (result.ok) {
       filledSlots.push(slot.name);
     } else {
-      // Distinguish origin-mismatch from other fill errors. If
-      // browserFillByLocator detects the page navigated, halt the
-      // loop — continuing would type the remaining secrets into the
-      // same new origin.
-      if (result.error.startsWith("origin-mismatch:")) {
+      // Distinguish origin-mismatch from other fill errors via the
+      // discriminated `code` field, NOT a magic-string prefix on
+      // `error` — see BrowserFillByLocatorResult in
+      // src/tools/browser.ts. Origin drift halts the loop;
+      // continuing would type the remaining secrets into the same
+      // new origin.
+      if (result.code === "origin-mismatch") {
         bailedOnOriginDrift = true;
         errors.push({ slot: slot.name, error: result.error });
         break;

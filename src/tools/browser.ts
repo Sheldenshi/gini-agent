@@ -138,12 +138,22 @@ const sessions = new Map<string, Session>();
 // hover). The registry is per-task so closing a session
 // (closeSession or sweep) deletes the entry, bounding memory.
 const filledSecretValues = new Map<string, Set<string>>();
+// Minimum length below which a typed value is NOT registered as a
+// redaction target. A single-character secret would otherwise
+// turn every literal occurrence of that character into
+// "[redacted]" — including digits inside snapshot ref tokens
+// like `[@e1]`, which would shred the snapshot and break the
+// agent's locator references. Multi-character secrets are
+// vanishingly unlikely to collide with structural snapshot
+// tokens. Real credentials are always ≥ this length in
+// practice (PINs are typically 4+, OTPs 6+, passwords 8+).
+const FILLED_SECRET_MIN_REDACTION_LENGTH = 4;
 // Record a secret value typed for a task. Called by
 // browserFillByLocator immediately before .fill() runs. Empty
-// strings are not recorded so the redactor's empty-string guard
-// stays safe.
+// strings and short strings are not recorded so the redactor's
+// substring match stays safe against structural tokens.
 function recordFilledSecret(taskId: string, value: string): void {
-  if (typeof value !== "string" || value.length === 0) return;
+  if (typeof value !== "string" || value.length < FILLED_SECRET_MIN_REDACTION_LENGTH) return;
   let set = filledSecretValues.get(taskId);
   if (!set) {
     set = new Set<string>();
@@ -152,11 +162,30 @@ function recordFilledSecret(taskId: string, value: string): void {
   set.add(value);
 }
 // Drop the per-task registry when the task's session closes (idle
-// sweep, explicit close, or browser disconnect). The redactor is a
-// no-op when the registry is missing, so this is a memory-bound
-// cleanup, not a security boundary.
+// sweep, explicit close, or browser disconnect). Memory-bound
+// cleanup — the union-across-tasks redaction (see
+// allRegisteredSecrets below) keeps secrets visible to other
+// active tasks until each task's own session terminates.
 function clearFilledSecrets(taskId: string): void {
   filledSecretValues.delete(taskId);
+}
+// Union of every known secret across every active task's registry.
+// The shared-BrowserContext architecture (persistent / CDP profile
+// is shared across tasks per src/tools/browser.ts:495-502) means
+// Task A can type a credential, the page can JS-copy it into
+// document.title, and Task B can read that title via its own
+// snapshot/navigate response. Task B's per-task registry is empty,
+// but Task A's is non-empty until Task A's session closes — so
+// reading the union catches cross-task leaks via shared DOM state.
+// Returns [] when no task has any registered secrets so the
+// redactor's empty-set fast path stays cheap in the common case.
+function allRegisteredSecrets(): string[] {
+  if (filledSecretValues.size === 0) return [];
+  const out = new Set<string>();
+  for (const set of filledSecretValues.values()) {
+    for (const v of set) out.add(v);
+  }
+  return Array.from(out);
 }
 // Set at runtime startup via setBrowserInstance(). Lets ensureBrowser()
 // look up state.browser to decide between connectOverCDP() and launch().
@@ -1241,15 +1270,23 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
 // string leaf — url, title, tab.url, tab.title, plus anything
 // future tool responses surface.
 //
-// taskId is optional so legacy call sites (no per-task context)
-// fall through to the no-redaction fast path. The registry is
-// per-task so the lookup is O(1) — no DOM walk required.
-function ok(payload: Record<string, unknown>, taskId?: string): string {
-  const registered = taskId ? filledSecretValues.get(taskId) : undefined;
-  if (!registered || registered.size === 0) {
+// taskId is accepted for API symmetry but the redaction consults
+// allRegisteredSecrets() across every active task's registry, not
+// just this task's. The shared BrowserContext (CDP / persistent
+// profile) bleeds DOM state across tasks — Task A's page can copy
+// a typed credential into document.title, then Task B reads that
+// title via its own snapshot/navigate response. A purely
+// per-task lookup would miss this because Task B's registry is
+// empty. The union catches cross-task leaks at the cost of
+// over-redacting in edge cases where two tasks coincidentally
+// typed the same long string (vanishingly unlikely given the
+// 4-char minimum).
+function ok(payload: Record<string, unknown>, _taskId?: string): string {
+  void _taskId;
+  const secrets = allRegisteredSecrets();
+  if (secrets.length === 0) {
     return JSON.stringify({ success: true, ...payload });
   }
-  const secrets = Array.from(registered);
   const redacted = redactSecretValuesDeep({ success: true, ...payload }, secrets);
   return JSON.stringify(redacted);
 }
@@ -1403,21 +1440,19 @@ async function collectSecretValuesFromPageWithSession(page: import("playwright-c
   } catch {
     liveValues = [];
   }
-  // Merge in the per-task registry of secrets typed via
-  // browserFillByLocator (records typed value BEFORE .fill, so the
-  // registry survives a page handler that synchronously cleared
-  // the input). The DOM collection still adds value because the
-  // page may carry server-prefilled values on stamped elements
-  // that this session never typed.
-  if (typeof taskId === "string") {
-    const registered = filledSecretValues.get(taskId);
-    if (registered && registered.size > 0) {
-      const out: string[] = [...liveValues];
-      for (const v of registered) {
-        if (!out.includes(v)) out.push(v);
-      }
-      return out;
+  // Merge in EVERY active task's registry (not just this task's).
+  // Shared BrowserContext means another task's typed credential
+  // could be visible on this page's title / DOM / URL even though
+  // this task never typed it. taskId is accepted for API
+  // symmetry; the union read makes it advisory.
+  void taskId;
+  const registered = allRegisteredSecrets();
+  if (registered.length > 0) {
+    const out: string[] = [...liveValues];
+    for (const v of registered) {
+      if (!out.includes(v)) out.push(v);
     }
+    return out;
   }
   return liveValues;
 }
@@ -1485,15 +1520,28 @@ export function redactSecretValuesDeep(value: unknown, secrets: readonly string[
 // agent will re-snapshot on its own when it resumes — and because
 // the fill might be one of several in the same submit batch, so
 // taking a snapshot per slot is wasted work.
+// Result discriminator for browserFillByLocator. Callers branch
+// on `code` rather than parsing a magic-string prefix from
+// `error` — see src/execution/browser-fill-secrets.ts which uses
+// code === "origin-mismatch" to halt the per-slot loop without
+// typing remaining secrets into a drifted origin. Future error
+// classes (e.g. timeout, detached, frame-detached) can be added
+// here without touching the consumer's branching logic.
+export type BrowserFillByLocatorResult =
+  | { ok: true }
+  | { ok: false; code: "origin-mismatch"; error: string }
+  | { ok: false; code: "validation-error"; error: string }
+  | { ok: false; code: "fill-error"; error: string };
+
 export async function browserFillByLocator(
   taskId: string,
   args: { locator: string; value: string; expectedUrl?: string }
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<BrowserFillByLocatorResult> {
   if (typeof args.locator !== "string" || args.locator.length === 0) {
-    return { ok: false, error: "Missing required string argument: locator" };
+    return { ok: false, code: "validation-error", error: "Missing required string argument: locator" };
   }
   if (typeof args.value !== "string") {
-    return { ok: false, error: "Missing required string argument: value" };
+    return { ok: false, code: "validation-error", error: "Missing required string argument: value" };
   }
   try {
     return await withSession(taskId, async (session) => {
@@ -1517,6 +1565,7 @@ export async function browserFillByLocator(
         if (liveUrl !== args.expectedUrl) {
           return {
             ok: false,
+            code: "origin-mismatch",
             error: `origin-mismatch: live=${liveUrl ?? "invalid"} expected=${args.expectedUrl}`
           } as const;
         }
@@ -1592,10 +1641,14 @@ export async function browserFillByLocator(
     // pre-fill, so even a clear-on-input page hostile script
     // can't unregister the value.
     const raw = error instanceof Error ? error.message : String(error);
-    const registered = filledSecretValues.get(taskId);
-    const secretList = registered ? Array.from(registered) : [];
-    const sanitized = redactSecretValuesFromString(raw, secretList);
-    return { ok: false, error: sanitized };
+    // Union across every active task's registry — see ok() / the
+    // shared-BrowserContext comment above. Another task's typed
+    // value may appear in this task's error message via the
+    // Call log: fill("...") path if the agent is, e.g., copying
+    // a value from one page to another.
+    void taskId;
+    const sanitized = redactSecretValuesFromString(raw, allRegisteredSecrets());
+    return { ok: false, code: "fill-error", error: sanitized };
   }
 }
 
