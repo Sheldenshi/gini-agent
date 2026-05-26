@@ -311,6 +311,19 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // anyone hitting the gateway through the tunnel. Running `next start`
   // against the prebuilt output avoids HMR entirely.
   const webMode = process.env.GINI_WEB_MODE === "production" ? "start" : "dev";
+  // Dist-dir convention:
+  //   - Dev mode: every instance gets its own `.next-<instance>` so two
+  //     parallel `next dev` runs don't deadlock on `<distDir>/lock`. The dev
+  //     server creates the dir on demand, so namespacing is free.
+  //   - Production mode (`next start`): the dir must already contain built
+  //     artifacts. `bun run build` produces `.next` by default (no
+  //     GINI_DIST_DIR set), so if `.next-<instance>` doesn't exist we fall
+  //     back to `.next`. This keeps the standard "build once, start many"
+  //     workflow working while still honoring an instance-specific build
+  //     when the operator has produced one (e.g. `cd web && GINI_DIST_DIR=.next-foo bun run build`).
+  //   The convention is: namespaced dir wins if present, plain `.next` is the
+  //   fallback. Build pipelines that want per-instance isolation should set
+  //   GINI_DIST_DIR=.next-<instance> at build time.
   // Bind to loopback explicitly. Next 16 defaults to 0.0.0.0, which
   // would make the BFF reachable from any host on the LAN — and
   // proxy.ts uses the client-controlled Host header to decide
@@ -330,6 +343,17 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // and namespace per instance. Standalone `bun run dev` still defaults to
   // `.next` because that env var is unset.
   const instanceSlug = config.instance.replace(/[^a-zA-Z0-9_-]/g, "_");
+  // In production mode (`next start`), the dist dir must already exist with
+  // built artifacts. `bun run build` produces `.next` by default — so if the
+  // namespaced `.next-<instance>` dir is missing, fall back to `.next` rather
+  // than crashing with "Could not find a production build in the
+  // '.next-<instance>' directory". Dev mode always uses the namespaced dir
+  // because `next dev` creates it on demand.
+  const namespacedDistDir = `.next-${instanceSlug}`;
+  let distDir = namespacedDistDir;
+  if (webMode === "start" && !existsSync(join(webRoot, namespacedDistDir))) {
+    distDir = ".next";
+  }
   const foreground = options.foreground === true;
   // Foreground: keep the web child attached and tee dev-server stdio to both
   // the user's terminal and web.log. Daemon (gini start) keeps the historic
@@ -345,7 +369,7 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
       GINI_RUNTIME_URL: url(config),
       GINI_TOKEN: config.token,
       GINI_INSTANCE: config.instance,
-      GINI_DIST_DIR: `.next-${instanceSlug}`,
+      GINI_DIST_DIR: distDir,
       // Tunnel secret is no longer forwarded via env — the Next.js proxy
       // reads it (and the enabled flag) from ~/.gini/instances/<inst>/config.json
       // on each request via runtimeTunnelState(). Reading lazily from the
