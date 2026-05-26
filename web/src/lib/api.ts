@@ -25,9 +25,33 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}): Pr
     ...init,
     headers: { "content-type": "application/json", ...(init.headers ?? {}) }
   });
-  const value = (await response.json()) as { error?: string };
-  if (!response.ok) throw new HttpError(value.error ?? `HTTP ${response.status}`, response.status);
-  return value as T;
+  if (!response.ok) {
+    // Read the body as text first because a Response stream can only
+    // be consumed once. Try JSON.parse to extract {error: "..."} from
+    // the gateway, but fall back to the raw text when the upstream
+    // returned HTML/plain (e.g. a 502 from a reverse proxy). Without
+    // this guard the original code called response.json() before
+    // checking response.ok and threw SyntaxError on non-JSON error
+    // bodies; callers that distinguish HttpError from network errors
+    // (e.g. TunnelSettingsCard's self-severing race) then
+    // mis-classify the real failure as success.
+    let message = `HTTP ${response.status}`;
+    const text = await response.text().catch(() => "");
+    if (text.length > 0) {
+      try {
+        const parsed = JSON.parse(text) as { error?: string };
+        if (typeof parsed?.error === "string") {
+          message = parsed.error;
+        } else if (text.trim().length > 0) {
+          message = text.trim();
+        }
+      } catch {
+        if (text.trim().length > 0) message = text.trim();
+      }
+    }
+    throw new HttpError(message, response.status);
+  }
+  return (await response.json()) as T;
 }
 
 export function streamUrl(path: string): string {
