@@ -178,6 +178,23 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       ) : null}
       {isBrowserFillSecret && fillSlots.length > 0 && isPending ? (
         <div className="mt-2 space-y-2">
+          {/*
+            Prominent "fill destination" badge so the user can spot a
+            mismatch between the agent's claimed labels and the actual
+            page the secret will land on. The agent controls
+            slot.label and block.summary; the page URL is captured by
+            the gateway at approval-creation time and is the only
+            non-spoofable element on this card. If the agent were
+            prompt-injected to ask for "GitHub password" while the
+            captured page is `https://evil.com/phishing`, this badge
+            is what lets the user see the mismatch.
+          */}
+          {approval?.target ? (
+            <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
+              <span className="text-muted-foreground">Fill destination: </span>
+              <span className="font-mono">{approval.target}</span>
+            </div>
+          ) : null}
           {fillSlots.map((slot) => (
             <div key={slot.name} className="space-y-1">
               <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-${slot.name}`}>

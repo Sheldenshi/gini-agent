@@ -58,27 +58,44 @@ export function parseFillSecretSlots(raw: unknown): FillSecretSlot[] {
   });
 }
 
-// Returns origin + pathname for a raw URL, dropping the query string,
-// fragment, userinfo, and any other component that may carry secrets
-// (OAuth `code`/`state`, password-reset `token`, magic-link nonces,
-// embedded session ids). Used by the dispatcher to build a
-// redaction-safe `target` on the approval row, by the bounded
-// fill_secret handler to compare live URL against approvedUrl, and
-// by browserFillByLocator to re-check the page URL just before the
-// playwright .fill(). Lives in this leaf module (no Node-only
-// imports) so all three callers share the same normalization
-// without crossing the dispatcher → browser tool dependency
-// boundary.
+// Returns the ORIGIN (protocol+host+port) for a raw URL, dropping
+// the pathname, query string, fragment, userinfo, and any other
+// component that may carry secrets. Pathnames are particularly
+// risky because password-reset URLs (`/reset/<token>`), magic-link
+// signin (`/auth/<one-time-code>`), and OAuth confirmation flows
+// (`/verify/<token>`) routinely encode secret tokens directly in
+// the path — and the audit writer-boundary only drops `evidence`
+// when `redacted: true`, leaving `target` intact. Stripping
+// pathname is the only way to be sure no secret-bearing path
+// component lands in state.audit[].target or state.events[].target.
+//
+// Used by the dispatcher to build a redaction-safe `target` on
+// the approval row, by the bounded fill_secret handler to compare
+// live URL against approvedUrl, and by browserFillByLocator to
+// re-check the page URL just before the playwright .fill().
+// Lives in this leaf module (no Node-only imports) so all three
+// callers share the same normalization without crossing the
+// dispatcher → browser tool dependency boundary.
 //
 // Returns undefined for invalid / non-http(s) URLs so the caller
 // can either refuse the operation (dispatcher: refuse to mint an
 // approval) or fall back to a locator-only target.
+//
+// Trade-off vs path-inclusive binding: a fill approved on
+// `https://example.com/login` can now be submitted while the page
+// is at `https://example.com/profile`. The same-origin reduction
+// is acceptable because (a) the user-visible "Fill destination"
+// badge in the chat card shows the origin to the human reviewer,
+// (b) the human approves before any fill runs, and (c) the
+// agent-navigated same-origin pathname change is not a credential
+// theft vector unless the origin itself was wrong, which the
+// badge would catch.
 export function sanitizeUrlForAuditTarget(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   try {
     const parsed = new URL(raw);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
-    return `${parsed.origin}${parsed.pathname}`;
+    return parsed.origin;
   } catch {
     return undefined;
   }

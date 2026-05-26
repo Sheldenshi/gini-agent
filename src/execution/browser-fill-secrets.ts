@@ -11,13 +11,19 @@
 //      `target`) — refuse if the page has navigated since approval.
 //   4. resolveApproval(resumeChatTask: false) — atomic check-and-flip
 //      from pending → approved that closes the deny-mid-fill race.
-//   5. Per-slot fill loop with TWO guards inside browserFillByLocator:
-//      a) The owning task's status is still non-terminal (a cancel
-//         landing after the atomic resolve aborts the rest of the
-//         loop).
-//      b) The live page URL still matches approvedUrl (TOCTOU close
-//         — a navigation between the pre-loop check and the .fill()
-//         must not land secrets on a new origin).
+//   5. Per-slot fill loop with TWO guards at DIFFERENT layers:
+//      a) Task-status check INSIDE this loop (readState per
+//         iteration BEFORE the browserFillByLocator call): a cancel
+//         landing after the atomic resolve makes the next iteration
+//         observe terminal status and bail, recording
+//         aborted: "task-cancelled-mid-fill".
+//      b) URL re-check INSIDE browserFillByLocator (which holds a
+//         live withSession lock): the comparison against
+//         approvedUrl runs immediately before locator.fill(),
+//         TOCTOU-closing the window to one playwright API hop.
+//      The split exists because task status needs no playwright
+//      session (a state read) while URL needs the live page
+//      reference.
 //   6. Audit row with redacted: true and evidence covering filled
 //      slots + per-slot errors. Slot VALUES never appear anywhere.
 //   7. resumeChatTask with a result string reflecting what actually

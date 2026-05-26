@@ -182,9 +182,19 @@ export default function HomePage() {
                       </p>
                     </div>
                     {isBrowserFillSecret ? (
-                      <span className="shrink-0 text-[11px] text-muted-foreground">
-                        Enter credentials in the chat session.
-                      </span>
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="text-[11px] text-muted-foreground">
+                          Enter credentials in chat.
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                        >
+                          Deny
+                        </Button>
+                      </div>
                     ) : (
                       <div className="flex shrink-0 gap-2">
                         <Button

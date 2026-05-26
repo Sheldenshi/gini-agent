@@ -951,6 +951,15 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
           const placeholder = el.getAttribute("placeholder");
           if (placeholder) return placeholder.trim();
         }
+        // For elements stamped with data-gini-secret (contenteditable
+        // fields filled via fill_secret), the textContent holds the
+        // typed value — same risk as <input>.value would carry. Mask
+        // the name with "[redacted]" so the snapshot doesn't leak the
+        // typed bytes via the entry's name field.
+        if (el.getAttribute("data-gini-secret") !== null) {
+          const raw = (el.textContent ?? "").trim();
+          return raw.length > 0 ? "[redacted]" : "";
+        }
         const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
         return text.slice(0, 120);
       };
@@ -1294,12 +1303,21 @@ async function collectSecretValuesFromPageWithSession(page: import("playwright-c
   try {
     return await page.evaluate(() => {
       const nodes = Array.from(document.querySelectorAll("[data-gini-secret]"));
-      return nodes
-        .map((el) => {
-          const value = (el as HTMLInputElement).value;
-          return typeof value === "string" ? value : "";
-        })
-        .filter((v) => v.length > 0);
+      const values: string[] = [];
+      for (const el of nodes) {
+        // <input>/<textarea>/<select> elements expose the typed
+        // bytes via the .value property. Non-input fill targets
+        // (e.g. [contenteditable] <div> elements — playwright's
+        // .fill() supports these) hold the typed bytes in
+        // textContent instead. Collect BOTH so the redactor knows
+        // every literal secret occurrence regardless of which
+        // surface the fill landed on.
+        const value = (el as HTMLInputElement).value;
+        if (typeof value === "string" && value.length > 0) values.push(value);
+        const text = el.textContent;
+        if (typeof text === "string" && text.length > 0) values.push(text);
+      }
+      return values;
     });
   } catch {
     return [];
@@ -1399,22 +1417,43 @@ export async function browserFillByLocator(
       const locator = session.page.locator(selector);
       await locator.fill(args.value, { timeout: 10_000 });
       // Stamp the element with data-gini-secret so subsequent
-      // browser_snapshot calls redact its value (see
-      // snapshot walker's secret-field branch). type="password"
-      // already triggers redaction on its own; this covers fields
-      // the page may flip from password→text post-fill (some SPAs
-      // do this to show the value in their own custom UI) and
-      // generic credential fields that aren't explicitly password
-      // type but were filled via fill_secret. evaluate is wrapped
-      // in a try/catch on the page-side because losing the
-      // attribute stamp must not fail the fill itself.
-      await locator.evaluate((el) => {
-        try {
-          (el as Element).setAttribute("data-gini-secret", "true");
-        } catch {
-          /* attribute set best-effort */
-        }
-      });
+      // browser_snapshot calls redact its value (see snapshot
+      // walker's secret-field branch). type="password" already
+      // triggers redaction on its own; this covers fields the page
+      // may flip from password→text post-fill (some SPAs do this
+      // to show the value in their own custom UI) and generic
+      // credential fields that aren't explicitly password type but
+      // were filled via fill_secret.
+      //
+      // CRITICAL: the stamping MUST NOT fail the fill outcome. The
+      // .fill() at the line above already wrote the secret to the
+      // DOM; if we let a stamp-evaluate throw (element detached,
+      // page navigated, frame-detached, serialization error) bubble
+      // out to the outer catch, the caller would record this slot
+      // as errored AND the value would be in the DOM unstamped —
+      // subsequent snapshots wouldn't redact it. Wrap the entire
+      // Node-side evaluate await in its own try/catch so the fill
+      // outcome reflects the actual DOM write, not the stamp's
+      // success. A stamp failure is a recoverable defense-in-depth
+      // miss; if it happens, the snapshot walker's other heuristics
+      // (type=password, autocomplete=current-password) still cover
+      // the common cases.
+      try {
+        await locator.evaluate((el) => {
+          try {
+            (el as Element).setAttribute("data-gini-secret", "true");
+          } catch {
+            /* attribute set best-effort */
+          }
+        });
+      } catch {
+        /* stamp evaluate threw on the Node side (detached element,
+           navigation, serialization) — keep the fill outcome and
+           rely on the snapshot walker's other redaction signals.
+           A defensive trace is emitted by the bounded fill module
+           via the per-slot result if subsequent calls observe
+           unstamped values. */
+      }
       return { ok: true } as const;
     });
   } catch (error) {

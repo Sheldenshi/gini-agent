@@ -167,9 +167,18 @@ function ApprovalCard({
           </pre>
         )}
         {isBrowserFillSecret ? (
-          <p className="text-xs text-muted-foreground">
-            Open the chat session to enter credentials. The Approve / Deny buttons here don&apos;t apply to credential entry — the values must be typed into the amber card in chat.
-          </p>
+          <>
+            <p className="text-xs text-muted-foreground">
+              Open the chat session to enter credentials. Approve doesn&apos;t apply here — the values must be typed into the amber card in chat. Deny still cancels the request.
+            </p>
+            {onDecide ? (
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+                  Deny
+                </Button>
+              </div>
+            ) : null}
+          </>
         ) : onDecide ? (
           <div className="flex gap-2">
             <Button size="sm" disabled={pending} onClick={() => onDecide("approve")}>

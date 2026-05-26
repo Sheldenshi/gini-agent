@@ -141,18 +141,19 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(state.approvals.length).toBe(0);
   });
 
-  test("sanitizeUrlForAuditTarget strips query and fragment, keeps origin+pathname", () => {
+  test("sanitizeUrlForAuditTarget keeps origin only — strips pathname/query/fragment/userinfo", () => {
     // The audit writer-boundary only drops `evidence` on
     // redacted:true (see src/state/audit.ts); `target` is kept
-    // intact. Any URL with a token in the query string would
-    // otherwise land verbatim in state.audit[].target, so the
-    // dispatcher uses this helper to normalize URLs to
-    // origin+pathname before writing them onto an approval.
-    expect(sanitizeUrlForAuditTarget("https://example.com/login")).toBe("https://example.com/login");
-    expect(sanitizeUrlForAuditTarget("https://example.com/oauth/callback?code=secret&state=xyz")).toBe("https://example.com/oauth/callback");
-    expect(sanitizeUrlForAuditTarget("https://example.com/reset?token=top-secret-bytes#fragment")).toBe("https://example.com/reset");
-    expect(sanitizeUrlForAuditTarget("https://user:pw@example.com/path?q=1")).toBe("https://example.com/path");
-    expect(sanitizeUrlForAuditTarget("http://localhost:8080/admin")).toBe("http://localhost:8080/admin");
+    // intact. Any URL with a token in the path OR query string
+    // would otherwise land verbatim in state.audit[].target.
+    // Password-reset and magic-link URLs routinely encode tokens
+    // in the path (`/reset/<token>`, `/auth/<one-time-code>`), so
+    // pathname is stripped too.
+    expect(sanitizeUrlForAuditTarget("https://example.com/login")).toBe("https://example.com");
+    expect(sanitizeUrlForAuditTarget("https://example.com/oauth/callback?code=secret&state=xyz")).toBe("https://example.com");
+    expect(sanitizeUrlForAuditTarget("https://example.com/reset/abc-secret-token-xyz?token=more-secret#fragment")).toBe("https://example.com");
+    expect(sanitizeUrlForAuditTarget("https://user:pw@example.com/path?q=1")).toBe("https://example.com");
+    expect(sanitizeUrlForAuditTarget("http://localhost:8080/admin")).toBe("http://localhost:8080");
     // Non-http(s) and malformed inputs fall through to undefined so
     // the caller can use a locator-only target.
     expect(sanitizeUrlForAuditTarget("javascript:alert(1)")).toBeUndefined();
@@ -205,8 +206,10 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     const approval = state.approvals.find((a) => a.id === result.approvalId);
     expect(approval).toBeDefined();
     expect(approval?.action).toBe("browser.fill_secret");
-    // approvedUrl is stripped of query string by sanitizeUrlForAuditTarget.
-    expect(approval?.payload.approvedUrl).toBe("https://example.com/login");
-    expect(approval?.target).toBe("https://example.com/login");
+    // approvedUrl is stripped to origin only by sanitizeUrlForAuditTarget;
+    // pathname is dropped because reset/magic-link URLs can carry
+    // tokens in the path component.
+    expect(approval?.payload.approvedUrl).toBe("https://example.com");
+    expect(approval?.target).toBe("https://example.com");
   });
 });

@@ -933,7 +933,7 @@ describe("runtime api", () => {
       createApproval(state, {
         taskId,
         action: "browser.fill_secret",
-        target: "https://example.com/login",
+        target: "https://example.com",
         risk: "high",
         reason: "Sign in to the test site",
         payload: {
@@ -943,12 +943,15 @@ describe("runtime api", () => {
           ],
           reason: "Sign in",
           toolCallId: "call_fill",
-          approvedUrl: "https://example.com/login"
+          // Origin only — sanitizeUrlForAuditTarget strips pathname.
+          approvedUrl: "https://example.com"
         }
       })
     );
     const { __test: browserTest } = await import("./tools/browser");
     browserTest.installFakeSessionWithPageForTest(taskId, {
+      // The live URL can be on any path within the approved origin;
+      // the equality check is on origin only after the SEC-C fix.
       url: () => "https://example.com/login",
       close: () => Promise.resolve()
     } as Partial<import("playwright-core").Page>);
@@ -999,7 +1002,7 @@ describe("runtime api", () => {
       createApproval(state, {
         taskId,
         action: "browser.fill_secret",
-        target: "https://example.com/login",
+        target: "https://example.com",
         risk: "high",
         reason: "Sign in to the test site",
         payload: {
@@ -1009,7 +1012,7 @@ describe("runtime api", () => {
           ],
           reason: "Sign in",
           toolCallId: "call_fill",
-          approvedUrl: "https://example.com/login"
+          approvedUrl: "https://example.com"
         }
       })
     );
@@ -1106,7 +1109,7 @@ describe("runtime api", () => {
       createApproval(state, {
         taskId,
         action: "browser.fill_secret",
-        target: "https://example.com/login",
+        target: "https://example.com",
         risk: "high",
         reason: "Sign in",
         payload: {
@@ -1118,8 +1121,10 @@ describe("runtime api", () => {
           toolCallId: "call_fill",
           // The /connect origin guard reads from the structural
           // approvedUrl on payload — peer approval actions carry
-          // their contract fields under payload too.
-          approvedUrl: "https://example.com/login"
+          // their contract fields under payload too. Stored as
+          // origin only (no pathname) since reset/magic-link
+          // URLs can carry tokens in the path.
+          approvedUrl: "https://example.com"
         }
       })
     );
@@ -1137,7 +1142,7 @@ describe("runtime api", () => {
     const body = await response.json();
     expect(body.ok).toBe(false);
     expect(body.message).toContain("navigated");
-    expect(body.message).toContain("https://example.com/login");
+    expect(body.message).toContain("https://example.com");
     // Approval stayed pending — no resolveApproval call ran.
     const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
