@@ -80,10 +80,12 @@ export interface TunnelHandlerHooks {
   getSnapshot(): TunnelSnapshot | null;
   /**
    * Optional: re-run the Apple Notes refresh and return the post-refresh
-   * snapshot. The ADR documents `GET /api/tunnel` as the operator's
+   * snapshot. `POST /api/tunnel/refresh-notes` is the operator's
    * trigger for re-syncing the iCloud Note after they grant Automation
    * permission to Notes.app — calling this hook from the handler keeps
-   * that promise.
+   * that promise. (GET /api/tunnel is strictly read-only; the resync
+   * lives on POST so SameSite=Lax cookies do NOT attach on cross-site
+   * navigation, closing the CSRF surface a GET side-effect would open.)
    */
   refreshAppleNote?(): Promise<TunnelSnapshot>;
   /**

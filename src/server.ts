@@ -252,12 +252,24 @@ let pendingApply: Promise<void> = Promise.resolve();
 // stop, and would now leak a child past the shutdown deadline.
 let shutdownStarted = false;
 
-// Last resolved web target the tunnel was pointed at. The webPortPath
-// watcher compares incoming changes to this so a no-op rewrite (gini
-// start writing the same port back) doesn't trigger an unnecessary
-// cloudflared recycle.
+// Last resolved web target the tunnel was pointed at. `runRecycle`
+// compares the freshly-probed target against this value (combined with
+// a check that the manager reports a live cloudflareUrl) so duplicate
+// fs.watch events for a single write — APFS commonly fires rename+change
+// pairs — don't pointlessly tear down and re-spawn cloudflared, which
+// would rotate the public URL with no real port change.
 let currentWebTarget: string | null = null;
 let webPortWatcher: FSWatcher | null = null;
+
+// Set when the boot tunnel bring-up's resolveWebTarget polled past its 60s
+// ceiling. fs.watch only fires on CHANGES to an already-existing file —
+// the ENOENT retry path attaches AFTER the file appears, so the appearance
+// itself never produces a callback. Without this flag, a slow web boot
+// (Next.js cold compile > 60s) leaves cloudflared dormant forever even
+// after the port file lands. tryRegisterWebPortWatcher enqueues a single
+// recovery runRecycle on first successful attach when this flag is set,
+// then clears it so subsequent watcher reattaches don't re-trigger.
+let bootFailureRecorded = false;
 
 async function runApplyConfig(
   update: { enabled?: boolean; appleNotes?: { enabled?: boolean } }
@@ -372,6 +384,14 @@ async function runApplyConfig(
       tunnelManager.setTargetUrl(resolvedTarget);
     } catch (error) {
       resolveError = error instanceof Error ? error : new Error(String(error));
+      // Mirror the boot-path failure surface: record on the snapshot so
+      // the UI's 5s refetch sees `lastError` and renders the diagnostic
+      // instead of leaving the user on "Connecting…" indefinitely. The
+      // optimistic toast that fires off the PATCH throw is overwritten
+      // by the next snapshot fetch; without recording here the snapshot
+      // would arrive as `enabled: true, lastError: null, cloudflareUrl:
+      // null` and the rollback hint is lost.
+      tunnelManager.recordStartFailure(resolveError.message);
       appendLog(config.instance, "tunnel.start.error", {
         error: resolveError.message,
         reason: "web target unresolved — refusing to spawn cloudflared against the raw runtime port"
@@ -469,10 +489,10 @@ const server = Bun.serve({
       // the Apple Notes write the moment the operator flips the tunnel
       // ON via the web UI — without this, the hook captured at boot
       // would stay `undefined` for the rest of the process lifetime
-      // and GET /api/tunnel would never trigger the documented re-sync
-      // path until the next restart. Disabled-state gating moved
-      // inside the closure so it consults the live config object that
-      // applyConfig mutates.
+      // and `POST /api/tunnel/refresh-notes` would never trigger the
+      // documented re-sync path until the next restart. Disabled-state
+      // gating moved inside the closure so it consults the live config
+      // object that applyConfig mutates.
       refreshAppleNote: () => tunnelResolved.config.enabled
         ? tunnelManager.refreshAppleNote()
         : Promise.resolve(tunnelManager.getSnapshot()),
@@ -558,6 +578,13 @@ if (tunnelResolved.config.enabled) {
       // file, so the Settings card would sit on "Connecting…"
       // indefinitely with no diagnostic.
       tunnelManager.recordStartFailure(message);
+      // Mark so the next successful watcher attach can recover.
+      // resolveWebTarget's 60s ceiling can fire on a cold Next.js
+      // compile while the web child is still in flight; once the
+      // port file finally lands, the watcher attaches and we want
+      // a one-shot runRecycle to bring cloudflared up against the
+      // now-healthy port without operator intervention.
+      bootFailureRecorded = true;
     }
   });
   // The chain itself swallows rejections (it can't; the inner
@@ -604,6 +631,33 @@ const runRecycle = async (): Promise<void> => {
   try {
     do {
       recyclePending = false;
+      // Peek the live target BEFORE tearing the tunnel down. fs.watch
+      // on macOS APFS commonly fires twice for one write (rename +
+      // change), and the watcher serializes events through
+      // `pendingApply.then(runRecycle, ...)` — so two sequential
+      // runRecycle calls slip past `recycleInFlight` (the second
+      // runs AFTER the first cleared the flag). Without this peek,
+      // the second call would stop+restart the manager, rotating the
+      // public cloudflared URL even though the port never changed.
+      //
+      // Skip the recycle ONLY when (a) the resolved target matches
+      // what we already had AND (b) the manager reports a live
+      // tunnel (cloudflareUrl is set). The (b) condition is what
+      // makes this safe to combine with the 3b recovery path —
+      // when the boot bring-up failed and bootFailureRecorded
+      // enqueued a recovery runRecycle, `currentWebTarget` is null
+      // (we never started), so condition (a) doesn't fire and we
+      // fall through to start. Likewise if cloudflared crashed and
+      // the manager's exit monitor nulled the handle, cloudflareUrl
+      // is null and we restart even on an unchanged target.
+      const probedTarget = await resolveWebTarget();
+      const snapshotBeforeRecycle = tunnelManager.getSnapshot();
+      if (
+        probedTarget === currentWebTarget
+        && snapshotBeforeRecycle.cloudflareUrl !== null
+      ) {
+        continue;
+      }
       // Stop BEFORE resolving the new target. The web.port file
       // changed, which means the previous web rebound (or another
       // gini start replaced it). The freed port may already have
@@ -648,6 +702,19 @@ const tryRegisterWebPortWatcher = (): void => {
       // inconsistent with the spawned subprocess.
       pendingApply = pendingApply.then(runRecycle, () => undefined);
     });
+    // First successful attach after a boot-time resolveWebTarget
+    // failure: enqueue a single runRecycle to bring cloudflared up
+    // against the now-existing port. fs.watch only fires on changes
+    // to an already-existing file, so the appearance-via-ENOENT-
+    // retry that just happened won't produce a synthetic callback;
+    // without this kick, the tunnel would stay dormant until the
+    // user manually re-PATCHes or restarts. Clear the flag so any
+    // future watcher reattach (e.g. after webPortWatcher.close())
+    // doesn't re-trigger.
+    if (bootFailureRecorded) {
+      bootFailureRecorded = false;
+      pendingApply = pendingApply.then(runRecycle, () => undefined);
+    }
   } catch {
     // File doesn't exist yet (common at boot — gini start spawns
     // the runtime before writing web.port). Schedule a retry; the
