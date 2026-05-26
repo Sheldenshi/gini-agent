@@ -1002,11 +1002,14 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
             const input = el as HTMLInputElement;
             const inputType = (input.type || "").toLowerCase();
             const autocomplete = (input.getAttribute("autocomplete") || "").toLowerCase();
+            // `getAttribute(...) !== null` works on both real DOM Element
+            // and any minimal stub that implements only getAttribute (the
+            // unit test fakes in browser.test.ts don't have hasAttribute).
             const isSecretField = inputType === "password"
               || autocomplete === "current-password"
               || autocomplete === "new-password"
               || autocomplete === "one-time-code"
-              || input.hasAttribute("data-gini-secret");
+              || input.getAttribute("data-gini-secret") !== null;
             const rawValue = input.value ?? "";
             value = isSecretField
               ? (rawValue.length > 0 ? "[redacted]" : "")
