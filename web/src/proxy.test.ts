@@ -19,7 +19,7 @@ import { proxy } from "./proxy";
 
 let suiteRoot: string;
 const TOKEN = "test-token";
-const envSnapshot: { instance?: string; root?: string; token?: string; url?: string } = {};
+const envSnapshot: { instance?: string; root?: string; token?: string; url?: string; trustedOrigins?: string } = {};
 const originalFetch = globalThis.fetch;
 let instanceCounter = 0;
 let currentInstance: string;
@@ -29,6 +29,7 @@ beforeAll(() => {
   envSnapshot.root = process.env.GINI_STATE_ROOT;
   envSnapshot.token = process.env.GINI_TOKEN;
   envSnapshot.url = process.env.GINI_RUNTIME_URL;
+  envSnapshot.trustedOrigins = process.env.GINI_TRUSTED_ORIGINS;
   suiteRoot = mkdtempSync(join(tmpdir(), "gini-proxy-test-"));
 });
 
@@ -41,6 +42,8 @@ afterAll(() => {
   else process.env.GINI_TOKEN = envSnapshot.token;
   if (envSnapshot.url === undefined) delete process.env.GINI_RUNTIME_URL;
   else process.env.GINI_RUNTIME_URL = envSnapshot.url;
+  if (envSnapshot.trustedOrigins === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+  else process.env.GINI_TRUSTED_ORIGINS = envSnapshot.trustedOrigins;
   // CRITICAL: restore globalThis.fetch. The beforeEach replaces it with
   // a Bun mock; without this restoration, sibling test files in the
   // same Bun process inherit the stubbed fetch and start failing
@@ -73,6 +76,10 @@ describe("proxy", () => {
     // to the real instance's runtime.port and the test would race a live
     // gateway.
     process.env.GINI_RUNTIME_URL = "http://127.0.0.1:9";
+    // Clear GINI_TRUSTED_ORIGINS so each test starts from the un-
+    // configured allowlist state. Tests that exercise the
+    // trusted-origins branch set it explicitly.
+    delete process.env.GINI_TRUSTED_ORIGINS;
     globalThis.fetch = mock(async () =>
       new Response(JSON.stringify({ providerConfigured: true }), {
         status: 200,
@@ -85,16 +92,103 @@ describe("proxy", () => {
     // Restore the original fetch after each test so a sibling test
     // that runs between hooks doesn't observe the stub.
     globalThis.fetch = originalFetch;
+    delete process.env.GINI_TRUSTED_ORIGINS;
     rmSync(join(suiteRoot, "instances", currentInstance), { recursive: true, force: true });
   });
 
-  test("external host with tunnel disabled returns 404", async () => {
+  test("external host with tunnel disabled AND no trusted-origins returns 404", async () => {
+    // Shape C in proxy.ts's non-loopback branch comment: no tunnel
+    // authorizer and no operator-blessed allowlist means the surface
+    // is un-deployed and must be invisible.
     writeTunnelConfig({ enabled: false, secret: "abcdefghij0123456789" });
+    delete process.env.GINI_TRUSTED_ORIGINS;
     const request = new NextRequest(new URL("https://tunnel.example.com/anything"), {
       headers: { host: "tunnel.example.com" }
     });
     const response = await proxy(request);
     expect(response.status).toBe(404);
+  });
+
+  test("external host with tunnel disabled + GINI_TRUSTED_ORIGINS set passes through without vetted marker", async () => {
+    // Shape B in proxy.ts's non-loopback branch comment: the operator
+    // exposed the BFF on a tailnet / public DNS hostname and opted
+    // into GINI_TRUSTED_ORIGINS. The proxy must pass through so the
+    // BFF's guardCsrf can enforce the allowlist by exact Origin match.
+    // The vetted marker MUST NOT be stamped — that header is reserved
+    // for tunnel-authorized requests and would otherwise let a
+    // non-tunnel deployment bypass the allowlist check.
+    writeTunnelConfig({ enabled: false, secret: "abcdefghij0123456789" });
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini-server.tail.ts.net";
+    const request = new NextRequest(new URL("https://gini-server.tail.ts.net/dashboard"), {
+      headers: { host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+    // No 4xx/5xx — pass-through to the BFF chain.
+    expect(response.status).toBeLessThan(400);
+    // No tunnel-vetted marker stamped. NextResponse.next reports the
+    // override index for cloned headers; when we strip but don't
+    // re-set the marker, the stamped value must be absent or empty.
+    const stampedValue = response.headers.get("x-middleware-request-x-gini-tunnel-vetted");
+    expect(stampedValue === null || stampedValue === "").toBe(true);
+    // No tunnel-prefix rewrite and no Set-Cookie — the request flows
+    // through unchanged so the BFF guard sees the real Origin/Host.
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("x-middleware-next")).toBe("1");
+  });
+
+  test("external host with tunnel disabled + GINI_TRUSTED_ORIGINS empty (malformed) passes through", async () => {
+    // Edge case: an operator who set the env var but every entry was
+    // malformed still gets the pass-through behavior here. guardCsrf
+    // will fail-closed downstream — refusing every request — which is
+    // the right answer for an operator who clearly meant to lock down
+    // the surface but typo'd every entry. We test that the proxy
+    // doesn't 404 first.
+    writeTunnelConfig({ enabled: false, secret: "abcdefghij0123456789" });
+    process.env.GINI_TRUSTED_ORIGINS = "not-a-url, also-not-a-url";
+    const request = new NextRequest(new URL("https://gini-server.tail.ts.net/dashboard"), {
+      headers: { host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+  });
+
+  test("external host with tunnel enabled + valid secret still stamps vetted marker", async () => {
+    // Regression: even with GINI_TRUSTED_ORIGINS set, an active tunnel
+    // still routes through the secret-prefix / cookie gate and stamps
+    // the vetted marker. The tunnel and trusted-origins surfaces are
+    // separate auth paths; the tunnel one must keep working when
+    // operators also configure an allowlist.
+    const secret = "abcdefghij0123456789";
+    writeTunnelConfig({ enabled: true, secret });
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini-server.tail.ts.net";
+    const request = new NextRequest(new URL(`https://tunnel.example.com/${secret}/settings`), {
+      headers: { host: "tunnel.example.com" }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+    const overrideIndex = response.headers.get("x-middleware-override-headers") ?? "";
+    expect(overrideIndex.split(",")).toContain("x-gini-tunnel-vetted");
+    expect(response.headers.get("x-middleware-request-x-gini-tunnel-vetted")).toBe("1");
+  });
+
+  test("external host with tunnel disabled + trusted-origins set strips inbound vetted marker", async () => {
+    // Defense in depth: an attacker on the trusted-origins surface
+    // cannot forge x-gini-tunnel-vetted to influence the BFF guard.
+    // The proxy must strip any inbound value on the pass-through path
+    // exactly like it does on the localhost path.
+    writeTunnelConfig({ enabled: false, secret: "abcdefghij0123456789" });
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini-server.tail.ts.net";
+    const request = new NextRequest(new URL("https://gini-server.tail.ts.net/api/runtime/state"), {
+      headers: {
+        host: "gini-server.tail.ts.net",
+        "x-gini-tunnel-vetted": "attacker-supplied"
+      }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+    const stampedValue = response.headers.get("x-middleware-request-x-gini-tunnel-vetted");
+    expect(stampedValue === null || stampedValue === "").toBe(true);
   });
 
   test("external host bootstrap to /<secret> redirects to / with Set-Cookie", async () => {

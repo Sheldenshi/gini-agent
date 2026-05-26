@@ -23,7 +23,7 @@
 // /_next/static and /_next/image so static asset loading is unaffected.
 
 import { NextResponse, type NextRequest } from "next/server";
-import { runtimeToken, runtimeTunnelState, runtimeUrl } from "@/lib/runtime";
+import { runtimeToken, runtimeTunnelState, runtimeUrl, trustedOrigins } from "@/lib/runtime";
 
 // Upper bound on the round-trip to the local gateway's /api/setup/status.
 // The gateway is on 127.0.0.1 and the call hits a tiny in-memory check, so
@@ -61,8 +61,12 @@ async function isProviderConfigured(): Promise<boolean | null> {
 // bundle keeps fumbling because hot-module updates don't survive
 // cloudflared (the HMR websocket is gated alongside everything else).
 const SESSION_COOKIE = "gini_tunnel_session";
-// One day — secrets rotate every gateway restart anyway, so a stale
-// cookie just stops working at next reboot.
+// One day — long enough that the operator's session survives a
+// gateway restart, short enough that an exfiltrated cookie has a
+// bounded shelf life. Cookies are keyed by the persisted secret
+// (stable across restarts unless the operator runs `gini tunnel
+// rotate-secret`), so a deliberate rotation invalidates every
+// outstanding session.
 const SESSION_TTL_SECONDS = 60 * 60 * 24;
 
 // Internal authorization marker the proxy stamps onto requests that
@@ -110,30 +114,70 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const { pathname } = request.nextUrl;
 
   if (!isLocalHost) {
-    // External host (cloudflared): one of two auth paths must be present
-    // before we'll forward anything to the BFF — which auto-injects the
-    // operator's bearer token, so passing through unauthenticated would
-    // hand authenticated /api/* access to anyone who learned the
-    // trycloudflare hostname.
+    // Non-loopback Host. Three deployment shapes feed this branch and
+    // each has a distinct authorization model:
     //
-    //   1. URL contains `/<secret>/...` — initial bootstrap. We strip
-    //      the prefix and set a HttpOnly session cookie before
-    //      rewriting.
-    //   2. The session cookie matches the secret — subsequent requests
-    //      no longer need the prefix in the URL, so the page's relative
-    //      `fetch("/api/runtime/...")` calls just work.
+    //   A. Tunnel enabled (cloudflared): require the URL secret prefix
+    //      `/<secret>/...` or a matching session cookie before we'll
+    //      forward anything to the BFF — which auto-injects the
+    //      operator's bearer token, so passing through unauthenticated
+    //      would hand authenticated /api/* access to anyone who learned
+    //      the trycloudflare hostname.
+    //        1. URL contains `/<secret>/...` — initial bootstrap. We
+    //           strip the prefix and set a HttpOnly session cookie before
+    //           rewriting.
+    //        2. The session cookie matches the secret — subsequent
+    //           requests no longer need the prefix in the URL, so the
+    //           page's relative `fetch("/api/runtime/...")` calls just
+    //           work.
+    //      Requests that pass either check get `x-gini-tunnel-vetted: 1`
+    //      stamped on the upstream headers; the BFF guard treats that
+    //      marker as equivalent to a loopback Host because cloudflared
+    //      mints a fresh hostname on every restart and can't be put in
+    //      GINI_TRUSTED_ORIGINS.
+    //
+    //   B. Tunnel disabled + GINI_TRUSTED_ORIGINS set (tailnet / public
+    //      DNS deployment per ADR bff-trust-boundary.md): pass through
+    //      to the BFF without stamping the vetted marker. The BFF's
+    //      guardCsrf enforces the allowlist by exact Origin match, which
+    //      is the production-shape DNS-rebinding defense. The proxy
+    //      cannot enforce the allowlist here because allowlists key on
+    //      Origin (not Host), and a same-origin GET can legitimately
+    //      omit Origin — only guardCsrf has the full picture.
+    //
+    //   C. Tunnel disabled + GINI_TRUSTED_ORIGINS unset: 404. No tunnel
+    //      authorizer and no operator-blessed allowlist means this
+    //      Host should not be reachable at all; failing closed at the
+    //      proxy keeps DNS-rebinding pages from probing the BFF before
+    //      guardCsrf gets a chance to refuse them.
     //
     // The secret + enabled flag come from config.json on every request
-    // (mtime-cached for 2s). Reading lazily avoids the env-injection race
-    // that bit first-boot autostart: the runtime mints the secret in
-    // src/server.ts AFTER `gini start` has already spawned the web with
-    // an empty GINI_TUNNEL_SECRET, and the autostart web plist did not
-    // propagate the env var at all. Now both layers consult the same
-    // disk record the gateway treats as the source of truth, so a
-    // freshly-enabled tunnel starts authorizing requests on the next
-    // request without restarting the web.
+    // (uncached — see readFileFreshTrim). Reading lazily avoids the
+    // env-injection race that bit first-boot autostart: the runtime
+    // mints the secret in src/server.ts AFTER `gini start` has already
+    // spawned the web with an empty GINI_TUNNEL_SECRET, and the
+    // autostart web plist did not propagate the env var at all. Now
+    // both layers consult the same disk record the gateway treats as
+    // the source of truth, so a freshly-enabled tunnel starts
+    // authorizing requests on the next request without restarting the
+    // web.
     const { enabled, secret } = runtimeTunnelState();
-    if (!enabled || !secret) return new NextResponse("Not Found", { status: 404 });
+    if (!enabled || !secret) {
+      // Shape B vs C: pass through to the BFF only when the operator
+      // has explicitly configured a trusted-origin allowlist. An empty
+      // allowlist (env var set but every entry malformed) is treated
+      // the same as "set" — guardCsrf will fail-closed on the
+      // forwarded request, which is the right answer for an operator
+      // who clearly meant to lock down the surface. Unset means no
+      // external deployment is configured; 404 keeps the un-deployed
+      // surface invisible.
+      const allowlist = trustedOrigins();
+      if (allowlist === null) return new NextResponse("Not Found", { status: 404 });
+      // Strip any inbound vetted marker so a remote caller cannot
+      // forge it before reaching the BFF guard. guardCsrf will then
+      // enforce Origin/Host using the allowlist.
+      return NextResponse.next({ request: { headers: strippedHeaders(request) } });
+    }
     const prefix = `/${secret}`;
     // Accept BOTH `/<secret>/...` (canonical) and bare `/<secret>` (the
     // form Next 16 produces after its automatic trailing-slash 308).
