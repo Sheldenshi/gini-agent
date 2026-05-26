@@ -16,6 +16,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
+import { registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
   useChatBlocks,
@@ -44,6 +45,18 @@ export default function ChatDetailScreen() {
   useEffect(() => {
     if (unauthorized) router.replace("/setup");
   }, [unauthorized]);
+
+  // Request APNs permission + register the device token the first time
+  // the user lands on a chat detail screen. Asking here (vs. on app
+  // launch) trades a few seconds of latency for noticeably higher
+  // grant rates — the user is already invested in an actual
+  // conversation, so the prompt reads as "Gini wants to let you know
+  // when something needs your call" instead of unexplained chrome.
+  // The module is idempotent across remounts and gates iOS-only
+  // internally, so calling it unconditionally here is fine.
+  useEffect(() => {
+    void registerForPushAsync();
+  }, []);
 
   const list = useMemo<ChatBlock[]>(() => blocks.data ?? [], [blocks.data]);
 
