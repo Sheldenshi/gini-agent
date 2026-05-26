@@ -142,7 +142,19 @@ shape that depends on memorising the URL breaks at the next reboot.
    `publicUrl` to `null` before forwarding the snapshot to the browser
    — the catch-all proxy at `web/src/app/api/runtime/[...path]/route.ts`
    refuses every other `/api/runtime/tunnel/*` path so a new endpoint
-   added to the gateway doesn't accidentally bypass the redactor.
+   added to the gateway doesn't accidentally bypass the redactor. The
+   one explicit exception is `tunnel/qr.svg`, which the catch-all
+   allow-lists via `canonicalSecondSegmentIsQrSvg`: the operator's
+   localhost browser needs to render the QR so they can scan it from
+   their phone, and an SVG that is also visible in the DOM cannot
+   meaningfully be redacted from browser JS — anyone with the rendered
+   pixels can run a QR decoder and recover the secret-bearing URL.
+   Hiding the SVG bytes while displaying the same pixels is a fiction;
+   the trade-off is also called out in the inline comment at
+   `web/src/app/api/runtime/[...path]/route.ts:25-30`. The
+   `tunnel/qr.txt` path is *not* allow-listed and remains refused by
+   the BFF — terminal QR rendering is for CLI/SSH operators talking
+   to the gateway directly, not for browser JS.
 
 6. When the runtime is on macOS and the iCloud account is signed in
    under Notes.app, the manager mirrors the current tunnel URL into a

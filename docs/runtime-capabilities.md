@@ -65,7 +65,7 @@ Stable local clients use the gateway API:
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
-- `/api/tunnel`, `/api/tunnel/refresh-notes`, `/api/tunnel/qr.svg`
+- `/api/tunnel`, `/api/tunnel/refresh-notes`, `/api/tunnel/qr.svg`, `/api/tunnel/qr.txt` (ANSI half-block QR for terminal display)
 
 All routes require `Authorization: Bearer <token>` except health checks, the limited SSE token compatibility path, and requests arriving through the optional Cloudflare quick tunnel with a valid secret-path prefix (see [Cloudflare Quick Tunnel With Secret-Path Auth And iCloud Notes Mirror](adr/tunnel-and-icloud-pairing.md)). The tunnel surface is opt-in (`tunnel.enabled` in the instance config) and rejects requests whose URL does not begin with the per-instance secret path.
 
