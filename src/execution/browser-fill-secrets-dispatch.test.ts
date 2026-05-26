@@ -117,6 +117,40 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(state.approvals.length).toBe(0);
   });
 
+  test("refuses dispatch when chat session is a dedicated job session mirroring to Telegram", async () => {
+    // Dedicated job-spawned sessions intentionally leave `source`
+    // undefined (so they don't compete for inbound routing) and
+    // record the bridge descriptor on `outboundMirror` instead.
+    // finalize.ts routes the eventual assistant text back via
+    // outboundMirror, so a fill_secret approval minted here would
+    // never get a web card to fill — the surface guard must catch
+    // both fields. See ChatSessionRecord docs in src/types.ts and
+    // the finalize.ts:161 outboundMirror-vs-source precedent.
+    const config = makeConfig("fill-secrets-outbound-telegram");
+    const taskId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "job session");
+      // Job-spawned: no inbound source, only the outbound mirror.
+      session.outboundMirror = { kind: "telegram", bridgeId: "bridge_t", chatId: 123, target: "123" };
+      const task = createTask(state.instance, "test");
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+      session.taskIds.push(task.id);
+      return task.id;
+    });
+
+    const result = await dispatchToolCall(config, taskId, "browser_fill_secrets", "call_1", VALID_ARGS);
+
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("only works in the web chat");
+    expect(parsed.error).toContain("telegram");
+
+    const state = readState(config.instance);
+    expect(state.approvals.length).toBe(0);
+  });
+
   test("rejects duplicate slot names with a sync error", async () => {
     const config = makeConfig("fill-secrets-dupe");
     const taskId = await seedTaskWithSession(config, undefined);

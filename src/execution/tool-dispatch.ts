@@ -2496,7 +2496,19 @@ async function browserFillSecretsTool(
   const surfaceSession = surfaceTask.chatSessionId
     ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
     : undefined;
-  const surfaceKind = surfaceSession?.source?.kind;
+  // Read both `source` (inbound bridge descriptor on live chat
+  // sessions) and `outboundMirror` (bridge descriptor on dedicated
+  // job-spawned sessions whose `source` is intentionally undefined
+  // so they don't compete for inbound routing — see ChatSessionRecord
+  // doc in src/types.ts). A scheduled job spawned from a Telegram
+  // chat has source=undefined but outboundMirror.kind="telegram",
+  // and submits with mode:"chat" so the full tool catalog is in
+  // scope — without checking outboundMirror, the guard would let
+  // such a job mint a fill_secret approval that no user can
+  // complete (no web card was ever rendered, finalize.ts routes
+  // the eventual reply back through outboundMirror to Telegram).
+  // Mirror finalize.ts:161's `outboundMirror ?? source` precedent.
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",
