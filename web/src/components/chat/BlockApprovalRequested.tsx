@@ -189,12 +189,29 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             captured page is `https://evil.com/phishing`, this badge
             is what lets the user see the mismatch.
           */}
-          {approval?.target ? (
-            <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
-              <span className="text-muted-foreground">Fill destination: </span>
-              <span className="font-mono">{approval.target}</span>
-            </div>
-          ) : null}
+          {(() => {
+            // Read from approval.payload.approvedUrl — the canonical
+            // load-bearing field the gateway compares against the
+            // live page URL. approval.target currently mirrors the
+            // same value, but the dispatcher's own comment marks
+            // target as "the human-readable label" and approvedUrl
+            // as "the load-bearing equality check," so a future
+            // change to target's format must not silently change
+            // what the user sees on the card. Fall back to target
+            // for legacy approvals minted before the payload field
+            // existed.
+            const approvedUrlField = typeof approval?.payload?.approvedUrl === "string"
+              ? approval.payload.approvedUrl
+              : undefined;
+            const destination = approvedUrlField ?? approval?.target;
+            if (!destination) return null;
+            return (
+              <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
+                <span className="text-muted-foreground">Fill destination: </span>
+                <span className="font-mono">{destination}</span>
+              </div>
+            );
+          })()}
           {fillSlots.map((slot) => (
             <div key={slot.name} className="space-y-1">
               <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-${slot.name}`}>

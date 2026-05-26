@@ -1227,8 +1227,31 @@ async function snapshot(page: Page, full: boolean, taskId?: string): Promise<Sna
   return { text, refs, elementCount, truncated };
 }
 
-function ok(payload: Record<string, unknown>): string {
-  return JSON.stringify({ success: true, ...payload });
+// Build a browser tool response, applying a redaction pass over
+// EVERY string leaf when the per-task secret registry has any
+// recorded values. The snapshot text is already redacted inside
+// snapshot(), and browserConsole/browserVision redact their
+// eval/answer fields explicitly — but every browser tool response
+// also includes raw `url: page.url()`, `title: await page.title()`,
+// and (for browser_tabs) tab arrays with both. A page can write
+// the typed credential into document.title (via an input handler)
+// or push it into the URL state (via history.pushState / hash),
+// and those metadata fields would otherwise leak through. Walking
+// the entire payload through redactSecretValuesDeep catches every
+// string leaf — url, title, tab.url, tab.title, plus anything
+// future tool responses surface.
+//
+// taskId is optional so legacy call sites (no per-task context)
+// fall through to the no-redaction fast path. The registry is
+// per-task so the lookup is O(1) — no DOM walk required.
+function ok(payload: Record<string, unknown>, taskId?: string): string {
+  const registered = taskId ? filledSecretValues.get(taskId) : undefined;
+  if (!registered || registered.size === 0) {
+    return JSON.stringify({ success: true, ...payload });
+  }
+  const secrets = Array.from(registered);
+  const redacted = redactSecretValuesDeep({ success: true, ...payload }, secrets);
+  return JSON.stringify(redacted);
 }
 
 function fail(error: string): string {
@@ -1261,7 +1284,7 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1280,7 +1303,7 @@ export async function browserSnapshot(taskId: string, args: Record<string, unkno
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1304,7 +1327,7 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1328,7 +1351,7 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1434,9 +1457,21 @@ export function redactSecretValuesDeep(value: unknown, secrets: readonly string[
   if (Array.isArray(value)) {
     return value.map((item) => redactSecretValuesDeep(item, secrets, seen));
   }
+  // Redact both KEYS and values. An agent can use a computed key
+  // to smuggle the secret bytes out via JSON serialization
+  // (`{[input.value]: 1}` → `{"hunter2": 1}`). When two keys
+  // collapse to the same redacted form, append a numeric suffix
+  // so the second hit doesn't silently overwrite the first.
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    out[k] = redactSecretValuesDeep(v, secrets, seen);
+    const redactedKey = redactSecretValuesFromString(k, secrets);
+    let finalKey = redactedKey;
+    if (finalKey !== k && Object.prototype.hasOwnProperty.call(out, finalKey)) {
+      let i = 2;
+      while (Object.prototype.hasOwnProperty.call(out, `${redactedKey}_${i}`)) i++;
+      finalKey = `${redactedKey}_${i}`;
+    }
+    out[finalKey] = redactSecretValuesDeep(v, secrets, seen);
   }
   return out;
 }
@@ -1578,7 +1613,7 @@ export async function browserPress(taskId: string, args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1601,7 +1636,7 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1621,7 +1656,7 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1696,7 +1731,7 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
         messages: redactedMessages,
         evalResult: redactedEvalResult,
         evalError: evalError ? redactSecretValuesFromString(evalError, secretValues) : null
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1723,7 +1758,7 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1754,7 +1789,7 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1839,7 +1874,7 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
         elementCount: snap.elementCount,
         truncated: snap.truncated,
         selected: selection
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1908,7 +1943,7 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1938,7 +1973,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
             active: p === session.page
           }))
         );
-        return ok({ url: session.page.url(), tabs });
+        return ok({ url: session.page.url(), tabs }, taskId);
       }
       if (action === "new") {
         if (args.url !== undefined && (typeof args.url !== "string" || args.url.length === 0)) {
@@ -1975,7 +2010,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           snapshot: snap.text,
           elementCount: snap.elementCount,
           truncated: snap.truncated
-        });
+        }, taskId);
       }
       if (action === "switch") {
         if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
@@ -1994,7 +2029,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           snapshot: snap.text,
           elementCount: snap.elementCount,
           truncated: snap.truncated
-        });
+        }, taskId);
       }
       // close
       if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
@@ -2039,7 +2074,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -2050,7 +2085,7 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
   try {
     consoleLogs.delete(taskId);
     await closeSession(taskId);
-    return ok({ closed: true, taskId });
+    return ok({ closed: true, taskId }, taskId);
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
@@ -2168,7 +2203,7 @@ export async function browserVision(
         full,
         cost: result.cost ?? null,
         usage: result.usage ?? null
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -2273,7 +2308,7 @@ export async function browserUploadFile(
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -2318,7 +2353,7 @@ export async function browserUploadFileApproved(
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));

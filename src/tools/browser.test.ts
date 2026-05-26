@@ -344,6 +344,34 @@ describe("browserFillByLocator error redaction", () => {
   });
 });
 
+describe("redactSecretValuesDeep object-key redaction", () => {
+  // An agent can use a computed object key to smuggle the secret
+  // out via JSON serialization: `{[input.value]: 1}` produces
+  // `{"hunter2": 1}` and `JSON.stringify` writes the key verbatim.
+  // The walker must redact both keys and values.
+  const { redactSecretValuesDeep } = require("./browser") as typeof import("./browser");
+
+  test("redacts secret bytes when they appear as object keys", () => {
+    const result = redactSecretValuesDeep({ "hunter2-LEAK": 1, other: "ok" }, ["hunter2-LEAK"]) as Record<string, unknown>;
+    expect(Object.keys(result)).not.toContain("hunter2-LEAK");
+    expect(Object.keys(result)).toContain("[redacted]");
+    expect(result.other).toBe("ok");
+  });
+
+  test("disambiguates collisions when multiple keys redact to the same token", () => {
+    const result = redactSecretValuesDeep({
+      "alpha-secret": "a",
+      "beta-secret": "b",
+      kept: "c"
+    }, ["alpha-secret", "beta-secret"]) as Record<string, unknown>;
+    // Both secret-keyed entries survive without overwriting each other.
+    const keys = Object.keys(result).filter((k) => k !== "kept");
+    expect(keys.length).toBe(2);
+    expect(keys.every((k) => k.startsWith("[redacted]"))).toBe(true);
+    expect(result.kept).toBe("c");
+  });
+});
+
 describe("redactSecretValuesFromString", () => {
   test("replaces every occurrence of every secret with [redacted]", () => {
     const text = "Login attempt with username=tomsmith and password=SuperSecret123. Retried with SuperSecret123 again.";
