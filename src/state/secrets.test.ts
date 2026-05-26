@@ -80,6 +80,28 @@ describe("secret round-trip", () => {
   });
 });
 
+describe("readSecret error paths", () => {
+  test("ENOENT does not leak the absolute filesystem path", () => {
+    const instance = "missing-file";
+    const ref = { purpose: "token", path: secretFilePath(instance, "id_ghost", "token") };
+    // File was never written; readFileSync will throw ENOENT.
+    let caught: Error | undefined;
+    try {
+      readSecret(instance, ref);
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeDefined();
+    // Must not contain the absolute path or any /Users/... prefix.
+    expect(caught?.message).not.toContain(ref.path);
+    expect(caught?.message).not.toMatch(/\/Users\//);
+    expect(caught?.message).not.toMatch(/\/tmp\//);
+    // Must still identify the missing target for diagnostics.
+    expect(caught?.message).toContain("id_ghost.token");
+    expect(caught?.message).toContain("missing");
+  });
+});
+
 describe("delete", () => {
   test("deleteSecret unlinks the file", () => {
     const instance = "del-one";

@@ -61,7 +61,7 @@ describe("approval-mode migration shim", () => {
 
     const loaded = loadConfig(instance);
     // loadConfig itself doesn't migrate; install runs the alias.
-    install(loaded);
+    await install(loaded);
     // Wait for the fire-and-forget audit row to land.
     await migrateLegacyApprovalMode(loaded);
 
@@ -93,7 +93,7 @@ describe("approval-mode migration shim", () => {
     writeConfig(instance, legacy);
 
     const loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     await migrateLegacyApprovalMode(loaded);
     // Second invocation should detect the existing audit row and skip.
     await migrateLegacyApprovalMode(loaded);
@@ -115,7 +115,7 @@ describe("approval-mode migration shim", () => {
     writeConfig(instance, fresh);
 
     let loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     // User explicitly opts into yolo via the settings API.
     updateAutoApproveSettings(loaded, { approvalMode: "yolo" });
 
@@ -126,7 +126,7 @@ describe("approval-mode migration shim", () => {
 
     // Simulate a restart: load the on-disk config fresh and rerun install.
     loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     await migrateLegacyApprovalMode(loaded);
 
     const state = readState(loaded.instance);
@@ -141,7 +141,7 @@ describe("approval-mode migration shim", () => {
     writeConfig(instance, fresh);
 
     const loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     await migrateLegacyApprovalMode(loaded);
 
     expect(loaded.approvalMode).toBe("auto");
@@ -166,7 +166,7 @@ describe("approval-mode migration shim", () => {
     writeConfig(instance, legacy);
 
     const loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     await migrateLegacyApprovalMode(loaded);
 
     expect(loaded.approvalMode).toBe("auto");
@@ -190,13 +190,13 @@ describe("approval-mode migration shim", () => {
 
     // First boot.
     let loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     await migrateLegacyApprovalMode(loaded);
 
     // Simulate a restart — the on-disk file now has approvalMode set
     // so the pre-flip marker should not re-fire.
     loaded = loadConfig(instance);
-    install(loaded);
+    await install(loaded);
     await migrateLegacyApprovalMode(loaded);
 
     const state = readState(loaded.instance);

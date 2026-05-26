@@ -6,30 +6,6 @@ import { join, resolve } from "node:path";
 // is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
 // it, every reconnect re-replays the entire event log.
 const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
-// Routes the BFF must gate behind origin + sec-fetch-site checks.
-// The default forwarding path injects the gateway bearer token
-// server-side, so a cross-origin POST from a victim's browser
-// reaches the gateway authenticated. Without this guard, an
-// attacker page can trigger any non-listed POST as the operator.
-// `embedding/reembed` is destructive enough to belong here even
-// though it doesn't lose data — `allBanks: true` runs an expensive
-// embedding pass against every bank in the instance, a DoS vector
-// for any operator who's paying per-token for embeddings.
-// `messaging/<bridge>/<verb>` covers the operator-only bot allowlist
-// surface (allow / deny / pair / reject-pending / disable / health
-// /send/receive) — any of those forwarded cross-origin would let an
-// attacker page mutate the bot's allowlist or fire outbound messages
-// as the operator. The bare `messaging` POST creates a brand-new bridge
-// (with a bot token) under the operator's identity, so it has to land
-// in the same guard or a cross-origin page can plant attacker-supplied
-// ingress.
-const PRIVILEGED_POST_ROUTES: ReadonlyArray<RegExp> = [
-  /^update$/,
-  /^update\/check$/,
-  /^embedding\/reembed$/,
-  /^messaging$/,
-  /^messaging\/[^/]+\/(allow|deny|pair|reject-pending|disable|health|send|receive)$/
-];
 
 // Always read the file fresh. The earlier mtime[+size]-keyed cache
 // kept returning stale values in three reachable scenarios:
@@ -158,7 +134,7 @@ export async function proxyRequest(
   const canonical = canonicalizeSegments(pathSegments);
   if (!canonical) return Response.json({ error: "Invalid path" }, { status: 400 });
 
-  const guard = guardPrivilegedRequest(request, canonical);
+  const guard = guardCsrf(request, canonical);
   if (guard) return guard;
 
   const upstreamUrl = new URL(request.url);
@@ -247,15 +223,208 @@ function canonicalizeSegments(segments: string[]): string[] | null {
   return out;
 }
 
-function guardPrivilegedRequest(request: Request, pathSegments: string[]): Response | null {
-  if (request.method !== "POST") return null;
-  const route = pathSegments.join("/");
-  if (!PRIVILEGED_POST_ROUTES.some((pattern) => pattern.test(route))) return null;
+// Parse GINI_TRUSTED_ORIGINS into a Set of normalized origin strings
+// (scheme://host[:port], no trailing slash, no path). Each entry must be a
+// complete origin; bare hostnames are rejected. See ADR bff-trust-boundary.md
+// for the trust-boundary decision and DNS-rebinding threat model.
+//
+// Tri-state return:
+//   null  → env var is unset; loopback-only Host-equality fallback applies.
+//   Set   → at least one valid origin parsed; the Set is the allowlist.
+//   empty → operator set the env var but every entry was malformed; the guard
+//           fails closed (refuses every privileged POST). This is the
+//           defense-in-depth posture for a typo in a control that exists
+//           specifically to lock down the trust boundary.
+function parseTrustedOrigins(raw: string | undefined): ReadonlySet<string> | null {
+  if (!raw || !raw.trim()) return null;
+  const out = new Set<string>();
+  for (const candidate of raw.split(",")) {
+    const trimmed = candidate.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      // Origins are scheme + host[+port] only. An operator who pasted a
+      // full URL like `https://gini-server.tail.ts.net/path?q=1` would
+      // silently get a broader allowlist than they meant (the path/query
+      // are dropped by .host). Reject those entries individually so the
+      // operator either fixes the env var or — if every entry is malformed
+      // — sees the fail-closed posture at the outer caller.
+      if (
+        (parsed.pathname !== "" && parsed.pathname !== "/")
+        || parsed.search !== ""
+        || parsed.hash !== ""
+        || parsed.username !== ""
+        || parsed.password !== ""
+      ) {
+        continue;
+      }
+      out.add(`${parsed.protocol}//${parsed.host}`);
+    } catch {
+      // Skip malformed entries individually; the outer caller decides what
+      // to do when every entry is bad. A single bad entry alongside good
+      // ones still produces a usable allowlist.
+    }
+  }
+  return out;
+}
 
-  const requestOrigin = new URL(request.url).origin;
+// Read process.env each call rather than caching at module import. The
+// allowlist is short and the parse is trivial — re-running it per
+// privileged POST costs a few microseconds, the requests aren't a hot
+// path, and tests can now drive the guard's behavior by setting or
+// deleting GINI_TRUSTED_ORIGINS in the test process without restarting
+// the module loader. Without this, integration tests that exercise the
+// BFF guard via proxyRequest would behave differently depending on
+// whether the operator's dev shell had the env var exported — a real
+// test-environment dependency, not just a theoretical one.
+function trustedOrigins(): ReadonlySet<string> | null {
+  return parseTrustedOrigins(process.env.GINI_TRUSTED_ORIGINS);
+}
+
+// Loopback hostnames the guard's local-dev fallback accepts when no
+// allowlist is configured. Anything else is DNS-rebindable from a public
+// origin and must be locked down with GINI_TRUSTED_ORIGINS.
+function isLoopbackHost(host: string): boolean {
+  // Strip the optional :port suffix. IPv6 literals are wrapped in brackets,
+  // so look at everything up to the last ":" only when no closing bracket
+  // follows. URL.host normalizes IPv6 to "[::1]:port" form.
+  const closeBracket = host.lastIndexOf("]");
+  const hostnameOnly = closeBracket >= 0
+    ? host.slice(0, closeBracket + 1)
+    : host.includes(":") ? host.slice(0, host.indexOf(":")) : host;
+  return hostnameOnly === "localhost" || hostnameOnly === "127.0.0.1" || hostnameOnly === "[::1]";
+}
+
+// Internal authorization marker that web/src/proxy.ts stamps onto requests
+// already vetted by the tunnel secret-path or session-cookie gate. The
+// proxy ALWAYS strips any inbound value before re-setting its own, so the
+// marker cannot be forged from outside. The guard treats its presence as
+// equivalent to a loopback Host (the tunnel surface legitimately runs on a
+// non-loopback `<random>.trycloudflare.com` host that cannot be put in
+// GINI_TRUSTED_ORIGINS because cloudflared mints a fresh hostname on every
+// restart). We still demand Origin == Host as defense in depth — proxy.ts
+// has already vetted the request, but matching Origin to Host adds same-
+// origin verification at the BFF boundary.
+const TUNNEL_VETTED_HEADER = "x-gini-tunnel-vetted";
+const TUNNEL_VETTED_VALUE = "1";
+
+function isTunnelVetted(request: Request): boolean {
+  return request.headers.get(TUNNEL_VETTED_HEADER) === TUNNEL_VETTED_VALUE;
+}
+
+// Tier the guard by method:
+// - Unsafe methods (POST/PUT/PATCH/DELETE): require Origin. Modern browsers
+//   always send it; absence indicates a non-browser client (curl/scripts/
+//   misconfigured proxies) and those should talk to the gateway directly
+//   with their own token, not the BFF's bearer-injection surface.
+// - Safe methods (GET/HEAD): allow missing Origin. Non-browser clients
+//   doing read-only inspection via the BFF (legacy callers) keep working.
+//   When Origin IS present (browser fetch), it's still checked — a DNS-
+//   rebinding page sends Origin honestly to the attacker-controlled host,
+//   so the allowlist/loopback check still catches it.
+//
+// The guard runs on every request, not just the prior PRIVILEGED_POST_ROUTES
+// list — readable surfaces like /state and the bare /pairing/claim POST
+// that mints device tokens were previously un-guarded and DNS-rebindable.
+const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
   const origin = request.headers.get("origin");
-  if (origin && origin !== requestOrigin) {
-    return Response.json({ error: "Forbidden" }, { status: 403 });
+  const isUnsafe = UNSAFE_METHODS.has(request.method);
+  const vetted = isTunnelVetted(request);
+  if (!origin) {
+    if (isUnsafe) {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    // Safe method (GET/HEAD) without Origin. Browsers may omit Origin on
+    // same-origin safe requests, which is the exact shape a DNS-rebound
+    // page produces (the browser thinks it's same-origin to attacker.
+    // example post-rebind). Validate the Host here so a non-loopback
+    // exposure still requires GINI_TRUSTED_ORIGINS to be set — Origin-
+    // less GETs from a rebound page hitting a tailnet/tunnel BFF will
+    // 403 because Host is non-loopback. Non-browser callers on
+    // loopback (curl, scripts) keep working.
+    const allowlist = trustedOrigins();
+    if (allowlist) {
+      // Operator opted into the strict allowlist. There's no Origin to
+      // compare, so we can't tell whether this is a legitimate same-
+      // origin GET or a rebound page that omitted Origin. Fail closed:
+      // any non-browser caller can hit the gateway directly with its
+      // own token, and a browser would have sent Origin.
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+    // Tunnel-vetted Origin-less safe requests are rejected: an Origin-less
+    // GET has no same-origin verification we could pair with the proxy's
+    // vetting, so accepting it would widen the surface to non-browser
+    // callers that happen to learn the tunnel hostname. Legitimate
+    // browsers on the tunnel always send Origin on cross-process API
+    // fetches.
+    if (!isLoopbackHost(expectedHost)) {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+  } else {
+    let originUrl: URL;
+    try {
+      originUrl = new URL(origin);
+    } catch {
+      return Response.json({ error: "Forbidden" }, { status: 403 });
+    }
+    // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS
+    // rebinding. When set, only requests whose Origin exactly matches one
+    // of the listed scheme+host[+port] entries pass. A rebinding attack
+    // sets Origin honestly to the attacker-controlled hostname (the
+    // browser sets Origin to the URL the operator visited), so an
+    // explicit allowlist breaks the bypass that a Host-equality check
+    // alone cannot — the browser legitimately sends Host equal to
+    // attacker.example after a rebind, and the Host comparison accepts
+    // it. The allowlist takes that codepath off the table for any
+    // operator who configures it. If the operator set the env var but
+    // every entry was malformed (empty Set), we fail closed — refuse
+    // every request — rather than silently downgrading to the rebindable
+    // fallback.
+    const allowlist = trustedOrigins();
+    if (allowlist) {
+      const normalized = `${originUrl.protocol}//${originUrl.host}`;
+      if (!allowlist.has(normalized)) {
+        return Response.json({ error: "Forbidden" }, { status: 403 });
+      }
+    } else {
+      // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset. Compare the
+      // browser-supplied Origin host against the Host header the browser
+      // actually used. Restrict the fallback to loopback Host values
+      // (localhost, 127.0.0.1, [::1]) so a BFF exposed on tailnet /
+      // tunnel / public-DNS hostname cannot be approached by a DNS-
+      // rebinding page that legitimately sets both Origin and Host to
+      // an attacker-controlled name. Operators running on a non-
+      // loopback hostname MUST set GINI_TRUSTED_ORIGINS — without it,
+      // the guard refuses every request so the rebindable path is
+      // fully closed.
+      //
+      // Exception: tunnel-vetted requests bypass the loopback requirement
+      // when Origin matches Host. The cloudflared tunnel surface
+      // legitimately runs on a non-loopback `<random>.trycloudflare.com`
+      // host, and the hostname rotates every restart so it cannot be put
+      // in GINI_TRUSTED_ORIGINS. proxy.ts already enforced the tunnel-
+      // secret or session-cookie gate AND stripped any client-supplied
+      // value of the vetted header before stamping its own, so the
+      // marker cannot be forged from outside. Pairing it with
+      // Origin == Host adds same-origin verification at the BFF
+      // boundary — a DNS-rebound page with a forged Origin would
+      // mismatch.
+      const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+      const sameOrigin = originUrl.host === expectedHost;
+      if (vetted && sameOrigin) {
+        // Authorized via tunnel proxy. Skip the loopback check.
+      } else {
+        if (!isLoopbackHost(expectedHost)) {
+          return Response.json({ error: "Forbidden" }, { status: 403 });
+        }
+        if (!sameOrigin) {
+          return Response.json({ error: "Forbidden" }, { status: 403 });
+        }
+      }
+    }
   }
 
   const fetchSite = request.headers.get("sec-fetch-site");

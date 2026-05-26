@@ -17,11 +17,17 @@ import type { Instance } from "../types";
 import { instanceRoot } from "../paths";
 import { id, now } from "./ids";
 
-// Bumped to 2 in Phase C: added agent_id columns to memory_banks and
+// Bumped to 3 for the ChatBlock protocol (ADR chat-block-protocol.md):
+// adds the `chat_blocks` table used by src/state/chat-blocks.ts to
+// persist runtime-emitted semantic conversation blocks (user_text,
+// assistant_text, tool_call, tool_result, phase, approval_requested,
+// system_note) alongside the legacy ChatMessageRecord path.
+//
+// Previous bump (Phase C → 2): added agent_id columns to memory_banks and
 // memory_units for per-agent memory isolation. New SQLite installs add the
 // columns through CREATE TABLE; existing installs add them via the additive
 // migration in applyMigrations().
-export const MEMORY_SCHEMA_VERSION = 2;
+export const MEMORY_SCHEMA_VERSION = 3;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -301,6 +307,39 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_memory_banks_agent ON memory_banks(agent_id);
     CREATE INDEX IF NOT EXISTS idx_memory_units_agent ON memory_units(agent_id);
     CREATE INDEX IF NOT EXISTS idx_memory_units_agent_network ON memory_units(agent_id, network);
+  `);
+
+  // Step 4 — chat_blocks table (schema version 3). Backs the ChatBlock
+  // protocol described in ADR chat-block-protocol.md. Runtime emits one
+  // row per semantic block (user_text, assistant_text streaming deltas,
+  // tool_call, tool_result, phase, approval_requested, system_note); the
+  // legacy ChatMessageRecord path keeps writing during the migration
+  // window. `ordinal` is allocated as `MAX(ordinal) + 1` per session_id
+  // inside the insert transaction so writers compete cleanly for the
+  // next slot. The agent_id index covers per-agent inbox views; the
+  // session+ordinal index covers ordered playback; the task_id partial
+  // index covers run-detail joins without bloating ordinary rows.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS chat_blocks (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      agent_id TEXT,
+      ordinal INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN (
+        'user_text','assistant_text','tool_call','tool_result',
+        'phase','approval_requested','system_note'
+      )),
+      payload_json TEXT NOT NULL,
+      task_id TEXT,
+      run_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (session_id, ordinal)
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_session ON chat_blocks(session_id, ordinal);
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_task ON chat_blocks(task_id) WHERE task_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
   `);
 
   db.run(

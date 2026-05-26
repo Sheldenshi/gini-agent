@@ -111,4 +111,18 @@ export interface ProviderModule {
   // responsible for any installation, OAuth, project provisioning, etc.,
   // and itself calls request_connector at the end to capture credentials.
   setupSkill?: string;
+  // Optional. When set, the runtime auto-registers a matching MCP server
+  // record (in `state.mcpServers`) the first time a configured + healthy
+  // connector for this provider appears. The registry is keyed by `name`:
+  // if an MCP server with the same name already exists (user-managed or
+  // otherwise), the upsert is a no-op so we never clobber custom config.
+  // Headers may reference `${ENV}` placeholders that resolve through
+  // `resolveMcpHeaders()` against the same provider's `envBindings`.
+  mcpServer?: {
+    name: string;
+    url: string;
+    transport?: "http";
+    headers?: Record<string, string>;
+    exposedTools?: string[];
+  };
 }

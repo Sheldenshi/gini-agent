@@ -132,7 +132,6 @@ describe("awaitTerminalTask", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });
@@ -166,7 +165,6 @@ describe("awaitTerminalTask", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });
@@ -193,7 +191,6 @@ describe("awaitTerminalTask", () => {
         tracePath: "",
         auditIds: [],
         approvalIds: [],
-        memoryIds: [],
         skillIds: []
       });
     });

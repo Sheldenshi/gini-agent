@@ -5,11 +5,10 @@ import { toast } from "sonner";
 import { PageHeader } from "@/components/PageHeader";
 import { api } from "@/lib/api";
 import { useInvalidate, useStatus } from "@/lib/queries";
-import type { AgentRow } from "@/lib/view-types";
 import { ProviderCard, type ProviderCatalogItem } from "./_components/ProviderCard";
-import { AgentCard } from "./_components/AgentCard";
 import { ToolsetsCard, type ToolsetRow } from "./_components/ToolsetsCard";
-import { McpCard, MessagingCard, type McpRow, type MessagingRow } from "./_components/McpCard";
+import { McpCard, type McpRow } from "./_components/McpCard";
+import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
 import { TunnelSettingsCard } from "./_components/TunnelSettingsCard";
@@ -21,10 +20,6 @@ export default function SettingsPage() {
     queryKey: ["providers"],
     queryFn: () => api<ProviderCatalogItem[]>("/providers/catalog"),
     refetchInterval: 60_000
-  });
-  const agents = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api<{ agents: AgentRow[]; activeAgentId?: string }>("/agents")
   });
   const toolsets = useQuery({
     queryKey: ["toolsets"],
@@ -41,12 +36,6 @@ export default function SettingsPage() {
   const devices = useQuery({
     queryKey: ["devices"],
     queryFn: () => api<DeviceRow[]>("/devices")
-  });
-
-  const useAgent = useMutation({
-    mutationFn: (id: string) => api(`/agents/${encodeURIComponent(id)}/use`, { method: "POST" }),
-    onSuccess: () => { toast.success("Agent activated"); invalidate(["agents", "state", "status", "memory"]); },
-    onError: (error: Error) => toast.error(error.message)
   });
 
   const toolsetToggle = useMutation({
@@ -74,9 +63,9 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const messagingDisable = useMutation({
-    mutationFn: (id: string) => api(`/messaging/${encodeURIComponent(id)}/disable`, { method: "POST" }),
-    onSuccess: () => { toast.success("Bridge disabled"); invalidate(["messaging", "state"]); },
+  const messagingRemove = useMutation({
+    mutationFn: (id: string) => api(`/messaging/${encodeURIComponent(id)}/remove`, { method: "POST" }),
+    onSuccess: () => { toast.success("Bridge removed"); invalidate(["messaging", "state", "events"]); },
     onError: (error: Error) => toast.error(error.message)
   });
 
@@ -92,7 +81,6 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const activeAgentId = agents.data?.activeAgentId;
   // Prefer activeAgent.resolvedProvider (Phase B) and fall back to
   // provider.provider for safety during rollout — older runtimes that
   // pre-date the activeAgent block still surface the legacy field.
@@ -102,25 +90,16 @@ export default function SettingsPage() {
     ?? status.data?.provider?.provider?.model;
   const catalogEntry = catalog.data?.find((c) => c.name === effectiveProviderName);
   const displayName = catalogEntry?.displayName ?? effectiveProviderName;
-  const agentWarnings = status.data?.activeAgent?.warnings ?? [];
 
   return (
     <>
-      <PageHeader title="Settings" description="Providers, browser, agents, toolsets, integrations, devices" />
+      <PageHeader title="Settings" description="Providers, browser, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
         <ProviderCard displayName={displayName} model={effectiveProviderModel} />
 
         <TunnelSettingsCard />
 
         <BrowserSettingsCard />
-
-        <AgentCard
-          agents={agents.data?.agents ?? []}
-          activeAgentId={activeAgentId}
-          warnings={agentWarnings}
-          pending={useAgent.isPending}
-          onUse={(id) => useAgent.mutate(id)}
-        />
 
         <ToolsetsCard
           toolsets={toolsets.data?.toolsets ?? []}
@@ -139,9 +118,9 @@ export default function SettingsPage() {
         <MessagingCard
           bridges={messaging.data ?? []}
           healthPending={messagingHealth.isPending}
-          disablePending={messagingDisable.isPending}
+          removePending={messagingRemove.isPending}
           onHealth={(id) => messagingHealth.mutate(id)}
-          onDisable={(id) => messagingDisable.mutate(id)}
+          onRemove={(id) => messagingRemove.mutate(id)}
         />
 
         <DevicesCard

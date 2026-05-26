@@ -37,7 +37,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     instance: "test",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
-    tasks: [], approvals: [], audit: [], memories: [], skills: [], jobs: [],
+    tasks: [], approvals: [], audit: [], skills: [], jobs: [],
     connectors: [], improvements: [], pairingCodes: [], devices: [],
     promotions: [], snapshots: [], tools: [], toolsets, subagents: [],
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
@@ -61,7 +61,12 @@ const ALWAYS_ON = new Set([
   "cancel_task",
   "install_skill",
   "enable_skill",
-  "disable_skill"
+  "disable_skill",
+  // Identity-file edit tools live under the "identity" toolset which is
+  // not in defaults; always-on so a fresh instance can propose SOUL.md /
+  // USER.md edits. The propose-vs-approve file split is the gate.
+  "edit_soul",
+  "edit_user_profile"
 ]);
 
 describe("buildToolCatalog", () => {
@@ -90,8 +95,6 @@ describe("buildToolCatalog", () => {
     const names = new Set(catalog.map((t) => t.function.name));
     const expectedVisible = [
       "recall_memory",
-      "add_memory",
-      "update_memory",
       "search_history",
       "cancel_task",
       "install_skill",
@@ -104,6 +107,11 @@ describe("buildToolCatalog", () => {
     for (const tool of expectedVisible) {
       expect(names.has(tool)).toBe(true);
     }
+    // add_memory and update_memory were dropped as part of the
+    // state.memories consolidation. See ADR
+    // runtime-identity-files.md.
+    expect(names.has("add_memory")).toBe(false);
+    expect(names.has("update_memory")).toBe(false);
   });
 
   test("disabling messaging toolset hides send_message (kill switch works)", () => {
@@ -172,5 +180,53 @@ describe("buildToolCatalog", () => {
     const names = new Set(catalog.map((t) => t.function.name));
     expect(names.has("file_read")).toBe(true);
     expect(names.has("terminal_exec")).toBe(true);
+  });
+
+  describe("identity tool descriptions", () => {
+    // The descriptions of `edit_user_profile` and `edit_soul` carry the
+    // bulk of the in-prompt steering. Pin the key clauses so a future
+    // rewrite that drops them surfaces as a test failure instead of
+    // silently regressing model behavior.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+
+    test("edit_user_profile description names the H2 sections and the soft cap", () => {
+      const tool = catalog.find((t) => t.function.name === "edit_user_profile");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      // H2 section convention (Identity, Preferences, Background, Goals).
+      expect(desc).toContain("## Identity");
+      expect(desc).toContain("## Preferences");
+      // Set preferred over append.
+      expect(desc).toContain('Prefer `action: "set"`');
+      // Declarative-not-imperative phrasing rule.
+      expect(desc).toContain("facts ABOUT the user");
+      // Budget awareness clause.
+      expect(desc).toContain("soft cap");
+      // SKIP-list keyword (a single representative entry is enough).
+      expect(desc).toContain("task progress");
+      // Don't-narrate / short ack rule.
+      expect(desc).toContain("Got it");
+      // USER/SOUL partition: communication preferences route here, not to
+      // edit_soul. A representative imperative-form example pins the rule
+      // so a future rewrite that drops the preference branch surfaces.
+      expect(desc).toContain("preferences");
+      expect(desc).toContain("be more concise");
+    });
+
+    test("edit_soul description names the H2 sections and the soft cap", () => {
+      const tool = catalog.find((t) => t.function.name === "edit_soul");
+      expect(tool).toBeDefined();
+      const desc = tool?.function.description ?? "";
+      expect(desc).toContain("## Voice");
+      expect(desc).toContain("## Style");
+      expect(desc).toContain('Prefer `action: "set"`');
+      expect(desc).toContain("Voice is terse");
+      expect(desc).toContain("soft cap");
+      // USER/SOUL partition: SOUL fires only on explicit persona
+      // assignment, not on USER preferences about communication.
+      expect(desc).toContain("persona");
+      expect(desc).toContain("You are");
+    });
   });
 });

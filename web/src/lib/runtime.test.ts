@@ -1,8 +1,8 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runtimeTunnelState } from "./runtime";
+import { proxyRequest, runtimeTunnelState } from "./runtime";
 
 // runtimeTunnelState reads the tunnel slot out of config.json on demand.
 // The previous implementation required the runtime to inject
@@ -109,5 +109,204 @@ describe("runtimeTunnelState", () => {
     mkdirSync(instanceDir, { recursive: true });
     writeFileSync(join(instanceDir, "config.json"), "{ not valid");
     expect(runtimeTunnelState()).toEqual({ enabled: false, secret: "" });
+  });
+});
+
+// guardCsrf is not exported, so we exercise it through proxyRequest. The
+// fetcher stub captures the upstream call; a 200 from the stub means the
+// guard let the request through, while a 403 returned without the stub
+// being called means the guard rejected.
+describe("guardCsrf via proxyRequest", () => {
+  let originsSnapshot: string | undefined;
+
+  beforeEach(() => {
+    originsSnapshot = process.env.GINI_TRUSTED_ORIGINS;
+    delete process.env.GINI_TRUSTED_ORIGINS;
+  });
+
+  afterEach(() => {
+    if (originsSnapshot === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+    else process.env.GINI_TRUSTED_ORIGINS = originsSnapshot;
+  });
+
+  function stubFetcher(): { fetcher: typeof fetch; called: () => number } {
+    let calls = 0;
+    const fetcher = mock(async () => {
+      calls += 1;
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
+    }) as unknown as typeof fetch;
+    return { fetcher, called: () => calls };
+  }
+
+  test("non-loopback Host without vetted header is rejected", async () => {
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://abc.trycloudflare.com"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
+  test("non-loopback Host WITH vetted header and matching Origin is accepted", async () => {
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(200);
+    expect(called()).toBe(1);
+  });
+
+  test("vetted header with mismatched Origin/Host is rejected", async () => {
+    const { fetcher, called } = stubFetcher();
+    // The marker without same-origin verification cannot authorize the
+    // request — defense in depth against a proxy.ts bug that stamped the
+    // header on a request whose Origin had been mangled in flight.
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://attacker.example",
+        "x-gini-tunnel-vetted": "1"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
+  test("vetted header with wrong value is treated as absent", async () => {
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "yes"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
+  test("vetted header does NOT override GINI_TRUSTED_ORIGINS allowlist", async () => {
+    // When the operator opted into the strict allowlist, the vetted
+    // marker must not grant access to a hostname not on the list — that
+    // would invert the explicit security posture the allowlist
+    // represents. A typo-protected operator config wins over the
+    // tunnel's internal authorization marker.
+    process.env.GINI_TRUSTED_ORIGINS = "https://tail.example";
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(403);
+    expect(called()).toBe(0);
+  });
+
+  test("vetted POST from tunneled origin is accepted (unsafe method)", async () => {
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/chats", {
+      method: "POST",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ title: "test" })
+    });
+    const response = await proxyRequest(request, ["chats"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(200);
+    expect(called()).toBe(1);
+  });
+
+  test("loopback request without vetted header still works", async () => {
+    // Verifies the existing local-dev path isn't broken: a same-origin
+    // request on 127.0.0.1 still passes without the marker.
+    const { fetcher, called } = stubFetcher();
+    const request = new Request("http://127.0.0.1:3072/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "127.0.0.1:3072",
+        origin: "http://127.0.0.1:3072"
+      }
+    });
+    const response = await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(response.status).toBe(200);
+    expect(called()).toBe(1);
+  });
+
+  test("the vetted header is NOT forwarded to the runtime", async () => {
+    // pickForwardHeaders allow-lists `content-type`, `accept`,
+    // `cache-control`, and `last-event-id`. The vetted marker is an
+    // internal BFF-only signal — the runtime must never see it,
+    // otherwise a future runtime change that trusts the header would
+    // re-open the bypass that the BFF guard exists to prevent.
+    let observed: Headers | null = null;
+    const fetcher = mock(async (_url: string, init: RequestInit) => {
+      observed = new Headers(init.headers);
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    const request = new Request("https://abc.trycloudflare.com/api/runtime/state", {
+      method: "GET",
+      headers: {
+        host: "abc.trycloudflare.com",
+        origin: "https://abc.trycloudflare.com",
+        "x-gini-tunnel-vetted": "1"
+      }
+    });
+    await proxyRequest(request, ["state"], {
+      runtimeUrl: "http://127.0.0.1:7778",
+      token: "test-token",
+      fetcher
+    });
+    expect(observed).not.toBeNull();
+    expect((observed as unknown as Headers).get("x-gini-tunnel-vetted")).toBeNull();
   });
 });

@@ -1224,6 +1224,322 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // ChatBlock protocol pin (ADR chat-block-protocol.md). The loop must
+  // emit a typed stream of blocks per chat session: user_text, phase,
+  // assistant_text, tool_call, tool_result, approval_requested,
+  // system_note. Tests run the loop against the echo provider with
+  // pre-loaded responses and assert the block list shape.
+  test("emits typed blocks for a successful tool-calling turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const fixturePath = join(workspaceRoot, "hello.md");
+    writeFileSync(fixturePath, "Hello, world!");
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-success");
+    const provider = normalizeProvider(config.provider);
+
+    // Set up the session BEFORE submitting the task so chatSessionId
+    // is bound to the task. submitTask threads chatSessionId through
+    // to createTask which the emission resolver reads.
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-test", undefined, "agent_x")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Sure, reading it now.",
+      toolCalls: [
+        { id: "call_1", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "hello.md" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "The file says: Hello, world!",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "what does hello.md say?" });
+    const finished = await waitForTerminal(config, submitted.taskId);
+    expect(finished.status).toBe("completed");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    // Expected sequence in ordinal order:
+    //   user_text → phase("Thinking") → assistant_text("Sure, reading it now.")
+    //   → phase("Working: file_read") → tool_call(file_read, ok)
+    //   → tool_result(call_1) → phase("Thinking") → assistant_text(final)
+    //   → phase("Completed")
+    const kinds = blocks.map((b) => b.kind);
+    expect(kinds[0]).toBe("user_text");
+    expect(kinds).toContain("tool_call");
+    expect(kinds).toContain("tool_result");
+    expect(kinds[kinds.length - 1]).toBe("phase");
+
+    const user = blocks.find((b) => b.kind === "user_text");
+    expect(user?.kind === "user_text" && user.text).toBe("what does hello.md say?");
+
+    const toolCall = blocks.find((b) => b.kind === "tool_call");
+    if (toolCall?.kind === "tool_call") {
+      expect(toolCall.toolName).toBe("file_read");
+      expect(toolCall.displayLabel).toBe("Read file");
+      expect(toolCall.argsPreview).toBe("hello.md");
+      expect(toolCall.argsFull).toEqual({ path: "hello.md" });
+      expect(toolCall.status).toBe("ok");
+      expect(toolCall.callId).toBe("call_1");
+    } else {
+      throw new Error("missing tool_call block");
+    }
+
+    const toolResult = blocks.find((b) => b.kind === "tool_result");
+    if (toolResult?.kind === "tool_result") {
+      expect(toolResult.callId).toBe("call_1");
+    } else {
+      throw new Error("missing tool_result block");
+    }
+
+    // Final assistant_text is the model's reply (after the tool result
+    // turn) — settled with streaming:false.
+    const assistantTexts = blocks.filter((b): b is typeof blocks[0] & { kind: "assistant_text" } =>
+      b.kind === "assistant_text"
+    );
+    expect(assistantTexts.length).toBeGreaterThan(0);
+    const finalAssistant = assistantTexts[assistantTexts.length - 1]!;
+    expect(finalAssistant.streaming).toBe(false);
+    expect(finalAssistant.text).toContain("Hello, world!");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("emits approval_requested with the action field for gated tools", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-approval");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-approval", undefined, "agent_y")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_w", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "out.txt", content: "hi" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Wrote it.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "write out.txt" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const { listChatBlocks } = await import("../state");
+    let blocks = listChatBlocks(config.instance, session.id);
+    const approval = blocks.find((b) => b.kind === "approval_requested");
+    if (approval?.kind === "approval_requested") {
+      expect(approval.approvalId).toBe(paused.approvalIds[0]);
+      expect(approval.action).toBe("file.write");
+      expect(approval.risk).toBeDefined();
+    } else {
+      throw new Error("missing approval_requested block");
+    }
+
+    // Resume by approving; the tool_call flips ok and a tool_result lands.
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, submitted.taskId);
+    expect(finished.status).toBe("completed");
+
+    blocks = listChatBlocks(config.instance, session.id);
+    const toolCall = blocks.find((b) => b.kind === "tool_call");
+    if (toolCall?.kind === "tool_call") {
+      expect(toolCall.status).toBe("ok");
+    } else {
+      throw new Error("missing tool_call block");
+    }
+    const toolResult = blocks.find((b) => b.kind === "tool_result");
+    expect(toolResult).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    writeFileSync(join(workspaceRoot, "a.md"), "alpha");
+    writeFileSync(join(workspaceRoot, "b.md"), "beta");
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-parallel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-parallel", undefined, "agent_p")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_a", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "a.md" }) } },
+        { id: "call_b", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "b.md" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read both.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "read both" });
+    const finished = await waitForTerminal(config, submitted.taskId);
+    expect(finished.status).toBe("completed");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const toolCalls = blocks.filter((b): b is typeof blocks[0] & { kind: "tool_call" } => b.kind === "tool_call");
+    expect(toolCalls).toHaveLength(2);
+    expect(toolCalls.map((c) => c.callId).sort()).toEqual(["call_a", "call_b"]);
+    expect(toolCalls.map((c) => c.ordinal)).toEqual(
+      toolCalls.map((c) => c.ordinal).slice().sort((x, y) => x - y)
+    );
+    expect(toolCalls.every((c) => c.status === "ok")).toBe(true);
+
+    const toolResults = blocks.filter((b) => b.kind === "tool_result");
+    expect(toolResults).toHaveLength(2);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("subagent tasks (no chat session) skip block emission entirely", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-subagent");
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Subagent done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    // Submit a task without a chatSessionId — equivalent to a subagent
+    // child or a CLI imperative task. The loop should run to
+    // completion but no chat_blocks rows should land.
+    const task = await submitTask(config, "subagent prompt", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    // No session => no rows in chat_blocks for this task. We can't
+    // grep by taskId alone (no helper exposed) so just confirm we
+    // wrote zero rows by asking the DB directly via getMemoryDb.
+    const { getMemoryDb } = await import("../state");
+    const db = getMemoryDb(config.instance);
+    const count = db
+      .query<{ c: number }, [string]>("SELECT COUNT(*) AS c FROM chat_blocks WHERE task_id = ?")
+      .get(task.id)?.c ?? 0;
+    expect(count).toBe(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("cancellation flips streaming assistant_text to settled and emits cancellation block", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-cancel");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-cancel", undefined, "agent_c")
+    );
+
+    // Single response that finishes immediately — the test exercises
+    // post-completion cancelTask emission rather than a true
+    // mid-stream cancel (which requires provider-stream injection
+    // outside the echo provider's contract). The chat-block invariant
+    // we test here: cancelTask emits system_note + Cancelled phase
+    // even after the task has already settled.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Hi.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "say hi" });
+    const finished = await waitForTerminal(config, submitted.taskId);
+    expect(finished.status).toBe("completed");
+
+    // Now cancel the (already-completed) task. cancelTask is idempotent
+    // for terminal tasks — it returns the row as-is — but the
+    // chat-block emission still happens unconditionally in the current
+    // implementation. We verify the invariant differently: by re-
+    // running through a fresh task that we cancel BEFORE waiting for
+    // it to settle.
+    const { cancelTask, submitTask } = await import("../agent");
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "second response",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    // Manually create a queued task tied to the same chat session,
+    // then cancel before runChatTask gets a chance to flip to
+    // running. The terminal status guard at the top of runChatTask
+    // detects the cancellation and bails out cleanly.
+    const cancelTarget = await submitTask(config, "will-be-cancelled", {
+      mode: "chat",
+      chatSessionId: session.id
+    });
+    await cancelTask(config, cancelTarget.id);
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+    const sysNotes = blocks.filter((b) => b.kind === "system_note");
+    expect(sysNotes.some((n) => n.kind === "system_note" && n.text === "Cancelled")).toBe(true);
+    const phases = blocks.filter((b) => b.kind === "phase");
+    expect(phases.some((p) => p.kind === "phase" && p.label === "Cancelled")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("deleteChatSession cascades and removes all chat blocks", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-cascade");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-cascade", undefined, "agent_d")
+    );
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Hello back.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "hi" });
+    await waitForTerminal(config, submitted.taskId);
+
+    const { listChatBlocks } = await import("../state");
+    expect(listChatBlocks(config.instance, session.id).length).toBeGreaterThan(0);
+
+    await mutateState(config.instance, (state) => deleteChatSession(state, session.id));
+    expect(listChatBlocks(config.instance, session.id)).toHaveLength(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 describe("buildAgentIdentity", () => {

@@ -3,11 +3,11 @@ import { createHandler, writePid } from "./http";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
+import { syncProviderMcpServers } from "./integrations/mcp-sync";
 import { install } from "./runtime";
 import { migrateIfNeeded } from "./memory";
 import { configPath, loadConfig, parseInstance, runtimePortPath, tunnelLogPath, webPortPath, writeConfigAtomic } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
-import { applyLegacyTelegramPairingMigration } from "./state/store";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
@@ -33,7 +33,7 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
-install(config);
+await install(config);
 writePid(config);
 
 // Inform the browser session manager which instance to consult for the
@@ -68,42 +68,18 @@ setBrowserInstance(config.instance);
   }
 }
 
-// One-shot migration for legacy telegram bridges (pre-allowlist). Runs
-// once per server start; the migration helper is idempotent so a
-// second run is a no-op. Done inside mutateState so the minted
-// pairing code lands on disk immediately — minting in a read-only
-// path (normalizeState) would create ephemeral codes on every
-// inspection.
-void mutateState(config.instance, (state) => {
-  const migrated = applyLegacyTelegramPairingMigration(state);
-  if (migrated) {
-    appendLog(config.instance, "messaging.pairing.migrated.applied", { instance: config.instance });
-  }
-}).catch((error) => {
-  appendLog(config.instance, "messaging.pairing.migration.error", {
+// Legacy Hindsight-migration opportunistic seam. The
+// state.memories surface was retired in the memory-surface
+// consolidation; the install-time migration in
+// `migrate-pinned-to-user-md.ts` now drains every active pinned row into
+// USER.md. `migrateIfNeeded` is kept as a no-op so older external
+// callers don't break, but the report is always `null` — nothing to log.
+// See ADR runtime-identity-files.md.
+migrateIfNeeded(config).catch((error) => {
+  appendLog(config.instance, "memory.migrate.error", {
     error: error instanceof Error ? error.message : String(error)
   });
 });
-
-// Hindsight phase 6: opportunistic legacy migration. Runs once per server
-// start; subsequent starts are no-ops because each migrated record carries
-// metadata.migratedToUnitId. Failures are logged but do not block startup —
-// `gini doctor` surfaces the count of unmigrated rows.
-migrateIfNeeded(config)
-  .then((report) => {
-    if (!report) return;
-    appendLog(config.instance, "memory.migrated", {
-      total: report.total,
-      migrated: report.migrated,
-      skipped: report.skipped,
-      failed: report.failed
-    });
-  })
-  .catch((error) => {
-    appendLog(config.instance, "memory.migrate.error", {
-      error: error instanceof Error ? error.message : String(error)
-    });
-  });
 
 // Slice 2: load filesystem-backed skills (bundled + user) at boot. Errors
 // are absorbed into the audit/log so a malformed SKILL.md can never block
@@ -136,6 +112,22 @@ runConnectorDetection(config)
   })
   .catch((error) => {
     appendLog(config.instance, "connector.detection.error", {
+      error: error instanceof Error ? error.message : String(error)
+    });
+  });
+
+// Back-fill MCP server registrations for any connectors that were already
+// healthy before the connector↔MCP bridge shipped. Idempotent and
+// best-effort: errors are absorbed so a malformed provider descriptor
+// can't block startup.
+syncProviderMcpServers(config)
+  .then((created) => {
+    if (created.length > 0) {
+      appendLog(config.instance, "mcp.auto_register.startup", { created });
+    }
+  })
+  .catch((error) => {
+    appendLog(config.instance, "mcp.auto_register.error", {
       error: error instanceof Error ? error.message : String(error)
     });
   });

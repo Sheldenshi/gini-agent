@@ -5,13 +5,11 @@
 // drive their own prompts via a shared SetupIO surface.
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
-import { configPath, writeConfigAtomic } from "../../paths";
-import { normalizeProvider } from "../../provider";
+import { writeConfigAtomic } from "../../paths";
+import { hasUsableCodexCredentials, normalizeProvider } from "../../provider";
 import {
   ensureSecretsEnvPerms,
   secretsEnvPath,
@@ -106,33 +104,20 @@ export interface ProviderModule {
   ensureCredentials(io: SetupIO): Promise<boolean>;
 }
 
-function codexAuthFilePath(): string {
-  const home = process.env.HOME || homedir();
-  return join(home, ".codex", "auth.json");
-}
-
-// Parse-only: we never read or copy token values out of auth.json — only
-// confirm the file (or env var) holds well-formed JSON.
+// Single source of truth for "are codex credentials usable?" — the runtime
+// helper resolves CODEX_AUTH_JSON as a filesystem path (matching the gateway
+// and providerHealth probes), so this CLI flow can't drift from what the
+// runtime actually accepts. We still distinguish env vs file as the source
+// for display purposes by checking whether CODEX_AUTH_JSON drove the lookup.
 function checkCodexCredentialsStatus(): CredentialStatus {
-  const envRaw = process.env.CODEX_AUTH_JSON;
-  if (envRaw && envRaw.length > 0) {
-    try {
-      JSON.parse(envRaw);
-      return { available: true, source: "env", display: "✓ in CODEX_AUTH_JSON env" };
-    } catch {
-      // fall through; treat unparseable env as missing
-    }
+  if (!hasUsableCodexCredentials({ name: "codex", model: "gpt-5.5" })) {
+    return { available: false, source: "missing", display: "✗ missing — run codex --login" };
   }
-  const path = codexAuthFilePath();
-  if (existsSync(path)) {
-    try {
-      JSON.parse(readFileSync(path, "utf8"));
-      return { available: true, source: "file", display: "✓ ~/.codex/auth.json" };
-    } catch {
-      // unparseable → treat as missing
-    }
+  const envPath = process.env.CODEX_AUTH_JSON;
+  if (envPath && envPath.length > 0) {
+    return { available: true, source: "env", display: "✓ in CODEX_AUTH_JSON env" };
   }
-  return { available: false, source: "missing", display: "✗ missing — run codex --login" };
+  return { available: true, source: "file", display: "✓ ~/.codex/auth.json" };
 }
 
 const openaiProvider: ProviderModule = {

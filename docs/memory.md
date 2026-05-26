@@ -2,9 +2,17 @@
 
 Gini memory is visible, governable, and local by default.
 
-Memory records live in `~/.gini/instances/<instance>/memory.db` using SQLite. The model cache for local embeddings and reranking lives in `~/.gini/models/`.
+Gini has three memory surfaces (see [ADR runtime-identity-files.md](./adr/runtime-identity-files.md) for the partition):
 
-Memory is scoped per agent. Each agent owns its own pool — banks, units, and legacy memory records all carry the active agent id, and recall filters on it across every channel. Switching the active agent changes which memories are recalled and pinned. New agents start with an empty pool; configuration is copied at creation, content is not. See [ADR agent-memory-isolation.md](./adr/agent-memory-isolation.md) for the isolation contract.
+- **USER.md** — instance-scoped user identity, always injected into the prompt. Edited via the `edit_user_profile` tool, auto-approved when the injection scan passes (a flagged body routes through `.proposed` for review).
+- **SOUL.md** — per-agent persona, always injected. Edited via the `edit_soul` tool which always routes through `.proposed` for user approval.
+- **Hindsight** — per-agent SQLite bank populated automatically by auto-retain at the end of every chat task. Queried by recall on each turn and by the `recall_memory` tool on demand.
+
+This document covers Hindsight; USER.md / SOUL.md are documented in [runtime-identity-files.md](./adr/runtime-identity-files.md).
+
+Hindsight units live in `~/.gini/instances/<instance>/memory.db` using SQLite. The model cache for local embeddings and reranking lives in `~/.gini/models/`.
+
+Hindsight is scoped per agent. Each agent owns its own bank, units carry the active agent id, and recall filters on it across every channel. Switching the active agent changes which memories are recalled. New agents start with an empty bank; configuration is copied at creation, content is not. See [ADR agent-memory-isolation.md](./adr/agent-memory-isolation.md) for the isolation contract.
 
 ## Mental Model
 
@@ -17,20 +25,18 @@ flowchart LR
   Recall --> Context[Context for future work]
   Context --> Agent[Agent response or action]
   SQLite --> Reflect[Reflect]
-  Reflect --> Proposal[Memory proposal]
-  Proposal --> Review[Human review]
-  Review --> SQLite
+  Reflect --> Summary[Reflected summary]
+  Summary --> SQLite
 ```
 
-Memory is not hidden prompt stuffing. Gini records memory units with provenance, retrieves them through multiple signals, and keeps review surfaces available for proposed or generated changes.
+Memory is not hidden prompt stuffing. Hindsight records memory units with provenance and retrieves them through multiple signals on demand.
 
 ## Memory Operations
 
-- **Retain:** write a memory unit with source/provenance metadata.
-- **Recall:** retrieve relevant memory with semantic, lexical, graph, and temporal signals.
+- **Retain:** write a memory unit with source/provenance metadata. The auto-retain pipeline runs at the end of every chat task and populates the bank without any tool call.
+- **Recall:** retrieve relevant memory with semantic, lexical, graph, and temporal signals. Surfaced via the `recall_memory` tool and the per-turn automatic recall.
 - **Reflect:** propose higher-level memory from existing evidence.
 - **Reinforce:** update strength and relationships as memories are used.
-- **Review:** edit, approve, reject, or archive memory records.
 
 ## Retain Flow
 
@@ -43,7 +49,6 @@ flowchart TD
   Embed --> Store[(SQLite memory.db)]
   Store --> Audit[Audit event]
   Store --> Trace[Trace evidence when tied to execution]
-  Store --> Review[Review/edit/archive surfaces]
 ```
 
 Retain keeps enough metadata to answer: where did this memory come from, what entities does it touch, what model embedded it, and what runtime action created it.
@@ -85,18 +90,7 @@ The four channels cover different failure modes:
 
 ## Review And Governance
 
-```mermaid
-stateDiagram-v2
-  [*] --> Proposed
-  Proposed --> Active: approve
-  Proposed --> Rejected: reject
-  Active --> Active: edit
-  Active --> Archived: archive
-  Rejected --> [*]
-  Archived --> [*]
-```
-
-Agent-created memory should stay inspectable. Review states make it possible to accept useful memories, reject bad ones, and archive outdated facts without deleting provenance.
+Hindsight units do not flow through a propose/approve gate — auto-retain writes them directly to the bank. Provenance metadata (source task, source trace ids, embedding model) is recorded with every unit so the user can review them on the Memory page and prune individual units as needed. Curated identity facts go through the propose/approve gate for USER.md and SOUL.md instead, see [ADR runtime-identity-files.md](./adr/runtime-identity-files.md).
 
 ## Embeddings
 
@@ -146,15 +140,12 @@ GINI_RERANKER_TOP_N=<int>
 
 Smoke tests pin echo providers so parallel smoke runs and CI do not download models.
 
-## Current Surfaces
+## Hindsight Surfaces
 
-- `gini memory list/add/edit/approve/reject/archive`
-- `/api/memory`
-- `/api/banks`
-- `/api/memory/recall`
-- `/api/memory/reflect`
-- `/api/memory/migrate`
-- web Memory page
+- `gini memory {retain|recall|reflect|units|banks|migrate}` — CLI subcommands.
+- `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks` — API contracts.
+- The `recall_memory` agent tool (default `memory` toolset).
+- The web Memory page.
 
 ## Direction
 

@@ -7,7 +7,7 @@ export function hermesParityChecks(config: RuntimeConfig): { ok: boolean; checks
   const checks: ParityCheck[] = [
     check("cli", "CLI workflow", true, ["install/start/status/task commands exist"], "pass"),
     check("events", "Runtime event stream", true, [`${state.events.length} events`, "events API feeds CLI/mobile/watch surfaces"], "pass"),
-    check("memory", "Persistent memory", true, [`${state.memories.length} memory records`, "proposal/approve/reject APIs", "user/project/device/temporary scopes"], "pass"),
+    check("memory", "Persistent memory", true, ["USER.md (cross-agent identity)", "SOUL.md (per-agent persona)", "Hindsight per-agent bank (auto-retain + recall)"], "pass"),
     check("skills", "Skills/procedures", true, [`${state.skills.length} skills`, "search/show/update/test/enable/disable/rollback APIs"], "pass"),
     check("session_search", "Session search", true, ["search API returns task/trace/memory/skill/audit citations"], "pass"),
     check("jobs", "Cron/jobs", true, [`${state.jobs.length} jobs`, `${state.jobRuns.length} run records`, "prompt/script run/replay/update/remove APIs"], "pass"),

@@ -5,9 +5,29 @@ import { print } from "../output";
 
 const ADD_VALUE_FLAGS = new Set(["--bot-token"]);
 
+const KNOWN_SUBS = new Set([
+  "list",
+  "add",
+  "health",
+  "disable",
+  "remove",
+  "receive",
+  "send",
+  "messages",
+  "allow",
+  "deny",
+  "reject-pending",
+  "chats"
+]);
+
 export async function messaging(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;
   const sub = cliArgs[1] ?? "list";
+  if (!KNOWN_SUBS.has(sub)) {
+    throw new Error(
+      `Unknown messaging subcommand '${sub}'. Available: ${Array.from(KNOWN_SUBS).join(", ")}.`
+    );
+  }
   if (sub === "add") {
     const tail = restAfter(cliArgs, sub);
     const parsed = parseSubArgs(tail, ADD_VALUE_FLAGS);
@@ -24,21 +44,12 @@ export async function messaging(ctx: CliContext): Promise<void> {
       body: JSON.stringify(body)
     });
     print(bridge);
-    printPairingHint(bridge);
     return;
   }
-  if (sub === "health" || sub === "disable") {
+  if (sub === "health" || sub === "disable" || sub === "remove") {
     const id = restAfter(cliArgs, sub)[0];
     if (!id) throw new Error(`Usage: gini messaging ${sub} <bridge-id-or-name>`);
     print(await api(config, `/api/messaging/${encodeURIComponent(id)}/${sub}`, { method: "POST" }));
-    return;
-  }
-  if (sub === "pair") {
-    const id = restAfter(cliArgs, sub)[0];
-    if (!id) throw new Error("Usage: gini messaging pair <bridge-id-or-name>");
-    const bridge = await api(config, `/api/messaging/${encodeURIComponent(id)}/pair`, { method: "POST" });
-    print(bridge);
-    printPairingHint(bridge);
     return;
   }
   if (sub === "receive" || sub === "send") {
@@ -89,23 +100,4 @@ export async function messaging(ctx: CliContext): Promise<void> {
     return;
   }
   print(await api(config, "/api/messaging"));
-}
-
-// Surfaced after `gini messaging add` (telegram-kind) and `gini
-// messaging pair`. The bridge record already carries the code, but
-// users skim the JSON output — a separate line with the code and a
-// short instruction makes the next step obvious.
-function printPairingHint(bridge: unknown): void {
-  if (!bridge || typeof bridge !== "object") return;
-  const meta = (bridge as { metadata?: { pairingCode?: unknown; pairingCodeExpiresAt?: unknown; botUsername?: unknown } }).metadata;
-  if (!meta || typeof meta !== "object") return;
-  const code = typeof meta.pairingCode === "string" ? meta.pairingCode : undefined;
-  if (!code) return;
-  const expiresRaw = typeof meta.pairingCodeExpiresAt === "string" ? meta.pairingCodeExpiresAt : undefined;
-  const handle = typeof meta.botUsername === "string" ? `@${meta.botUsername}` : "your bot";
-  const expiresHint = expiresRaw
-    ? ` Expires at ${expiresRaw}.`
-    : "";
-  // eslint-disable-next-line no-console
-  console.log(`\nPairing code: ${code}\nDM ${handle} on Telegram with that message to enroll your chat.${expiresHint}`);
 }

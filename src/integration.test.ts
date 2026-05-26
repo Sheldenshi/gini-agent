@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { proxyRequest } from "../web/src/lib/runtime";
 
 const RUNTIME_URL = "http://127.0.0.1:9999";
@@ -9,6 +9,20 @@ function mockFetcher(handler: (url: string, init: RequestInit) => Response | Pro
 }
 
 describe("runtime proxy", () => {
+  // The BFF guard's behavior branches on GINI_TRUSTED_ORIGINS — when set,
+  // only listed origins pass; when unset, the loopback-fallback path
+  // matches Origin against Host. Pin the env to "unset" before each test
+  // so dev shells / CI environments that export the var don't change the
+  // guard's branch under tests that assume the fallback.
+  const savedTrustedOrigins = process.env.GINI_TRUSTED_ORIGINS;
+  beforeEach(() => {
+    delete process.env.GINI_TRUSTED_ORIGINS;
+  });
+  afterEach(() => {
+    if (savedTrustedOrigins === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
+    else process.env.GINI_TRUSTED_ORIGINS = savedTrustedOrigins;
+  });
+
   test("injects bearer token and forwards GET to /api/<path>", async () => {
     let captured: { url: string; init: RequestInit } | null = null;
     const fetcher = mockFetcher((url, init) => {
@@ -40,7 +54,7 @@ describe("runtime proxy", () => {
     });
     const request = new Request("http://localhost/api/runtime/tasks", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: "http://localhost" },
       body: JSON.stringify({ input: "hello" })
     });
     const response = await proxyRequest(request, ["tasks"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
@@ -83,20 +97,190 @@ describe("runtime proxy", () => {
     expect(captured.auth).toBe(`Bearer ${TOKEN}`);
   });
 
+  test("rejects non-loopback Host in the fallback path even when Origin matches", async () => {
+    // The fallback (no GINI_TRUSTED_ORIGINS) accepts only loopback Host
+    // values so a BFF on tailnet / tunnel can't be approached by a DNS-
+    // rebinding page that sets Origin and Host to the same attacker-
+    // controlled name. Without the loopback restriction, the equality
+    // check at the bottom of the fallback would pass and the bearer
+    // would be forwarded.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tailnet.example/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "http://gini-server.tailnet.example", host: "gini-server.tailnet.example" }
+    });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(403);
+  });
+
+  test("allowlist branch accepts origins in GINI_TRUSTED_ORIGINS and rejects the rest", async () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini-server.tailnet.example,http://localhost:3000";
+
+    const passed: { auth: string | null } = { auth: null };
+    const passingFetcher = mockFetcher((_url, init) => {
+      passed.auth = (init.headers as Headers).get("authorization");
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
+    });
+    const passingRequest = new Request("https://gini-server.tailnet.example/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "https://gini-server.tailnet.example", host: "gini-server.tailnet.example" }
+    });
+    const passingResponse = await proxyRequest(passingRequest, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher: passingFetcher });
+    expect(passingResponse.status).toBe(200);
+    expect(passed.auth).toBe(`Bearer ${TOKEN}`);
+
+    const rejectingFetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const rejectedRequest = new Request("https://gini-server.tailnet.example/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "https://attacker.example", host: "gini-server.tailnet.example" }
+    });
+    const rejectedResponse = await proxyRequest(rejectedRequest, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher: rejectingFetcher });
+    expect(rejectedResponse.status).toBe(403);
+  });
+
+  test("allowlist branch fails closed when every entry in GINI_TRUSTED_ORIGINS is malformed", async () => {
+    // A typo in the env var that leaves zero parseable origins refuses
+    // every privileged POST rather than silently downgrading to the
+    // rebindable Host-equality fallback.
+    process.env.GINI_TRUSTED_ORIGINS = "not-a-url, also-not-a-url, :::garbage";
+
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://localhost/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "http://localhost" }
+    });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(403);
+  });
+
+  test("privileged POST with no Origin header fails closed", async () => {
+    // Modern browsers always send Origin on POST. A request without it
+    // is either a non-browser client (curl, scripts) that should hit the
+    // gateway directly with its own token, or a misconfigured proxy
+    // stripping the header — neither should drive the operator's
+    // bearer-injected privileged path.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://localhost/api/runtime/update", { method: "POST" });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(403);
+  });
+
+  test("rejects Origin-less GETs on non-loopback hosts (browser may omit Origin on same-origin safe requests)", async () => {
+    // Some browsers omit Origin on same-origin GET. A DNS-rebound page
+    // that thinks it's same-origin to attacker.example produces exactly
+    // this shape: no Origin, Host = attacker.example. The fallback's
+    // host validation must run even without Origin so a non-loopback
+    // host without an allowlist 403s.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tail.ts.net/api/runtime/state", {
+      method: "GET",
+      headers: { host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
+  test("rejects Origin-less GETs when GINI_TRUSTED_ORIGINS is set (no Origin to validate)", async () => {
+    // With an allowlist configured, the operator opted in to strict
+    // Origin-based validation. There's no Origin to compare on, so the
+    // safest call is to refuse and let non-browser callers go directly
+    // to the gateway with their own token.
+    process.env.GINI_TRUSTED_ORIGINS = "http://localhost:3000";
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://localhost:3000/api/runtime/state", {
+      method: "GET",
+      headers: { host: "localhost:3000" }
+    });
+    const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
+  test("rejects GETs whose Origin doesn't match Host on non-loopback hosts (DNS-rebinding for read-only state)", async () => {
+    // Before the wider guard, GETs bypassed the CSRF check entirely.
+    // A DNS-rebound page on attacker.example fetching /api/runtime/state
+    // would have Origin=Host=attacker.example, the BFF would inject the
+    // bearer, and the response would be readable same-origin under the
+    // attacker's page. The guard now runs on every request and rejects
+    // a non-loopback Host without an explicit allowlist.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tail.ts.net/api/runtime/state", {
+      method: "GET",
+      headers: { origin: "http://gini-server.tail.ts.net", host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
+  test("rejects non-listed POSTs (pairing/claim) that previously bypassed the guard", async () => {
+    // /pairing and /pairing/claim used to live outside PRIVILEGED_POST_ROUTES,
+    // so a rebound page could drive token-minting under the operator's
+    // bearer. The guard now runs on every POST regardless of route.
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("http://gini-server.tail.ts.net/api/runtime/pairing", {
+      method: "POST",
+      headers: { origin: "http://gini-server.tail.ts.net", host: "gini-server.tail.ts.net", "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const response = await proxyRequest(request, ["pairing"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    expect(response.status).toBe(403);
+  });
+
+  test("allowlist entries with a path or query are rejected so the operator's intent isn't silently broadened", async () => {
+    // An operator who pastes a full URL — say https://host/some-path —
+    // would otherwise silently get an allowlist for the entire host
+    // (the URL parser drops the path on .host). Refuse those entries
+    // so a copy-paste mistake either produces an empty (fail-closed)
+    // allowlist or a deliberately narrow one.
+    process.env.GINI_TRUSTED_ORIGINS = "https://gini-server.tail.ts.net/some-path?token=secret";
+
+    const fetcher = mockFetcher(() => {
+      throw new Error("upstream should not be called");
+    });
+    const request = new Request("https://gini-server.tail.ts.net/api/runtime/update", {
+      method: "POST",
+      headers: { origin: "https://gini-server.tail.ts.net", host: "gini-server.tail.ts.net" }
+    });
+    const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+
+    expect(response.status).toBe(403);
+  });
+
   test("supports PATCH and DELETE methods", async () => {
     const seen: string[] = [];
     const fetcher = mockFetcher(async (_url, init) => {
       seen.push(String(init.method));
       return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
     });
-    const patchRequest = new Request("http://localhost/api/runtime/memory/m_1", {
+    const patchRequest = new Request("http://localhost/api/runtime/skills/s_1", {
       method: "PATCH",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", origin: "http://localhost" },
       body: JSON.stringify({ content: "x" })
     });
-    const deleteRequest = new Request("http://localhost/api/runtime/memory/m_1", { method: "DELETE" });
-    await proxyRequest(patchRequest, ["memory", "m_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
-    await proxyRequest(deleteRequest, ["memory", "m_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    const deleteRequest = new Request("http://localhost/api/runtime/skills/s_1", {
+      method: "DELETE",
+      headers: { origin: "http://localhost" }
+    });
+    await proxyRequest(patchRequest, ["skills", "s_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
+    await proxyRequest(deleteRequest, ["skills", "s_1"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
 
     expect(seen).toEqual(["PATCH", "DELETE"]);
   });

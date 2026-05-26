@@ -2,7 +2,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildAgentSystemContext } from "./system-prompt";
-import type { CostRecord, MemoryRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
+import { readState } from "./state";
+import { appendTrace } from "./state/trace";
+import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -802,10 +805,23 @@ async function readResponsesToolCallingStream(
     });
   }
 
+  // Backstop: codex sometimes emits tool calls as literal `<tool_call>`
+  // markup in the assistant text channel instead of (or in addition to)
+  // structured function_call items. Recover those so the chat-task loop
+  // can dispatch them. The structured shape wins on dedup, so a model
+  // that emits both an SSE function_call and a text mirror only fires
+  // the call once.
+  const joinedText = textParts.join("");
+  const extracted = extractTextToolCallsFromAssistantText(joinedText, toolCalls);
+  for (const call of extracted.calls) {
+    toolCalls.push(call);
+  }
+  const finalText = extracted.residual;
+
   const finishReason: ToolCallingResult["finishReason"] = toolCalls.length > 0 ? "tool_calls" : "stop";
   return {
     provider,
-    text: textParts.join("").trim(),
+    text: finalText.trim(),
     toolCalls,
     finishReason,
     responseId,
@@ -814,31 +830,313 @@ async function readResponsesToolCallingStream(
   };
 }
 
+// Codex tool-call-as-text backstop. The Responses-API parser handles the
+// structured `function_call` items; this complements it by scanning the
+// final assistant text for literal `<tool_call>...</tool_call>` markup.
+// Each successfully parsed block is emitted as a synthetic ToolCall and
+// the markup is stripped from the residual text so the user never sees
+// the raw XML/JSON in chat. Two body shapes are recognized:
+//   1. XML: `<tool_call name="X"><arg name="Y">v</arg>...</tool_call>`
+//   2. JSON: `<tool_call>{"name":"X","arguments":{...}}</tool_call>`
+// A third hybrid form (XML `name=` attribute with a JSON inner body) is
+// handled by trying JSON first and falling back to XML <arg> children.
+// `structuredCalls` is the list of natively-decoded function_calls; any
+// text block that matches one by (name, arguments-shape) is dropped to
+// avoid double-dispatch.
+export function extractTextToolCallsFromAssistantText(
+  text: string,
+  structuredCalls: ToolCall[]
+): { calls: ToolCall[]; residual: string } {
+  if (!text || !text.includes("<tool_call")) {
+    return { calls: [], residual: text };
+  }
+  // Build a sorted list of code-block (` ``` ` fenced or single-backtick
+  // span) ranges so we can skip `<tool_call>` substrings that appear
+  // inside them — the model is probably explaining its own syntax.
+  const codeRanges = collectCodeRanges(text);
+  const calls: ToolCall[] = [];
+  const seenDedupKeys = new Set<string>();
+  for (const call of structuredCalls) {
+    seenDedupKeys.add(toolCallDedupKey(call.function.name, call.function.arguments));
+  }
+  let residual = "";
+  let cursor = 0;
+  const re = /<tool_call(\s[^>]*)?>([\s\S]*?)<\/tool_call>/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (isRangeInsideAny(start, end, codeRanges)) {
+      continue;
+    }
+    const attrs = match[1] ?? "";
+    const inner = match[2] ?? "";
+    const parsed = parseTextToolCallBlock(attrs, inner);
+    if (!parsed) {
+      // Malformed body — keep the original text in place. The chat-task
+      // loop will surface the broken response to the user rather than
+      // silently dispatching a corrupt call.
+      continue;
+    }
+    const dedup = toolCallDedupKey(parsed.name, parsed.arguments);
+    // Always strip the markup from the residual so the user doesn't see
+    // raw XML/JSON in the reply, even when the structured channel already
+    // covered the call.
+    residual += text.slice(cursor, start);
+    cursor = end;
+    if (seenDedupKeys.has(dedup)) {
+      continue;
+    }
+    seenDedupKeys.add(dedup);
+    calls.push({
+      id: synthesizeToolCallId(parsed.name, parsed.arguments, calls.length),
+      type: "function",
+      function: { name: parsed.name, arguments: parsed.arguments }
+    });
+  }
+  residual += text.slice(cursor);
+  return { calls, residual };
+}
+
+// Parse a single `<tool_call ...>...</tool_call>` body. Returns the tool
+// name and a JSON-encoded arguments string (the ToolCall wire format),
+// or undefined when the body is unrecoverable.
+function parseTextToolCallBlock(
+  attrs: string,
+  inner: string
+): { name: string; arguments: string } | undefined {
+  // Name comes from the outer attribute when present, otherwise from a
+  // JSON `name` field in the inner body (the legacy shape).
+  let name = readXmlAttribute(attrs, "name");
+  const trimmedInner = inner.trim();
+  // JSON body. Tolerate either `arguments` or `parameters` for the args
+  // bag; tolerate string or object values.
+  if (trimmedInner.startsWith("{")) {
+    try {
+      const payload = JSON.parse(trimmedInner) as unknown;
+      if (isRecord(payload)) {
+        if (!name && typeof payload.name === "string") name = payload.name;
+        const args = payload.arguments ?? payload.parameters;
+        const argsJson = serializeArgs(args);
+        if (name && argsJson !== undefined) {
+          return { name, arguments: argsJson };
+        }
+      }
+    } catch {
+      // Fall through to XML parsing.
+    }
+  }
+  // XML body with <arg name="X">value</arg> children.
+  if (name) {
+    const xmlArgs = parseXmlArgChildren(inner);
+    if (xmlArgs) {
+      return { name, arguments: JSON.stringify(xmlArgs) };
+    }
+    // Empty body with a name attribute still counts as a zero-arg call.
+    if (trimmedInner.length === 0) {
+      return { name, arguments: "{}" };
+    }
+  }
+  return undefined;
+}
+
+// Coerce an args bag into the JSON-encoded string the ToolCall shape
+// requires. Strings are passed through (the model already serialized);
+// objects/arrays/primitives are JSON-encoded; null/undefined become "{}".
+function serializeArgs(value: unknown): string | undefined {
+  if (value === undefined || value === null) return "{}";
+  if (typeof value === "string") {
+    // A pre-serialized JSON string. Validate it parses; if not, fall back
+    // to wrapping it as a literal — better to fail JSON-parse downstream
+    // than to claim success on a corrupt args payload.
+    try {
+      JSON.parse(value);
+      return value;
+    } catch {
+      return undefined;
+    }
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+// Extract a single attribute value from an XML-style attribute string.
+// Supports both double- and single-quoted values. Returns undefined when
+// the attribute is absent.
+function readXmlAttribute(attrs: string, key: string): string | undefined {
+  if (!attrs) return undefined;
+  const re = new RegExp(`\\b${key}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`);
+  const m = re.exec(attrs);
+  if (!m) return undefined;
+  return m[1] ?? m[2];
+}
+
+// Parse `<arg name="X">value</arg>` children into a flat record. Returns
+// undefined when no <arg> children are present (so the caller can decide
+// whether to treat the call as zero-arg or malformed).
+function parseXmlArgChildren(inner: string): Record<string, string> | undefined {
+  const out: Record<string, string> = {};
+  const re = /<arg(\s[^>]*)?>([\s\S]*?)<\/arg>/g;
+  let saw = false;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(inner)) !== null) {
+    const argAttrs = m[1] ?? "";
+    const argInner = m[2] ?? "";
+    const argName = readXmlAttribute(argAttrs, "name");
+    if (!argName) continue;
+    saw = true;
+    out[argName] = decodeXmlEntities(argInner.trim());
+  }
+  return saw ? out : undefined;
+}
+
+// Minimal entity decoder for the subset that codex emits inside <arg>
+// bodies: &amp;, &lt;, &gt;, &quot;, &apos;. Numeric entities are passed
+// through unchanged since tool args are user-facing strings the dispatch
+// layer will treat as literal text.
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
+// Dedup key for matching a text-extracted call against a structured one.
+// Args are normalized through JSON.parse → JSON.stringify so that whitespace
+// and key-order differences don't defeat the match.
+function toolCallDedupKey(name: string, argsJson: string): string {
+  let normalized = argsJson;
+  try {
+    const parsed = JSON.parse(argsJson) as unknown;
+    normalized = JSON.stringify(parsed);
+  } catch {
+    // Leave as-is — non-JSON arguments are vanishingly rare and the raw
+    // string is still a stable key for dedup.
+  }
+  return `${name} ${normalized}`;
+}
+
+// Synthesize a deterministic call id for a text-extracted call. Using a
+// content-derived id (not a random one) means a retry that re-receives
+// the same text won't dispatch a second time when the upstream loop's
+// idempotency check is keyed on call id.
+function synthesizeToolCallId(name: string, argsJson: string, index: number): string {
+  const fingerprint = textBackstopFingerprint(`${name}:${argsJson}:${index}`);
+  return `call_textbackstop_${fingerprint}`;
+}
+
+// Stable, short fingerprint over the call key. Sticks to a 32-bit FNV-1a
+// variant so the result is deterministic without needing Node's crypto.
+function textBackstopFingerprint(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
+}
+
+// Collect ranges of `text` that fall inside a triple-backtick fenced
+// code block or a single-backtick inline-code span. Used to skip
+// `<tool_call>` substrings the model is quoting in a code block rather
+// than emitting as an actual call.
+function collectCodeRanges(text: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  // Fenced blocks first — these can span newlines and contain backticks.
+  const fenced = /```[\s\S]*?```/g;
+  let m: RegExpExecArray | null;
+  while ((m = fenced.exec(text)) !== null) {
+    ranges.push([m.index, m.index + m[0].length]);
+  }
+  // Inline spans. Walk in two passes so fenced ranges win; the inline
+  // regex is greedy-shy to avoid bridging across paragraphs.
+  const inline = /`[^`\n]+`/g;
+  while ((m = inline.exec(text)) !== null) {
+    const start = m.index;
+    const end = start + m[0].length;
+    if (!isRangeInsideAny(start, end, ranges)) {
+      ranges.push([start, end]);
+    }
+  }
+  return ranges.sort((a, b) => a[0] - b[0]);
+}
+
+function isRangeInsideAny(start: number, end: number, ranges: Array<[number, number]>): boolean {
+  for (const [rs, re] of ranges) {
+    if (start >= rs && end <= re) return true;
+  }
+  return false;
+}
+
 export async function generateTaskSummary(
   config: RuntimeConfig,
   input: string,
-  memories: MemoryRecord[],
   recalledContext?: string,
   onDelta?: (text: string) => void,
   // Optional per-call override. Resolved by callers from the active agent's
   // providerName/model via resolveEffectiveContext. Embeddings/reranker still
   // read config.provider — do NOT mutate config here.
-  providerOverride?: ProviderConfig
+  providerOverride?: ProviderConfig,
+  // Optional owning task id. When present, identity-file scan blocks
+  // emit a runtime trace warning on the task — matches the chat-task
+  // path's onBlocked plumbing. When absent (no task context — e.g.
+  // tests calling generateTaskSummary directly), the [BLOCKED: ...]
+  // notice in the prompt is the only signal.
+  taskId?: string
 ): Promise<ProviderResult> {
   const provider = normalizeProvider(providerOverride ?? config.provider);
   if (provider.name === "echo") {
-    const memoryText = memories.length > 0 ? ` Active memory: ${memories.map((memory) => memory.content).join(" | ")}` : "";
     return {
       provider,
-      text: `Gini handled: ${input}${memoryText}`
+      text: `Gini handled: ${input}`
     };
   }
 
-  const systemContext = buildAgentSystemContext(memories, recalledContext);
+  // Runtime identity files. The legacy single-shot path doesn't carry
+  // the chat-task identity block, but it still benefits from a
+  // user-curated INSTRUCTIONS.md / USER.md and the active agent's
+  // SOUL.md. Active-agent lookup is best-effort — when no agent is
+  // active the SOUL.md block is elided. See ADR runtime-identity-files.md.
+  const activeAgentId = resolveActiveAgentId(config);
+  const onBlocked = taskId
+    ? (filename: string, findings: string[]): void => {
+        appendTrace(config.instance, taskId, {
+          type: "model",
+          message: `identity file blocked: ${filename}`,
+          data: { filename, findings }
+        });
+      }
+    : undefined;
+  const loadOpts = onBlocked ? { onBlocked } : undefined;
+  const instructionsOverride = loadInstructions(config.instance, loadOpts) ?? undefined;
+  const soulBlock = loadSoul(config.instance, activeAgentId, loadOpts) ?? undefined;
+  const userProfileBlock = loadUserProfile(config.instance, loadOpts) ?? undefined;
+  const systemContext = buildAgentSystemContext(recalledContext, undefined, {
+    instructionsOverride,
+    soul: soulBlock,
+    userProfile: userProfileBlock
+  });
   if (provider.name === "openrouter" || provider.name === "local") {
     return callChatCompletions(provider, input, systemContext);
   }
   return callOpenAIResponses(provider, input, systemContext, onDelta);
+}
+
+// Best-effort active-agent resolution for the legacy single-shot path.
+// Reads state once; failures (missing state file in tests, etc.) leave
+// the SOUL.md block elided. The modern chat-task path threads the
+// agent through resolveEffectiveContext and never falls back to this.
+function resolveActiveAgentId(config: RuntimeConfig): string | undefined {
+  try {
+    return readState(config.instance).activeAgentId;
+  } catch {
+    return undefined;
+  }
 }
 
 // Hindsight phase 2 — structured-output helper.
@@ -1408,9 +1706,30 @@ function readCodexCredentials(provider: ProviderConfig): {
   }
 }
 
+// Public helper for callers that need a yes/no on "are codex credentials
+// usable?" without the full credential record. Routes through the same
+// codexAuthPath() resolution providerHealth uses so CODEX_AUTH_JSON is
+// interpreted consistently (filesystem path, not raw JSON) everywhere.
+//
+// Pass a ProviderConfig if available; an empty {name:"codex"} is enough
+// when the caller just wants to gate a UI flow on credential presence.
+export function hasUsableCodexCredentials(provider?: ProviderConfig): boolean {
+  const probe = provider ?? { name: "codex" as const, model: DEFAULT_CODEX_MODEL };
+  return readCodexCredentials(probe).ok;
+}
+
 function codexAuthPath(provider: ProviderConfig): string {
-  const raw = provider.apiKeyEnv && process.env[provider.apiKeyEnv]
-    ? process.env[provider.apiKeyEnv]
+  // apiKeyEnv only makes sense for codex providers (where it would point at
+  // a CODEX_AUTH_JSON-style path env). For non-codex providers the field
+  // typically holds an OpenAI key env name (e.g. "OPENAI_API_KEY") whose
+  // value is an `sk-...` secret, not a filesystem path. Honoring it
+  // unconditionally would resolve to a nonsense path during openai→codex
+  // credential probes and produce false negatives. Gate on provider.name so
+  // hasUsableCodexCredentials() reads the real codex auth source regardless
+  // of which provider the caller's config currently names.
+  const apiKeyEnv = provider.name === "codex" ? provider.apiKeyEnv : undefined;
+  const raw = apiKeyEnv && process.env[apiKeyEnv]
+    ? process.env[apiKeyEnv]
     : process.env.CODEX_AUTH_JSON ?? DEFAULT_CODEX_AUTH_PATH;
   const path = raw ?? DEFAULT_CODEX_AUTH_PATH;
   return resolve(path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);

@@ -63,7 +63,10 @@ export function improvementPayload(kind: string, title: string, content: string)
   if (kind === "job") {
     return { name: title, prompt: content, intervalSeconds: 3600 };
   }
-  return { content, confidence: 0.75 };
+  // Legacy "memory" payload was removed alongside the state.memories
+  // consolidation. Fall through to a skill-shaped payload so a legacy
+  // caller gets a sane proposal instead of crashing.
+  return { name: title, description: content, trigger: title, steps: [content], status: "enabled" };
 }
 
 export function help(): void {
@@ -83,7 +86,7 @@ Usage:
   bun run gini runs list|show
   bun run gini approvals
   bun run gini approval approve|deny <approval-id>
-  bun run gini memory list|add|approve|reject
+  bun run gini memory retain|recall|reflect|units|banks|migrate
   bun run gini reranker status
   bun run gini skills list|add|show|search|validate|test|enable|disable|rollback
   bun run gini jobs list|add|run|pause|resume|remove|runs|replay
@@ -97,7 +100,7 @@ Usage:
   bun run gini browser status|connect [--url WSURL]|disconnect
   bun run gini subagents list|spawn
   bun run gini mcp list|add|health|invoke|disable
-  bun run gini messaging list|add|health|pair|disable|allow|deny|reject-pending|chats
+  bun run gini messaging list|add|health|disable|remove|allow|deny|reject-pending|chats|receive|send|messages
   bun run gini import inspect openclaw <path>
   bun run gini import plan openclaw [path]
   bun run gini import apply openclaw [path] [--force]
@@ -122,6 +125,7 @@ Usage:
   bun run gini smoke
   bun run gini tunnel status|qr|enable|disable|rotate-secret|sync-notes
   bun run gini tunnel apple-notes enable|disable|folder <name>
+  bun run gini identity show|history|rollback
 
 Process lifecycle:
   gini start      - daemon mode; instance keeps running after the terminal

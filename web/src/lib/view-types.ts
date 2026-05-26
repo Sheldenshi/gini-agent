@@ -11,7 +11,6 @@ import type {
   Task,
   Approval,
   AuditEvent,
-  MemoryRecord,
   SkillRecord,
   JobRecord,
   ConnectorRecord,
@@ -42,7 +41,6 @@ export interface RuntimeStateSnapshot {
   tasks: Task[];
   approvals: Approval[];
   audit: AuditEvent[];
-  memories: MemoryRecord[];
   skills: SkillRecord[];
   jobs: JobRecord[];
   connectors: ConnectorRecord[];

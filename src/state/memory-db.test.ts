@@ -370,14 +370,14 @@ describe("memory-db schema and storage", () => {
     expect(scoped.map((unit) => unit.id)).toEqual([stamped.id]);
   });
 
-  test("resetInstance clears the memory DB and probe reports zero units", () => {
+  test("resetInstance clears the memory DB and probe reports zero units", async () => {
     const instance = "mem-reset";
     const config = { ...defaultConfig(instance), stateRoot: instanceRoot(instance) };
     ensureDefaultBank(instance);
     insertMemoryUnit(instance, { text: "to be wiped", network: "world" });
     expect(countMemoryUnits(instance)).toBe(1);
 
-    resetInstance(config);
+    await resetInstance(config);
 
     // After reset, the instance root has been recreated by install(); the memory
     // DB is gone until the next ensureDefaultBank() / insert / probe call.

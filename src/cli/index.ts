@@ -41,6 +41,7 @@ import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, unin
 import { setup } from "./commands/setup";
 import { autostart } from "./commands/autostart";
 import { tunnel } from "./commands/tunnel";
+import { identity } from "./commands/identity";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -97,7 +98,7 @@ export async function run(): Promise<void> {
     case "stop": stop(ctx); break;
     case "status": await statusCmd(ctx); break;
     case "doctor": await doctorCmd(ctx); break;
-    case "reset": reset(ctx); break;
+    case "reset": await reset(ctx); break;
     case "setup": await setup(ctx); break;
     case "autostart": await autostart(ctx); break;
     case "task": await task(ctx); break;
@@ -154,6 +155,7 @@ export async function run(): Promise<void> {
     case "evidence": evidence(ctx); break;
     case "smoke": await smoke(ctx); break;
     case "tunnel": await tunnel(ctx); break;
+    case "identity": await identity(ctx); break;
     default: help();
   }
 }

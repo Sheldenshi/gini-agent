@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
@@ -15,6 +15,7 @@ import { Textarea } from "@/components/ui/textarea";
 import type { HindsightBankView, HindsightRecallView, HindsightReflectView, HindsightUnitView } from "@/lib/view-types";
 
 const NETWORKS = ["all", "world", "experience", "opinion", "observation"] as const;
+const UNITS_PAGE_SIZE = 10;
 
 // HindsightPanel renders the Hindsight memory surfaces:
 //   - bank profile editor (sliders for skepticism / literalism / empathy / bias)
@@ -24,8 +25,19 @@ const NETWORKS = ["all", "world", "experience", "opinion", "observation"] as con
 export function HindsightPanel() {
   const banks = useHindsightBanks();
   const [network, setNetwork] = useState<typeof NETWORKS[number]>("all");
+  const [visibleCount, setVisibleCount] = useState(UNITS_PAGE_SIZE);
   const units = useHindsightUnits(network);
   const bank = banks.data?.[0];
+
+  // Reset pagination when the user switches network tabs so the new
+  // list starts from the top instead of preserving a deep scroll.
+  useEffect(() => {
+    setVisibleCount(UNITS_PAGE_SIZE);
+  }, [network]);
+
+  const allUnits = units.data ?? [];
+  const visibleUnits = allUnits.slice(0, visibleCount);
+  const remaining = Math.max(0, allUnits.length - visibleUnits.length);
 
   return (
     <div className="space-y-4">
@@ -57,12 +69,36 @@ export function HindsightPanel() {
               ))}
             </TabsList>
           </Tabs>
-          {(units.data ?? []).length === 0 ? (
+          {allUnits.length === 0 ? (
             <p className="py-6 text-center text-xs text-muted-foreground">No units in this network yet.</p>
           ) : (
-            <ul className="space-y-2">
-              {(units.data ?? []).map((unit) => <UnitRow key={unit.id} unit={unit} />)}
-            </ul>
+            <>
+              <ul className="space-y-2">
+                {visibleUnits.map((unit) => <UnitRow key={unit.id} unit={unit} />)}
+              </ul>
+              <div className="flex items-center justify-between pt-2 text-xs text-muted-foreground">
+                <span>
+                  Showing {visibleUnits.length} of {allUnits.length}
+                </span>
+                {remaining > 0 ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setVisibleCount((count) => count + UNITS_PAGE_SIZE)}
+                  >
+                    Load {Math.min(UNITS_PAGE_SIZE, remaining)} more
+                  </Button>
+                ) : visibleUnits.length > UNITS_PAGE_SIZE ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setVisibleCount(UNITS_PAGE_SIZE)}
+                  >
+                    Show less
+                  </Button>
+                ) : null}
+              </div>
+            </>
           )}
         </CardContent>
       </Card>

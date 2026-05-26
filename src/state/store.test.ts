@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { applyLegacyTelegramPairingMigration, createEmptyState, normalizeState } from "./store";
+import { createEmptyState, normalizeState } from "./store";
 import type { RuntimeState } from "../types";
 
 // Isolated state root so the test never touches ~/.gini.
@@ -377,148 +377,55 @@ describe("backfillDefaultAgentToolsets", () => {
     expect(audits.length).toBe(0);
   });
 });
-
-describe("applyLegacyTelegramPairingMigration", () => {
-  test("mints a pairing code for a legacy telegram bridge that polled before the allowlist landed (lastOffset present, no allowedChatIds, no pairingCode)", () => {
-    const state = createEmptyState("test-instance-tg-legacy");
-    state.messagingBridges = [{
-      id: "bridge_legacy_1",
-      instance: "test-instance-tg-legacy",
-      name: "legacy-tg",
-      kind: "telegram",
-      status: "configured",
-      deliveryTargets: ["42"],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
-      // lastOffset present → legacy bridge that actually polled before
-      // the allowlist landed. No allowedChatIds, no pairingCode.
-      metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
-    }];
-
-    const migrated = applyLegacyTelegramPairingMigration(state);
-    expect(migrated).toBe(true);
-
-    const live = state.messagingBridges.find((b) => b.id === "bridge_legacy_1");
-    expect(typeof live?.metadata?.pairingCode).toBe("string");
-    expect(String(live?.metadata?.pairingCode).startsWith("pair-")).toBe(true);
-    expect(typeof live?.metadata?.pairingCodeExpiresAt).toBe("string");
-    expect(Date.parse(String(live?.metadata?.pairingCodeExpiresAt))).toBeGreaterThan(Date.now());
-
-    // Audit row landed so the migration is traceable.
-    const audit = state.audit.find(
-      (e) => e.action === "messaging.pairing.migrated" && e.target === "bridge_legacy_1"
-    );
-    expect(audit).toBeDefined();
-  });
-
-  test("normalizeState does NOT mint codes on a read-only path (no ephemeral codes per read)", () => {
-    // Architectural invariant: the legacy backfill lives OUTSIDE
-    // normalizeState specifically so that pure read paths (CLI
-    // inspections, status APIs) don't generate ephemeral codes that
-    // never persist. normalizeState is called on every read, the
-    // migration helper is called only from explicit write paths.
-    const state = createEmptyState("test-instance-tg-noop-read");
-    state.messagingBridges = [{
-      id: "bridge_legacy_2",
-      instance: "test-instance-tg-noop-read",
-      name: "legacy-tg-2",
-      kind: "telegram",
-      status: "configured",
-      deliveryTargets: ["42"],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
-      metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
-    }];
-
-    const normalized = normalizeState("test-instance-tg-noop-read", state);
-    const live = normalized.messagingBridges.find((b) => b.id === "bridge_legacy_2");
-    // No code on a pure read.
-    expect(live?.metadata?.pairingCode).toBeUndefined();
-    expect(live?.metadata?.pairingCodeExpiresAt).toBeUndefined();
-  });
-
-  test("does NOT mint for a brand-new telegram bridge (no lastOffset)", () => {
-    const state = createEmptyState("test-instance-tg-fresh");
-    state.messagingBridges = [{
-      id: "bridge_fresh_1",
-      instance: "test-instance-tg-fresh",
-      name: "fresh-tg",
-      kind: "telegram",
-      status: "configured",
-      deliveryTargets: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
-      metadata: { botUsername: "ginibot", botId: 1 }
-    }];
-
-    const migrated = applyLegacyTelegramPairingMigration(state);
-    expect(migrated).toBe(false);
-    const live = state.messagingBridges.find((b) => b.id === "bridge_fresh_1");
-    expect(live?.metadata?.pairingCode).toBeUndefined();
-  });
-
-  test("does NOT mint when the bridge already has an allowlist or an existing pairing code", () => {
-    const state = createEmptyState("test-instance-tg-idempotent");
-    state.messagingBridges = [
+describe("dropDeadMemoryImprovements", () => {
+  test("strips improvements with the legacy kind: memory and audits each removal", () => {
+    const state = createEmptyState("legacy-memory-improvements");
+    // Inject legacy proposals via the dynamic shape — the type-level
+    // ImprovementKind dropped "memory" alongside the state.memories
+    // consolidation, but persisted state files still carry them.
+    state.improvements = [
+      ...state.improvements,
       {
-        id: "already_paired",
-        instance: "test-instance-tg-idempotent",
-        name: "tg-paired",
-        kind: "telegram",
-        status: "configured",
-        deliveryTargets: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token-1" }],
-        metadata: {
-          lastOffset: 999,
-          pairingCode: "pair-deadbeef",
-          pairingCodeExpiresAt: new Date(Date.now() + 60_000).toISOString()
-        }
+        id: "imp_mem_1",
+        instance: state.instance,
+        // Cast through unknown because the field is no longer typed.
+        kind: "memory" as unknown as "skill",
+        title: "remember preferences",
+        rationale: "legacy",
+        status: "proposed",
+        sourceTaskId: undefined,
+        sourceTraceIds: [],
+        payload: { content: "x" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
       },
       {
-        id: "already_allowed",
-        instance: "test-instance-tg-idempotent",
-        name: "tg-allowed",
-        kind: "telegram",
-        status: "configured",
-        deliveryTargets: [],
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token-2" }],
-        metadata: { lastOffset: 999, allowedChatIds: [4242] }
+        id: "imp_skill_1",
+        instance: state.instance,
+        kind: "skill",
+        title: "real skill",
+        rationale: "ok",
+        status: "proposed",
+        sourceTaskId: undefined,
+        sourceTraceIds: [],
+        payload: { name: "real skill" },
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z"
       }
     ];
 
-    const migrated = applyLegacyTelegramPairingMigration(state);
-    expect(migrated).toBe(false);
-    const paired = state.messagingBridges.find((b) => b.id === "already_paired");
-    const allowed = state.messagingBridges.find((b) => b.id === "already_allowed");
-    expect(paired?.metadata?.pairingCode).toBe("pair-deadbeef");
-    expect(allowed?.metadata?.pairingCode).toBeUndefined();
-  });
+    const normalized = normalizeState(state.instance, state);
 
-  test("does NOT touch discord-kind bridges", () => {
-    const state = createEmptyState("test-instance-disc-skip");
-    state.messagingBridges = [{
-      id: "bridge_disc_1",
-      instance: "test-instance-disc-skip",
-      name: "disc",
-      kind: "discord",
-      status: "configured",
-      deliveryTargets: ["channel-1"],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      secretRefs: [{ purpose: "bot-token", path: "/tmp/fake-token" }],
-      metadata: { botUsername: "ginibot", botId: 1, lastOffset: 12345 }
-    }];
+    // The legacy memory proposal is gone; the skill proposal stays.
+    expect(normalized.improvements.find((p) => p.id === "imp_mem_1")).toBeUndefined();
+    expect(normalized.improvements.find((p) => p.id === "imp_skill_1")).toBeDefined();
 
-    const migrated = applyLegacyTelegramPairingMigration(state);
-    expect(migrated).toBe(false);
-    const live = state.messagingBridges.find((b) => b.id === "bridge_disc_1");
-    expect(live?.metadata?.pairingCode).toBeUndefined();
+    // The removal landed an audit row so operators can see why the
+    // proposal disappeared.
+    const audit = normalized.audit.find(
+      (event) => event.action === "improvement.memory-kind.removed" && event.target === "imp_mem_1"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence?.title).toBe("remember preferences");
   });
 });

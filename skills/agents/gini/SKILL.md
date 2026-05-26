@@ -182,9 +182,9 @@ instance behind NAT works the same as one on a public host.
    }
    ```
 
-   The response carries a `metadata.pairingCode`. The bot's username is
-   not resolved yet — run the health probe next to learn the actual
-   handle.
+   The response carries the bridge id and an initial status. The bot's
+   username isn't resolved yet — run the health probe next to learn the
+   actual handle.
 
    Human-operator CLI mirror: `gini messaging add my-bot telegram --bot-token <BOT_TOKEN>`.
 
@@ -201,27 +201,39 @@ instance behind NAT works the same as one on a public host.
 
    Human-operator CLI mirror: `gini messaging health my-bot`.
 
-4. **Pair the user's chat.** The user DMs the bot the pairing code from
-   their personal Telegram account. The bridge records the chat ID. To
-   request a fresh code:
-
-   ```http
-   POST /api/messaging/my-bot/pair
-   ```
-
-   Human-operator CLI mirror: `gini messaging pair my-bot`.
+4. **Enroll the user's chat.** Have the user DM the bot anything
+   (including `/start`). The runtime mints a short verification code
+   (`F971-8261` format, 10-minute TTL), records it on
+   `bridge.metadata.recentDeniedChats[].verificationCode` for the
+   originating chat, and DMs the same code back to the user. Fetch the
+   pending list with `GET /api/messaging/my-bot/chats`, confirm the
+   `verificationCode` matches what the user reports receiving, then
+   allow-list the chat in the next step. A DM after the code expires
+   mints a fresh one and replaces the row.
 
 5. **Allow-list the chat ID** so the bridge will deliver messages there:
 
    ```http
    POST /api/messaging/my-bot/allow
 
-   { "chatId": 123456789 }
+   { "chatId": 123456789, "expectedCode": "F971-8261" }
    ```
 
-   Group chat IDs are negative integers — that is correct, not an error.
+   Pass the `expectedCode` you confirmed in step 4. The server re-checks
+   that it still matches the live `verificationCode` on the pending row
+   and hasn't expired, so a code that rotated (the user re-DM'd and
+   minted a new one) or aged past its TTL between fetch and approve
+   returns `409 Conflict` instead of silently allow-listing the chat.
+
+   Group chat IDs are negative integers — that is correct, not an
+   error. Group chats have no `verificationCode` (no per-user channel
+   to deliver one through), so omit `expectedCode` when allow-listing a
+   negative chat ID.
 
    Human-operator CLI mirror: `gini messaging allow my-bot <chatId>`.
+   The CLI omits the code because the explicit invocation on the
+   operator's machine already proves intent; the API path is the one
+   that needs the code-rotation check.
 
 6. **Send a message** to confirm round-trip:
 
@@ -245,9 +257,9 @@ auto-approves with a full audit trail, `yolo` skips the queue).
 ### Inspecting state
 
 API: `GET /api/messaging`, `GET /api/messaging/<id>/{chats,messages}`,
-`POST /api/messaging/<id>/{health,disable}`.
+`POST /api/messaging` (create), `POST /api/messaging/<id>/{health,disable,remove,allow,deny,reject-pending,send,receive}`.
 
-Human-operator CLI mirror: `gini messaging {list|chats|messages|health|disable|deny}`.
+Human-operator CLI mirror: `gini messaging {list|add|health|disable|remove|receive|send|messages|allow|deny|reject-pending|chats}`. `disable` keeps the bridge row with status `"disabled"`; `remove` drops it. Telegram per-chat enrollment uses `allow`/`deny`/`reject-pending`/`chats`; Discord uses channel-as-auth via `deliveryTargets` (no per-chat allowlist).
 
 ## MCP Servers
 
@@ -338,23 +350,30 @@ or `skills/agents/codex/SKILL.md` — those skills cover `--allowedTools`,
 
 ## Memory
 
-Pinned memories ride the system prompt every turn. Long-term memory is
-pulled by embedding recall on each task.
+Three surfaces, no fourth:
 
-The agent has three tools for memory: `recall_memory` for explicit
-mid-task lookups (distinct from the automatic recall that runs at task
-start), `add_memory` to propose a new memory, and `update_memory` to
-edit an existing one in place. `add_memory` always lands as `proposed`
-and requires user approval via the memory review flow — same gate as
-the memory reflection pipeline.
+- `USER.md` (instance-scoped, always-inject) — user identity, preferences,
+  recurring goals. Edits go through `edit_user_profile`, which
+  auto-approves: writes land at the approved file and ride the system
+  prompt on the next turn. Cross-agent — switching agents preserves
+  the user profile.
+- `SOUL.md` (per-agent, always-inject) — agent persona and behavior
+  rules. Edits go through `edit_soul` with a propose-vs-approve gate
+  because persona edits change behavior across every turn.
+- Hindsight (per-agent SQLite bank, recall-on-demand) — long-term
+  memory populated by auto-retain at task end. Recall surfaces relevant
+  units automatically; `recall_memory` is the on-demand lookup tool.
 
-API: `POST /api/memory { content, status }`, `GET /api/memory`,
-`PATCH /api/memory/<id>`, `DELETE /api/memory/<id>`,
-`POST /api/memory/<id>/approve`, `POST /api/memory/recall { query, tokenBudget, bankId }`.
+The legacy `state.memories` pinned-memory store, `add_memory`,
+`update_memory`, the `/api/memory` CRUD routes, and
+`gini memory list|add|approve|reject` were removed in the
+memory-surface consolidation. The only API surfaces are the Hindsight
+endpoints (`/api/memory/retain`, `/api/memory/recall`,
+`/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`) plus
+the identity-file approve endpoint for SOUL.md
+(`POST /api/identity-files/soul/approve`).
 
-Human-operator CLI mirror: `gini memory {add|list|edit|delete|recall|reflect}`.
-
-Keep pinned memories short — every active row costs context every turn.
+Human-operator CLI mirror: `gini memory {retain|recall|reflect|units|banks|migrate}`.
 
 ## Skills
 
@@ -477,4 +496,7 @@ land in the queue, and wait for the user's decision.
 5. When the user asks Gini to remember to do something later, create a
    scheduled job — the runtime auto-binds it to a dedicated thread so
    future fires don't bury the current conversation.
-6. Keep pinned memories short; offload depth to recall.
+6. For durable identity facts ("my name is X", "I prefer Y") call
+   `edit_user_profile` so they ride the prompt every turn across agents.
+   For ephemeral facts let auto-retain land them in Hindsight — never
+   narrate "I'll remember that" without actually calling a tool.

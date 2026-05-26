@@ -42,11 +42,9 @@
 // handler itself; the actual launchctl interaction is the detached
 // child's responsibility.
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { configPath, writeConfigAtomic } from "../paths";
-import { normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { writeFileSync } from "node:fs";
+import { configPath } from "../paths";
+import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -133,7 +131,7 @@ export async function setSetupProvider(
       ? payload.model
       : (config.provider?.name === "openai" && config.provider.model ? config.provider.model : "gpt-5.4-mini");
     config.provider = normalizeProvider({ name: "openai", model });
-    writeConfigAtomic(config.instance, config);
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
@@ -154,7 +152,7 @@ export async function setSetupProvider(
     };
   }
   // providerName === "codex"
-  if (!hasCodexAuth()) {
+  if (!hasUsableCodexCredentials(config.provider)) {
     return {
       ok: false,
       provider: providerHealth(config),
@@ -167,7 +165,7 @@ export async function setSetupProvider(
     ? payload.model
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
   config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
-  writeConfigAtomic(config.instance, config);
+  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's
   // already updated. But the plist still has GINI_INSTANCE etc — no env
@@ -180,15 +178,4 @@ export async function setSetupProvider(
     provider: providerHealth(config),
     plistRefreshNeeded: false
   };
-}
-
-function hasCodexAuth(): boolean {
-  const envRaw = process.env.CODEX_AUTH_JSON;
-  if (envRaw && envRaw.length > 0) {
-    try { JSON.parse(envRaw); return true; } catch { /* fall through */ }
-  }
-  const home = process.env.HOME || homedir();
-  const authPath = join(home, ".codex", "auth.json");
-  if (!existsSync(authPath)) return false;
-  try { JSON.parse(readFileSync(authPath, "utf8")); return true; } catch { return false; }
 }

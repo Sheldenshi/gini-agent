@@ -58,7 +58,7 @@ describe("createAgent", () => {
 
   test("inherits provider/model from the default agent when caller omits them", async () => {
     const config = buildConfig(workspaceRoot, "create-agent-inherit", root);
-    install(config);
+    await install(config);
     // install() seeds the default agent from config.provider, but does so
     // via a fire-and-forget mutateState. Wait for it to settle so the
     // inheritance read sees the seeded value rather than the undefined
@@ -93,7 +93,7 @@ describe("createAgent", () => {
 
   test("explicit overrides win over default-agent inheritance", async () => {
     const config = buildConfig(workspaceRoot, "create-agent-override", root);
-    install(config);
+    await install(config);
     await mutateState(config.instance, (state) => {
       const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
       if (!defaultAgent) throw new Error("default agent missing after install");
@@ -116,12 +116,15 @@ describe("createAgent", () => {
 
   test("deleteAgent removes the agent, its memories, and its hindsight bank", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-cascade", root);
-    install(config);
+    await install(config);
 
     const created = await createAgent(config, { name: "scratch" });
     // Bank already created by createAgent → ensureAgentBank. Stamp a
     // hindsight unit and a legacy MemoryRecord onto the new agent so the
-    // cascade has something concrete to clean up.
+    // cascade has something concrete to clean up. The legacy
+    // `state.memories` per-agent purge was removed alongside the
+    // state.memories consolidation; only the Hindsight bank cascade
+    // remains. See ADR runtime-identity-files.md.
     ensureAgentBank(config.instance, created.id);
     insertMemoryUnit(config.instance, {
       bankId: bankIdForAgent(created.id),
@@ -129,32 +132,15 @@ describe("createAgent", () => {
       text: "scratch hindsight",
       network: "experience"
     });
-    await mutateState(config.instance, (state) => {
-      state.memories.push({
-        id: "mem_scratch_only",
-        instance: config.instance,
-        agentId: created.id,
-        content: "scratch memory",
-        status: "active",
-        sensitivity: "normal",
-        confidence: 1,
-        provenance: "test fixture",
-        createdAt: "2025-01-01",
-        updatedAt: "2025-01-01"
-      });
-      return null;
-    });
 
     const result = await deleteAgent(config, created.id);
     expect(result.ok).toBe(true);
     expect(result.id).toBe(created.id);
-    expect(result.memoriesArchived).toBe(1);
     expect(result.unitsDeleted).toBe(1);
     expect(result.bankDeleted).toBe(true);
 
     const after = readState(config.instance);
     expect(after.agents.find((agent) => agent.id === created.id)).toBeUndefined();
-    expect(after.memories.find((memory) => memory.id === "mem_scratch_only")).toBeUndefined();
     expect(getBank(config.instance, bankIdForAgent(created.id))).toBeNull();
     expect(listMemoryUnits(config.instance, bankIdForAgent(created.id))).toEqual([]);
     expect(after.audit.some((event) => event.action === "agent.deleted" && event.target === created.id)).toBe(true);
@@ -162,7 +148,7 @@ describe("createAgent", () => {
 
   test("deleteAgent resolves by name", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-by-name", root);
-    install(config);
+    await install(config);
     const created = await createAgent(config, { name: "by-name" });
     const result = await deleteAgent(config, "by-name");
     expect(result.id).toBe(created.id);
@@ -172,7 +158,7 @@ describe("createAgent", () => {
 
   test("deleteAgent refuses to delete the default agent", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-default", root);
-    install(config);
+    await install(config);
     await expect(deleteAgent(config, "agent_default")).rejects.toThrow(
       "Cannot delete the default agent."
     );
@@ -180,7 +166,7 @@ describe("createAgent", () => {
 
   test("deleteAgent refuses to delete the active agent", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-active", root);
-    install(config);
+    await install(config);
     const created = await createAgent(config, { name: "active-one" });
     await useAgent(config, created.id);
     await expect(deleteAgent(config, created.id)).rejects.toThrow(
@@ -190,40 +176,16 @@ describe("createAgent", () => {
 
   test("deleteAgent throws when the agent does not exist", async () => {
     const config = buildConfig(workspaceRoot, "delete-agent-missing", root);
-    install(config);
+    await install(config);
     await expect(deleteAgent(config, "agent_does_not_exist")).rejects.toThrow(
       "Agent not found: agent_does_not_exist"
     );
   });
 
-  test("does not copy memories from the default agent (clean memory)", async () => {
-    const config = buildConfig(workspaceRoot, "create-agent-clean-memory", root);
-    install(config);
-    // Stamp a memory on the default agent.
-    await mutateState(config.instance, (state) => {
-      const defaultAgent = state.agents.find((agent) => agent.id === "agent_default");
-      if (!defaultAgent) throw new Error("default agent missing after install");
-      state.memories.push({
-        id: "mem_default_only",
-        instance: config.instance,
-        agentId: defaultAgent.id,
-        content: "should not leak",
-        status: "active",
-        sensitivity: "normal",
-        confidence: 1,
-        provenance: "test fixture",
-        createdAt: "2025-01-01",
-        updatedAt: "2025-01-01"
-      });
-      return defaultAgent;
-    });
-
-    const created = await createAgent(config, { name: "fresh" });
-    const after = readState(config.instance);
-    const ownedByNewAgent = after.memories.filter((memory) => memory.agentId === created.id);
-    expect(ownedByNewAgent).toEqual([]);
-    // And the original memory on the default agent stays put.
-    const ownedByDefault = after.memories.filter((memory) => memory.id === "mem_default_only");
-    expect(ownedByDefault.length).toBe(1);
-  });
+  // The "does not copy memories from the default agent" test was
+  // removed alongside the state.memories consolidation — pinned memory
+  // is no longer a per-agent record type. USER.md is instance-scoped,
+  // SOUL.md is per-agent and never inherited at create time, and
+  // Hindsight banks are created fresh per agent. See ADR
+  // runtime-identity-files.md.
 });

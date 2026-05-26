@@ -202,4 +202,81 @@ describe("proxy", () => {
       expect(new URL(rewriteHeader as string).pathname).toBe("/");
     }
   });
+
+  // Verify the tunnel-vetted marker is stamped on rewritten requests so
+  // the BFF guard accepts them. NextResponse.rewrite with
+  // `{ request: { headers } }` propagates modified headers via
+  // `x-middleware-request-<key>` + an `x-middleware-override-headers`
+  // index — Next's adapter rewrites those onto the request before the
+  // route handler sees it. We inspect those internal markers rather
+  // than running the full handler.
+  test("rewritten cookie-authed request carries x-gini-tunnel-vetted: 1", async () => {
+    const secret = "abcdefghij0123456789";
+    writeTunnelConfig({ enabled: true, secret });
+    const request = new NextRequest(new URL("https://tunnel.example.com/api/runtime/state"), {
+      headers: { host: "tunnel.example.com", cookie: `gini_tunnel_session=${secret}` }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+    const overrideIndex = response.headers.get("x-middleware-override-headers") ?? "";
+    expect(overrideIndex.split(",")).toContain("x-gini-tunnel-vetted");
+    expect(response.headers.get("x-middleware-request-x-gini-tunnel-vetted")).toBe("1");
+  });
+
+  test("rewritten bootstrap request carries x-gini-tunnel-vetted: 1", async () => {
+    const secret = "abcdefghij0123456789";
+    writeTunnelConfig({ enabled: true, secret });
+    const request = new NextRequest(new URL(`https://tunnel.example.com/${secret}/settings`), {
+      headers: { host: "tunnel.example.com" }
+    });
+    const response = await proxy(request);
+    const overrideIndex = response.headers.get("x-middleware-override-headers") ?? "";
+    expect(overrideIndex.split(",")).toContain("x-gini-tunnel-vetted");
+    expect(response.headers.get("x-middleware-request-x-gini-tunnel-vetted")).toBe("1");
+  });
+
+  test("inbound x-gini-tunnel-vetted from a tunnel client is stripped and re-set", async () => {
+    // Without the strip, a remote attacker who knows the trycloudflare
+    // hostname but NOT the secret could attach the marker themselves
+    // and bypass the BFF guard. The proxy must always overwrite the
+    // value rather than passing it through verbatim. We verify by
+    // sending a deliberately wrong value and confirming the rewritten
+    // request carries `1` (the proxy's canonical value).
+    const secret = "abcdefghij0123456789";
+    writeTunnelConfig({ enabled: true, secret });
+    const request = new NextRequest(new URL("https://tunnel.example.com/api/runtime/state"), {
+      headers: {
+        host: "tunnel.example.com",
+        cookie: `gini_tunnel_session=${secret}`,
+        "x-gini-tunnel-vetted": "attacker-supplied"
+      }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+    expect(response.headers.get("x-middleware-request-x-gini-tunnel-vetted")).toBe("1");
+  });
+
+  test("localhost requests have x-gini-tunnel-vetted stripped (not set)", async () => {
+    // Defense in depth: a co-tenant process on 127.0.0.1 should not be
+    // able to forge the marker to influence the BFF guard. The proxy
+    // strips it on the localhost path and does NOT re-set it (loopback
+    // Host already satisfies the guard). The override index lists the
+    // header (because the proxy clones+modifies the headers object) but
+    // the value must be empty, signalling deletion.
+    writeTunnelConfig({ enabled: true, secret: "abcdefghij0123456789" });
+    const request = new NextRequest(new URL("http://127.0.0.1:3072/api/runtime/state"), {
+      headers: {
+        host: "127.0.0.1:3072",
+        "x-gini-tunnel-vetted": "attacker-supplied"
+      }
+    });
+    const response = await proxy(request);
+    expect(response.status).not.toBe(404);
+    // The strippedHeaders helper deletes the marker. NextResponse.next
+    // stamps the override index only for keys that differ from the
+    // request — when we delete a header the override index records it
+    // with an empty value so the downstream sees no marker.
+    const stampedValue = response.headers.get("x-middleware-request-x-gini-tunnel-vetted");
+    expect(stampedValue === null || stampedValue === "").toBe(true);
+  });
 });

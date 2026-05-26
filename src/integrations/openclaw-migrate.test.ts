@@ -2694,13 +2694,12 @@ describe("applyMigration", () => {
     expect(readFileSync(helperPath, "utf8")).toContain("refreshed");
   });
 
-  test("telegram migration auto-mints a pairing code when allow-list is empty", async () => {
-    // Without auto-minting, an openclaw config that ships a bot
-    // token but no allowFrom (operator was using openclaw's
-    // dmPolicy="pairing" pattern) lands a configured-looking
-    // bridge that silently denies every inbound. The migrator
-    // should mirror addMessagingBridge and mint a pairing code so
-    // the bridge is immediately usable via DM-and-paste.
+  test("telegram migration with empty allow-list lands a configured bridge and warns the operator to DM the bot", async () => {
+    // An openclaw config that ships a bot token but no allowFrom
+    // (operator was using openclaw's dmPolicy="pairing" pattern)
+    // lands a configured bridge whose poller mints a verification
+    // code per inbound DM. The migrator emits an operator-facing
+    // warning pointing at the Settings UI flow.
     seedOpenclawTree(OPENCLAW_ROOT, {
       withConfig: true,
       withTelegramChannel: true
@@ -2712,15 +2711,14 @@ describe("applyMigration", () => {
     expect(result.bridgesCreated).toBe(1);
     const state = readState("telegram-pair-automint");
     const bridge = state.messagingBridges.find((entry) => entry.kind === "telegram")!;
-    const metadata = bridge.metadata as { pairingCode?: string; pairingCodeExpiresAt?: string };
-    expect(typeof metadata.pairingCode).toBe("string");
-    expect(metadata.pairingCode!.length).toBeGreaterThan(0);
-    expect(typeof metadata.pairingCodeExpiresAt).toBe("string");
-    // Operator-facing warning tells them to run `gini messaging pair`.
+    // No pre-minted code on the migrated bridge — the new flow waits
+    // for a user DM and mints a verification code at that point.
+    expect(bridge.metadata).toBeDefined();
+    expect((bridge.metadata as { pairingCode?: unknown }).pairingCode).toBeUndefined();
     expect(
       result.warnings.some((warning) =>
         warning.includes("Telegram bridge migrated with empty allow-list") &&
-        warning.includes("gini messaging pair")
+        warning.includes("verification code")
       )
     ).toBe(true);
   });

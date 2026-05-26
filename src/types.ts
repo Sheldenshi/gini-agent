@@ -9,8 +9,6 @@ export type ApprovalStatus = "pending" | "approved" | "denied";
 
 export type RiskLevel = "low" | "medium" | "high";
 
-export type MemoryStatus = "proposed" | "active" | "archived" | "rejected" | "conflicted";
-
 export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
@@ -19,7 +17,7 @@ export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
-export type ImprovementKind = "memory" | "skill" | "job";
+export type ImprovementKind = "skill" | "job";
 
 export type PairingStatus = "pending" | "claimed" | "expired" | "revoked";
 
@@ -248,6 +246,125 @@ export interface PersistedAppleNotesConfig {
   account?: string;
 }
 
+// ChatBlock — semantic, typed conversation block emitted by the runtime so
+// clients (web, mobile, CLI bridges) render a uniform stream instead of each
+// rebuilding the same UI vocabulary by parsing ChatMessageRecord + Task
+// state. See ADR chat-block-protocol.md.
+//
+// Blocks are ordered per chat session by `ordinal` (monotonically increasing
+// integer, allocated under the SQLite transaction that inserts the row).
+// Streaming `assistant_text` blocks carry the FULL accreted text on every
+// delta; clients merge by `id` so reconnects/resumes are idempotent. All
+// other block kinds are append-only.
+//
+// Persisted in SQLite (memory.db, table `chat_blocks`) by
+// src/state/chat-blocks.ts. The runtime dual-publishes alongside the legacy
+// ChatMessageRecord path during the migration window — phase 1 keeps both
+// running, phases 2/3 migrate clients, phase 4 retires the legacy path.
+export type ChatBlockKind =
+  | "user_text"
+  | "assistant_text"
+  | "tool_call"
+  | "tool_result"
+  | "phase"
+  | "approval_requested"
+  | "system_note";
+
+interface ChatBlockBase {
+  id: string;
+  sessionId: string;
+  instance: Instance;
+  ordinal: number;
+  createdAt: string;
+  taskId?: string;
+  runId?: string;
+}
+
+export interface UserTextBlock extends ChatBlockBase {
+  kind: "user_text";
+  text: string;
+}
+
+export interface AssistantTextBlock extends ChatBlockBase {
+  kind: "assistant_text";
+  updatedAt: string;
+  // Full accreted text. On streaming deltas the same block id is upserted
+  // with the running total so reconnecting clients always observe a
+  // monotonically growing string and never need to splice deltas
+  // themselves.
+  text: string;
+  streaming: boolean;
+}
+
+export type ToolCallStatus = "running" | "ok" | "error" | "denied";
+
+export interface ToolCallBlock extends ChatBlockBase {
+  kind: "tool_call";
+  updatedAt: string;
+  toolName: string;
+  // Human-friendly label derived from the tool catalog (e.g. "Read file",
+  // "Run shell command"). Clients render this in the bubble header so the
+  // mapping lives in one place server-side.
+  displayLabel: string;
+  // Truncated headline of the args (e.g. the file path or the command),
+  // suitable for inline rendering without expanding the full args object.
+  argsPreview: string;
+  // Full parsed args. Available for expanded views; never trimmed.
+  argsFull: Record<string, unknown>;
+  status: ToolCallStatus;
+  errorMessage?: string;
+  // Provider-issued tool call id. Used by `tool_result` blocks to
+  // associate result with call, and by resume paths to flip the
+  // matching running block to `ok`/`error` after the approval lands.
+  callId: string;
+}
+
+export interface ToolResultBlock extends ChatBlockBase {
+  kind: "tool_result";
+  // Provider-issued tool call id that this result belongs to.
+  callId: string;
+  // Truncated preview of the tool's result string. The full transcript
+  // lives on the legacy ChatMessageRecord during the migration window
+  // and on the task's audit chain; the block carries only what clients
+  // need to render.
+  preview: string;
+  // True when `preview` was truncated. Clients can show an "expand" hint.
+  truncated: boolean;
+}
+
+export interface PhaseBlock extends ChatBlockBase {
+  kind: "phase";
+  // Free-form short label (e.g. "Thinking", "Working: file_read",
+  // "Completed"). Matches the existing Task.currentStep vocabulary so the
+  // migration is a one-to-one rename rather than a UX overhaul.
+  label: string;
+}
+
+export interface ApprovalRequestedBlock extends ChatBlockBase {
+  kind: "approval_requested";
+  approvalId: string;
+  // Approval action (`file.write`, `terminal.exec`, `connector.request`,
+  // etc.). Lets clients branch on `connector.request` to render the
+  // Connect dialog vs the standard Approve/Deny pair.
+  action: string;
+  risk: string;
+  summary: string;
+}
+
+export interface SystemNoteBlock extends ChatBlockBase {
+  kind: "system_note";
+  text: string;
+}
+
+export type ChatBlock =
+  | UserTextBlock
+  | AssistantTextBlock
+  | ToolCallBlock
+  | ToolResultBlock
+  | PhaseBlock
+  | ApprovalRequestedBlock
+  | SystemNoteBlock;
+
 export interface RuntimeState {
   version: 1;
   instance: Instance;
@@ -256,7 +373,6 @@ export interface RuntimeState {
   tasks: Task[];
   approvals: Approval[];
   audit: AuditEvent[];
-  memories: MemoryRecord[];
   skills: SkillRecord[];
   jobs: JobRecord[];
   connectors: ConnectorRecord[];
@@ -390,7 +506,6 @@ export interface Task {
   tracePath: string;
   auditIds: string[];
   approvalIds: string[];
-  memoryIds: string[];
   skillIds: string[];
   jobId?: string;
   parentTaskId?: string;
@@ -698,9 +813,11 @@ export interface MessagingBridgeRecord {
   //     botUsername, botId, lastOffset,
   //     allowedChatIds: number[],           // per-chat allowlist (no TOFU)
   //     ownerChatId?: number,               // first-enrolled chat for audit history
-  //     recentDeniedChats?: DeniedChatAttempt[],
-  //     pairingCode?: string,               // one-shot enroll-via-DM code
-  //     pairingCodeExpiresAt?: string       // ISO timestamp; 15-minute TTL
+  //     recentDeniedChats?: DeniedChatAttempt[]  // pending enrollment requests; each
+  //                                              // entry carries a verificationCode +
+  //                                              // verificationCodeExpiresAt for the
+  //                                              // operator-side handshake (see
+  //                                              // src/integrations/messaging.ts)
   //   }
   //   discord: {
   //     botUsername, botId, globalName?,
@@ -862,28 +979,6 @@ export interface Approval {
   risk: RiskLevel;
   reason: string;
   payload: Record<string, unknown>;
-}
-
-export interface MemoryRecord {
-  id: string;
-  instance: Instance;
-  // Per-agent isolation key. Optional in the type because legacy state
-  // files persisted before Phase C don't carry it; normalizeState
-  // backfills these by stamping the active agent at migration time.
-  agentId?: string;
-  content: string;
-  sourceTaskId?: string;
-  createdAt: string;
-  updatedAt: string;
-  lastUsedAt?: string;
-  confidence: number;
-  status: MemoryStatus;
-  sensitivity: "normal" | "sensitive";
-  provenance: string;
-  // Hindsight phase 6: bag for migration breadcrumbs (e.g.
-  // `migratedToUnitId`). Stays optional so old persisted state files don't
-  // break — readState tolerates missing fields.
-  metadata?: Record<string, unknown>;
 }
 
 export interface SkillRecord {

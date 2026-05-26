@@ -65,6 +65,45 @@ const SESSION_COOKIE = "gini_tunnel_session";
 // cookie just stops working at next reboot.
 const SESSION_TTL_SECONDS = 60 * 60 * 24;
 
+// Internal authorization marker the proxy stamps onto requests that
+// passed the tunnel-secret or session-cookie gate above. The BFF's
+// per-route guard (web/src/lib/runtime.ts:guardCsrf) checks for this
+// header as an equivalent to "loopback Host" because tunneled
+// requests legitimately carry a non-loopback Host
+// (<random>.trycloudflare.com) and there is no static origin to put
+// in GINI_TRUSTED_ORIGINS — cloudflared mints a fresh hostname on
+// every restart. The proxy ALWAYS strips any inbound value before
+// re-setting it, so a remote caller cannot forge the marker; only
+// requests that just passed the secret/cookie check carry it
+// downstream.
+const TUNNEL_VETTED_HEADER = "x-gini-tunnel-vetted";
+const TUNNEL_VETTED_VALUE = "1";
+
+// Strip + re-set the marker on the headers we forward upstream. The
+// strip is the security-critical half: a remote attacker who knows
+// the trycloudflare hostname but NOT the secret could try to attach
+// `x-gini-tunnel-vetted: 1` themselves; without the strip the BFF
+// guard would treat the spoofed value as proof the proxy already
+// vetted them. Use a fresh Headers clone so the original NextRequest
+// stays untouched (Next.js holds onto request headers internally).
+function vettedHeaders(request: NextRequest): Headers {
+  const headers = new Headers(request.headers);
+  headers.delete(TUNNEL_VETTED_HEADER);
+  headers.set(TUNNEL_VETTED_HEADER, TUNNEL_VETTED_VALUE);
+  return headers;
+}
+
+// Strip the marker but DO NOT set it. Used on the localhost path so a
+// co-tenant process on 127.0.0.1 cannot forge the header to influence
+// the BFF guard's decision. The localhost path's own request still
+// satisfies the guard via loopback-Host equality, so the marker simply
+// isn't needed there.
+function strippedHeaders(request: NextRequest): Headers {
+  const headers = new Headers(request.headers);
+  headers.delete(TUNNEL_VETTED_HEADER);
+  return headers;
+}
+
 export async function proxy(request: NextRequest): Promise<NextResponse> {
   const host = request.headers.get("host") ?? "";
   const isLocalHost = isLocalHostName(host);
@@ -164,21 +203,35 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     }
     const rewritten = request.nextUrl.clone();
     rewritten.pathname = stripped;
-    const response = NextResponse.rewrite(rewritten);
+    // Propagate the tunnel-vetted marker upstream to the BFF guard. The
+    // request reaches `/api/runtime/[...path]` (or any other rewritten
+    // target) with `x-gini-tunnel-vetted: 1` attached and any inbound
+    // value stripped — see vettedHeaders() above for the strip-then-set
+    // rationale. NextResponse.rewrite forwards modified request headers
+    // upstream when passed via `{ request: { headers } }`; without this
+    // option Next would deliver the original request headers and the
+    // marker would never reach the route handler.
+    const response = NextResponse.rewrite(rewritten, { request: { headers: vettedHeaders(request) } });
     if (hasPrefix) attachSession(response, secret);
     return response;
   }
 
-  // Localhost: existing setup gate.
+  // Localhost: existing setup gate. Strip any inbound tunnel-vetted
+  // marker so a co-tenant process on 127.0.0.1 cannot forge the header
+  // to influence the BFF guard — the localhost path's own loopback-Host
+  // equality already satisfies guardCsrf, so the marker is unwanted
+  // here, and stripping it shrinks the surface a hostile local process
+  // could probe.
+  const strippedReqHeaders = strippedHeaders(request);
   if (pathname.startsWith("/setup") || pathname.startsWith("/api/")) {
-    return NextResponse.next();
+    return NextResponse.next({ request: { headers: strippedReqHeaders } });
   }
   const configured = await isProviderConfigured();
   if (configured === false) {
     const setupUrl = new URL("/setup", request.url);
     return NextResponse.redirect(setupUrl);
   }
-  return NextResponse.next();
+  return NextResponse.next({ request: { headers: strippedReqHeaders } });
 }
 
 function attachSession(response: NextResponse, secret: string): void {

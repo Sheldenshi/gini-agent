@@ -83,7 +83,7 @@ export async function reflect(config: RuntimeConfig, input: ReflectInput): Promi
   // routes to the OpenAI Responses API (or the chat-completions fallback for
   // local/openrouter).
   const userPrompt = `${systemMessage}\n\nQuestion: ${input.query}\n\nProvide your response.`;
-  const generated = await generateTaskSummary(config, userPrompt, [], undefined, undefined, providerOverride);
+  const generated = await generateTaskSummary(config, userPrompt, undefined, undefined, providerOverride, input.sourceTaskId);
 
   // 4. Extract opinions.
   const opinionStub = await generateStructured(config, {

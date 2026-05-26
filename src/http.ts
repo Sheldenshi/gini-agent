@@ -10,14 +10,23 @@ import {
 } from "./integrations/tunnel";
 import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
-import { appendTrace, mutateState, readState, readTrace } from "./state";
+import {
+  addAudit,
+  appendTrace,
+  listChatBlocks,
+  listChatBlocksAfter,
+  mutateState,
+  readState,
+  readTrace,
+  subscribeChatBlocks
+} from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
-import { archiveMemory, createMemoryFromInput, editMemory, migrateLegacyMemories, recall, reflect, retain, updateMemory } from "./memory";
+import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
@@ -29,10 +38,27 @@ import { searchSessions } from "./execution/search";
 import { listToolsets, setToolsetStatus } from "./capabilities/toolsets";
 import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/subagents";
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
-import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, pairMessagingBridge, receiveMessagingInput, rejectPendingChat, sendMessagingOutput } from "./integrations/messaging";
+import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
 import { providerCatalog } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
+import {
+  approveSoul,
+  approveUserProfile,
+  instructionsPath,
+  listSoulHistory,
+  listUserProfileHistory,
+  loadInstructions,
+  loadSoul,
+  loadUserProfile,
+  restoreSoulFromHistory,
+  restoreUserProfileFromHistory,
+  soulHistoryDir,
+  soulPath,
+  userProfileHistoryDir,
+  userProfilePath
+} from "./runtime/identity-files";
+import { SOUL_SOFT_CAP_CHARS, USER_SOFT_CAP_CHARS, identityBudgetState } from "./system-prompt";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
@@ -264,6 +290,20 @@ export function createHandler(
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
+    // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
+    // /blocks endpoint returns the full ordered list for initial render;
+    // /stream is the SSE companion clients subscribe to for live
+    // updates. Both validate the session exists so a stale link returns
+    // 404 rather than streaming an empty channel forever.
+    ["GET", /^\/api\/chat\/([^/]+)\/blocks$/, (_request, params) => {
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      return json(listChatBlocks(config.instance, sessionId));
+    }],
+    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, (request, params) => chatBlockStream(config, request, params[0])],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
     ["GET", /^\/api\/tasks$/, (request) => {
@@ -431,19 +471,6 @@ export function createHandler(
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
-    ["GET", /^\/api\/memory$/, () => {
-      // Phase C — MemoryRecord listings are scoped to the active agent so
-      // the web UI's "Memory" page only shows the active agent's pool.
-      const state = readState(config.instance);
-      const effective = resolveEffectiveContext(state, config);
-      const memories = effective.agentId
-        ? state.memories.filter((memory) => memory.agentId === effective.agentId)
-        : state.memories;
-      return json(memories);
-    }],
-    ["POST", /^\/api\/memory$/, async (request) => {
-      return json(await createMemoryFromInput(config, await body(request)), 201);
-    }],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);
@@ -597,10 +624,29 @@ export function createHandler(
       if (!updated) return json({ error: "bank not found" }, 404);
       return json(updated);
     }],
-    ["PATCH", /^\/api\/memory\/([^/]+)$/, async (request, params) => json(await editMemory(config, params[0], await body(request)))],
-    ["DELETE", /^\/api\/memory\/([^/]+)$/, async (_request, params) => json(await archiveMemory(config, params[0]))],
-    ["POST", /^\/api\/memory\/([^/]+)\/approve$/, async (_request, params) => json(await updateMemory(config, params[0], "active"))],
-    ["POST", /^\/api\/memory\/([^/]+)\/reject$/, async (_request, params) => json(await updateMemory(config, params[0], "rejected"))],
+    // Identity-file approval surface. The chat-task `edit_soul` tool
+    // lands its proposal on SOUL.md.proposed and the runtime continues
+    // to read the approved SOUL.md until this endpoint renames the
+    // proposal over the approved target. `edit_user_profile` is
+    // auto-approved post-consolidation for clean bodies; a write that
+    // trips the injection scanner falls back to USER.md.proposed and
+    // requires this approval endpoint before it lands at the approved
+    // path. See ADR runtime-identity-files.md and ADR
+    // runtime-identity-files.md for the original propose/approve design.
+    ["POST", /^\/api\/identity-files\/soul\/approve$/, async () => json(await approveSoulProposal(config))],
+    ["POST", /^\/api\/identity-files\/user\/approve$/, async () => json(await approveUserProfileProposal(config))],
+    // Read-only inspection: dump INSTRUCTIONS.md, USER.md, and the
+    // SOUL.md for the active or named agent with char counts vs the
+    // soft cap. Returns full file content (no truncation). The CLI
+    // `gini identity show` consumes this endpoint.
+    ["GET", /^\/api\/identity-files$/, (request) => json(showIdentityFiles(config, request))],
+    // List history snapshots for USER.md or a per-agent SOUL.md.
+    // kind ∈ {user, soul}; agentId required for soul. Newest first.
+    ["GET", /^\/api\/identity-files\/history$/, (request) => json(showIdentityHistory(config, request))],
+    // Restore an identity file from a named history snapshot. Atomic.
+    // Emits an audit row + creates a fresh pre-rollback snapshot so
+    // the rollback is itself reversible.
+    ["POST", /^\/api\/identity-files\/rollback$/, async (request) => json(await rollbackIdentityFile(config, request))],
     ["GET", /^\/api\/skills$/, (request) => {
       const query = new URL(request.url).searchParams.get("q");
       return json(query ? searchSkills(config, query) : listSkills(config));
@@ -755,12 +801,15 @@ export function createHandler(
     ["POST", /^\/api\/messaging\/([^/]+)\/send$/, async (request, params) => json(await sendMessagingOutput(config, params[0], await body(request)), 201)],
     ["POST", /^\/api\/messaging\/([^/]+)\/health$/, async (_request, params) => json(await checkMessagingBridge(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/disable$/, async (_request, params) => json(await disableMessagingBridge(config, params[0]))],
-    ["POST", /^\/api\/messaging\/([^/]+)\/pair$/, async (_request, params) => json(await pairMessagingBridge(config, params[0]))],
+    ["POST", /^\/api\/messaging\/([^/]+)\/remove$/, async (_request, params) => json(await removeMessagingBridge(config, params[0]))],
     ["GET", /^\/api\/messaging\/([^/]+)\/chats$/, (_request, params) => json(listAllowedChats(config, params[0]))],
     ["POST", /^\/api\/messaging\/([^/]+)\/allow$/, async (request, params) => {
       const payload = await body(request);
       const chatId = parseChatIdStrict(payload.chatId);
-      return json(await allowChat(config, params[0], chatId));
+      const expectedCode = typeof payload.expectedCode === "string" && payload.expectedCode.length > 0
+        ? payload.expectedCode
+        : undefined;
+      return json(await allowChat(config, params[0], chatId, { expectedCode }));
     }],
     ["POST", /^\/api\/messaging\/([^/]+)\/deny$/, async (request, params) => {
       const payload = await body(request);
@@ -969,6 +1018,216 @@ async function body(request: Request): Promise<Record<string, unknown>> {
   return (await request.json()) as Record<string, unknown>;
 }
 
+// Promote SOUL.md.proposed → SOUL.md for the active agent and write an
+// `identity.soul.approved` audit row. Returns `{ ok: true, path }` on
+// success or `{ ok: false, reason }` when no proposal exists / no
+// active agent. The API surface mirrors the propose tool — the rename
+// itself is atomic. See ADR runtime-identity-files.md.
+async function approveSoulProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
+  const state = readState(config.instance);
+  const agentId = state.activeAgentId;
+  if (!agentId) return { ok: false, reason: "no active agent" };
+  const promoted = approveSoul(config.instance, agentId);
+  if (!promoted) return { ok: false, reason: "no proposal to approve" };
+  const path = soulPath(config.instance, agentId);
+  await mutateState(config.instance, (s) => {
+    addAudit(
+      s,
+      {
+        actor: "user",
+        action: "identity.soul.approved",
+        target: path,
+        risk: "low",
+        evidence: { agentId, path }
+      },
+      { agentId }
+    );
+  });
+  return { ok: true, path };
+}
+
+// Promote USER.md.proposed → USER.md and write an audit row. Reached
+// when `edit_user_profile` produced a body the injection scanner flagged
+// — the auto-approve path bypasses this endpoint entirely. Returns
+// `{ ok: true, path }` on success or `{ ok: false, reason }` when no
+// proposal exists. See ADR runtime-identity-files.md.
+async function approveUserProfileProposal(config: RuntimeConfig): Promise<{ ok: boolean; reason?: string; path?: string }> {
+  const promoted = approveUserProfile(config.instance);
+  if (!promoted) return { ok: false, reason: "no proposal to approve" };
+  const path = userProfilePath(config.instance);
+  await mutateState(config.instance, (s) => {
+    addAudit(
+      s,
+      {
+        actor: "user",
+        action: "identity.user_profile.approved",
+        target: path,
+        risk: "low",
+        evidence: { path, approvedFromProposal: true }
+      },
+      { system: true }
+    );
+  });
+  return { ok: true, path };
+}
+
+// Identity-file inspection. Returns the bytes of INSTRUCTIONS.md,
+// USER.md, and (for the active or named agent) SOUL.md with char-vs-cap
+// budget metadata. No truncation — the response carries the full file
+// content. The CLI `gini identity show` consumes this endpoint and
+// pretty-prints; downstream UIs are free to do the same. SOUL.md
+// surfaces under all agents in the instance by default (an empty
+// agentId query parameter dumps each agent's SOUL.md alongside the
+// shared instance-level USER.md / INSTRUCTIONS.md).
+function showIdentityFiles(config: RuntimeConfig, request: Request): unknown {
+  const state = readState(config.instance);
+  const requestedAgent = new URL(request.url).searchParams.get("agentId") ?? undefined;
+  const instructionsContent = loadInstructions(config.instance);
+  const userContent = loadUserProfile(config.instance);
+  const userBudget = userContent && !userContent.startsWith("[BLOCKED:")
+    ? identityBudgetState(userContent, USER_SOFT_CAP_CHARS)
+    : null;
+  const targetAgents = requestedAgent
+    ? state.agents.filter((a) => a.id === requestedAgent || a.name === requestedAgent)
+    : state.agents;
+  const soulEntries = targetAgents.map((agent) => {
+    const content = loadSoul(config.instance, agent.id);
+    const budget = content && !content.startsWith("[BLOCKED:")
+      ? identityBudgetState(content, SOUL_SOFT_CAP_CHARS)
+      : null;
+    return {
+      agentId: agent.id,
+      agentName: agent.name,
+      path: soulPath(config.instance, agent.id),
+      content,
+      budget
+    };
+  });
+  return {
+    instance: config.instance,
+    instructions: {
+      path: instructionsPath(config.instance),
+      content: instructionsContent
+    },
+    userProfile: {
+      path: userProfilePath(config.instance),
+      content: userContent,
+      budget: userBudget,
+      cap: USER_SOFT_CAP_CHARS
+    },
+    souls: soulEntries,
+    soulCap: SOUL_SOFT_CAP_CHARS
+  };
+}
+
+// List history snapshots for USER.md or a per-agent SOUL.md. Query
+// params: kind=user|soul, agentId=<id> (required when kind=soul).
+// Returns the snapshot entries newest-first; each carries the filename
+// (which the rollback endpoint accepts), the absolute path, mtime, and
+// size.
+function showIdentityHistory(config: RuntimeConfig, request: Request): unknown {
+  const url = new URL(request.url);
+  const kind = (url.searchParams.get("kind") ?? "").toLowerCase();
+  const agentId = url.searchParams.get("agentId") ?? undefined;
+  if (kind === "user") {
+    return {
+      kind: "user",
+      dir: userProfileHistoryDir(config.instance),
+      entries: listUserProfileHistory(config.instance)
+    };
+  }
+  if (kind === "soul") {
+    if (!agentId) return { error: "agentId required when kind=soul" };
+    return {
+      kind: "soul",
+      agentId,
+      dir: soulHistoryDir(config.instance, agentId),
+      entries: listSoulHistory(config.instance, agentId)
+    };
+  }
+  return { error: "kind must be one of: user, soul" };
+}
+
+// Restore an identity file from a named history snapshot. Payload:
+// { kind: "user" | "soul", snapshot: "<name>", agentId?: "<id>" }.
+// Emits an `identity.<file>.rollback` audit row with the source
+// snapshot and the pre-rollback snapshot path (so the rollback is
+// itself recoverable). Returns 404 when the snapshot doesn't exist.
+async function rollbackIdentityFile(
+  config: RuntimeConfig,
+  request: Request
+): Promise<unknown> {
+  const payload = (await body(request)) as { kind?: unknown; snapshot?: unknown; agentId?: unknown };
+  const kind = typeof payload.kind === "string" ? payload.kind : "";
+  const snapshot = typeof payload.snapshot === "string" ? payload.snapshot : "";
+  if (!snapshot) return { ok: false, reason: "snapshot required" };
+  if (kind === "user") {
+    const result = restoreUserProfileFromHistory(config.instance, snapshot);
+    if (!result.ok) return { ok: false, reason: result.reason };
+    await mutateState(config.instance, (s) => {
+      addAudit(
+        s,
+        {
+          actor: "user",
+          action: "identity.user_profile.rollback",
+          target: userProfilePath(config.instance),
+          risk: "low",
+          evidence: {
+            snapshot,
+            fromPath: result.from,
+            restoredBytes: result.restoredBytes,
+            preRestoreSnapshot: result.preRestoreSnapshot
+          }
+        },
+        { system: true }
+      );
+    });
+    return {
+      ok: true,
+      kind: "user",
+      restoredBytes: result.restoredBytes,
+      fromPath: result.from,
+      preRestoreSnapshot: result.preRestoreSnapshot,
+      activePath: userProfilePath(config.instance)
+    };
+  }
+  if (kind === "soul") {
+    const agentId = typeof payload.agentId === "string" ? payload.agentId : "";
+    if (!agentId) return { ok: false, reason: "agentId required when kind=soul" };
+    const result = restoreSoulFromHistory(config.instance, agentId, snapshot);
+    if (!result.ok) return { ok: false, reason: result.reason };
+    await mutateState(config.instance, (s) => {
+      addAudit(
+        s,
+        {
+          actor: "user",
+          action: "identity.soul.rollback",
+          target: soulPath(config.instance, agentId),
+          risk: "low",
+          evidence: {
+            agentId,
+            snapshot,
+            fromPath: result.from,
+            restoredBytes: result.restoredBytes,
+            preRestoreSnapshot: result.preRestoreSnapshot
+          }
+        },
+        { agentId }
+      );
+    });
+    return {
+      ok: true,
+      kind: "soul",
+      agentId,
+      restoredBytes: result.restoredBytes,
+      fromPath: result.from,
+      preRestoreSnapshot: result.preRestoreSnapshot,
+      activePath: soulPath(config.instance, agentId)
+    };
+  }
+  return { ok: false, reason: "kind must be one of: user, soul" };
+}
+
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
@@ -1001,11 +1260,10 @@ function statusFromErrorMessage(message: string): number {
   // Agent delete guards (default agent, active agent) throw user-input
   // errors that should surface as 400.
   if (message.startsWith("Cannot delete")) return 400;
-  // Memory write paths (createMemoryFromInput, the "remember "-prefix
-  // path in agent.ts) throw this when no agent is active. Sibling routes
-  // (/memory/retain, /memory/recall, /memory/reflect) already return 400
-  // for the same condition — map this here so legacy POST /api/memory
-  // matches.
+  // Hindsight memory routes (/memory/retain, /memory/recall,
+  // /memory/reflect) and identity-file edit tools throw this when no
+  // agent is active. Map to 400 so callers see a clean user-input error
+  // rather than a 500.
   if (message.includes("no active agent")) return 400;
   // Browser-connect surfaces user-input failures with these prefixes;
   // forward them to 400 so the webapp can surface the original error text
@@ -1031,7 +1289,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Telegram inbound target must be")) return 400;
   if (message.startsWith("Discord inbound target")) return 400;
   if (message.startsWith("Outbound message requires")) return 400;
-  if (message.startsWith("Pairing codes only apply")) return 400;
+  // Verification-code race surfaces from `allowChat` when the operator's UI
+  // snapshot lost to the server: the code rotated (a fresher DM minted a new
+  // one) or aged past its TTL between page load and click. 409 Conflict
+  // signals "your view is stale, refresh and retry" — the UI can then prompt
+  // a re-fetch of the pending row rather than show a generic server error.
+  if (message.startsWith("Verification code")) return 409;
   if (message.startsWith("Chat allowlist only applies")) return 400;
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
@@ -1105,6 +1368,111 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
     cancel() {
       closed = true;
       if (interval) clearInterval(interval);
+    }
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      connection: "keep-alive"
+    }
+  });
+}
+
+// ChatBlock SSE stream. Per ADR chat-block-protocol.md, each frame is
+// `id: <blockId>\nevent: chat_block\ndata: <json>\n\n` so a browser
+// EventSource auto-attaches Last-Event-ID on reconnect and the runtime
+// resumes from the cursor instead of re-replaying the full list.
+//
+// Differs from `eventStream` above: that route polls the global ring
+// buffer at 1s. Here we use the in-process EventEmitter wired into
+// insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
+// inserts and upserts both fire AFTER the SQLite commit so subscribers
+// observe durable rows.
+function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string): Response {
+  let closed = false;
+  let keepalive: Timer | undefined;
+  let unsubscribe: (() => void) | undefined;
+  const encoder = new TextEncoder();
+  const seen = new Set<string>();
+  const lastEventId =
+    request.headers.get("last-event-id") ??
+    new URL(request.url).searchParams.get("lastEventId") ??
+    null;
+
+  // Validate the session exists. We do this inside the stream factory
+  // (rather than at the route handler) so the 404 carries the SSE
+  // content-type semantics for clients that route both error and
+  // success branches through the same EventSource handler.
+  const state = readState(config.instance);
+  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+    return new Response(JSON.stringify({ error: `Chat session not found: ${sessionId}` }), {
+      status: 404,
+      headers: { "content-type": "application/json" }
+    });
+  }
+
+  const stream = new ReadableStream({
+    start(controller) {
+      // Two enqueue paths:
+      //   - `enqueueBackfill` dedupes by block id so an initial replay
+      //     doesn't double-send a row that we already sent (relevant
+      //     on reconnect when Last-Event-ID is honored). The seen set
+      //     is consulted ONLY here.
+      //   - `enqueueLive` never dedupes. Upsert-capable kinds
+      //     (`assistant_text` streaming deltas, `tool_call` status
+      //     flips) fire the same block id repeatedly with updated
+      //     payloads; clients merge by id, so the wire MUST carry
+      //     every frame. Skipping by id here was the previous bug —
+      //     terminal `streaming: false` flips never reached the
+      //     client.
+      const enqueueFrame = (block: { id: string }): void => {
+        controller.enqueue(
+          encoder.encode(
+            `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
+          )
+        );
+      };
+      const enqueueBackfill = (block: { id: string }): void => {
+        if (closed) return;
+        if (seen.has(block.id)) return;
+        seen.add(block.id);
+        enqueueFrame(block);
+      };
+      const enqueueLive = (block: { id: string }): void => {
+        if (closed) return;
+        // Mark live-delivered blocks so a hypothetical mid-stream
+        // backfill (we don't issue one today, but the wiring is
+        // defensive) doesn't re-send the same row in addition.
+        seen.add(block.id);
+        enqueueFrame(block);
+      };
+
+      // Initial backfill: send any blocks the client is missing.
+      // listChatBlocksAfter honors Last-Event-ID (or falls back to the
+      // full list when the cursor is unknown / absent).
+      const backfill = listChatBlocksAfter(config.instance, sessionId, lastEventId);
+      for (const block of backfill) enqueueBackfill(block);
+
+      // Subscribe to future inserts/upserts. Listeners fire AFTER the
+      // SQLite commit so observers see durable rows. Live events
+      // skip the dedup gate by design — see comment above.
+      unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
+        enqueueLive(block);
+      });
+
+      // Idle keepalive (mirrors eventStream above). Proxies often cap
+      // idle streams around 30-60s; a comment line resets the idle-byte
+      // clock at every hop without surfacing as an event.
+      keepalive = setInterval(() => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(`: keepalive\n\n`));
+      }, 5_000);
+    },
+    cancel() {
+      closed = true;
+      if (keepalive) clearInterval(keepalive);
+      if (unsubscribe) unsubscribe();
     }
   });
   return new Response(stream, {

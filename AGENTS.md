@@ -15,6 +15,7 @@ Keep ADRs current when architecture changes.
 - Update an existing ADR when the original decision still stands but implementation details, consequences, or acceptance checks changed.
 - Add a new ADR for a significant architecture decision, trust boundary, persistence model, process shape, provider strategy, client contract, or operational workflow.
 - If a change makes an ADR obsolete, mark the old decision as superseded and link to the replacement ADR.
+- ADRs should be forward-looking. Don't write removal logs — context for what was deleted belongs in git history and PR descriptions, not in an ADR. If two ADRs overlap because of a consolidation, merge the canonical forward-looking content into one and delete the redundant ADR (instead of leaving both).
 - ADRs are named by slug (`docs/adr/<slug>.md`), no number prefix. Pick the slug carefully and never rename it once merged — the filename is the citation key.
 - Always cite an ADR by its full filename including `.md` so the reference is unambiguously a file: `see ADR agent-memory-isolation.md` in prose and code comments, and `[Per-Agent Memory Isolation](docs/adr/agent-memory-isolation.md)` for markdown links.
 
@@ -27,6 +28,10 @@ Keep ADRs current when architecture changes.
 - Browser code must not receive gateway bearer tokens; token injection stays server-side in the Next.js BFF.
 - Side-effecting tools must preserve approval, audit, and trace behavior.
 - Instance-aware paths, ports, logs, and state must remain isolated.
+
+## Branches
+
+Use `<type>/<kebab-case-topic>`, where `<type>` is one of `feat`, `fix`, `chore`, `docs`, `refactor`, or `test`. Examples: `feat/profile-switcher`, `fix/chat-title-overflow`, `docs/release-process`.
 
 ## Commits and PR titles
 

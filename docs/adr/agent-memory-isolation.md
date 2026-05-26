@@ -43,11 +43,7 @@ agent changes which facts the agent knows.
   `bankIdForAgent(agentId)` so a fresh agent auto-creates its bank on
   first recall.
 - Retain and reflect resolve the active agent via
-  `resolveEffectiveContext` and stamp `agentId` at write time. The
-  legacy `createMemoryFromInput` path fails loudly with
-  `"Cannot create memory: no active agent."` if no agent is active.
-- The system-prompt pinned-memory block filters `state.memories` by
-  the active agent before passing to `buildAgentSystemContext`.
+  `resolveEffectiveContext` and stamp `agentId` at write time.
 - `createAgent` calls `ensureAgentBank` so a newly created agent gets
   an empty bank immediately.
 - `/api/status.activeAgent.memoryNamespace` exposes the isolation key
@@ -55,16 +51,13 @@ agent changes which facts the agent knows.
 
 ## Read And Write Semantics
 
-- **Write:** every retain/reflect/legacy-create path resolves the
-  active agent and stamps `agentId`. No active agent → loud failure
-  on the legacy CRUD path. Auto-retain inside `runChatTask` and
-  `runTask` reads `state.activeAgentId` and skips writing (with a
-  trace) when no agent is active, rather than leaking into the
-  default bank.
+- **Write:** every retain/reflect path resolves the active agent and
+  stamps `agentId`. Auto-retain inside `runChatTask` and `runTask`
+  reads `state.activeAgentId` and skips writing (with a trace) when
+  no agent is active, rather than leaking into the default bank.
 - **Read:** `RecallInput.agentId` is required. The four channels
-  filter on `agent_id` before fusion. The system-prompt pinned block
-  filters `state.memories` by active agent. There is no cross-agent
-  search; it is an explicit non-goal.
+  filter on `agent_id` before fusion. There is no cross-agent search;
+  it is an explicit non-goal.
 
 ## Boundary
 
@@ -81,6 +74,18 @@ both fields from existing state files on first read. The Hindsight
 a historical record of pre-Phase-C data and is separate from the
 runtime field that was removed.
 
+**Amendment (2026-05-21):** `state.memories` (the legacy JSON pinned-
+memory store) was removed alongside the memory-surface consolidation.
+The system-prompt pinned-memory block is gone; USER.md (instance-scoped,
+cross-agent) holds the user-identity surface and Hindsight (per-agent
+bank, unchanged) holds long-term recall. `migrateMemoryAgentId` and the
+`MemoryRecord.scope` strip step were both removed because the source
+collection no longer exists; the per-agent isolation key now applies
+only to Hindsight units, jobs, sessions, and the SOUL.md file path. A
+one-shot migration drains pre-consolidation `state.memories` into
+USER.md and clears the array. See ADR
+[runtime-identity-files.md](./runtime-identity-files.md).
+
 ## Subagent Inheritance
 
 Subagents go through `runChatTask` which reads `state.activeAgentId`,
@@ -91,12 +96,11 @@ revisited.
 
 ## Migration
 
-`normalizeState` runs two backfills after the agent rename and lane
-migrations are settled:
+`normalizeState` runs the Hindsight backfill after the agent rename and
+lane migrations are settled. The legacy `state.memories` backfill was
+retired alongside the memory-surface consolidation — see the 2026-05-21
+amendment above.
 
-- `migrateMemoryAgentId(state)` walks `state.memories` and stamps any
-  row missing `agentId` with the active agent id. Emits one
-  `memory.agentid.backfill` audit event with the count.
 - `migrateHindsightAgentIdColumns(instance, state)` opens the SQLite
   memory.db only if it already exists, runs
   `UPDATE … WHERE agent_id IS NULL` against `memory_units` and

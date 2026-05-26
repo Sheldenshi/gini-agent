@@ -1,5 +1,4 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
 import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
@@ -26,7 +25,6 @@ export function createEmptyState(instance: Instance): RuntimeState {
     tasks: [],
     approvals: [],
     audit: [],
-    memories: [],
     skills: [],
     jobs: [],
     connectors: [
@@ -153,7 +151,6 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "tasks",
     "approvals",
     "audit",
-    "memories",
     "skills",
     "jobs",
     "connectors",
@@ -270,23 +267,71 @@ function migrateProfileFieldsToAgent(state: RuntimeState): void {
   delete stateAny.activeProfileId;
 }
 
-// Drop the dead `MemoryRecord.scope` and `AgentRecord.memoryScopes` fields
-// from persisted state. Neither was consulted at runtime after Phase C —
-// `agentId` is the only memory isolation boundary. Idempotent: a second
-// pass over an already-cleaned state file matches no rows. Emits one
-// summary audit event per collection when something was stripped so the
-// cleanup shows up in `gini doctor` / /api/audit.
-function migrateDropDeadMemoryFields(state: RuntimeState): void {
-  let scopesStripped = 0;
-  if (Array.isArray(state.memories)) {
-    for (const memory of state.memories) {
-      const rec = memory as unknown as { scope?: unknown };
-      if (rec.scope !== undefined) {
-        delete rec.scope;
-        scopesStripped += 1;
-      }
-    }
+// Strip legacy improvement proposals with `kind: "memory"` from the
+// in-memory shape. The `memory` kind was removed alongside the
+// state.memories consolidation; older state files may still carry
+// proposals on that kind which would otherwise fall through the
+// proposeImprovement normalizer and get mis-applied as a skill or job.
+// Each removed proposal lands an audit row so operators can see the
+// pruning happened. See ADR runtime-identity-files.md.
+function dropDeadMemoryImprovements(state: RuntimeState): void {
+  if (!Array.isArray(state.improvements)) return;
+  const removed: Array<{ id: string; title: string; status: string }> = [];
+  state.improvements = state.improvements.filter((proposal) => {
+    const dyn = proposal as unknown as { kind?: unknown; id?: unknown; title?: unknown; status?: unknown };
+    if (dyn.kind !== "memory") return true;
+    removed.push({
+      id: typeof dyn.id === "string" ? dyn.id : "<unknown>",
+      title: typeof dyn.title === "string" ? dyn.title : "<untitled>",
+      status: typeof dyn.status === "string" ? dyn.status : "<unknown>"
+    });
+    return false;
+  });
+  if (removed.length === 0) return;
+  for (const entry of removed) {
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "improvement.memory-kind.removed",
+        target: entry.id,
+        risk: "low",
+        evidence: { title: entry.title, status: entry.status, reason: "kind: memory removed in consolidation" }
+      },
+      { system: true }
+    );
   }
+}
+
+// Defensive drop of the legacy `state.memories` field. The migration in
+// `migratePinnedMemoriesToUserProfile` clears the array and sets a marker
+// so this normally runs against an empty array, but old state files from
+// instances that haven't yet booted post-consolidation still carry the
+// field on disk. The `migrations.statePinnedToUserMd` marker gates the
+// drop — without it, a half-installed instance could lose pinned content
+// before the migration ran. With it, the field is dead and we strip it
+// from the in-memory shape so subsequent code paths never see the legacy
+// surface. The on-disk JSON keeps the field as an empty array until the
+// next write; that's fine — the migration is idempotent and the type-
+// level field is gone. See ADR runtime-identity-files.md.
+function dropDeadMemoriesField(state: RuntimeState): void {
+  const dyn = state as unknown as {
+    memories?: unknown;
+    migrations?: { statePinnedToUserMd?: string };
+  };
+  if (!Array.isArray(dyn.memories)) return;
+  if (!dyn.migrations?.statePinnedToUserMd) {
+    // Migration hasn't run yet for this instance. Leave `state.memories`
+    // intact so the migration can drain it.
+    return;
+  }
+  delete dyn.memories;
+}
+
+// Drop the dead `AgentRecord.memoryScopes` field from persisted state.
+// Idempotent: a second pass over an already-cleaned state file matches
+// no rows.
+function migrateDropDeadAgentMemoryScopes(state: RuntimeState): void {
   let memoryScopesStripped = 0;
   if (Array.isArray(state.agents)) {
     for (const agent of state.agents) {
@@ -296,20 +341,6 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
         memoryScopesStripped += 1;
       }
     }
-  }
-  if (scopesStripped > 0) {
-    // Migration housekeeping at instance load — no agent context yet.
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "memory.scope.dropped",
-        target: "state.memories",
-        risk: "low",
-        evidence: { stripped: scopesStripped }
-      },
-      { system: true }
-    );
   }
   if (memoryScopesStripped > 0) {
     addAudit(
@@ -322,47 +353,6 @@ function migrateDropDeadMemoryFields(state: RuntimeState): void {
         evidence: { stripped: memoryScopesStripped }
       },
       { system: true }
-    );
-  }
-}
-
-// Phase C — per-agent memory isolation backfill for the legacy
-// MemoryRecord store. Walks state.memories and stamps `agentId` on rows
-// that pre-date Phase C, bundling all of them under whichever agent was
-// active at migration time (typically the default agent on davao-style
-// instances). Idempotent: rows already carrying `agentId` are skipped.
-// Audits the count so the rebucketing shows up in `gini doctor` /
-// /api/audit. Hindsight unit/bank backfill lives in
-// migrateHindsightAgentIdColumns (runs against SQLite, not JSON state).
-function migrateMemoryAgentId(state: RuntimeState): void {
-  if (!Array.isArray(state.memories) || state.memories.length === 0) return;
-  const defaultAgentId =
-    state.activeAgentId
-    ?? state.agents.find((agent) => agent.status === "active")?.id
-    ?? state.agents[0]?.id
-    ?? "agent_default";
-  // Treat stale agentIds (pointing at a deleted/unknown agent) the same as
-  // missing — leaving them stamped to a dead id strands the memory under
-  // an unselectable bucket in the UI. Mirrors the predicate in
-  // migrateRecordAgentIds.
-  const validAgentIds = new Set(state.agents.map((agent) => agent.id));
-  let stamped = 0;
-  for (const memory of state.memories) {
-    if (memory.agentId && validAgentIds.has(memory.agentId)) continue;
-    memory.agentId = defaultAgentId;
-    stamped += 1;
-  }
-  if (stamped > 0) {
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "memory.agentid.backfill",
-        target: defaultAgentId,
-        risk: "low",
-        evidence: { stamped, agentId: defaultAgentId }
-      },
-      { agentId: defaultAgentId }
     );
   }
 }
@@ -386,8 +376,8 @@ function migrateTaskChatSessionId(state: RuntimeState): void {
 }
 
 // Stamp the active-at-migration-time agent onto records that pre-date the
-// per-agent isolation field. Mirrors migrateMemoryAgentId — idempotent and
-// audit-emitting. Covers Task, ChatSessionRecord, JobRecord, JobRunRecord,
+// per-agent isolation field. Idempotent and audit-emitting. Covers Task,
+// ChatSessionRecord, JobRecord, JobRunRecord,
 // SubagentRecord, Approval in one pass so the backfill audit doesn't fan
 // out into six separate rows. RuntimeEvent and AuditEvent are deliberately
 // excluded — see the comment at the stamp loop below.
@@ -654,7 +644,6 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.tasks ??= [];
   state.approvals ??= [];
   state.audit ??= [];
-  state.memories ??= [];
   state.skills ??= [];
   state.jobs ??= [];
   state.pairingCodes ??= [];
@@ -763,15 +752,27 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   // existing `agent_default` record. Runs after agents are populated;
   // idempotent.
   migrateDefaultAgentToolsets(state, instance);
-  // Phase C — per-agent memory isolation backfill. Runs after agents are
-  // present so the migration can stamp the right id. Both helpers are
-  // idempotent so a re-read of an already-migrated state file is a no-op.
-  migrateMemoryAgentId(state);
+  // Phase C — per-agent memory isolation backfill for the SQLite
+  // hindsight store. The legacy `state.memories` per-agent backfill
+  // ran here too; that surface was removed in the state.memories
+  // consolidation (see ADR runtime-identity-files.md) so only
+  // the SQLite-backed helper remains.
   migrateHindsightAgentIdColumns(instance, state);
-  // Drop dead MemoryRecord.scope / AgentRecord.memoryScopes fields from
-  // legacy state files. Runs after agents are populated so the audit
-  // event can land on a valid state.
-  migrateDropDeadMemoryFields(state);
+  // Drop the dead AgentRecord.memoryScopes field from legacy state
+  // files. Runs after agents are populated so the audit event lands on
+  // a valid state.
+  migrateDropDeadAgentMemoryScopes(state);
+  // Defensive drop of the now-removed `state.memories` field. Only
+  // strips when the consolidation migration has already run for this
+  // instance (marker present), so a half-installed instance keeps its
+  // pinned content intact until the migration drains it. See ADR
+  // runtime-identity-files.md.
+  dropDeadMemoriesField(state);
+  // Strip legacy improvement proposals with `kind: "memory"` so the
+  // proposeImprovement normalizer never sees them and silently
+  // mis-applies them as skills or jobs. See ADR
+  // runtime-identity-files.md.
+  dropDeadMemoryImprovements(state);
   state.relays ??= [];
   state.notifications ??= [];
   state.events ??= [];
@@ -876,78 +877,4 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   }
   expirePairingCodes(state);
   return state;
-}
-
-// One-shot migration for telegram bridges created before the chat
-// allowlist + pairing-code surface landed. Without this, a legacy
-// bridge upgrades into `metadata.allowedChatIds === undefined`, the
-// poller's `authorizeTelegramChat` denies every inbound, and the
-// operator sees total silence on a bridge that previously worked.
-// The mint gives them a pairing code they can DM the bot with to
-// re-enroll without recreating the bridge.
-//
-// Lives OUTSIDE normalizeState by design. normalizeState runs on every
-// read, including pure inspections like `gini messaging chats`. If the
-// backfill ran there, each read would mint a different random code on
-// a legacy bridge until something persisted via mutateState — operators
-// running pre-runtime CLI inspections could see a code that's never
-// actually live. Callers explicitly invoke this from a write path
-// (server startup), so the mint happens exactly once and the code is
-// durable from the first observation onward.
-//
-// Idempotent: only fires when the bridge has NO allowlist AND NO
-// pairing code at all (active or expired). After one mint the second
-// branch sees a present pairingCode and skips.
-const LEGACY_PAIRING_CODE_BYTES = 4;
-const LEGACY_PAIRING_CODE_TTL_MS = 15 * 60 * 1000;
-const LEGACY_PAIRING_CODE_PREFIX = "pair-";
-export function applyLegacyTelegramPairingMigration(state: RuntimeState): boolean {
-  let migrated = false;
-  for (const bridge of state.messagingBridges ?? []) {
-    if (bridge.kind !== "telegram") continue;
-    const meta = (bridge.metadata ?? {}) as Record<string, unknown>;
-    // Treat ANY present allowlist array as "already migrated", even if
-    // it's empty. An explicit `allowedChatIds: []` is the operator
-    // saying "I disabled every chat on purpose" (via `gini messaging
-    // deny` on each one). Reopening the pairing window on such a
-    // bridge would surprise the operator and could undo a deliberate
-    // lockout. Only a fully-absent `allowedChatIds` indicates the
-    // pre-allowlist schema we're migrating from.
-    const allowed = meta.allowedChatIds;
-    const hasAllowlist = Array.isArray(allowed);
-    const hasAnyCode = typeof meta.pairingCode === "string";
-    if (hasAllowlist || hasAnyCode) continue;
-    // The migration only targets bridges that ACTUALLY polled before
-    // the allowlist landed — those have `lastOffset` set on metadata
-    // from their pre-allowlist runtime. A bridge with no `lastOffset`
-    // is either brand-new (addMessagingBridge already minted a code
-    // for it) or one whose code was deliberately cleared by
-    // tryClaimPairingCode after a failed/expired claim; in either
-    // case minting another code would be surprising. The strict
-    // `typeof === "number"` guard also avoids ambiguity from a
-    // legacy `0` sentinel or a malformed serialization.
-    const lastOffset = meta.lastOffset;
-    if (typeof lastOffset !== "number") continue;
-    const code = LEGACY_PAIRING_CODE_PREFIX + randomBytes(LEGACY_PAIRING_CODE_BYTES).toString("hex");
-    bridge.metadata = {
-      ...meta,
-      pairingCode: code,
-      pairingCodeExpiresAt: new Date(Date.now() + LEGACY_PAIRING_CODE_TTL_MS).toISOString()
-    };
-    bridge.updatedAt = now();
-    addAudit(
-      state,
-      {
-        actor: "runtime",
-        action: "messaging.pairing.migrated",
-        target: bridge.id,
-        risk: "low",
-        evidence: { reason: "legacy-bridge-allowlist-backfill" }
-      },
-      // Messaging bridge is an instance-shared resource — not bound to any agent.
-      { system: true }
-    );
-    migrated = true;
-  }
-  return migrated;
 }

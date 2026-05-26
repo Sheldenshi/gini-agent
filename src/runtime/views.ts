@@ -10,7 +10,6 @@ export function mobileBootstrap(config: RuntimeConfig) {
     instance: config.instance,
     tasks: state.tasks,
     approvals: state.approvals,
-    memories: state.memories,
     skills: state.skills,
     jobs: state.jobs,
     connectors: state.connectors,
