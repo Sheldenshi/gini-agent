@@ -2548,20 +2548,20 @@ async function browserFillSecretsTool(
     : `The agent is asking you to fill ${slots.length} field${slots.length === 1 ? "" : "s"} on the current page.`;
 
   // Build a stable target string so the approval card can show
-  // which page the fill targets. Pull the live URL from the browser
-  // session if one exists; strip the query string and fragment
-  // before recording — query strings on the live URL frequently
-  // carry tokens (OAuth `code`/`state`, password-reset `token`,
-  // session ids, magic-link nonces). The `target` field is
-  // preserved by the redacted-writer-boundary in src/state/audit.ts
-  // (only `evidence` is dropped on redacted:true), so a raw URL
-  // with a query token would land verbatim in state.audit[].target
-  // and state.events[].target. Use origin+pathname only.
+  // which page the fill targets. The structural copy of the
+  // approved URL lives on `payload.approvedUrl` (see the
+  // createApproval call below) — the safety check in
+  // src/execution/browser-fill-secrets.ts reads from there, NOT
+  // from a parseable substring of target. `target` is the
+  // human-readable label that flows into the audit row. Strip
+  // query strings and fragments before recording — they
+  // frequently carry tokens (OAuth `code`/`state`, password-reset
+  // `token`, session ids, magic-link nonces) and the audit
+  // writer-boundary only drops `evidence` on redacted:true, leaving
+  // `target` intact.
   const liveUrl = peekCurrentBrowserUrl(taskId);
-  const sanitizedUrl = sanitizeUrlForAuditTarget(liveUrl);
-  const target = sanitizedUrl
-    ? `${sanitizedUrl}#${slots.map((s) => s.locator).join(",")}`
-    : slots.map((s) => s.locator).join(",");
+  const approvedUrl = sanitizeUrlForAuditTarget(liveUrl);
+  const target = approvedUrl ?? "(no live page)";
 
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
@@ -2574,7 +2574,18 @@ async function browserFillSecretsTool(
       target,
       risk: "high",
       reason,
-      payload: { slots, reason, toolCallId }
+      // Structural fields the /connect handler reads:
+      //   - slots: which DOM elements to fill (kept; parsed by
+      //     parseFillSecretSlots at every consumer).
+      //   - approvedUrl: the origin+pathname captured at dispatch
+      //     time, used as the load-bearing equality check against
+      //     the live page URL before any .fill() runs. Stored
+      //     structurally (not encoded in target's substring) so a
+      //     future tweak to target formatting can't silently weaken
+      //     the safety check.
+      //   - toolCallId: the originating tool_call_id the chat-task
+      //     loop uses to thread the resume tool result.
+      payload: { slots, reason, toolCallId, approvedUrl }
     });
     item.approvalIds.push(approval.id);
     item.updatedAt = now();

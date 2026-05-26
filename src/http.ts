@@ -12,9 +12,8 @@ import {
   readTrace,
   subscribeChatBlocks
 } from "./state";
-import { browserFillByLocator, browserNavigate, peekCurrentBrowserUrl, safetyCheck } from "./tools/browser";
-import { sanitizeUrlForAuditTarget } from "./execution/tool-dispatch";
-import { parseFillSecretSlots } from "./execution/browser-fill-secrets-types";
+import { browserNavigate, safetyCheck } from "./tools/browser";
+import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -240,161 +239,18 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         : {};
 
       if (approval.action === "browser.fill_secret") {
-        // browser.fill_secret path: each secrets entry's key is a slot
-        // name declared at approval creation. Look up the slot's
-        // locator in approval.payload.slots and call browserFillByLocator
-        // for each. The submitted values exist only in this handler's
-        // request scope — they are NOT written to state, the
-        // connector store, or the audit evidence column.
-        // Parse via the shared parser so the kind allowlist enforced
-        // here matches what the dispatcher minted onto the approval
-        // payload AND what the chat card uses to type the <input>
-        // element. A divergence between layers could let an
-        // attacker-supplied payload widen the rendered input type
-        // past what the UI's own allowlist would permit.
-        const slots = parseFillSecretSlots(approval.payload.slots);
-        // Enforce the full-submission contract at the runtime boundary,
-        // not the web client. fillReady in the React card is just UX;
-        // any client (CLI, mobile, script, direct API) could POST a
-        // partial body. Reject if any declared slot is missing a
-        // non-empty string in `secrets`. This is the gate, not a hint —
-        // without it /connect could resolve with some slots silently
-        // unfilled, and the agent's synthesized result string in
-        // agent.ts:runApprovedAction would still report every declared
-        // slot as filled, lying to the model.
-        const missing = slots
-          .filter((slot) => typeof secrets[slot.name] !== "string" || secrets[slot.name].length === 0)
-          .map((slot) => slot.name);
-        if (missing.length > 0) {
-          return json({
-            ok: false,
-            message: `Missing value for slot(s): ${missing.join(", ")}. All declared slots must be submitted.`
-          }, 400);
-        }
-        const taskId = approval.taskId;
-        if (!taskId) {
-          return json({ ok: false, message: "Approval is not bound to a task; cannot fill." }, 400);
-        }
-        // Bind the fill to the page the user actually approved. The
-        // approval.target encodes the origin+pathname captured at
-        // approval creation (see sanitizeUrlForAuditTarget in
-        // src/execution/tool-dispatch.ts) joined to the locator list
-        // with a "#" separator. Between then and now the page can
-        // navigate (agent action, user click on a card-side link,
-        // JS-driven redirect, a phishing redirect from the same
-        // window). Compare against the live page URL — if the
-        // origin+pathname no longer match what the user approved,
-        // refuse: a fresh approval would be needed to authorize the
-        // new destination. Targets minted without a live URL (the
-        // dispatcher's fallback when no browser session existed yet)
-        // skip the check because there's no approved origin to
-        // compare against; the fill loop's own missing-session error
-        // becomes the authoritative refusal in that path.
-        const approvedTargetUrl = (() => {
-          const t = approval.target ?? "";
-          const hashIndex = t.indexOf("#");
-          const urlPart = hashIndex >= 0 ? t.slice(0, hashIndex) : "";
-          return sanitizeUrlForAuditTarget(urlPart);
-        })();
-        if (approvedTargetUrl) {
-          const liveUrl = peekCurrentBrowserUrl(taskId);
-          const liveSanitized = sanitizeUrlForAuditTarget(liveUrl);
-          if (!liveSanitized || liveSanitized !== approvedTargetUrl) {
-            return json({
-              ok: false,
-              message: `Page navigated since the approval was created (approved: ${approvedTargetUrl}, live: ${liveSanitized ?? "no session"}). Refusing to fill on an unapproved origin.`
-            }, 409);
-          }
-        }
-        // Close the deny-mid-fill race by resolving the approval
-        // atomically BEFORE the per-slot loop. resolveApproval flips
-        // pending → approved inside a single mutateState callback (see
-        // src/agent.ts:resolveApproval); after this returns successfully,
-        // any concurrent decideApproval(deny) will fail with
-        // "Approval is already approved" instead of letting the fill
-        // loop keep writing secrets to the DOM while the operator's
-        // deny mutates state in parallel. We pass resumeChatTask:false
-        // so runApprovedAction does NOT resume the chat-task loop
-        // here — the fills haven't happened yet, and the agent must
-        // see the actual filled/errored outcome, not a synthesized
-        // success message. We call resumeChatTask manually after
-        // fills + audit below.
-        try {
-          await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: false });
-        } catch (error) {
-          // Race lost (another path already resolved this approval).
-          // Surface as 410 Gone so the client knows to re-fetch.
-          const message = error instanceof Error ? error.message : String(error);
-          return json({ ok: false, message: `Could not lock approval for fill: ${message}` }, 410);
-        }
-        const filledSlots: string[] = [];
-        const errors: { slot: string; error: string }[] = [];
-        for (const slot of slots) {
-          const value = secrets[slot.name];
-          if (typeof value !== "string") continue;
-          // browserFillByLocator takes a raw playwright selector
-          // (CSS, text=, etc.) or an "@<id>" ARIA-ref token. The
-          // tool's own browser_type goes through a session-ref map
-          // that only knows about tokens from the latest snapshot
-          // and would reject a raw selector; this entrypoint
-          // bypasses that.
-          const result = await browserFillByLocator(taskId, { locator: slot.locator, value });
-          if (result.ok) {
-            filledSlots.push(slot.name);
-          } else {
-            errors.push({ slot: slot.name, error: result.error });
-          }
-        }
-        // Audit row carries only metadata (slot names + per-slot
-        // success/error). The values themselves are never written.
-        // redacted: true ensures the writer drops the evidence
-        // column at the boundary as defense in depth, even though
-        // we're already careful about what we put there.
-        await mutateState(config.instance, (mutable) => {
-          addAudit(
-            mutable,
-            {
-              actor: "user",
-              action: "browser.fill_secret",
-              target: approval.target,
-              risk: "high",
-              taskId,
-              approvalId: approval.id,
-              redacted: true,
-              evidence: { filledSlots, errors }
-            },
-            { taskId }
-          );
-        });
-        // Resume the chat-task loop with a result string that
-        // reflects what actually happened. The approval is already
-        // resolved (above) so resume MUST run — otherwise the task
-        // hangs in waiting_approval forever. Build the tool result
-        // here rather than re-using the synthesized string from
-        // runApprovedAction so the agent learns about partial fills
-        // and per-slot errors via the same tool_result it would
-        // normally read.
-        const filledList = filledSlots.length > 0 ? filledSlots.join(", ") : "(none)";
-        const errorList = errors.length > 0
-          ? errors.map((e) => `${e.slot} (${e.error})`).join("; ")
-          : "";
-        const resumeResult = errors.length === 0
-          ? `User submitted values for slots ${filledList}. The fields are now filled on the page. Take a fresh browser_snapshot before deciding the next action.`
-          : `User submitted values; filled slots ${filledList}. ${errors.length} slot(s) failed: ${errorList}. Take a fresh browser_snapshot to see the current state before retrying.`;
-        const toolCallId = typeof approval.payload.toolCallId === "string"
-          ? approval.payload.toolCallId
-          : undefined;
-        if (toolCallId) {
-          await resumeChatTask(config, taskId, toolCallId, resumeResult);
-        }
-        if (errors.length > 0) {
-          return json({
-            ok: false,
-            message: `Fill failed for ${errors.length} slot(s): ${errorList}`,
-            filledSlots
-          });
-        }
-        return json({ ok: true, filledSlots });
+        // The fill_secret flow is bounded inside
+        // src/execution/browser-fill-secrets.ts. The handler here is
+        // a thin routing seam: parse the body's `secrets` field,
+        // delegate to the module, return its {status, body} envelope
+        // as the HTTP response. All of the runtime concerns — slot
+        // validation, structural approved-URL check, atomic approval
+        // resolution, per-slot fill with per-slot origin /
+        // task-status re-checks, redacted audit row, chat-task
+        // resume — live in the bounded module so they can be
+        // unit-tested in isolation.
+        const result = await runFillSecretConnect(config, approval, secrets);
+        return json(result.body, result.status);
       }
 
       // connector.request path (unchanged).

@@ -1075,7 +1075,7 @@ describe("runtime api", () => {
       createApproval(state, {
         taskId,
         action: "browser.fill_secret",
-        target: "https://example.com/login#@e1,@e2",
+        target: "https://example.com/login",
         risk: "high",
         reason: "Sign in",
         payload: {
@@ -1084,7 +1084,11 @@ describe("runtime api", () => {
             { name: "password", locator: "@e2", label: "Password", kind: "password" }
           ],
           reason: "Sign in",
-          toolCallId: "call_fill"
+          toolCallId: "call_fill",
+          // The /connect origin guard reads from the structural
+          // approvedUrl on payload — peer approval actions carry
+          // their contract fields under payload too.
+          approvedUrl: "https://example.com/login"
         }
       })
     );

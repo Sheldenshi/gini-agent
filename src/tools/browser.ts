@@ -1273,7 +1273,7 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
 // taking a snapshot per slot is wasted work.
 export async function browserFillByLocator(
   taskId: string,
-  args: { locator: string; value: string }
+  args: { locator: string; value: string; expectedOrigin?: string }
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   if (typeof args.locator !== "string" || args.locator.length === 0) {
     return { ok: false, error: "Missing required string argument: locator" };
@@ -1283,6 +1283,33 @@ export async function browserFillByLocator(
   }
   try {
     return await withSession(taskId, async (session) => {
+      // Per-slot origin re-check immediately before the playwright
+      // .fill() call. The /connect handler's pre-loop URL check is
+      // TOCTOU on its own: a navigation between the pre-loop check
+      // and any subsequent slot's .fill() would land the secret on
+      // a new origin. Re-reading session.page.url() inside the
+      // same withSession callback closes the window to the depth
+      // of one playwright API call. Callers that don't supply
+      // expectedOrigin skip the check (existing browser tool
+      // callers that don't need the binding).
+      if (args.expectedOrigin) {
+        const liveUrl = session.page.url();
+        let liveOrigin: string | undefined;
+        try {
+          const parsed = new URL(liveUrl);
+          if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+            liveOrigin = `${parsed.origin}${parsed.pathname}`;
+          }
+        } catch {
+          /* invalid URL falls through to the mismatch error below */
+        }
+        if (liveOrigin !== args.expectedOrigin) {
+          return {
+            ok: false,
+            error: `origin-mismatch: live=${liveOrigin ?? "invalid"} expected=${args.expectedOrigin}`
+          } as const;
+        }
+      }
       const selector = args.locator.startsWith("@")
         ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
         : args.locator;
