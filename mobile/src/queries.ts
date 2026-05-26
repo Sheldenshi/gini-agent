@@ -206,6 +206,16 @@ export function useChatBlocks(sessionId: string | null): {
     dataRef.current = data;
   }, [data]);
 
+  // Tracks the id of the most recent block observed so we can carry
+  // Last-Event-ID across every EventSource reconstruction — react-native-sse
+  // tracks its own lastEventId per instance, but a fresh `new EventSource()`
+  // after AppState transitions, error-driven reopen, or initial connect
+  // starts blank. Passing the header explicitly lets the gateway's
+  // listChatBlocksAfter replay only what was missed. The SSE wire id is
+  // the same string the server assigns as the block id, so we update this
+  // wherever we mutate dataRef.
+  const lastSeenIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!sessionId) {
       setData(undefined);
@@ -232,6 +242,10 @@ export function useChatBlocks(sessionId: string | null): {
           ? current.map((b, i) => (i === idx ? block : b))
           : [...current, block];
       dataRef.current = next;
+      // The SSE wire id matches the block id, so updating the resume
+      // cursor on every event keeps the cursor pinned to the latest
+      // delivered frame — even for upsert-style mutations.
+      lastSeenIdRef.current = block.id;
       setData(next);
     };
 
@@ -244,8 +258,17 @@ export function useChatBlocks(sessionId: string | null): {
         if (!cancelled) setError(err as Error);
         return;
       }
+      // Build a fresh header set per open so a Last-Event-ID accumulated
+      // by upsert() or the seed handler rides along on every new XHR.
+      // react-native-sse keeps the header for as long as the instance
+      // lives; reconstruction (AppState toggle, error reopen, sessionId
+      // change) is exactly when the cursor would otherwise reset.
+      const headers: Record<string, string> = { ...endpoint.headers };
+      if (lastSeenIdRef.current) {
+        headers["Last-Event-ID"] = lastSeenIdRef.current;
+      }
       const source = new EventSource<"chat_block">(endpoint.url, {
-        headers: endpoint.headers,
+        headers,
         // 0 disables auto-reconnect; we want it on. The library default
         // (5000ms) is fine — a longer gap means slower recovery from a
         // tunnel restart but doesn't lose data thanks to Last-Event-ID.
@@ -291,6 +314,9 @@ export function useChatBlocks(sessionId: string | null): {
         const blocks = await api<ChatBlock[]>(`/chat/${sessionId}/blocks`);
         if (cancelled) return;
         dataRef.current = blocks;
+        // Seed the resume cursor so the very first SSE open skips
+        // the redundant full replay listChatBlocksAfter(null) emits.
+        lastSeenIdRef.current = blocks[blocks.length - 1]?.id ?? null;
         setData(blocks);
         setError(null);
         setIsPending(false);
