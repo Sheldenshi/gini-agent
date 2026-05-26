@@ -18,19 +18,62 @@ The right substrate is the one Shelden already built for `connector.request`. Th
 ## Required Now
 
 - `Approval.action` gains `"browser.fill_secret"`.
-- The `POST /api/approvals/<id>/connect` handler branches on `approval.action`:
-  - `"connector.request"` keeps its existing behavior (`createConnector`, `writeSecret`, `checkConnector`, resolve approval).
-  - `"browser.fill_secret"` reads the same `secrets` field from the request body, looks up each key as a named slot in `approval.payload.slots` (each slot carries `{ name, locator, label, kind? }`), calls `browserFillByLocator(taskId, { locator: slot.locator, value })` per slot, writes one redacted audit row (`redacted: true`, `evidence: { filledSlots, errors }`), resolves the approval atomically BEFORE the fill loop via `resolveApproval(resumeChatTask: false)` to close the deny-mid-fill race, then calls `resumeChatTask` manually with a result string reflecting the actual filled/errored outcome. No `createConnector`, no `writeSecret`, no persistence of any kind. The slot values exist only inside the handler's request-scope local variables.
+- The `POST /api/approvals/<id>/connect` handler is a thin routing seam that delegates to the bounded module `src/execution/browser-fill-secrets.ts:runFillSecretConnect(config, approval, secrets)`. The module owns:
+  - Slot parsing via the shared parser in `src/execution/browser-fill-secrets-types.ts` (same parser the dispatcher and the chat-card UI use, so the kind-allowlist enforcement can't drift between layers).
+  - Full-submission contract: every declared slot must carry a non-empty string. Partial bodies return 400 with the list of missing slot names — the runtime is the gate, not the web client's UX-only `fillReady`.
+  - Origin equality check against the structured `approval.payload.approvedUrl`. The URL is NOT encoded into `approval.target` as a parseable substring (peer approval actions also carry their contract fields under payload).
+  - Atomic `resolveApproval(..., { resumeChatTask: false })` BEFORE the per-slot fill loop. The atomic check-and-flip closes the deny-mid-fill race window. `resumeChatTask: false` keeps `runApprovedAction`'s no-op branch from resuming the chat-task loop prematurely.
+  - Per-slot fill loop with TWO guards inside `browserFillByLocator`'s `withSession` callback: (a) the live page URL still equals `approvedUrl` (TOCTOU close — a navigation between the pre-loop check and the .fill() must not land secrets on a new origin); (b) the owning task is still non-terminal (a `cancelTask` after the atomic resolve aborts the rest of the loop, recorded as `aborted: "task-cancelled-mid-fill"` in the audit evidence).
+  - One redacted audit row (`redacted: true`, `evidence: { filledSlots, errors, ...aborted }`). The audit writer-boundary drops `evidence` on `redacted: true`. Slot VALUES never appear anywhere — only slot names + per-slot error strings.
+  - `resumeChatTask` wrapped in try/catch so a terminal-task throw inside the chat-task loop doesn't make the handler claim a 500; the audit row already records the truth about what filled vs. what didn't.
 - A new agent tool `browser_fill_secrets` (always-on, same gating tier as `request_connector`):
   - Tool catalog descriptor: parameters `{ slots: Array<{ name, locator, label, kind? }>, reason: string }`.
-  - Tool function mints an approval with `action: "browser.fill_secret"`, payload `{ slots, reason, toolCallId }`. Returns `{ kind: "pending", approvalId }`.
-  - The chat-task loop already emits an `approval_requested` block for any pending approval (`chat-task.ts:1098-1110`); no new emission seam needed.
+  - Tool function rejects duplicate slot names up-front, then mints an approval with `action: "browser.fill_secret"`, payload `{ slots, reason, toolCallId, approvedUrl }`. Returns `{ kind: "pending", approvalId }`. The dispatch creates the approval directly via `createApproval` — it does NOT route through `pendingOrAuto`, see "Approval-substrate carve-outs" below.
+  - The chat-task loop emits an `approval_requested` block for any pending approval (`chat-task.ts`); no new emission seam needed.
 - A new branch in `BlockApprovalRequested.tsx` for `action === "browser.fill_secret"`:
   - Renders one HTML input per slot from `payload.slots`, with `type` set from `slot.kind` (`text` | `password` | `email` | `tel` | `number` | `url`, defaulting to `text`).
   - Password-manager attributes (`autoComplete="off"`, `data-1p-ignore`, `data-lpignore`, `data-form-type="other"`) to suppress autofill.
   - Submit POSTs `{ secrets: Record<slot.name, value> }` to `/approvals/<id>/connect` via the existing `connect` mutation path.
-  - Clears local state on success so the secret never lingers in React state past the click.
+  - Clears local state on EVERY settled outcome (success, partial-fail, network error, abort) and always invalidates the approvals query cache, since the gateway resolves the approval atomically before running fills — a partial-fail still moves the approval out of pending, so the card must re-render with Submit disabled.
 - All audit rows for the fill action use `redacted: true` so the writer drops the evidence column at the boundary.
+- Browser-side defense in depth: the snapshot walker masks the value of any input with `type="password"`, autocomplete in `current-password`/`new-password`/`one-time-code`, or a `data-gini-secret` attribute (stamped by `browserFillByLocator` post-fill). `browser_console` and `browser_vision` both post-process their tool results through `redactSecretValuesFromString` against the live `data-gini-secret` values, and `browser_vision` additionally blurs `[data-gini-secret]` elements via inline CSS immediately before the screenshot (restored in a finally block).
+
+## Approval-substrate carve-outs
+
+`browser.fill_secret` is intentionally outside two contracts that the
+peer approval ADRs assume hold universally. Both carve-outs are made
+necessary by the fact that the side effect's INPUTS (the secret
+values) live in the request body of `/connect` and must never become
+arguments to `runApprovedAction` (which would require persisting
+them).
+
+- **Does not route through `pendingOrAuto`**: the dispatcher
+  (`browserFillSecretsTool` in `src/execution/tool-dispatch.ts`) calls
+  `createApproval` directly. To keep the mode-uniformity claim in
+  [approval-mode.md](approval-mode.md) end-to-end honest,
+  `resolveApprovalPolicy` returns `{ mode: "gate", reason: "fill-secret-always-gate" }`
+  for `browser.fill_secret` regardless of `approvalMode` — yolo
+  cannot auto-approve credential entry because the credentials come
+  from the user, not the agent. Any future refactor that wires
+  fill_secret through `pendingOrAuto` still produces the same gate.
+- **Side effect runs outside `executeApprovedAction`**: the per-slot
+  playwright fills happen inside `/connect`'s request handler (via
+  `runFillSecretConnect`), not inside `runApprovedAction`. Decision:
+  [approval-execution-abort.md](approval-execution-abort.md) is updated
+  to acknowledge the carve-out. In place of the `claimApproval` /
+  `releaseApproval` / `raceWithAbort` infrastructure other approved
+  actions get, the module re-reads task status via `readState` before
+  each slot's fill and bails on terminal status. Granularity is
+  "between slot N and slot N+1" instead of per-await.
+- **`decideApproval(approve)` refuses `browser.fill_secret`**: the
+  only resolution path is `/connect` with values. Routing through
+  the generic `/approve` HTTP route or the CLI's approve command
+  would flip status to approved without any DOM fill ever
+  happening, and the agent would be told (in the synthesized result
+  string) that "fields filled" over an empty form. `runApprovedAction`
+  for `browser.fill_secret` is consequently a no-op that returns
+  undefined — its branch only exists for defensive correctness on the
+  resolveApproval-from-/connect path where `resumeChatTask: false`.
 
 ## Surface Restriction
 
@@ -56,7 +99,12 @@ The dispatch surface guard (`browserFillSecretsTool` in `src/execution/tool-disp
 
 - Calling `browser_fill_secrets({ slots: [{ name: "username", locator: "input[name=\"username\"]", label: "Username" }, { name: "password", locator: "input[name=\"password\"]", label: "Password", kind: "password" }], reason: "Sign in to the test site" })` creates one pending approval with `action: "browser.fill_secret"` and the agent loop pauses on `waiting_approval`.
 - The chat UI renders one card with two input fields. The password field is `type="password"`.
-- `POST /api/approvals/<id>/connect` with `{ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } }` fills both DOM fields via `browserType`, writes one redacted audit row with `action: "browser.fill_secret"`, and resolves the approval.
+- `POST /api/approvals/<id>/connect` with `{ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } }` fills both DOM fields via `browserFillByLocator`, writes one redacted audit row with `action: "browser.fill_secret"`, and resolves the approval.
+- Calling `decideApproval(approve)` (via HTTP `/approve` or CLI) on a `browser.fill_secret` approval throws / returns 400; the only resolution path is `/connect` with the per-slot values.
+- Posting `/connect` with a body that misses any declared slot returns 400 with the list of missing names; no DOM fill runs and the approval stays pending.
+- Posting `/connect` when the live page URL no longer matches `approval.payload.approvedUrl` returns 409; no DOM fill runs and the approval stays pending.
+- Calling `browser_console` on a page with a `data-gini-secret`-stamped element redacts the value from `evalResult`, `evalError`, and console-message text.
+- Calling `browser_vision` on a page with a `data-gini-secret`-stamped element blurs the element in the screenshot before sending to the vision model and additionally redacts any literal occurrence of the secret value from the model's answer.
 - The on-disk `state.json` and the task's trace JSONL never contain `"tomsmith"` or `"SuperSecretPassword!"` byte sequences.
 - Submitting the same approval twice returns `410 Gone`.
 - Denying the approval via `POST /api/approvals/<id>/deny` returns the task to the agent loop with a denial tool result and never touches the browser.
