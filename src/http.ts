@@ -12,7 +12,7 @@ import {
   readTrace,
   subscribeChatBlocks
 } from "./state";
-import { browserNavigate, safetyCheck } from "./tools/browser";
+import { browserNavigate, browserType, safetyCheck } from "./tools/browser";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -202,8 +202,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const state = readState(config.instance);
       const approval = state.approvals.find((a) => a.id === approvalId);
       if (!approval) return json({ error: "Approval not found" }, 404);
-      if (approval.action !== "connector.request") {
-        return json({ error: `Approval ${approvalId} is not a connector.request (${approval.action})` }, 400);
+      // The /connect endpoint is the shared substrate for any approval
+      // whose user-facing card asks the user to type a value (or set
+      // of named values). connector.request persists them to an
+      // encrypted connector record; browser.fill_secret pipes them
+      // through to playwright.fill on the agent's active page and
+      // discards them when the request returns.
+      if (approval.action !== "connector.request" && approval.action !== "browser.fill_secret") {
+        return json({ error: `Approval ${approvalId} does not take a /connect submission (${approval.action})` }, 400);
       }
       if (approval.status !== "pending") {
         return json({ error: `Approval is already ${approval.status}` }, 410);
@@ -212,6 +218,80 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
         ? payload.secrets as Record<string, string>
         : {};
+
+      if (approval.action === "browser.fill_secret") {
+        // browser.fill_secret path: each secrets entry's key is a slot
+        // name declared at approval creation. Look up the slot's
+        // locator in approval.payload.slots and call browserType for
+        // each. The submitted values exist only in this handler's
+        // request scope — they are NOT written to state, the
+        // connector store, or the audit evidence column.
+        const rawSlots = Array.isArray(approval.payload.slots) ? approval.payload.slots : [];
+        const slots = rawSlots.flatMap((s) => {
+          if (!s || typeof s !== "object") return [];
+          const entry = s as { name?: unknown; locator?: unknown; label?: unknown; kind?: unknown };
+          if (typeof entry.name !== "string" || typeof entry.locator !== "string") return [];
+          return [{
+            name: entry.name,
+            locator: entry.locator,
+            label: typeof entry.label === "string" ? entry.label : entry.name,
+            kind: typeof entry.kind === "string" ? entry.kind : "text"
+          }];
+        });
+        const taskId = approval.taskId;
+        if (!taskId) {
+          return json({ ok: false, message: "Approval is not bound to a task; cannot fill." }, 400);
+        }
+        const filledSlots: string[] = [];
+        const errors: { slot: string; error: string }[] = [];
+        for (const slot of slots) {
+          const value = secrets[slot.name];
+          if (typeof value !== "string") continue;
+          const result = await browserType(taskId, { ref: slot.locator, text: value });
+          // browserType returns a JSON string with success/error
+          try {
+            const parsed = JSON.parse(result) as { success?: boolean; error?: string };
+            if (parsed.success === true) {
+              filledSlots.push(slot.name);
+            } else {
+              errors.push({ slot: slot.name, error: parsed.error ?? "fill failed" });
+            }
+          } catch {
+            errors.push({ slot: slot.name, error: "browserType returned non-JSON" });
+          }
+        }
+        // Audit row carries only metadata (slot names + per-slot
+        // success/error). The values themselves are never written.
+        // redacted: true ensures the writer drops the evidence
+        // column at the boundary as defense in depth, even though
+        // we're already careful about what we put there.
+        await mutateState(config.instance, (mutable) => {
+          addAudit(
+            mutable,
+            {
+              actor: "user",
+              action: "browser.fill_secret",
+              target: approval.target,
+              risk: "high",
+              taskId,
+              approvalId: approval.id,
+              redacted: true,
+              evidence: { filledSlots, errors }
+            },
+            { taskId }
+          );
+        });
+        if (errors.length > 0) {
+          return json({
+            ok: false,
+            message: `Fill failed for ${errors.length} slot(s): ${errors.map((e) => `${e.slot} (${e.error})`).join("; ")}`
+          });
+        }
+        await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
+        return json({ ok: true, filledSlots });
+      }
+
+      // connector.request path (unchanged).
       const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
       const providerId = String(approval.payload.provider ?? "");
       const providerLabel = typeof approval.payload.providerLabel === "string"

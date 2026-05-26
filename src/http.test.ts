@@ -865,7 +865,7 @@ describe("runtime api", () => {
     );
     expect(response.status).toBe(400);
     const body = await response.json();
-    expect(body.error).toContain("not a connector.request");
+    expect(body.error).toContain("does not take a /connect submission");
   });
 
   // Round-1 review fix: browser-connect throws with prefixes that the
