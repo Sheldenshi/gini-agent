@@ -1401,6 +1401,41 @@ async function runApprovedAction(
     return result;
   }
 
+  if (approval.action === "browser.fill_secret") {
+    // Side effect (the per-slot playwright fill) already ran inside
+    // POST /api/approvals/<id>/connect via browserFillByLocator. By
+    // the time we reach here the approval is approved and the DOM is
+    // updated. All this branch does is synthesize the tool result so
+    // the chat-task loop resumes from the parked browser_fill_secrets
+    // call and the agent can decide what to do next — typically
+    // re-snapshot, then click whatever submit/login button follows.
+    // The slot values themselves never reach this branch; the result
+    // string enumerates slot NAMES only, which are non-secret by
+    // design (the model supplied them on the original tool call).
+    void extraEvidence;
+    const slots = Array.isArray(approval.payload.slots) ? approval.payload.slots : [];
+    const filledSlots: string[] = [];
+    for (const s of slots) {
+      if (s && typeof s === "object") {
+        const entry = s as { name?: unknown };
+        if (typeof entry.name === "string") filledSlots.push(entry.name);
+      }
+    }
+    if (approval.taskId) {
+      appendTrace(config.instance, approval.taskId, {
+        type: "tool",
+        message: "Form fields filled via browser.fill_secret",
+        data: { slots: filledSlots, approvalId: approval.id }
+      });
+    }
+    const slotList = filledSlots.length > 0 ? filledSlots.join(", ") : "(unknown)";
+    const result = `User submitted values for slots ${slotList}. The fields are now filled on the page. Take a fresh browser_snapshot before deciding the next action.`;
+    if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
+    }
+    return result;
+  }
+
   if (approval.action === "file.write") {
     // Do the abort check, path validation, file I/O, and audit-row
     // write all INSIDE the same `mutateState` callback so the
