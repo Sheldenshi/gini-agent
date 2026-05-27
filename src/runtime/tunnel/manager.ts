@@ -5,7 +5,7 @@ import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
 import { atomicWriteFile } from "./atomic-write";
-import { secretRevision } from "./secret";
+import { generateTunnelSecret, secretRevision } from "./secret";
 import { instanceRoot } from "../../paths";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -338,8 +338,7 @@ class TunnelManager {
       // iCloud Notes.
       this.generation += 1;
       try {
-        const persisted = patchTunnelConfig(this.config.instance, {}); // ensure block exists
-        const next = patchTunnelConfig(this.config.instance, { secret: cryptoSecret() });
+        const next = patchTunnelConfig(this.config.instance, { secret: generateTunnelSecret() });
         this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret, this.snapshot.publicUrl) };
         setRedactionSecret(next.secret);
         // Refresh Notes if mirror is on and tunnel is up — the note carries
@@ -360,8 +359,6 @@ class TunnelManager {
           }
         }
         appendLog(this.config.instance, "tunnel.secret-rotated", {});
-        // No persisted result captured from `persisted` — avoids unused-var warning.
-        void persisted;
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -552,13 +549,6 @@ class TunnelManager {
   private notesNoteName(): string {
     return `gini-tunnel-${this.config.instance}`;
   }
-}
-
-function cryptoSecret(): string {
-  // Delegate to the same generator used at boot. Imported lazily to avoid
-  // import-cycle paranoia (this file is the highest layer in the tunnel
-  // subtree).
-  return require("./secret").generateTunnelSecret() as string;
 }
 
 /** Compose the bootstrap URL the phone scans: `<publicUrl>/<secret>`. The
