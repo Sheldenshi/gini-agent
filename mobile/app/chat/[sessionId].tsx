@@ -20,6 +20,7 @@ import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/
 import {
   isTaskInFlight,
   useChatBlocks,
+  useChatSession,
   useSendMessage
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
@@ -33,6 +34,7 @@ import type { ChatBlock } from "@/src/types";
 export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const blocks = useChatBlocks(sessionId ?? null);
+  const session = useChatSession(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
 
   const [text, setText] = useState("");
@@ -121,18 +123,24 @@ export default function ChatDetailScreen() {
     return map;
   }, [list]);
 
-  // Title derivation: first user_text block's excerpt, falling back to
-  // "Chat" while the list is empty. Avoids a second polling call to
-  // /chat/:id for the session record — the block stream carries enough
-  // for the detail header.
+  // Title source of truth is the session record — the gateway seeds it
+  // from the first user message and updates it on rename, so the header
+  // stays in sync with the chat list. Fall back to the first user_text
+  // block while the session record is still loading, then to "Chat".
   const headerTitle = useMemo(() => {
+    const sessionTitle = session.data?.title?.trim();
+    if (sessionTitle) {
+      return sessionTitle.length > 40
+        ? `${sessionTitle.slice(0, 40)}…`
+        : sessionTitle;
+    }
     const firstUserText = list.find((b) => b.kind === "user_text");
     if (firstUserText && firstUserText.kind === "user_text") {
       const trimmed = firstUserText.text.trim();
       if (trimmed) return trimmed.length > 40 ? `${trimmed.slice(0, 40)}…` : trimmed;
     }
     return "Chat";
-  }, [list]);
+  }, [list, session.data?.title]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
 
