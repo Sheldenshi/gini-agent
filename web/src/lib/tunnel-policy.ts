@@ -67,20 +67,6 @@ export function isTunnelDenied(canonicalPath: string, method: string): boolean {
   return false;
 }
 
-/** Path rewrite hook. Previously the BFF rewrote `GET /api/runtime/tunnel`
- *  under vetted=1 to `/api/tunnel/redacted` so tunneled JS only saw the
- *  redacted snapshot shape. That redaction is dropped now — vetted callers
- *  receive the full privileged snapshot so the tunneled UI can render the
- *  QR / publicUrl / secret with the same click-to-reveal pattern as the
- *  loopback view. Kept as a no-op shim so the BFF catch-all wiring doesn't
- *  need to change; returning null means "forward the path unchanged". */
-export function rewriteForTunnel(
-  _canonicalPath: string,
-  _method: string
-): string[] | null {
-  return null;
-}
-
 /** Match a candidate secret prefix in the canonical path. Returns the secret
  *  string when the path is exactly `/<secret>` or starts with `/<secret>/`,
  *  along with the suffix to redirect to. */

@@ -5,7 +5,6 @@ import {
   looksLikeSecretSegment,
   matchSecretPrefix,
   readTunnelCookie,
-  rewriteForTunnel,
   tunnelSecretEquals,
   withoutTrailingSlash
 } from "./tunnel-policy";
@@ -43,15 +42,6 @@ describe("isTunnelDenied", () => {
   test("allows unrelated paths", () => {
     expect(isTunnelDenied("/api/runtime/chat", "POST")).toBe(false);
     expect(isTunnelDenied("/api/runtime/state", "GET")).toBe(false);
-  });
-});
-
-describe("rewriteForTunnel", () => {
-  test("no-op shim — vetted callers receive the full privileged snapshot", () => {
-    expect(rewriteForTunnel("/api/runtime/tunnel", "GET")).toBeNull();
-    expect(rewriteForTunnel("/api/runtime/tunnel/", "GET")).toBeNull();
-    expect(rewriteForTunnel("/api/runtime/tunnel", "PATCH")).toBeNull();
-    expect(rewriteForTunnel("/api/runtime/tunnel/qr.svg", "GET")).toBeNull();
   });
 });
 
