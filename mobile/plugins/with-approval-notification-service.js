@@ -174,9 +174,14 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
   // 5) Add the Swift source to the Sources build phase. The
   //    {target: target.uuid} option is the part that wires the file
   //    reference to *this* target (without it, Xcode adds the file to
-  //    the host app's Sources phase by accident).
+  //    the host app's Sources phase by accident). The path is the
+  //    basename only: the parent PBXGroup already carries
+  //    `path = targetName`, so xcodebuild resolves the build input as
+  //    `<SRCROOT>/<group.path>/NotificationService.swift`. Prefixing
+  //    the target name here would double it
+  //    (`<targetName>/<targetName>/…`).
   xcodeProject.addSourceFile(
-    `${targetName}/NotificationService.swift`,
+    "NotificationService.swift",
     { target: target.uuid },
     pbxGroup.uuid
   );
