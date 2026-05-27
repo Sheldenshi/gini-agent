@@ -130,34 +130,12 @@ export async function runMessagingPairingConnect(
       }
       return { status: 200, body: { ok: false, message } };
     }
+    // Resume the chat-task BEFORE the audit lineage write. An audit
+    // mutateState throw must not prevent the task from continuing
+    // after the side effect already landed.
     await persistConnectOutcome(config, approval.id, {
       ok: true,
       message: `Pairing request for chat ${chatId} rejected`
-    });
-    // Chat-card lineage audit row, mirroring runMessagingBridgeConnect's
-    // pattern. allowChat / rejectPendingChat write generic audit rows
-    // with `{ system: true }` and no taskId/approvalId, so without
-    // this row a chat-card-driven reject is indistinguishable from
-    // a CLI / settings-page reject. The row joins approval ↔ chat ↔ task.
-    await mutateState(config.instance, (state) => {
-      addAudit(
-        state,
-        {
-          actor: "user",
-          action: "messaging.approve_pairing",
-          target: `${bridgeId}:${chatId}`,
-          risk: "medium",
-          taskId,
-          approvalId: approval.id,
-          evidence: {
-            bridgeId,
-            chatId,
-            outcome: "rejected",
-            toolCallId: toolCallId ?? null
-          }
-        },
-        taskId ? { taskId } : { system: true }
-      );
     });
     if (taskId && toolCallId) {
       await safeResume(
@@ -167,6 +145,36 @@ export async function runMessagingPairingConnect(
         `Pairing request for chat ${chatId} was rejected. Tell the user the request was cleared; a fresh DM will mint a new request.`,
         { context: "messaging.approve_pairing", approvalId: approval.id }
       );
+    }
+    // Chat-card lineage audit row, mirroring runMessagingBridgeConnect's
+    // pattern. allowChat / rejectPendingChat write generic audit rows
+    // with `{ system: true }` and no taskId/approvalId, so without
+    // this row a chat-card-driven reject is indistinguishable from
+    // a CLI / settings-page reject. The row joins approval ↔ chat ↔ task.
+    // Wrapped: an audit throw is non-load-bearing.
+    try {
+      await mutateState(config.instance, (state) => {
+        addAudit(
+          state,
+          {
+            actor: "user",
+            action: "messaging.approve_pairing",
+            target: `${bridgeId}:${chatId}`,
+            risk: "medium",
+            taskId,
+            approvalId: approval.id,
+            evidence: {
+              bridgeId,
+              chatId,
+              outcome: "rejected",
+              toolCallId: toolCallId ?? null
+            }
+          },
+          taskId ? { taskId } : { system: true }
+        );
+      });
+    } catch {
+      // Non-load-bearing.
     }
     return { status: 200, body: { ok: true, rejected: true } };
   }
@@ -195,29 +203,6 @@ export async function runMessagingPairingConnect(
     ok: true,
     message: `Pairing approved for chat ${chatId}`
   });
-  // Chat-card lineage audit row — same rationale as the reject
-  // branch. allowChat writes a generic messaging.chat.allowed row
-  // with `{ system: true }` and no taskId/approvalId.
-  await mutateState(config.instance, (state) => {
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "messaging.approve_pairing",
-        target: `${bridgeId}:${chatId}`,
-        risk: "medium",
-        taskId,
-        approvalId: approval.id,
-        evidence: {
-          bridgeId,
-          chatId,
-          outcome: "approved",
-          toolCallId: toolCallId ?? null
-        }
-      },
-      taskId ? { taskId } : { system: true }
-    );
-  });
   if (taskId && toolCallId) {
     await safeResume(
       config,
@@ -226,6 +211,34 @@ export async function runMessagingPairingConnect(
       `Pairing approved: chat ${chatId} is now enrolled on the bridge. The bot has sent the user a confirmation message — they can chat with Gini now.`,
       { context: "messaging.approve_pairing", approvalId: approval.id }
     );
+  }
+  // Chat-card lineage audit row — same rationale as the reject
+  // branch. allowChat writes a generic messaging.chat.allowed row
+  // with `{ system: true }` and no taskId/approvalId. Audit is
+  // written AFTER safeResume so an audit throw can't orphan the task.
+  try {
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "messaging.approve_pairing",
+          target: `${bridgeId}:${chatId}`,
+          risk: "medium",
+          taskId,
+          approvalId: approval.id,
+          evidence: {
+            bridgeId,
+            chatId,
+            outcome: "approved",
+            toolCallId: toolCallId ?? null
+          }
+        },
+        taskId ? { taskId } : { system: true }
+      );
+    });
+  } catch {
+    // Non-load-bearing.
   }
   return { status: 200, body: { ok: true, enrolled: true } };
 }

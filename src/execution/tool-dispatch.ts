@@ -533,7 +533,10 @@ function classifyHost(host: string): "loopback" | "private" | "linkLocal" | "pub
     // strictly necessary, which is the right direction for an SSRF
     // guard.
     if (lower.startsWith("fc") || lower.startsWith("fd")) return "private";
-    if (lower.startsWith("fe80")) return "linkLocal";
+    // IPv6 link-local is fe80::/10 — first 10 bits 1111111010, so
+    // the leading hex byte is fe80–febf. A prefix check on "fe80"
+    // misses fe81..febf; widen to the full /10 range.
+    if (/^fe[89ab]/.test(lower)) return "linkLocal";
     // IPv4-mapped IPv6 forms. Three shapes are all valid IPv6
     // literals for the same underlying IPv4 address; each must be
     // reclassified on the embedded IPv4 or the guard is bypassable:
@@ -645,13 +648,19 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 12_000);
+  // Strip query string + fragment before persisting the URL. A
+  // server-controlled redirect can append tokens to the Location
+  // header; logging current.toString() verbatim would carry those
+  // into trace and audit. origin + pathname keeps the destination
+  // identifiable for an operator without leaking the credentials.
+  const sanitizedUrl = `${current.protocol}//${current.host}${current.pathname}`;
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Web page fetched (chat-task)",
-    data: { url: current.toString(), status: response.status, bytes: text.length, redirects: hops }
+    data: { url: sanitizedUrl, status: response.status, bytes: text.length, redirects: hops }
   });
-  await recordLowRiskAudit(config, taskId, "web.fetch", current.toString(), { status: response.status, bytes: text.length, redirects: hops });
-  return text || `Fetched ${current.toString()} with HTTP ${response.status}.`;
+  await recordLowRiskAudit(config, taskId, "web.fetch", sanitizedUrl, { status: response.status, bytes: text.length, redirects: hops });
+  return text || `Fetched ${sanitizedUrl} with HTTP ${response.status}.`;
 }
 
 // Tiny helper kept inline because it's only used by the redirect-cap

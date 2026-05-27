@@ -165,40 +165,12 @@ export async function runMessagingBridgeConnect(
     return { status: 200, body: { ok: false, message } };
   }
 
-  // Stamp a follow-up audit row with the chat-side lineage. The
-  // shared substrate (createMessagingBridgeRecord) writes a generic
-  // `messaging.configured` row with actor:"user" and no task/approval
-  // reference, so a bridge created from CLI vs settings vs chat is
-  // indistinguishable in the audit log. Add a complementary row so
-  // operators can prove "bridge X was created from approval Y inside
-  // task Z". Mirrors browser-fill-secrets.ts:247-267 in spirit.
-  await mutateState(config.instance, (state) => {
-    // AgentContext is a discriminated union — `{taskId}` only
-    // satisfies it when taskId is a string, so narrow before
-    // passing. messaging.add_bridge approvals always carry a taskId
-    // (set in tool-dispatch.ts:requestMessagingBridgeTool), but the
-    // wire type makes Approval.taskId optional; fall through to
-    // {system: true} if a future caller mints the approval without
-    // one.
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "messaging.add_bridge",
-        target: bridge.id,
-        risk: "high",
-        taskId,
-        approvalId: approval.id,
-        evidence: {
-          kind,
-          bridgeName: bridge.name,
-          toolCallId: toolCallId ?? null
-        }
-      },
-      taskId ? { taskId } : { system: true }
-    );
-  });
-
+  // Persist outcome + resume the chat-task BEFORE the lineage
+  // audit write. safeResume swallows its own throws via failTask;
+  // the audit mutateState below can throw on disk-full / db-lock
+  // and that error must NOT prevent the chat-task from resuming
+  // (a failed audit row is far less harmful than orphaning the
+  // task in waiting_approval after the bridge already exists).
   await persistConnectOutcome(config, approval.id, {
     ok: true,
     message: `${kindLabel} bridge added: ${bridge.name}`
@@ -211,6 +183,40 @@ export async function runMessagingBridgeConnect(
       `${kindLabel} bridge added: ${bridge.name}. Tell the user it's ready and walk them through enrolling a chat (DM the bot, share the verification code, you approve from the settings page) if relevant.`,
       { context: "messaging.add_bridge", approvalId: approval.id }
     );
+  }
+  // Stamp a follow-up audit row with the chat-side lineage. The
+  // shared substrate (createMessagingBridgeRecord) writes a generic
+  // `messaging.configured` row with actor:"user" and no task/approval
+  // reference, so a bridge created from CLI vs settings vs chat is
+  // indistinguishable in the audit log. Add a complementary row so
+  // operators can prove "bridge X was created from approval Y inside
+  // task Z". Mirrors browser-fill-secrets.ts:247-267 in spirit.
+  // Wrapped in try so an audit-write throw doesn't change the
+  // chat-side response — the side effect succeeded and the task
+  // already resumed.
+  try {
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "messaging.add_bridge",
+          target: bridge.id,
+          risk: "high",
+          taskId,
+          approvalId: approval.id,
+          evidence: {
+            kind,
+            bridgeName: bridge.name,
+            toolCallId: toolCallId ?? null
+          }
+        },
+        taskId ? { taskId } : { system: true }
+      );
+    });
+  } catch {
+    // Audit row is non-load-bearing — operator still has the
+    // shared substrate's generic messaging.configured row.
   }
   return { status: 200, body: { ok: true, bridge } };
 }

@@ -679,6 +679,11 @@ describe("request_connector dispatch", () => {
       "http://[::1]/",
       "http://[fc00::1]/",
       "http://[fe80::1]/",
+      // fe80::/10 spans fe80 through febf — pin the upper end of
+      // the range so a fe9x/feax/febx address can't bypass.
+      "http://[fe90::1]/",
+      "http://[fea0::1]/",
+      "http://[febf::1]/",
       "http://example.localhost/api",
       // IPv4-mapped IPv6 hex forms — all alias the same loopback /
       // RFC1918 addresses but bypass the dot-quad-only regex if not

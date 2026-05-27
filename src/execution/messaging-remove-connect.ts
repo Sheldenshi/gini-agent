@@ -87,30 +87,6 @@ export async function runMessagingRemoveConnect(
     ok: true,
     message: `Bridge '${bridgeName}' removed`
   });
-  // Chat-card lineage audit row — same rationale as the pairing
-  // and bridge-create connect handlers. removeMessagingBridge writes
-  // a generic messaging.removed row with `{ system: true }` and no
-  // taskId/approvalId, so chat-card-driven removes are otherwise
-  // indistinguishable from CLI / settings-page removes.
-  await mutateState(config.instance, (state) => {
-    addAudit(
-      state,
-      {
-        actor: "user",
-        action: "messaging.remove_bridge",
-        target: bridgeId,
-        risk: "high",
-        taskId,
-        approvalId: approval.id,
-        evidence: {
-          bridgeId,
-          bridgeName,
-          toolCallId: toolCallId ?? null
-        }
-      },
-      taskId ? { taskId } : { system: true }
-    );
-  });
   if (taskId && toolCallId) {
     await safeResume(
       config,
@@ -119,6 +95,35 @@ export async function runMessagingRemoveConnect(
       `Bridge '${bridgeName}' has been removed. Its bot token was deleted; past messages remain in history.`,
       { context: "messaging.remove_bridge", approvalId: approval.id }
     );
+  }
+  // Chat-card lineage audit row — same rationale as the pairing
+  // and bridge-create connect handlers. removeMessagingBridge writes
+  // a generic messaging.removed row with `{ system: true }` and no
+  // taskId/approvalId, so chat-card-driven removes are otherwise
+  // indistinguishable from CLI / settings-page removes. Audit runs
+  // AFTER safeResume so a throw can't orphan the task.
+  try {
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "user",
+          action: "messaging.remove_bridge",
+          target: bridgeId,
+          risk: "high",
+          taskId,
+          approvalId: approval.id,
+          evidence: {
+            bridgeId,
+            bridgeName,
+            toolCallId: toolCallId ?? null
+          }
+        },
+        taskId ? { taskId } : { system: true }
+      );
+    });
+  } catch {
+    // Non-load-bearing.
   }
   return { status: 200, body: { ok: true, removed: true, bridgeId } };
 }
