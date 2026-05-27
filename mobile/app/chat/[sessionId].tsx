@@ -16,7 +16,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
-import { refreshBadge, registerForPushAsync } from "@/src/push";
+import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
   useChatBlocks,
@@ -73,6 +73,11 @@ export default function ChatDetailScreen() {
     const latestId = list[list.length - 1]!.id;
     if (lastReadBlockIdRef.current === latestId) return;
     lastReadBlockIdRef.current = latestId;
+    // Read-state + badge are per-device on the gateway; the web target
+    // (and any client that hasn't acquired an APNs token yet) has no
+    // X-Device-Token header to send, so the call would just 400. Skip
+    // the round-trip entirely until a token is cached.
+    if (!getCachedDeviceToken()) return;
     void (async () => {
       try {
         await api(`/chat/${sessionId}/read`, {
