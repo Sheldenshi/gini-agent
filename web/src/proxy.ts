@@ -49,13 +49,25 @@ async function isProviderConfigured(): Promise<boolean | null> {
   }
 }
 
-/** Per-request Host classifier. Loopback is the operator's own machine.
- *  Tunnel branch matches the live trycloudflare hostname (read from the
- *  sibling file the runtime writes on enable) OR an explicit allowlist
- *  entry. Everything else 404s before any secret/cookie check —
- *  defends against DNS-rebinding to an attacker-controlled hostname per
- *  PLAN.md "Architecture" step 3. */
-function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-trusted" | "unknown" {
+/** Per-request Host classifier. Three live lanes:
+ *
+ *  - `loopback`: the operator's own machine (`localhost` / `127.0.0.1` /
+ *    `[::1]`). Pass through with the setup gate; the marker is stripped.
+ *  - `tunnel`: the live trycloudflare hostname the runtime writes to the
+ *    `tunnel.publicUrl` sibling file on enable. Gated on the secret-prefix
+ *    bootstrap or the session cookie; the marker is stamped on forwards.
+ *  - `trusted`: a stable hostname the operator listed in
+ *    `GINI_TRUSTED_ORIGINS` (Tailscale, reverse proxy, whatever stable
+ *    front they own). The BFF's CSRF guard handles origin equality on
+ *    this lane; the proxy does NOT apply the tunnel's enabled / secret /
+ *    cookie checks here. Conflating the two would 404 every trusted
+ *    request whenever the tunnel was disabled — a real deployment hazard
+ *    for operators who don't use the cloudflare lane at all.
+ *
+ *  Anything else returns `unknown` and 404s before any secret/cookie
+ *  check — defends against DNS-rebinding to an attacker-controlled
+ *  hostname per PLAN.md "Architecture" step 3. */
+function classifyHost(hostHeader: string | null): "loopback" | "tunnel" | "trusted" | "unknown" {
   if (!hostHeader) return "unknown";
   const lower = hostHeader.toLowerCase();
   const hostOnly = lower.includes("]")
@@ -71,7 +83,7 @@ function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-truste
   // is visible on the very next hit.
   const liveHost = readLiveTunnelHost();
   if (liveHost) {
-    if (hostMatches(lower, liveHost)) return "tunnel-or-trusted";
+    if (hostMatches(lower, liveHost)) return "tunnel";
   }
   // Share the env-var parse + validation with the BFF CSRF guard so the
   // two lanes can't drift apart on what counts as a valid entry (entries
@@ -84,7 +96,7 @@ function classifyHost(hostHeader: string | null): "loopback" | "tunnel-or-truste
   if (allowlist) {
     for (const url of allowlist) {
       const entryHost = url.host.toLowerCase();
-      if (hostMatches(lower, entryHost)) return "tunnel-or-trusted";
+      if (hostMatches(lower, entryHost)) return "trusted";
     }
   }
   return "unknown";
@@ -142,20 +154,26 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const tunnel = readTunnelConfigFromDisk();
   const canon = canonicalizePath(url.pathname);
 
-  // -------- LOOPBACK BRANCH --------
-  if (classification === "loopback") {
-    // Strip any inbound marker before forwarding — same-UID co-tenants cannot
-    // forge it through a loopback caller.
+  // -------- LOOPBACK + TRUSTED BRANCHES --------
+  // Both lanes strip the marker (no upstream classifier proved anything; the
+  // BFF guard makes its own decision via loopback-Host or origin-allowlist).
+  // The tunnel-specific gates (enabled / secret / cookie) only belong on the
+  // tunnel lane — applying them to a trusted-host caller would 404 every
+  // request whenever the tunnel was disabled.
+  if (classification === "loopback" || classification === "trusted") {
     const headers = stripVettedHeaders(request.headers);
     const next = NextResponse.next({ request: { headers } });
-    // Setup gate runs ONLY on loopback. A tunneled phone hitting / should not
-    // be redirected to /setup since /setup is a localhost-only experience.
-    const { pathname } = url;
-    if (!pathname.startsWith("/setup") && !pathname.startsWith("/api/") && !pathname.startsWith("/connect")) {
-      const configured = await isProviderConfigured();
-      if (configured === false) {
-        const setupUrl = new URL("/setup", request.url);
-        return applyResponsePolicy(NextResponse.redirect(setupUrl));
+    // Setup gate runs ONLY on loopback. A tunneled phone or a Tailscale-front
+    // caller hitting / should not be redirected to /setup since /setup is a
+    // localhost-only experience.
+    if (classification === "loopback") {
+      const { pathname } = url;
+      if (!pathname.startsWith("/setup") && !pathname.startsWith("/api/") && !pathname.startsWith("/connect")) {
+        const configured = await isProviderConfigured();
+        if (configured === false) {
+          const setupUrl = new URL("/setup", request.url);
+          return applyResponsePolicy(NextResponse.redirect(setupUrl));
+        }
       }
     }
     return applyResponsePolicy(next);
