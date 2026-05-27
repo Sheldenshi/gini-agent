@@ -185,6 +185,32 @@ export async function refreshBadge(): Promise<void> {
 // listener subscription would leak.
 let registrationStarted = false;
 
+// Generation counter bumped by __resetRegistrationForSignOut. Any
+// registration that starts in generation N must short-circuit (no
+// cache write, no listener install) if the counter has advanced by
+// the time its async work resolves. Without this guard, a sign-out
+// that races a still-in-flight registration POST would wipe the
+// credential, then the late-arriving POST handler would cache the
+// token + install listeners under the wiped credential — leaving an
+// orphaned subscription alive on the device.
+let signedOutGeneration = 0;
+
+// Promise for the currently-running registerForPushAsync invocation,
+// if any. Sign-out awaits this (with a timeout) before bumping the
+// generation so an in-flight POST has a chance to settle naturally;
+// anything that resolves AFTER the bump still short-circuits via the
+// generation check.
+let registrationInFlight: Promise<void> | null = null;
+
+// Public hook for the sign-out path. Resolves when the current
+// registerForPushAsync run finishes (success or failure), or
+// immediately if no registration is in flight. Callers should race
+// this against a short timeout so a stuck network can't block
+// sign-out indefinitely.
+export function awaitRegistrationInFlight(): Promise<void> {
+  return registrationInFlight ?? Promise.resolve();
+}
+
 // Cached APNs device token after a successful registration. The mobile
 // runtime needs this on every /read, /badge, and SSE open so the
 // gateway can scope reads + watch-state to this specific device
@@ -270,6 +296,12 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
   if (registrationStarted) return;
   registrationStarted = true;
 
+  // Capture the sign-out generation at entry. Any side effect after
+  // an `await` checks this against the current value before touching
+  // the cache or installing a listener — if a sign-out happened
+  // while we were suspended, the registration must abort silently.
+  const entryGeneration = signedOutGeneration;
+
   // Always register the approval category up-front, before any
   // permission prompt. If the user has previously granted permission,
   // the next incoming approval push needs the category in place
@@ -277,122 +309,151 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
   // registration is harmless (no notifications will arrive to use it).
   void registerApprovalCategoryAsync();
 
-  try {
-    // The library's typings re-export `PermissionResponse` from 'expo'
-    // for the base shape, but the 'expo' package only exports it
-    // structurally — TS resolves the inherited `status` field
-    // inconsistently across SDK versions. Treat the response as a
-    // loose record and read `granted`, which is the convenience flag
-    // documented as the authoritative grant check.
-    const existing = (await Notifications.getPermissionsAsync()) as unknown as { granted?: boolean };
-    let granted = Boolean(existing.granted);
-    if (!granted) {
-      const requested = (await Notifications.requestPermissionsAsync({
-        ios: { allowAlert: true, allowBadge: true, allowSound: true }
-      })) as unknown as { granted?: boolean };
-      granted = Boolean(requested.granted);
-    }
-    if (!granted) {
-      // User declined. Reset the flag so a subsequent screen-mount
-      // can retry — they may have changed their mind in Settings.
-      registrationStarted = false;
-      return;
-    }
+  const run = (async () => {
+    try {
+      // The library's typings re-export `PermissionResponse` from 'expo'
+      // for the base shape, but the 'expo' package only exports it
+      // structurally — TS resolves the inherited `status` field
+      // inconsistently across SDK versions. Treat the response as a
+      // loose record and read `granted`, which is the convenience flag
+      // documented as the authoritative grant check.
+      const existing = (await Notifications.getPermissionsAsync()) as unknown as { granted?: boolean };
+      let granted = Boolean(existing.granted);
+      if (!granted) {
+        const requested = (await Notifications.requestPermissionsAsync({
+          ios: { allowAlert: true, allowBadge: true, allowSound: true }
+        })) as unknown as { granted?: boolean };
+        granted = Boolean(requested.granted);
+      }
+      if (!granted) {
+        // User declined. Reset the flag so a subsequent screen-mount
+        // can retry — they may have changed their mind in Settings.
+        registrationStarted = false;
+        return;
+      }
 
-    const bundleId = opts.bundleId ?? resolveBundleId();
-    if (!bundleId) {
-      // Can't register without a bundle id (the gateway requires it).
-      registrationStarted = false;
-      return;
-    }
+      const bundleId = opts.bundleId ?? resolveBundleId();
+      if (!bundleId) {
+        // Can't register without a bundle id (the gateway requires it).
+        registrationStarted = false;
+        return;
+      }
 
-    // getDevicePushTokenAsync returns the raw APNs token — what we
-    // want for direct-to-Apple delivery. getExpoPushTokenAsync would
-    // route through Expo's push service, which is the wrong fit
-    // because the gateway is the push provider and uses its own .p8.
-    const token = await Notifications.getDevicePushTokenAsync();
-    if (token.type === "ios") {
-      await postDevice(token.data, bundleId);
-      // Cache after the POST succeeds so callers downstream (api
-      // helper, SSE resolver) get the same token the gateway just
-      // accepted. On POST failure cachedDeviceToken stays null and
-      // those callers no-op until the next mount's retry. Persist
-      // to AsyncStorage so the next cold launch can prime the cache
-      // before registration runs again.
-      cachedDeviceToken = token.data;
-      void persistDeviceToken(token.data);
-    }
+      // getDevicePushTokenAsync returns the raw APNs token — what we
+      // want for direct-to-Apple delivery. getExpoPushTokenAsync would
+      // route through Expo's push service, which is the wrong fit
+      // because the gateway is the push provider and uses its own .p8.
+      const token = await Notifications.getDevicePushTokenAsync();
+      if (token.type === "ios") {
+        await postDevice(token.data, bundleId);
+        // Sign-out race guard: if a sign-out bumped the generation
+        // while the POST was in flight, abort silently. The token POST
+        // already succeeded server-side; the sign-out's awaited DELETE
+        // is the cleanup path (it ran with knowledge that the in-flight
+        // registration may have just persisted this token, because
+        // sign-out awaits awaitRegistrationInFlight before issuing the
+        // DELETE).
+        if (entryGeneration !== signedOutGeneration) return;
+        // Cache after the POST succeeds so callers downstream (api
+        // helper, SSE resolver) get the same token the gateway just
+        // accepted. On POST failure cachedDeviceToken stays null and
+        // those callers no-op until the next mount's retry. Persist
+        // to AsyncStorage so the next cold launch can prime the cache
+        // before registration runs again.
+        cachedDeviceToken = token.data;
+        void persistDeviceToken(token.data);
+      }
 
-    // Listen for token rotations. The library debounces internally,
-    // so we just forward every emission straight to the gateway.
-    if (!tokenSub) {
-      tokenSub = Notifications.addPushTokenListener((event) => {
-        if (event.type !== "ios") return;
-        // Fire-and-forget — if the network is down the next mount's
-        // initial registration will catch up.
-        void postDevice(event.data, bundleId).then(() => {
-          cachedDeviceToken = event.data;
-          void persistDeviceToken(event.data);
-        }).catch(() => { /* swallow */ });
-      });
-    }
+      // Re-check the generation before installing any listener. A
+      // sign-out that lands here would otherwise leave the listener
+      // subscribed under the wiped credential, firing into a future
+      // sign-in.
+      if (entryGeneration !== signedOutGeneration) return;
 
-    // Response listener: handles three cases via dispatchNotificationResponse.
-    //   - Default tap (no actionIdentifier set, or
-    //     UNNotificationDefaultActionIdentifier) → deep-link to chat.
-    //   - APPROVE action → POST /api/approvals/:id/approve.
-    //   - DENY action → POST /api/approvals/:id/deny.
-    // Both action endpoints are existing routes (src/http.ts:201-202)
-    // — they pre-date the push surface and already enforce auth +
-    // ownership. The action handler runs in the background while the
-    // app is suspended; iOS gives ~30s of JS time which is plenty for
-    // a single POST round-trip.
-    if (!responseSub) {
-      responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
-        void dispatchNotificationResponse(response, {
-          apiCall: (path, init) => api(path, init),
-          navigate: (sessionId) => {
-            // expo-router uses dynamic segments via the bracketed path.
-            router.push(`/chat/${sessionId}`);
-          },
-          notifyFailure: notifyActionFailure
+      // Listen for token rotations. The library debounces internally,
+      // so we just forward every emission straight to the gateway.
+      if (!tokenSub) {
+        tokenSub = Notifications.addPushTokenListener((event) => {
+          if (event.type !== "ios") return;
+          // Same generation check on the rotation path: a rotation
+          // callback that resolves after sign-out must not repopulate
+          // the cache under a stale credential.
+          const rotationGeneration = signedOutGeneration;
+          // Fire-and-forget — if the network is down the next mount's
+          // initial registration will catch up.
+          void postDevice(event.data, bundleId).then(() => {
+            if (rotationGeneration !== signedOutGeneration) return;
+            cachedDeviceToken = event.data;
+            void persistDeviceToken(event.data);
+          }).catch(() => { /* swallow */ });
         });
-      });
-    }
+      }
 
-    // Foreground delivery listener — fires for every received push,
-    // including silent ones (where `setNotificationHandler` returned
-    // shouldShow=false). We branch on the event discriminator from the
-    // payload's data block: `phase_completed` / `phase_failed` are the
-    // silent wakes the gateway fires when a task finishes and the user
-    // isn't actively watching. The badge refetch is the side-effect.
-    // If the relevant chat detail is already mounted, its SSE stream
-    // will deliver the same block — no imperative refetch needed from
-    // here.
-    if (!receivedSub) {
-      receivedSub = Notifications.addNotificationReceivedListener((notification) => {
-        // Per the wire shape from the server-side dispatcher, all
-        // routing fields are inside `userInfo["body"]`, which expo
-        // surfaces as `content.data`. The `silent` boolean
-        // discriminator pins whether to treat this as a background
-        // wake — keying off it (rather than the now-dropped aps
-        // sub-object) avoids depending on iOS internals.
-        const data = notification.request.content.data as
-          | { event?: string; sessionId?: string; silent?: unknown }
-          | undefined;
-        if (!data) return;
-        if (data.silent !== true) return;
-        if (data.event === "phase_completed" || data.event === "phase_failed") {
-          void refreshBadge();
-        }
-      });
+      // Response listener: handles three cases via dispatchNotificationResponse.
+      //   - Default tap (no actionIdentifier set, or
+      //     UNNotificationDefaultActionIdentifier) → deep-link to chat.
+      //   - APPROVE action → POST /api/approvals/:id/approve.
+      //   - DENY action → POST /api/approvals/:id/deny.
+      // Both action endpoints are existing routes (src/http.ts:201-202)
+      // — they pre-date the push surface and already enforce auth +
+      // ownership. The action handler runs in the background while the
+      // app is suspended; iOS gives ~30s of JS time which is plenty for
+      // a single POST round-trip.
+      if (!responseSub) {
+        responseSub = Notifications.addNotificationResponseReceivedListener((response) => {
+          void dispatchNotificationResponse(response, {
+            apiCall: (path, init) => api(path, init),
+            navigate: (sessionId) => {
+              // expo-router uses dynamic segments via the bracketed path.
+              router.push(`/chat/${sessionId}`);
+            },
+            notifyFailure: notifyActionFailure
+          });
+        });
+      }
+
+      // Foreground delivery listener — fires for every received push,
+      // including silent ones (where `setNotificationHandler` returned
+      // shouldShow=false). We branch on the event discriminator from the
+      // payload's data block: `phase_completed` / `phase_failed` are the
+      // silent wakes the gateway fires when a task finishes and the user
+      // isn't actively watching. The badge refetch is the side-effect.
+      // If the relevant chat detail is already mounted, its SSE stream
+      // will deliver the same block — no imperative refetch needed from
+      // here.
+      if (!receivedSub) {
+        receivedSub = Notifications.addNotificationReceivedListener((notification) => {
+          // Per the wire shape from the server-side dispatcher, all
+          // routing fields are inside `userInfo["body"]`, which expo
+          // surfaces as `content.data`. The `silent` boolean
+          // discriminator pins whether to treat this as a background
+          // wake — keying off it (rather than the now-dropped aps
+          // sub-object) avoids depending on iOS internals.
+          const data = notification.request.content.data as
+            | { event?: string; sessionId?: string; silent?: unknown }
+            | undefined;
+          if (!data) return;
+          if (data.silent !== true) return;
+          if (data.event === "phase_completed" || data.event === "phase_failed") {
+            void refreshBadge();
+          }
+        });
+      }
+    } catch {
+      // Permission/token retrieval can fail on first launch in
+      // unusual states (e.g. iOS Simulator without a Apple ID). Allow
+      // retry on next mount.
+      registrationStarted = false;
     }
-  } catch {
-    // Permission/token retrieval can fail on first launch in
-    // unusual states (e.g. iOS Simulator without a Apple ID). Allow
-    // retry on next mount.
-    registrationStarted = false;
-  }
+  })();
+
+  registrationInFlight = run.finally(() => {
+    // Clear the in-flight slot only if we're still the active run.
+    // A retry on a subsequent mount installs its own promise; we
+    // mustn't clobber it from this finally.
+    if (registrationInFlight === run) registrationInFlight = null;
+  });
+  await registrationInFlight;
 }
 
 // POST the token to /api/push/devices. The gateway's handler is an
@@ -431,6 +492,11 @@ export function __resetRegistrationForSignOut(): void {
   registrationStarted = false;
   cachedDeviceToken = null;
   void clearPersistedDeviceToken();
+  // Bump generation LAST so anything that resolves during a
+  // sign-out's pre-bump drain (via awaitRegistrationInFlight) still
+  // completes naturally; anything that resolves after the bump
+  // short-circuits via the entryGeneration check.
+  signedOutGeneration += 1;
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
@@ -442,6 +508,8 @@ export function __resetRegistrationForSignOut(): void {
 export function __resetForTests(): void {
   registrationStarted = false;
   cachedDeviceToken = null;
+  registrationInFlight = null;
+  signedOutGeneration = 0;
   void clearPersistedDeviceToken();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }

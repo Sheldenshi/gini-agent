@@ -102,22 +102,43 @@ async function tryDeregisterCachedDevice(): Promise<void> {
     // push.ts skip this path entirely.
     const pushModule = require("./push") as {
       getCachedDeviceToken?: () => string | null;
+      awaitRegistrationInFlight?: () => Promise<void>;
       __resetRegistrationForSignOut?: () => void;
     };
+    // Drain any in-flight registration before reading the cached
+    // token. Without this wait, a sign-out that races a registration
+    // POST would see cachedDeviceToken=null, skip the DELETE, and
+    // leave an orphaned token alive on the gateway once the
+    // registration's POST settles a moment later. Bounded by a 2s
+    // timeout so a stuck network can't block sign-out indefinitely —
+    // the registration's own generation guard will short-circuit any
+    // late resolution that arrives after we bump.
+    const inFlight = pushModule.awaitRegistrationInFlight?.();
+    if (inFlight) {
+      await Promise.race([
+        inFlight,
+        new Promise<void>((resolve) => setTimeout(resolve, 2000))
+      ]);
+    }
     const token = pushModule.getCachedDeviceToken?.();
-    if (!token) return;
-    const apiModule = require("./api") as {
-      api: (path: string, init?: { method?: string }) => Promise<unknown>;
-    };
-    try {
-      await apiModule.api(`/push/devices/${encodeURIComponent(token)}`, { method: "DELETE" });
-    } catch {
-      // 401 (already-invalid bearer), 404 (orphaned), or network
-      // failure — log and continue; we still need to clear local
-      // creds.
+    if (token) {
+      const apiModule = require("./api") as {
+        api: (path: string, init?: { method?: string }) => Promise<unknown>;
+      };
+      try {
+        await apiModule.api(`/push/devices/${encodeURIComponent(token)}`, { method: "DELETE" });
+      } catch {
+        // 401 (already-invalid bearer), 404 (orphaned), or network
+        // failure — log and continue; we still need to clear local
+        // creds.
+      }
     }
     // Reset the in-process registration guard so a sign-in with a
-    // different credential rebuilds permission + token + POST.
+    // different credential rebuilds permission + token + POST. This
+    // also bumps the generation counter so any registration work
+    // that resolves after this point (e.g. a POST whose response
+    // landed after our 2s race timed out) short-circuits its own
+    // cache write.
     pushModule.__resetRegistrationForSignOut?.();
   } catch {
     // require("./push") can throw in non-RN test envs.
