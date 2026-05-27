@@ -92,7 +92,12 @@ function applescriptEscape(value: string): string {
 
 function runOsascript(script: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("osascript", ["-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+    // Pipe the script over stdin (osascript without `-e` reads from stdin)
+    // instead of passing it on argv. argv is world-readable via `ps` and
+    // `/proc/<pid>/cmdline`; the bootstrap-URL note body contains the live
+    // tunnel secret, so argv exposure is a real same-UID leak. stdin
+    // delivery keeps the secret in the kernel pipe + child memory only.
+    const child = spawn("osascript", [], { stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     const timeout = setTimeout(() => {
@@ -110,5 +115,8 @@ function runOsascript(script: string): Promise<string> {
       if (code === 0) resolve(stdout.trim());
       else reject(new Error(stderr.trim() || `osascript exited with code ${code ?? "?"}`));
     });
+    if (child.stdin) {
+      child.stdin.end(script);
+    }
   });
 }

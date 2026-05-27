@@ -32,7 +32,18 @@ export function launchCloudflared(opts: LaunchOptions): CloudflaredLaunch {
     "--protocol", "http2",
     "--url", `http://127.0.0.1:${opts.port}`
   ];
-  const proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+  // Whitelist the env the subprocess actually needs. The gateway's parent
+  // env carries provider API keys (OPENAI_API_KEY, GINI_* tokens) that
+  // cloudflared has no business reading; passing `env: {...}` overrides
+  // Node's default-inherited env so a compromise of the cloudflared
+  // binary can't exfiltrate them via process.env.
+  const env: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin:/usr/sbin:/sbin",
+    HOME: process.env.HOME ?? "",
+    TMPDIR: process.env.TMPDIR ?? "/tmp",
+    LANG: process.env.LANG ?? "en_US.UTF-8"
+  };
+  const proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], env });
 
   let resolveUrl!: (url: string) => void;
   let rejectUrl!: (err: Error) => void;

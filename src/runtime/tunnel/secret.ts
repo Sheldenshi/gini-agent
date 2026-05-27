@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 // 192 bits of entropy, base64url-encoded → 32 characters. Picked to fit
 // cleanly on a 32-char URL segment while keeping brute-force well past
@@ -8,6 +8,16 @@ const SECRET_BYTES = 24;
 
 export function generateTunnelSecret(): string {
   return randomBytes(SECRET_BYTES).toString("base64url");
+}
+
+/** Non-reversible identifier derived from the secret. The 16-char hex prefix
+ *  of SHA-256(secret) is safe to expose in URL query strings, log lines, and
+ *  the redacted snapshot — a recipient cannot invert it to recover the
+ *  secret. Used as a cache-buster on the QR `<img>` src so a rotate-secret
+ *  invalidates the painted image without leaking the secret in the URL. */
+export function secretRevision(secret: string | null): string | null {
+  if (!secret) return null;
+  return createHash("sha256").update(secret, "utf8").digest("hex").slice(0, 16);
 }
 
 // Constant-time byte equality across two strings. We coerce both sides to

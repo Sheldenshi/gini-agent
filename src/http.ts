@@ -73,6 +73,11 @@ function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
     enabled: snapshot.enabled,
     secret: null,
     publicUrl: null,
+    // The revision is a SHA-256 prefix of the secret — non-reversible and
+    // safe to expose. The browser uses it as a cache-buster for the QR
+    // image. A tunneled browser doesn't actually need it (the launcher is
+    // hidden in tunneled contexts) but exposing it keeps the shape uniform.
+    secretRevision: snapshot.secretRevision,
     lastError: snapshot.lastError,
     appleNotes: {
       enabled: snapshot.appleNotes.enabled,

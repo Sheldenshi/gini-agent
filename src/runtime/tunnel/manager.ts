@@ -5,6 +5,7 @@ import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
 import { atomicWriteFile } from "./atomic-write";
+import { secretRevision } from "./secret";
 import { instanceRoot } from "../../paths";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -80,6 +81,7 @@ class TunnelManager {
     this.snapshot = {
       enabled: persisted.enabled,
       secret: persisted.secret,
+      secretRevision: secretRevision(persisted.secret),
       publicUrl: null,
       lastError: null,
       appleNotes: {
@@ -172,6 +174,7 @@ class TunnelManager {
             ...this.snapshot,
             enabled: true,
             secret: persisted.secret,
+            secretRevision: secretRevision(persisted.secret),
             publicUrl: url,
             lastError: null
           };
@@ -323,7 +326,7 @@ class TunnelManager {
       try {
         const persisted = patchTunnelConfig(this.config.instance, {}); // ensure block exists
         const next = patchTunnelConfig(this.config.instance, { secret: cryptoSecret() });
-        this.snapshot = { ...this.snapshot, secret: next.secret };
+        this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret) };
         setRedactionSecret(next.secret);
         // Refresh Notes if mirror is on and tunnel is up — the note carries
         // the URL which embeds the secret as the QR-encoded path.

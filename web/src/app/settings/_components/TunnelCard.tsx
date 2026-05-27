@@ -13,6 +13,7 @@ interface TunnelSnapshot {
   enabled: boolean;
   secret: string | null;
   publicUrl: string | null;
+  secretRevision: string | null;
   lastError: string | null;
   appleNotes: {
     enabled: boolean;
@@ -110,7 +111,7 @@ export function TunnelCard() {
         {showQr ? (
           <div className="grid gap-4 md:grid-cols-[auto_1fr]">
             <img
-              src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secret ?? "")}`}
+              src={`/api/runtime/tunnel/qr.svg?v=${encodeURIComponent(data?.secretRevision ?? "")}`}
               alt="Tunnel QR"
               className="h-48 w-48 rounded border bg-white p-2"
               data-testid="tunnel-settings-qr"
