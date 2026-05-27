@@ -43,7 +43,7 @@ export function BlockToolCallsCollapsed({
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
-        className="flex items-center gap-[13px] self-start rounded-lg border border-[#1E1E24] bg-[#121216] px-[13px] py-[9px] text-left"
+        className="flex items-center gap-[13px] self-start py-0.5 text-left"
       >
         <ChevronRight
           className={`size-4 shrink-0 text-[#7A7A80] transition-transform ${expanded ? "rotate-90" : ""}`}
