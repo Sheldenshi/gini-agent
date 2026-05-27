@@ -560,6 +560,25 @@ Loopback bearer           full operator access, unchanged         config edit
 
 ## Deny list through the tunnel
 
+> **NOTE (deliberate divergence from the original spec below).** PLAN.md
+> describes the original conservative deny list — the entire
+> `/api/runtime/tunnel/*` subtree (QR endpoints, refresh-notes) was denied
+> through the tunnel and `GET /api/runtime/tunnel` was rewritten to
+> `/api/tunnel/redacted` so tunneled browser JS only saw the redacted shape.
+> That policy was intentionally broadened: the tunneled settings card now
+> exposes the same Enable / Disable / Rotate / Apple-Notes-toggle controls
+> the loopback view does (so an operator who realizes they've leaked the
+> QR can rotate-secret from the same surface they scanned on), so
+> `GET /api/runtime/tunnel`, `PATCH /api/runtime/tunnel`,
+> `GET /api/runtime/tunnel/qr.svg`, `GET /api/runtime/tunnel/qr.txt`, and
+> `POST /api/runtime/tunnel/refresh-notes` are all ALLOWED through the
+> tunnel; only `/api/runtime/pairing/*` (the device-bearer mint) remains
+> denied. The QR-pixel canvas-decode XSS hazard is explicitly accepted as
+> a tradeoff. The live policy lives in
+> `docs/adr/tunnel-and-mobile-access.md` and
+> `docs/adr/bff-trust-boundary.md`; refer there before reading the historical
+> spec below.
+
 The deny list applies ONLY to tunnel-vetted requests — i.e., requests that arrived via the proxy's TUNNEL BRANCH (Host classified as live tunnel hostname or a `GINI_TRUSTED_ORIGINS` entry) and were stamped with `x-gini-tunnel-vetted: 1` before forwarding. Loopback callers (LOOPBACK BRANCH, no marker stamped) bypass the deny list entirely — the operator's localhost browser must be able to fetch the QR endpoints, PATCH `/api/runtime/tunnel` to enable/disable, POST `/api/runtime/pairing` to mint a device code, and so on. The defense for loopback callers is the bearer-on-localhost contract plus `guardCsrf`'s Origin/Host equality requirement on unsafe methods (which rejects any cross-process unsafe call that doesn't supply matching Origin/Host) — NOT the deny list.
 
 All deny rules below are checked at TWO layers, each gated by a layer-specific condition:

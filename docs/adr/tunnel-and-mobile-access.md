@@ -11,9 +11,12 @@ the secret or cookie in constant time, and stamps an internal marker
 (`x-gini-tunnel-vetted: 1`) on requests that pass before the BFF guard sees
 them.
 
-The full design contract lives in `PLAN.md`. This ADR captures the
-architecture decisions, trust boundary changes, and operational invariants
-the contract pins.
+The original design contract lives in `PLAN.md` for historical context.
+The trust-radius and deny-list policy were deliberately broadened during
+implementation — the live policy is captured below and in
+`bff-trust-boundary.md`. When the two disagree, this ADR (and the
+implementation it pins) wins; `PLAN.md` has a banner in the deny-list
+section pointing back here.
 
 ## Context
 

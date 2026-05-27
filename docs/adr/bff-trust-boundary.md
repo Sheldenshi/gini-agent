@@ -160,4 +160,11 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
 - The marker is never forwarded to the runtime — the BFF's
   `pickForwardHeaders` allowlist strips it before bearer injection,
   and the runtime never observes it.
-- `bun test src/integration.test.ts` pins all of the above.
+- The non-tunnel `GINI_TRUSTED_ORIGINS` / loopback / Origin-match
+  cases are pinned by `bun test src/integration.test.ts`. The
+  tunnel-vetted marker / deny / cookie / classification flow is
+  not yet covered by an integration test — pure-helper coverage
+  in `web/src/lib/tunnel-policy.test.ts`, `web/src/lib/canonicalize.test.ts`,
+  and `web/src/lib/trusted-origins.test.ts` pins the building
+  blocks. End-to-end coverage of the proxy / BFF interaction is a
+  documented gap.
