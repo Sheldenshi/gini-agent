@@ -9,6 +9,8 @@
 // flips to true. That is the only reliable cross-version way to detect a
 // successful scheme handoff from a web page.
 
+import { ConnectClient } from "./ConnectClient";
+
 type SearchParams = Record<string, string | string[] | undefined>;
 
 const DEFAULT_SCHEME = "gini://connect";
@@ -97,10 +99,6 @@ export default async function ConnectPage({
   const sep = scheme.includes("?") ? "&" : "?";
   const tokenSuffix = token ? `&token=${encodeURIComponent(token)}` : "";
   const schemeUrl = `${scheme}${sep}api=${encodeURIComponent(apiUrl)}${tokenSuffix}`;
-  // JSON.stringify does not escape `</script>` by default; if any URL ever
-  // contained that sequence the inline script block would terminate early.
-  // Re-encode `<` as `<` after JSON.stringify to neutralize that.
-  const config = JSON.stringify({ schemeUrl, webUrl, fallbackMs }).replace(/</g, "\\u003c");
 
   return (
     <div className="mx-auto max-w-md p-6 text-sm">
@@ -114,21 +112,7 @@ export default async function ConnectPage({
           .
         </p>
       </noscript>
-      <script
-        dangerouslySetInnerHTML={{
-          __html: `(() => {
-  const { schemeUrl, webUrl, fallbackMs } = ${config};
-  let appOpened = false;
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) appOpened = true;
-  });
-  window.location.href = schemeUrl;
-  setTimeout(() => {
-    if (!appOpened) window.location.replace(webUrl);
-  }, fallbackMs);
-})();`,
-        }}
-      />
+      <ConnectClient schemeUrl={schemeUrl} webUrl={webUrl} fallbackMs={fallbackMs} />
     </div>
   );
 }

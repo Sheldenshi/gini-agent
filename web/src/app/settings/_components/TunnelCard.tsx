@@ -34,14 +34,19 @@ interface TunnelSnapshot {
 type ConfirmKind = "disable" | "rotate" | null;
 
 /** Strip the optional `:port` suffix and check if the resulting hostname is
- *  a loopback literal. Matches the proxy's classifyHost in web/src/proxy.ts. */
-function isLoopbackHost(host: string): boolean {
+ *  a loopback literal. Matches the proxy's classifyHost in web/src/proxy.ts.
+ *  Declared as a `const` arrow rather than a `function` declaration because
+ *  Next.js Turbopack's HMR has been observed losing the binding for top-
+ *  level function declarations after rapid edits in client components,
+ *  leaving the component crashing with `ReferenceError: isLoopbackHost is
+ *  not defined`. The `const` form survives reload reliably. */
+const isLoopbackHost = (host: string): boolean => {
   const close = host.lastIndexOf("]");
   const name = close >= 0
     ? host.slice(0, close + 1)
     : host.includes(":") ? host.slice(0, host.indexOf(":")) : host;
   return name === "localhost" || name === "127.0.0.1" || name === "[::1]";
-}
+};
 
 export function TunnelCard() {
   const qc = useQueryClient();
