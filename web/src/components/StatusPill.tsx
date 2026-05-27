@@ -37,6 +37,16 @@ export function StatusPill({ value, className }: { value: string; className?: st
   );
 }
 
+// Actions where the risk badge is suppressed in the UI. The audit row still
+// carries the underlying classification from src/execution/tool-risk.ts; this
+// only softens the visual framing for benign trust-establishment steps
+// (e.g. browser.connect — clicking Connect is itself the consent).
+const HIDE_RISK_BADGE_ACTIONS: ReadonlySet<string> = new Set(["browser.connect"]);
+
+export function shouldHideRiskBadge(action: string): boolean {
+  return HIDE_RISK_BADGE_ACTIONS.has(action);
+}
+
 export function RiskPill({ value }: { value: string }) {
   const tone =
     value === "high"

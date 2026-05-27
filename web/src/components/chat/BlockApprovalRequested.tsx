@@ -5,7 +5,7 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { RiskPill, StatusPill, shouldHideRiskBadge } from "@/components/StatusPill";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
@@ -98,7 +98,6 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
 
   const isConnectorRequest = block.action === "connector.request";
   const isBrowserFillSecret = block.action === "browser.fill_secret";
-  const isBrowserConnect = block.action === "browser.connect";
   const providerId = isConnectorRequest && approval
     ? String(approval.payload?.provider ?? "")
     : "";
@@ -183,7 +182,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs text-foreground">{block.action}</span>
-        {isBrowserConnect ? null : <RiskPill value={block.risk} />}
+        {shouldHideRiskBadge(block.action) ? null : <RiskPill value={block.risk} />}
         {!isPending && approval ? <StatusPill value={approval.status} /> : null}
         <button
           type="button"

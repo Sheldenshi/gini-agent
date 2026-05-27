@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
-import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { RiskPill, StatusPill, shouldHideRiskBadge } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import {
   useApprovals,
@@ -164,15 +164,7 @@ export default function HomePage() {
                         <span className="font-mono text-[11px]">
                           {isBrowserConnect ? "Connect to agent's browser" : approval.action}
                         </span>
-                        {/*
-                          Suppress the MEDIUM-RISK badge for `browser.connect`.
-                          The action is still gated (the user still has to
-                          click Connect to consent) but the visual framing is
-                          softer because this is a benign sign-in step, not a
-                          destructive action. All other approvals keep the
-                          badge.
-                        */}
-                        {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
+                        {shouldHideRiskBadge(approval.action) ? null : <RiskPill value={approval.risk} />}
                       </div>
                       {isBrowserConnect ? null : (
                         <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
