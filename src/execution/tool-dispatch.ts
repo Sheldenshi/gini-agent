@@ -3382,6 +3382,21 @@ async function waitForMessagingPairTool(
       result: JSON.stringify({ ok: false, error: `wait_for_messaging_pair only applies to telegram bridges (got '${initialBridge.kind}').` })
     };
   }
+  // Snapshot the allowlist at wait start so we can detect a chat
+  // getting enrolled out-of-band (settings page click, CLI
+  // `gini messaging allow`, or another agent's parallel
+  // request_messaging_pairing) WHILE this wait is running. allowChat
+  // both removes the pending row AND adds chatId to allowedChatIds,
+  // so the pending-row predicate alone can't tell us "someone else
+  // approved it" from "no one has DM'd yet" — both look like
+  // "nothing to surface." Without this snapshot, the agent would
+  // time out and tell the user "DM the bot again" even though they
+  // were already enrolled.
+  const initialAllowedSnapshot = new Set<number>(
+    Array.isArray((initialBridge.metadata ?? {} as Record<string, unknown>).allowedChatIds)
+      ? ((initialBridge.metadata ?? {}).allowedChatIds as unknown[]).map((v) => Number(v)).filter((n) => Number.isFinite(n))
+      : []
+  );
 
   const reasonText = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()
@@ -3428,6 +3443,27 @@ async function waitForMessagingPairTool(
         ? liveMeta.allowedChatIds.map((v) => Number(v)).filter((n) => Number.isFinite(n))
         : []
     );
+
+    // Out-of-band enrollment detection: any chat in the current
+    // allowlist that wasn't there at wait start is a fresh
+    // approval landed via settings / CLI / a parallel agent flow.
+    // Return success so the agent can tell the user "the chat is
+    // enrolled, you can DM the bot now" instead of timing out.
+    const freshlyEnrolled: number[] = [];
+    for (const chatId of allowedSet) {
+      if (!initialAllowedSnapshot.has(chatId)) freshlyEnrolled.push(chatId);
+    }
+    if (freshlyEnrolled.length > 0) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: true,
+          outOfBand: true,
+          enrolledChatIds: freshlyEnrolled,
+          message: `Chat ${freshlyEnrolled.join(", ")} got enrolled on bridge '${liveBridge.name}' out-of-band (settings page, CLI, or a parallel agent flow) while waiting. The user can DM the bot now.`
+        })
+      };
+    }
 
     // Surface the first pending row that the operator can act on:
     // (a) has a verification code (groups never mint a code and

@@ -855,6 +855,63 @@ describe("request_connector dispatch", () => {
     ).toBe(0);
   }, 30000);
 
+  test("wait_for_messaging_pair: detects out-of-band enrollment and exits with success", async () => {
+    // While the wait loop is running, a parallel operator (settings
+    // page, `gini messaging allow`, or another agent's
+    // request_messaging_pairing) can approve a chat. allowChat both
+    // removes the pending row AND adds chatId to allowedChatIds, so
+    // the pending-row predicate alone can't tell us a fresh enrollment
+    // happened — both "approved out-of-band" and "no one DM'd yet"
+    // look like nothing-to-surface. Pin that the snapshot-diff on
+    // allowedChatIds exits with ok:true + the new chatIds when an
+    // enrollment lands mid-wait.
+    const instance = `wait-pair-out-of-band-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg-oob",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [],
+        recentDeniedChats: []
+      };
+    });
+    const dispatchPromise = dispatchToolCall(
+      config,
+      taskId,
+      "wait_for_messaging_pair",
+      "call_wait_oob",
+      JSON.stringify({ bridge: "tg-oob", timeoutSeconds: 10 })
+    );
+    // Simulate another path enrolling chat 555 while the wait is
+    // running (e.g. operator clicked Approve on the settings page).
+    await Bun.sleep(1200);
+    await mutateState(instance, (state) => {
+      const live = state.messagingBridges.find((b) => b.name === "tg-oob");
+      if (live) {
+        live.metadata = { ...(live.metadata ?? {}), allowedChatIds: [555] };
+      }
+    });
+    const result = await dispatchPromise;
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(true);
+      expect(parsed.outOfBand).toBe(true);
+      expect(parsed.enrolledChatIds).toEqual([555]);
+    }
+    // No approval card was minted — the wait exited before the
+    // request_messaging_pairing path fired.
+    const state = readState(instance);
+    expect(
+      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+    ).toBe(0);
+  }, 15000);
+
   test("wait_for_messaging_pair: skips a pending row whose chat is already enrolled, then exits on task cancel", async () => {
     // Pin the second half of the new predicate: a pending row whose
     // chatId is already on the allowlist must NOT surface. Approved

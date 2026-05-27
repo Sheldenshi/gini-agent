@@ -1167,6 +1167,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Messaging bridge not found")) return 404;
   if (message.startsWith("Messaging bridge is not configured")) return 400;
   if (message.startsWith("Messaging bridge name is required")) return 400;
+  // rejectPendingChat throws these when the operator clicks Reject
+  // on a stale card (the pending row was re-DM'd and the code rotated)
+  // or on a card whose chat was already enrolled by a parallel
+  // operator. Both are user-input class — 400, not 500.
+  if (message.startsWith("Cannot reject")) return 400;
+  if (message.startsWith("Pairing request for chat")) return 400;
   if (/^(Telegram|Discord) bridges require a botToken/.test(message)) return 400;
   if (/^(Telegram|Discord) bot token contains invalid characters/.test(message)) return 400;
   if (message.startsWith("Inbound message text or media is required")) return 400;
