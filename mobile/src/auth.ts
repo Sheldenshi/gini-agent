@@ -81,8 +81,47 @@ export async function saveCredentials(creds: AuthCredentials): Promise<void> {
 }
 
 export async function clearCredentials(): Promise<void> {
+  // Best-effort deregister the cached APNs token from the gateway
+  // before dropping the bearer. Without this the device row outlives
+  // the sign-out — the user re-pairing with a different credential
+  // would orphan the old row, and the next push for the old
+  // credential would still wake this device. Failures are swallowed:
+  // the sign-out itself must always succeed, and an orphaned row is
+  // a recoverable annoyance (the gateway prunes on the next 410
+  // Unregistered from APNs once the app uninstalls).
+  await tryDeregisterCachedDevice();
   await AsyncStorage.removeItem(STORAGE_KEY);
   broadcast(null);
+}
+
+async function tryDeregisterCachedDevice(): Promise<void> {
+  try {
+    // Lazy require: keeps the import graph free of an auth → push
+    // cycle (push.ts imports api.ts which depends on cached
+    // credentials), and lets tests / web bundles that never load
+    // push.ts skip this path entirely.
+    const pushModule = require("./push") as {
+      getCachedDeviceToken?: () => string | null;
+      __resetRegistrationForSignOut?: () => void;
+    };
+    const token = pushModule.getCachedDeviceToken?.();
+    if (!token) return;
+    const apiModule = require("./api") as {
+      api: (path: string, init?: { method?: string }) => Promise<unknown>;
+    };
+    try {
+      await apiModule.api(`/push/devices/${encodeURIComponent(token)}`, { method: "DELETE" });
+    } catch {
+      // 401 (already-invalid bearer), 404 (orphaned), or network
+      // failure — log and continue; we still need to clear local
+      // creds.
+    }
+    // Reset the in-process registration guard so a sign-in with a
+    // different credential rebuilds permission + token + POST.
+    pushModule.__resetRegistrationForSignOut?.();
+  } catch {
+    // require("./push") can throw in non-RN test envs.
+  }
 }
 
 export function useAuth(): AuthState & {

@@ -368,6 +368,21 @@ function resolveBundleId(): string | null {
   }
 }
 
+// Called from auth.ts after a successful sign-out so the next
+// sign-in re-runs the full registration flow (permission, token
+// fetch, POST /push/devices, listener re-subscription). The cached
+// token is cleared too — the new credential's gateway has a
+// different devices table and we must not reuse a stale token under
+// the wrong credential. Subscription handles are removed so they
+// don't double up on the next register.
+export function __resetRegistrationForSignOut(): void {
+  registrationStarted = false;
+  cachedDeviceToken = null;
+  if (tokenSub) { tokenSub.remove(); tokenSub = null; }
+  if (responseSub) { responseSub.remove(); responseSub = null; }
+  if (receivedSub) { receivedSub.remove(); receivedSub = null; }
+}
+
 // Test-only entry — clears the in-process gates so the next call to
 // registerForPushAsync runs the full flow again. Used by tests that
 // drive multiple registration attempts.
