@@ -2285,6 +2285,123 @@ describe("runtime api", () => {
     expect(idLineMatch?.[1]).not.toContain(":");
   });
 
+  test("GET /api/chat/:id/stream emits chat_session frame on initial connect", async () => {
+    // The mobile client reads the chat-detail header title from the
+    // session record this frame carries. Without an initial emit,
+    // there's a window where the header would render "Chat" / the
+    // first-message fallback even though the gateway already knows
+    // the canonical title (e.g. on reconnect to an already-renamed
+    // session).
+    const config = testConfig("chat-stream-session-initial");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "before-rename" })
+    });
+    await call(handler, config, `/api/chat/${session.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: "Renamed in the lobby" })
+    });
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_session");
+    expect(buffer).toContain("Renamed in the lobby");
+  });
+
+  test("GET /api/chat/:id/stream pushes chat_session frame on rename", async () => {
+    // The auto-rename path (chat-task → autoRenameChatAfterTurn) fires
+    // after task completion and the mobile chat-detail header must
+    // pick up the new title without polling. Stand-in for the auto
+    // case by hitting /rename explicitly — both paths route through
+    // renameChat → publishChatSession.
+    const config = testConfig("chat-stream-session-rename");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "" })
+    });
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+
+    // Drain the initial chat_session frame (the one emitted on connect)
+    // so the assertion below targets the rename-driven frame.
+    let buffer = "";
+    if (reader) {
+      const initialDeadline = Date.now() + 500;
+      while (Date.now() < initialDeadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+      // Clear the buffer so we can detect the second emit independently.
+      buffer = "";
+
+      // Trigger the publish from another concurrent caller, then drain.
+      await call(handler, config, `/api/chat/${session.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: "Streamed rename" })
+      });
+
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("Streamed rename")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_session");
+    expect(buffer).toContain("Streamed rename");
+  });
+
   test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
     const config = testConfig("chat-blocks-stream-404");
     const handler = createHandler(config);

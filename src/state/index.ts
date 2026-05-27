@@ -104,6 +104,10 @@ export {
   hasAnyActiveSubscription
 } from "./sse-subscriptions";
 export {
+  subscribeChatSession,
+  publishChatSession
+} from "./chat-session-events";
+export {
   markRead,
   getLastReadByDevice,
   getReadState,

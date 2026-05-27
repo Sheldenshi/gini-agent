@@ -15,6 +15,7 @@ import {
   readTrace,
   removeDeviceForCredential,
   subscribeChatBlocks,
+  subscribeChatSession,
   unreadCountForDevice,
   upsertDevice
 } from "./state";
@@ -1483,6 +1484,7 @@ function chatBlockStream(
   let closed = false;
   let keepalive: Timer | undefined;
   let unsubscribe: (() => void) | undefined;
+  let unsubscribeSession: (() => void) | undefined;
   let unregisterSubscription: (() => void) | undefined;
   const encoder = new TextEncoder();
   const seen = new Set<string>();
@@ -1496,7 +1498,8 @@ function chatBlockStream(
   // content-type semantics for clients that route both error and
   // success branches through the same EventSource handler.
   const state = readState(config.instance);
-  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+  const initialSession = state.chatSessions.find((s) => s.id === sessionId);
+  if (!initialSession) {
     return new Response(JSON.stringify({ error: `Chat session not found: ${sessionId}` }), {
       status: 404,
       headers: { "content-type": "application/json" }
@@ -1568,6 +1571,21 @@ function chatBlockStream(
         enqueueFrame(block);
       };
 
+      // Emit the current session record so subscribers always have a
+      // title without a separate REST round-trip. The mobile chat
+      // detail header reads from this; the web client can use it too
+      // (or ignore it). Live updates flow through subscribeChatSession
+      // below — currently fired on rename (explicit + auto-generated).
+      // Frames omit an `id:` line; chat_session events are not
+      // Last-Event-ID replayable. Reconnects always re-emit the
+      // current record from this initial send, so missing a transient
+      // rename frame is harmless.
+      controller.enqueue(
+        encoder.encode(
+          `event: chat_session\ndata: ${JSON.stringify(initialSession)}\n\n`
+        )
+      );
+
       // Initial backfill: send any blocks the client is missing.
       // listChatBlocksAfter honors Last-Event-ID (or falls back to the
       // full list when the cursor is unknown / absent).
@@ -1579,6 +1597,18 @@ function chatBlockStream(
       // skip the dedup gate by design — see comment above.
       unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
         enqueueLive(block);
+      });
+
+      // Subscribe to session-record updates (title renames). Publishers
+      // fire after mutateState resolves so the on-disk state matches the
+      // event payload.
+      unsubscribeSession = subscribeChatSession(config.instance, sessionId, (session) => {
+        if (closed) return;
+        controller.enqueue(
+          encoder.encode(
+            `event: chat_session\ndata: ${JSON.stringify(session)}\n\n`
+          )
+        );
       });
 
       // Idle keepalive (mirrors eventStream above). Proxies often cap
@@ -1593,6 +1623,7 @@ function chatBlockStream(
       closed = true;
       if (keepalive) clearInterval(keepalive);
       if (unsubscribe) unsubscribe();
+      if (unsubscribeSession) unsubscribeSession();
       // Drop the active-watch entry. The cleanup helper is idempotent
       // so a duplicate call from an error path is a no-op.
       if (unregisterSubscription) unregisterSubscription();

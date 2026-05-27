@@ -19,12 +19,19 @@ import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
-  useChatBlocks,
-  useChatSession,
+  useChatStream,
   useSendMessage
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
 import type { ChatBlock } from "@/src/types";
+
+// Placeholder titles the runtime stamps on a freshly created session
+// before the auto-rename runs. Mirrors DEFAULT_CHAT_TITLES in
+// src/execution/chat.ts. When the session record carries one of these,
+// the header falls back to the first user_text excerpt instead — a
+// stable, conversation-derived label is more useful than "New chat" in
+// the gap between the user's first send and the auto-rename completing.
+const DEFAULT_TITLE_FALLBACKS = new Set<string>(["Untitled chat", "New chat"]);
 
 // Three sections: a header with back arrow + centered title, the
 // scrolling conversation, and the input bar (pill + circular send
@@ -33,8 +40,7 @@ import type { ChatBlock } from "@/src/types";
 // land exactly per the design.
 export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
-  const blocks = useChatBlocks(sessionId ?? null);
-  const session = useChatSession(sessionId ?? null);
+  const stream = useChatStream(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
 
   const [text, setText] = useState("");
@@ -43,7 +49,7 @@ export default function ChatDetailScreen() {
   // 401 → setup. Effect-driven so all later hooks still run on the
   // unauthorized render (Rules of Hooks).
   const unauthorized =
-    blocks.error instanceof ApiError && blocks.error.status === 401;
+    stream.error instanceof ApiError && stream.error.status === 401;
   useEffect(() => {
     if (unauthorized) router.replace("/setup");
   }, [unauthorized]);
@@ -60,7 +66,7 @@ export default function ChatDetailScreen() {
     void registerForPushAsync();
   }, []);
 
-  const list = useMemo<ChatBlock[]>(() => blocks.data ?? [], [blocks.data]);
+  const list = useMemo<ChatBlock[]>(() => stream.blocks ?? [], [stream.blocks]);
 
   // Mark the chat as read once we know which block id is latest.
   // Debounced by `lastReadBlockIdRef` — we only POST when the tail
@@ -123,13 +129,15 @@ export default function ChatDetailScreen() {
     return map;
   }, [list]);
 
-  // Title source of truth is the session record — the gateway seeds it
-  // from the first user message and updates it on rename, so the header
-  // stays in sync with the chat list. Fall back to the first user_text
-  // block while the session record is still loading, then to "Chat".
+  // Title source of truth is the session record — the gateway emits it
+  // over the same /stream SSE connection (initial frame on connect plus
+  // a fresh frame on every rename), so the header reflects the
+  // auto-generated title as soon as the runtime writes it. Fall back to
+  // the first user_text block excerpt during the brief window between
+  // the /blocks REST seed and the SSE open, then to "Chat".
   const headerTitle = useMemo(() => {
-    const sessionTitle = session.data?.title?.trim();
-    if (sessionTitle) {
+    const sessionTitle = stream.session?.title?.trim();
+    if (sessionTitle && !DEFAULT_TITLE_FALLBACKS.has(sessionTitle)) {
       return sessionTitle.length > 40
         ? `${sessionTitle.slice(0, 40)}…`
         : sessionTitle;
@@ -140,7 +148,7 @@ export default function ChatDetailScreen() {
       if (trimmed) return trimmed.length > 40 ? `${trimmed.slice(0, 40)}…` : trimmed;
     }
     return "Chat";
-  }, [list, session.data?.title]);
+  }, [list, stream.session?.title]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
 
@@ -211,7 +219,7 @@ export default function ChatDetailScreen() {
         keyboardVerticalOffset={Platform.OS === "ios" ? 80 : 0}
         style={styles.flex}
       >
-        {blocks.isPending && !blocks.data ? (
+        {stream.isPending && !stream.blocks ? (
           <View style={styles.center}>
             <ActivityIndicator color={theme.muted} />
           </View>

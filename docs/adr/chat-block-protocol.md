@@ -213,6 +213,20 @@ remote previews, screen readers) would need the same translation code.
   - SSE frames carry `id: <blockId>\nevent: chat_block\ndata: <json>\n\n`.
     Browsers' `EventSource` auto-attaches the last `id` as
     `Last-Event-ID` on reconnect.
+  - The same SSE connection also delivers a second event kind,
+    `chat_session`, carrying the current `ChatSessionRecord` payload.
+    The gateway emits it once on initial connect (so the client has
+    the canonical title without a separate REST round-trip) and again
+    whenever the session is renamed — both via `PATCH /api/chat/:id`
+    and via the auto-rename path in
+    `src/execution/chat.ts:autoRenameChatAfterTurn`. The pub/sub lives
+    in `src/state/chat-session-events.ts`; publishers fire **after**
+    `mutateState` resolves so subscribers only observe durable
+    records, matching the chat-block post-commit semantics. The
+    `chat_session` event has no `id:` line and is not part of the
+    `Last-Event-ID` resume cursor — every reconnect re-emits the
+    current record from the initial-send path, so a missed transient
+    rename frame is harmless.
 
 ## Alternatives Considered
 

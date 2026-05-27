@@ -10,6 +10,7 @@ import {
   isTerminalTaskStatus,
   listChatBlocks,
   mutateState,
+  publishChatSession,
   readState,
   renameChatSession
 } from "../state";
@@ -197,7 +198,14 @@ export async function deleteChat(config: RuntimeConfig, id: string) {
 
 export async function renameChat(config: RuntimeConfig, id: string, input: Record<string, unknown>) {
   const title = String(input.title ?? "");
-  return mutateState(config.instance, (state) => renameChatSession(state, id, title));
+  const updated = await mutateState(config.instance, (state) => renameChatSession(state, id, title));
+  // Fan the rename out over /api/chat/:id/stream so open SSE
+  // subscribers (mobile chat detail, web client) see the new title
+  // without a refetch. Publish after mutateState resolves so the
+  // disk-write commit precedes the event — matches chat-blocks
+  // post-commit semantics.
+  publishChatSession(config.instance, updated);
+  return updated;
 }
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
@@ -356,13 +364,21 @@ export async function autoRenameChatAfterTurn(config: RuntimeConfig, sessionId: 
   const title = await generateChatTitleFromBlocks(config, blocks);
   if (!title) return;
 
-  await mutateState(config.instance, (state) => {
+  let renamed = false;
+  const updated = await mutateState(config.instance, (state) => {
     const live = state.chatSessions.find((item) => item.id === sessionId);
     if (!live) return undefined;
     if (!isDefaultChatTitle(live.title)) return live;
     if (isScheduledJobDeliverySession(state, sessionId)) return live;
+    renamed = true;
     return renameChatSession(state, sessionId, title);
   });
+  // Publish only when the title actually changed — re-emitting on
+  // every turn would push redundant events to subscribers and force
+  // them to re-render the header for no reason. The branches above
+  // that return `live` (already-titled session, scheduled-job
+  // delivery) intentionally skip the publish.
+  if (renamed && updated) publishChatSession(config.instance, updated);
 }
 
 function isDefaultChatTitle(title: string): boolean {
