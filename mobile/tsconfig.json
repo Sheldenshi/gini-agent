@@ -5,7 +5,8 @@
     "paths": {
       "@/*": ["./*"],
       "@runtime/*": ["../src/*"]
-    }
+    },
+    "types": ["bun"]
   },
   "include": [
     "**/*.ts",
