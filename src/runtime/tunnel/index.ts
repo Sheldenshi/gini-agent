@@ -8,9 +8,6 @@ export {
   redact,
   setRedactionSecret,
   setRedactionPublicUrl,
-  markRotationInFlight,
-  decrementRotationInFlight,
-  getRedactionTargets,
   __resetRedactionForTests
 } from "./redact";
 export { readTunnelConfig, ensureTunnelConfig, patchTunnelConfig } from "./config-store";

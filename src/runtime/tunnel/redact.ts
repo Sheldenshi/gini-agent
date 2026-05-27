@@ -18,12 +18,6 @@ interface PriorSecret {
   inFlight: number;
 }
 
-export interface RedactionTargets {
-  currentSecret: string | null;
-  publicUrl: string | null;
-  priorSecrets: ReadonlyArray<string>;
-}
-
 // Module-level singleton state. Initialized via setRedactionSecret() on
 // startup and on rotation; queried on every redact() call. Process-bound;
 // distinct runtime processes maintain their own ring (each owns its own
@@ -50,39 +44,11 @@ export function setRedactionPublicUrl(url: string | null): void {
   state.publicUrl = url;
 }
 
-export function markRotationInFlight(count: number): void {
-  // Capture in-flight requests at rotation commit. The newest prior entry
-  // (the just-rotated-out secret) takes the count.
-  const top = state.prior[state.prior.length - 1];
-  if (top) top.inFlight = count;
-}
-
-export function decrementRotationInFlight(): void {
-  // Decrement the oldest entry whose inFlight is still > 0. Tests pin a
-  // single rotation in flight at a time; production traffic is single-
-  // operator so the queue is shallow.
-  for (const entry of state.prior) {
-    if (entry.inFlight > 0) {
-      entry.inFlight -= 1;
-      break;
-    }
-  }
-}
-
-export function pruneRotationRing(now: number = Date.now()): void {
+function pruneRotationRing(now: number = Date.now()): void {
   state.prior = state.prior.filter((entry) => {
     if (entry.inFlight > 0) return true;
     return now - entry.rotatedAt < ROTATION_TIME_FLOOR_MS;
   });
-}
-
-export function getRedactionTargets(): RedactionTargets {
-  pruneRotationRing();
-  return {
-    currentSecret: state.current,
-    publicUrl: state.publicUrl,
-    priorSecrets: state.prior.map((entry) => entry.value)
-  };
 }
 
 /** Replace every occurrence of the redaction targets in `input` with the

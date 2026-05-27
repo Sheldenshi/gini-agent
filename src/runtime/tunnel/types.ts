@@ -1,7 +1,13 @@
 // Tunnel state contract — types shared between manager, runtime endpoints,
-// and BFF callers. The privileged shape carries the secret + publicUrl; the
-// redacted shape nulls those fields and is what tunneled browser callers see.
-// See PLAN.md "Public surface" + "Trust radius".
+// and BFF callers. The privileged shape (`TunnelSnapshot`) carries the
+// secret + publicUrl. The redacted shape (`RedactedTunnelSnapshot`)
+// nulls those fields and is exposed at `/api/tunnel/redacted` for any
+// caller that wants the safe shape explicitly. Per the broadened policy
+// in `docs/adr/tunnel-and-mobile-access.md`, tunneled browser callers
+// now receive the privileged shape directly so the tunneled settings
+// card can render the QR + URL with the same click-to-reveal pattern
+// as the loopback view; the redacted shape stayed in the API for
+// completeness but is no longer the default for tunneled requests.
 
 export interface AppleNotesState {
   enabled: boolean;
