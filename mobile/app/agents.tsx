@@ -18,6 +18,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
 import { chatListTime } from "@/src/format";
+import { nav } from "@/src/nav";
 import {
   useAgents,
   useChats,
@@ -425,7 +426,7 @@ function ChatRow({ session }: { session: ChatSession }) {
 
   return (
     <TouchableOpacity
-      onPress={() => router.push(`/chat/${session.id}`)}
+      onPress={() => nav(() => router.push(`/chat/${session.id}`))}
       activeOpacity={0.7}
       style={styles.chatRow}
     >

@@ -16,6 +16,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
+import { nav } from "@/src/nav";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
@@ -204,7 +205,7 @@ export default function ChatDetailScreen() {
           visually even though the right edge has no icon. */}
       <View style={styles.header}>
         <TouchableOpacity
-          onPress={() => router.back()}
+          onPress={() => nav(() => router.back())}
           hitSlop={8}
           style={styles.headerIconButton}
           accessibilityRole="button"
