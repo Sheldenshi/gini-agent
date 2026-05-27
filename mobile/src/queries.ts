@@ -7,7 +7,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 import EventSource from "react-native-sse";
-import { api, ApiError, resolveStreamEndpoint } from "./api";
+import { api, ApiError, resolveStreamEndpoint, type UploadRef } from "./api";
 import type {
   AgentRecord,
   AgentsResponse,
@@ -519,14 +519,21 @@ export function useCreateChat(agentId: string | null) {
   });
 }
 
+export interface SendMessageInput {
+  content: string;
+  images?: UploadRef[];
+}
+
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
-  return useMutation<{ taskId: string }, Error, string>({
-    mutationFn: (content: string) => {
+  return useMutation<{ taskId: string }, Error, SendMessageInput>({
+    mutationFn: ({ content, images }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
+      const body: Record<string, unknown> = { content };
+      if (images && images.length > 0) body.images = images;
       return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content })
+        body: JSON.stringify(body)
       });
     },
     onSuccess: () => {
