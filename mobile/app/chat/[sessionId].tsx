@@ -129,18 +129,22 @@ export default function ChatDetailScreen() {
     return map;
   }, [list]);
 
-  // Title source of truth is the session record — the gateway emits it
-  // over the same /stream SSE connection (initial frame on connect plus
-  // a fresh frame on every rename), so the header reflects the
-  // auto-generated title as soon as the runtime writes it. Fall back to
-  // the first user_text block excerpt during the brief window between
-  // the /blocks REST seed and the SSE open, then to "Chat".
+  // Title source of truth is the session record — the gateway seeds it
+  // in the initial REST fetch (in parallel with /blocks) and pushes
+  // renames over the same /stream SSE connection thereafter. Until the
+  // session record has actually loaded, the header stays on "Chat":
+  // falling back to the first user_text excerpt during the loading
+  // window would flash a wrong-looking title and then swap to the real
+  // one a frame later, which is the bug this hook was rewritten to
+  // avoid. Once the session is loaded and its title is a default
+  // ("New chat" / "Untitled chat"), THEN the first user_text excerpt
+  // takes over until the runtime's auto-rename emits the real title.
   const headerTitle = useMemo(() => {
-    const sessionTitle = stream.session?.title?.trim();
-    if (sessionTitle && !DEFAULT_TITLE_FALLBACKS.has(sessionTitle)) {
-      return sessionTitle.length > 40
-        ? `${sessionTitle.slice(0, 40)}…`
-        : sessionTitle;
+    const session = stream.session;
+    if (!session) return "Chat";
+    const title = session.title?.trim();
+    if (title && !DEFAULT_TITLE_FALLBACKS.has(title)) {
+      return title.length > 40 ? `${title.slice(0, 40)}…` : title;
     }
     const firstUserText = list.find((b) => b.kind === "user_text");
     if (firstUserText && firstUserText.kind === "user_text") {
@@ -148,7 +152,7 @@ export default function ChatDetailScreen() {
       if (trimmed) return trimmed.length > 40 ? `${trimmed.slice(0, 40)}…` : trimmed;
     }
     return "Chat";
-  }, [list, stream.session?.title]);
+  }, [list, stream.session]);
 
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
 

@@ -388,19 +388,27 @@ export function useChatStream(sessionId: string | null): {
       openStream();
     };
 
-    // Seed the list before opening the stream so the chat renders with
-    // its persisted history immediately. The seed resolve stashes the
-    // last block's id into lastSeenIdRef; openStream() reads that ref
-    // and injects it as `Last-Event-ID` on the first SSE connect, so
-    // the gateway's listChatBlocksAfter only replays what's actually
-    // new (typically nothing, since the seed just covered everything).
-    // If the seed never lands (a `merged` of length 0 — fresh chat
-    // with no blocks), the header is omitted and the gateway falls
-    // back to full backfill; the id-keyed upsert collapses any
-    // duplicates.
+    // Seed both blocks and the session record before opening the stream
+    // so the chat renders its persisted history AND its canonical title
+    // in a single first paint. The two REST calls fire in parallel
+    // (Promise.all) because the chat detail screen needs both up front:
+    // without the session in the seed, the header would briefly show
+    // the first-user-text fallback before the SSE chat_session frame
+    // lands and overwrites it — a visible flash on chat-open.
+    //
+    // The seed resolve stashes the last block's id into lastSeenIdRef;
+    // openStream() reads that ref and injects it as `Last-Event-ID` on
+    // the first SSE connect, so the gateway's listChatBlocksAfter only
+    // replays what's actually new (typically nothing). If `merged` is
+    // empty (fresh chat with no blocks), the header is omitted and the
+    // gateway falls back to full backfill; the id-keyed upsert collapses
+    // any duplicates.
     (async () => {
       try {
-        const blocks = await api<ChatBlock[]>(`/chat/${sessionId}/blocks`);
+        const [blocks, session] = await Promise.all([
+          api<ChatBlock[]>(`/chat/${sessionId}/blocks`),
+          api<ChatSession>(`/chat/${sessionId}`)
+        ]);
         if (cancelled) return;
         // Merge by id rather than overwrite. If the AppState handler or
         // any other path opened a stream while the seed was in flight,
@@ -414,8 +422,12 @@ export function useChatStream(sessionId: string | null): {
           ...blocks,
           ...existing.filter((b) => !seededIds.has(b.id))
         ];
-        const existingSession = dataRef.current.session;
-        dataRef.current = { forSessionId: sessionId, blocks: merged, session: existingSession };
+        // Prefer a session record that already arrived over SSE (a
+        // mid-seed reconnect could plausibly land one, though with
+        // Promise.all the REST response usually wins) — the SSE frame
+        // is the more recent snapshot from the same source.
+        const liveSession = dataRef.current.session ?? session;
+        dataRef.current = { forSessionId: sessionId, blocks: merged, session: liveSession };
         // Seed the resume cursor so the very first SSE open skips
         // the redundant full replay listChatBlocksAfter(null) emits.
         // The /blocks REST response only carries the block's id (no
@@ -424,7 +436,7 @@ export function useChatStream(sessionId: string | null): {
         // updated_at when the suffix is absent. Subsequent SSE frames
         // will rewrite this with the wire `<id>:<ts>` form.
         lastSeenIdRef.current = merged[merged.length - 1]?.id ?? null;
-        setState({ forSessionId: sessionId, blocks: merged, session: existingSession });
+        setState({ forSessionId: sessionId, blocks: merged, session: liveSession });
         setError(null);
         seeded = true;
         maybeOpenStream();
