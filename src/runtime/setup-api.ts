@@ -45,7 +45,7 @@
 import { writeFileSync } from "node:fs";
 import { configPath } from "../paths";
 import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
-import { writeKeyToSecretsEnv } from "../state/secrets-env";
+import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
@@ -203,5 +203,74 @@ export async function setSetupProvider(
     ok: true,
     provider: providerHealth(config),
     plistRefreshNeeded: false
+  };
+}
+
+export interface RemoveSetupProviderResult {
+  ok: boolean;
+  provider: ReturnType<typeof providerHealth>;
+  // True when removal flipped the gateway off the named provider, so the
+  // active row in /api/status now reflects whatever we fell back to.
+  switched: boolean;
+  error?: string;
+}
+
+// Disconnect an env-keyed provider: scrub its bearer from process.env +
+// secrets.env, and, when removing the currently-active provider, fall
+// back to codex if codex auth is available so the gateway stays usable.
+// Codex itself isn't removable through the UI because ~/.codex/auth.json
+// is owned by the `codex` CLI — the user manages it via codex --logout.
+// Local has no key to remove; the gate below mirrors that.
+export function removeSetupProvider(
+  config: RuntimeConfig,
+  providerName: string
+): RemoveSetupProviderResult {
+  if (providerName === "codex") {
+    return {
+      ok: false,
+      provider: providerHealth(config),
+      switched: false,
+      error: "Codex is managed by the codex CLI. Run `codex --logout` to sign out."
+    };
+  }
+  const envKeySpec = ENV_KEY_PROVIDERS[providerName];
+  if (!envKeySpec || providerName === "local") {
+    return {
+      ok: false,
+      provider: providerHealth(config),
+      switched: false,
+      error: `Cannot remove provider '${providerName}'.`
+    };
+  }
+
+  // Wipe the bearer from both stores so the running process and future
+  // shell launches stop seeing it. removeKeyFromSecretsEnv is a no-op if
+  // the file or the line is already absent — safe to call unconditionally.
+  removeKeyFromSecretsEnv(envKeySpec.envVar);
+  delete process.env[envKeySpec.envVar];
+
+  let switched = false;
+  if (config.provider?.name === providerName) {
+    // The instance was using this provider — falling back to codex when
+    // its OAuth is on disk keeps the gateway in a working state. Otherwise
+    // we drop to echo, which is harmless (deterministic stub) and at least
+    // doesn't crash on the next call.
+    if (hasUsableCodexCredentials()) {
+      const codexCatalog = providerCatalog().find((p) => p.id === "codex");
+      config.provider = normalizeProvider({
+        name: "codex",
+        model: codexCatalog?.models[0] ?? "gpt-5.5"
+      } as ProviderConfig);
+    } else {
+      config.provider = normalizeProvider({ name: "echo", model: "gini-echo-v0" });
+    }
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    switched = true;
+  }
+
+  return {
+    ok: true,
+    provider: providerHealth(config),
+    switched
   };
 }

@@ -62,7 +62,7 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
+import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
@@ -838,6 +838,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/setup\/provider$/, async (request) => {
       const payload = await body(request);
       const result = await setSetupProvider(config, payload);
+      return json(result, result.ok ? 200 : 400);
+    }],
+    ["POST", /^\/api\/setup\/provider\/remove$/, async (request) => {
+      const payload = await body(request);
+      const providerName = typeof payload.provider === "string" ? payload.provider : "";
+      const result = removeSetupProvider(config, providerName);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
