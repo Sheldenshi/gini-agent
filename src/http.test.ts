@@ -861,7 +861,10 @@ describe("runtime api", () => {
       { method: "POST", body: JSON.stringify({ secrets: {} }) },
       config.token
     );
-    expect(response.status).toBe(404);
+    // Authorizations exist but don't accept a /connect body — preserve
+    // the legacy "this approval does not take connect submission" 400
+    // for old clients hitting the alias with an authorization id.
+    expect(response.status).toBe(400);
   });
 
   test("POST /api/approvals/<id>/approve refuses browser.fill_secret action", async () => {

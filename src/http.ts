@@ -88,7 +88,16 @@ async function forwardToSetupComplete(
 ): Promise<Response> {
   const state = readState(config.instance);
   const setup = state.setupRequests.find((s) => s.id === id);
-  if (!setup) return json({ error: "Approval not found" }, 404);
+  if (!setup) {
+    // Pre-split callers might hit the alias with an authorization id by
+    // mistake. Preserve the legacy "this action does not take connect
+    // submission" 400 instead of a misleading 404 — only an id that
+    // exists nowhere should 404.
+    if (state.authorizations.some((a) => a.id === id)) {
+      return json({ error: "This approval does not take a connect submission. Use /approve or /deny." }, 400);
+    }
+    return json({ error: "Approval not found" }, 404);
+  }
   if (setup.status !== "pending") return json({ error: `Setup request is already ${setup.status}` }, 410);
   const payload = await body(request);
   const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
@@ -121,6 +130,7 @@ async function forwardToSetupComplete(
         message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
       });
     }
+    await emitConnectorRequestAudit(config, setup, connector.id);
     await resolveSetupRequest(config, id, "complete", {
       actor: "user",
       toolResult: `Connected to ${providerLabel}. Proceed with the original request.`
@@ -128,6 +138,43 @@ async function forwardToSetupComplete(
     return json({ ok: true, connector: probed });
   }
   return json({ error: `Setup request ${id} action not supported: ${setup.action}` }, 400);
+}
+
+// Per-action audit row for connector.request completion. createConnector
+// and checkConnector emit their own connector.create / connector.health
+// rows, but neither carries the originating setup id — the audit trail
+// would otherwise lose the link between the agent's request and the
+// user's resolution. Low risk: the user is the actor and they've already
+// inspected the provider before submitting credentials.
+async function emitConnectorRequestAudit(
+  config: RuntimeConfig,
+  setup: { id: string; target: string; taskId?: string; agentId?: string; payload: Record<string, unknown> },
+  connectorId: string
+): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "connector.request",
+        target: setup.target,
+        risk: "low",
+        taskId: setup.taskId,
+        runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
+        approvalId: setup.id,
+        evidence: {
+          provider: String(setup.payload.provider ?? ""),
+          providerLabel: typeof setup.payload.providerLabel === "string" ? setup.payload.providerLabel : null,
+          connectorId
+        }
+      },
+      setup.taskId
+        ? { taskId: setup.taskId }
+        : setup.agentId
+          ? { agentId: setup.agentId }
+          : { system: true }
+    );
+  });
 }
 
 async function forwardToSetupOpenBrowser(
@@ -360,6 +407,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
             message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
           });
         }
+        await emitConnectorRequestAudit(config, setup, connector.id);
         await resolveSetupRequest(config, setupId, "complete", {
           actor: "user",
           toolResult: `Connected to ${providerLabel}. Proceed with the original request.`
@@ -404,7 +452,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         const blocked = safetyCheck(targetUrl);
         if (blocked) return json({ error: blocked }, 400);
       }
-      const status = await connectBrowser(config, { mode: "managed" });
+      // skipAudit so the capability does not write a reasonless row;
+      // we write a setup-aware row below that carries the originating
+      // setup id and reason.
+      const status = await connectBrowser(config, { mode: "managed" }, { skipAudit: true });
       if (!status.connected) {
         return json({ ok: false, error: "Browser failed to launch." }, 500);
       }
@@ -428,6 +479,34 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           openedUrl: openedUrl ?? null,
           navigateError: navigateError ?? null
         };
+        const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
+          ? setup.payload.reason
+          : setup.target;
+        addAudit(
+          state,
+          {
+            actor: "user",
+            action: "browser.connect",
+            target: reasonTarget,
+            risk: "medium",
+            taskId: setup.taskId,
+            runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
+            approvalId: setup.id,
+            evidence: {
+              stage: "open-browser",
+              mode: status.record?.mode,
+              headless: status.record?.headless ?? false,
+              pid: status.record?.pid ?? null,
+              openedUrl: openedUrl ?? null,
+              navigateError: navigateError ?? null
+            }
+          },
+          setup.taskId
+            ? { taskId: setup.taskId }
+            : setup.agentId
+              ? { agentId: setup.agentId }
+              : { system: true }
+        );
         if (item.taskId) {
           appendTrace(config.instance, item.taskId, {
             type: "approval",
@@ -464,12 +543,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       const setup = state.setupRequests.find((s) => s.id === id);
       if (setup) {
+        // Pre-split clients that approved a browser.connect via the
+        // generic /approve endpoint must keep working through the alias
+        // window. Reuse the new completion helper + resolver so the
+        // behavior is identical to /setup-requests/:id/complete.
+        if (setup.action === "browser.connect") {
+          const { ok, result } = await completeBrowserConnectSetup(config, setup);
+          await resolveSetupRequest(config, id, "complete", { actor: "user", toolResult: result });
+          return json({ ok });
+        }
+        // browser.fill_secret and connector.request always required a
+        // request body (credentials / scopes) — the legacy /approve
+        // never carried it, so 400 with a migration hint is the only
+        // honest response.
         if (setup.action === "browser.fill_secret") {
           return json({ error: "browser.fill_secret must be resolved via /complete with values." }, 400);
         }
-        // browser.connect and connector.request legacy /approve never had
-        // body content — the new path is /complete. Refuse so callers
-        // migrate.
         return json({ error: `Use POST /api/setup-requests/${id}/complete for ${setup.action}.` }, 400);
       }
       return json({ error: "Approval not found" }, 404);

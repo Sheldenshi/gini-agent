@@ -9,7 +9,8 @@ import type {
   ChatSessionRecord,
   ChatMessageRecord,
   Task,
-  Approval,
+  Authorization,
+  SetupRequest,
   AuditEvent,
   SkillRecord,
   JobRecord,
@@ -39,7 +40,8 @@ export interface AgentRow {
 export interface RuntimeStateSnapshot {
   instance: string;
   tasks: Task[];
-  approvals: Approval[];
+  authorizations: Authorization[];
+  setupRequests: SetupRequest[];
   audit: AuditEvent[];
   skills: SkillRecord[];
   jobs: JobRecord[];

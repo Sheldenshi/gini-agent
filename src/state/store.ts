@@ -242,14 +242,12 @@ function migrateApprovalsToAuthorizationsAndSetupRequests(state: RuntimeState): 
     delete state.approvals;
     return;
   }
-  const hasNew = (Array.isArray(state.authorizations) && state.authorizations.length > 0)
-    || (Array.isArray(state.setupRequests) && state.setupRequests.length > 0);
-  if (hasNew) {
-    // Both shapes present — assume a partial write or concurrent path
-    // already migrated. Drop the legacy field and trust the new arrays.
-    delete state.approvals;
-    return;
-  }
+  // Always partition. A mixed-shape file (both `approvals` and one of the
+  // new arrays populated) can happen if a process crashed mid-write or if
+  // a downgrade-then-upgrade left rows in both shapes; silently dropping
+  // the legacy rows would lose pending work. Merge by id below — any
+  // legacy row whose id already exists in the corresponding new array is
+  // skipped (the new shape wins), the rest are appended.
   const authorizations: Authorization[] = [];
   const setupRequests: SetupRequest[] = [];
   for (const row of legacy) {
@@ -268,8 +266,20 @@ function migrateApprovalsToAuthorizationsAndSetupRequests(state: RuntimeState): 
       authorizations.push(row);
     }
   }
-  state.authorizations = authorizations;
-  state.setupRequests = setupRequests;
+  // Merge: keep any rows already in the new arrays, append legacy rows
+  // whose id isn't represented yet. The new shape wins on conflict — a
+  // partial write that produced both shapes is treated as "the new array
+  // is authoritative for the rows it carries."
+  const existingAuthIds = new Set((state.authorizations ?? []).map((a) => a.id));
+  const existingSetupIds = new Set((state.setupRequests ?? []).map((s) => s.id));
+  state.authorizations = [
+    ...(state.authorizations ?? []),
+    ...authorizations.filter((a) => !existingAuthIds.has(a.id))
+  ];
+  state.setupRequests = [
+    ...(state.setupRequests ?? []),
+    ...setupRequests.filter((s) => !existingSetupIds.has(s.id))
+  ];
   delete state.approvals;
 }
 

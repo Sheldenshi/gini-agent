@@ -12,7 +12,12 @@ import { useInvalidate } from "@/lib/queries";
 // too coarse — a connector.create and a skill.enable both arrive as "runtime"
 // events.
 const ACTION_TO_KEYS: Record<string, string[]> = {
-  approval: ["approvals"],
+  // Keep `approval` mapped to all three caches during the alias window so
+  // legacy events from old clients/servers still wake up the new query
+  // keys. Once the alias is removed this can drop "approvals".
+  approval: ["approvals", "authorizations", "setup-requests", "tasks", "task", "chat"],
+  authorization: ["authorizations", "approvals", "tasks", "task", "chat"],
+  setup: ["setup-requests", "approvals", "tasks", "task", "chat"],
   task: ["tasks", "task", "chat"],
   connector: ["connectors"],
   skill: ["skills"],
@@ -31,7 +36,7 @@ const ACTION_TO_KEYS: Record<string, string[]> = {
 // Fallback when the event has no parseable action — uses the SSE kind only.
 const KIND_TO_KEYS: Record<string, string[]> = {
   task: ["tasks", "task", "chat"],
-  approval: ["approvals"],
+  approval: ["approvals", "authorizations", "setup-requests"],
   job: ["jobs", "jobRuns", "improvements"],
   memory: ["memory"],
   skill: ["skills"],
