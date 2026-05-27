@@ -735,7 +735,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           <>
             <Button
               size="sm"
-              disabled={pairingSubmit.isPending || !isPending}
+              disabled={pairingSubmit.isPending || !isPending || !approval}
               onClick={() => {
                 if (pairingSubmittingRef.current) return;
                 pairingSubmittingRef.current = true;
@@ -748,7 +748,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="outline"
-              disabled={pairingSubmit.isPending || !isPending}
+              disabled={pairingSubmit.isPending || !isPending || !approval}
               onClick={() => {
                 if (pairingSubmittingRef.current) return;
                 pairingSubmittingRef.current = true;
@@ -764,7 +764,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="destructive"
-              disabled={removeSubmit.isPending || !isPending}
+              disabled={removeSubmit.isPending || !isPending || !approval}
               onClick={() => {
                 if (removeSubmittingRef.current) return;
                 removeSubmittingRef.current = true;
