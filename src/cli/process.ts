@@ -412,11 +412,21 @@ export async function waitForWebHealthz(webUrl: string, childPid: number | undef
   throw new Error(`Next.js did not become healthy within 30s on ${webUrl}.`);
 }
 
+// Walk up to 1000 ports forward from `preferred` looking for a free
+// one. The previous range of 100 turned out to be too tight in CI:
+// multiple parallel `gini run` tests can each roll a random base in
+// the 7400-8399 window (src/cli/args.ts GINI_PORT default), and with
+// runners that also have other services holding ports, the 100-wide
+// search regularly saturated. 1000 ports gives 10x the room without
+// noticeably increasing local-dev startup time (each canListen probe
+// returns sub-millisecond when the port is free).
+const PORT_SEARCH_WINDOW = 1000;
+
 export async function availablePort(preferred: number): Promise<number> {
-  for (let port = preferred; port < preferred + 100; port += 1) {
+  for (let port = preferred; port < preferred + PORT_SEARCH_WINDOW; port += 1) {
     if (await canListen(port)) return port;
   }
-  throw new Error(`No available port found from ${preferred} to ${preferred + 99}.`);
+  throw new Error(`No available port found from ${preferred} to ${preferred + PORT_SEARCH_WINDOW - 1}.`);
 }
 
 function canListen(port: number): Promise<boolean> {
