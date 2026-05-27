@@ -256,13 +256,13 @@ export function ProviderCard({
                       variant="outline"
                       size="icon"
                       aria-label={`Remove ${displayProviderName(row)}`}
-                      // Disable when this is the only connected provider —
-                      // removing it would leave the gateway with nothing.
-                      // Codex is in `rows` when its OAuth is on disk, so a
-                      // user with Codex + DeepSeek still gets to delete
-                      // DeepSeek (rows.length === 2 there).
-                      disabled={rows.length <= 1}
-                      title={rows.length <= 1 ? "Connect another provider before removing this one." : undefined}
+                      // Block removal of the currently-active provider —
+                      // the user should switch first via the radio + Save
+                      // Bar, then delete. Avoids surprise fallbacks
+                      // mid-conversation and keeps the rule one sentence
+                      // long.
+                      disabled={isActive}
+                      title={isActive ? "Switch to another provider before removing this one." : undefined}
                       onClick={() => setRemovingRow(row)}
                     >
                       <Trash2Icon className="size-4 text-[#9A9AA0]" />
