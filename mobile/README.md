@@ -127,8 +127,10 @@ foregrounding the app. The user can act without unlocking the device.
 
 The action handler runs only if the app is at least suspended; if the
 user has fully killed the app from the app switcher, iOS records the
-action but our JS never runs. There's no permanent state loss — the
-agent re-emits the approval request and the user sees a fresh push.
+action but our JS never runs. The user must open the app and approve
+from there. The approval remains pending in the runtime until acted
+on — the runtime does not have a retry loop that re-emits approval
+requests.
 
 ## Known limitations (v1)
 

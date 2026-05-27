@@ -108,10 +108,10 @@ the silent wake to update its badge.
   — open the app to retry") so a network blip doesn't silently lose
   the action.
 - iOS only invokes the response listener if the app is at least
-  suspended. If the user has killed the app from the app switcher, the
-  action is recorded but our JS never runs. The runtime re-emits
-  approval requests if the operator never resolves them, so this case
-  recovers on the next push without permanent state loss.
+  suspended. If the user has killed the app from the app switcher,
+  iOS doesn't run JS — the user must open the app and approve from
+  there. The approval remains pending in the runtime until acted on
+  (the runtime has no retry loop that re-emits approval requests).
 
 ## Action endpoints
 

@@ -28,9 +28,10 @@
 // (suspended). If the user has fully killed the app from the app
 // switcher, the action button still posts the response, but our
 // listener never runs because there's no JS to run. Apple does not
-// expose a way around this for non-foregrounding actions. Users in
-// that state will still see the next approval push when the agent
-// re-emits — there's no permanent state loss, only a one-off retry.
+// expose a way around this for non-foregrounding actions. The user
+// must open the app and approve from there. The approval remains
+// pending in the runtime until acted on — the runtime does not have
+// a retry loop that re-emits approval requests.
 //
 // Idempotency: the gateway's POST handler is an upsert. Calling
 // register multiple times (e.g. across screen mounts) is safe — the
