@@ -1458,7 +1458,16 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         const parsed = new URL(url);
         if (isIP(parsed.hostname) === 0) {
           const { address } = await lookup(parsed.hostname);
-          const resolvedBlocked = safetyCheck(`${parsed.protocol}//${address}/`);
+          // IPv6 addresses MUST be wrapped in brackets to form a
+          // valid URL authority. Without brackets,
+          // "https://2606:4700:4700::1111/" parses with the first
+          // ":4700" as a port, corrupting the host parse and
+          // causing safetyCheck to throw on the malformed URL —
+          // which my catch then swallowed, silently bypassing the
+          // resolved-host check for every legitimate IPv6 DNS
+          // target. Wrap if the resolved address parses as IPv6.
+          const authority = isIP(address) === 6 ? `[${address}]` : address;
+          const resolvedBlocked = safetyCheck(`${parsed.protocol}//${authority}/`);
           if (resolvedBlocked) {
             return fail(`${resolvedBlocked} (resolved from ${parsed.hostname})`);
           }
