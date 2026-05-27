@@ -189,19 +189,44 @@ class TunnelManager {
             this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
             appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
           }
+          // Watch for post-banner cloudflared crashes. The proc.on("exit")
+          // inside launchCloudflared only rejects the publicUrl promise —
+          // which is already resolved at this point, so the reject is a
+          // no-op. Install our own listener so a mid-life cloudflared exit
+          // transitions the snapshot to `lastError` (and clears publicUrl)
+          // per PLAN.md "Operational invariants" line 624: the gateway does
+          // not respawn, but the snapshot must reflect the dead tunnel so
+          // the operator can re-enable.
+          const launchGeneration = this.generation;
+          launch.process.once("exit", (code) => {
+            // Only act if this launch is still the live one — a disable or
+            // recycle since the spawn already nulled this.cloudflared and
+            // updated the snapshot; we mustn't override a clean disable.
+            if (this.cloudflared !== launch) return;
+            if (launchGeneration !== this.generation) return;
+            this.cloudflared = null;
+            try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+            setRedactionPublicUrl(null);
+            this.snapshot = {
+              ...this.snapshot,
+              publicUrl: null,
+              lastError: redact(`cloudflared exited (code ${code ?? "?"})`)
+            };
+            appendLog(this.config.instance, "tunnel.cloudflared.exit", { code: code ?? null });
+          });
           appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
           // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
           // refreshNotes here would put a 15s osascript timeout ahead of a
           // follow-up disable() in the apply chain, defeating PLAN.md's
           // 5000ms exposure cap on disable. The bare `runRefreshNotes()`
           // call updates `this.snapshot` and `this.notesAvailable` outside
-          // the queue — that's acceptable because the only field touched
-          // (`appleNotes.lastError` / `appleNotes.notesAvailable`) doesn't
-          // gate any tunnel-transition decision, and a concurrent disable
-          // that flips the snapshot's other fields won't be clobbered (the
-          // Notes path only writes the `appleNotes` sub-object).
+          // the queue. Capture the current generation at scheduling time so
+          // a later disable / rotateSecret that bumps the generation makes
+          // the background refresh bail before writing a stale URL/secret
+          // to iCloud Notes.
           if (this.snapshot.appleNotes.enabled) {
-            void this.runRefreshNotes().catch(() => { /* surfaced in appleNotes.lastError */ });
+            const scheduledGeneration = this.generation;
+            void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
           }
         } catch (err) {
           // Banner-parse failure or process exit — the subprocess may still be
@@ -291,6 +316,10 @@ class TunnelManager {
    *  matches the live secret — 404 on the next hit. */
   async rotateSecret(): Promise<TunnelTransitionResult> {
     return this.enqueue(async () => {
+      // Bump the generation so any in-flight detached Notes refresh from
+      // a prior enable() bails before writing the now-stale URL/secret to
+      // iCloud Notes.
+      this.generation += 1;
       try {
         const persisted = patchTunnelConfig(this.config.instance, {}); // ensure block exists
         const next = patchTunnelConfig(this.config.instance, { secret: cryptoSecret() });
@@ -366,8 +395,18 @@ class TunnelManager {
   /** Notes refresh worker. Pure body — DOES NOT enqueue. Public callers go
    *  through `refreshNotes()` which adds the enqueue wrapper; internal callers
    *  (already inside an enqueue task) invoke this directly to avoid the
-   *  promise-chain self-deadlock. */
-  private async runRefreshNotes(): Promise<TunnelTransitionResult> {
+   *  promise-chain self-deadlock.
+   *
+   *  `scheduledGeneration`, when supplied by the detached fire-and-forget
+   *  caller from enable(), is the generation observed at scheduling time.
+   *  A rotateSecret() / disable() bumping the generation while we're
+   *  awaiting probeNotesAvailable / writeNote bails the refresh before it
+   *  can resurrect a stale URL/secret in iCloud Notes. */
+  private async runRefreshNotes(scheduledGeneration?: number): Promise<TunnelTransitionResult> {
+    if (scheduledGeneration !== undefined && scheduledGeneration !== this.generation) {
+      return { ok: false, error: "superseded" };
+    }
+    if (this.shuttingDown) return { ok: false, error: "shutdown" };
     const url = this.snapshot.publicUrl;
     const secret = this.snapshot.secret;
     if (!url || !secret) {
@@ -378,6 +417,10 @@ class TunnelManager {
     }
     // Re-probe availability before writing — handles TCC denial recovery.
     const probe = await probeNotesAvailable();
+    if (scheduledGeneration !== undefined && scheduledGeneration !== this.generation) {
+      return { ok: false, error: "superseded" };
+    }
+    if (this.shuttingDown) return { ok: false, error: "shutdown" };
     this.notesAvailable = probe.available;
     if (!probe.available) {
       const msg = redact(probe.error ?? "Notes unavailable");
@@ -388,6 +431,12 @@ class TunnelManager {
       return { ok: false, error: msg };
     }
     try {
+      // One more guard right before the side effect — if the operator hit
+      // disable / rotate between the probe and now, drop the write.
+      if (scheduledGeneration !== undefined && scheduledGeneration !== this.generation) {
+        return { ok: false, error: "superseded" };
+      }
+      if (this.shuttingDown) return { ok: false, error: "shutdown" };
       await writeNote({
         folder: NOTES_FOLDER,
         noteName: this.notesNoteName(),
