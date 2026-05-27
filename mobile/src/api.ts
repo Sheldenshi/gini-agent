@@ -40,6 +40,12 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${creds.token}`,
+    // Attach the cached APNs device token automatically when present.
+    // Routes that key per-device (e.g. /chat/:id/read, /badge) need
+    // it; routes that don't simply ignore the header. Resolved
+    // lazily via require() so api.ts doesn't create an import cycle
+    // with push.ts (which imports api).
+    ...resolveDeviceTokenHeader(),
     ...(init.headers ?? {})
   };
 
@@ -98,6 +104,29 @@ export function resolveStreamEndpoint(path: string): {
   }
   return {
     url: `${origin}/api${path}`,
-    headers: { authorization: `Bearer ${creds.token}` }
+    headers: {
+      authorization: `Bearer ${creds.token}`,
+      // SSE endpoint resolver also injects X-Device-Token so the
+      // gateway's per-device watch registry can credit this device's
+      // open stream and suppress redundant silent pushes to it.
+      ...resolveDeviceTokenHeader()
+    }
   };
+}
+
+// Pull the cached APNs token from push.ts on every call. We avoid a
+// static import because push.ts depends on this module (transitively
+// through ApiError), and bundlers handle the cycle inconsistently
+// when require()'d lazily. Returns an empty object when no token is
+// cached so the header simply isn't sent.
+function resolveDeviceTokenHeader(): Record<string, string> {
+  try {
+    const pushModule = require("./push") as { getCachedDeviceToken?: () => string | null };
+    const token = pushModule.getCachedDeviceToken?.();
+    if (token) return { "X-Device-Token": token };
+  } catch {
+    // Test envs without RN: push.ts side effects fail to load; that's
+    // fine — the header is best-effort.
+  }
+  return {};
 }

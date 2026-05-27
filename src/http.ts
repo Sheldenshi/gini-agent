@@ -6,6 +6,7 @@ import {
   addAudit,
   addSseSubscription,
   appendTrace,
+  getDevice,
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
@@ -14,7 +15,7 @@ import {
   readTrace,
   removeDeviceForCredential,
   subscribeChatBlocks,
-  unreadCountForCredential,
+  unreadCountForDevice,
   upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
@@ -166,15 +167,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {
       // Resolve the credential before opening the SSE stream so the
-      // active-subscription registry knows who is watching. Used by the
-      // APNs dispatcher to suppress completion silent pushes when the
-      // user is already on the session. The `authorized` gate above
-      // already accepted the bearer, so a null here means the bearer is
-      // valid for `authorizedBearer` but not for credential resolution —
-      // treat as unauthenticated rather than falling through anonymously.
+      // optional X-Device-Token header can be validated. The
+      // `authorized` gate above already accepted the bearer, so a
+      // null here means the bearer is valid for `authorizedBearer`
+      // but not for credential resolution — treat as unauthenticated
+      // rather than falling through anonymously.
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
-      return chatBlockStream(config, request, params[0], credential);
+      // X-Device-Token is optional — mobile clients send it after
+      // they've registered their APNs token via POST /push/devices, so
+      // the dispatcher can per-device suppress completion silent pushes
+      // while they're watching. Web/CLI clients don't send it (they
+      // have no APNs token); they simply aren't tracked in the
+      // suppression registry, which is correct — no push is ever sent
+      // to them anyway.
+      const deviceToken = deviceTokenFromRequest(config, request, credential);
+      return chatBlockStream(config, request, params[0], deviceToken);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -681,6 +689,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
+      // Read state is keyed per device, not per credential — two
+      // iPhones owned by the same human each track their own cursor.
+      // The X-Device-Token header is mandatory here; web/CLI clients
+      // don't post reads because there's no device-specific badge to
+      // sync for them.
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
       const sessionId = params[0];
       const state = readState(config.instance);
       if (!state.chatSessions.some((s) => s.id === sessionId)) {
@@ -694,7 +709,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       // Validate the block belongs to this session — the cursor would
       // be meaningless otherwise, and accepting cross-session ids would
-      // let a client smuggle a foreign block into another credential's
+      // let a client smuggle a foreign block into another device's
       // read state.
       const blockBelongs = listChatBlocks(config.instance, sessionId).some(
         (b) => b.id === lastReadBlockId
@@ -702,13 +717,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!blockBelongs) {
         return json({ error: "Block does not belong to this session" }, 400);
       }
-      const result = markRead(config.instance, sessionId, credential, lastReadBlockId);
+      const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
       return json({ ok: true, readState: result });
     }],
     ["GET", /^\/api\/badge$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
-      const unread = unreadCountForCredential(config.instance, credential);
+      // Badge totals are per-device (see /read endpoint comment).
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const unread = unreadCountForDevice(config.instance, dev.token);
       return json({ unread });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
@@ -1090,6 +1108,55 @@ function bearerFromRequest(request: Request): string | undefined {
   return bearer ?? undefined;
 }
 
+// Resolve and validate the optional X-Device-Token header. Returns the
+// token string when present AND it belongs to the caller's credential;
+// returns null when absent (web/CLI clients) or when the device row
+// doesn't exist; throws nothing.
+//
+// Validation is mandatory: a malicious caller with a valid bearer
+// could otherwise smuggle another credential's APNs token into the
+// SSE registry or read-state, causing cross-account read cursors or
+// silent-push suppression bypass. The devices table's `credential_id`
+// column is the source of truth — the token only counts as "yours" if
+// upsertDevice recorded it under your credential.
+function deviceTokenFromRequest(
+  config: RuntimeConfig,
+  request: Request,
+  credentialId: string
+): string | null {
+  const raw = request.headers.get("x-device-token");
+  if (!raw) return null;
+  const token = raw.trim();
+  if (!token) return null;
+  const row = getDevice(config.instance, token);
+  if (!row) return null;
+  if (row.credentialId !== credentialId) return null;
+  return token;
+}
+
+// Variant that throws (caller catches and 403s). Used by routes where
+// the device token is mandatory (read-state writes and the badge
+// endpoint — both are mobile-only, no good fallback when the header
+// is missing or mismatched). Returns:
+//   - { ok: true, token }    when valid
+//   - { ok: false, reason }  when missing, malformed, or mismatched
+function requireDeviceToken(
+  config: RuntimeConfig,
+  request: Request,
+  credentialId: string
+): { ok: true; token: string } | { ok: false; reason: string; status: number } {
+  const raw = request.headers.get("x-device-token");
+  if (!raw || !raw.trim()) {
+    return { ok: false, reason: "X-Device-Token header is required", status: 400 };
+  }
+  const token = raw.trim();
+  const row = getDevice(config.instance, token);
+  if (!row || row.credentialId !== credentialId) {
+    return { ok: false, reason: "Device token is not registered to this credential", status: 403 };
+  }
+  return { ok: true, token };
+}
+
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
 }
@@ -1250,7 +1317,12 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
 // insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
 // inserts and upserts both fire AFTER the SQLite commit so subscribers
 // observe durable rows.
-function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string, credentialId: string): Response {
+function chatBlockStream(
+  config: RuntimeConfig,
+  request: Request,
+  sessionId: string,
+  deviceToken: string | null
+): Response {
   let closed = false;
   let keepalive: Timer | undefined;
   let unsubscribe: (() => void) | undefined;
@@ -1278,12 +1350,20 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
     start(controller) {
       // Record this subscription on the active-watch registry so the
       // APNs dispatcher can skip terminal-phase silent pushes for the
-      // credential currently watching this session. Registered inside
+      // device currently watching this session. Registered inside
       // `start` (rather than at the route handler) so it always pairs
       // with `cancel` — if the response is created but never consumed
       // (rare, but possible on certain client disconnects), the
       // registry doesn't pick up a phantom entry.
-      unregisterSubscription = addSseSubscription(config.instance, credentialId, sessionId);
+      //
+      // Web/CLI clients (no X-Device-Token) skip registration: there's
+      // no APNs device behind them, so per-device suppression doesn't
+      // apply. Registering under a credential key would also incorrectly
+      // suppress pushes to a foregrounded mobile device sharing the
+      // same credential.
+      if (deviceToken) {
+        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId);
+      }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay
       //     doesn't double-send a row that we already sent (relevant

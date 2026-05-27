@@ -99,14 +99,14 @@ export {
 export type { PushDevice, UpsertDeviceInput } from "./devices";
 export {
   addSseSubscription,
-  isCredentialWatching,
+  isDeviceWatching,
   hasAnyActiveSubscription
 } from "./sse-subscriptions";
 export {
   markRead,
-  getLastReadByCredential,
+  getLastReadByDevice,
   getReadState,
-  unreadCountForCredential
+  unreadCountForDevice
 } from "./chat-read-state";
 export type { ChatReadState } from "./chat-read-state";
 export {

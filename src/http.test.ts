@@ -2169,6 +2169,15 @@ describe("runtime api", () => {
       const config = testConfig("chat-read-badge");
       const handler = createHandler(config);
 
+      // Register a device first — read/badge now key per device, not
+      // per credential, so the mobile client identifies itself via
+      // X-Device-Token on every call.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
       const session = await call(handler, config, "/api/chat", {
         method: "POST",
         body: JSON.stringify({ title: "read state" })
@@ -2188,24 +2197,30 @@ describe("runtime api", () => {
         text: "follow up"
       });
 
-      // Fresh credential: no read state yet, both blocks unread.
-      const before = await call(handler, config, "/api/badge");
+      // Fresh device: no read state yet, both blocks unread.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
       expect(before.unread).toBe(2);
 
       const marked = await call(handler, config, `/api/chat/${session.id}/read`, {
         method: "POST",
+        headers: deviceHeader,
         body: JSON.stringify({ lastReadBlockId: b1.id })
       });
       expect(marked.ok).toBe(true);
       expect(marked.readState.lastReadBlockId).toBe(b1.id);
 
-      const after = await call(handler, config, "/api/badge");
+      const after = await call(handler, config, "/api/badge", { headers: deviceHeader });
       expect(after.unread).toBe(1);
     });
 
     test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {
       const config = testConfig("chat-read-validate");
       const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
       const sessionA = await call(handler, config, "/api/chat", {
         method: "POST",
         body: JSON.stringify({ title: "A" })
@@ -2226,7 +2241,7 @@ describe("runtime api", () => {
         handler,
         config,
         `/api/chat/${sessionA.id}/read`,
-        { method: "POST", body: JSON.stringify({}) },
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({}) },
         config.token
       );
       expect(missing.status).toBe(400);
@@ -2236,7 +2251,7 @@ describe("runtime api", () => {
         handler,
         config,
         `/api/chat/${sessionB.id}/read`,
-        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
         config.token
       );
       expect(cross.status).toBe(400);
@@ -2246,22 +2261,49 @@ describe("runtime api", () => {
         handler,
         config,
         "/api/chat/chat_nonexistent/read",
-        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
         config.token
       );
       expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400 (mobile-only endpoint).
+      const missingDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(missingDevice.status).toBe(400);
+
+      // Foreign device token (not registered to this credential): 403.
+      const foreignDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        {
+          method: "POST",
+          headers: { "x-device-token": "tok_someone_else" },
+          body: JSON.stringify({ lastReadBlockId: bA.id })
+        },
+        config.token
+      );
+      expect(foreignDevice.status).toBe(403);
     });
 
-    test("read state is scoped to the calling credential", async () => {
-      const config = testConfig("chat-read-credential");
+    test("read state is scoped per device, not per credential", async () => {
+      // Two iPhones owned by the same human (both register under the
+      // "owner" credential). iPhone A reading the chat must NOT clear
+      // iPhone B's badge — that's the load-bearing per-device guarantee.
+      const config = testConfig("chat-read-device");
       const handler = createHandler(config);
-      const pairing = await call(handler, config, "/api/pairing", {
+      await call(handler, config, "/api/push/devices", {
         method: "POST",
-        body: JSON.stringify({ ttlSeconds: 60 })
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
       });
-      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+      await call(handler, config, "/api/push/devices", {
         method: "POST",
-        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
       });
 
       const session = await call(handler, config, "/api/chat", {
@@ -2275,16 +2317,21 @@ describe("runtime api", () => {
         text: "hello"
       });
 
-      // Owner marks read; their badge drops to 0. The phone's badge is
-      // still 1 because read state is per-credential.
+      // iPhone A marks read; its badge drops to 0. iPhone B's badge
+      // is still 1 because read state is per-device.
       await call(handler, config, `/api/chat/${session.id}/read`, {
         method: "POST",
+        headers: { "x-device-token": "tok_iphone_a" },
         body: JSON.stringify({ lastReadBlockId: block.id })
       });
-      const ownerBadge = await call(handler, config, "/api/badge");
-      const phoneBadge = await callWithToken(handler, config, claimed.token, "/api/badge");
-      expect(ownerBadge.unread).toBe(0);
-      expect(phoneBadge.unread).toBe(1);
+      const badgeA = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_a" }
+      });
+      const badgeB = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_b" }
+      });
+      expect(badgeA.unread).toBe(0);
+      expect(badgeB.unread).toBe(1);
     });
 
     test("read + badge endpoints require authentication", async () => {

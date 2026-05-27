@@ -1,29 +1,41 @@
 // Active SSE subscription tracking. A small in-process registry that
-// maps a credential id to the set of chat session ids it currently has
-// open over /api/chat/:id/stream.
+// maps a device token to the set of chat session ids that device
+// currently has open over /api/chat/:id/stream.
 //
 // Used by the APNs dispatcher (src/integrations/apns/dispatcher.ts) so
 // that "completion" silent pushes — phase blocks with label `Completed`
-// or `Failed` — are suppressed when the user is actively watching the
-// session. There's no point waking the device to refetch a block that
-// just arrived over the open SSE channel; the suppression keeps APNs
-// traffic down and avoids redundant badge math.
+// or `Failed` — are suppressed when THIS device is actively watching
+// the session. Per-device (rather than per-credential) suppression is
+// load-bearing: two iOS installs of the same human share one
+// credential ("owner"), but only one of them might be foregrounded on
+// the chat — the other still needs the silent wake to refresh its
+// badge. Keying on the APNs token (which the device sends as
+// X-Device-Token on the SSE handshake) keeps the two devices distinct.
+//
+// Web and CLI clients without a device token never register here —
+// they don't need silent-push suppression (there's no APNs device
+// behind them), and including them would collapse onto the same
+// credential key and break the per-device guarantee above.
 //
 // The state is per-process and per-instance because SSE connections
 // terminate at this gateway process; a future multi-process deployment
 // would need a shared store or a cross-process emitter, but that's out
 // of scope for the single-Bun-runtime model.
 //
-// Lifecycle: callers `addSseSubscription` on handshake (after auth
-// resolves a credential) and `removeSseSubscription` from every cleanup
-// path (cancel, error, normal close). The returned cleanup function
-// makes both legs of the pair impossible to forget.
+// Lifecycle: callers `addSseSubscription` on handshake (after the
+// optional X-Device-Token is validated against the devices table) and
+// `removeSseSubscription` from every cleanup path (cancel, error,
+// normal close). The returned cleanup function makes both legs of the
+// pair impossible to forget.
 
 import type { Instance } from "../types";
 
-// instance::credentialId → set of sessionIds currently subscribed.
-// Map nesting keeps lookups O(1) on the dispatcher's hot path
-// (isCredentialWatching) without scanning a flat array on every push.
+// instance → deviceToken → set of opaque per-call handles. Each
+// addSseSubscription call inserts its own handle (so two concurrent
+// streams for the same (device, session) don't collapse to one slot
+// and a single cleanup can't yank the peer's record). Handles are
+// stored as `${sessionId}::${nonce}`; membership checks scan the small
+// Set for the session prefix.
 const subscriptions: Map<string, Map<string, Set<string>>> = new Map();
 
 function instanceBucket(instance: Instance): Map<string, Set<string>> {
@@ -35,29 +47,24 @@ function instanceBucket(instance: Instance): Map<string, Set<string>> {
   return bucket;
 }
 
-// Register an active SSE subscription. Returns a cleanup function that
-// callers MUST invoke from every teardown path (stream cancel, error,
-// normal close) so the registry stays accurate. Multiple opens of the
-// same (credential, session) tuple are tolerated — the registry
-// reference-counts internally so two tabs / two devices for the same
-// credential coexist; the entry survives until the last subscription
+// Register an active SSE subscription for a specific device. Returns a
+// cleanup function that callers MUST invoke from every teardown path
+// (stream cancel, error, normal close) so the registry stays accurate.
+// Multiple opens of the same (device, session) tuple are tolerated —
+// the registry reference-counts internally so two reconnect attempts
+// or peers coexist; the entry survives until the last subscription
 // closes.
 export function addSseSubscription(
   instance: Instance,
-  credentialId: string,
+  deviceToken: string,
   sessionId: string
 ): () => void {
   const bucket = instanceBucket(instance);
-  let sessions = bucket.get(credentialId);
+  let sessions = bucket.get(deviceToken);
   if (!sessions) {
     sessions = new Set();
-    bucket.set(credentialId, sessions);
+    bucket.set(deviceToken, sessions);
   }
-  // Add a unique handle per call so concurrent subscriptions to the
-  // same session from the same credential don't collapse to one entry
-  // (and so the first cleanup doesn't yank the still-open peer's
-  // record). The Set holds opaque tokens; we expose membership only
-  // via the predicate helpers below.
   const handle = `${sessionId}::${Math.random().toString(36).slice(2)}`;
   sessions.add(handle);
 
@@ -65,44 +72,41 @@ export function addSseSubscription(
   return () => {
     if (removed) return;
     removed = true;
-    const live = bucket.get(credentialId);
+    const live = bucket.get(deviceToken);
     if (!live) return;
     live.delete(handle);
-    if (live.size === 0) bucket.delete(credentialId);
+    if (live.size === 0) bucket.delete(deviceToken);
     if (bucket.size === 0) subscriptions.delete(instance);
   };
 }
 
-// True when the given credential has at least one open SSE subscription
-// for the given session. The dispatcher consults this before emitting a
-// completion silent push — if the user is already watching, the SSE
-// channel will deliver the block and the push is redundant.
-export function isCredentialWatching(
+// True when the given device has at least one open SSE subscription
+// for the given session. The dispatcher consults this per-device
+// before emitting a completion silent push — if THIS device is already
+// watching, the SSE channel will deliver the block and the push is
+// redundant. Other devices for the same credential are evaluated
+// independently.
+export function isDeviceWatching(
   instance: Instance,
-  credentialId: string,
+  deviceToken: string,
   sessionId: string
 ): boolean {
-  const sessions = subscriptions.get(instance)?.get(credentialId);
+  const sessions = subscriptions.get(instance)?.get(deviceToken);
   if (!sessions) return false;
-  // Handles are stored as `${sessionId}::${nonce}` — checking
-  // membership is a prefix scan, but Sets are small (typically 1-2
-  // open streams per credential) so this stays cheap.
   for (const handle of sessions) {
     if (handle.startsWith(`${sessionId}::`)) return true;
   }
   return false;
 }
 
-// True when the given credential has ANY active SSE subscription on
-// this instance, regardless of session. Coarser than the per-session
-// predicate; used in cases where "is the app app-active for this
-// human?" is the right signal (e.g. a future broadcast-level push that
-// wakes the badge without targeting a specific chat).
+// True when the given device has ANY active SSE subscription on this
+// instance, regardless of session. Coarser than the per-session
+// predicate; reserved for future broadcast-level signals.
 export function hasAnyActiveSubscription(
   instance: Instance,
-  credentialId: string
+  deviceToken: string
 ): boolean {
-  const sessions = subscriptions.get(instance)?.get(credentialId);
+  const sessions = subscriptions.get(instance)?.get(deviceToken);
   return Boolean(sessions && sessions.size > 0);
 }
 

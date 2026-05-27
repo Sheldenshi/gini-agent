@@ -33,7 +33,13 @@ import { id, now } from "./ids";
 // memory_units for per-agent memory isolation. New SQLite installs add the
 // columns through CREATE TABLE; existing installs add them via the additive
 // migration in applyMigrations().
-export const MEMORY_SCHEMA_VERSION = 5;
+// Bumped to 6 for per-device chat_read_state: switches the read-state
+// PK from (session_id, credential_id) to (session_id, device_token) so
+// two iPhones owned by the same human (sharing one "owner" credential)
+// don't share a cursor. Implemented as a recreate-and-drop migration:
+// existing v5 rows are dropped during the bump (the old keying made
+// them incorrect anyway under multi-device ownership).
+export const MEMORY_SCHEMA_VERSION = 6;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -369,23 +375,21 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
   `);
 
-  // Step 6 — chat_read_state table (schema version 5). Tracks the last
-  // block id each credential has acknowledged seeing on a given chat
+  // Step 6 — chat_read_state table (schema version 6). Tracks the
+  // last block id each device has acknowledged seeing on a given chat
   // session. Used to compute the iOS app's badge count and to drive
   // silent-push suppression for completion phases. Composite primary
-  // key on (session_id, credential_id) makes upsert idempotent and
-  // gives the per-credential aggregate query an index-only path through
-  // `chat_read_state_by_credential`.
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS chat_read_state (
-      session_id TEXT NOT NULL,
-      credential_id TEXT NOT NULL,
-      last_read_block_id TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (session_id, credential_id)
-    );
-    CREATE INDEX IF NOT EXISTS chat_read_state_by_credential ON chat_read_state(credential_id);
-  `);
+  // key on (session_id, device_token) so two iPhones owned by the
+  // same human (sharing one "owner" credential under the runtime's
+  // single-tenant credential model) each track their own per-session
+  // cursor.
+  //
+  // Upgrade from v5: the previous schema used (session_id, credential_id).
+  // Under multi-device ownership those rows were already incorrect (one
+  // device's open would clobber the other's badge), so the migration
+  // simply drops the old table and starts fresh — losing one badge
+  // sync per device is a cheap correctness fix.
+  ensureChatReadStateDeviceTokenSchema(db);
 
   db.run(
     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
@@ -399,6 +403,61 @@ function ensureColumn(db: Database, table: string, column: string, type: string)
     .all();
   if (rows.some((row) => row.name === column)) return;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+
+// Migration helper for the v5 → v6 chat_read_state shape change.
+// Creates the device-keyed table from scratch if missing; if a v5
+// (credential_id-keyed) table exists, drops it and starts over. The
+// drop is intentional: under multi-device ownership the v5 rows
+// already collapsed onto one credential cursor, so they couldn't be
+// meaningfully migrated into device-specific cursors. The badge will
+// recompute as fresh-everything on first access, and the mobile
+// client POSTs /chat/:id/read on every chat-detail mount, so the
+// missing rows are repopulated within seconds of normal use.
+function ensureChatReadStateDeviceTokenSchema(db: Database): void {
+  const cols = db
+    .query<{ name: string }, []>("PRAGMA table_info(chat_read_state)")
+    .all();
+  const hasCredentialId = cols.some((c) => c.name === "credential_id");
+  const hasDeviceToken = cols.some((c) => c.name === "device_token");
+
+  if (cols.length === 0) {
+    // Fresh DB — create the device-keyed table directly.
+    db.exec(`
+      CREATE TABLE chat_read_state (
+        session_id TEXT NOT NULL,
+        device_token TEXT NOT NULL,
+        last_read_block_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, device_token)
+      );
+      CREATE INDEX chat_read_state_by_device ON chat_read_state(device_token);
+    `);
+    return;
+  }
+
+  if (hasDeviceToken && !hasCredentialId) {
+    // Already on v6 schema (or post-v6 fresh install). No-op.
+    return;
+  }
+
+  if (hasCredentialId) {
+    // v5 → v6: drop and recreate. The old rows aren't recoverable into
+    // the new schema (no way to attribute a credential's read to one
+    // specific device after the fact).
+    db.exec(`
+      DROP INDEX IF EXISTS chat_read_state_by_credential;
+      DROP TABLE chat_read_state;
+      CREATE TABLE chat_read_state (
+        session_id TEXT NOT NULL,
+        device_token TEXT NOT NULL,
+        last_read_block_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, device_token)
+      );
+      CREATE INDEX chat_read_state_by_device ON chat_read_state(device_token);
+    `);
+  }
 }
 
 // Float32Array <-> Buffer round-trip.
