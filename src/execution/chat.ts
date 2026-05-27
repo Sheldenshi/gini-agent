@@ -54,6 +54,20 @@ export function listChatSessions(config: RuntimeConfig) {
   // without N+1 fetches. Sessions with no qualifying blocks fall back to
   // null and the client renders just the title.
   const latestByCallId = getLatestMessagesBySession(config.instance);
+  // Pre-index pending gates by taskId so the per-session count below is
+  // O(taskIds) instead of O(sessions × approvals). Authorizations and
+  // SetupRequests are two parallel approval surfaces with the same
+  // "session is awaiting the user" semantics — both contribute to the
+  // sidebar indicator.
+  const pendingByTaskId = new Map<string, number>();
+  for (const auth of state.authorizations) {
+    if (auth.status !== "pending" || !auth.taskId) continue;
+    pendingByTaskId.set(auth.taskId, (pendingByTaskId.get(auth.taskId) ?? 0) + 1);
+  }
+  for (const setup of state.setupRequests) {
+    if (setup.status !== "pending" || !setup.taskId) continue;
+    pendingByTaskId.set(setup.taskId, (pendingByTaskId.get(setup.taskId) ?? 0) + 1);
+  }
   return state.chatSessions.map((session) => {
     const raw = latestByCallId.get(session.id) ?? null;
     const lastMessagePreview = raw
@@ -61,9 +75,14 @@ export function listChatSessions(config: RuntimeConfig) {
         ? `${raw.slice(0, LAST_MESSAGE_PREVIEW_CHARS).trimEnd()}…`
         : raw
       : null;
+    let pendingApprovalCount = 0;
+    for (const taskId of session.taskIds) {
+      pendingApprovalCount += pendingByTaskId.get(taskId) ?? 0;
+    }
     return {
       ...session,
       lastMessagePreview,
+      pendingApprovalCount,
       messages: state.chatMessages.filter((message) => message.sessionId === session.id),
       runs: state.runs.filter((run) => session.runIds.includes(run.id))
     };

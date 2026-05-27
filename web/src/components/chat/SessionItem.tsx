@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Bot, X } from "lucide-react";
+import { Bot, CircleAlert, X } from "lucide-react";
 import type { ChatSession } from "@/lib/view-types";
 import { cn } from "@/lib/utils";
 import { formatRelativeTime } from "./relative-time";
@@ -57,6 +57,13 @@ export function SessionItem({
   })();
 
   const time = formatRelativeTime(session.updatedAt ?? session.createdAt);
+  const pendingApprovalCount = session.pendingApprovalCount ?? 0;
+  const needsApproval = pendingApprovalCount > 0;
+  const approvalTitle = needsApproval
+    ? pendingApprovalCount === 1
+      ? "Awaiting your approval"
+      : `Awaiting your approval (${pendingApprovalCount})`
+    : undefined;
 
   return (
     <li>
@@ -93,6 +100,7 @@ export function SessionItem({
               const suffixes: string[] = [];
               if (isUnread) suffixes.push("unread");
               if (session.origin === "job") suffixes.push("created by a job");
+              if (needsApproval) suffixes.push("awaiting approval");
               return suffixes.length > 0 ? `${label} (${suffixes.join(", ")})` : label;
             })()}
           >
@@ -109,6 +117,15 @@ export function SessionItem({
                 className="flex shrink-0 items-center"
               >
                 <Bot className="size-3.5 text-muted-foreground" />
+              </span>
+            ) : null}
+            {needsApproval ? (
+              <span
+                title={approvalTitle}
+                aria-hidden="true"
+                className="flex shrink-0 items-center"
+              >
+                <CircleAlert className="size-3.5 text-amber-500" />
               </span>
             ) : null}
             <span className={cn("truncate", isUnread && "font-semibold")}>

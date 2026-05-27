@@ -27,15 +27,16 @@ import {
   normalizeProvider
 } from "../provider";
 import { decideApproval } from "../agent";
-import { createChatMessage, mutateState, readState } from "../state";
+import { createChatMessage, insertChatBlock, mutateState, readState } from "../state";
 import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
+  listChatSessions,
   submitChatMessage,
   syncChatTaskResult,
   createChat
 } from "./chat";
-import type { RuntimeConfig, Task } from "../types";
+import type { Authorization, RuntimeConfig, SetupRequest, Task } from "../types";
 
 function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
   return {
@@ -457,5 +458,219 @@ describe("chat session waiting-approval placeholder", () => {
 
     const stateNow = readState(config.instance);
     expect(stateNow.chatSessions.find((item) => item.id === session.id)?.title).toBe("Untitled chat");
+  });
+});
+
+// listChatSessions enriches each session with `pendingApprovalCount` so the
+// sidebar can render an "awaiting approval" indicator without a second
+// round-trip. The count joins state.authorizations and state.setupRequests
+// (both pending) against the session's taskIds.
+describe("chat list pendingApprovalCount enrichment", () => {
+  let root: string;
+  let workspaceRoot: string;
+  let prevState: string | undefined;
+  let prevLog: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "gini-chat-list-"));
+    workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-list-ws-"));
+    prevState = process.env.GINI_STATE_ROOT;
+    prevLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+  });
+
+  afterEach(() => {
+    if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
+    else process.env.GINI_STATE_ROOT = prevState;
+    if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
+    else process.env.GINI_LOG_ROOT = prevLog;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  async function seedTask(config: RuntimeConfig, sessionId: string, taskId: string): Promise<void> {
+    await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: taskId,
+        title: taskId,
+        input: "",
+        status: "running",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: sessionId
+      };
+      state.tasks.push(task);
+      const sessionRecord = state.chatSessions.find((s) => s.id === sessionId);
+      if (sessionRecord) sessionRecord.taskIds.push(taskId);
+    });
+  }
+
+  async function seedAuthorization(
+    config: RuntimeConfig,
+    overrides: Partial<Authorization> & Pick<Authorization, "id" | "taskId" | "status">
+  ): Promise<void> {
+    await mutateState(config.instance, (state) => {
+      const at = new Date().toISOString();
+      const authorization: Authorization = {
+        instance: state.instance,
+        createdAt: at,
+        updatedAt: at,
+        action: "file.write",
+        target: "out.txt",
+        risk: "medium",
+        reason: "test authorization",
+        payload: {},
+        ...overrides
+      };
+      state.authorizations.push(authorization);
+    });
+  }
+
+  async function seedSetupRequest(
+    config: RuntimeConfig,
+    overrides: Partial<SetupRequest> & Pick<SetupRequest, "id" | "taskId" | "status">
+  ): Promise<void> {
+    await mutateState(config.instance, (state) => {
+      const at = new Date().toISOString();
+      const setupRequest: SetupRequest = {
+        instance: state.instance,
+        createdAt: at,
+        updatedAt: at,
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "test setup",
+        payload: {},
+        ...overrides
+      };
+      state.setupRequests.push(setupRequest);
+    });
+  }
+
+  test("returns 0 when the session has no approvals", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-no-approvals");
+    const session = await createChat(config, { title: "plain" });
+
+    const rows = listChatSessions(config);
+    const row = rows.find((s) => s.id === session.id);
+    expect(row?.pendingApprovalCount).toBe(0);
+  });
+
+  test("counts a pending Authorization linked to one of the session's tasks", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-auth-pending");
+    const session = await createChat(config, { title: "needs auth" });
+    await seedTask(config, session.id, "task_auth_1");
+    await seedAuthorization(config, { id: "authz_1", taskId: "task_auth_1", status: "pending" });
+
+    const row = listChatSessions(config).find((s) => s.id === session.id);
+    expect(row?.pendingApprovalCount).toBe(1);
+  });
+
+  test("counts a pending SetupRequest linked to one of the session's tasks", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-setup-pending");
+    const session = await createChat(config, { title: "needs setup" });
+    await seedTask(config, session.id, "task_setup_1");
+    await seedSetupRequest(config, { id: "setup_1", taskId: "task_setup_1", status: "pending" });
+
+    const row = listChatSessions(config).find((s) => s.id === session.id);
+    expect(row?.pendingApprovalCount).toBe(1);
+  });
+
+  test("sums pending Authorizations and SetupRequests on the same session", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-both-pending");
+    const session = await createChat(config, { title: "needs both" });
+    await seedTask(config, session.id, "task_both_1");
+    await seedTask(config, session.id, "task_both_2");
+    await seedAuthorization(config, { id: "authz_a", taskId: "task_both_1", status: "pending" });
+    await seedAuthorization(config, { id: "authz_b", taskId: "task_both_2", status: "pending" });
+    await seedSetupRequest(config, { id: "setup_a", taskId: "task_both_1", status: "pending" });
+
+    const row = listChatSessions(config).find((s) => s.id === session.id);
+    expect(row?.pendingApprovalCount).toBe(3);
+  });
+
+  test("ignores resolved Authorizations and SetupRequests", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-resolved");
+    const session = await createChat(config, { title: "resolved" });
+    await seedTask(config, session.id, "task_resolved_1");
+    await seedAuthorization(config, { id: "authz_approved", taskId: "task_resolved_1", status: "approved" });
+    await seedAuthorization(config, { id: "authz_denied", taskId: "task_resolved_1", status: "denied" });
+    await seedSetupRequest(config, { id: "setup_completed", taskId: "task_resolved_1", status: "completed" });
+    await seedSetupRequest(config, { id: "setup_cancelled", taskId: "task_resolved_1", status: "cancelled" });
+
+    const row = listChatSessions(config).find((s) => s.id === session.id);
+    expect(row?.pendingApprovalCount).toBe(0);
+  });
+
+  test("ignores approvals whose taskId is not in the session's taskIds", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-other-session");
+    const target = await createChat(config, { title: "target" });
+    const other = await createChat(config, { title: "other" });
+    await seedTask(config, other.id, "task_other_1");
+    await seedAuthorization(config, { id: "authz_other", taskId: "task_other_1", status: "pending" });
+    await seedSetupRequest(config, { id: "setup_other", taskId: "task_other_1", status: "pending" });
+
+    const rows = listChatSessions(config);
+    expect(rows.find((s) => s.id === target.id)?.pendingApprovalCount).toBe(0);
+    expect(rows.find((s) => s.id === other.id)?.pendingApprovalCount).toBe(2);
+  });
+
+  test("truncates lastMessagePreview when the latest block exceeds the cap", async () => {
+    // Sibling-branch coverage for the existing preview-truncation ternary
+    // — exercises the long-text path that runs alongside the new
+    // pendingApprovalCount enrichment in the same map().
+    const config = buildConfig(workspaceRoot, "chat-list-long-preview");
+    const session = await createChat(config, { title: "long preview" });
+    const longText = "x".repeat(300);
+    insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: longText,
+      agentId: null
+    });
+
+    const row = listChatSessions(config).find((s) => s.id === session.id);
+    expect(row?.lastMessagePreview).toBeTruthy();
+    expect(row?.lastMessagePreview?.endsWith("…")).toBe(true);
+    expect(row?.lastMessagePreview?.length).toBeLessThan(longText.length);
+  });
+
+  test("ignores approvals with no taskId", async () => {
+    const config = buildConfig(workspaceRoot, "chat-list-no-task-link");
+    const session = await createChat(config, { title: "untargeted" });
+    await mutateState(config.instance, (state) => {
+      const at = new Date().toISOString();
+      state.authorizations.push({
+        id: "authz_no_task",
+        instance: state.instance,
+        status: "pending",
+        createdAt: at,
+        updatedAt: at,
+        action: "file.write",
+        target: "out.txt",
+        risk: "low",
+        reason: "no task linkage",
+        payload: {}
+      });
+      state.setupRequests.push({
+        id: "setup_no_task",
+        instance: state.instance,
+        status: "pending",
+        createdAt: at,
+        updatedAt: at,
+        action: "browser.connect",
+        target: "https://example.com",
+        reason: "no task linkage",
+        payload: {}
+      });
+    });
+
+    const row = listChatSessions(config).find((s) => s.id === session.id);
+    expect(row?.pendingApprovalCount).toBe(0);
   });
 });
