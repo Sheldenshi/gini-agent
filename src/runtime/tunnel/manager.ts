@@ -145,6 +145,94 @@ class TunnelManager {
     return next;
   }
 
+  /** Stop any current cloudflared, launch a new one, install the exit
+   *  listener BEFORE awaiting the banner, await the URL, sync-check
+   *  exitCode for any same-tick exit, stamp `snapshot.publicUrl /
+   *  secret / secretRevision / enabled=true`, atomic-write the
+   *  publicUrl sibling file. MUST be called from inside the apply
+   *  chain — the queue serialization is the caller's responsibility.
+   *  Shared between `enable()` and `rotateSecret()` so the inline
+   *  recycle in `rotateSecret` doesn't duplicate the lifecycle. */
+  private async swapCloudflared(webPort: number, secret: string): Promise<TunnelTransitionResult> {
+    if (this.shuttingDown) {
+      return { ok: false, error: "Tunnel manager shutting down" };
+    }
+    if (this.cloudflared) {
+      const prev = this.cloudflared;
+      this.cloudflared = null;
+      try { await prev.stop(); } catch { /* already gone */ }
+    }
+    const launch = launchCloudflared({ port: webPort });
+    this.cloudflared = launch;
+    // Install the exit listener BEFORE the await so any same-tick
+    // crash during banner parse triggers cleanup. process.once does
+    // not fire for past exits. Identity check + null-cloudflared
+    // guards double-cleanup when the catch block below also handles
+    // the same exit.
+    launch.process.once("exit", (code) => {
+      if (this.cloudflared !== launch) return;
+      this.cloudflared = null;
+      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      setRedactionPublicUrl(null);
+      this.snapshot = {
+        ...this.snapshot,
+        publicUrl: null,
+        lastError: redact(`cloudflared exited (code ${code ?? "?"})`)
+      };
+      appendLog(this.config.instance, "tunnel.cloudflared.exit", { code: code ?? null });
+    });
+    try {
+      const url = await launch.publicUrl;
+      // Belt-and-suspenders: process.once fires on the next event-loop
+      // tick, so a same-tick exit between the await resolving and our
+      // snapshot stamp would slip past. Sync exitCode catches that gap.
+      if (launch.process.exitCode !== null) {
+        this.cloudflared = null;
+        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+        setRedactionPublicUrl(null);
+        const msg = redact(`cloudflared exited (code ${launch.process.exitCode}) during banner parse`);
+        this.snapshot = { ...this.snapshot, publicUrl: null, lastError: msg };
+        return { ok: false, error: msg };
+      }
+      // Re-check the shutdown flag after the long await — SIGTERM may
+      // have flipped it while we were waiting for cloudflared's banner.
+      if (this.shuttingDown) {
+        this.cloudflared = null;
+        try { await launch.stop(); } catch { /* already gone */ }
+        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+        this.snapshot = { ...this.snapshot, publicUrl: null, lastError: "shutdown" };
+        return { ok: false, error: "shutdown" };
+      }
+      this.snapshot = {
+        ...this.snapshot,
+        enabled: true,
+        secret,
+        secretRevision: secretRevision(secret, url),
+        publicUrl: url,
+        lastError: null
+      };
+      setRedactionPublicUrl(url);
+      try {
+        atomicWriteFile(publicUrlPath(this.config.instance), `${url}\n`);
+      } catch (writeErr) {
+        const writeMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+        this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
+        appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
+      }
+      return { ok: true, snapshot: this.snapshot };
+    } catch (err) {
+      // Banner-parse failure or process exit reject. Subprocess may still
+      // be running — stop it before nulling the reference.
+      this.cloudflared = null;
+      try { await launch.stop(); } catch { /* already gone */ }
+      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      const msg = err instanceof Error ? err.message : String(err);
+      this.snapshot = { ...this.snapshot, publicUrl: null, lastError: redact(msg) };
+      setRedactionPublicUrl(null);
+      return { ok: false, error: redact(msg) };
+    }
+  }
+
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     let outerResolve!: (value: T) => void;
     let outerReject!: (err: unknown) => void;
@@ -183,127 +271,28 @@ class TunnelManager {
         // on every request; ordering is important for the 5000 ms exposure cap.
         const persisted = this.persistTunnel( { enabled: true });
         setRedactionSecret(persisted.secret);
-        // Stop any existing tunnel before spawning a new one — call sites use
-        // this both to bring up after disable and to recycle on port change.
-        if (this.cloudflared) {
-          const prev = this.cloudflared;
-          this.cloudflared = null;
-          await prev.stop();
+        const result = await this.swapCloudflared(webPort, persisted.secret);
+        if (!result.ok) {
+          // Roll back enabled:true so the next gateway boot doesn't see a
+          // stale enable claim with no live tunnel.
+          try { this.persistTunnel({ enabled: false }); } catch { /* best-effort */ }
+          this.snapshot = { ...this.snapshot, enabled: false };
+          appendLog(this.config.instance, "tunnel.enable.error", { error: result.error });
+          return result;
         }
-        const launch = launchCloudflared({ port: webPort });
-        this.cloudflared = launch;
-        // Install the post-banner exit listener BEFORE awaiting publicUrl.
-        // `process.once("exit")` does NOT fire for past exits — installing
-        // after the await would miss any exit that happened during banner
-        // parse, leaving the snapshot stamped "live" while cloudflared is
-        // gone. The `this.cloudflared !== launch` identity guard prevents
-        // double-cleanup when the catch block below also runs for the
-        // same exit (the catch nulls cloudflared, so the listener no-ops
-        // on its later fire).
-        //
-        // Liveness is determined by OBJECT IDENTITY (`this.cloudflared
-        // !== launch`), not by `this.generation`. The Notes-refresh
-        // `this.generation` ticks on disable + rotateSecret to invalidate
-        // background Notes writes, but a `rotateSecret` does NOT replace
-        // the cloudflared subprocess — the same launch is still live and
-        // a later crash of it must still be detected.
-        launch.process.once("exit", (code) => {
-          if (this.cloudflared !== launch) return;
-          this.cloudflared = null;
-          try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-          setRedactionPublicUrl(null);
-          this.snapshot = {
-            ...this.snapshot,
-            publicUrl: null,
-            lastError: redact(`cloudflared exited (code ${code ?? "?"})`)
-          };
-          appendLog(this.config.instance, "tunnel.cloudflared.exit", { code: code ?? null });
-        });
-        try {
-          const url = await launch.publicUrl;
-          // Belt-and-suspenders: `process.once("exit")` fires on the next
-          // event-loop tick, so a same-tick exit between the await
-          // resolution and our snapshot stamp would slip past the listener
-          // long enough for the stamp to record "live". A synchronous
-          // exitCode read catches that gap.
-          if (launch.process.exitCode !== null) {
-            this.cloudflared = null;
-            try { this.persistTunnel({ enabled: false }); } catch { /* best-effort */ }
-            try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-            this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(`cloudflared exited (code ${launch.process.exitCode}) during banner parse`) };
-            setRedactionPublicUrl(null);
-            return { ok: false, error: redact(`cloudflared exited (code ${launch.process.exitCode}) during banner parse`) };
-          }
-          // Re-check the shutdown flag after the long await — SIGTERM may
-          // have flipped it while we were waiting for cloudflared's banner.
-          // Without this re-check we'd publish a publicUrl file the drain
-          // has already unlinked and keep cloudflared alive past the cap.
-          if (this.shuttingDown) {
-            this.cloudflared = null;
-            try { await launch.stop(); } catch { /* already gone */ }
-            try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
-            try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-            this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: "shutdown" };
-            return { ok: false, error: "shutdown" };
-          }
-          this.snapshot = {
-            ...this.snapshot,
-            enabled: true,
-            secret: persisted.secret,
-            // Bind the revision to the publicUrl too so a disable→enable
-            // cycle (which mints a fresh trycloudflare hostname but keeps
-            // the same secret) busts the browser's QR `<img>` cache.
-            // Without this the operator sees the OLD QR pixels encoding
-            // the dead hostname and the iPhone scan hits a 1033.
-            secretRevision: secretRevision(persisted.secret, url),
-            publicUrl: url,
-            lastError: null
-          };
-          setRedactionPublicUrl(url);
-          // Publish the live URL to disk so the Next.js proxy (separate
-          // process) can equality-match Host instead of trusting any
-          // .trycloudflare.com suffix. If the write fails the proxy can't
-          // classify Host and will 404 every request — surface the error
-          // in lastError so the operator sees the failure rather than a
-          // silently broken tunnel.
-          try {
-            atomicWriteFile(publicUrlPath(this.config.instance), `${url}\n`);
-          } catch (writeErr) {
-            const writeMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-            this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
-            appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
-          }
-          appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
-          // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
-          // refreshNotes here would put a 15s osascript timeout ahead of a
-          // follow-up disable() in the apply chain, defeating PLAN.md's
-          // 5000ms exposure cap on disable. The bare `runRefreshNotes()`
-          // call updates `this.snapshot` and `this.notesAvailable` outside
-          // the queue. Capture the current generation at scheduling time so
-          // a later disable / rotateSecret that bumps the generation makes
-          // the background refresh bail before writing a stale URL/secret
-          // to iCloud Notes.
-          if (this.snapshot.appleNotes.enabled) {
-            const scheduledGeneration = this.generation;
-            void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
-          }
-        } catch (err) {
-          // Banner-parse failure or process exit — the subprocess may still be
-          // running. Calling launch.stop() here closes the orphan window
-          // before we null the reference. This is symmetric with the
-          // success-path teardown in disable().
-          this.cloudflared = null;
-          try { await launch.stop(); } catch { /* already gone */ }
-          // Roll back the persisted enabled:true so the next gateway boot
-          // doesn't see a stale "enabled with no live tunnel" claim and so
-          // proxy requests stop being accepted immediately.
-          try { this.persistTunnel( { enabled: false }); } catch { /* surfaced via lastError */ }
-          try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-          const msg = err instanceof Error ? err.message : String(err);
-          this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(msg) };
-          setRedactionPublicUrl(null);
-          appendLog(this.config.instance, "tunnel.enable.error", { error: redact(msg) });
-          return { ok: false, error: redact(msg) };
+        appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
+        // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
+        // refreshNotes here would put a 15s osascript timeout ahead of a
+        // follow-up disable() in the apply chain, defeating PLAN.md's
+        // 5000ms exposure cap on disable. The bare `runRefreshNotes()`
+        // call updates `this.snapshot` and `this.notesAvailable` outside
+        // the queue. Capture the current generation at scheduling time so
+        // a later disable / rotateSecret that bumps the generation makes
+        // the background refresh bail before writing a stale URL/secret
+        // to iCloud Notes.
+        if (this.snapshot.appleNotes.enabled) {
+          const scheduledGeneration = this.generation;
+          void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
         }
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
@@ -384,10 +373,20 @@ class TunnelManager {
    *    request) closes at the network layer.
    *  - The rotated trycloudflare hostname: the host-only cookie's
    *    binding doesn't match the new hostname either, so even a
-   *    reconnecting client with the old cookie can't piggy-back. */
+   *    reconnecting client with the old cookie can't piggy-back.
+   *
+   *  Recycle happens INLINE inside the same apply-chain slot as the
+   *  secret commit. A previous version scheduled the recycle as a
+   *  fire-and-forget `void this.enable(port)` AFTER the rotate task
+   *  resolved; that left a window where a concurrent `disable()`
+   *  could queue between rotate and recycle (chain: rotate → disable
+   *  → recycle), let disable run, then have recycle resurrect the
+   *  tunnel by re-enabling it. Doing the recycle inline makes the
+   *  whole rotate+recycle atomic against any other apply-chain
+   *  operation. */
   async rotateSecret(): Promise<TunnelTransitionResult> {
     let scheduledGeneration = 0;
-    let needsRecycle = false;
+    let didRecycle = false;
     const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       // Bump the generation so any in-flight detached Notes refresh from
       // a prior enable() / rotateSecret() bails before writing the now-
@@ -395,14 +394,32 @@ class TunnelManager {
       this.generation += 1;
       try {
         const next = this.persistTunnel( { secret: generateTunnelSecret() });
-        this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret, this.snapshot.publicUrl) };
         setRedactionSecret(next.secret);
         scheduledGeneration = this.generation;
-        // Only recycle if a tunnel is actually running. Rotating while
-        // the tunnel is off is just a config write — no open connections
-        // to close, hostname stays absent.
-        needsRecycle = this.cloudflared !== null && this.lastWebPort !== null;
-        appendLog(this.config.instance, "tunnel.secret-rotated", {});
+        // If a tunnel is running, recycle cloudflared INLINE so a
+        // concurrent disable() can't interleave between commit and
+        // recycle. swapCloudflared assumes it's inside the apply chain.
+        if (this.cloudflared !== null && this.lastWebPort !== null) {
+          const swap = await this.swapCloudflared(this.lastWebPort, next.secret);
+          if (!swap.ok) {
+            // Recycle failed mid-rotation. The secret is already
+            // committed; mark the tunnel down so the operator can
+            // re-enable. Persisted enabled stays true so the next
+            // boot's reconcile attempts the relaunch.
+            this.snapshot = { ...this.snapshot, lastError: swap.error };
+            return swap;
+          }
+          didRecycle = true;
+        } else {
+          // No running tunnel — just stamp the new secret + revision so
+          // the snapshot reflects the rotation. publicUrl stays null.
+          this.snapshot = {
+            ...this.snapshot,
+            secret: next.secret,
+            secretRevision: secretRevision(next.secret, this.snapshot.publicUrl)
+          };
+        }
+        appendLog(this.config.instance, "tunnel.secret-rotated", { recycled: didRecycle });
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -411,18 +428,12 @@ class TunnelManager {
       }
     });
     if (!result.ok) return result;
-    if (needsRecycle && this.lastWebPort !== null) {
-      // Recycle outside the apply chain — enable() itself enqueues, so
-      // a concurrent disable() can still preempt this. The in-progress
-      // rotation task has already returned, so a follow-up disable()
-      // gets the chain slot before the recycle's enable() body runs.
-      // enable() handles its own fire-and-forget Notes refresh, so we
-      // don't fire a second one here.
-      const port = this.lastWebPort;
-      void this.enable(port).catch(() => { /* surfaced in lastError */ });
-    } else if (this.snapshot.appleNotes.enabled && this.snapshot.publicUrl && this.notesAvailable) {
-      // Tunnel was off → no connections to close. Still refresh Notes
-      // for the new secret so the mirror reflects the rotated state.
+    // Fire-and-forget Notes refresh OUTSIDE the apply chain (15s
+    // osascript timeout would otherwise sit ahead of a follow-up
+    // disable). The captured scheduledGeneration gate inside
+    // runRefreshNotes bails if a concurrent disable / re-rotate /
+    // re-enable bumps the generation before the write lands.
+    if (this.snapshot.appleNotes.enabled && this.snapshot.publicUrl && this.notesAvailable) {
       void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
     }
     return result;
