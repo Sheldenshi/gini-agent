@@ -4,16 +4,14 @@ import Link from "next/link";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
-  BotIcon,
   PencilIcon,
   PlusIcon,
-  ServerIcon,
-  SparklesIcon,
   Terminal as TerminalIcon,
   Trash2Icon,
   ZapIcon
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 
@@ -31,11 +29,13 @@ export interface ProviderCatalogItem {
   configured?: boolean;
 }
 
-// Trim the marketing suffix used in the static catalog. Pencil mocks
-// reference providers by short name (OpenAI, OpenRouter, …) and stacking
-// "Compatible" on every label adds noise without disambiguating anything.
+// Trim suffixes that the static catalog stacks on top of the brand name.
+// The Pencil mocks reference providers by short name (OpenAI, OpenRouter,
+// Codex, …); the auth badge alongside each row carries the "how" (OAuth /
+// API key / Local) so the brand label doesn't need to repeat it.
 export function displayProviderName(item: { displayName: string; name: string }): string {
   if (item.name === "local") return "Local";
+  if (item.name === "codex") return "Codex";
   return item.displayName.replace(/\s+Compatible$/i, "");
 }
 
@@ -44,15 +44,16 @@ export function displayProviderName(item: { displayName: string; name: string })
 // stand in for `local`).
 const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "local"] as const;
 
-// Per-provider visual identity. Lucide icons mirror the iconography in the
-// Pencil mock; auth label is what shows up in the small pill next to the
-// provider name.
+// Per-provider visual identity. Brand logos for OpenAI/DeepSeek/Ollama
+// come from the authoritative Pencil design file; codex (Terminal) and
+// openrouter (Zap) use Lucide because they have no widely-recognized
+// brand mark to swap in.
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; authLabel: string }> = {
   codex: { icon: TerminalIcon, authLabel: "OAuth" },
-  openai: { icon: SparklesIcon, authLabel: "API key" },
-  deepseek: { icon: BotIcon, authLabel: "API key" },
+  openai: { icon: OpenAILogo, authLabel: "API key" },
+  deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
-  local: { icon: ServerIcon, authLabel: "Local" }
+  local: { icon: OllamaLogo, authLabel: "Local" }
 };
 
 interface SetProviderResult {
@@ -122,7 +123,7 @@ export function ProviderCard({
       <ul className="flex flex-col gap-3">
         {rows.map((row) => {
           const isActive = activeProviderName === row.name;
-          const visual = PROVIDER_VISUAL[row.name] ?? { icon: SparklesIcon, authLabel: row.auth };
+          const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
           const model = isActive
             ? (activeProviderModel ?? row.models[0] ?? "")

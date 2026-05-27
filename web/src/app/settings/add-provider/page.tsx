@@ -7,10 +7,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   ArrowLeftIcon,
-  BotIcon,
   CheckIcon,
-  ServerIcon,
-  SparklesIcon,
   Terminal as TerminalIcon,
   ZapIcon
 } from "lucide-react";
@@ -18,17 +15,21 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
-const SELECTABLE_PROVIDERS = ["openai", "openrouter", "deepseek", "local"] as const;
+// Codex stays first so it lines up with where the Settings list shows
+// its row. Echo is dev-only and never appears here.
+const SELECTABLE_PROVIDERS = ["codex", "openai", "openrouter", "deepseek", "local"] as const;
 
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; description: string }> = {
-  openai: { icon: SparklesIcon, description: "GPT-5.4, GPT-5.4 mini, …" },
+  codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
+  openai: { icon: OpenAILogo, description: "GPT-5.4, GPT-5.4 mini, …" },
   openrouter: { icon: ZapIcon, description: "Multi-model router" },
-  deepseek: { icon: BotIcon, description: "DeepSeek V4 family" },
-  local: { icon: ServerIcon, description: "Ollama, LM Studio, vLLM" }
+  deepseek: { icon: DeepSeekLogo, description: "DeepSeek V4 family" },
+  local: { icon: OllamaLogo, description: "Ollama, LM Studio, vLLM" }
 };
 
 interface SetProviderResult {
@@ -76,24 +77,40 @@ export default function AddProviderPage() {
   };
 
   const entry = tiles.find((t) => t.name === providerName);
-  const requiresApiKey = providerName !== "local" && providerName !== "";
+  const isCodex = providerName === "codex";
+  const isLocal = providerName === "local";
+  const requiresApiKey = providerName !== "" && !isCodex && !isLocal;
 
   const save = useMutation({
-    mutationFn: async (): Promise<SetProviderResult> =>
-      api<SetProviderResult>("/setup/provider", {
+    mutationFn: async (): Promise<SetProviderResult> => {
+      // Codex doesn't take an apiKey or a user-picked model: the gateway
+      // reads ~/.codex/auth.json on each call and the catalog only ships
+      // gpt-5.5. Send a minimal payload so the backend's codex branch runs.
+      if (isCodex) {
+        return api<SetProviderResult>("/setup/provider", {
+          method: "POST",
+          body: JSON.stringify({ provider: "codex" })
+        });
+      }
+      return api<SetProviderResult>("/setup/provider", {
         method: "POST",
         body: JSON.stringify({
           provider: providerName,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
           ...(selectedModel ? { model: selectedModel } : {})
         })
-      }),
+      });
+    },
     onSuccess: (result) => {
       if (!result.ok) {
         toast.error(result.error ?? "Failed to save provider.");
         return;
       }
-      toast.success(`Provider set to ${providerName} (${selectedModel}).`);
+      toast.success(
+        isCodex
+          ? "Codex OAuth verified."
+          : `Provider set to ${providerName} (${selectedModel}).`
+      );
       invalidate(["status", "providers"]);
       router.push("/settings");
     },
@@ -102,9 +119,8 @@ export default function AddProviderPage() {
 
   const canSubmit =
     providerName !== "" &&
-    selectedModel !== "" &&
-    (!requiresApiKey || apiKey.trim().length > 0) &&
-    !save.isPending;
+    !save.isPending &&
+    (isCodex ? true : selectedModel !== "" && (!requiresApiKey || apiKey.trim().length > 0));
 
   return (
     <>
@@ -133,7 +149,7 @@ export default function AddProviderPage() {
             <h2 className="text-sm font-semibold">Provider type</h2>
             <p className="text-xs text-muted-foreground">Choose the model API surface to configure.</p>
           </div>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
             {tiles.map((tile) => {
               const visual = PROVIDER_VISUAL[tile.name] ?? { icon: SparklesIcon, description: "" };
               const Icon = visual.icon;
@@ -169,9 +185,11 @@ export default function AddProviderPage() {
           <div className="mb-5 space-y-1">
             <h2 className="text-sm font-semibold">Configure {entry ? displayProviderName(entry) : "provider"}</h2>
             <p className="text-xs text-muted-foreground">
-              {requiresApiKey
-                ? "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."
-                : "Local providers accept no-auth requests; leave the key blank if your gateway is open."}
+              {isCodex
+                ? "Codex authenticates through your existing ChatGPT account — no API key needed."
+                : isLocal
+                  ? "Local providers accept no-auth requests; leave the key blank if your gateway is open."
+                  : "Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider."}
             </p>
           </div>
 
@@ -182,44 +200,61 @@ export default function AddProviderPage() {
               if (canSubmit) save.mutate();
             }}
           >
-            {requiresApiKey ? (
-              <div className="grid gap-2">
-                <Label htmlFor="provider-api-key">API key</Label>
-                <Input
-                  id="provider-api-key"
-                  type="password"
-                  autoComplete="off"
-                  placeholder={providerName === "deepseek" ? "sk-… (DeepSeek)" : "sk-…"}
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  disabled={save.isPending}
-                />
+            {isCodex ? (
+              <div className="space-y-3">
+                <p className="text-sm text-foreground">
+                  Run this in your terminal, then click Verify Codex auth:
+                </p>
+                <pre className="rounded-md bg-[#0F0F13] px-4 py-3 font-mono text-xs text-[#C2C2C8]">codex --login</pre>
+                <p className="text-xs text-muted-foreground">
+                  Gini reads <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.codex/auth.json</code> on
+                  every request, so a future <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">codex --login</code> refresh is picked up automatically.
+                </p>
               </div>
-            ) : null}
+            ) : (
+              <>
+                {requiresApiKey ? (
+                  <div className="grid gap-2">
+                    <Label htmlFor="provider-api-key">API key</Label>
+                    <Input
+                      id="provider-api-key"
+                      type="password"
+                      autoComplete="off"
+                      placeholder={providerName === "deepseek" ? "sk-… (DeepSeek)" : "sk-…"}
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      disabled={save.isPending}
+                    />
+                  </div>
+                ) : null}
 
-            <div className="grid gap-2">
-              <Label htmlFor="provider-model">Default model</Label>
-              <Select
-                key={providerName}
-                defaultValue={selectedModel}
-                onValueChange={setSelectedModel}
-                disabled={!entry || save.isPending}
-              >
-                <SelectTrigger id="provider-model"><SelectValue placeholder="Select model" /></SelectTrigger>
-                <SelectContent>
-                  {entry?.models.map((m) => (
-                    <SelectItem key={m} value={m}>{m}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
+                <div className="grid gap-2">
+                  <Label htmlFor="provider-model">Default model</Label>
+                  <Select
+                    key={providerName}
+                    defaultValue={selectedModel}
+                    onValueChange={setSelectedModel}
+                    disabled={!entry || save.isPending}
+                  >
+                    <SelectTrigger id="provider-model"><SelectValue placeholder="Select model" /></SelectTrigger>
+                    <SelectContent>
+                      {entry?.models.map((m) => (
+                        <SelectItem key={m} value={m}>{m}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </>
+            )}
 
             <div className="flex items-center justify-end gap-3 border-t border-[#1F1F26] pt-5">
               <Button asChild variant="outline" type="button">
                 <Link href="/settings">Cancel</Link>
               </Button>
               <Button type="submit" disabled={!canSubmit}>
-                {save.isPending ? "Saving…" : "Save provider"}
+                {save.isPending
+                  ? (isCodex ? "Verifying…" : "Saving…")
+                  : (isCodex ? "Verify Codex auth" : "Save provider")}
               </Button>
             </div>
           </form>
