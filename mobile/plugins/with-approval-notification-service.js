@@ -143,17 +143,31 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
     target.uuid
   );
 
-  // 3) Create a PBXGroup that holds the NSE's source files. Mirrors
-  //    the on-disk layout `ios/<TargetName>/` so opening the project
-  //    in Xcode shows the same hierarchy the prebuild laid down.
-  const pbxGroup = xcodeProject.addPbxGroup(
-    [
-      "NotificationService.swift",
-      `${targetName}-Info.plist`
-    ],
-    targetName,
-    targetName
-  );
+  // 3) Create an EMPTY PBXGroup at <SRCROOT>/<targetName>/. We
+  //    deliberately do not pass file names here.
+  //
+  //    Why: xcode-cli's addPbxGroup eagerly creates BOTH a
+  //    PBXFileReference and a PBXBuildFile for every file in its
+  //    input array (see node_modules/xcode/lib/pbxProject.js:528–
+  //    534). It never attaches the PBXBuildFile to a build phase, so
+  //    that build file is orphaned in the pbxproj.
+  //
+  //    Then when we later call addSourceFile for the swift file,
+  //    xcode-cli's addFile (called internally) runs `hasFile(path)`
+  //    against the already-created PBXFileReference and returns
+  //    null — its "null is better for early errors" guard. That
+  //    bubbles up as `file = null` in addSourceFile, which silently
+  //    bails before reaching addToPbxSourcesBuildPhase. The Swift
+  //    source is therefore never added to the NSE's Sources phase,
+  //    Xcode compiles nothing for the NSE target, and the .appex
+  //    ships with no executable — which crashes the App Store
+  //    Connect upload (CFBundleExecutable points at a missing
+  //    binary).
+  //
+  //    Passing [] lets addSourceFile below own the entire
+  //    file-ref + build-file + Sources-phase creation chain end to
+  //    end.
+  const pbxGroup = xcodeProject.addPbxGroup([], targetName, targetName);
 
   // 4) Attach that group to the project's root group so it shows up in
   //    Xcode's navigator (otherwise the files exist on disk but aren't
@@ -171,20 +185,29 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
     }
   }
 
-  // 5) Add the Swift source to the Sources build phase. The
-  //    {target: target.uuid} option is the part that wires the file
-  //    reference to *this* target (without it, Xcode adds the file to
-  //    the host app's Sources phase by accident). The path is the
-  //    basename only: the parent PBXGroup already carries
-  //    `path = targetName`, so xcodebuild resolves the build input as
-  //    `<SRCROOT>/<group.path>/NotificationService.swift`. Prefixing
-  //    the target name here would double it
-  //    (`<targetName>/<targetName>/…`).
+  // 5) Add the Swift source. Now that the group has no pre-existing
+  //    file ref for "NotificationService.swift", addSourceFile takes
+  //    the full path: addFile creates a PBXFileReference inside
+  //    pbxGroup, stamps file.target = target.uuid, registers a
+  //    PBXBuildFile, and pushes that PBXBuildFile into THIS target's
+  //    PBXSourcesBuildPhase. The path is the basename only — the
+  //    parent group already carries `path = targetName`, so xcodebuild
+  //    resolves the build input as
+  //    `<SRCROOT>/<group.path>/NotificationService.swift`.
   xcodeProject.addSourceFile(
     "NotificationService.swift",
     { target: target.uuid },
     pbxGroup.uuid
   );
+
+  // 5a) Register the NSE's Info.plist as a plain file reference inside
+  //     the group. xcodebuild consumes it via the INFOPLIST_FILE build
+  //     setting (configured below) — it does not need to be in a
+  //     PBXResourcesBuildPhase, and listing it there would actually
+  //     bundle a stray copy of the plist into the .appex's Resources
+  //     directory. addFile creates only the PBXFileReference (no
+  //     PBXBuildFile), which is what we want.
+  xcodeProject.addFile(`${targetName}-Info.plist`, pbxGroup.uuid);
 
   // 6) Configure per-build-config settings the NSE needs:
   //    - Info.plist path
