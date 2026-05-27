@@ -1,3 +1,5 @@
+import type { TunnelPersistedConfig } from "./runtime/tunnel/types";
+
 // `default` is the production end-user install (set by ~/.local/bin/gini).
 // Anything else is a developer worktree (auto-derived from the repo dir
 // basename) or a named test/smoke instance.
@@ -171,6 +173,14 @@ export interface RuntimeConfig {
   workspaceRoot: string;
   stateRoot: string;
   logRoot: string;
+  // On-disk tunnel block, kept in sync by TunnelManager so the four
+  // whole-config writers (`updateAutoApproveSettings`,
+  // `setSetupProvider`, the boot-time approval-mode migration, …) don't
+  // silently clobber an enable / disable / rotate-secret transition
+  // when they serialize the in-memory config back to disk. The manager
+  // mutates this field after every `patchTunnelConfig` call. Optional
+  // because legacy `config.json` files predate the field.
+  tunnel?: TunnelPersistedConfig;
   // User-curated allowlist of shell-glob patterns that bypass the approval
   // gate for terminal_exec. Patterns match the full command string (e.g.
   // `memo *` matches any command starting with "memo "). Auto-approved

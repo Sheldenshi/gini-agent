@@ -73,6 +73,12 @@ class TunnelManager {
     // idempotent — subsequent boots see the existing block and skip the
     // rewrite, so config.json's mtime doesn't leak enable history.
     const persisted = ensureTunnelConfig(config.instance);
+    // Mirror the on-disk tunnel block into the in-memory RuntimeConfig so
+    // unrelated whole-config writers (updateAutoApproveSettings,
+    // setSetupProvider, …) serialize the up-to-date tunnel state instead
+    // of a stale boot-time snapshot. The manager keeps this field in sync
+    // through `persistTunnel` below.
+    config.tunnel = persisted;
     // Stale publicUrl from a previous boot becomes invalid the moment
     // cloudflared rotates hostnames on restart. Remove on construction so
     // the proxy can't equality-match against a host that no cloudflared
@@ -120,6 +126,21 @@ class TunnelManager {
     return readTunnelConfig(this.config.instance);
   }
 
+  /** Atomic disk write of the tunnel block PLUS in-memory sync so any
+   *  whole-config writer that runs later (e.g. `updateAutoApproveSettings`,
+   *  `setSetupProvider`) serializes the up-to-date tunnel state instead
+   *  of the stale boot-time snapshot it picked up from `loadConfig`.
+   *  Without this mirror, an enable / disable / rotate-secret transition
+   *  would land on disk but the next unrelated config save would clobber
+   *  it from the in-memory `RuntimeConfig`. */
+  private persistTunnel(
+    patch: Partial<TunnelPersistedConfig> & { appleNotes?: Partial<TunnelPersistedConfig["appleNotes"]> }
+  ): TunnelPersistedConfig {
+    const next = patchTunnelConfig(this.config.instance, patch);
+    this.config.tunnel = next;
+    return next;
+  }
+
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     let outerResolve!: (value: T) => void;
     let outerReject!: (err: unknown) => void;
@@ -152,7 +173,7 @@ class TunnelManager {
       try {
         // Commit enabled:true to config first. The proxy reads tunnel.enabled
         // on every request; ordering is important for the 5000 ms exposure cap.
-        const persisted = patchTunnelConfig(this.config.instance, { enabled: true });
+        const persisted = this.persistTunnel( { enabled: true });
         setRedactionSecret(persisted.secret);
         // Stop any existing tunnel before spawning a new one — call sites use
         // this both to bring up after disable and to recycle on port change.
@@ -172,7 +193,7 @@ class TunnelManager {
           if (this.shuttingDown) {
             this.cloudflared = null;
             try { await launch.stop(); } catch { /* already gone */ }
-            try { patchTunnelConfig(this.config.instance, { enabled: false }); } catch { /* best-effort */ }
+            try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
             try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
             this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: "shutdown" };
             return { ok: false, error: "shutdown" };
@@ -255,7 +276,7 @@ class TunnelManager {
           // Roll back the persisted enabled:true so the next gateway boot
           // doesn't see a stale "enabled with no live tunnel" claim and so
           // proxy requests stop being accepted immediately.
-          try { patchTunnelConfig(this.config.instance, { enabled: false }); } catch { /* surfaced via lastError */ }
+          try { this.persistTunnel( { enabled: false }); } catch { /* surfaced via lastError */ }
           try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
           const msg = err instanceof Error ? err.message : String(err);
           this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(msg) };
@@ -267,7 +288,7 @@ class TunnelManager {
       } catch (err) {
         // Outer-catch covers config-write failure before launch — keep the
         // persisted state consistent with the in-memory snapshot.
-        try { patchTunnelConfig(this.config.instance, { enabled: false }); } catch { /* best-effort */ }
+        try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
         const msg = err instanceof Error ? err.message : String(err);
         this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(msg) };
         return { ok: false, error: redact(msg) };
@@ -286,7 +307,7 @@ class TunnelManager {
       // in lastError but keep the disable flow committed.
       let configErr: string | null = null;
       try {
-        patchTunnelConfig(this.config.instance, { enabled: false });
+        this.persistTunnel( { enabled: false });
       } catch (err) {
         configErr = err instanceof Error ? err.message : String(err);
         appendLog(this.config.instance, "tunnel.disable.config-error", { error: redact(configErr) });
@@ -332,32 +353,17 @@ class TunnelManager {
   /** Mint a fresh secret atomically. The next request's cookie no longer
    *  matches the live secret — 404 on the next hit. */
   async rotateSecret(): Promise<TunnelTransitionResult> {
-    return this.enqueue(async () => {
+    let scheduledGeneration = 0;
+    const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       // Bump the generation so any in-flight detached Notes refresh from
-      // a prior enable() bails before writing the now-stale URL/secret to
-      // iCloud Notes.
+      // a prior enable() / rotateSecret() bails before writing the now-
+      // stale URL/secret to iCloud Notes.
       this.generation += 1;
       try {
-        const next = patchTunnelConfig(this.config.instance, { secret: generateTunnelSecret() });
+        const next = this.persistTunnel( { secret: generateTunnelSecret() });
         this.snapshot = { ...this.snapshot, secret: next.secret, secretRevision: secretRevision(next.secret, this.snapshot.publicUrl) };
         setRedactionSecret(next.secret);
-        // Refresh Notes if mirror is on and tunnel is up — the note carries
-        // the URL which embeds the secret as the QR-encoded path.
-        if (this.snapshot.appleNotes.enabled && this.snapshot.publicUrl && this.notesAvailable) {
-          try {
-            await writeNote({
-              folder: NOTES_FOLDER,
-              noteName: this.notesNoteName(),
-              body: bootstrapUrl(this.snapshot.publicUrl, next.secret)
-            });
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.snapshot = {
-              ...this.snapshot,
-              appleNotes: { ...this.snapshot.appleNotes, lastError: redact(msg) }
-            };
-          }
-        }
+        scheduledGeneration = this.generation;
         appendLog(this.config.instance, "tunnel.secret-rotated", {});
         return { ok: true, snapshot: this.snapshot };
       } catch (err) {
@@ -366,6 +372,17 @@ class TunnelManager {
         return { ok: false, error: redact(msg) };
       }
     });
+    // Fire-and-forget the Notes refresh OUTSIDE the apply chain — same
+    // pattern enable() and setAppleNotesEnabled() use. Awaiting writeNote
+    // inside the enqueue body would sit a 15s osascript timeout in front
+    // of any follow-up disable(), defeating PLAN.md's 5000ms exposure
+    // cap. The captured scheduledGeneration gate inside runRefreshNotes
+    // bails if a concurrent disable / re-rotate / re-enable moves on
+    // before the write lands.
+    if (result.ok && this.snapshot.appleNotes.enabled && this.snapshot.publicUrl && this.notesAvailable) {
+      void this.runRefreshNotes(scheduledGeneration).catch(() => { /* surfaced in appleNotes.lastError */ });
+    }
+    return result;
   }
 
   async setAppleNotesEnabled(enabled: boolean): Promise<TunnelTransitionResult> {
@@ -377,7 +394,7 @@ class TunnelManager {
     let scheduledGeneration = 0;
     const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       try {
-        patchTunnelConfig(this.config.instance, { appleNotes: { enabled } });
+        this.persistTunnel( { appleNotes: { enabled } });
         const notes: AppleNotesState = {
           enabled,
           notesAvailable: this.notesAvailable,
