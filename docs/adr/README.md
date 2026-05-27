@@ -26,4 +26,3 @@ Each file in this directory captures one architecture decision: the context, the
 - [Openclaw Migration](openclaw-migration.md)
 - [BFF Trust Boundary For Privileged POSTs](bff-trust-boundary.md)
 - [Mobile Push Notifications (APNs + NSE + Inline Actions)](mobile-push-notifications.md)
-- [Gateway CORS For Browser-Origin Clients](gateway-cors.md)
