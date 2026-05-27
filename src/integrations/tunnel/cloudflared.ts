@@ -60,18 +60,51 @@ export interface SpawnTunnelOptions {
 
 const REDACTED_PLACEHOLDER = "[redacted]";
 
-function redactBytes(value: Uint8Array, redactStrings: readonly string[] | undefined): Uint8Array {
-  if (!redactStrings || redactStrings.length === 0) return value;
-  // The redact strings are ASCII (base64url secret characters); decoding
-  // as UTF-8 + replace + re-encode is safe for the substrings we care
-  // about. A multi-byte UTF-8 sequence split across chunks could only
-  // affect surrounding bytes that aren't part of any redact string.
-  let text = new TextDecoder().decode(value);
-  for (const secret of redactStrings) {
-    if (!secret) continue;
-    text = text.replaceAll(secret, REDACTED_PLACEHOLDER);
+/**
+ * Stateful redactor that holds back the trailing N-1 bytes of every
+ * input chunk (where N is the longest redact string) so a secret
+ * straddling a chunk boundary still matches. Each `consume` returns
+ * the bytes that are safe to flush now; `flush` returns any held
+ * remainder when the stream closes.
+ */
+class StreamingRedactor {
+  private readonly secrets: readonly string[];
+  private readonly maxLen: number;
+  private buffer = "";
+
+  constructor(secrets: readonly string[] | undefined) {
+    this.secrets = (secrets ?? []).filter((s): s is string => typeof s === "string" && s.length > 0);
+    this.maxLen = this.secrets.reduce((max, s) => Math.max(max, s.length), 0);
   }
-  return new TextEncoder().encode(text);
+
+  consume(value: Uint8Array): Uint8Array {
+    if (this.secrets.length === 0) return value;
+    // Decode as UTF-8. cloudflared stderr is ASCII, so chunk-split
+    // multi-byte sequences aren't a concern in practice; on the
+    // boundary we hold back maxLen-1 chars regardless of encoding.
+    this.buffer += new TextDecoder().decode(value);
+    if (this.buffer.length <= this.maxLen - 1) return new Uint8Array(0);
+    // Keep the trailing (maxLen - 1) characters as the holdover —
+    // the next chunk's prefix combined with this tail still has a
+    // chance to form a complete secret occurrence.
+    const cutoff = this.buffer.length - (this.maxLen - 1);
+    let release = this.buffer.slice(0, cutoff);
+    this.buffer = this.buffer.slice(cutoff);
+    for (const secret of this.secrets) {
+      release = release.replaceAll(secret, REDACTED_PLACEHOLDER);
+    }
+    return new TextEncoder().encode(release);
+  }
+
+  flush(): Uint8Array {
+    if (this.secrets.length === 0 || this.buffer.length === 0) return new Uint8Array(0);
+    let release = this.buffer;
+    this.buffer = "";
+    for (const secret of this.secrets) {
+      release = release.replaceAll(secret, REDACTED_PLACEHOLDER);
+    }
+    return new TextEncoder().encode(release);
+  }
 }
 
 export interface TunnelHandle {
@@ -261,11 +294,15 @@ async function parseUrlFromStderr(
   if (!stream) throw new Error("cloudflared stderr is not piped");
   const reader = stream.getReader();
   const decoder = new TextDecoder();
+  const redactor = new StreamingRedactor(redactStrings);
   let buffer = "";
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    if (log) await log.write(Buffer.from(redactBytes(value, redactStrings)));
+    if (log) {
+      const safe = redactor.consume(value);
+      if (safe.length > 0) await log.write(Buffer.from(safe));
+    }
     buffer += decoder.decode(value, { stream: true });
     let nl = buffer.indexOf("\n");
     while (nl !== -1) {
@@ -280,16 +317,22 @@ async function parseUrlFromStderr(
         // cloudflared's writer blocks, eventually deadlocking the
         // subprocess.
         try { reader.releaseLock(); } catch { /* ignore */ }
-        const drained = keepDraining(stream, log, redactStrings);
+        const drained = keepDraining(stream, log, redactor);
         return { url, drained };
       }
       nl = buffer.indexOf("\n");
     }
   }
+  // Stream closed before URL: flush held-back bytes (if redacting) so
+  // we don't lose any tail material the log was supposed to carry.
+  if (log) {
+    const tail = redactor.flush();
+    if (tail.length > 0) await log.write(Buffer.from(tail));
+  }
   throw new Error("cloudflared stderr closed before a URL appeared");
 }
 
-function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null, redactStrings: readonly string[] | undefined): Promise<void> {
+function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null, redactor: StreamingRedactor): Promise<void> {
   // Continue reading stderr without blocking startup. When a log handle
   // is provided we copy bytes into it; without one we discard. Errors
   // are swallowed so a closed log or stream can't keep the process
@@ -302,7 +345,16 @@ function keepDraining(stream: ReadableStream<Uint8Array>, log: FileHandle | null
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        if (log) await log.write(Buffer.from(redactBytes(value, redactStrings)));
+        if (log) {
+          const safe = redactor.consume(value);
+          if (safe.length > 0) await log.write(Buffer.from(safe));
+        }
+      }
+      // Stream closed: flush held-back bytes so the log doesn't lose
+      // the final fragment of stderr.
+      if (log) {
+        const tail = redactor.flush();
+        if (tail.length > 0) await log.write(Buffer.from(tail));
       }
     } catch {
       /* ignore */
@@ -317,6 +369,23 @@ function defaultSpawner(
   // Bun's Subprocess shape is broader than the minimal interface we expose
   // to consumers; the cast narrows the return type without leaking
   // Bun-specific shape into callers.
-  const child = Bun.spawn(command, { ...opts, stdin: "ignore" });
+  //
+  // Spawn cloudflared with a SANITIZED environment, not the gateway's
+  // ambient one. cloudflared honours `TUNNEL_HTTP_HOST_HEADER` (per
+  // its origin-parameters docs) — when set, every request forwarded
+  // from cloudflared to the local origin carries the configured
+  // value as `Host:`. If that env var leaked in from the operator's
+  // shell or a co-tenant launcher to say `localhost`, every tunneled
+  // request would arrive at proxy.ts with a loopback Host, the
+  // isLocalHostName check would pass, and the secret-path gate would
+  // be bypassed entirely. Whitelist only PATH, HOME, USER, LANG, TZ
+  // — enough for cloudflared to find its binary, locate its own
+  // cache dir, and produce timestamps in the operator's locale.
+  const env: Record<string, string> = {};
+  for (const key of ["PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ"]) {
+    const value = process.env[key];
+    if (typeof value === "string") env[key] = value;
+  }
+  const child = Bun.spawn(command, { ...opts, stdin: "ignore", env });
   return child as unknown as ReturnType<NonNullable<SpawnTunnelOptions["spawn"]>>;
 }

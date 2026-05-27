@@ -381,6 +381,16 @@ const startWebHealthPolling = (): void => {
     const target = currentWebTarget;
     probeWebHealthy(target).then((healthy) => {
       probeInFlight = false;
+      // Discard the result if the target moved while the probe was
+      // in flight (a successful recycle landed a new port between
+      // probe start and probe resolve). Acting on a stale failure
+      // would trigger an unnecessary recycle of the now-healthy
+      // new target; acting on a stale success would suppress a
+      // legitimate failure detection for the new target.
+      if (currentWebTarget !== target) {
+        webHealthFailureStreak = 0;
+        return;
+      }
       if (healthy) {
         webHealthFailureStreak = 0;
         return;
