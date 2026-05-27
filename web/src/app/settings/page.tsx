@@ -94,7 +94,11 @@ export default function SettingsPage() {
     <>
       <PageHeader title="Settings" description="Providers, browser, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
-        <ProviderCard displayName={displayName} model={effectiveProviderModel} />
+        <ProviderCard
+          displayName={displayName}
+          model={effectiveProviderModel}
+          catalog={catalog.data ?? []}
+        />
 
         <BrowserSettingsCard />
 

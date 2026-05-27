@@ -49,8 +49,19 @@ import { writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
+
+// OpenAI-compatible providers that authenticate via an env var written to
+// ~/.gini/secrets.env. `local` allows an empty key because many local
+// gateways (Ollama, LM Studio) accept no-auth requests. Codex is excluded
+// because it uses its own OAuth/auth.json flow.
+const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
+  openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
+  openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
+  deepseek: { envVar: "DEEPSEEK_API_KEY", allowEmptyKey: false, defaultModel: "deepseek-v4-flash" },
+  local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" }
+};
 
 export interface SetupStatus {
   ok: true;
@@ -108,29 +119,39 @@ export async function setSetupProvider(
       error: `Unsupported provider '${providerName}'. Allowed: ${SUPPORTED_PROVIDERS.join(", ")}.`
     };
   }
-  if (providerName === "openai") {
+  const envKeySpec = ENV_KEY_PROVIDERS[providerName];
+  if (envKeySpec) {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
-    if (!apiKey) {
+    if (!apiKey && !envKeySpec.allowEmptyKey) {
       return {
         ok: false,
         provider: providerHealth(config),
         plistRefreshNeeded: false,
-        error: "apiKey is required for the openai provider."
+        error: `apiKey is required for the ${providerName} provider.`
       };
     }
-    // Persist to secrets.env so the wrapper-sourced env carries it on
-    // future shell launches. The shared writer lives in src/state/ —
-    // both CLI and runtime are allowed to depend on src/state/.
-    writeKeyToSecretsEnv("OPENAI_API_KEY", apiKey);
-    // Make the running gateway use the new key on its very next
-    // provider call. readOpenAIBearer reads process.env on each call,
-    // so this assignment is enough — no restart needed.
-    process.env.OPENAI_API_KEY = apiKey;
+    if (apiKey) {
+      // Persist to secrets.env so the wrapper-sourced env carries it on
+      // future shell launches. The shared writer lives in src/state/ —
+      // both CLI and runtime are allowed to depend on src/state/.
+      writeKeyToSecretsEnv(envKeySpec.envVar, apiKey);
+      // Make the running gateway use the new key on its very next
+      // provider call. readOpenAIBearer reads process.env on each call,
+      // so this assignment is enough — no restart needed.
+      process.env[envKeySpec.envVar] = apiKey;
+    }
 
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
-      : (config.provider?.name === "openai" && config.provider.model ? config.provider.model : "gpt-5.4-mini");
-    config.provider = normalizeProvider({ name: "openai", model });
+      : (config.provider?.name === providerName && config.provider.model ? config.provider.model : envKeySpec.defaultModel);
+    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
+      ? payload.baseUrl.trim()
+      : undefined;
+    config.provider = normalizeProvider({
+      name: providerName as ProviderConfig["name"],
+      model,
+      ...(baseUrl ? { baseUrl } : {})
+    });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
@@ -143,7 +164,7 @@ export async function setSetupProvider(
     // SIGTERM handler reads the marker and execs the refresh as the
     // very last thing on the way out. See
     // src/runtime/autostart-refresh.ts.
-    const refreshed = requestAutostartRefresh(config.instance);
+    const refreshed = apiKey ? requestAutostartRefresh(config.instance) : false;
 
     return {
       ok: true,
