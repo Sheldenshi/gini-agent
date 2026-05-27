@@ -110,14 +110,17 @@ describe("formatIssueBody", () => {
 });
 
 describe("buildIssueUrl", () => {
-  test("points at the canonical Lilac-Labs/gini-agent repo with the bug label", () => {
+  test("points at the canonical Lilac-Labs/gini-agent repo via the bug_report template", () => {
     const url = buildIssueUrl(
       { title: "T", whatHappened: "x", stepsToReproduce: "", expected: "" },
       {}
     );
     expect(url.startsWith("https://github.com/Lilac-Labs/gini-agent/issues/new?")).toBe(true);
     const parsed = new URL(url);
-    expect(parsed.searchParams.get("labels")).toBe("bug");
+    // The template parameter is what carries the `bug` label here; the
+    // `labels` parameter would 404 for reporters without triage permission.
+    expect(parsed.searchParams.get("template")).toBe("bug_report.md");
+    expect(parsed.searchParams.get("labels")).toBeNull();
     expect(parsed.searchParams.get("title")).toBe("T");
     expect(parsed.searchParams.get("body")).toContain("### What happened?");
   });

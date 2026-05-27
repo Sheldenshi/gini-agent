@@ -71,11 +71,19 @@ export function formatIssueBody(input: BugReportInput, ctx: BugReportContext): s
   ].join("\n");
 }
 
+// Reference the existing issue template instead of asserting the `bug`
+// label directly: GitHub's `labels` query parameter requires the
+// reporter to have push/triage permission on the repo and otherwise
+// 404s, which would break the in-app reporter for any external user.
+// Pointing at the template applies its front-matter labels (see
+// .github/ISSUE_TEMPLATE/bug_report.md) without that permission gate.
+// We still send `body` so GitHub uses our prefilled content rather than
+// the template's section scaffolding.
 export function buildIssueUrl(input: BugReportInput, ctx: BugReportContext): string {
   const params = new URLSearchParams();
   params.set("title", formatIssueTitle(input));
   params.set("body", formatIssueBody(input, ctx));
-  params.set("labels", "bug");
+  params.set("template", "bug_report.md");
   return `${REPO_ISSUE_URL}?${params.toString()}`;
 }
 
