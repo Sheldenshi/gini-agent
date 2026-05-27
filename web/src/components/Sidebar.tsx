@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import {
   Activity,
   AlertTriangle,
+  Bug,
   Cog,
   Download,
   Loader2,
@@ -30,6 +31,8 @@ import { api } from "@/lib/api";
 import { useStatus } from "@/lib/queries";
 import { AgentSwitcher } from "@/components/AgentSwitcher";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
+
+const REPORT_BUG_URL = "https://github.com/Lilac-Labs/gini-agent/issues";
 
 type NavItem = { href: string; label: string; icon: LucideIcon };
 type NavGroup = readonly NavItem[];
@@ -99,6 +102,18 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             })}
           </div>
         ))}
+        <div className="mt-2 border-t border-sidebar-border pt-2">
+          <a
+            href={REPORT_BUG_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={onNavigate}
+            className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+          >
+            <Bug className="h-4 w-4" />
+            Report a bug
+          </a>
+        </div>
       </nav>
       <UpdateReminder />
     </div>
