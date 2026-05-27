@@ -13,8 +13,14 @@ const APP_SCHEME = "gini";
 
 const EAS_PROJECT_ID = process.env.EAS_PROJECT_ID;
 const EXPO_OWNER = process.env.EXPO_OWNER;
-const EXPO_UPDATES_URL = process.env.EXPO_UPDATES_URL;
 const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID;
+
+// EAS-hosted OTA URL is deterministic from the project id. Self-hosters
+// who point at their own server can replace this with a constant or a
+// new env var when that comes up.
+const EXPO_UPDATES_URL = EAS_PROJECT_ID
+  ? `https://u.expo.dev/${EAS_PROJECT_ID}`
+  : undefined;
 
 const config: ExpoConfig = {
   name: APP_NAME,

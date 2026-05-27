@@ -83,9 +83,8 @@ edit one place.
 
 | Var                 | Where to get it                                           |
 |---------------------|-----------------------------------------------------------|
-| `EAS_PROJECT_ID`    | `eas init` in `mobile/`                                   |
+| `EAS_PROJECT_ID`    | `eas init` in `mobile/`. The OTA URL is derived from it.  |
 | `EXPO_OWNER`        | `expo whoami` (your Expo account or org)                  |
-| `EXPO_UPDATES_URL`  | `eas update:configure` output (leave blank to skip OTA)   |
 | `APPLE_TEAM_ID`     | developer.apple.com → Membership → Team ID                |
 
 **3. `eas.json` submit profile** (committed) — replace `appleTeamId` and
