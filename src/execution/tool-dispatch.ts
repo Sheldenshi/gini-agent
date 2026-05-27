@@ -2309,14 +2309,14 @@ async function requestSendMessage(
 }
 
 // Request that the user connect an external provider. Routed through the
-// approval state machine so the chat-task loop pauses naturally — the
+// setup-request state machine so the chat-task loop pauses naturally — the
 // task moves to waiting_approval, the chat UI renders a Connect card
 // (branched on `action === "connector.request"`), and the loop resumes
-// when the user finishes the secret entry via POST /api/approvals/<id>/connect.
+// when the user finishes the secret entry via POST /api/setup-requests/<id>/complete.
 //
-// The side effect happens in the connect endpoint, NOT in
+// The side effect happens in the complete endpoint, NOT in
 // executeApprovedAction: the endpoint calls createConnector + checkConnector,
-// then resolves the approval. The corresponding executeApprovedAction
+// then resolves the setup request. The corresponding executeApprovedAction
 // branch is a no-op string that simply tells the model "connected, proceed".
 async function requestConnectorTool(
   config: RuntimeConfig,
@@ -2463,13 +2463,13 @@ async function requestConnectorTool(
   return { kind: "pending", approvalId };
 }
 
-// Browser-fill-secrets tool. Mints a browser.fill_secret approval
+// Browser-fill-secrets tool. Mints a browser.fill_secret setup request
 // whose payload carries the slots the agent wants the user to fill.
 // Same chat-block emission path as request_connector — the chat-task
-// loop's pending-approval handler emits an approval_requested block
+// loop's pending-setup handler emits a setup_requested block
 // into the chat stream as soon as this returns { kind: "pending" }.
 // The card renders inline. On Submit, the BFF forwards to
-// POST /api/approvals/<id>/connect, which detects the action and
+// POST /api/setup-requests/<id>/complete, which detects the action and
 // runs the playwright-fill branch (see src/http.ts). Values are
 // never written to state, audit, or trace payloads.
 async function browserFillSecretsTool(

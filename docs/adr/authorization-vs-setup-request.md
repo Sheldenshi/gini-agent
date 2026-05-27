@@ -9,7 +9,7 @@ Split the legacy single-`Approval` concept into two first-class types differenti
 | `Authorization` | Agent | User clicks approve/deny; the agent then performs the risk-classified action. |
 | `SetupRequest` | User | User performs a setup step (with optional input body); the agent waits, then resumes. |
 
-`Approval` is retired as a named type. `state.approvals` is partitioned into `state.authorizations` and `state.setupRequests` on first read; a one-release `/api/approvals*` alias keeps polling clients alive during deploy.
+`Approval` is retired as a named type. `state.approvals` is partitioned into `state.authorizations` and `state.setupRequests` on first read. Clients hit `/api/authorizations*` and `/api/setup-requests*` directly — no `/api/approvals*` alias is exposed.
 
 ## Context
 
@@ -57,7 +57,7 @@ The per-action audit rows (`browser.connect`, `connector.request`, `browser.fill
 - `POST /api/setup-requests/:id/cancel`
 - `POST /api/setup-requests/:id/open-browser` (stage 1 of the two-stage `browser.connect` flow)
 
-`/api/approvals*` is a deprecated alias for one release: the list endpoint returns the merged collection with a `kind` discriminator; the action endpoints route to the new handlers. A one-line per-process log fires on first hit.
+No `/api/approvals*` alias is exposed; the legacy endpoint family is removed and clients must call `/api/authorizations*` or `/api/setup-requests*` directly.
 
 ## Chat Blocks
 
@@ -75,7 +75,7 @@ The per-action audit rows (`browser.connect`, `connector.request`, `browser.fill
 - `shouldHideRiskBadge` is gone.
 - The `isBrowserConnect` flag survives only as a layout discriminator inside the `BlockSetupRequested` renderer (Connect button vs credential dialog vs inline credential inputs).
 - Old state.json files migrate on first read; a unit test pins the partition.
-- The legacy `/api/approvals*` alias is removed at the next release cycle.
+- The legacy `/api/approvals*` alias is gone — callers must migrate to `/api/authorizations*` and `/api/setup-requests*`.
 
 ## Forward-Looking Notes
 
