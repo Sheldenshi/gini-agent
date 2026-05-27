@@ -82,7 +82,7 @@ Per-action behaviour:
   what the runtime acknowledged at cancel time, not what the page
   state eventually became.
 - **`browser.fill_secret`** — the side effect (per-slot playwright
-  fill) runs INSIDE `POST /api/approvals/<id>/connect`, not inside
+  fill) runs INSIDE `POST /api/setup-requests/<id>/complete`, not inside
   `executeApprovedAction`, so the in-flight registry's
   `claimApproval` / `releaseApproval` lifecycle does NOT cover the
   fill loop. See [browser-fill-secret.md](browser-fill-secret.md)

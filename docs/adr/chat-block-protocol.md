@@ -45,7 +45,9 @@ parsing runtime artifacts that were never meant to drive a UI directly:
 - Approval bubbles came from a separate `/api/approvals` poll, joined
   back to the chat by `taskId`. The Connect dialog vs the regular
   Approve/Deny pair was disambiguated by reading `approval.action`
-  from a different endpoint.
+  from a different endpoint. Today the surface is split into
+  `/api/authorizations*` and `/api/setup-requests*` (see ADR
+  authorization-vs-setup-request.md).
 
 The web client carried this translation logic. When the mobile client
 landed (`mobile/`), it had to reimplement the same vocabulary —
@@ -72,7 +74,8 @@ remote previews, screen readers) would need the same translation code.
     | ToolCallBlock
     | ToolResultBlock
     | PhaseBlock
-    | ApprovalRequestedBlock
+    | AuthorizationRequestedBlock
+    | SetupRequestedBlock
     | SystemNoteBlock;
   ```
 
@@ -106,25 +109,29 @@ remote previews, screen readers) would need the same translation code.
   preserves the partial text the user already saw — cancellation and
   failure paths intentionally do not drop the in-flight row.
 
-- `ApprovalRequestedBlock.action` is part of the wire contract so
-  clients can branch on the card variant without a cross-endpoint
-  join. Three branches:
-  - `connector.request` — render the Connect dialog. Submit posts
-    `{ secrets, scopes, name }` to `/api/approvals/<id>/connect`.
-  - `browser.fill_secret` — render an inline form with one input
-    per slot in `approval.payload.slots`. Submit posts
-    `{ secrets: { <slot.name>: <value>, ... } }` to
-    `/api/approvals/<id>/connect`. The card also reads
-    `approval.payload.approvedUrl` to render the "fill destination"
-    badge so the human reviewer can spot a target mismatch. The
-    generic `/approve` endpoint refuses this action (only `/connect`
-    completes the fill); `/deny` is still valid. See ADR
-    [browser-fill-secret.md](browser-fill-secret.md).
-  - everything else — standard Approve / Deny pair posting to
-    `/api/approvals/<id>/{approve,deny}`.
-
-  The block also carries `risk` and `summary` so the bubble can
-  render without a follow-up `/api/approvals` fetch.
+- `AuthorizationRequestedBlock.action` and `SetupRequestedBlock.action`
+  are part of the wire contract so clients can branch on the card
+  variant without a cross-endpoint join.
+  - `AuthorizationRequestedBlock` — standard Approve / Deny pair
+    posting to `/api/authorizations/<id>/{approve,deny}`. Carries
+    `risk` and `summary` so the bubble renders without a follow-up
+    fetch.
+  - `SetupRequestedBlock` — user-actor card. Three layouts keyed off
+    `action`:
+    - `connector.request` — render the Connect dialog. Submit posts
+      `{ secrets, scopes, name }` to
+      `/api/setup-requests/<id>/complete`.
+    - `browser.fill_secret` — render an inline form with one input
+      per slot in `setupRequest.payload.slots`. Submit posts
+      `{ secrets: { <slot.name>: <value>, ... } }` to
+      `/api/setup-requests/<id>/complete`. The card also reads
+      `setupRequest.payload.approvedUrl` to render the "fill
+      destination" badge so the human reviewer can spot a target
+      mismatch. See ADR [browser-fill-secret.md](browser-fill-secret.md).
+    - `browser.connect` — Connect button posts to
+      `/api/setup-requests/<id>/open-browser`; the follow-up "I've
+      signed in" posts to `/api/setup-requests/<id>/complete`.
+    Cancel always posts to `/api/setup-requests/<id>/cancel`.
 
 - Tool catalog labels live with the catalog. `displayLabel` on each
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`
