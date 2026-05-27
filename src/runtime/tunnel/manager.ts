@@ -194,17 +194,27 @@ class TunnelManager {
     // not fire for past exits. Identity check + null-cloudflared
     // guards double-cleanup when the catch block below also handles
     // the same exit.
-    launch.process.once("exit", (code) => {
+    launch.process.once("exit", (code, signal) => {
       if (this.cloudflared !== launch) return;
       this.cloudflared = null;
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
       setRedactionPublicUrl(null);
+      // `proc.on("exit", (code, signal))` reports exactly one of the two:
+      // normal exits set `code` and leave `signal` null, signal-driven
+      // termination sets `signal` and leaves `code` null. The pre-banner
+      // check below already distinguishes them; mirror the same shape
+      // here so a SIGKILL'd cloudflared surfaces as "signal SIGKILL"
+      // instead of the noise-y "(code ?)" string.
+      const reason = code !== null ? `code ${code}` : `signal ${signal}`;
       this.snapshot = {
         ...this.snapshot,
         publicUrl: null,
-        lastError: redact(`cloudflared exited (code ${code ?? "?"})`)
+        lastError: redact(`cloudflared exited (${reason})`)
       };
-      appendLog(this.config.instance, "tunnel.cloudflared.exit", { code: code ?? null });
+      appendLog(this.config.instance, "tunnel.cloudflared.exit", {
+        code: code ?? null,
+        signal: signal ?? null
+      });
     });
     try {
       const url = await launch.publicUrl;
