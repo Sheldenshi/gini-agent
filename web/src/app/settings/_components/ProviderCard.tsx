@@ -176,20 +176,31 @@ export function ProviderCard({
                     Set active
                   </Button>
                 )}
-                <Button asChild type="button" variant="outline" size="icon" aria-label={`Edit ${displayProviderName(row)}`}>
-                  <Link href={`/settings/add-provider?provider=${row.name}`}>
-                    <PencilIcon className="size-4 text-[#9A9AA0]" />
-                  </Link>
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  aria-label={`Remove ${displayProviderName(row)}`}
-                  disabled
-                >
-                  <Trash2Icon className="size-4 text-[#9A9AA0]" />
-                </Button>
+                {/*
+                  Codex authenticates via codex --login → ~/.codex/auth.json,
+                  so there's no key or model to edit from this UI and nothing
+                  to "remove" without breaking the user's shell auth. Hide
+                  both row-level actions for codex; the Verify flow on the
+                  Add Provider page is the only place codex re-auth lives.
+                */}
+                {row.name === "codex" ? null : (
+                  <>
+                    <Button asChild type="button" variant="outline" size="icon" aria-label={`Edit ${displayProviderName(row)}`}>
+                      <Link href={`/settings/add-provider?provider=${row.name}`}>
+                        <PencilIcon className="size-4 text-[#9A9AA0]" />
+                      </Link>
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      aria-label={`Remove ${displayProviderName(row)}`}
+                      disabled
+                    >
+                      <Trash2Icon className="size-4 text-[#9A9AA0]" />
+                    </Button>
+                  </>
+                )}
               </div>
             </li>
           );
