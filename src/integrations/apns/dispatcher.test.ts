@@ -93,6 +93,14 @@ describe("apns dispatcher", () => {
     expect((aps.alert as Record<string, unknown>).body).toBe("Tap to review");
     expect(aps.category).toBe("APPROVAL_REQUEST");
     expect(aps["thread-id"]).toBe("chat_xyz");
+    // `mutable-content: 1` is what causes iOS to invoke the
+    // Notification Service Extension before display. The NSE attaches
+    // the APPROVAL_REQUEST category id so the lock-screen Approve /
+    // Deny actions surface — without this flag, the NSE never runs.
+    // Number-typed (not boolean) per APNs spec: JSON `true`
+    // is silently ignored.
+    expect(aps["mutable-content"]).toBe(1);
+    expect(typeof aps["mutable-content"]).toBe("number");
     // Defensive: nothing carrying the summary or action verb leaked
     // into the wire payload.
     const serialized = JSON.stringify(a?.payload);
