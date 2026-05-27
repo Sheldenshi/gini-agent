@@ -12,6 +12,7 @@
         "@expo/vector-icons": "^15.0.3",
         "@react-native-async-storage/async-storage": "2.2.0",
         "@tanstack/react-query": "^5.100.9",
+        "dotenv": "^17.4.2",
         "expo": "~56.0.5",
         "expo-constants": "~56.0.16",
         "expo-dev-client": "~56.0.16",
@@ -608,6 +609,8 @@
     "dnssd-advertise": ["dnssd-advertise@1.1.4", "", {}, "sha512-AmGyK9WpNf06WeP5TjHZq/wNzP76OuEeaiTlKr9E/EEelYLczywUKoqRz+DPRq/ErssjT4lU+/W7wzJW+7K/ZA=="],
 
     "dom-accessibility-api": ["dom-accessibility-api@0.6.3", "", {}, "sha512-7ZgogeTnjuHbo+ct10G9Ffp0mif17idi0IyWNVA/wcwcm7NPOD/WEHVP3n7n3MhXqxoIYm8d6MuZohYWIZ4T3w=="],
+
+    "dotenv": ["dotenv@17.4.2", "", {}, "sha512-nI4U3TottKAcAD9LLud4Cb7b2QztQMUEfHbvhTH09bqXTxnSie8WnjPALV/WMCrJZ6UV/qHJ6L03OqO3LcdYZw=="],
 
     "ee-first": ["ee-first@1.1.1", "", {}, "sha512-WMwm9LhRUo+WUaRN+vRuETqG89IgZphVSNkdFgeb6sS/E4OrDIN7t48CAewSHXc6C8lefD8KKfr5vY61brQlow=="],
 

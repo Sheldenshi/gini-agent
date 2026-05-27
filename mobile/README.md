@@ -68,26 +68,29 @@ to the agent picker.
 Gini is open source — the iOS app is yours to fork, rebrand, and ship under
 your own Apple developer account. Three layers to touch:
 
-**1. Per-fork constants in `app.config.ts`** (committed). These are
-project identity — they change once when you fork, never per-environment,
-and EAS CLI reads them statically so env interpolation isn't an option:
+**1. Branding constants in `app.config.ts`** (committed):
 
 - `IOS_BUNDLE_ID` / `ANDROID_PACKAGE` — your reverse-DNS bundle id.
 - `APP_NAME` — what users see on the home screen.
 - `APP_SLUG` — the EAS slug (lowercase, hyphenated).
 - `APP_SCHEME` — your deep-link scheme (e.g. `myagent://`).
-- `EAS_PROJECT_ID` — get one by running `eas init` in `mobile/`.
-- `EXPO_OWNER` — your Expo account or org (from `expo whoami`).
 
 The NSE bundle id and OTA updates URL are derived, so you only edit
 one place.
 
-**2. Per-developer secrets in `mobile/.env`** (gitignored). Copy
-`.env.example` and fill in:
+**2. Org credentials in `mobile/.env`** (gitignored). Copy `.env.example`
+and fill in. These live outside the repo because no fork shares
+permission to use them:
 
-| Var             | Where to get it                                    |
-|-----------------|----------------------------------------------------|
-| `APPLE_TEAM_ID` | developer.apple.com → Membership → Team ID         |
+| Var               | Where to get it                                      |
+|-------------------|------------------------------------------------------|
+| `EAS_PROJECT_ID`  | `eas init` in `mobile/`. The OTA URL derives from it. |
+| `EXPO_OWNER`      | `expo whoami` — your Expo account or org.            |
+| `APPLE_TEAM_ID`   | developer.apple.com → Membership → Team ID.          |
+
+The config loads `.env` via `dotenv/config`, so every Expo / EAS command
+(`expo start`, `expo prebuild`, `eas init`, `eas build`, `eas update`)
+sees the values without extra setup.
 
 **3. `eas.json` submit profile** (committed) — replace `appleTeamId` and
 `ascAppId` under `submit.production.ios` with your own before running
