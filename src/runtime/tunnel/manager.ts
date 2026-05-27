@@ -192,8 +192,48 @@ class TunnelManager {
         }
         const launch = launchCloudflared({ port: webPort });
         this.cloudflared = launch;
+        // Install the post-banner exit listener BEFORE awaiting publicUrl.
+        // `process.once("exit")` does NOT fire for past exits — installing
+        // after the await would miss any exit that happened during banner
+        // parse, leaving the snapshot stamped "live" while cloudflared is
+        // gone. The `this.cloudflared !== launch` identity guard prevents
+        // double-cleanup when the catch block below also runs for the
+        // same exit (the catch nulls cloudflared, so the listener no-ops
+        // on its later fire).
+        //
+        // Liveness is determined by OBJECT IDENTITY (`this.cloudflared
+        // !== launch`), not by `this.generation`. The Notes-refresh
+        // `this.generation` ticks on disable + rotateSecret to invalidate
+        // background Notes writes, but a `rotateSecret` does NOT replace
+        // the cloudflared subprocess — the same launch is still live and
+        // a later crash of it must still be detected.
+        launch.process.once("exit", (code) => {
+          if (this.cloudflared !== launch) return;
+          this.cloudflared = null;
+          try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+          setRedactionPublicUrl(null);
+          this.snapshot = {
+            ...this.snapshot,
+            publicUrl: null,
+            lastError: redact(`cloudflared exited (code ${code ?? "?"})`)
+          };
+          appendLog(this.config.instance, "tunnel.cloudflared.exit", { code: code ?? null });
+        });
         try {
           const url = await launch.publicUrl;
+          // Belt-and-suspenders: `process.once("exit")` fires on the next
+          // event-loop tick, so a same-tick exit between the await
+          // resolution and our snapshot stamp would slip past the listener
+          // long enough for the stamp to record "live". A synchronous
+          // exitCode read catches that gap.
+          if (launch.process.exitCode !== null) {
+            this.cloudflared = null;
+            try { this.persistTunnel({ enabled: false }); } catch { /* best-effort */ }
+            try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+            this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(`cloudflared exited (code ${launch.process.exitCode}) during banner parse`) };
+            setRedactionPublicUrl(null);
+            return { ok: false, error: redact(`cloudflared exited (code ${launch.process.exitCode}) during banner parse`) };
+          }
           // Re-check the shutdown flag after the long await — SIGTERM may
           // have flipped it while we were waiting for cloudflared's banner.
           // Without this re-check we'd publish a publicUrl file the drain
@@ -233,33 +273,6 @@ class TunnelManager {
             this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
             appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
           }
-          // Watch for post-banner cloudflared crashes. The proc.on("exit")
-          // inside launchCloudflared only rejects the publicUrl promise —
-          // which is already resolved at this point, so the reject is a
-          // no-op. Install our own listener so a mid-life cloudflared exit
-          // transitions the snapshot to `lastError` (and clears publicUrl)
-          // per PLAN.md "Operational invariants" line 624: the gateway does
-          // not respawn, but the snapshot must reflect the dead tunnel so
-          // the operator can re-enable.
-          //
-          // Liveness is determined by OBJECT IDENTITY (`this.cloudflared
-          // !== launch`), not by `this.generation`. The Notes-refresh
-          // `this.generation` ticks on disable + rotateSecret to invalidate
-          // background Notes writes, but a `rotateSecret` does NOT replace
-          // the cloudflared subprocess — the same launch is still live and
-          // a later crash of it must still be detected.
-          launch.process.once("exit", (code) => {
-            if (this.cloudflared !== launch) return;
-            this.cloudflared = null;
-            try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-            setRedactionPublicUrl(null);
-            this.snapshot = {
-              ...this.snapshot,
-              publicUrl: null,
-              lastError: redact(`cloudflared exited (code ${code ?? "?"})`)
-            };
-            appendLog(this.config.instance, "tunnel.cloudflared.exit", { code: code ?? null });
-          });
           appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
           // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
           // refreshNotes here would put a 15s osascript timeout ahead of a
