@@ -725,7 +725,15 @@ export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
   const task = await mutateState(config.instance, (state) => {
-    const task = findTask(state, taskId);
+    // The two `runTask(...).catch(failTask(...))` fire-and-forget call
+    // sites in createTask/retryTask can race with test cleanup or a
+    // parent-task cancelation that removes the task row before this
+    // catch handler runs. A removed task is more terminal than
+    // "failed" — nothing left to audit, nothing left to update — so
+    // no-op rather than throwing an unhandled "Task not found" out
+    // through an already-detached promise chain.
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) return null;
     // Idempotent: a sibling approval denial may have already flipped
     // the task to `failed` (see decideApproval-deny). Repeating the
     // audit row would double-count the failure and the in-flight abort
@@ -758,6 +766,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     recordInFlightAborted(state, config.instance, task, "task.failed");
     return task;
   });
+  if (!task) return;
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
