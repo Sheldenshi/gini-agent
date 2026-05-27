@@ -8,11 +8,12 @@ import {
   getLatestMessagesBySession,
   insertChatBlock,
   isTerminalTaskStatus,
+  listChatBlocks,
   mutateState,
   readState,
   renameChatSession
 } from "../state";
-import type { ChatMessageRecord, RuntimeConfig, TaskStatus } from "../types";
+import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
 import { generateStructured } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
@@ -317,21 +318,25 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
   return message;
 }
 
-async function autoRenameChatAfterTurn(config: RuntimeConfig, sessionId: string): Promise<void> {
+export async function autoRenameChatAfterTurn(config: RuntimeConfig, sessionId: string): Promise<void> {
   const snapshot = readState(config.instance);
   const session = snapshot.chatSessions.find((item) => item.id === sessionId);
   if (!session) return;
   if (!isDefaultChatTitle(session.title)) return;
   if (isScheduledJobDeliverySession(snapshot, sessionId)) return;
 
-  const messages = snapshot.chatMessages
-    .filter((message) => message.sessionId === sessionId)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  const userTurns = messages.filter((message) => message.role === "user").length;
-  const assistantTurns = messages.filter((message) => message.role === "assistant").length;
-  if (userTurns < AUTO_RENAME_USER_TURNS || assistantTurns < AUTO_RENAME_ASSISTANT_TURNS) return;
+  // Source of truth is chat_blocks (ADR chat-block-protocol.md). The legacy
+  // chatMessages table only carries user rows for web-driven chats — assistant
+  // text lives in chat_blocks — so a chatMessages-based count would never
+  // cross the threshold for the primary UI path.
+  const blocks = listChatBlocks(config.instance, sessionId);
+  const userBlocks = blocks.filter((b): b is UserTextBlock => b.kind === "user_text");
+  const assistantBlocks = blocks.filter(
+    (b): b is AssistantTextBlock => b.kind === "assistant_text" && !b.streaming
+  );
+  if (userBlocks.length < AUTO_RENAME_USER_TURNS || assistantBlocks.length < AUTO_RENAME_ASSISTANT_TURNS) return;
 
-  const title = await generateChatTitle(config, messages);
+  const title = await generateChatTitleFromBlocks(config, blocks);
   if (!title) return;
 
   await mutateState(config.instance, (state) => {
@@ -353,15 +358,18 @@ function isScheduledJobDeliverySession(state: ReturnType<typeof readState>, sess
   return state.jobs.some((job) => job.chatSessionId === sessionId);
 }
 
-async function generateChatTitle(
+async function generateChatTitleFromBlocks(
   config: RuntimeConfig,
-  messages: ChatMessageRecord[]
+  blocks: ChatBlock[]
 ): Promise<string | undefined> {
-  const transcript = messages
-    .filter((message) => message.role === "user" || message.role === "assistant")
+  const turns = blocks
+    .filter((b) => b.kind === "user_text" || (b.kind === "assistant_text" && !b.streaming))
     .slice(-8)
-    .map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.content}`)
-    .join("\n");
+    .map((b) => {
+      const text = (b as UserTextBlock | AssistantTextBlock).text ?? "";
+      return `${b.kind === "user_text" ? "User" : "Assistant"}: ${text}`;
+    });
+  const transcript = turns.join("\n");
   if (!transcript) return undefined;
 
   const result = await generateStructured(

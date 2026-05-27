@@ -71,6 +71,7 @@ import {
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
+import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
@@ -961,6 +962,15 @@ async function runLoop(
       // the model's text stream doesn't retain a cancelled output.
       if (finished.status === "completed") {
         void scheduleAutoRetain(config, finished);
+        if (finished.chatSessionId) {
+          void autoRenameChatAfterTurn(config, finished.chatSessionId).catch((error) => {
+            appendLog(config.instance, "chat.auto_title.failed", {
+              sessionId: finished.chatSessionId,
+              taskId: finished.id,
+              error: error instanceof Error ? error.message : String(error)
+            });
+          });
+        }
       }
       return finished;
     }
@@ -1295,6 +1305,15 @@ async function runLoop(
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     if (exhausted.status === "completed") {
       void scheduleAutoRetain(config, exhausted);
+      if (exhausted.chatSessionId) {
+        void autoRenameChatAfterTurn(config, exhausted.chatSessionId).catch((error) => {
+          appendLog(config.instance, "chat.auto_title.failed", {
+            sessionId: exhausted.chatSessionId,
+            taskId: exhausted.id,
+            error: error instanceof Error ? error.message : String(error)
+          });
+        });
+      }
     }
     return exhausted;
   } catch (error) {
