@@ -296,10 +296,11 @@ export function TunnelCard() {
                 </>
               ) : (
                 <>
-                  This mints a fresh 192-bit secret and writes it to <code className="font-mono">config.json</code>.
-                  Every outstanding session cookie (including any phone you&apos;ve already paired) mismatches
-                  on the very next request and gets a 404. The Cloudflare hostname stays the same; only the
-                  secret prefix changes. Re-scan the new QR to reconnect.
+                  This mints a fresh 192-bit secret AND recycles <code className="font-mono">cloudflared</code>
+                  &nbsp;so every open TCP / SSE connection drops at the network layer — the panic-button
+                  contract. The rotating <code className="font-mono">trycloudflare.com</code> hostname
+                  changes too, so the host-only session cookie won&apos;t survive a reconnect. Re-scan the
+                  new QR (a freshly-minted URL) to get back in.
                 </>
               )}
             </DialogDescription>
