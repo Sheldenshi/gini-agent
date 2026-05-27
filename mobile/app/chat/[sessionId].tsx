@@ -1,8 +1,12 @@
 import { Feather } from "@expo/vector-icons";
+import * as ImagePicker from "expo-image-picker";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActionSheetIOS,
   ActivityIndicator,
+  Alert,
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -14,7 +18,7 @@ import {
   View
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { api, ApiError } from "@/src/api";
+import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
@@ -24,6 +28,42 @@ import {
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
 import type { ChatBlock } from "@/src/types";
+
+interface PendingImage {
+  localId: string;
+  previewUri: string;
+  filename: string;
+  mimeType: string;
+  status: "uploading" | "ready" | "error";
+  errorMessage?: string;
+  ref?: UploadRef;
+}
+
+// Pull a reasonable filename + mime from the picker asset. iOS hands us
+// the original photo extension (.HEIC/.jpg/...) when available; when it
+// doesn't, we fall back to .jpg since the picker re-encodes HEIC for us
+// only on explicit request. `mediaTypes: ["images"]` already guarantees
+// the asset is an image, so a defaulted image/jpeg type is safe enough
+// for the gateway's mime-prefix guard.
+function describeAsset(asset: ImagePicker.ImagePickerAsset): {
+  filename: string;
+  mimeType: string;
+} {
+  const uriName = asset.fileName ?? asset.uri.split("/").pop() ?? "image.jpg";
+  const filename = uriName.includes(".") ? uriName : `${uriName}.jpg`;
+  const ext = filename.split(".").pop()?.toLowerCase();
+  const mimeFromExt =
+    ext === "png"
+      ? "image/png"
+      : ext === "gif"
+        ? "image/gif"
+        : ext === "webp"
+          ? "image/webp"
+          : ext === "heic" || ext === "heif"
+            ? "image/heic"
+            : "image/jpeg";
+  return { filename, mimeType: asset.mimeType ?? mimeFromExt };
+}
 
 // Placeholder titles the runtime stamps on a freshly created session
 // before the auto-rename runs. Mirrors DEFAULT_CHAT_TITLES in
@@ -44,6 +84,7 @@ export default function ChatDetailScreen() {
   const send = useSendMessage(sessionId ?? null);
 
   const [text, setText] = useState("");
+  const [images, setImages] = useState<PendingImage[]>([]);
   const scrollRef = useRef<ScrollView | null>(null);
 
   // 401 → setup. Effect-driven so all later hooks still run on the
@@ -180,17 +221,123 @@ export default function ChatDetailScreen() {
   }, [list.length, sessionId, lastAssistantUpdatedAt]);
 
   const trimmed = text.trim();
+  const readyImages = useMemo(
+    () => images.filter((image) => image.status === "ready" && image.ref).map((image) => image.ref!),
+    [images]
+  );
+  const anyUploading = images.some((image) => image.status === "uploading");
   const showSendBusy = send.isPending || inFlight;
-  const sendDisabled = !trimmed || showSendBusy || !sessionId;
+  const sendDisabled =
+    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId;
 
   const submit = () => {
     // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
     // also covers in-flight assistant work, not just the mutation's own
     // pending state.
     if (sendDisabled) return;
-    send.mutate(trimmed, {
-      onSuccess: () => setText("")
+    send.mutate(
+      { content: trimmed, images: readyImages },
+      {
+        onSuccess: () => {
+          setText("");
+          setImages([]);
+        }
+      }
+    );
+  };
+
+  // Each picker asset gets a local id so the tray entry can be replaced
+  // in place when its upload finishes (or fails), and removed by the
+  // user before send. The preview uri the picker returns is a stable
+  // local file:// path — safe to render in <Image> without copying.
+  const beginUpload = async (asset: ImagePicker.ImagePickerAsset): Promise<void> => {
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const { filename, mimeType } = describeAsset(asset);
+    setImages((prev) => [
+      ...prev,
+      { localId, previewUri: asset.uri, filename, mimeType, status: "uploading" }
+    ]);
+    try {
+      const ref = await uploadImage({ uri: asset.uri, name: filename, mimeType });
+      setImages((prev) =>
+        prev.map((image) =>
+          image.localId === localId ? { ...image, status: "ready", ref } : image
+        )
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setImages((prev) =>
+        prev.map((image) =>
+          image.localId === localId
+            ? { ...image, status: "error", errorMessage: message }
+            : image
+        )
+      );
+      Alert.alert("Upload failed", message);
+    }
+  };
+
+  const pickFromLibrary = async (): Promise<void> => {
+    const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert(
+        "Photo access required",
+        "Enable photo library access in Settings to attach images."
+      );
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      allowsMultipleSelection: true,
+      // Keep the upload reasonably small; the server has no explicit
+      // cap but transferring full 12MP shots over cellular is wasteful
+      // when the model only consumes ~1024px on the long edge anyway.
+      quality: 0.85
     });
+    if (result.canceled) return;
+    for (const asset of result.assets) void beginUpload(asset);
+  };
+
+  const takePhoto = async (): Promise<void> => {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert(
+        "Camera access required",
+        "Enable camera access in Settings to capture photos."
+      );
+      return;
+    }
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ["images"],
+      quality: 0.85
+    });
+    if (result.canceled) return;
+    for (const asset of result.assets) void beginUpload(asset);
+  };
+
+  const openAttachmentMenu = (): void => {
+    if (Platform.OS === "ios") {
+      ActionSheetIOS.showActionSheetWithOptions(
+        {
+          options: ["Cancel", "Take Photo", "Choose From Library"],
+          cancelButtonIndex: 0
+        },
+        (index) => {
+          if (index === 1) void takePhoto();
+          else if (index === 2) void pickFromLibrary();
+        }
+      );
+    } else {
+      Alert.alert("Attach photo", undefined, [
+        { text: "Take Photo", onPress: () => void takePhoto() },
+        { text: "Choose From Library", onPress: () => void pickFromLibrary() },
+        { text: "Cancel", style: "cancel" }
+      ]);
+    }
+  };
+
+  const removeImage = (localId: string): void => {
+    setImages((prev) => prev.filter((image) => image.localId !== localId));
   };
 
   if (unauthorized) return null;
@@ -253,13 +400,58 @@ export default function ChatDetailScreen() {
           </ScrollView>
         )}
 
-        {/* Input bar — pill input with a leading "+" affordance (no-op
-            in v1) and a navy circular send button. The pill sits inside
-            a white surface bar with a top hairline so the input feels
-            anchored to the bottom edge. */}
+        {/* Input bar — pill input with a leading "+" affordance that
+            opens an attach-photo action sheet, and a navy circular send
+            button. The pill sits inside a white surface bar with a top
+            hairline so the input feels anchored to the bottom edge.
+            Pending image attachments render as a horizontal tray above
+            the pill while they upload and until send. */}
         <View style={styles.inputBar}>
+          {images.length > 0 ? (
+            <ScrollView
+              horizontal
+              keyboardShouldPersistTaps="handled"
+              showsHorizontalScrollIndicator={false}
+              style={styles.thumbTray}
+              contentContainerStyle={styles.thumbTrayContent}
+            >
+              {images.map((image) => (
+                <View
+                  key={image.localId}
+                  style={[
+                    styles.thumb,
+                    image.status === "error" && styles.thumbError
+                  ]}
+                >
+                  <Image source={{ uri: image.previewUri }} style={styles.thumbImage} />
+                  {image.status === "uploading" ? (
+                    <View style={styles.thumbOverlay}>
+                      <ActivityIndicator color={theme.buttonText} />
+                    </View>
+                  ) : null}
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    accessibilityLabel="Remove attachment"
+                    onPress={() => removeImage(image.localId)}
+                    style={styles.thumbRemove}
+                    hitSlop={6}
+                  >
+                    <Feather name="x" size={12} color={theme.buttonText} />
+                  </TouchableOpacity>
+                </View>
+              ))}
+            </ScrollView>
+          ) : null}
           <View style={styles.inputPill}>
-            <Feather name="plus" size={24} color={theme.codeChipText} />
+            <TouchableOpacity
+              onPress={openAttachmentMenu}
+              accessibilityRole="button"
+              accessibilityLabel="Attach photo"
+              hitSlop={8}
+              style={styles.plusButton}
+            >
+              <Feather name="plus" size={24} color={theme.codeChipText} />
+            </TouchableOpacity>
             <TextInput
               value={text}
               onChangeText={setText}
@@ -366,9 +558,61 @@ const styles = StyleSheet.create({
     backgroundColor: theme.bg,
     borderWidth: 1,
     borderColor: theme.inputBorder,
-    paddingLeft: 18,
+    paddingLeft: 12,
     paddingRight: 8,
     paddingVertical: 4
+  },
+  plusButton: {
+    width: 32,
+    height: 32,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  thumbTray: {
+    marginBottom: 10,
+    maxHeight: 76
+  },
+  thumbTrayContent: {
+    gap: 8,
+    paddingRight: 4
+  },
+  thumb: {
+    width: 64,
+    height: 64,
+    borderRadius: 12,
+    overflow: "hidden",
+    backgroundColor: theme.codeChipBg,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    position: "relative"
+  },
+  thumbError: {
+    borderColor: theme.danger
+  },
+  thumbImage: {
+    width: "100%",
+    height: "100%"
+  },
+  thumbOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: "rgba(0,0,0,0.35)",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  thumbRemove: {
+    position: "absolute",
+    top: 2,
+    right: 2,
+    width: 18,
+    height: 18,
+    borderRadius: 9,
+    backgroundColor: "rgba(0,0,0,0.7)",
+    alignItems: "center",
+    justifyContent: "center"
   },
   inputText: {
     flex: 1,

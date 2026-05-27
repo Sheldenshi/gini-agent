@@ -83,6 +83,75 @@ function safeParse(text: string): unknown {
   }
 }
 
+// Uploaded image ref returned by POST /api/uploads. Matches the runtime's
+// ImageAttachment shape — the client only carries this descriptor and
+// attaches it to the next /messages call's `images` array.
+export interface UploadRef {
+  id: string;
+  mimeType: string;
+  size: number;
+}
+
+// Multipart upload to the gateway. We can't reuse api() because it pins
+// content-type: application/json, which would strip the multipart
+// boundary FormData needs. The picker hands us a local file:// URI, not
+// a Blob, so we wrap it in the React Native FormData file-object shape
+// the platform's networking layer recognizes.
+export async function uploadImage(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  let origin: string;
+  try {
+    origin = new URL(creds.baseUrl).origin;
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  const form = new FormData();
+  // RN FormData accepts the { uri, name, type } object form for file
+  // parts; the native layer streams the file from disk rather than
+  // requiring a Blob load into JS memory.
+  form.append("file", {
+    uri: file.uri,
+    name: file.name,
+    type: file.mimeType
+  } as unknown as Blob);
+  const response = await fetch(`${origin}/api/uploads`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${creds.token}` },
+    body: form
+  });
+  const text = await response.text();
+  const value = text ? safeParse(text) : null;
+  if (!response.ok) {
+    const message =
+      value && typeof value === "object" && "error" in value && typeof value.error === "string"
+        ? value.error
+        : `HTTP ${response.status}`;
+    throw new ApiError(response.status, message);
+  }
+  return value as UploadRef;
+}
+
+// Absolute URL for a stored upload. The gateway serves the bytes with
+// long-lived immutable cache headers; the request still needs the bearer
+// token, so callers must pass it via an Image source's `headers` prop.
+export function uploadUrl(id: string): string {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  const origin = new URL(creds.baseUrl).origin;
+  return `${origin}/api/uploads/${encodeURIComponent(id)}`;
+}
+
+export function authHeader(): Record<string, string> {
+  const creds = readCachedCredentials();
+  if (!creds) return {};
+  return { Authorization: `Bearer ${creds.token}` };
+}
+
 // Resolve the absolute gateway URL + auth headers for an SSE subscription.
 // react-native-sse opens its own XHR, so we can't reuse the `api()` fetcher;
 // this helper centralizes origin normalization and bearer injection so the
