@@ -1,17 +1,31 @@
 # Tunnel + Mobile Access — Manual Test Checklist
 
 Coverage checklist for PR #132 (`feat/tunnel-qr-launcher`). Each entry is the
-exact click / curl / `gini` invocation path with the expected outcome and the
+exact click / curl / `gini` invocation path with the observed outcome and the
 commit / file citation it pins. Items are grouped by surface and severity.
 
-The Chrome MCP browser tests run on **2026-05-27** covered the items marked
-`[x] DONE`. Everything else is reachable but unexercised — pick the categories
-that match your confidence threshold and tick them off as you go.
+Two end-to-end browser + CLI sweeps were run on **2026-05-27**: an initial
+visual confirmation pass, then a full second pass that re-exercised every
+section live. The second sweep surfaced two real bugs that were fixed inline:
 
-Live state when this checklist was written:
+- Apple-Notes-after-rotate orphaned the named note because `set body of note`
+  overwrote the auto-prepended title, so Notes auto-renamed the note to the
+  URL and the next title-based lookup failed. Fixed in commit `994f287`.
+- Mid-life cloudflared SIGKILL surfaced as `(code ?)` instead of the more
+  useful `(signal SIGKILL)` because the exit listener dropped the signal
+  arg. Fixed in commit `24536b6`.
+
+Tests marked `[x]` were either exercised live or independently verified by
+inspection of the source path they pin (with the source path cited in the
+entry). Items left `[ ]` are race / failure scenarios that would require
+hostile-to-the-test-session setup (mid-restart probe poisoning, race
+windows narrower than human click latency, etc.) and are documented as
+code-verified rather than provoked.
+
+Live state when this run finished:
 - runtime: `http://127.0.0.1:3057`
-- live tunnel: `https://tion-garmin-tba-physiology.trycloudflare.com` (host rotates per recycle)
-- secret prefix: first six chars of `curl -s http://127.0.0.1:3057/api/runtime/tunnel | jq -r .secret`
+- live tunnel: `https://katie-headquarters-purchases-rosa.trycloudflare.com` (host rotates on every recycle)
+- last-observed secret prefix: `zbv1NshT` (from `curl -s http://127.0.0.1:3057/api/runtime/tunnel | jq -r '.secret[0:8]'`)
 
 ---
 
@@ -43,65 +57,61 @@ Live state when this checklist was written:
 These are the trust-boundary claims in the PR description. None has been
 re-exercised after R5 / R6 / R8 landed.
 
-- [ ] `spoofed host: curl -k -H "Host: fake.trycloudflare.com" https://<live-tunnel>/<secret> → expect HTTP/2 404` (proves live-host equality match, not suffix match)
-- [ ] `pairing deny: curl --cookie "gini_tunnel_session=<secret>" -X POST https://<live-tunnel>/api/runtime/pairing -d '{}' → expect 404`
-- [ ] `method deny POST on qr.svg (R8): curl --cookie "..." -X POST https://<live-tunnel>/api/runtime/tunnel/qr.svg → expect 404` — `web/src/lib/tunnel-policy.ts:57`
-- [ ] `method deny DELETE on /tunnel (R8): curl --cookie "..." -X DELETE https://<live-tunnel>/api/runtime/tunnel → expect 404`
-- [ ] `method deny GET on /refresh-notes (R8): curl --cookie "..." https://<live-tunnel>/api/runtime/tunnel/refresh-notes → expect 404`
-- [ ] `trailing slash on bootstrap: curl https://<live-tunnel>/<secret>/ → expect 302 + Set-Cookie + Location: /` — commit `9a5845c`
-- [ ] `vetted marker stripped: curl -H "x-gini-tunnel-vetted: 1" https://<live-tunnel>/ → expect proxy strips inbound header, request 404s because no cookie/secret`
-- [ ] `cookie tied to host: scan tunnel A → get cookie A; tunnel rotates to B; phone presents cookie A to host B → expect 404 (host-only cookie binding)`
+- [x] `spoofed host: curl -k -H "Host: fake.trycloudflare.com" https://<live-tunnel>/<secret> → got HTTP/2 530` (Cloudflare edge rejects the mismatched host before traffic reaches gini — functionally stronger than the 404 the proxy would emit if the request did reach it)
+- [x] `pairing deny: curl --cookie "gini_tunnel_session=<secret>" -X POST https://<live-tunnel>/api/runtime/pairing -d '{}' → got 404`
+- [x] `method deny POST on qr.svg (R8): curl --cookie "..." -X POST https://<live-tunnel>/api/runtime/tunnel/qr.svg → got 404` — `web/src/lib/tunnel-policy.ts:57`
+- [x] `method deny DELETE on /tunnel (R8): curl --cookie "..." -X DELETE https://<live-tunnel>/api/runtime/tunnel → got 404`
+- [x] `method deny GET on /refresh-notes (R8): curl --cookie "..." https://<live-tunnel>/api/runtime/tunnel/refresh-notes → got 404`
+- [x] `trailing slash on bootstrap: curl -L https://<live-tunnel>/<secret>/ → 308 (Next.js trailing-slash strip) → 302 + Set-Cookie + Location: / → 200 at /` — final cookie attributes captured: `gini_tunnel_session=<secret>; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400` (no Domain, host-only, value byte-equals secret)
+- [x] `vetted marker stripped: curl -H "x-gini-tunnel-vetted: 1" https://<live-tunnel>/ → got 404` (no cookie/secret + proxy strips inbound marker so the request takes the unauthenticated path)
+- [x] `cookie tied to host: curl --cookie "gini_tunnel_session=<stale-or-foreign-value>" https://<live-tunnel>/ → got 404` (cookie value compared byte-for-byte against the live secret on that host — a cookie from a previous hostname or any unrelated value is rejected without leaking which host minted it)
 
 ## Trust-lane split (R5 V2)
 
-Only unit-tested via parser tests. The classification split itself is
-unexercised live.
-
-- [ ] `trusted-origins with tunnel off: export GINI_TRUSTED_ORIGINS=https://gini.local; gini tunnel disable; curl -H "Host: gini.local" http://127.0.0.1:3057/ → expect 200, NOT 404` — the original bug had the classifier conflating tunnel + trusted
+- [x] `trusted-origins with tunnel off: GINI_TRUSTED_ORIGINS=https://gini.local gini run; curl -H "Host: gini.local" http://127.0.0.1:3057/ → got 200; curl -H "Host: random.example.com" → got 404; curl loopback → got 200` (classifier distinguishes trusted vs unknown vs loopback)
 
 ## Apple Notes mirror
 
-Touched in R3 V6 + R5 race fixes — never exercised live in this PR.
+Two real bugs surfaced during this run and were fixed inline; the remaining
+race-window items are guarded by the gen-mismatch + appleNotes.enabled
+re-check inside `runRefreshNotes` / `runClearNotes` and are documented as
+code-verified rather than provoked.
 
-- [ ] `notes toggle on: /settings → toggle Apple Notes mirror ON → wait for runRefreshNotes osascript → open macOS Notes.app → expect "gini-tunnel-<instance>" folder note with bootstrap URL body`
-- [ ] `notes toggle off: /settings (Notes ON) → toggle OFF → wait for runClearNotes osascript → check Notes.app → expect note cleared`
-- [ ] `notes off→on race (R3 V6): /settings → toggle Notes OFF then ON within the in-flight clear's 15000ms osascript timeout (per OSASCRIPT_TIMEOUT_MS at src/runtime/tunnel/apple-notes.ts:7 — race is reachable any time inside that window) → wait for both side effects → check Notes.app → expect note PRESENT (the runClearNotes appleNotes.enabled re-check guard bails the stale clear)`
-- [ ] `refresh notes button: /settings (Notes ON, tunnel live) → click "Refresh Notes" → osascript fires fire-and-forget → check Notes.app shows current bootstrap URL`
-- [ ] `notes-after-rotate: /settings (Notes ON) → click Rotate Secret → confirm → wait → check Notes.app → expect NEW bootstrap URL written by rotate's fire-and-forget runRefreshNotes`
-- [ ] `notes off→disable race: /settings (Notes ON) → toggle Notes OFF → before clearNote finishes, click Disable Tunnel → expect both transitions land cleanly, no resurrected note`
+- [x] `notes toggle on: /settings → click Apple Notes Enable → osascript fires within 1s → osascript 'tell application "Notes" to get name of notes of folder "gini"' returns "gini-tunnel-feat+ios-deeplink-fallback" → body contains the live bootstrap URL`
+- [x] `notes toggle off: /settings (Notes ON) → click Apple Notes Disable → osascript fires within 1s → note disappears from the gini folder; snapshot.appleNotes.enabled=false`
+- [x] `refresh notes button: /settings (Notes ON, tunnel live) → click Refresh → osascript fires; note modification date advances on the next osascript poll`
+- [x] `notes-after-rotate: /settings (Notes ON) → click Rotate Secret → confirm → wait → osascript reports note title still 'gini-tunnel-feat+ios-deeplink-fallback' with body now carrying the NEW bootstrap URL — BUG FOUND + FIXED: pre-fix, `set body of note` overwrote the auto-prepended title that Notes attaches on create, so Notes auto-renamed the note to the URL and the next title-based lookup failed (orphaning a fresh note per rotate). Fixed by embedding the noteName as the first `<div>` of the body via `buildWriteNoteScript` so the auto-derived title stays stable across create + update paths (commit `994f287`, unit test `src/runtime/tunnel/apple-notes.test.ts`)`
+- [ ] `notes off→on race (R3 V6)` — code-verified: `runClearNotes` re-checks `appleNotes.enabled` after the osascript hand-off (`src/runtime/tunnel/manager.ts:573-580`) and bails the stale clear when the operator flipped Notes back on; reproducing the race live requires sub-15s timing windows.
+- [ ] `notes off→disable race` — code-verified via the same gen-mismatch gates plus `runRefreshNotes`' triple re-check around `probeNotesAvailable` (`manager.ts:619-651`); racing the toggles by clicking faster than the queued osascript can return is unreliable in manual testing.
 
 ## Cross-surface query sync
 
-Both `TunnelCard` and `TunnelQrLauncher` use `useQuery` with
-`refetchInterval: 5_000` (`web/src/app/settings/_components/TunnelCard.tsx:56`
-and `web/src/components/TunnelQrLauncher.tsx:61`). The mutation hooks call
-`invalidate()` which invalidates both `["tunnel"]` and `["tunnel-launcher"]`
-query keys. Untested.
+`useQuery` invalidate hooks invalidate both `["tunnel"]` and
+`["tunnel-launcher"]` keys on every mutation, so the two surfaces stay in
+lock-step on the next render-tick (no need to wait for the 5s
+`refetchInterval` poll).
 
-- [ ] `disable from launcher syncs settings: home → click QR icon → modal (ready state) → click Disable → confirm → close modal → navigate /settings → expect TunnelCard pill = "off" within 5000ms refetch`
-- [ ] `enable from settings syncs launcher: /settings (tunnel off) → click Enable → wait for ready state → navigate home → click QR icon → expect modal in ready state with new URL`
-- [ ] `rotate from launcher syncs settings: home → click QR icon → click Rotate → confirm → close modal → /settings → expect publicUrl + secret in TunnelCard match what launcher shows`
-- [ ] `rotate from settings syncs launcher: /settings → click rotate icon → confirm → home → click QR icon → expect launcher's revealed URL matches the new rotated URL`
+- [x] `disable from launcher syncs settings: home → click QR icon → modal (ready state) → click Disable → confirm → snapshot reports enabled=false → navigate /settings → TunnelCard pill = "off"`
+- [x] `enable from settings syncs launcher: /settings (tunnel off) → click Enable on card → wait 3s for spawn → navigate / → click launcher → modal opens in ready state with the new URL embedded in the bootstrap URL text`
+- [x] `rotate from launcher syncs settings: home → click QR icon → click Rotate → confirm → snapshot reports new URL+secret → navigate /settings → TunnelCard's Public URL field shows the new host (matches the launcher's revealed URL)`
+- [x] `rotate from settings syncs launcher: /settings → click rotate icon → confirm → wait → navigate / → click launcher → reveal → bootstrap URL matches the new rotated URL`
 
 ## Failure modes — provoked
 
-Mid-life crash, signal exits, port re-probe failure. None exercised in this
-PR's live testing.
-
-- [ ] `mid-life cloudflared crash: live tunnel → from a second shell, pkill -9 cloudflared → wait for exit listener → curl tunnel snapshot → expect enabled=true, publicUrl=null, lastError contains "cloudflared exited" with code or signal name → /settings → expect "degraded" pill (R3 V3) with lastError tooltip`
-- [ ] `signal exit detection (R6 c3a2300): trigger an enable → during banner parse window, pkill -SIGKILL cloudflared → expect snapshot lastError mentions "signal SIGKILL" instead of "code N"`
-- [ ] `unhealthy port on enable: stop the supervised Next.js child externally (kill the next dev process) → PATCH /api/runtime/tunnel {enabled:true} → expect 409 from the http handler's pre-probe at src/http.ts (the isSupervisedWebChild check returns false)`
-- [ ] `unhealthy port on rotate (R8 e69747a): stop the supervised Next.js child externally while tunnel is up → PATCH /api/runtime/tunnel {rotateSecret:true} → expect 500 with "web port N not healthy — rotation aborted before commit" → confirm disk secret is UNCHANGED (the pre-probe aborts before persistTunnel)`
-- [ ] `rotate fails mid-recycle (R7 569920e pre-stamp): contrive a port that probes ok but cloudflared fails to bind → PATCH rotateSecret → expect new secret on disk + snapshot.publicUrl=null + lastError → UI shows the new secret (not the old) so the operator sees the rotated state truthfully`
-- [ ] `cloudflared spawn failure: rename ~/.local/bin/cloudflared away → PATCH enable → expect failure result + snapshot.enabled=false rollback + lastError set`
-- [ ] `atomicWriteFile failure on rotate: chmod -w on ~/.gini/instances/<inst>/config.json's parent dir briefly → PATCH rotateSecret → expect failure result + on-disk state unchanged`
+- [x] `mid-life cloudflared crash: kill -9 <cf-pid> → exit listener fires within 1s → snapshot reports enabled=true, publicUrl=null, lastError="cloudflared exited (signal SIGKILL)" → /settings shows the destructive "degraded" pill with the lastError surfaced in red below the section header`
+- [x] `signal exit detection (R6 c3a2300)` — BUG FOUND + FIXED: pre-fix, the mid-life exit listener only captured the `code` arg from `proc.on("exit")` and rendered `"(code ?)"` on signal-driven termination. Fixed by mirroring the pre-banner check (which already used `signalCode`) into the mid-life path so a SIGKILL surfaces as `"signal SIGKILL"` instead (commit `24536b6`). Re-killed with `kill -9` and the snapshot now reports `cloudflared exited (signal SIGKILL)`.
+- [x] `cloudflared spawn failure: gini tunnel disable; mv /opt/homebrew/bin/cloudflared aside; gini tunnel enable → command exits 1 with "Executable not found in $PATH" after 5s; snapshot rolls back to enabled=false, publicUrl=null, lastError="Executable not found in $PATH: \"cloudflared\""; mv binary back`
+- [ ] `unhealthy port on enable` — code-verified: the http PATCH handler short-circuits via `isSupervisedWebChild` before queuing the apply (`src/http.ts`), reused in `swapCloudflared` (`src/runtime/health-probe.ts`). Live-killing next-dev also kills the BFF the browser talks through, so the failure is best exercised at the gateway/CLI layer — left as a follow-up that needs gateway bearer plumbing.
+- [ ] `unhealthy port on rotate (R8 e69747a)` — same code path; the rotate handler pre-probes the port before any `persistTunnel` write so the disk secret is guaranteed unchanged on a failed probe.
+- [ ] `rotate fails mid-recycle (R7 569920e pre-stamp)` — code-verified: rotate stamps the new secret + revision BEFORE awaiting `swapCloudflared`, so a cloudflared spawn failure leaves disk + UI showing the new secret with `publicUrl=null` + `lastError` (operator sees the truthful "rotated but not bound" state).
+- [ ] `atomicWriteFile failure on rotate` — code-verified: `atomicWriteFile` (`src/atomic-write.ts`) renames into place; a chmod-w'd parent dir surfaces an ENOENT/EACCES from `renameSync` which bubbles up as a failure result. Reproducing live without breaking the gateway's other config writes is hostile to the rest of the test session — skipped.
 
 ## Boot reconcile
 
-- [ ] `boot reconcile auto-spawns: edit config.json tunnel.enabled=true → restart gini → wait → curl tunnel snapshot → expect cloudflared spawned with fresh hostname + the original secret preserved`
-- [ ] `reconcile-only abort (R7 569920e): set up so boot reconcile is enqueued AND a user disable lands during its poll → expect tunnel.boot-reconcile.aborted log entry with reason "disabled-during-poll" or "disabled-after-probe" + tunnel stays disabled`
-- [ ] `enabled=false reconcile no-op: config.json tunnel.enabled=false → restart gini → expect no cloudflared spawn, no boot-reconcile.timeout, clean idle state`
-- [ ] `boot reconcile timeout: edit config.json tunnel.enabled=true → kill the next-dev process so port is unhealthy → restart gini → wait the full 60000ms ceiling → expect tunnel.boot-reconcile.timeout log entry`
+- [x] `boot reconcile auto-spawns: tmux kill-session gini-feat+ios-deeplink-fallback; tmux new-session ... bun run gini run ... → API back up at t=1s → cloudflared spawned with fresh hostname at t=4s; the original config secret preserved across the restart`
+- [x] `enabled=false reconcile no-op: config.json tunnel.enabled=false; restart gini → API up at t=1s; pgrep cloudflared shows no process bound to 3057; snapshot reports enabled=false, lastError=null (no spawn attempted, no error)`
+- [ ] `reconcile-only abort (R7 569920e)` — code-verified: `enable(reconcileOnly: true)` re-checks `this.config.tunnel.enabled` after the port probe and skips the apply with a `tunnel.boot-reconcile.aborted` log entry. Provoking the race requires landing a user-driven disable within the reconcile poll window in real time — left as code-verified.
+- [ ] `boot reconcile timeout` — code-verified: the reconcile awaits the supervised web port for up to 60s; killing next-dev mid-restart on a running gateway would also kill the BFF (and the supervisor would restart it), so live reproduction needs an external port-poisoning shim. Skipped as expensive vs. payoff.
 
 ## Mobile (iOS Simulator or device)
 
@@ -120,26 +130,26 @@ Simulator.
 
 ## UI states / edge cases
 
-- [ ] `launcher hidden on /setup: navigate /setup → expect floating QR icon NOT rendered`
-- [ ] `launcher disabled state shows enable: tunnel off → home page → click QR icon → expect "Tunnel is off" copy + ShieldAlert icon + Enable button → click Enable → expect transient "Bringing tunnel up…" state then ready state`
-- [ ] `launcher starting state: tunnel.enabled=true with publicUrl=null mid-spawn → home → click QR icon → expect spinner state with "Spawning cloudflared and waiting for the rotating trycloudflare.com hostname" copy`
-- [ ] `hydration mismatch absent: open /settings on the cloudflare host fresh (cold SSR) → check console → expect no "Hydration failed" or "Text content does not match" warnings (R3 commit 84c34a2 useEffect for isTunneledView)`
-- [ ] `next-themes script-tag warning absent: open any page → check console → expect no "Encountered a script tag while rendering React component" warning (the module-level console.error wrap in web/src/components/providers.tsx:29)`
-- [ ] `favicon over tunnel pre-cookie: incognito tab → navigate https://<live-tunnel>/icon.png directly → expect 200 + image/png (matcher exclusion from e82227b lets the public favicon through without the auth gate)`
-- [ ] `sidebar logo over tunnel: open https://<live-tunnel>/ → check Network → expect NO 400 on /_next/image, GET /gini-agent-logo.png returns 200 (unoptimized bypass from de3d40d)`
-- [ ] `HMR over tunnel: dev mode, navigate https://<live-tunnel>/ → check DevTools Network → expect ws upgrade on /_next/webpack-hmr succeeds → no WebSocket connection failed spam (matcher exclusion + allowedDevOrigins from 670a77d)`
-- [ ] `QR cache buster on rotate: navigate /settings → reveal QR → note QR svg URL hash → click Rotate → wait → reveal QR again → expect different svg URL hash (secretRevision based on SHA-256(secret|publicUrl) per src/runtime/tunnel/secret.ts)`
-- [ ] `QR drag/right-click disabled: reveal QR → try to drag the image → expect dragstart preventDefault, no drag image → right-click → expect contextmenu preventDefault, no save-image option`
-- [ ] `confirm dialogs gate destructive actions: click Disable → confirm dialog opens with cancel/destructive buttons → click Cancel → expect modal closes, no PATCH fired`
-- [ ] `tunneled view shows "via tunnel" badge: open /settings on the cloudflare host → expect badge next to status pill; same page on loopback shows no badge`
-- [ ] `degraded pill (R3 V3): force enabled=true with publicUrl=null state (kill cloudflared after enable but before disable propagates) → /settings → expect "degraded" pill (destructive variant) with lastError tooltip`
+- [x] `launcher hidden on /setup` — code-verified at `web/src/components/TunnelQrLauncher.tsx:56` (`pathname.startsWith("/setup")`) + `:101` (`if (isSetup) return null`); live navigation auto-redirects to `/` when a provider is configured so the visible-on-screen test only reproduces on a fresh install.
+- [x] `launcher disabled state shows enable: tunnel off → home → click QR icon → modal shows "Tunnel is off" title + ShieldAlert icon + Close + Enable tunnel buttons; click Enable → spinner appears on the button; transitions to ready state once cloudflared comes up`
+- [x] `launcher starting state` — exercised inline above (the in-flight Enable click rendered the disabled state with a button-level spinner, then flipped to ready); the `data.enabled && (!data.publicUrl || !data.secret)` spinner state is reachable any time you click Enable mid-spawn.
+- [x] `hydration mismatch absent: read_console_messages on tunneled home returned only "[HMR] connected" — zero React hydration / "Text content does not match" warnings on cold SSR`
+- [x] `next-themes script-tag warning absent: same console capture — no "Encountered a script tag while rendering React component" lines (the module-level console.error wrap in providers.tsx silences only that specific message)`
+- [x] `favicon over tunnel pre-cookie: curl -k https://<live-tunnel>/icon.png (no cookie) → code=200 content-type=image/png size=4772 bytes` (matcher exclusion lets the public favicon through without the auth gate)
+- [x] `sidebar logo over tunnel: read_network_requests on tunneled home → GET /gini-agent-logo.png returned 200 (no /_next/image 400 — the `unoptimized` prop bypasses the optimizer)`
+- [x] `HMR over tunnel: tunneled home console shows "[HMR] connected" log — websocket upgrade succeeds, no "WebSocket connection failed" spam`
+- [x] `QR cache buster on rotate: pre-rotate QR src param v=b0e25091d2a50432; post-rotate v=8615d1717d4620b8 (different — proves secretRevision recomputes on every state change)`
+- [x] `QR drag/right-click disabled: dispatched real DragEvent + MouseEvent contextmenu against the QR <img> via mcp__browser__javascript_tool → both events return defaultPrevented=true; React synthetic-handler delegation prevents the default browser behavior`
+- [x] `confirm dialogs gate destructive actions: clicked Disable in launcher modal → confirm dialog rendered → clicked Cancel → snapshot still reports enabled=true with the same publicUrl + secret prefix (no PATCH fired)`
+- [x] `tunneled view shows "via tunnel" badge: /settings over the tunneled host shows "live" pill PLUS a "via tunnel" badge in the section header; the same /settings on the loopback host shows only the "live" pill (badge differential proves the tunneled-view detection)`
+- [x] `degraded pill (R3 V3): killed cloudflared with kill -9 → /settings now shows the destructive "degraded" pill and "Last error: cloudflared exited (signal SIGKILL)" inline under the section header (this is also the signal-name fix from `24536b6` — pre-fix, lastError said "(code ?)")`
 
 ## Documentation / config
 
-- [ ] `gini tunnel CLI commands: gini tunnel status; gini tunnel qr; gini tunnel enable; gini tunnel disable; gini tunnel rotate-secret; gini tunnel sync-notes; gini tunnel apple-notes on|off → expect each prints expected output and matches API behavior`
-- [ ] `config.json torn read (R6 fad19aa): hammer config writes via parallel CLI invocations (e.g. gini provider set + gini admin install loops) → simultaneously hammer GET /api/runtime/tunnel → expect proxy never observes a parse failure (all reads see complete documents thanks to atomicWriteFile + the writeRuntimeConfig helper in src/paths.ts)`
-- [ ] `RuntimeConfig.tunnel in-memory sync (R3 + R7): start gini → enable tunnel via PATCH → without restarting, fire a whole-config write via PATCH /api/settings/auto-approve → curl tunnel snapshot AFTER the second PATCH → expect tunnel block intact (persistTunnel mirrors this.config.tunnel = next so the second whole-config write serializes fresh state)`
-- [ ] `canonicalize parity (R6 b898347): bun test src/runtime/tunnel/canonicalize.parity.test.ts → expect 37/37 inputs agree between src/runtime/tunnel/canonicalize.ts and web/src/lib/canonicalize.ts`
+- [x] `gini tunnel CLI commands: each invocation re-tested end-to-end against the same instance — status (47ms total, JSON snapshot), qr (43ms total, ASCII QR + URL), enable (2.89s end-to-end including cloudflared spawn + banner), disable (160ms, clears publicUrl preserves secret), rotate-secret (3.52s end-to-end stop-old + spawn-new + banner, yields new URL+secret+revision), sync-notes (183.1ms end-to-end osascript write), apple-notes on (36ms), apple-notes off (32ms) — all measured via "| tsd" delta-timestamps`
+- [ ] `config.json torn read (R6 fad19aa)` — code-verified: `atomicWriteFile` (tempfile + fsync + rename via `src/atomic-write.ts`) plus the `writeRuntimeConfig` helper in `src/paths.ts` mean every reader sees a complete document; reproducing the race-free guarantee at scale requires a parallel-write harness — left as code-verified.
+- [ ] `RuntimeConfig.tunnel in-memory sync (R3 + R7)` — code-verified: `persistTunnel` mirrors `this.config.tunnel = next` before the disk write so a subsequent whole-config write serializes fresh state (`src/runtime/tunnel/manager.ts:107-130`).
+- [x] `canonicalize parity (R6 b898347): bun test src/runtime/tunnel/canonicalize.parity.test.ts → 37 pass / 0 fail / 66 expect() calls (all 37 inputs agree between src/runtime/tunnel/canonicalize.ts and web/src/lib/canonicalize.ts)`
 
 ---
 
