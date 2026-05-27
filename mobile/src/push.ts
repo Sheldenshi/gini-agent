@@ -40,6 +40,7 @@
 import { Platform } from "react-native";
 import { router } from "expo-router";
 import * as Notifications from "expo-notifications";
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import { api, ApiError } from "./api";
 import {
   APPROVAL_CATEGORY,
@@ -192,12 +193,58 @@ let registrationStarted = false;
 // import it without prop-drilling through every hook.
 let cachedDeviceToken: string | null = null;
 
+// AsyncStorage key for the device token cache. Persisted across cold
+// launches so the X-Device-Token header is available BEFORE the
+// async permission/registration flow completes. A rehydrated token
+// may be stale (rotated server-side, or paired against a different
+// credential), but that's fine: requests still authenticate via the
+// bearer, and the eventual registerForPushAsync() re-acquires and
+// re-posts the live token, repopulating this slot.
+const DEVICE_TOKEN_STORAGE_KEY = "gini.push.device-token";
+
+async function persistDeviceToken(token: string): Promise<void> {
+  try {
+    await AsyncStorage.setItem(DEVICE_TOKEN_STORAGE_KEY, token);
+  } catch {
+    // Best-effort: if storage is unavailable the in-memory cache still
+    // covers the same-process lifetime.
+  }
+}
+
+async function clearPersistedDeviceToken(): Promise<void> {
+  try {
+    await AsyncStorage.removeItem(DEVICE_TOKEN_STORAGE_KEY);
+  } catch {
+    // ditto — clearing failures don't block sign-out.
+  }
+}
+
 // Read-only accessor. Returns null until the device has registered
 // successfully — callers should tolerate that (mobile-only endpoints
 // like /badge can no-op when the token isn't set yet, since the
 // badge will refresh on the next mount once registration completes).
 export function getCachedDeviceToken(): string | null {
   return cachedDeviceToken;
+}
+
+// Rehydrate the device-token cache from AsyncStorage. Called from
+// the root layout's priming sequence (alongside primeCredentials)
+// so header-bearing requests on cold launch (notably the initial
+// refreshBadge() and any SSE open before the chat-detail screen
+// mounts) carry X-Device-Token without waiting on the
+// permission-gated registration flow. No-op when no token has ever
+// been persisted (e.g. fresh install pre-grant) or on read failure.
+export async function primeDeviceTokenFromStorage(): Promise<void> {
+  if (cachedDeviceToken) return;
+  try {
+    const stored = await AsyncStorage.getItem(DEVICE_TOKEN_STORAGE_KEY);
+    if (stored && typeof stored === "string" && stored.length > 0) {
+      cachedDeviceToken = stored;
+    }
+  } catch {
+    // Storage unavailable — leave cachedDeviceToken null; the next
+    // registerForPushAsync() will re-acquire.
+  }
 }
 
 // Subscription handles — kept module-scoped so a hot reload doesn't
@@ -269,8 +316,11 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
       // Cache after the POST succeeds so callers downstream (api
       // helper, SSE resolver) get the same token the gateway just
       // accepted. On POST failure cachedDeviceToken stays null and
-      // those callers no-op until the next mount's retry.
+      // those callers no-op until the next mount's retry. Persist
+      // to AsyncStorage so the next cold launch can prime the cache
+      // before registration runs again.
       cachedDeviceToken = token.data;
+      void persistDeviceToken(token.data);
     }
 
     // Listen for token rotations. The library debounces internally,
@@ -282,6 +332,7 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
         // initial registration will catch up.
         void postDevice(event.data, bundleId).then(() => {
           cachedDeviceToken = event.data;
+          void persistDeviceToken(event.data);
         }).catch(() => { /* swallow */ });
       });
     }
@@ -379,6 +430,7 @@ function resolveBundleId(): string | null {
 export function __resetRegistrationForSignOut(): void {
   registrationStarted = false;
   cachedDeviceToken = null;
+  void clearPersistedDeviceToken();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
@@ -390,6 +442,7 @@ export function __resetRegistrationForSignOut(): void {
 export function __resetForTests(): void {
   registrationStarted = false;
   cachedDeviceToken = null;
+  void clearPersistedDeviceToken();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }
   if (responseSub) { responseSub.remove(); responseSub = null; }
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }

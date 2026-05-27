@@ -23,7 +23,11 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
-import { refreshBadge, registerApprovalCategoryAsync } from "@/src/push";
+import {
+  primeDeviceTokenFromStorage,
+  refreshBadge,
+  registerApprovalCategoryAsync
+} from "@/src/push";
 import { family, theme } from "@/src/theme";
 
 // Single shared client across the tree so navigating between screens
@@ -50,9 +54,16 @@ export default function RootLayout() {
   const [primed, setPrimed] = useState(false);
   useEffect(() => {
     let active = true;
-    primeCredentials().then(() => {
+    // Sequence the cold-start primes so by the time AuthCacheGuard
+    // fires its first refreshBadge() the X-Device-Token header is
+    // already in place. Without the device-token prime, /badge and
+    // /read would 400 (missing header) for the brief window between
+    // credential rehydration and registerForPushAsync() completing.
+    (async () => {
+      await primeCredentials();
+      await primeDeviceTokenFromStorage();
       if (active) setPrimed(true);
-    });
+    })();
     return () => {
       active = false;
     };
