@@ -27,8 +27,10 @@ import { recall } from "../memory";
 import {
   generateToolCallingResponse,
   type ToolCallingMessage,
+  type MessageContentPart,
   type ToolCall
 } from "../provider";
+import { uploadDataUrl } from "../state/uploads";
 import {
   SOUL_SOFT_CAP_CHARS,
   USER_SOFT_CAP_CHARS,
@@ -391,7 +393,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const messages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
     ...prior,
-    { role: "user", content: task.input }
+    buildUserMessage(config, task)
   ];
 
   appendTrace(config.instance, taskId, {
@@ -479,7 +481,51 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return stored
     .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+    .map((m) => {
+      if (m.role === "user" && m.images && m.images.length > 0) {
+        return {
+          role: "user" as const,
+          content: buildVisionContent(config, m.content, m.images)
+        };
+      }
+      return { role: m.role as "user" | "assistant", content: m.content };
+    });
+}
+
+// Build the latest user-turn message. When the task carries image refs the
+// content becomes a parts array so the provider sees both text and images;
+// otherwise it stays a plain string (the legacy text-only path).
+function buildUserMessage(config: RuntimeConfig, task: Task): ToolCallingMessage {
+  if (task.images && task.images.length > 0) {
+    return { role: "user", content: buildVisionContent(config, task.input, task.images) };
+  }
+  return { role: "user", content: task.input };
+}
+
+// Render image refs as data URLs at dispatch time. The provider can't
+// authenticate against /api/uploads/:id, so we inline base64 bytes. A
+// missing/unreadable upload is dropped with a trace; the text part is
+// retained so the model still gets the user's words.
+function buildVisionContent(
+  config: RuntimeConfig,
+  text: string,
+  images: ReadonlyArray<{ id: string; mimeType: string }>
+): MessageContentPart[] {
+  const parts: MessageContentPart[] = [];
+  if (text.length > 0) parts.push({ type: "text", text });
+  for (const image of images) {
+    const dataUrl = uploadDataUrl(config.instance, image.id);
+    if (!dataUrl) {
+      appendLog(config.instance, "chat.image.missing", { uploadId: image.id });
+      continue;
+    }
+    parts.push({ type: "image_url", image_url: { url: dataUrl } });
+  }
+  // Provider requires non-empty content. If every image failed to load and
+  // there was no text, fall through to an empty text part so we never send
+  // an empty parts array.
+  if (parts.length === 0) parts.push({ type: "text", text: "" });
+  return parts;
 }
 
 // Restrict the parent-built tool catalog to the subagent's toolset

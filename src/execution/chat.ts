@@ -14,7 +14,8 @@ import {
   readState,
   renameChatSession
 } from "../state";
-import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import { uploadExists } from "../state/uploads";
 import { generateStructured } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
@@ -208,9 +209,34 @@ export async function renameChat(config: RuntimeConfig, id: string, input: Recor
   return updated;
 }
 
+function parseImageAttachments(instance: string, raw: unknown): ImageAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ImageAttachment[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const id = typeof item.id === "string" ? item.id : "";
+    const mimeType = typeof item.mimeType === "string" ? item.mimeType : "";
+    const size = typeof item.size === "number" ? item.size : Number(item.size ?? 0);
+    if (!id || !mimeType) continue;
+    // Reject upload ids that haven't been registered with this instance.
+    // Submitting a phantom id would let a client pin an arbitrary value
+    // in chat history without backing bytes — the renderer would 404 and
+    // the provider would skip the image at dispatch.
+    if (!uploadExists(instance, id)) {
+      throw new Error(`Invalid input: image upload not found: ${id}`);
+    }
+    out.push({ id, mimeType, size });
+  }
+  return out;
+}
+
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
   const content = String(input.content ?? "").trim();
-  if (!content) throw new Error("Chat message content is required.");
+  const images = parseImageAttachments(config.instance, input.images);
+  if (!content && images.length === 0) {
+    throw new Error("Chat message content is required.");
+  }
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) throw new Error(`Chat session not found: ${sessionId}`);
@@ -223,11 +249,19 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     runId: run.id,
     mode: "chat",
     chatSessionId: sessionId,
-    agentId: session.agentId
+    agentId: session.agentId,
+    ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);
   await mutateState(config.instance, (current) => {
-    const message = createChatMessage(current, { sessionId, role: "user", content, taskId: task.id, runId: run.id });
+    const message = createChatMessage(current, {
+      sessionId,
+      role: "user",
+      content,
+      taskId: task.id,
+      runId: run.id,
+      ...(images.length > 0 ? { images } : {})
+    });
     const runRecord = current.runs.find((item) => item.id === run.id);
     if (runRecord) {
       runRecord.userMessageId = message.id;
@@ -248,7 +282,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       text: content,
       taskId: task.id,
       runId: run.id,
-      agentId: session.agentId ?? null
+      agentId: session.agentId ?? null,
+      ...(images.length > 0 ? { images } : {})
     });
   } catch (error) {
     appendLog(config.instance, "chat.user_block.insert_failed", {

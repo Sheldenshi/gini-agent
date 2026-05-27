@@ -548,6 +548,12 @@ export interface Task {
   // (oldest dropped). Not persisted as audit truth — these are a display
   // convenience only.
   recentToolCalls?: ToolCallSummary[];
+  // Image attachments carried by the user message that spawned this task.
+  // Stamped on submission so the agent loop can build vision content from a
+  // single record instead of racing the chat-message write. The bytes live
+  // under ~/.gini/instances/<inst>/uploads/<id>.<ext>; this array only
+  // carries the refs.
+  images?: ImageAttachment[];
 }
 
 export interface RuntimeEvent {

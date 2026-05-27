@@ -106,8 +106,24 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
     runId: row.run_id ?? undefined
   };
   switch (row.kind) {
-    case "user_text":
-      return { ...base, kind: "user_text", text: String(payload.text ?? "") };
+    case "user_text": {
+      const images = Array.isArray(payload.images)
+        ? payload.images
+            .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+            .map((item) => ({
+              id: String(item.id ?? ""),
+              mimeType: String(item.mimeType ?? ""),
+              size: Number(item.size ?? 0)
+            }))
+            .filter((image) => image.id.length > 0)
+        : undefined;
+      return {
+        ...base,
+        kind: "user_text",
+        text: String(payload.text ?? ""),
+        ...(images && images.length > 0 ? { images } : {})
+      };
+    }
     case "assistant_text":
       return {
         ...base,
@@ -199,7 +215,10 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
 function payloadFor(block: ChatBlock): string {
   switch (block.kind) {
     case "user_text":
-      return JSON.stringify({ text: block.text });
+      return JSON.stringify({
+        text: block.text,
+        ...(block.images && block.images.length > 0 ? { images: block.images } : {})
+      });
     case "assistant_text":
       return JSON.stringify({ text: block.text, streaming: block.streaming });
     case "tool_call":
@@ -282,7 +301,12 @@ export function insertChatBlock(
       };
       switch (input.kind) {
         case "user_text":
-          return { ...base, kind: "user_text", text: input.text };
+          return {
+            ...base,
+            kind: "user_text",
+            text: input.text,
+            ...(input.images && input.images.length > 0 ? { images: input.images } : {})
+          };
         case "assistant_text":
           return {
             ...base,

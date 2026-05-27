@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn } from "bun";
-import type { Authorization, RuntimeConfig, RuntimeState, SetupRequest, Task } from "./types";
+import type { Authorization, ImageAttachment, RuntimeConfig, RuntimeState, SetupRequest, Task } from "./types";
 import { statePath, traceDir } from "./paths";
 import {
   addAudit,
@@ -128,6 +128,10 @@ export interface SubmitTaskOptions {
   // message. Stamped on the task so the UI can resolve task -> session
   // without fetching the unscoped chatMessages list.
   chatSessionId?: string;
+  // Image refs attached to the user message that spawned this task.
+  // Threaded through to Task.images so the chat-task loop can dispatch
+  // vision content without re-reading the chat message.
+  images?: ImageAttachment[];
 }
 
 export async function submitTask(
@@ -155,6 +159,7 @@ export async function submitTask(
     options.chatSessionId
   );
   if (options.mode) created.mode = options.mode;
+  if (options.images && options.images.length > 0) created.images = options.images;
   // When a parentTaskId is set, the upsert + the parent-status
   // check must serialize together. Without this, `spawnSubagent`'s
   // in-callback check inside `createSubagentRecord` can pass, then
