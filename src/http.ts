@@ -932,7 +932,7 @@ function preflightResponse(request: Request): Response {
     headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
   }
   headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
-  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Device-Token, Last-Event-ID, Accept");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Device-Token, Last-Event-ID, Accept, Cache-Control, X-Requested-With");
   headers.set("Access-Control-Max-Age", "600");
   return new Response(null, { status: 204, headers });
 }
