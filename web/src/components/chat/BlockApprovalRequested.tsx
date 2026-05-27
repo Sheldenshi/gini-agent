@@ -5,7 +5,7 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { RiskPill } from "@/components/StatusPill";
+import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { api } from "@/lib/api";
 import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
@@ -157,11 +157,33 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     && fillSlots.length > 0
     && fillSlots.every((s) => typeof fillValues[s.name] === "string" && fillValues[s.name].length > 0);
 
+  // Once the approval is no longer pending, drop the amber accent so
+  // the bubble visually reads as historical rather than an active
+  // prompt. The buttons still render in their resolved-state form
+  // below (status pill instead of dead Submit/Deny) so the user
+  // sees what happened without it looking like they still need
+  // to act.
+  const cardClass = isPending
+    ? "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
+    : "rounded-lg border border-border bg-background/40 p-3";
+  // Past-tense the summary once resolved so "Enter credentials..."
+  // doesn't keep reading as an active ask after the user has
+  // already submitted (or denied). Display-only — the underlying
+  // block.summary on the wire stays as the agent's original
+  // reason text.
+  const displaySummary = !isPending && approval && isBrowserFillSecret
+    ? approval.status === "approved"
+      ? `Credentials submitted. (${block.summary})`
+      : approval.status === "denied"
+        ? `Request denied. (${block.summary})`
+        : block.summary
+    : block.summary;
   return (
-    <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
+    <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
         <span className="font-mono text-xs text-foreground">{block.action}</span>
         <RiskPill value={block.risk} />
+        {!isPending && approval ? <StatusPill value={approval.status} /> : null}
         <button
           type="button"
           className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
@@ -170,7 +192,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           {expanded ? "Hide details" : "Show details"}
         </button>
       </div>
-      <p className="mt-1 text-xs text-muted-foreground">{block.summary}</p>
+      <p className="mt-1 text-xs text-muted-foreground">{displaySummary}</p>
       {expanded && approval ? (
         <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
           {JSON.stringify(approval.payload, null, 2)}
@@ -235,7 +257,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           ))}
         </div>
       ) : null}
-      <div className="mt-2 flex gap-2">
+      <div className={isPending ? "mt-2 flex gap-2" : "hidden"}>
         {isConnectorRequest ? (
           <>
             <Button
