@@ -86,6 +86,30 @@ describe("browser safetyCheck", () => {
   test("allows ordinary https URLs", () => {
     expect(safetyCheck("https://example.com/")).toBeUndefined();
   });
+
+  test("blocks loopback navigation (BFF / runtime SSRF surface)", () => {
+    // The BFF's catch-all /api/runtime/* proxy injects the runtime
+    // bearer for safe-method loopback requests, so an agent that
+    // navigates the controlled browser to its own host can read
+    // runtime state (including messaging.approve_pairing payloads).
+    // Pin that the loopback variants are all refused — IPv4 literal,
+    // IPv6 literal, 0.0.0.0, the localhost hostname, and the 127/8
+    // range and *.localhost.
+    const refused = [
+      "http://127.0.0.1:3082/api/runtime/approvals",
+      "http://localhost:3082/api/state",
+      "http://0.0.0.0/",
+      "http://[::1]/",
+      "http://127.5.5.5/",
+      "http://example.localhost/"
+    ];
+    for (const url of refused) {
+      const result = safetyCheck(url);
+      expect(result).toBeDefined();
+      expect(result!.startsWith("Blocked:")).toBe(true);
+      expect(result).toContain("loopback");
+    }
+  });
 });
 
 // Smoke test for the CDP-vs-launch decision. We can't actually exercise

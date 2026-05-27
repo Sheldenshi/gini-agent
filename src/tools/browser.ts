@@ -789,7 +789,19 @@ const BLOCKED_HOSTNAMES = new Set([
   "169.254.169.254",
   "100.100.100.200",
   "metadata.google.internal",
-  "metadata.goog"
+  "metadata.goog",
+  // Loopback + unspecified — the agent's BFF and runtime listen on
+  // these addresses, and the BFF's catch-all /api/runtime/* proxy
+  // injects the runtime bearer for any safe-method loopback request
+  // (no Origin header from a server-driven browser navigation). Without
+  // these entries an agent could navigate the controlled browser to
+  // http://127.0.0.1:<bff-port>/api/runtime/approvals and read state
+  // including the messaging.approve_pairing payload's verificationCode.
+  // Mirrors the broader loopback block on the web_fetch tool.
+  "127.0.0.1",
+  "0.0.0.0",
+  "localhost",
+  "::1"
 ]);
 
 const SECRET_PATTERNS = [
@@ -897,7 +909,20 @@ export function safetyCheck(rawUrl: string): string | undefined {
   // Strip IPv6 brackets so the comparisons below see the bare host.
   const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
   if (BLOCKED_HOSTNAMES.has(host)) {
+    // Distinguish the loopback / metadata buckets in the error
+    // message so an operator debugging a blocked navigation knows
+    // why. The buckets are merged in BLOCKED_HOSTNAMES for cheap
+    // lookup; classify by host string for the error.
+    if (host === "127.0.0.1" || host === "0.0.0.0" || host === "localhost" || host === "::1") {
+      return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
+    }
     return `Blocked: ${host} is a cloud metadata endpoint.`;
+  }
+  // Loopback /8 (127.0.0.0/8 — anything 127.x.y.z, not just 127.0.0.1)
+  // and *.localhost (RFC 6761) — same rationale as the literal
+  // 127.0.0.1 entry.
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
+    return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
   }
   if (isLinkLocal(host)) {
     return `Blocked: ${host} is a link-local address.`;
