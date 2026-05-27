@@ -151,6 +151,11 @@ function UpdateReminder() {
         return;
       }
       toast.success("Gini updated. Restarting...");
+      qc.setQueryData<GiniVersionInfo>(["version", "check"], (prev) => {
+        const base = prev ?? statusVersion;
+        if (!base) return prev;
+        return { ...base, git: { ...base.git, updateAvailable: false } };
+      });
       setTimeout(() => {
         qc.invalidateQueries({ queryKey: ["status"] });
         qc.invalidateQueries({ queryKey: ["version", "check"] });
