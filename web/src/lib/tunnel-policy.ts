@@ -43,9 +43,13 @@ const TUNNEL_PREFIX = "/api/runtime/tunnel";
  *  - QR endpoints (`/api/runtime/tunnel/qr.svg`, `/qr.txt`): ALLOW. The
  *    pixels do encode the bootstrap URL, but the operator surfaces them
  *    behind a click-to-reveal blur + an explicit privacy warning.
- *  - Notes refresh (`/api/runtime/tunnel/refresh-notes`): DENY. This
- *    drives osascript on the operator's Mac and has no use case from a
- *    tunneled phone — keep it loopback-only.
+ *  - Notes refresh (`/api/runtime/tunnel/refresh-notes`): ALLOW. The
+ *    tunneled view exposes the same Apple Notes mirror toggle that the
+ *    loopback settings card does, and a tunneled operator needs to be
+ *    able to drive a one-off re-sync after enabling the mirror or
+ *    after a recycle. The osascript itself runs on the operator's Mac
+ *    — the tunneled caller only triggers it; it cannot exfiltrate
+ *    Notes content.
  *  - Any future `/api/runtime/tunnel/<sub>` route: DENY by default.
  *    Adding a new endpoint should be a deliberate ALLOW, not a silent
  *    unlock.

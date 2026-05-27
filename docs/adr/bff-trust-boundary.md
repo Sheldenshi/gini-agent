@@ -86,11 +86,19 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   end-to-end: the proxy strips any inbound value before any branch
   decision and only stamps it after passing the secret/cookie gate
   (PLAN.md "Marker un-forgeability"). The BFF also re-checks a
-  tunnel-specific deny list against `/api/runtime/pairing/*` and
-  `/api/runtime/tunnel/*` (the QR endpoints, refresh-notes, and
-  PATCH on the bare tunnel root are all denied through the tunnel)
-  and rewrites bare `GET /api/runtime/tunnel` to the redacted
-  snapshot shape (`/api/tunnel/redacted`) before forwarding. The
+  tunnel-specific deny list: `/api/runtime/pairing/*` is the only
+  subtree denied to tunneled callers (minting a permanent device
+  bearer from a leaked URL is the real privilege escalation). Every
+  other `/api/runtime/tunnel/*` route the tunneled settings card
+  needs — `GET` / `PATCH` on the bare tunnel root, `GET /qr.svg`,
+  `GET /qr.txt`, `POST /refresh-notes` — is explicitly allowed so the
+  operator can rotate-secret, disable, or refresh the Apple Notes
+  mirror from the same surface they scanned on. Unknown
+  `/api/runtime/tunnel/<sub>` paths fall through to default-deny.
+  This is a deliberate broadening of PLAN.md's original deny list,
+  documented in tunnel-and-mobile-access.md. The BFF no longer
+  rewrites `GET /api/runtime/tunnel` to `/api/tunnel/redacted` —
+  vetted callers now receive the privileged snapshot directly. The
   legacy `GINI_TRUSTED_ORIGINS` lane remains intact for operators
   who front the BFF with their own stable hostname instead of the
   rotating trycloudflare URL.
@@ -140,12 +148,15 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   `Host: localhost`) passes whether the env var is set (and matches)
   or unset.
 - Tunnel-vetted GETs (marker stamped) on `/api/runtime/tunnel` return
-  the redacted snapshot shape (`secret: null`, `publicUrl: null`).
+  the privileged snapshot (`secret` + `publicUrl` populated) — the
+  tunneled settings card renders the QR + URL from the same data
+  shape the loopback view sees.
 - Tunnel-vetted requests to `/api/runtime/tunnel/qr.svg`,
   `/api/runtime/tunnel/qr.txt`, `POST /api/runtime/tunnel/refresh-notes`,
-  `PATCH /api/runtime/tunnel`, and any method on `/api/runtime/pairing/*`
-  return 404. Loopback callers of the same routes pass (the deny list
-  only applies when the marker is stamped).
+  and `PATCH /api/runtime/tunnel` all pass through and execute on the
+  runtime. Only `/api/runtime/pairing/*` (every method) and any
+  unknown `/api/runtime/tunnel/<sub>` path return 404 under the
+  marker. Loopback callers of every route pass without the marker.
 - The marker is never forwarded to the runtime — the BFF's
   `pickForwardHeaders` allowlist strips it before bearer injection,
   and the runtime never observes it.

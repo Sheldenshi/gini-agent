@@ -66,15 +66,40 @@ Key invariants the proxy enforces per PLAN.md:
   `x-gini-tunnel-vetted` value BEFORE its branch decisions and only stamps
   the marker on requests that passed the secret/cookie gate. The BFF reads
   the marker only on forwarded headers, never on inbound.
-- **Deny list**: tunneled requests to `/api/runtime/pairing/*` (the device
-  pairing surface), `/api/runtime/tunnel/<sub>` (QR endpoints, Apple Notes
-  refresh — anything that would let a tunnel holder mint device bearers or
-  fetch the QR pixels that encode the bootstrap URL), and the bare
-  `/api/runtime/tunnel` path with method other than GET are all 404'd at
-  the proxy and again at the BFF. Loopback callers bypass the deny list.
-- **Rewrite**: bare `GET /api/runtime/tunnel` under `vetted=1` is rewritten
-  by the BFF to `/api/tunnel/redacted` on the runtime so the tunneled
-  browser receives only `secret: null` / `publicUrl: null`.
+- **Deny list**: `/api/runtime/pairing/*` (the device-pairing surface) is
+  denied for tunneled callers — minting a permanent device bearer from a
+  leaked QR is the one real privilege escalation in this design, so the
+  pairing subtree stays loopback-only. Every other `/api/runtime/tunnel/*`
+  route the tunnel UI needs is explicitly ALLOWED:
+  - `GET /api/runtime/tunnel` returns the privileged snapshot (secret +
+    publicUrl) so the tunneled settings card can render the QR / URL.
+  - `PATCH /api/runtime/tunnel` lets the tunneled view drive enable /
+    disable / rotate-secret / Apple-Notes toggle through the same
+    confirm dialogs the loopback view uses.
+  - `GET /api/runtime/tunnel/qr.svg`, `/qr.txt` serve the QR pixels;
+    surfaced behind a click-to-reveal blur + explicit "live credential"
+    warning in the UI.
+  - `POST /api/runtime/tunnel/refresh-notes` triggers a one-off Apple
+    Notes mirror re-sync.
+
+  Any unknown `/api/runtime/tunnel/<sub>` route is denied by default; a
+  new tunnel-surfaced endpoint requires an explicit ALLOW entry rather
+  than silently inheriting the privileged exposure.
+
+  This is a deliberate broadening of PLAN.md's original conservative
+  deny list. The operator opted into surfacing the full tunnel-control
+  UI on the tunneled view so that a leaked URL can be revoked from the
+  same surface the operator scanned on. The shoulder-surfing
+  consequence (the QR pixels carry the bootstrap URL and a JS-level
+  XSS could canvas-decode them) is explicitly accepted; rotate-secret
+  is the panic-button mitigation.
+- **No BFF rewrite**: previously the BFF rewrote bare
+  `GET /api/runtime/tunnel` under `vetted=1` to `/api/tunnel/redacted`
+  so tunneled JS only saw the redacted snapshot shape. That rewrite is
+  dropped — vetted callers receive the full privileged snapshot. The
+  `/api/tunnel/redacted` endpoint is still exposed by the runtime for
+  any caller that wants the safe shape explicitly, but the BFF no
+  longer substitutes it implicitly.
 - **Operational lifecycle**: `cloudflared` lifetime equals gateway lifetime;
   shutdown stops the subprocess within a 5000 ms SIGKILL cap. Disable
   commits `enabled:false` to config FIRST, then kills cloudflared so the
@@ -93,7 +118,7 @@ Key invariants the proxy enforces per PLAN.md:
 |---|---|---|
 | URL holder (knows `/<secret>/`) | full operator access MINUS deny list | `rotate-secret` or hostname rotation on restart |
 | Session-cookie holder | same as URL holder | same |
-| Tunnel-vetted browser JS | full operator access MINUS deny list; receives redacted snapshot shape only | same |
+| Tunnel-vetted browser JS | full operator access MINUS pairing subtree; receives the privileged tunnel snapshot (secret + publicUrl) so it can render the QR / URL / rotate-secret UI | same |
 | Paired-device bearer | full operator access | device revoke |
 | Loopback bearer | full operator access | config edit |
 
@@ -139,10 +164,16 @@ short version:
 - Disable causes the next cookie-bearing request to 404, independent of the
   cloudflared-termination window.
 - Rotation invalidates outstanding cookies on the next hit.
-- Tunneled GET `/api/runtime/tunnel` returns the redacted snapshot.
-- Tunneled requests to `/api/runtime/pairing/*` and
-  `/api/runtime/tunnel/<sub>` return the deny status (404).
-- Loopback callers of the same routes pass.
+- Tunneled GET `/api/runtime/tunnel` returns the privileged snapshot
+  (secret + publicUrl populated).
+- Tunneled PATCH `/api/runtime/tunnel`, GET `/qr.svg`, GET `/qr.txt`,
+  and POST `/refresh-notes` all pass through and execute on the
+  runtime.
+- Tunneled requests to `/api/runtime/pairing/*` return 404 (the only
+  remaining denied subtree).
+- Any unknown `/api/runtime/tunnel/<sub>` path returns 404 (default-deny
+  for new endpoints).
+- Loopback callers of every route pass without the marker.
 - The marker is stripped from any inbound request before branch decisions
   and is never forwarded to the runtime.
 - Log files under `~/.gini/instances/<inst>/logs/` contain no occurrence of
