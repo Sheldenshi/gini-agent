@@ -39,7 +39,10 @@
           "enableBackgroundRemoteNotifications": true
         }
       ],
-      "./plugins/with-approval-notification-service.js",
+      [
+        "./plugins/with-approval-notification-service.js",
+        { "appleTeamId": "WB6Y3K67AB" }
+      ],
       "expo-updates"
     ],
     "experiments": {

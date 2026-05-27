@@ -22,6 +22,11 @@
  *                      the host app's bundle id to produce the NSE
  *                      bundle id (e.g. "ai.lilaclabs.gini.mobile.notificationservice")
  *   - `iosDeployment` — defaults to "15.1", the NSE's minimum iOS version
+ *   - `appleTeamId`  — required for EAS Build / archive signing. Sets
+ *                      DEVELOPMENT_TEAM on the NSE target so automatic
+ *                      signing can resolve a provisioning profile.
+ *                      Without it, Xcode emits the misleading
+ *                      "resource bundles are signed by default" error.
  *
  * Source of truth for the Swift NSE itself:
  *   mobile/ios-extensions/ApprovalNotificationService/NotificationService.swift
@@ -198,8 +203,14 @@ function addExtensionTarget(xcodeProject, opts, hostBundleId) {
         buildSettings.TARGETED_DEVICE_FAMILY = `"1,2"`;
         buildSettings.LD_RUNPATH_SEARCH_PATHS = `"$(inherited) @executable_path/Frameworks @executable_path/../../Frameworks"`;
         // CODE_SIGN_STYLE = Automatic mirrors what Xcode does when a
-        // human adds an extension via the GUI.
+        // human adds an extension via the GUI. DEVELOPMENT_TEAM must be
+        // set explicitly: EAS injects the team into the main app target
+        // via the distribution cert, but the NSE target is created
+        // here, after that injection, so it has to carry its own team.
         buildSettings.CODE_SIGN_STYLE = "Automatic";
+        if (opts.appleTeamId) {
+          buildSettings.DEVELOPMENT_TEAM = opts.appleTeamId;
+        }
       }
     }
   }
@@ -215,7 +226,8 @@ function resolveOptions(rawOpts) {
   return {
     targetName: opts.targetName || DEFAULT_TARGET_NAME,
     bundleSuffix: opts.bundleSuffix || DEFAULT_BUNDLE_SUFFIX,
-    iosDeployment: opts.iosDeployment || DEFAULT_IOS_DEPLOYMENT
+    iosDeployment: opts.iosDeployment || DEFAULT_IOS_DEPLOYMENT,
+    appleTeamId: opts.appleTeamId
   };
 }
 
