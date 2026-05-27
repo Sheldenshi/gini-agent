@@ -400,29 +400,34 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const cardClass = isPending
     ? "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
     : "rounded-lg border border-border bg-background/40 p-3";
-  // The React sticky state (bridgeResultOk, pairingResultOk,
-  // removeResultOk) only survives the current page session — on
-  // reload it re-initializes to null and the past-tense summary
-  // falls back to "Bridge added"/"Pairing approved"/"Bridge
-  // removed", which is a lie when the /connect side effect
-  // actually failed (the approval row's status flips to
-  // "approved" at resolveApproval BEFORE the side effect runs).
-  // The /connect handlers now persist their outcome onto
-  // approval.connectOutcome, so reads fall through:
-  // sticky (this session) → persisted (durable across reload).
+  // Server-side persisted outcome is the source of truth — the
+  // /connect handlers write it inside the same mutateState that
+  // commits the side effect. React sticky state (bridgeResultOk,
+  // pairingResultOk, removeResultOk) is the fast-path signal for
+  // the in-flight window before useApprovals() refetches, but it
+  // can disagree with the server in one specific case: a
+  // network/abort error fires onError on the client AFTER the
+  // server already committed and persistConnectOutcome wrote
+  // ok:true. The earlier "sticky-then-persisted" priority let the
+  // client's incorrect ok:false win over the server truth.
+  // Reverse it: trust persistedOutcome when present, fall back to
+  // sticky only when the server hasn't written one yet (purely
+  // in-flight, no commit). On reload sticky is gone and
+  // persistedOutcome remains durable, so the post-reload render
+  // still reads the truthful past-tense summary.
   const persistedOutcome = approval?.connectOutcome;
-  const effectiveBridgeOk = bridgeResultOk !== null
-    ? bridgeResultOk
-    : persistedOutcome?.ok ?? null;
-  const effectiveBridgeMessage = bridgeResultMessage ?? persistedOutcome?.message ?? null;
-  const effectivePairingOk = pairingResultOk !== null
-    ? pairingResultOk
-    : persistedOutcome?.ok ?? null;
-  const effectivePairingMessage = pairingResultMessage ?? persistedOutcome?.message ?? null;
-  const effectiveRemoveOk = removeResultOk !== null
-    ? removeResultOk
-    : persistedOutcome?.ok ?? null;
-  const effectiveRemoveMessage = removeError ?? persistedOutcome?.message ?? null;
+  const effectiveBridgeOk = persistedOutcome
+    ? persistedOutcome.ok
+    : bridgeResultOk;
+  const effectiveBridgeMessage = persistedOutcome?.message ?? bridgeResultMessage ?? null;
+  const effectivePairingOk = persistedOutcome
+    ? persistedOutcome.ok
+    : pairingResultOk;
+  const effectivePairingMessage = persistedOutcome?.message ?? pairingResultMessage ?? null;
+  const effectiveRemoveOk = persistedOutcome
+    ? persistedOutcome.ok
+    : removeResultOk;
+  const effectiveRemoveMessage = persistedOutcome?.message ?? removeError ?? null;
   // Past-tense the summary once resolved so "Enter credentials..."
   // doesn't keep reading as an active ask after the user has
   // already submitted (or denied). Display-only — the underlying
