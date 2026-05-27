@@ -679,7 +679,18 @@ describe("request_connector dispatch", () => {
       "http://[::1]/",
       "http://[fc00::1]/",
       "http://[fe80::1]/",
-      "http://example.localhost/api"
+      "http://example.localhost/api",
+      // IPv4-mapped IPv6 hex forms — all alias the same loopback /
+      // RFC1918 addresses but bypass the dot-quad-only regex if not
+      // decoded. URL parser normalizes [::127.0.0.1] to [::7f00:1]
+      // (the deprecated IPv4-compatible form), so this isn't just an
+      // attacker-crafted curiosity — it shows up unprompted.
+      "http://[::ffff:7f00:1]/",
+      "http://[::ffff:a00:1]/",
+      "http://[::ffff:c0a8:1]/",
+      "http://[::ffff:ac10:1]/",
+      "http://[::ffff:a9fe:1]/",
+      "http://[::7f00:1]/"
     ];
     for (const url of refusedTargets) {
       await expect(

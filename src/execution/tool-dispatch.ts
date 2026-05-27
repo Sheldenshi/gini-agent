@@ -534,10 +534,28 @@ function classifyHost(host: string): "loopback" | "private" | "linkLocal" | "pub
     // guard.
     if (lower.startsWith("fc") || lower.startsWith("fd")) return "private";
     if (lower.startsWith("fe80")) return "linkLocal";
-    // IPv4-mapped IPv6 form, e.g. ::ffff:127.0.0.1 — reclassify the
-    // embedded IPv4 to keep the loopback check honest.
-    const mapped = lower.match(/^::ffff:([\d.]+)$/);
-    if (mapped) return classifyHost(mapped[1] ?? "");
+    // IPv4-mapped IPv6 forms. Three shapes are all valid IPv6
+    // literals for the same underlying IPv4 address; each must be
+    // reclassified on the embedded IPv4 or the guard is bypassable:
+    //   a. mixed dot-quad: "::ffff:127.0.0.1"
+    //   b. pure hex IPv4-mapped: "::ffff:7f00:1"
+    //   c. deprecated IPv4-compatible: "::7f00:1" (no ffff). Node's
+    //      URL parser normalizes "[::127.0.0.1]" to this form, so
+    //      it shows up unprompted even when the agent passed a
+    //      dot-quad-looking URL.
+    const mappedDotQuad = lower.match(/^::ffff:([\d.]+)$/);
+    if (mappedDotQuad) return classifyHost(mappedDotQuad[1] ?? "");
+    const mappedHex = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    const compatHex = lower.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    const hex = mappedHex ?? compatHex;
+    if (hex) {
+      const hi = parseInt(hex[1] ?? "0", 16);
+      const lo = parseInt(hex[2] ?? "0", 16);
+      if (Number.isFinite(hi) && Number.isFinite(lo)) {
+        const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        return classifyHost(ipv4);
+      }
+    }
     return "public";
   }
   return "unknown";
