@@ -1,3 +1,4 @@
+import * as FileSystem from "expo-file-system/legacy";
 import { readCachedCredentials, type AuthCredentials } from "./auth";
 
 // Mirrors web/src/lib/api.ts in shape (`api<T>(path, init)`), but talks
@@ -94,9 +95,13 @@ export interface UploadRef {
 
 // Multipart upload to the gateway. We can't reuse api() because it pins
 // content-type: application/json, which would strip the multipart
-// boundary FormData needs. The picker hands us a local file:// URI, not
-// a Blob, so we wrap it in the React Native FormData file-object shape
-// the platform's networking layer recognizes.
+// boundary. We also can't use fetch() with FormData here: Expo SDK 56
+// installs a winter-fetch polyfill whose convertFormDataAsync rejects
+// React Native's classic `{uri, name, type}` part shape (see
+// node_modules/expo/src/winter/fetch/convertFormData.ts — "Unsupported
+// FormDataPart implementation"). FileSystem.uploadAsync streams the
+// file from disk through native URLSession, sidestepping the polyfill
+// and avoiding loading the bytes into JS memory at all.
 export async function uploadImage(file: {
   uri: string;
   name: string;
@@ -110,23 +115,15 @@ export async function uploadImage(file: {
   } catch {
     throw new ApiError(0, "Stored base URL is invalid.");
   }
-  const form = new FormData();
-  // RN FormData accepts the { uri, name, type } object form for file
-  // parts; the native layer streams the file from disk rather than
-  // requiring a Blob load into JS memory.
-  form.append("file", {
-    uri: file.uri,
-    name: file.name,
-    type: file.mimeType
-  } as unknown as Blob);
-  const response = await fetch(`${origin}/api/uploads`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${creds.token}` },
-    body: form
+  const response = await FileSystem.uploadAsync(`${origin}/api/uploads`, file.uri, {
+    httpMethod: "POST",
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: "file",
+    mimeType: file.mimeType,
+    headers: { Authorization: `Bearer ${creds.token}` }
   });
-  const text = await response.text();
-  const value = text ? safeParse(text) : null;
-  if (!response.ok) {
+  const value = response.body ? safeParse(response.body) : null;
+  if (response.status < 200 || response.status >= 300) {
     const message =
       value && typeof value === "object" && "error" in value && typeof value.error === "string"
         ? value.error
