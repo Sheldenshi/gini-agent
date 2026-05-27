@@ -2857,6 +2857,82 @@ async function listMessagingPairingsTool(
 // chat is already enrolled, no longer pending, or the code has
 // expired — gives the agent a recoverable tool_result instead of
 // minting a card the operator can't act on.
+
+// Shape of a pending recentDeniedChats entry that both
+// requestMessagingPairingTool and waitForMessagingPairTool consume
+// when minting a messaging.approve_pairing approval. Fields match
+// what BlockApprovalRequested.tsx pulls off the payload.
+interface PendingPairForApproval {
+  chatId: number;
+  chatType?: string;
+  sender?: string;
+  verificationCode?: string;
+  verificationCodeExpiresAt?: string;
+}
+
+// Single source of truth for messaging.approve_pairing approval
+// minting. Both the explicit-request tool (requestMessagingPairingTool)
+// and the wait-loop tool (waitForMessagingPairTool) build the same
+// approval shape, including the chat-task plumbing (approvalIds.push,
+// approval_reason chat message, appendTrace). Centralizing it keeps
+// the two call sites from drifting when the card grows a new payload
+// field — adding the field here propagates to both.
+async function mintPairingApproval(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  bridge: { id: string; name: string; metadata?: Record<string, unknown> },
+  pending: PendingPairForApproval,
+  reasonOverride?: string
+): Promise<string> {
+  const reason = reasonOverride
+    ?? `Confirm the verification code below matches what you received on Telegram before approving chat ${pending.chatId}.`;
+  const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
+  const botUsername = typeof meta.botUsername === "string" ? meta.botUsername : undefined;
+  return mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "messaging.approve_pairing",
+      target: `${bridge.id}:${pending.chatId}`,
+      risk: "medium",
+      reason,
+      payload: {
+        bridgeId: bridge.id,
+        bridgeName: bridge.name,
+        botUsername: botUsername ?? null,
+        chatId: pending.chatId,
+        chatType: pending.chatType ?? "private",
+        sender: pending.sender ?? null,
+        verificationCode: pending.verificationCode ?? null,
+        verificationCodeExpiresAt: pending.verificationCodeExpiresAt ?? null,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.approve_pairing",
+      data: { approvalId: approval.id, bridgeId: bridge.id, chatId: pending.chatId, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
 async function requestMessagingPairingTool(
   config: RuntimeConfig,
   taskId: string,
@@ -2948,54 +3024,17 @@ async function requestMessagingPairingTool(
     }
   }
 
-  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+  const reasonOverride = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()
-    : `Confirm the verification code below matches what you received on Telegram before approving chat ${chatId}.`;
-  const metadata = (bridge.metadata ?? {}) as { botUsername?: unknown };
-  const botUsername = typeof metadata.botUsername === "string" ? metadata.botUsername : undefined;
-
-  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
-    const item = findTask(mutable, taskId);
-    if (isTerminalTaskStatus(item.status)) {
-      throw new TaskAlreadyTerminalError(taskId, item.status);
-    }
-    const approval = createApproval(mutable, {
-      taskId: item.id,
-      action: "messaging.approve_pairing",
-      target: `${bridge.id}:${chatId}`,
-      risk: "medium",
-      reason,
-      payload: {
-        bridgeId: bridge.id,
-        bridgeName: bridge.name,
-        botUsername: botUsername ?? null,
-        chatId,
-        chatType: pending.chatType,
-        sender: pending.sender ?? null,
-        verificationCode: pending.verificationCode ?? null,
-        verificationCodeExpiresAt: pending.verificationCodeExpiresAt ?? null,
-        toolCallId
-      }
-    });
-    item.approvalIds.push(approval.id);
-    item.updatedAt = now();
-    if (item.chatSessionId) {
-      createChatMessage(mutable, {
-        sessionId: item.chatSessionId,
-        role: "assistant",
-        content: reason,
-        taskId: item.id,
-        runId: item.runId,
-        kind: "approval_reason"
-      });
-    }
-    appendTrace(config.instance, item.id, {
-      type: "approval",
-      message: "Approval requested for messaging.approve_pairing",
-      data: { approvalId: approval.id, bridgeId: bridge.id, chatId, toolCallId }
-    });
-    return approval.id;
-  });
+    : undefined;
+  const approvalId = await mintPairingApproval(
+    config,
+    taskId,
+    toolCallId,
+    bridge,
+    { ...pending, chatId },
+    reasonOverride
+  );
   return { kind: "pending", approvalId };
 }
 
@@ -3143,55 +3182,24 @@ async function waitForMessagingPairTool(
     );
 
     if (newOrRotated && newOrRotated.verificationCode) {
-      // Mint the messaging.approve_pairing approval bound to this
-      // task so the chat-task loop pauses on it. Reuses the
-      // payload shape requestMessagingPairingTool / the
-      // BlockApprovalRequested card already expect.
-      const metaForCard = (liveBridge.metadata ?? {}) as { botUsername?: unknown };
-      const botUsername = typeof metaForCard.botUsername === "string" ? metaForCard.botUsername : undefined;
-      const cardReason = reasonText
-        ?? `Confirm the verification code below matches what you received on Telegram before approving chat ${newOrRotated.chatId}.`;
-      const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
-        const item = findTask(mutable, taskId);
-        if (isTerminalTaskStatus(item.status)) {
-          throw new TaskAlreadyTerminalError(taskId, item.status);
-        }
-        const approval = createApproval(mutable, {
-          taskId: item.id,
-          action: "messaging.approve_pairing",
-          target: `${liveBridge.id}:${newOrRotated.chatId}`,
-          risk: "medium",
-          reason: cardReason,
-          payload: {
-            bridgeId: liveBridge.id,
-            bridgeName: liveBridge.name,
-            botUsername: botUsername ?? null,
-            chatId: newOrRotated.chatId,
-            chatType: newOrRotated.chatType ?? "private",
-            sender: newOrRotated.sender ?? null,
-            verificationCode: newOrRotated.verificationCode ?? null,
-            verificationCodeExpiresAt: newOrRotated.verificationCodeExpiresAt ?? null,
-            toolCallId
-          }
-        });
-        item.approvalIds.push(approval.id);
-        item.updatedAt = now();
-        if (item.chatSessionId) {
-          createChatMessage(mutable, {
-            sessionId: item.chatSessionId,
-            role: "assistant",
-            content: cardReason,
-            taskId: item.id,
-            runId: item.runId,
-            kind: "approval_reason"
-          });
-        }
-        appendTrace(config.instance, item.id, {
-          type: "approval",
-          message: "Approval requested for messaging.approve_pairing (wait_for_messaging_pair)",
-          data: { approvalId: approval.id, bridgeId: liveBridge.id, chatId: newOrRotated.chatId, toolCallId }
-        });
-        return approval.id;
+      // Delegate to the shared mintPairingApproval helper so the
+      // payload shape stays in lockstep with requestMessagingPairingTool.
+      // The helper writes its own "Approval requested" trace; add a
+      // wait-variant trace afterward so an operator inspecting the
+      // task log can tell the card came from the polling loop instead
+      // of an explicit request_messaging_pairing call.
+      const approvalId = await mintPairingApproval(
+        config,
+        taskId,
+        toolCallId,
+        liveBridge,
+        newOrRotated,
+        reasonText
+      );
+      appendTrace(config.instance, taskId, {
+        type: "approval",
+        message: "Approval requested for messaging.approve_pairing (wait_for_messaging_pair)",
+        data: { approvalId, bridgeId: liveBridge.id, chatId: newOrRotated.chatId, toolCallId }
       });
       return { kind: "pending", approvalId };
     }
