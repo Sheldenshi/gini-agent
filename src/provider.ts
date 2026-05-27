@@ -1784,6 +1784,9 @@ function numberField(record: Record<string, unknown> | undefined, key: string): 
 function readCodexBearer(provider: ProviderConfig): string {
   const credentials = readCodexCredentials(provider);
   if (!credentials.ok || !credentials.bearer) {
+    if (credentials.transient) {
+      throw new CodexAuthRaceError(credentials.message);
+    }
     throw new Error(credentials.message);
   }
   return credentials.bearer;
@@ -1802,6 +1805,20 @@ class CodexSessionExpiredError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "CodexSessionExpiredError";
+  }
+}
+
+// Thrown when reading ~/.codex/auth.json observably races the codex CLI's
+// non-atomic rewrite — readFileSync returns an empty or partial document
+// and JSON.parse fails. Carries the same single-retry contract as
+// CodexSessionExpiredError so withCodexSessionRetry can wait out the
+// writer and re-read. Distinct error class so the retry helper can
+// distinguish "backend rejected the token" from "we couldn't read the
+// file" without conflating the two semantically.
+class CodexAuthRaceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexAuthRaceError";
   }
 }
 
@@ -1864,11 +1881,21 @@ const CODEX_RETRY_REWRITE_DELAY_MS = 50;
 // usually means the CLI hasn't yet refreshed, and looping would just
 // burn quota. A short delay before the retry avoids racing the writer
 // (see CODEX_RETRY_REWRITE_DELAY_MS).
+//
+// Two errors trigger the retry:
+//   - CodexSessionExpiredError — the backend rejected the token (401 or
+//     SSE error event matching the session-expired regex).
+//   - CodexAuthRaceError — local readCodexBearer observed a partial /
+//     empty auth.json mid-rewrite. Without this branch the parse failure
+//     surfaces as a permanent generic Error and the user sees a hard
+//     failure from a transient mid-write read.
 async function withCodexSessionRetry<T>(make: () => Promise<T>): Promise<T> {
   try {
     return await make();
   } catch (err) {
-    if (!(err instanceof CodexSessionExpiredError)) throw err;
+    if (!(err instanceof CodexSessionExpiredError) && !(err instanceof CodexAuthRaceError)) {
+      throw err;
+    }
     await new Promise<void>((resolve) => setTimeout(resolve, CODEX_RETRY_REWRITE_DELAY_MS));
     return await make();
   }
@@ -1880,6 +1907,11 @@ function readCodexCredentials(provider: ProviderConfig): {
   authPath: string;
   credentialType?: "api_key" | "access_token";
   message: string;
+  // True when the failure is plausibly a mid-rewrite read of auth.json
+  // (readFileSync threw, or JSON.parse failed). Distinguishes the
+  // retryable race window from steady-state "no credentials" states like
+  // "file is missing" or "tokens block is absent".
+  transient?: boolean;
 } {
   const authPath = codexAuthPath(provider);
   if (!existsSync(authPath)) {
@@ -1925,6 +1957,7 @@ function readCodexCredentials(provider: ProviderConfig): {
     return {
       ok: false,
       authPath,
+      transient: true,
       message: `Could not read Codex credentials at ${authPath}: ${error instanceof Error ? error.message : String(error)}`
     };
   }

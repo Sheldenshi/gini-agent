@@ -2175,6 +2175,71 @@ describe("provider", () => {
     }
   });
 
+  test("codex retries when auth.json is mid-rewrite (partial JSON parse fails on attempt 1)", async () => {
+    // The codex CLI rewrites auth.json non-atomically (truncate + write,
+    // no temp+rename). If gini's first attempt reads the file during
+    // that window, JSON.parse fails. The parse failure used to surface
+    // as a permanent generic Error; route it through CodexAuthRaceError
+    // so the same retry helper that handles session-expired waits out
+    // the writer and re-reads on attempt 2.
+    const { authPath, restore } = installCodexAuth("codex-retry-auth-race");
+    writeFileSync(authPath, "{ not valid json");
+    const restoreValidJson = setTimeout(() => {
+      writeFileSync(authPath, JSON.stringify({
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: "post-race-codex-access-token",
+          refresh_token: "post-race-codex-refresh-token"
+        }
+      }));
+    }, 25);
+
+    const originalFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = (() => {
+      fetchCalls += 1;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r2", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      const result = await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      // Attempt 1 threw before fetch ran (bearer read parse failure).
+      // The 50ms retry delay let the timer above restore valid JSON,
+      // and attempt 2 succeeded — so the backend saw exactly one
+      // request.
+      expect(fetchCalls).toBe(1);
+      expect(result.text).toBe("ok");
+    } finally {
+      clearTimeout(restoreValidJson);
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
   test("codex waits briefly before retrying so a mid-write auth.json can settle", async () => {
     // The codex CLI rewrites ~/.codex/auth.json non-atomically (truncate +
     // write, no temp+rename), so an immediate retry can race that writer
