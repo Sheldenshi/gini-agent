@@ -18,8 +18,8 @@ function asSnapshot(value: unknown): TunnelSnapshot {
 //   sync-notes          force an Apple Notes refresh
 //   apple-notes [on|off]  enable/disable the iCloud Notes mirror
 //
-// Falls back to direct `config.json` mutation for enable/disable when the
-// runtime isn't running so the next start picks up the change.
+// All subcommands talk to the running runtime HTTP API. The gateway must be
+// up — start it with `gini run` (or `gini start` in daemon mode) first.
 
 export async function tunnel(ctx: CliContext): Promise<void> {
   const { config, cliArgs } = ctx;

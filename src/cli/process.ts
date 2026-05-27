@@ -19,7 +19,7 @@ import { probeMemoryDb } from "../state/memory-db";
 import { legacyMigrationStatus } from "../memory";
 import { embeddingStatus, listBanksWithModelMismatch } from "../memory/embedding";
 import { rerankerStatus } from "../memory/reranker";
-import { defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
+import { configPath, defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
 import { api, auth, url } from "./api";
 
 export interface WebOptions {
@@ -165,7 +165,10 @@ function makeWebLogRedactor(instance: string): (chunk: Buffer | string) => strin
     const now = Date.now();
     if (cachedSecret !== null && now - cachedAt < CACHE_MS) return cachedSecret;
     try {
-      const raw = readFileSync(join(process.env.HOME ?? "", ".gini", "instances", instance, "config.json"), "utf8");
+      // Use configPath() so GINI_STATE_ROOT is honored — without this the
+      // redactor reads a nonexistent file under HOME and emits the secret
+      // unredacted in non-default deployments (tests, alt state-roots).
+      const raw = readFileSync(configPath(instance), "utf8");
       const parsed = JSON.parse(raw) as { tunnel?: { secret?: unknown } };
       const next = typeof parsed.tunnel?.secret === "string" ? parsed.tunnel.secret : null;
       if (next !== cachedSecret && cachedSecret) priorSecret = cachedSecret;

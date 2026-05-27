@@ -150,8 +150,17 @@ class TunnelManager {
           setRedactionPublicUrl(url);
           // Publish the live URL to disk so the Next.js proxy (separate
           // process) can equality-match Host instead of trusting any
-          // .trycloudflare.com suffix. See PLAN.md "Architecture" step 3.
-          try { atomicWriteFile(publicUrlPath(this.config.instance), `${url}\n`); } catch { /* surfaced via lastError */ }
+          // .trycloudflare.com suffix. If the write fails the proxy can't
+          // classify Host and will 404 every request — surface the error
+          // in lastError so the operator sees the failure rather than a
+          // silently broken tunnel.
+          try {
+            atomicWriteFile(publicUrlPath(this.config.instance), `${url}\n`);
+          } catch (writeErr) {
+            const writeMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
+            this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
+            appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
+          }
           appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
           // Fire Notes refresh asynchronously when enabled.
           if (this.snapshot.appleNotes.enabled) void this.refreshNotes();
@@ -187,39 +196,55 @@ class TunnelManager {
 
   async disable(): Promise<TunnelTransitionResult> {
     return this.enqueue(async () => {
+      this.generation += 1;
+      // Try to commit enabled:false BEFORE killing cloudflared (PLAN.md
+      // "Operational invariants" ordering for the 5000 ms exposure cap).
+      // If the config write throws (EACCES, disk full), we MUST still stop
+      // cloudflared so the public URL doesn't keep accepting traffic from
+      // a state the operator believes is disabled. Surface both failures
+      // in lastError but keep the disable flow committed.
+      let configErr: string | null = null;
       try {
-        this.generation += 1;
-        // Commit enabled:false BEFORE killing cloudflared. Without this
-        // ordering the proxy could read stale enabled:true between cloudflared
-        // termination and config commit. See PLAN.md "Operational invariants".
         patchTunnelConfig(this.config.instance, { enabled: false });
-        if (this.cloudflared) {
-          const prev = this.cloudflared;
-          this.cloudflared = null;
-          await prev.stop();
-        }
-        // Clear iCloud Notes copy on disable transition if Notes mirror is on.
-        if (this.snapshot.appleNotes.enabled && this.notesAvailable) {
-          try {
-            await clearNote(NOTES_FOLDER, this.notesNoteName());
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.snapshot = {
-              ...this.snapshot,
-              appleNotes: { ...this.snapshot.appleNotes, lastError: redact(msg) }
-            };
-          }
-        }
-        this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: null };
-        setRedactionPublicUrl(null);
-        try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-        appendLog(this.config.instance, "tunnel.disabled", { generation: this.generation });
-        return { ok: true, snapshot: this.snapshot };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        this.snapshot = { ...this.snapshot, lastError: redact(msg) };
-        return { ok: false, error: redact(msg) };
+        configErr = err instanceof Error ? err.message : String(err);
+        appendLog(this.config.instance, "tunnel.disable.config-error", { error: redact(configErr) });
       }
+      let stopErr: string | null = null;
+      if (this.cloudflared) {
+        const prev = this.cloudflared;
+        this.cloudflared = null;
+        try {
+          await prev.stop();
+        } catch (err) {
+          stopErr = err instanceof Error ? err.message : String(err);
+          appendLog(this.config.instance, "tunnel.disable.stop-error", { error: redact(stopErr) });
+        }
+      }
+      // Clear iCloud Notes copy on disable transition if Notes mirror is on.
+      let notesErr: string | null = null;
+      if (this.snapshot.appleNotes.enabled && this.notesAvailable) {
+        try {
+          await clearNote(NOTES_FOLDER, this.notesNoteName());
+        } catch (err) {
+          notesErr = err instanceof Error ? err.message : String(err);
+        }
+      }
+      const errorMsg = configErr ?? stopErr ?? null;
+      this.snapshot = {
+        ...this.snapshot,
+        enabled: false,
+        publicUrl: null,
+        lastError: errorMsg ? redact(errorMsg) : null,
+        appleNotes: notesErr
+          ? { ...this.snapshot.appleNotes, lastError: redact(notesErr) }
+          : this.snapshot.appleNotes
+      };
+      setRedactionPublicUrl(null);
+      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      appendLog(this.config.instance, "tunnel.disabled", { generation: this.generation });
+      if (errorMsg) return { ok: false, error: redact(errorMsg) };
+      return { ok: true, snapshot: this.snapshot };
     });
   }
 

@@ -47,19 +47,39 @@ tunnelManager(config);
 // the operator's expectation is that the tunnel comes back up after a restart
 // (with a new rotating hostname). The web port isn't known yet — the CLI
 // writes it once Next.js reports healthy — so we poll the sibling
-// `web.port` file and trigger `enable(webPort)` once it appears. Bounded
-// by the 60_000 ms PLAN.md ceiling on web-port discovery.
+// `web.port` file. The persisted flag is re-read inside the loop so a
+// `gini tunnel disable` issued before web.port appears does NOT re-enable
+// when the port lands. A `__healthz` probe runs before the cloudflared
+// spawn so we never expose a stale or squatted port to the public URL.
+// Bounded by the 60_000 ms PLAN.md ceiling on web-port discovery.
 {
-  const persisted = readTunnelConfig(config.instance);
-  if (persisted.enabled) {
+  const initial = readTunnelConfig(config.instance);
+  if (initial.enabled) {
     const deadline = Date.now() + 60_000;
     const poll = async () => {
       while (Date.now() < deadline) {
+        // Re-read the persisted state on every tick. If the operator runs
+        // `gini tunnel disable` while we're polling, the next check
+        // observes enabled=false and aborts the reconcile.
+        const persisted = readTunnelConfig(config.instance);
+        if (!persisted.enabled) {
+          appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "disabled-during-poll" });
+          return;
+        }
         const portFile = webPortPath(config.instance);
         if (fileExists(portFile)) {
           const portRaw = readFileSyncFs(portFile, "utf8").trim();
           const port = Number(portRaw);
           if (Number.isFinite(port) && port > 0) {
+            // Verify the port is actually our supervised Next.js child by
+            // probing the BFF-side healthz endpoint. A 200 with the
+            // expected JSON shape proves the port isn't a stale-file or
+            // port-squat scenario.
+            const healthy = await probeNextHealthz(port).catch(() => false);
+            if (!healthy) {
+              await Bun.sleep(500);
+              continue;
+            }
             const result = await tunnelManager(config).enable(port);
             appendLog(config.instance, "tunnel.boot-reconcile", { ok: result.ok });
             return;
@@ -70,6 +90,19 @@ tunnelManager(config);
       appendLog(config.instance, "tunnel.boot-reconcile.timeout", {});
     };
     void poll();
+  }
+}
+
+async function probeNextHealthz(port: number): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/runtime/__healthz`, {
+      signal: AbortSignal.timeout(1500)
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { service?: unknown; instance?: unknown };
+    return body.service === "gini-web" && body.instance === config.instance;
+  } catch {
+    return false;
   }
 }
 
