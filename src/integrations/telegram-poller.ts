@@ -22,6 +22,7 @@ import {
   sendMessagingOutput
 } from "./messaging";
 import { syncChatTaskResult } from "../execution/chat";
+import { surfacePendingPairingInChat } from "./messaging-pairing-alert";
 import {
   awaitTerminalTask,
   createDetachedTracker,
@@ -254,6 +255,33 @@ async function runLoop(
           // audit tables one row per DM. The user can always reload
           // the original DM to see the same code they were sent.
           if (entry?.verificationCode && entry.mintedFreshCode) {
+            // Auto-surface the pending pair as an inline chat
+            // approval card so the operator doesn't have to ask
+            // the agent "any pending pairings?" — the card just
+            // appears in the "Messaging alerts" chat session the
+            // moment a fresh code is minted. Best-effort: the
+            // settings-page polling fallback covers any failure
+            // here so a logging blip can't silently lose the
+            // alert surface. Fire-and-forget: the per-update loop
+            // shouldn't block on UI plumbing.
+            const bridgeSnapshot = readState(config.instance).messagingBridges.find(
+              (b) => b.id === bridgeId
+            );
+            if (bridgeSnapshot) {
+              void surfacePendingPairingInChat(config, {
+                bridgeId,
+                bridgeName: bridgeSnapshot.name,
+                botUsername:
+                  typeof (bridgeSnapshot.metadata as { botUsername?: unknown } | undefined)?.botUsername === "string"
+                    ? ((bridgeSnapshot.metadata as { botUsername?: unknown }).botUsername as string)
+                    : undefined,
+                chatId: incoming.chatId,
+                chatType: incoming.chatType,
+                sender: incoming.senderHandle,
+                verificationCode: entry.verificationCode,
+                verificationCodeExpiresAt: entry.verificationCodeExpiresAt
+              });
+            }
             // Compose the poller's lifecycle signal with a 10-second
             // timeout so a hung Telegram outbound socket can't pin the
             // per-update loop. Without this, a fetch that's TCP-accepted
