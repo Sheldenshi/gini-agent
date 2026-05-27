@@ -1,14 +1,19 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
+import {
+  BotIcon,
+  PencilIcon,
+  PlusIcon,
+  ServerIcon,
+  SparklesIcon,
+  Terminal as TerminalIcon,
+  Trash2Icon,
+  ZapIcon
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { EmptyState } from "@/components/PageHeader";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 
@@ -21,168 +26,150 @@ export interface ProviderCatalogItem {
   baseUrl?: string;
 }
 
-// Providers selectable in this form. `codex` uses its own OAuth/auth.json
-// flow handled by the /setup page and is intentionally omitted here.
-const SELECTABLE_PROVIDERS = new Set(["openai", "openrouter", "deepseek", "local"]);
+// Providers selectable on the Settings page. Echo is dev-only; the four
+// real providers map onto the Pencil mock (Codex, OpenAI, DeepSeek, Ollama
+// stand in for `local`).
+const SELECTABLE_PROVIDERS = ["codex", "openai", "deepseek", "openrouter", "local"] as const;
+
+// Per-provider visual identity. Lucide icons mirror the iconography in the
+// Pencil mock; auth label is what shows up in the small pill next to the
+// provider name.
+const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; authLabel: string }> = {
+  codex: { icon: TerminalIcon, authLabel: "OAuth" },
+  openai: { icon: SparklesIcon, authLabel: "API key" },
+  deepseek: { icon: BotIcon, authLabel: "API key" },
+  openrouter: { icon: ZapIcon, authLabel: "API key" },
+  local: { icon: ServerIcon, authLabel: "Local" }
+};
 
 interface SetProviderResult {
   ok: boolean;
   error?: string;
-  provider: { provider: { name: string; model: string } };
 }
 
 export function ProviderCard({
-  displayName,
-  model,
-  catalog
+  catalog,
+  activeProviderName,
+  activeProviderModel
 }: {
-  displayName?: string;
-  model?: string;
   catalog: ProviderCatalogItem[];
+  activeProviderName?: string;
+  activeProviderModel?: string;
 }) {
   const invalidate = useInvalidate();
-  const selectable = useMemo(
-    () => catalog.filter((c) => SELECTABLE_PROVIDERS.has(c.name)),
-    [catalog]
-  );
+  const rows = SELECTABLE_PROVIDERS
+    .map((name) => catalog.find((c) => c.name === name))
+    .filter((c): c is ProviderCatalogItem => Boolean(c));
 
-  const [providerName, setProviderName] = useState<string>("");
-  const [selectedModel, setSelectedModel] = useState<string>("");
-  const [apiKey, setApiKey] = useState("");
-
-  // Seed defaults the first time the catalog arrives.
-  useEffect(() => {
-    if (providerName === "" && selectable.length > 0) {
-      const first = selectable[0]!;
-      setProviderName(first.name);
-      setSelectedModel(first.models[0] ?? "");
-    }
-  }, [selectable, providerName]);
-
-  // When the user picks a different provider, reset the model to that
-  // provider's first catalog entry. Otherwise a stale model id leaks
-  // into the request body (e.g. openrouter model selected, then user
-  // switches to deepseek — would send openrouter/auto to deepseek).
-  const onProviderChange = (next: string) => {
-    setProviderName(next);
-    const entry = selectable.find((c) => c.name === next);
-    setSelectedModel(entry?.models[0] ?? "");
-    setApiKey("");
-  };
-
-  const entry = selectable.find((c) => c.name === providerName);
-  const requiresApiKey = providerName !== "local" && providerName !== "";
-
-  const setProvider = useMutation({
-    mutationFn: async (): Promise<SetProviderResult> =>
+  const setActive = useMutation({
+    mutationFn: async (vars: { provider: string; model: string }): Promise<SetProviderResult> =>
       api<SetProviderResult>("/setup/provider", {
         method: "POST",
-        body: JSON.stringify({
-          provider: providerName,
-          ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(selectedModel ? { model: selectedModel } : {})
-        })
+        body: JSON.stringify({ provider: vars.provider, model: vars.model })
       }),
-    onSuccess: (result) => {
+    onSuccess: (result, vars) => {
       if (!result.ok) {
-        toast.error(result.error ?? "Failed to set provider.");
+        toast.error(result.error ?? `Failed to set ${vars.provider}.`);
         return;
       }
-      toast.success(`Provider set to ${providerName} (${selectedModel}).`);
-      setApiKey("");
+      toast.success(`Active provider: ${vars.provider} (${vars.model})`);
       invalidate(["status", "providers"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const canSubmit =
-    providerName !== "" &&
-    selectedModel !== "" &&
-    (!requiresApiKey || apiKey.trim().length > 0) &&
-    !setProvider.isPending;
-
   return (
-    <Card>
-      <CardHeader><CardTitle className="text-sm">Provider</CardTitle></CardHeader>
-      <CardContent className="space-y-4">
-        {displayName ? (
-          <div>
-            <p className="text-sm">{displayName}</p>
-            {model ? <p className="mt-1 text-xs text-muted-foreground">{model}</p> : null}
-          </div>
-        ) : (
-          <EmptyState title="No active provider" />
-        )}
+    <section className="flex flex-col gap-4">
+      <header className="flex items-center justify-between gap-4">
+        <div className="space-y-1">
+          <h2 className="text-base font-semibold text-foreground">Model providers</h2>
+          <p className="text-xs text-muted-foreground">
+            Select the active provider for new chats, or connect a new one.
+          </p>
+        </div>
+        <Button asChild size="sm">
+          <Link href="/settings/add-provider">
+            <PlusIcon className="size-4" />
+            Add provider
+          </Link>
+        </Button>
+      </header>
 
-        <form
-          className="space-y-3 border-t pt-4"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (canSubmit) setProvider.mutate();
-          }}
-        >
-          <p className="text-xs font-medium text-muted-foreground">Change provider</p>
-          <div className="grid gap-2">
-            <Label htmlFor="provider-name">Provider</Label>
-            <Select value={providerName} onValueChange={onProviderChange} disabled={setProvider.isPending}>
-              <SelectTrigger id="provider-name"><SelectValue placeholder="Select provider" /></SelectTrigger>
-              <SelectContent>
-                {selectable.map((c) => (
-                  <SelectItem key={c.id} value={c.name}>{c.displayName}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="grid gap-2">
-            <Label htmlFor="provider-model">Model</Label>
-            {/*
-              Radix Select reads the visible label from the matching SelectItem,
-              and SelectItems only mount when SelectContent is open. Setting
-              `value` programmatically while the popup is closed leaves the
-              trigger showing the placeholder. Remount the Select whenever the
-              chosen provider changes so `defaultValue` re-seeds the displayed
-              label without depending on the popup being opened.
-            */}
-            <Select
-              key={providerName}
-              defaultValue={selectedModel}
-              onValueChange={setSelectedModel}
-              disabled={!entry || setProvider.isPending}
+      <ul className="flex flex-col gap-3">
+        {rows.map((row) => {
+          const isActive = activeProviderName === row.name;
+          const visual = PROVIDER_VISUAL[row.name] ?? { icon: SparklesIcon, authLabel: row.auth };
+          const Icon = visual.icon;
+          const model = isActive
+            ? (activeProviderModel ?? row.models[0] ?? "")
+            : (row.models[0] ?? "");
+
+          return (
+            <li
+              key={row.id}
+              className="flex items-center gap-4 rounded-2xl border border-[#1F1F24] bg-[#141418] p-5"
             >
-              <SelectTrigger id="provider-model"><SelectValue placeholder="Select model" /></SelectTrigger>
-              <SelectContent>
-                {entry?.models.map((m) => (
-                  <SelectItem key={m} value={m}>{m}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-          {requiresApiKey ? (
-            <div className="grid gap-2">
-              <Label htmlFor="provider-api-key">API key</Label>
-              <Input
-                id="provider-api-key"
-                type="password"
-                autoComplete="off"
-                placeholder={providerName === "deepseek" ? "ds-…" : "sk-…"}
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                disabled={setProvider.isPending}
-              />
-              <p className="text-xs text-muted-foreground">
-                Saved to ~/.gini/secrets.env (mode 0600). Not sent anywhere except the provider you pick.
-              </p>
-            </div>
-          ) : (
-            <p className="text-xs text-muted-foreground">
-              Local providers (Ollama, LM Studio) accept no-auth requests. Leave the key blank if your gateway is open.
-            </p>
-          )}
-          <Button type="submit" disabled={!canSubmit}>
-            {setProvider.isPending ? "Saving…" : "Save provider"}
-          </Button>
-        </form>
-      </CardContent>
-    </Card>
+              <span
+                aria-hidden
+                className={`flex size-5 items-center justify-center rounded-full border-[1.5px] ${
+                  isActive ? "border-[#B57BBE]" : "border-[#3A3A40]"
+                }`}
+              >
+                {isActive ? <span className="size-2.5 rounded-full bg-[#B57BBE]" /> : null}
+              </span>
+              <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-[#1C1C22]">
+                <Icon className="size-5 text-[#C2C2C8]" />
+              </span>
+              <div className="flex-1 space-y-1.5">
+                <div className="flex items-center gap-2.5">
+                  <span className="text-[15px] font-semibold text-foreground">{row.displayName}</span>
+                  <span className="rounded-md bg-[#1C1C22] px-2 py-0.5 text-[11px] font-semibold text-[#9A9AA0]">
+                    {visual.authLabel}
+                  </span>
+                  {isActive ? (
+                    <span className="rounded-md bg-[#14321F] px-2 py-0.5 text-[11px] font-semibold text-[#4ADE80]">
+                      Active
+                    </span>
+                  ) : null}
+                </div>
+                <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
+                  <span className="size-2 rounded-full bg-emerald-400" aria-hidden />
+                  <span>Connected</span>
+                  <span className="text-[#4A4A50]">·</span>
+                  <span className="font-mono">{model}</span>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                {isActive ? null : (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={setActive.isPending}
+                    onClick={() => setActive.mutate({ provider: row.name, model })}
+                  >
+                    Set active
+                  </Button>
+                )}
+                <Button asChild type="button" variant="outline" size="icon" aria-label={`Edit ${row.displayName}`}>
+                  <Link href={`/settings/add-provider?provider=${row.name}`}>
+                    <PencilIcon className="size-4 text-[#9A9AA0]" />
+                  </Link>
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  aria-label={`Remove ${row.displayName}`}
+                  disabled
+                >
+                  <Trash2Icon className="size-4 text-[#9A9AA0]" />
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
