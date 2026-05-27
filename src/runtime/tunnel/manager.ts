@@ -177,6 +177,16 @@ class TunnelManager {
       this.cloudflared = null;
       try { await prev.stop(); } catch { /* already gone */ }
     }
+    // Re-check shuttingDown one last time before the spawn. The probe
+    // (1500ms timeout) and `prev.stop()` (up to 5s SIGKILL fallback)
+    // are both async — SIGTERM may have arrived during either await.
+    // Without this gate, the post-banner shutdown check would still
+    // catch it, but we'd have spawned cloudflared for the duration
+    // of the banner parse before tearing it back down. Skip the
+    // spawn entirely if shutdown started.
+    if (this.shuttingDown) {
+      return { ok: false, error: "Tunnel manager shutting down" };
+    }
     const launch = launchCloudflared({ port: webPort });
     this.cloudflared = launch;
     // Install the exit listener BEFORE the await so any same-tick
@@ -243,10 +253,17 @@ class TunnelManager {
       }
       return { ok: true, snapshot: this.snapshot };
     } catch (err) {
-      // Banner-parse failure or process exit reject. Subprocess may still
-      // be running — stop it before nulling the reference.
+      // Banner-parse failure or process exit reject. If the process
+      // already exited (the publicUrl rejection came from the internal
+      // exit handler), skip the stop — `launch.stop()` would otherwise
+      // SIGTERM a dead process and wait up to 5s for the SIGKILL
+      // fallback timer to fire, adding gratuitous latency to every
+      // failed enable / recycle.
       this.cloudflared = null;
-      try { await launch.stop(); } catch { /* already gone */ }
+      const alreadyExited = launch.process.exitCode !== null || launch.process.signalCode !== null;
+      if (!alreadyExited) {
+        try { await launch.stop(); } catch { /* already gone */ }
+      }
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
       const msg = err instanceof Error ? err.message : String(err);
       this.snapshot = { ...this.snapshot, publicUrl: null, lastError: redact(msg) };
