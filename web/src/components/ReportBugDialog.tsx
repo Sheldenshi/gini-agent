@@ -48,7 +48,10 @@ export interface ReportBugDialogProps {
 export function ReportBugDialog({ open, onOpenChange }: ReportBugDialogProps) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-lg">
+      {/* `max-h` + `overflow-y-auto` keep the footer reachable on short */}
+      {/* viewports (e.g. iPhone SE) and when the field-sizing textareas */}
+      {/* grow with a long pasted error log. */}
+      <DialogContent className="max-h-[calc(100vh-2rem)] overflow-y-auto sm:max-w-lg">
         {/* Mount the form only while the dialog is open so each open cycle */}
         {/* gets a fresh useState. Avoids resetting form state in an effect */}
         {/* and keeps the body free of any stale input from a prior session. */}
@@ -126,6 +129,30 @@ function ReportBugForm({ onClose }: { onClose: () => void }) {
           repo. Version and page info are attached automatically.
         </DialogDescription>
       </DialogHeader>
+      {/* SECURITY.md asks for vulnerability reports to go to a private */}
+      {/* email rather than a public GitHub issue. Surface that here so a */}
+      {/* user about to file a security-relevant bug doesn't accidentally */}
+      {/* expose details in public. */}
+      <div className="rounded-md border border-border bg-amber-500/10 px-3 py-2 text-[12px] text-foreground">
+        <strong className="font-medium">Security issue?</strong>{" "}Don&apos;t file it here.
+        Email{" "}
+        <a
+          href="mailto:security@lilaclabs.ai"
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          security@lilaclabs.ai
+        </a>{" "}
+        — see{" "}
+        <a
+          href="https://github.com/Lilac-Labs/gini-agent/blob/main/SECURITY.md"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline underline-offset-2 hover:text-foreground"
+        >
+          SECURITY.md
+        </a>
+        .
+      </div>
       <div className="space-y-3">
         <div className="space-y-1">
           <Label htmlFor="bug-title">Title</Label>
