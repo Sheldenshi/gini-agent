@@ -16,9 +16,11 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
+import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
 import { Composer } from "@/components/chat/Composer";
 import { SessionItem } from "@/components/chat/SessionItem";
 import { api, type UploadRef } from "@/lib/api";
+import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   useCancelTask,
   useChatBlocks,
@@ -217,6 +219,15 @@ export default function ChatPage() {
     return map;
   }, [blocks]);
 
+  // Once an exchange (user_text → final assistant_text) has finished
+  // streaming, fold every tool_call inside it into one collapsed row
+  // so the transcript shows the question and the answer without a
+  // wall of intermediate tool steps. In-flight exchanges stay inline.
+  const renderItems = useMemo<ChatRenderItem[]>(
+    () => groupExchanges(visibleBlocks),
+    [visibleBlocks]
+  );
+
   const sessionTitle = selectedSession?.title || "New chat";
   const hasBlocks = visibleBlocks.length > 0;
 
@@ -278,18 +289,27 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {visibleBlocks.map((block) => (
-                      <li key={block.id}>
-                        <BlockRenderer
-                          block={block}
-                          toolResult={
-                            block.kind === "tool_call"
-                              ? toolResultsByCallId.get(block.callId)
-                              : undefined
-                          }
-                        />
-                      </li>
-                    ))}
+                    {renderItems.map((item) =>
+                      item.kind === "tool_group" ? (
+                        <li key={item.id}>
+                          <BlockToolCallsCollapsed
+                            calls={item.calls}
+                            resultsByCallId={toolResultsByCallId}
+                          />
+                        </li>
+                      ) : (
+                        <li key={item.block.id}>
+                          <BlockRenderer
+                            block={item.block}
+                            toolResult={
+                              item.block.kind === "tool_call"
+                                ? toolResultsByCallId.get(item.block.callId)
+                                : undefined
+                            }
+                          />
+                        </li>
+                      )
+                    )}
                   </ul>
                 )}
                 <div ref={messagesEndRef} />
