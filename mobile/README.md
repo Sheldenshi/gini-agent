@@ -66,26 +66,28 @@ to the agent picker.
 ## Fork & re-skin
 
 Gini is open source — the iOS app is yours to fork, rebrand, and ship under
-your own Apple developer account. Two layers to touch:
+your own Apple developer account. Three layers to touch:
 
-**1. Per-fork constants in `app.config.ts`** (committed):
+**1. Per-fork constants in `app.config.ts`** (committed). These are
+project identity — they change once when you fork, never per-environment,
+and EAS CLI reads them statically so env interpolation isn't an option:
 
 - `IOS_BUNDLE_ID` / `ANDROID_PACKAGE` — your reverse-DNS bundle id.
 - `APP_NAME` — what users see on the home screen.
 - `APP_SLUG` — the EAS slug (lowercase, hyphenated).
 - `APP_SCHEME` — your deep-link scheme (e.g. `myagent://`).
+- `EAS_PROJECT_ID` — get one by running `eas init` in `mobile/`.
+- `EXPO_OWNER` — your Expo account or org (from `expo whoami`).
 
-The NSE bundle id is derived (`<bundle>.notificationservice`), so you only
-edit one place.
+The NSE bundle id and OTA updates URL are derived, so you only edit
+one place.
 
-**2. Account-specific values in `mobile/.env`** (gitignored). Copy
+**2. Per-developer secrets in `mobile/.env`** (gitignored). Copy
 `.env.example` and fill in:
 
-| Var                 | Where to get it                                           |
-|---------------------|-----------------------------------------------------------|
-| `EAS_PROJECT_ID`    | `eas init` in `mobile/`. The OTA URL is derived from it.  |
-| `EXPO_OWNER`        | `expo whoami` (your Expo account or org)                  |
-| `APPLE_TEAM_ID`     | developer.apple.com → Membership → Team ID                |
+| Var             | Where to get it                                    |
+|-----------------|----------------------------------------------------|
+| `APPLE_TEAM_ID` | developer.apple.com → Membership → Team ID         |
 
 **3. `eas.json` submit profile** (committed) — replace `appleTeamId` and
 `ascAppId` under `submit.production.ios` with your own before running

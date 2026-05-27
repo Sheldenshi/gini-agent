@@ -67,9 +67,6 @@ jobs:
         working-directory: mobile
 
       - name: Publish update
-        env:
-          EAS_PROJECT_ID: ${{ secrets.EAS_PROJECT_ID }}
-          EXPO_OWNER: ${{ secrets.EXPO_OWNER }}
         run: |
           branch="${{ github.event.inputs.branch || 'production' }}"
           eas update \

@@ -1,8 +1,13 @@
 import type { ExpoConfig } from "expo/config";
 
-// Fork-friendly fields. Forkers edit the constants below (bundle ids, app
-// name, scheme) and put the rest in mobile/.env. See "Fork & re-skin" in
-// the README.
+// Fork-friendly fields. Forkers edit the constants below; per-developer
+// signing credentials live in mobile/.env. See "Fork & re-skin" in the
+// README.
+//
+// Why these are constants instead of env: EAS CLI reads app.config.ts
+// statically when checking project linkage, so projectId / owner /
+// bundle ids must be literal values — env interpolation isn't honored
+// at that step.
 
 const IOS_BUNDLE_ID = "ai.lilaclabs.gini.mobile";
 const ANDROID_PACKAGE = "ai.lilaclabs.gini.mobile";
@@ -10,17 +15,14 @@ const NSE_BUNDLE_ID = `${IOS_BUNDLE_ID}.notificationservice`;
 const APP_NAME = "Gini";
 const APP_SLUG = "gini-mobile";
 const APP_SCHEME = "gini";
-
-const EAS_PROJECT_ID = process.env.EAS_PROJECT_ID;
-const EXPO_OWNER = process.env.EXPO_OWNER;
-const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID;
+const EAS_PROJECT_ID = "d3a0b9e3-a377-4827-bf3c-274b519f305a";
+const EXPO_OWNER = "sheldenshi";
 
 // EAS-hosted OTA URL is deterministic from the project id. Self-hosters
-// who point at their own server can replace this with a constant or a
-// new env var when that comes up.
-const EXPO_UPDATES_URL = EAS_PROJECT_ID
-  ? `https://u.expo.dev/${EAS_PROJECT_ID}`
-  : undefined;
+// who point at their own server can replace this with a constant.
+const EXPO_UPDATES_URL = `https://u.expo.dev/${EAS_PROJECT_ID}`;
+
+const APPLE_TEAM_ID = process.env.APPLE_TEAM_ID;
 
 const config: ExpoConfig = {
   name: APP_NAME,
@@ -31,9 +33,7 @@ const config: ExpoConfig = {
   scheme: APP_SCHEME,
   userInterfaceStyle: "automatic",
   runtimeVersion: { policy: "appVersion" },
-  ...(EXPO_UPDATES_URL
-    ? { updates: { url: EXPO_UPDATES_URL, fallbackToCacheTimeout: 0 } }
-    : {}),
+  updates: { url: EXPO_UPDATES_URL, fallbackToCacheTimeout: 0 },
   ios: {
     supportsTablet: true,
     bundleIdentifier: IOS_BUNDLE_ID,
@@ -74,7 +74,7 @@ const config: ExpoConfig = {
   extra: {
     router: {},
     eas: {
-      ...(EAS_PROJECT_ID ? { projectId: EAS_PROJECT_ID } : {}),
+      projectId: EAS_PROJECT_ID,
       build: {
         experimental: {
           ios: {
@@ -89,7 +89,7 @@ const config: ExpoConfig = {
       },
     },
   },
-  ...(EXPO_OWNER ? { owner: EXPO_OWNER } : {}),
+  owner: EXPO_OWNER,
 };
 
 export default config;
