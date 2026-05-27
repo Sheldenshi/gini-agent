@@ -42,6 +42,7 @@ export function BlockToolCallsCollapsed({
       <Pressable
         onPress={() => setExpanded((v) => !v)}
         style={styles.header}
+        hitSlop={{ top: 8, bottom: 8 }}
         accessibilityRole="button"
         accessibilityState={{ expanded }}
         accessibilityLabel={summary}
@@ -88,7 +89,9 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     alignSelf: "flex-start",
+    flexWrap: "wrap",
     gap: 13,
+    rowGap: 13,
     paddingVertical: 2
   },
   chevron: {
