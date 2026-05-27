@@ -20,6 +20,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
+import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
+import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
@@ -169,6 +171,15 @@ export default function ChatDetailScreen() {
     }
     return map;
   }, [list]);
+
+  // Once an exchange (user_text → final assistant_text) has finished
+  // streaming, fold every tool_call inside it into one collapsed row
+  // so the transcript shows the question and the answer without a
+  // wall of intermediate tool steps. In-flight exchanges stay inline.
+  const renderItems = useMemo<ChatRenderItem[]>(
+    () => groupExchanges(visible),
+    [visible]
+  );
 
   // Title source of truth is the session record — the gateway seeds it
   // in the initial REST fetch (in parallel with /blocks) and pushes
@@ -381,17 +392,25 @@ export default function ChatDetailScreen() {
             keyboardShouldPersistTaps="handled"
           >
             {visible.length > 0 ? (
-              visible.map((block) => (
-                <BlockRenderer
-                  key={block.id}
-                  block={block}
-                  toolResult={
-                    block.kind === "tool_call"
-                      ? toolResultsByCallId.get(block.callId)
-                      : undefined
-                  }
-                />
-              ))
+              renderItems.map((item) =>
+                item.kind === "tool_group" ? (
+                  <BlockToolCallsCollapsed
+                    key={item.id}
+                    calls={item.calls}
+                    resultsByCallId={toolResultsByCallId}
+                  />
+                ) : (
+                  <BlockRenderer
+                    key={item.block.id}
+                    block={item.block}
+                    toolResult={
+                      item.block.kind === "tool_call"
+                        ? toolResultsByCallId.get(item.block.callId)
+                        : undefined
+                    }
+                  />
+                )
+              )
             ) : (
               <View style={styles.emptyChat}>
                 <Text style={styles.emptyChatText}>What can I help with?</Text>
