@@ -404,6 +404,188 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("list_messaging_bridges returns the configured bridges as a JSON envelope", async () => {
+    // The read-only inventory tool is the agent's entry point to
+    // "what messaging bridges do I have?" without needing the
+    // messaging toolset enabled. Pin the shape so the model can
+    // depend on consistent fields.
+    const instance = `list-messaging-bridges-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "t1",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = { botUsername: "test_bot" };
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "list_messaging_bridges",
+      "call_list",
+      JSON.stringify({})
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(true);
+      expect(Array.isArray(parsed.bridges)).toBe(true);
+      expect(parsed.bridges.length).toBe(1);
+      expect(parsed.bridges[0].name).toBe("t1");
+      expect(parsed.bridges[0].kind).toBe("telegram");
+      expect(parsed.bridges[0].botUsername).toBe("test_bot");
+    }
+  });
+
+  test("request_messaging_pairing: refuses unknown bridge / already-enrolled chat / missing pending row", async () => {
+    // The dispatcher reads bridge + pending state up-front and
+    // refuses without minting an approval whenever the card would
+    // be unactionable. Three guards in one test.
+    const instance = `req-pairing-guards-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Unknown bridge.
+    const unknown = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_pairing",
+      "call_p1",
+      JSON.stringify({ bridge: "nope", chatId: 1 })
+    );
+    expect(unknown.kind).toBe("sync");
+    if (unknown.kind === "sync") {
+      const parsed = JSON.parse(unknown.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("not found");
+    }
+
+    // Seed a telegram bridge with chat 42 already enrolled, and chat
+    // 99 on the pending list with a fresh code.
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [42],
+        recentDeniedChats: [
+          {
+            chatId: 99,
+            chatType: "private",
+            sender: "@alice",
+            lastAttemptAt: new Date().toISOString(),
+            verificationCode: "ABCD-1234",
+            verificationCodeExpiresAt: new Date(Date.now() + 60_000).toISOString()
+          }
+        ]
+      };
+    });
+
+    // Already-enrolled chat → refuse.
+    const enrolled = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_pairing",
+      "call_p2",
+      JSON.stringify({ bridge: "tg", chatId: 42 })
+    );
+    expect(enrolled.kind).toBe("sync");
+    if (enrolled.kind === "sync") {
+      const parsed = JSON.parse(enrolled.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("already enrolled");
+    }
+
+    // Chat with no pending row → refuse.
+    const noPending = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_pairing",
+      "call_p3",
+      JSON.stringify({ bridge: "tg", chatId: 100 })
+    );
+    expect(noPending.kind).toBe("sync");
+    if (noPending.kind === "sync") {
+      const parsed = JSON.parse(noPending.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("No pending pairing request");
+    }
+
+    // Chat with valid pending row → pending approval minted.
+    const happy = await dispatchToolCall(
+      config,
+      taskId,
+      "request_messaging_pairing",
+      "call_p4",
+      JSON.stringify({ bridge: "tg", chatId: 99 })
+    );
+    expect(happy.kind).toBe("pending");
+    if (happy.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === happy.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("messaging.approve_pairing");
+      expect(approval!.payload.chatId).toBe(99);
+      expect(approval!.payload.verificationCode).toBe("ABCD-1234");
+    }
+  });
+
+  test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {
+    const instance = `req-remove-bridge-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      createMessagingBridgeRecord(state, {
+        name: "doomed",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_remove_messaging_bridge",
+      "call_remove",
+      JSON.stringify({ bridge: "doomed" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("messaging.remove_bridge");
+      expect(approval!.payload.bridgeName).toBe("doomed");
+      expect(approval!.payload.kind).toBe("telegram");
+    }
+  });
+
+  test("request_remove_messaging_bridge: refuses unknown bridge synchronously", async () => {
+    const instance = `req-remove-unknown-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_remove_messaging_bridge",
+      "call_remove_bad",
+      JSON.stringify({ bridge: "missing" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("not found");
+    }
+    const state = readState(instance);
+    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
   test("request_messaging_bridge: rejects unknown kind synchronously", async () => {
     // The chat card branches on payload.kind to pick the per-kind
     // help text and the Submit label. A bogus kind would render an

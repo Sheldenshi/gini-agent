@@ -1146,6 +1146,101 @@ describe("runtime api", () => {
     expect(after?.status).toBe("pending");
   });
 
+  test("POST /api/approvals/<id>/approve refuses messaging.approve_pairing and messaging.remove_bridge actions", async () => {
+    // Symmetry with the messaging.add_bridge / browser.fill_secret
+    // refusals: the connect-only actions can't be resolved through
+    // the generic /approve route because their side effects need
+    // payload context (verification code, reject flag, bridge id)
+    // that only /connect carries.
+    const config = testConfig("approve-refuses-messaging-pairing-remove");
+    const handler = createHandler(config);
+    const { createApproval } = await import("./state");
+
+    const pairing = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.approve_pairing",
+        target: "bridge_x:42",
+        risk: "medium",
+        reason: "Confirm pairing",
+        payload: { bridgeId: "bridge_x", chatId: 42, verificationCode: "ABCD-1234", toolCallId: "call_p1" }
+      })
+    );
+    const remove = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.remove_bridge",
+        target: "bridge_x",
+        risk: "high",
+        reason: "Remove bridge",
+        payload: { bridgeId: "bridge_x", bridgeName: "doomed", kind: "telegram", toolCallId: "call_r1" }
+      })
+    );
+
+    const pairingResponse = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${pairing.id}/approve`,
+      { method: "POST" },
+      config.token
+    );
+    expect(pairingResponse.status).toBe(400);
+    const pairingBody = await pairingResponse.json();
+    expect(pairingBody.error).toContain("/connect");
+
+    const removeResponse = await rawCall(
+      handler,
+      config,
+      `/api/approvals/${remove.id}/approve`,
+      { method: "POST" },
+      config.token
+    );
+    expect(removeResponse.status).toBe(400);
+    const removeBody = await removeResponse.json();
+    expect(removeBody.error).toContain("/connect");
+
+    const after = readState(config.instance);
+    expect(after.approvals.find((a) => a.id === pairing.id)?.status).toBe("pending");
+    expect(after.approvals.find((a) => a.id === remove.id)?.status).toBe("pending");
+  });
+
+  test("POST /api/approvals/<id>/connect removes a messaging bridge through the approval flow", async () => {
+    // Happy path for the chat-side Remove bridge card. The /connect
+    // handler delegates to runMessagingRemoveConnect, which resolves
+    // the approval atomically then calls removeMessagingBridge.
+    const config = testConfig("connect-remove-bridge-happy");
+    const handler = createHandler(config);
+
+    // Create a real bridge via the existing endpoint so its
+    // encrypted secret + state record exist before we try to remove it.
+    const created = await call(handler, config, `/api/messaging`, {
+      method: "POST",
+      body: JSON.stringify({ name: "remove-me", kind: "telegram", botToken: "1234:ABCDEFGHIJKLMNOPQR" })
+    });
+    expect(created.id).toBeString();
+
+    const { createApproval } = await import("./state");
+    const approval = await mutateState(config.instance, (state) =>
+      createApproval(state, {
+        action: "messaging.remove_bridge",
+        target: created.id,
+        risk: "high",
+        reason: "Remove bridge",
+        payload: { bridgeId: created.id, bridgeName: "remove-me", kind: "telegram", toolCallId: "call_remove" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+    expect(response.removed).toBe(true);
+    expect(response.bridgeId).toBe(created.id);
+
+    const after = readState(config.instance);
+    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("approved");
+    expect(after.messagingBridges.find((b) => b.id === created.id)).toBeUndefined();
+  });
+
   test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {
     // fillReady in BlockApprovalRequested.tsx only disables the web
     // Submit button; CLI / mobile / direct API clients can still POST a

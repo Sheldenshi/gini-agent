@@ -69,12 +69,18 @@ const ALWAYS_ON = new Set([
   // logic as request_connector being outside the "connectors"
   // toolset.
   "browser_fill_secrets",
-  // request_messaging_bridge is the in-chat onboarding card for
-  // Telegram bridges. Same always-on rationale as request_connector
-  // / browser_fill_secrets — the agent needs to be able to surface
-  // "add a telegram bot" on a fresh instance without the user first
-  // toggling the messaging toolset.
+  // The chat-side messaging lifecycle meta-tools. Same always-on
+  // rationale as request_connector / browser_fill_secrets — they
+  // surface UI cards or read state, never egress data on their own.
+  // The surface-gateway send_message tool stays GATED by the
+  // messaging toolset (operators flip the toolset to disable
+  // outbound DM autonomy without losing the onboarding / inventory
+  // / pairing / removal affordances).
   "request_messaging_bridge",
+  "list_messaging_bridges",
+  "list_messaging_pairings",
+  "request_messaging_pairing",
+  "request_remove_messaging_bridge",
   "cancel_task",
   "install_skill",
   "enable_skill",

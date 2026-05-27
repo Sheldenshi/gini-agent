@@ -332,6 +332,18 @@ export interface ApprovalRequestedBlock extends ChatBlockBase {
   //     surfaces (home page, /permissions list) render Deny + a
   //     "resolve in chat" hint because they can't display the form.
   //     See docs/adr/telegram-bridge.md and chat-block-protocol.md.
+  //   - `messaging.approve_pairing` → confirmation card showing the
+  //     pending sender, chat type, verification code, expiry. Two
+  //     buttons: Approve (POSTs `{}` to /connect → server calls
+  //     allowChat with expectedCode); Reject (POSTs
+  //     `{ reject: true }` to /connect → server calls
+  //     rejectPendingChat). /approve refuses. Same hide-approve
+  //     treatment on home / permissions list.
+  //   - `messaging.remove_bridge` → destructive confirmation card
+  //     showing bridge name + irreversibility warning. Submit POSTs
+  //     `{}` to /connect → server calls removeMessagingBridge.
+  //     /approve refuses. Same hide-approve treatment on home /
+  //     permissions list.
   //   - everything else → standard Approve / Deny pair (POST to
   //     /api/approvals/<id>/{approve,deny}).
   action: string;
@@ -982,7 +994,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "browser.fill_secret" | "messaging.send" | "messaging.add_bridge";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "browser.fill_secret" | "messaging.send" | "messaging.add_bridge" | "messaging.approve_pairing" | "messaging.remove_bridge";
   target: string;
   risk: RiskLevel;
   reason: string;

@@ -115,6 +115,14 @@ function ApprovalCard({
   // Approve button on this page and leave only Deny + a pointer at
   // the chat where the values can be entered.
   const isMessagingAddBridge = approval.action === "messaging.add_bridge";
+  // The other two chat-only messaging actions follow the same
+  // /approve-refused contract — only the chat card has the right
+  // surface to display the per-action confirmation (verification
+  // code + sender for approve_pairing, irreversibility warning for
+  // remove_bridge), so this list page renders Deny only with a
+  // "resolve in chat" hint.
+  const isMessagingApprovePairing = approval.action === "messaging.approve_pairing";
+  const isMessagingRemoveBridge = approval.action === "messaging.remove_bridge";
   // `||` (not `??`) so an empty-string reason also falls back to the
   // approval target. `??` only fires for null/undefined; a payload that
   // carried `reason: ""` would otherwise render a blank card body.
@@ -189,6 +197,32 @@ function ApprovalCard({
           <>
             <p className="text-xs text-muted-foreground">
               Open the chat session to add the bridge. Approve doesn&apos;t apply here — the bridge name and bot token must be entered into the card in chat. Deny still cancels the request.
+            </p>
+            {onDecide ? (
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+                  Deny
+                </Button>
+              </div>
+            ) : null}
+          </>
+        ) : isMessagingApprovePairing ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Open the chat session to approve or reject this pairing. The verification code must be confirmed against what the user reports on Telegram before enrollment. Deny still cancels the request.
+            </p>
+            {onDecide ? (
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+                  Deny
+                </Button>
+              </div>
+            ) : null}
+          </>
+        ) : isMessagingRemoveBridge ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Open the chat session to confirm bridge removal. The destructive confirmation lives in the chat card. Deny still cancels the request.
             </p>
             {onDecide ? (
               <div className="flex gap-2">

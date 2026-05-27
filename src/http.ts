@@ -15,6 +15,8 @@ import {
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
+import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
+import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -210,6 +212,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           error: "messaging.add_bridge approvals must be resolved via /connect with the bridge name + bot token, not /approve."
         }, 400);
       }
+      if (approval?.action === "messaging.approve_pairing") {
+        // /connect carries the optional `reject: true` flag that
+        // distinguishes Approve vs Reject; /approve has no way to
+        // express that. Both outcomes also rely on payload context
+        // (verificationCode) the connect handler reads.
+        return json({
+          error: "messaging.approve_pairing approvals must be resolved via /connect (with optional reject:true), not /approve."
+        }, 400);
+      }
+      if (approval?.action === "messaging.remove_bridge") {
+        // Symmetry with the other messaging.* card actions — the
+        // /connect handler owns the destructive call so the resolve
+        // and side effect stay in one atomic seam.
+        return json({
+          error: "messaging.remove_bridge approvals must be resolved via /connect, not /approve."
+        }, 400);
+      }
       return json(await decideApproval(config, approvalId, "approve"));
     }],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
@@ -251,6 +270,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         approval.action !== "connector.request"
         && approval.action !== "browser.fill_secret"
         && approval.action !== "messaging.add_bridge"
+        && approval.action !== "messaging.approve_pairing"
+        && approval.action !== "messaging.remove_bridge"
       ) {
         return json({ error: `Approval ${approvalId} does not take a /connect submission (${approval.action})` }, 400);
       }
@@ -271,6 +292,25 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // so it can be unit-tested in isolation and so http.ts stays
         // a routing layer per the AGENTS.md boundary rule.
         const result = await runMessagingBridgeConnect(config, approval, secrets, payload.deliveryTargets);
+        return json(result.body, result.status);
+      }
+
+      if (approval.action === "messaging.approve_pairing") {
+        // Approve / Reject for an inbound Telegram pairing request.
+        // Delegate forwards `payload.reject` so a single endpoint
+        // covers both outcomes; allowChat / rejectPendingChat live
+        // inside the bounded module along with the atomic
+        // resolveApproval + safeResume wrapping.
+        const result = await runMessagingPairingConnect(config, approval, { reject: payload.reject });
+        return json(result.body, result.status);
+      }
+
+      if (approval.action === "messaging.remove_bridge") {
+        // Destructive bridge teardown from chat. Same shape as
+        // add_bridge — atomic resolveApproval BEFORE
+        // removeMessagingBridge, then safeResume back into the
+        // chat-task loop with the outcome.
+        const result = await runMessagingRemoveConnect(config, approval);
         return json(result.body, result.status);
       }
 

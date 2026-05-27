@@ -134,6 +134,22 @@ remote previews, screen readers) would need the same translation code.
     The other resolution surfaces (home page, /permissions list)
     therefore render only Deny + a "resolve in chat" hint for this
     action.
+  - `messaging.approve_pairing` — render a confirmation card
+    showing the pending sender, chat id, chat type, verification
+    code, and expiry from `approval.payload`. Two buttons: Approve
+    posts `{}` to `/connect`; Reject posts `{ reject: true }` to
+    `/connect`. Server calls `allowChat` (with the
+    `verificationCode` from the payload as `expectedCode`) or
+    `rejectPendingChat`. `/approve` refuses this action because
+    `/approve` cannot express the Approve-vs-Reject discriminant;
+    `/deny` is still valid. Same hide-approve treatment on home /
+    permissions list (Deny + "Approve/Reject in chat" hint).
+  - `messaging.remove_bridge` — render a destructive confirmation
+    card showing `approval.payload.bridgeName` + `payload.kind` and
+    the irreversibility warning. Submit posts `{}` to `/connect`,
+    which routes into `removeMessagingBridge`. `/approve` refuses;
+    `/deny` is still valid. Same hide-approve treatment on home /
+    permissions list (Deny + "Confirm in chat" hint).
   - everything else — standard Approve / Deny pair posting to
     `/api/approvals/<id>/{approve,deny}`.
 

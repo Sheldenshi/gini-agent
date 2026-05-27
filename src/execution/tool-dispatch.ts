@@ -51,6 +51,7 @@ import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
+import { listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -152,6 +153,14 @@ export async function dispatchToolCall(
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "request_messaging_bridge":
       return await requestMessagingBridgeTool(config, taskId, toolCallId, args);
+    case "list_messaging_bridges":
+      return { kind: "sync", result: await listMessagingBridgesTool(config) };
+    case "list_messaging_pairings":
+      return { kind: "sync", result: await listMessagingPairingsTool(config, args) };
+    case "request_messaging_pairing":
+      return await requestMessagingPairingTool(config, taskId, toolCallId, args);
+    case "request_remove_messaging_bridge":
+      return await requestRemoveMessagingBridgeTool(config, taskId, toolCallId, args);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -2741,6 +2750,253 @@ async function requestMessagingBridgeTool(
       type: "approval",
       message: "Approval requested for messaging.add_bridge",
       data: { approvalId: approval.id, kind, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// Read-only inventory of configured messaging bridges. Returns the
+// minimum every caller needs (id, name, kind, status, bot username
+// from metadata) so the agent can answer "what bridges do I have?"
+// or pick the right id for a follow-up request_remove_messaging_bridge
+// without leaking the encrypted secret refs / per-chat allowlists.
+async function listMessagingBridgesTool(config: RuntimeConfig): Promise<string> {
+  const state = readState(config.instance);
+  const bridges = state.messagingBridges.map((bridge) => {
+    const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
+    const botUsername = typeof meta.botUsername === "string" ? meta.botUsername : undefined;
+    return {
+      id: bridge.id,
+      name: bridge.name,
+      kind: bridge.kind,
+      status: bridge.status,
+      message: bridge.message ?? null,
+      botUsername: botUsername ?? null,
+      createdAt: bridge.createdAt,
+      updatedAt: bridge.updatedAt
+    };
+  });
+  return JSON.stringify({ ok: true, bridges });
+}
+
+// Read-only view of a Telegram bridge's pending pairing requests +
+// current allowlist. Mirrors the data MessagingCard's
+// TelegramPendingRequests component polls so the agent sees what
+// the operator would see in settings. Returns ok:false (string
+// envelope, not throw) on unknown bridges or non-telegram kinds so
+// the model gets a recoverable tool result instead of a hard error.
+async function listMessagingPairingsTool(
+  config: RuntimeConfig,
+  args: Record<string, unknown>
+): Promise<string> {
+  const bridge = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridge) {
+    return JSON.stringify({ ok: false, error: "list_messaging_pairings requires a 'bridge' (id or name)." });
+  }
+  try {
+    const view = listAllowedChats(config, bridge);
+    return JSON.stringify({ ok: true, bridge, ...view });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+// Pairing-approval affordance. Mints a messaging.approve_pairing
+// approval whose payload carries everything the chat card needs to
+// render the confirmation (bridge id+name+botUsername, chat id+type,
+// sender, verification code + expiry). Approve / Reject both flow
+// through /api/approvals/<id>/connect (Reject just sends
+// `{ reject: true }`); /approve refuses this action.
+//
+// The dispatcher reads the pending row up-front and refuses if the
+// chat is already enrolled, no longer pending, or the code has
+// expired — gives the agent a recoverable tool_result instead of
+// minting a card the operator can't act on.
+async function requestMessagingPairingTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridgeIdOrName) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "request_messaging_pairing requires a 'bridge' (id or name)." })
+    };
+  }
+  const chatIdRaw = args.chatId;
+  const chatId = typeof chatIdRaw === "number" ? chatIdRaw : Number(chatIdRaw);
+  if (!Number.isFinite(chatId)) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `request_messaging_pairing requires a numeric 'chatId' (got ${JSON.stringify(args.chatId)}).` })
+    };
+  }
+  const state = readState(config.instance);
+  const bridge = state.messagingBridges.find((b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName);
+  if (!bridge) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Messaging bridge not found: ${bridgeIdOrName}.` })
+    };
+  }
+  if (bridge.kind !== "telegram") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Pairing approvals only apply to telegram bridges (got '${bridge.kind}').` })
+    };
+  }
+  const view = listAllowedChats(config, bridge.id);
+  if (view.allowedChatIds.includes(chatId)) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Chat ${chatId} is already enrolled on bridge '${bridge.name}'. No pairing card needed.`
+      })
+    };
+  }
+  const pending = view.recentDeniedChats.find((entry) => entry.chatId === chatId);
+  if (!pending) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `No pending pairing request for chat ${chatId} on bridge '${bridge.name}'. Have the user DM the bot to mint a fresh request.`
+      })
+    };
+  }
+  if (pending.verificationCodeExpiresAt) {
+    const expiresAt = Date.parse(pending.verificationCodeExpiresAt);
+    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Verification code for chat ${chatId} expired. Tell the user to DM the bot again to mint a fresh code.`
+        })
+      };
+    }
+  }
+
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `Confirm the verification code below matches what you received on Telegram before approving chat ${chatId}.`;
+  const metadata = (bridge.metadata ?? {}) as { botUsername?: unknown };
+  const botUsername = typeof metadata.botUsername === "string" ? metadata.botUsername : undefined;
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "messaging.approve_pairing",
+      target: `${bridge.id}:${chatId}`,
+      risk: "medium",
+      reason,
+      payload: {
+        bridgeId: bridge.id,
+        bridgeName: bridge.name,
+        botUsername: botUsername ?? null,
+        chatId,
+        chatType: pending.chatType,
+        sender: pending.sender ?? null,
+        verificationCode: pending.verificationCode ?? null,
+        verificationCodeExpiresAt: pending.verificationCodeExpiresAt ?? null,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.approve_pairing",
+      data: { approvalId: approval.id, bridgeId: bridge.id, chatId, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// Bridge-removal affordance. Mints a messaging.remove_bridge
+// approval whose card asks the operator to confirm tearing down a
+// configured bridge from chat. Approve POSTs `{}` to /connect; the
+// runtime calls removeMessagingBridge (same path as the CLI / the
+// settings page's Remove button). Tasks see the resume tool result
+// once removal completes.
+async function requestRemoveMessagingBridgeTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridgeIdOrName) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "request_remove_messaging_bridge requires a 'bridge' (id or name)." })
+    };
+  }
+  const state = readState(config.instance);
+  const bridge = state.messagingBridges.find((b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName);
+  if (!bridge) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Messaging bridge not found: ${bridgeIdOrName}.` })
+    };
+  }
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `Remove the ${bridge.kind} bridge '${bridge.name}'? This deletes its bot token; past messages stay in history.`;
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "messaging.remove_bridge",
+      target: bridge.id,
+      risk: "high",
+      reason,
+      payload: {
+        bridgeId: bridge.id,
+        bridgeName: bridge.name,
+        kind: bridge.kind,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.remove_bridge",
+      data: { approvalId: approval.id, bridgeId: bridge.id, toolCallId }
     });
     return approval.id;
   });

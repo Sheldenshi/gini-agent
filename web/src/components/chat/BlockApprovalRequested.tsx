@@ -100,6 +100,8 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const isConnectorRequest = block.action === "connector.request";
   const isBrowserFillSecret = block.action === "browser.fill_secret";
   const isMessagingAddBridge = block.action === "messaging.add_bridge";
+  const isMessagingApprovePairing = block.action === "messaging.approve_pairing";
+  const isMessagingRemoveBridge = block.action === "messaging.remove_bridge";
   const providerId = isConnectorRequest && approval
     ? String(approval.payload?.provider ?? "")
     : "";
@@ -271,6 +273,110 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     && bridgeName.trim().length > 0
     && bridgeToken.trim().length > 0;
 
+  // === messaging.approve_pairing card state ===
+  const pairingPayload = isMessagingApprovePairing && approval ? approval.payload : null;
+  const pairingBridgeName = typeof pairingPayload?.bridgeName === "string"
+    ? (pairingPayload.bridgeName as string)
+    : "";
+  const pairingBotUsername = typeof pairingPayload?.botUsername === "string"
+    ? (pairingPayload.botUsername as string)
+    : "";
+  const pairingChatId = typeof pairingPayload?.chatId === "number"
+    ? (pairingPayload.chatId as number)
+    : null;
+  const pairingChatType = typeof pairingPayload?.chatType === "string"
+    ? (pairingPayload.chatType as string)
+    : "";
+  const pairingSender = typeof pairingPayload?.sender === "string"
+    ? (pairingPayload.sender as string)
+    : "";
+  const pairingCode = typeof pairingPayload?.verificationCode === "string"
+    ? (pairingPayload.verificationCode as string)
+    : "";
+  const pairingExpiresAt = typeof pairingPayload?.verificationCodeExpiresAt === "string"
+    ? (pairingPayload.verificationCodeExpiresAt as string)
+    : "";
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  // Track which side of the resolved card the user took so the
+  // past-tense summary distinguishes "Pairing approved" from
+  // "Pairing rejected" instead of leaning on `approval.status` alone
+  // (which is just `approved` in both cases — Reject is also a
+  // /connect call, not a /deny).
+  const [pairingOutcome, setPairingOutcome] = useState<"approved" | "rejected" | null>(null);
+  const pairingSubmittingRef = useRef(false);
+  const pairingSubmit = useMutation({
+    mutationFn: async (variant: { reject: boolean }) => {
+      const response = await api<{ ok: boolean; message?: string; enrolled?: boolean; rejected?: boolean }>(
+        `/approvals/${block.approvalId}/connect`,
+        {
+          method: "POST",
+          body: JSON.stringify(variant.reject ? { reject: true } : {})
+        }
+      );
+      return { response, variant };
+    },
+    onSuccess: ({ response, variant }) => {
+      // Always invalidate — server resolves the approval BEFORE the
+      // side effect, so the cache must refresh regardless of ok value
+      // to flip the card out of pending state. Same precedent as the
+      // bridge submitter and fillSubmit.
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      if (!response.ok) {
+        setPairingError(response.message ?? "Could not resolve pairing.");
+        return;
+      }
+      setPairingError(null);
+      setPairingOutcome(variant.reject ? "rejected" : "approved");
+      toast.success(variant.reject ? "Pairing rejected." : "Pairing approved.");
+    },
+    onError: (error: Error) => {
+      setPairingError(error.message);
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+    },
+    onSettled: () => {
+      pairingSubmittingRef.current = false;
+    }
+  });
+
+  // === messaging.remove_bridge card state ===
+  const removePayload = isMessagingRemoveBridge && approval ? approval.payload : null;
+  const removeBridgeName = typeof removePayload?.bridgeName === "string"
+    ? (removePayload.bridgeName as string)
+    : "";
+  const removeBridgeKind = typeof removePayload?.kind === "string"
+    ? (removePayload.kind as string)
+    : "";
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [removeResultOk, setRemoveResultOk] = useState<boolean | null>(null);
+  const removeSubmittingRef = useRef(false);
+  const removeSubmit = useMutation({
+    mutationFn: async () => {
+      const response = await api<{ ok: boolean; message?: string; removed?: boolean }>(
+        `/approvals/${block.approvalId}/connect`,
+        { method: "POST", body: JSON.stringify({}) }
+      );
+      return response;
+    },
+    onSuccess: (response) => {
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      setRemoveResultOk(response.ok);
+      if (!response.ok) {
+        setRemoveError(response.message ?? "Could not remove bridge.");
+        return;
+      }
+      setRemoveError(null);
+      toast.success("Bridge removed.");
+    },
+    onError: (error: Error) => {
+      setRemoveError(error.message);
+      setRemoveResultOk(false);
+      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+    },
+    onSettled: () => {
+      removeSubmittingRef.current = false;
+    }
+  });
+
   // Once the approval is no longer pending, drop the amber accent so
   // the bubble visually reads as historical rather than an active
   // prompt. The buttons still render in their resolved-state form
@@ -308,7 +414,29 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
         : approval.status === "denied"
           ? `Request denied. (${block.summary})`
           : block.summary
-      : block.summary;
+      : !isPending && approval && isMessagingApprovePairing
+        ? approval.status === "approved"
+          // Same resolve-before-side-effect ordering means we can't
+          // read "approved" → "pairing approved". The pairing outcome
+          // ref distinguishes Approve vs Reject (both POST /connect)
+          // from the failed-after-resolve case.
+          ? pairingOutcome === "rejected"
+            ? `Pairing rejected. (${block.summary})`
+            : pairingOutcome === "approved"
+              ? `Pairing approved. (${block.summary})`
+              : `Pairing resolved. (${block.summary})`
+          : approval.status === "denied"
+            ? `Request denied. (${block.summary})`
+            : block.summary
+        : !isPending && approval && isMessagingRemoveBridge
+          ? approval.status === "approved"
+            ? removeResultOk === false
+              ? `Bridge removal failed${removeError ? `: ${removeError}` : ""}. (${block.summary})`
+              : `Bridge removed. (${block.summary})`
+            : approval.status === "denied"
+              ? `Request denied. (${block.summary})`
+              : block.summary
+          : block.summary;
   return (
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
@@ -452,6 +580,69 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           ) : null}
         </div>
       ) : null}
+      {isMessagingApprovePairing && isPending && pairingChatId !== null ? (
+        <div className="mt-2 space-y-2">
+          <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
+            <span className="text-muted-foreground">Bridge: </span>
+            <span className="font-mono">{pairingBridgeName}</span>
+            {pairingBotUsername ? (
+              <>
+                <span className="text-muted-foreground"> · bot </span>
+                <span className="font-mono">@{pairingBotUsername}</span>
+              </>
+            ) : null}
+          </div>
+          <div className="rounded-md border border-border bg-background/40 p-2 text-xs">
+            <p className="text-sm font-medium">
+              Pairing request from {pairingSender || "unknown sender"}
+            </p>
+            <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+              {pairingChatType || "chat"} · chat {pairingChatId}
+            </p>
+            {pairingCode ? (
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                Verification code:{" "}
+                <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[11px] text-foreground">
+                  {pairingCode}
+                </code>
+                {pairingExpiresAt ? (
+                  <span className="ml-2">
+                    expires {new Date(pairingExpiresAt).toLocaleTimeString()}
+                  </span>
+                ) : null}
+                <span className="ml-2">— confirm with the user before approving.</span>
+              </p>
+            ) : (
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                Group chats have no per-user verification code. Confirm with the user out-of-band before approving.
+              </p>
+            )}
+          </div>
+          {pairingError ? (
+            <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+              {pairingError}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+      {isMessagingRemoveBridge && isPending ? (
+        <div className="mt-2 space-y-2">
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs">
+            <p className="text-sm font-medium">
+              Remove {removeBridgeKind} bridge{" "}
+              <span className="font-mono">{removeBridgeName}</span>?
+            </p>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              This deletes the bridge and its bot token. Past messages stay in history.
+            </p>
+          </div>
+          {removeError ? (
+            <p className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+              {removeError}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
       <div className={isPending ? "mt-2 flex gap-2" : "hidden"}>
         {isConnectorRequest ? (
           <>
@@ -509,6 +700,58 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
               }}
             >
               Add {bridgeKindLabel}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={decide.isPending || !isPending}
+              onClick={() => decide.mutate({ op: "deny" })}
+            >
+              Cancel
+            </Button>
+          </>
+        ) : isMessagingApprovePairing ? (
+          <>
+            <Button
+              size="sm"
+              disabled={pairingSubmit.isPending || !isPending}
+              onClick={() => {
+                if (pairingSubmittingRef.current) return;
+                pairingSubmittingRef.current = true;
+                setPairingError(null);
+                pairingSubmit.mutate({ reject: false });
+              }}
+            >
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={pairingSubmit.isPending || !isPending}
+              onClick={() => {
+                if (pairingSubmittingRef.current) return;
+                pairingSubmittingRef.current = true;
+                setPairingError(null);
+                pairingSubmit.mutate({ reject: true });
+              }}
+            >
+              Reject
+            </Button>
+          </>
+        ) : isMessagingRemoveBridge ? (
+          <>
+            <Button
+              size="sm"
+              variant="destructive"
+              disabled={removeSubmit.isPending || !isPending}
+              onClick={() => {
+                if (removeSubmittingRef.current) return;
+                removeSubmittingRef.current = true;
+                setRemoveError(null);
+                removeSubmit.mutate();
+              }}
+            >
+              Remove
             </Button>
             <Button
               size="sm"

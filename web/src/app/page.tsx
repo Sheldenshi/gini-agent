@@ -148,6 +148,13 @@ export default function HomePage() {
                   // so the operator can still cancel from the home
                   // list.
                   const isMessagingAddBridge = approval.action === "messaging.add_bridge";
+                  // Same hide-approve treatment for the other
+                  // chat-only messaging actions. The home pending
+                  // list never has the right surface to show
+                  // verification codes or destructive confirmations,
+                  // so it renders Deny + a pointer at chat.
+                  const isMessagingApprovePairing = approval.action === "messaging.approve_pairing";
+                  const isMessagingRemoveBridge = approval.action === "messaging.remove_bridge";
                   // The user-facing reason for browser.connect lives on
                   // payload.reason (set by the dispatch); fall back to the
                   // approval target (same string) if it's missing. We
@@ -205,6 +212,34 @@ export default function HomePage() {
                       <div className="flex shrink-0 flex-col items-end gap-1">
                         <span className="text-[11px] text-muted-foreground">
                           Add the bridge in chat.
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                        >
+                          Deny
+                        </Button>
+                      </div>
+                    ) : isMessagingApprovePairing ? (
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="text-[11px] text-muted-foreground">
+                          Approve/Reject in chat.
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                        >
+                          Deny
+                        </Button>
+                      </div>
+                    ) : isMessagingRemoveBridge ? (
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="text-[11px] text-muted-foreground">
+                          Confirm in chat.
                         </span>
                         <Button
                           size="sm"

@@ -899,6 +899,20 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       // src/http.ts is the outer layer; this is the load-bearing one.
       throw new Error("messaging.add_bridge approvals must be resolved via /connect with the bridge name + bot token, not /approve.");
     }
+    if (existing?.action === "messaging.approve_pairing") {
+      // /connect carries the Approve vs Reject discriminant (the
+      // `reject` flag on the body); /approve cannot express it. Also
+      // the side effect (allowChat / rejectPendingChat) needs the
+      // bridgeId + chatId from the payload, which the connect handler
+      // already reads. Defense in depth alongside the HTTP refusal.
+      throw new Error("messaging.approve_pairing approvals must be resolved via /connect (with optional reject:true), not /approve.");
+    }
+    if (existing?.action === "messaging.remove_bridge") {
+      // Destructive bridge teardown lives in the /connect handler's
+      // bounded module so the resolve + side effect stay atomic.
+      // Defense in depth.
+      throw new Error("messaging.remove_bridge approvals must be resolved via /connect, not /approve.");
+    }
     const { approval } = await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
     return approval;
   }
@@ -1445,6 +1459,26 @@ async function runApprovedAction(
     // messaging.add_bridge (see src/http.ts and the decideApproval
     // guard above), so /connect is the only resolver and this branch
     // is the resolveApproval-side no-op for that single path.
+    void extraEvidence;
+    void shouldResumeChat;
+    void chatToolCallId;
+    return undefined;
+  }
+
+  if (approval.action === "messaging.approve_pairing") {
+    // Same no-op pattern as messaging.add_bridge. The /connect
+    // handler runs allowChat or rejectPendingChat AFTER the atomic
+    // resolveApproval, then calls resumeChatTask with the
+    // appropriate outcome string itself.
+    void extraEvidence;
+    void shouldResumeChat;
+    void chatToolCallId;
+    return undefined;
+  }
+
+  if (approval.action === "messaging.remove_bridge") {
+    // Same no-op pattern: /connect handler owns the
+    // removeMessagingBridge call + the resume.
     void extraEvidence;
     void shouldResumeChat;
     void chatToolCallId;
