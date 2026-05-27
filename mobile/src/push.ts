@@ -106,35 +106,48 @@ Notifications.setNotificationHandler({
 // launch is the documented pattern.
 //
 // Exported for tests; production callers go through the implicit
-// invocation in `registerForPushAsync`.
-export async function registerApprovalCategoryAsync(): Promise<void> {
-  if (Platform.OS !== "ios") return;
-  try {
-    await Notifications.setNotificationCategoryAsync(APPROVAL_CATEGORY, [
-      {
-        identifier: APPROVE_ACTION,
-        buttonTitle: "Approve",
-        options: {
-          opensAppToForeground: false,
-          isAuthenticationRequired: false,
-          isDestructive: false
+// invocation in `registerForPushAsync`. The first call caches its
+// promise so concurrent callers (root layout effect, the implicit
+// invocation inside registerForPushAsync) share a single registration
+// rather than racing two `setNotificationCategoryAsync` calls. The
+// shared promise also makes it safe to `await` from the response
+// listener path, guaranteeing the category exists before any push
+// can fire its Approve / Deny buttons against it.
+let categoryRegistration: Promise<void> | null = null;
+export function registerApprovalCategoryAsync(): Promise<void> {
+  if (categoryRegistration) return categoryRegistration;
+  categoryRegistration = (async () => {
+    if (Platform.OS !== "ios") return;
+    try {
+      await Notifications.setNotificationCategoryAsync(APPROVAL_CATEGORY, [
+        {
+          identifier: APPROVE_ACTION,
+          buttonTitle: "Approve",
+          options: {
+            opensAppToForeground: false,
+            isAuthenticationRequired: false,
+            isDestructive: false
+          }
+        },
+        {
+          identifier: DENY_ACTION,
+          buttonTitle: "Deny",
+          options: {
+            opensAppToForeground: false,
+            isAuthenticationRequired: false,
+            // Deny is the destructive choice — iOS highlights it red.
+            isDestructive: true
+          }
         }
-      },
-      {
-        identifier: DENY_ACTION,
-        buttonTitle: "Deny",
-        options: {
-          opensAppToForeground: false,
-          isAuthenticationRequired: false,
-          // Deny is the destructive choice — iOS highlights it red.
-          isDestructive: true
-        }
-      }
-    ]);
-  } catch {
-    // setNotificationCategoryAsync can throw on the very first launch
-    // before the native module is ready; the next mount will retry.
-  }
+      ]);
+    } catch {
+      // setNotificationCategoryAsync can throw on the very first launch
+      // before the native module is ready. Clear the cached promise so
+      // a subsequent mount can retry instead of memoizing the failure.
+      categoryRegistration = null;
+    }
+  })();
+  return categoryRegistration;
 }
 
 // Schedules an immediate local notification so the user gets a visible
@@ -307,7 +320,11 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
   // the next incoming approval push needs the category in place
   // immediately. If they reject permission below, the category
   // registration is harmless (no notifications will arrive to use it).
-  void registerApprovalCategoryAsync();
+  // We start the registration here (cached via the module-scoped
+  // promise) and await it below before installing the response
+  // listener, so the OS sees the category before any Approve / Deny
+  // action button can fire.
+  const categoryReady = registerApprovalCategoryAsync();
 
   const run = (async () => {
     try {
@@ -388,6 +405,17 @@ export async function registerForPushAsync(opts: RegisterPushOptions = {}): Prom
           }).catch(() => { /* swallow */ });
         });
       }
+
+      // Drain the category registration before subscribing to the
+      // response listener. The listener routes Approve / Deny taps
+      // against the APPROVAL_REQUEST category — installing it before
+      // the category exists would let an immediate-on-launch push slip
+      // through with no action buttons attached.
+      await categoryReady;
+      // Generation re-check: the category drain is a fresh await
+      // boundary, so a sign-out that arrived during it must still be
+      // honoured.
+      if (entryGeneration !== signedOutGeneration) return;
 
       // Response listener: handles three cases via dispatchNotificationResponse.
       //   - Default tap (no actionIdentifier set, or
@@ -509,6 +537,7 @@ export function __resetForTests(): void {
   registrationStarted = false;
   cachedDeviceToken = null;
   registrationInFlight = null;
+  categoryRegistration = null;
   signedOutGeneration = 0;
   void clearPersistedDeviceToken();
   if (tokenSub) { tokenSub.remove(); tokenSub = null; }

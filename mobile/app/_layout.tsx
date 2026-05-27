@@ -56,29 +56,25 @@ export default function RootLayout() {
     let active = true;
     // Sequence the cold-start primes so by the time AuthCacheGuard
     // fires its first refreshBadge() the X-Device-Token header is
-    // already in place. Without the device-token prime, /badge and
-    // /read would 400 (missing header) for the brief window between
-    // credential rehydration and registerForPushAsync() completing.
+    // already in place AND the APPROVAL_REQUEST notification category
+    // exists. Without the device-token prime, /badge and /read would
+    // 400 (missing header) for the brief window between credential
+    // rehydration and registerForPushAsync() completing. Without the
+    // category await, an immediate-on-launch approval push could land
+    // before iOS has the Approve / Deny buttons wired.
+    // registerApprovalCategoryAsync is iOS-gated and idempotent — the
+    // promise it returns is cached at module scope so awaiting it
+    // here doesn't race the implicit invocation inside
+    // registerForPushAsync.
     (async () => {
       await primeCredentials();
       await primeDeviceTokenFromStorage();
+      await registerApprovalCategoryAsync();
       if (active) setPrimed(true);
     })();
     return () => {
       active = false;
     };
-  }, []);
-
-  // Register the APPROVAL_REQUEST notification category as early as
-  // possible — before any push (foreground or wake-up) can arrive — so
-  // the inline Approve / Deny buttons are wired regardless of whether
-  // the user has visited a chat detail yet. The category survives
-  // process restarts in iOS's local cache, but a fresh install or a
-  // cleared simulator has nothing until we register, and the chat
-  // detail screen is no longer the load-bearing site for this.
-  // registerApprovalCategoryAsync is iOS-gated and idempotent.
-  useEffect(() => {
-    void registerApprovalCategoryAsync();
   }, []);
 
   // Load all custom font faces up front. `useFonts` from `expo-font` keys
