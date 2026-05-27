@@ -383,10 +383,21 @@ const startWebHealthPolling = (): void => {
       return;
     }
     if (probeInFlight) return;
-    // If the tunnel is already down (recovery interval will handle
-    // it, or the operator disabled), there's nothing for the probe
-    // to defend — skip until cloudflared is back up.
-    if (tunnelManager.getSnapshot().cloudflareUrl === null) return;
+    // If cloudflared isn't running but the operator's intent is still
+    // "enabled", it crashed unexpectedly — the manager's exit monitor
+    // cleared the handle/URL but does not auto-restart, and the file-
+    // watcher path doesn't fire (web.port unchanged). Hand off to the
+    // boot-recovery interval, which polls until cloudflared comes
+    // back. Without this hand-off, an unexpected cloudflared death
+    // leaves the tunnel down until manual disable/re-enable.
+    if (tunnelManager.getSnapshot().cloudflareUrl === null) {
+      if (tunnelResolved.config.enabled && !bootFailureRecorded) {
+        appendLog(config.instance, "tunnel.unexpected.exit.recovering", {});
+        bootFailureRecorded = true;
+        startBootRecoveryPolling();
+      }
+      return;
+    }
     probeInFlight = true;
     const target = currentWebTarget;
     probeWebHealthy(target).then((healthy) => {
