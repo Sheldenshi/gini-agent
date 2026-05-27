@@ -3058,11 +3058,17 @@ async function waitForMessagingPairTool(
   const deadlineMs = Date.now() + timeoutSeconds * 1000;
   const POLL_INTERVAL_MS = 1000;
 
-  // Establish the baseline: any chatIds already in
-  // recentDeniedChats at tool-start are "old" and don't count as
-  // freshly-arrived events. A re-DM that overwrites an existing
-  // row (different verificationCodeExpiresAt) DOES count — the
-  // code rotation is itself a fresh event the operator should see.
+  // Validate bridge existence + kind up-front so we don't burn
+  // the timeout on a typo'd name. The wait predicate itself
+  // re-reads state every tick, so no snapshot is held here:
+  // surfacing a pending row that arrived BEFORE the wait started
+  // is still legitimate (the operator hasn't acted on it yet),
+  // and approved rows are removed from recentDeniedChats so they
+  // can't loop back. The previous snapshot-diff predicate raced
+  // with the natural "user DMs the bot between bridge create and
+  // wait_for_messaging_pair start" window — pre-existing rows
+  // were filtered out as not-new even though they represented the
+  // exact unresolved pair the agent was waiting for.
   const initialBridge = readState(config.instance).messagingBridges.find(
     (b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName
   );
@@ -3078,10 +3084,6 @@ async function waitForMessagingPairTool(
       result: JSON.stringify({ ok: false, error: `wait_for_messaging_pair only applies to telegram bridges (got '${initialBridge.kind}').` })
     };
   }
-  const initialMetadata = (initialBridge.metadata ?? {}) as { recentDeniedChats?: Array<{ chatId: number; verificationCodeExpiresAt?: string }> };
-  const initialPendingSnapshot = new Map<number, string | undefined>(
-    (initialMetadata.recentDeniedChats ?? []).map((entry) => [entry.chatId, entry.verificationCodeExpiresAt])
-  );
 
   const reasonText = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()
@@ -3113,6 +3115,7 @@ async function waitForMessagingPairTool(
       };
     }
     const liveMeta = (liveBridge.metadata ?? {}) as {
+      allowedChatIds?: unknown;
       recentDeniedChats?: Array<{
         chatId: number;
         chatType?: string;
@@ -3122,15 +3125,22 @@ async function waitForMessagingPairTool(
       }>;
     };
     const livePending = liveMeta.recentDeniedChats ?? [];
+    const allowedSet = new Set<number>(
+      Array.isArray(liveMeta.allowedChatIds)
+        ? liveMeta.allowedChatIds.map((v) => Number(v)).filter((n) => Number.isFinite(n))
+        : []
+    );
 
-    // Find the first chatId whose row is either brand-new since
-    // tool-start OR whose verificationCodeExpiresAt has rotated
-    // (a re-DM that minted a fresh code is itself a fresh event).
-    const newOrRotated = livePending.find((entry) => {
-      const initialExpiresAt = initialPendingSnapshot.get(entry.chatId);
-      if (initialExpiresAt === undefined) return true;
-      return entry.verificationCodeExpiresAt !== initialExpiresAt;
-    });
+    // Surface the first pending row that the operator can act on:
+    // (a) has a verification code (groups never mint a code and
+    // are not approvable via the chat-card handshake — they go
+    // through the settings page / CLI), and (b) isn't already
+    // enrolled on the bridge's allowlist. Approved rows are
+    // removed from recentDeniedChats by allowChat, so the second
+    // check is mostly defensive.
+    const newOrRotated = livePending.find(
+      (entry) => entry.verificationCode && !allowedSet.has(entry.chatId)
+    );
 
     if (newOrRotated && newOrRotated.verificationCode) {
       // Mint the messaging.approve_pairing approval bound to this

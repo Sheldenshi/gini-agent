@@ -606,6 +606,120 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("wait_for_messaging_pair: surfaces a pre-existing pending row immediately", async () => {
+    // The earlier snapshot-diff predicate filtered out chatIds that
+    // were already in recentDeniedChats at tool-start, racing the
+    // natural "user DMs the bot between request_messaging_bridge
+    // resolving and wait_for_messaging_pair starting" window. Pin
+    // the new behavior: a pending row with a verification code that
+    // isn't on the allowlist must be surfaced on the very first
+    // poll tick, regardless of whether it pre-existed.
+    const instance = `wait-pair-preexisting-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg-prewait",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [],
+        recentDeniedChats: [
+          {
+            chatId: 77,
+            chatType: "private",
+            sender: "@earlybird",
+            lastAttemptAt: new Date().toISOString(),
+            verificationCode: "WAIT-7700",
+            verificationCodeExpiresAt: "2099-01-01T00:00:00.000Z"
+          }
+        ]
+      };
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "wait_for_messaging_pair",
+      "call_wait_prewait",
+      JSON.stringify({ bridge: "tg-prewait", timeoutSeconds: 10 })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("messaging.approve_pairing");
+      expect(approval!.payload.chatId).toBe(77);
+      expect(approval!.payload.verificationCode).toBe("WAIT-7700");
+    }
+  });
+
+  test("wait_for_messaging_pair: skips a pending row whose chat is already enrolled, then exits on task cancel", async () => {
+    // Pin the second half of the new predicate: a pending row whose
+    // chatId is already on the allowlist must NOT surface. Approved
+    // rows are normally cleared from recentDeniedChats by allowChat,
+    // so this is mostly defensive — but if a stale entry lingers,
+    // the agent should still wait instead of double-surfacing the
+    // same chat. The wait's lower-bound timeout is 10s so we cancel
+    // the task mid-wait to exit fast; the wait tool's per-tick
+    // task-terminal check returns the cancelled sync result.
+    const instance = `wait-pair-already-enrolled-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    await mutateState(instance, (state) => {
+      const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
+      const bridge = createMessagingBridgeRecord(state, {
+        name: "tg-enrolled",
+        kind: "telegram",
+        deliveryTargets: []
+      });
+      bridge.metadata = {
+        allowedChatIds: [88],
+        recentDeniedChats: [
+          {
+            chatId: 88,
+            chatType: "private",
+            sender: "@alreadyhere",
+            lastAttemptAt: new Date().toISOString(),
+            verificationCode: "STALE-8888",
+            verificationCodeExpiresAt: "2099-01-01T00:00:00.000Z"
+          }
+        ]
+      };
+    });
+    const dispatchPromise = dispatchToolCall(
+      config,
+      taskId,
+      "wait_for_messaging_pair",
+      "call_wait_enrolled",
+      JSON.stringify({ bridge: "tg-enrolled", timeoutSeconds: 10 })
+    );
+    // Give the wait tool one full poll tick to scan and decide the
+    // already-enrolled row is unsurfacable, then cancel so the next
+    // tick's task-terminal check exits the loop.
+    await Bun.sleep(1200);
+    await mutateState(instance, (state) => {
+      const task = state.tasks.find((t) => t.id === taskId);
+      if (task) task.status = "cancelled";
+    });
+    const result = await dispatchPromise;
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      // Either "cancelled" or "timed out" is acceptable here; the
+      // load-bearing check is "no approval minted" below.
+    }
+    // No messaging.approve_pairing approval was minted for the
+    // already-enrolled chat.
+    const state = readState(instance);
+    expect(
+      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+    ).toBe(0);
+  }, 10000);
+
   test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {
     const instance = `req-remove-bridge-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
