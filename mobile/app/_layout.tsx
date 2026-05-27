@@ -23,7 +23,7 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
-import { refreshBadge } from "@/src/push";
+import { refreshBadge, registerApprovalCategoryAsync } from "@/src/push";
 import { family, theme } from "@/src/theme";
 
 // Single shared client across the tree so navigating between screens
@@ -56,6 +56,18 @@ export default function RootLayout() {
     return () => {
       active = false;
     };
+  }, []);
+
+  // Register the APPROVAL_REQUEST notification category as early as
+  // possible — before any push (foreground or wake-up) can arrive — so
+  // the inline Approve / Deny buttons are wired regardless of whether
+  // the user has visited a chat detail yet. The category survives
+  // process restarts in iOS's local cache, but a fresh install or a
+  // cleared simulator has nothing until we register, and the chat
+  // detail screen is no longer the load-bearing site for this.
+  // registerApprovalCategoryAsync is iOS-gated and idempotent.
+  useEffect(() => {
+    void registerApprovalCategoryAsync();
   }, []);
 
   // Load all custom font faces up front. `useFonts` from `expo-font` keys
