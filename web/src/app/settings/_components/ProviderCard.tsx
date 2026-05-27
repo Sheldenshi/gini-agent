@@ -183,7 +183,7 @@ export function ProviderCard({
           // currently in effect.
           const showRadioFill = switching ? isPending : isActive;
           const radioBorderClass = isPending || (!switching && isActive)
-            ? "border-[#B57BBE]"
+            ? "border-[#4277FB]"
             : "border-[#3A3A40]";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
@@ -208,7 +208,7 @@ export function ProviderCard({
                 disabled={setActive.isPending}
                 className={`flex size-5 shrink-0 items-center justify-center rounded-full border-[1.5px] transition disabled:cursor-not-allowed ${radioBorderClass}`}
               >
-                {showRadioFill ? <span className="size-2.5 rounded-full bg-[#B57BBE]" /> : null}
+                {showRadioFill ? <span className="size-2.5 rounded-full bg-[#4277FB]" /> : null}
               </button>
               <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-[#1C1C22]">
                 <Icon className="size-5 text-[#C2C2C8]" />
@@ -256,6 +256,13 @@ export function ProviderCard({
                       variant="outline"
                       size="icon"
                       aria-label={`Remove ${displayProviderName(row)}`}
+                      // Disable when this is the only connected provider —
+                      // removing it would leave the gateway with nothing.
+                      // Codex is in `rows` when its OAuth is on disk, so a
+                      // user with Codex + DeepSeek still gets to delete
+                      // DeepSeek (rows.length === 2 there).
+                      disabled={rows.length <= 1}
+                      title={rows.length <= 1 ? "Connect another provider before removing this one." : undefined}
                       onClick={() => setRemovingRow(row)}
                     >
                       <Trash2Icon className="size-4 text-[#9A9AA0]" />
@@ -279,10 +286,7 @@ export function ProviderCard({
             Remove {removingRow ? displayProviderName(removingRow) : "provider"}?
           </DialogTitle>
           <DialogDescription className="text-[13px] text-muted-foreground">
-            Clears the saved API key from <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.gini/secrets.env</code> and
-            disconnects the provider from this gateway. {removingRow && activeProviderName === removingRow.name
-              ? "Since it's currently active, the gateway will fall back to Codex if your codex CLI is signed in."
-              : "Your active provider is unchanged."}
+            You can reconnect anytime.
           </DialogDescription>
           <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">
             <Button
