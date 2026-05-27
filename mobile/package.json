@@ -9,7 +9,9 @@
     "ios": "expo start --ios",
     "web": "expo start --web",
     "prebuild": "expo prebuild --platform ios --clean",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:prod": "eas build --platform ios --profile production",
+    "submit": "eas submit --platform ios --latest"
   },
   "dependencies": {
     "@expo-google-fonts/hanken-grotesk": "^0.4.3",
