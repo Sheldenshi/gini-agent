@@ -191,25 +191,43 @@ export function ProviderCard({
             ? (activeProviderModel ?? row.models[0] ?? "")
             : (row.models[0] ?? "");
 
+          // Whole row is the selection target. Clicking the active row
+          // clears any pending switch, clicking any other row stages it.
+          // Locked while the mutation is in flight so a quick second
+          // click can't double-fire. Edit/Remove buttons stop propagation
+          // below so they don't accidentally re-select the row.
+          const toggleRow = () => {
+            if (setActive.isPending) return;
+            setPendingProvider(isActive ? null : row.name);
+          };
+
           return (
             <li
               key={row.id}
-              className="flex items-center gap-4 rounded-2xl border border-[#1F1F24] bg-[#141418] p-5"
+              role="button"
+              tabIndex={0}
+              aria-pressed={isPending || isActive}
+              aria-label={isActive ? `${displayProviderName(row)} (active)` : `Stage ${displayProviderName(row)} as active`}
+              aria-disabled={setActive.isPending}
+              onClick={toggleRow}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  toggleRow();
+                }
+              }}
+              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-[#1F1F24] bg-[#141418] p-5 transition hover:border-[#2A2A30] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
             >
-              {/* Radio doubles as the row's selection control: clicking
-                  the active row clears any pending switch, clicking any
-                  other row stages it. Disabled while the mutation is in
-                  flight so a quick second click can't double-fire. */}
-              <button
-                type="button"
-                aria-label={isActive ? `${displayProviderName(row)} (active)` : `Stage ${displayProviderName(row)} as active`}
-                aria-pressed={isPending || isActive}
-                onClick={() => setPendingProvider(isActive ? null : row.name)}
-                disabled={setActive.isPending}
-                className={`flex size-5 shrink-0 items-center justify-center rounded-full border-[1.5px] transition disabled:cursor-not-allowed ${radioBorderClass}`}
+              {/* Radio is purely visual now — the row itself is the
+                  control. Kept aria-hidden so screen readers don't
+                  announce a separate selection state alongside the
+                  row's aria-pressed. */}
+              <span
+                aria-hidden
+                className={`flex size-5 shrink-0 items-center justify-center rounded-full border-[1.5px] transition ${radioBorderClass}`}
               >
                 {showRadioFill ? <span className="size-2.5 rounded-full bg-[#4277FB]" /> : null}
-              </button>
+              </span>
               <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-[#1C1C22]">
                 <Icon className="size-5 text-[#C2C2C8]" />
               </span>
@@ -240,13 +258,19 @@ export function ProviderCard({
                 Add Provider page is the only place codex re-auth lives.
               */}
               {row.name === "codex" ? null : (
-                <div className="flex items-center gap-2">
+                // Action buttons live inside the clickable row, so each
+                // handler stops propagation — otherwise clicking Edit or
+                // Remove would also stage a switch on this row.
+                <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
                   <Button
                     type="button"
                     variant="outline"
                     size="icon"
                     aria-label={`Edit ${displayProviderName(row)}`}
-                    onClick={() => setEditingRow(row)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setEditingRow(row);
+                    }}
                   >
                     <PencilIcon className="size-4 text-[#9A9AA0]" />
                   </Button>
@@ -263,7 +287,10 @@ export function ProviderCard({
                       // long.
                       disabled={isActive}
                       title={isActive ? "Switch to another provider before removing this one." : undefined}
-                      onClick={() => setRemovingRow(row)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRemovingRow(row);
+                      }}
                     >
                       <Trash2Icon className="size-4 text-[#9A9AA0]" />
                     </Button>
