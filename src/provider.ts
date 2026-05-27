@@ -1418,6 +1418,39 @@ function pickBaseUrl(persisted: string | undefined, fallback: string): string {
   return persisted && persisted.trim().length > 0 ? persisted : fallback;
 }
 
+// DeepSeek V4 family + deepseek-reasoner (R1) accept a top-level
+// `thinking: {type: "enabled"|"disabled"}` flag plus
+// `reasoning_effort: "low"|"medium"|"high"|"max"` on their OpenAI-compat
+// chat-completions endpoint. The API defaults to thinking-on for these
+// models, which then enforces a `reasoning_content` echo-back contract on
+// subsequent turns. We default-on explicitly so the wire shape matches
+// what DeepSeek expects, and crank `reasoning_effort` to "max" so callers
+// pick the strongest setting without extra config. User-supplied
+// extraBody wins on conflicts.
+function deepseekSupportsThinking(model: string): boolean {
+  const m = model.trim().toLowerCase();
+  if (!m) return false;
+  if (m === "deepseek-reasoner") return true;
+  // deepseek-v4-*, deepseek-v5-*, ...  Excludes V3 explicitly.
+  return m.startsWith("deepseek-v") && !m.startsWith("deepseek-v3");
+}
+
+function withDeepSeekThinkingDefaults(
+  model: string,
+  extraBody: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (!deepseekSupportsThinking(model)) {
+    return extraBody;
+  }
+  const merged: Record<string, unknown> = { thinking: { type: "enabled" }, reasoning_effort: "max" };
+  if (extraBody) {
+    for (const [key, value] of Object.entries(extraBody)) {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {
@@ -1447,12 +1480,14 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     };
   }
   if (provider.name === "deepseek") {
+    const model = provider.model || DEFAULT_DEEPSEEK_MODEL;
+    const extraBody = withDeepSeekThinkingDefaults(model, provider.extraBody);
     return {
       name: "deepseek",
-      model: provider.model || DEFAULT_DEEPSEEK_MODEL,
+      model,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_DEEPSEEK_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "DEEPSEEK_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+      ...(extraBody ? { extraBody } : {})
     };
   }
   if (provider.name === "codex") {
