@@ -11,6 +11,8 @@ const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
+const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
+const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
@@ -86,6 +88,16 @@ export function providerCatalog(): ProviderCatalogItem[] {
       auth: "env",
       models: ["openrouter/auto"],
       capabilities: ["chat-completions", "model-routing"],
+      costHint: "external"
+    },
+    {
+      id: "deepseek",
+      name: "deepseek",
+      displayName: "DeepSeek",
+      baseUrl: DEFAULT_DEEPSEEK_BASE_URL,
+      auth: "env",
+      models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+      capabilities: ["chat-completions", "tool-calling"],
       costHint: "external"
     },
     {
@@ -1188,7 +1200,7 @@ export async function generateTaskSummary(
     soul: soulBlock,
     userProfile: userProfileBlock
   });
-  if (provider.name === "openrouter" || provider.name === "local") {
+  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
     return callChatCompletions(provider, input, systemContext);
   }
   return callOpenAIResponses(provider, input, systemContext, onDelta);
@@ -1294,7 +1306,12 @@ export async function generateStructured<T>(
   // OpenAI / OpenRouter / local OpenAI-compatible: chat-completions with
   // response_format json_object. We deliberately don't push json_schema —
   // many compat providers reject the field. Validator re-checks shape.
-  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "openai") {
+  if (
+    provider.name === "openrouter" ||
+    provider.name === "local" ||
+    provider.name === "openai" ||
+    provider.name === "deepseek"
+  ) {
     return callStructuredChatCompletions(provider, request);
   }
   // Codex doesn't expose /chat/completions and the /responses API doesn't
@@ -1447,6 +1464,15 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "local/default",
       baseUrl: pickBaseUrl(provider.baseUrl, "http://127.0.0.1:11434/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+    };
+  }
+  if (provider.name === "deepseek") {
+    return {
+      name: "deepseek",
+      model: provider.model || DEFAULT_DEEPSEEK_MODEL,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_DEEPSEEK_BASE_URL),
+      apiKeyEnv: provider.apiKeyEnv ?? "DEEPSEEK_API_KEY",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
@@ -2153,6 +2179,7 @@ function defaultBaseUrl(provider: ProviderConfig): string {
   if (provider.name === "codex") return DEFAULT_CODEX_BASE_URL;
   if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
   if (provider.name === "local") return "http://127.0.0.1:11434/v1";
+  if (provider.name === "deepseek") return DEFAULT_DEEPSEEK_BASE_URL;
   return DEFAULT_OPENAI_BASE_URL;
 }
 
