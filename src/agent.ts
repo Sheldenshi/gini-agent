@@ -725,7 +725,15 @@ export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
   const task = await mutateState(config.instance, (state) => {
-    const task = findTask(state, taskId);
+    // The two `runTask(...).catch(failTask(...))` fire-and-forget call
+    // sites in createTask/retryTask can race with test cleanup or a
+    // parent-task cancelation that removes the task row before this
+    // catch handler runs. A removed task is more terminal than
+    // "failed" — nothing left to audit, nothing left to update — so
+    // no-op rather than throwing an unhandled "Task not found" out
+    // through an already-detached promise chain.
+    const task = state.tasks.find((item) => item.id === taskId);
+    if (!task) return null;
     // Idempotent: a sibling approval denial may have already flipped
     // the task to `failed` (see decideApproval-deny). Repeating the
     // audit row would double-count the failure and the in-flight abort
@@ -758,6 +766,7 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     recordInFlightAborted(state, config.instance, task, "task.failed");
     return task;
   });
+  if (!task) return;
   appendTrace(config.instance, taskId, { type: "error", message, data: {} });
   await updateRunFromTask(config, task);
   if (task.jobId) await finalizeJobRunFromTask(config, task);
@@ -867,6 +876,19 @@ export async function completeLowRiskToolTask(
 // path is the right one to reach for, not this function.
 export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
   if (decision === "approve") {
+    // browser.fill_secret approvals can only be resolved via /connect
+    // with the per-slot values. Routing through resolveApproval would
+    // flip status to approved but no DOM fill ever ran (the side
+    // effect lives inside POST /api/approvals/<id>/connect), and the
+    // chat-task loop would either hang in waiting_approval (if
+    // runApprovedAction's branch returns undefined) or resume with a
+    // false "fields filled" message. Refuse early so the contract
+    // holds across every caller (HTTP /approve, CLI, /permissions UI,
+    // future API clients).
+    const existing = readState(config.instance).approvals.find((a) => a.id === approvalId);
+    if (existing?.action === "browser.fill_secret") {
+      throw new Error("browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve.");
+    }
     const { approval } = await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
     return approval;
   }
@@ -1399,6 +1421,25 @@ async function runApprovedAction(
       await resumeChatTask(config, approval.taskId, chatToolCallId, result);
     }
     return result;
+  }
+
+  if (approval.action === "browser.fill_secret") {
+    // The /connect handler owns the entire fill_secret lifecycle now:
+    // it calls resolveApproval(resumeChatTask:false) to atomically
+    // close the deny race BEFORE per-slot playwright fills, then runs
+    // the fills, writes the redacted audit row, and calls
+    // resumeChatTask with a result string that reflects actual filled
+    // / errored slots. By the time resolveApproval invokes this
+    // branch the agent has not yet been told what happened — and we
+    // can't synthesize a truthful result here because the fills come
+    // AFTER this point. Return undefined; /connect handles resume.
+    // The /approve route refuses fill_secret (see src/http.ts), so
+    // /connect is the only resolver and this branch is the
+    // resolveApproval-side no-op for that single path.
+    void extraEvidence;
+    void shouldResumeChat;
+    void chatToolCallId;
+    return undefined;
   }
 
   if (approval.action === "file.write") {

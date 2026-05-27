@@ -327,17 +327,19 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  // Halt-siblings regression tests (Review P1 #2). When a single LLM turn
-  // emits multiple approval-gated tool calls, denying one must auto-deny
-  // the rest, clear the captured snapshot, and prevent any later approve
-  // from running side effects.
-  test("denying one of multiple sibling approvals auto-denies the rest and prevents side effects", async () => {
+  // One-pending-per-turn regression. When the LLM emits multiple
+  // tool calls in a single assistant turn and the first one returns
+  // a pending approval, all subsequent dispatches MUST be deferred
+  // so their side effects don't race the user's approval decision.
+  // The chat-task loop skips remaining calls and synthesizes a
+  // "skipped" tool_result for message-history symmetry; the LLM
+  // re-evaluates from the new state on the next turn after the
+  // approval resolves.
+  test("pending approval halts the rest of the turn — later calls are skipped, not dispatched", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
-    const config = buildConfig(workspaceRoot, "chat-task-sibling-deny");
+    const config = buildConfig(workspaceRoot, "chat-task-pending-halt");
     const provider = normalizeProvider(config.provider);
 
-    // First model turn: ask for two file writes in parallel. Both become
-    // pending approvals on the same task (parallel tool_calls).
     setEchoToolCallingResponse({
       provider,
       text: "",
@@ -352,40 +354,25 @@ describe("chat-task loop", () => {
     const paused = await waitForTerminal(config, task.id);
     expect(paused.status).toBe("waiting_approval");
     expect(paused.toolCallState).toBeDefined();
-    expect(paused.toolCallState?.pending.length).toBe(2);
-    expect(paused.approvalIds.length).toBe(2);
+    // Only the first call goes pending. The second was skipped (its
+    // dispatch never ran) — message history carries a synthetic
+    // skipped tool_result so the LLM sees both tool_calls paired.
+    expect(paused.toolCallState?.pending.length).toBe(1);
+    expect(paused.approvalIds.length).toBe(1);
 
-    // Deny the first sibling. The fix should auto-deny the second.
-    const [firstApprovalId, secondApprovalId] = paused.approvalIds as [string, string];
+    // Deny the lone pending approval. The task fails. The second
+    // file_write never ran in the first place, so its file must not
+    // exist on disk either.
+    const [firstApprovalId] = paused.approvalIds as [string];
     await decideApproval(config, firstApprovalId, "deny");
-
-    // Wait for the task to land in failed (failTask is async).
     await Bun.sleep(50);
 
     const stateAfter = readState(config.instance);
     const failedTask = stateAfter.tasks.find((t) => t.id === task.id)!;
     expect(failedTask.status).toBe("failed");
-    // Snapshot cleared.
     expect(failedTask.toolCallState).toBeUndefined();
-
-    // Second approval was auto-denied.
-    const second = stateAfter.approvals.find((a) => a.id === secondApprovalId)!;
-    expect(second.status).toBe("denied");
-
-    // Try to approve the auto-denied sibling — must throw because it's no
-    // longer pending.
-    await expect(decideApproval(config, secondApprovalId, "approve")).rejects.toThrow(/already denied/);
-
-    // Verify no files were written. Even if executeApprovedAction was
-    // somehow called, the terminal-task short-circuit prevents the side
-    // effect.
     expect(existsSync(join(workspaceRoot, "a.txt"))).toBe(false);
     expect(existsSync(join(workspaceRoot, "b.txt"))).toBe(false);
-
-    // Audit trail should record the cascade.
-    const cascadeAudits = stateAfter.audit.filter((a) => a.action === "approval.cancelled_sibling_denial");
-    expect(cascadeAudits.length).toBe(1);
-    expect(cascadeAudits[0]?.approvalId).toBe(secondApprovalId);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

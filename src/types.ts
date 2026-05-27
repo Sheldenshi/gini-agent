@@ -314,8 +314,18 @@ export interface ApprovalRequestedBlock extends ChatBlockBase {
   kind: "approval_requested";
   approvalId: string;
   // Approval action (`file.write`, `terminal.exec`, `connector.request`,
-  // etc.). Lets clients branch on `connector.request` to render the
-  // Connect dialog vs the standard Approve/Deny pair.
+  // `browser.fill_secret`, etc.). Clients branch on `action` to render
+  // the right card variant:
+  //   - `connector.request` → Connect dialog (collects OAuth/API
+  //     creds via /api/approvals/<id>/connect).
+  //   - `browser.fill_secret` → inline Submit form with one input
+  //     per slot in approval.payload.slots; Submit POSTs the per-slot
+  //     values to /api/approvals/<id>/connect with body
+  //     `{ secrets: { <slot.name>: <value>, ... } }`. The generic
+  //     /approve endpoint refuses this action — Deny is still valid.
+  //     See docs/adr/browser-fill-secret.md.
+  //   - everything else → standard Approve / Deny pair (POST to
+  //     /api/approvals/<id>/{approve,deny}).
   action: string;
   risk: string;
   summary: string;
@@ -523,6 +533,14 @@ export interface RuntimeEvent {
   // back-filled — missing agentId is preserved as a first-class signal
   // that the row is system-attributed.
   agentId?: string;
+  // When true, the writer drops `data` before persisting. Metadata
+  // (action, target, actor via mirrored audit, timestamp, etc.) is still
+  // recorded so the activity feed shows that something happened, but the
+  // payload bytes never land on disk or stream out. Set by call sites
+  // that route sensitive material (e.g. a co-browse handoff relaying
+  // keystrokes) so even an accidental `data: { rawKey: ... }` is dropped
+  // at the boundary.
+  redacted?: boolean;
 }
 
 export interface RunRecord {
@@ -659,6 +677,10 @@ export interface TraceRecord {
   type: "task" | "model" | "tool" | "approval" | "memory" | "job" | "connector" | "error" | "warning";
   message: string;
   data?: Record<string, unknown>;
+  // When true, the writer drops `data` before serializing to JSONL.
+  // Same contract as RuntimeEvent.redacted — metadata still records
+  // that the trace existed; the payload is suppressed at the boundary.
+  redacted?: boolean;
 }
 
 export interface ToolRecord {
@@ -932,6 +954,14 @@ export interface AuditEvent {
   // agentId is preserved as a first-class signal that the row is
   // system-attributed.
   agentId?: string;
+  // When true, `evidence` is dropped at the addAudit boundary and the
+  // mirrored RuntimeEvent inherits the same redaction. The row remains
+  // visible (action, target, actor, timestamp preserved) so reviewers
+  // can see that the event happened; the payload bytes are not stored.
+  // Use for any audit whose evidence would carry credentials, OAuth
+  // tokens, raw keystrokes, or other material that must not land in
+  // state.json or stream out through the activity feed.
+  redacted?: boolean;
 }
 
 export interface Approval {
@@ -944,7 +974,7 @@ export interface Approval {
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "messaging.send";
+  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "browser.fill_secret" | "messaging.send";
   target: string;
   risk: RiskLevel;
   reason: string;

@@ -1013,7 +1013,37 @@ async function runLoop(
       inFlightAssistantText = "";
     }
 
+    // Tracks whether an earlier call in this turn returned a pending
+    // approval. Subsequent calls in the same `result.toolCalls` array
+    // MUST be skipped (not dispatched) so their side effects don't
+    // race the user's approval decision — e.g. an LLM turn that emits
+    // `[browser_fill_secrets, browser_click]` would otherwise fire
+    // browser_click on an empty form before the user submits the
+    // credential card. Each skipped call still gets a synthetic
+    // tool_result so the message-history stays paired
+    // (assistant_message tool_call → tool result) and the LLM can
+    // re-evaluate after the approval resolves.
+    let pausedThisTurn = false;
     for (const call of result.toolCalls) {
+      if (pausedThisTurn) {
+        const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
+        toolResultMessages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: JSON.stringify({ ok: false, skipped: true, reason: skipMessage })
+        });
+        emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: skipMessage });
+        emitToolResult(emitCtx, { callId: call.id, result: skipMessage });
+        await mutateState(config.instance, (state) => {
+          updateRecentToolCall(findTask(state, taskId), call.id, "done");
+        });
+        appendTrace(config.instance, taskId, {
+          type: "tool",
+          message: "Tool call skipped: prior pending approval in same turn",
+          data: { toolCallId: call.id, toolName: call.function.name }
+        });
+        continue;
+      }
       // Re-check terminal status under the same `mutateState` lock
       // that flips currentStep. The post-model bail-out above is
       // lock-free (`readState`), which leaves a window where a
@@ -1092,6 +1122,10 @@ async function runLoop(
             toolName: call.function.name,
             approvalId: dispatch.approvalId
           });
+          // From this point on, remaining tool calls in the same turn
+          // are skipped — their side effects must not race the
+          // user's approval decision.
+          pausedThisTurn = true;
           // Re-read the approval row to surface action/risk/summary on
           // the approval_requested block. The dispatch returns just
           // the id; the full row is the source of truth for these

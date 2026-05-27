@@ -107,10 +107,24 @@ remote previews, screen readers) would need the same translation code.
   failure paths intentionally do not drop the in-flight row.
 
 - `ApprovalRequestedBlock.action` is part of the wire contract so
-  clients can distinguish `connector.request` (render the Connect
-  dialog) from regular approvals (Approve/Deny pair) without a
-  cross-endpoint join. The block also carries `risk` and `summary` so
-  the bubble can render without a follow-up `/api/approvals` fetch.
+  clients can branch on the card variant without a cross-endpoint
+  join. Three branches:
+  - `connector.request` — render the Connect dialog. Submit posts
+    `{ secrets, scopes, name }` to `/api/approvals/<id>/connect`.
+  - `browser.fill_secret` — render an inline form with one input
+    per slot in `approval.payload.slots`. Submit posts
+    `{ secrets: { <slot.name>: <value>, ... } }` to
+    `/api/approvals/<id>/connect`. The card also reads
+    `approval.payload.approvedUrl` to render the "fill destination"
+    badge so the human reviewer can spot a target mismatch. The
+    generic `/approve` endpoint refuses this action (only `/connect`
+    completes the fill); `/deny` is still valid. See ADR
+    [browser-fill-secret.md](browser-fill-secret.md).
+  - everything else — standard Approve / Deny pair posting to
+    `/api/approvals/<id>/{approve,deny}`.
+
+  The block also carries `risk` and `summary` so the bubble can
+  render without a follow-up `/api/approvals` fetch.
 
 - Tool catalog labels live with the catalog. `displayLabel` on each
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`

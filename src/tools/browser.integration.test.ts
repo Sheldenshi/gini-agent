@@ -24,6 +24,7 @@ import {
   __test as browserTest,
   browserConsole,
   browserDrag,
+  browserFillByLocator,
   browserHover,
   browserNavigate,
   browserSelectOption,
@@ -269,6 +270,70 @@ describe.skipIf(!ENABLED)("browser tools — real Chromium integration", () => {
     const dropped = parsed.dropped === "ok";
     const partial = (parsed.events ?? []).includes("dragstart");
     expect(dropped || partial).toBe(true);
+  }, 60_000);
+
+  it("snapshot redaction — password input values and data-gini-secret marked fields never appear in the snapshot", async () => {
+    // Without this redaction the value the user typed into the
+    // fill_secret amber card would round-trip back into the LLM the
+    // next time the agent called browser_snapshot. The walker
+    // substitutes "[redacted]" for any non-empty value on:
+    //   - type="password"
+    //   - autocomplete=current-password / new-password / one-time-code
+    //   - any element stamped with data-gini-secret (set by
+    //     browserFillByLocator after a successful fill)
+    await bootInstance("snapshot-redact");
+
+    const taskId = `redact-${Date.now()}`;
+    const url = registerPage(
+      "/redact",
+      `<form>
+         <input type="password" id="pw" value="prefilled-from-server-bytes">
+         <input type="text" id="otp" autocomplete="one-time-code" value="123456">
+         <input type="text" id="visible" value="not-secret-visible">
+         <input type="text" id="willflip">
+       </form>`
+    );
+    const navRaw = await browserNavigate(taskId, { url });
+    const nav = JSON.parse(navRaw) as NavResult;
+    if (!nav.success) throw new Error(`navigate failed: ${nav.error}`);
+
+    // 1) The initial snapshot must redact pw (type="password") and
+    //    otp (autocomplete="one-time-code") but keep the visible field.
+    expect(nav.snapshot ?? "").not.toContain("prefilled-from-server-bytes");
+    expect(nav.snapshot ?? "").not.toContain("123456");
+    expect(nav.snapshot ?? "").toContain("not-secret-visible");
+    // Redacted fields surface with the masking marker so the agent
+    // knows the field has a value without learning what it is.
+    expect(nav.snapshot ?? "").toContain("[redacted]");
+
+    // 2) Fill the "will flip" text input via browserFillByLocator —
+    //    this is the path /connect uses on fill_secret submissions —
+    //    then flip its type to text from JS to mimic a page that
+    //    reveals what the user typed in a custom UI. The
+    //    data-gini-secret marker stamped during fill must survive
+    //    the type change so the next snapshot still redacts.
+    const fillResult = await browserFillByLocator(taskId, { locator: "#willflip", value: "fill-byte-payload-XYZ" });
+    expect(fillResult.ok).toBe(true);
+
+    // Flip the type to plain text post-fill.
+    const flipRaw = await browserConsole(taskId, {
+      expression: "(document.getElementById('willflip').type = 'text', 'flipped')"
+    });
+    const flip = JSON.parse(flipRaw) as ConsoleResult;
+    if (!flip.success) throw new Error(`flip failed: ${flip.error}`);
+
+    const snapAfterRaw = await browserSnapshot(taskId, {});
+    const snapAfter = JSON.parse(snapAfterRaw) as NavResult;
+    if (!snapAfter.success) throw new Error(`snapshot failed: ${snapAfter.error}`);
+    expect(snapAfter.snapshot ?? "").not.toContain("fill-byte-payload-XYZ");
+    // Confirm the marker really persisted on the element (defense
+    // against a future refactor that drops the evaluate stamp).
+    const markerRaw = await browserConsole(taskId, {
+      expression: "document.getElementById('willflip').getAttribute('data-gini-secret')"
+    });
+    const marker = JSON.parse(markerRaw) as ConsoleResult;
+    if (!marker.success) throw new Error(`marker check failed: ${marker.error}`);
+    expect(marker.evalResult).toBe("true");
   }, 60_000);
 
   it("select_option — browserSelectOption changes the <select> value", async () => {

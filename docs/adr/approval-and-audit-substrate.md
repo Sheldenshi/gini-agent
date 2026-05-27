@@ -18,6 +18,16 @@ The product promise is operational confidence. The system can start small, but i
 - Skills use a plain `enabled` / `disabled` lifecycle. Enabled skills can be
   advertised to the agent when their connector requirements are satisfied;
   disabled skills stay invisible to the agent.
+- `AuditEvent`, `RuntimeEvent`, and `TraceRecord` each carry an optional
+  `redacted` boolean that the writer enforces at the boundary. When true,
+  `addAudit` drops the `evidence` field, `appendEvent` drops `data`, and
+  `appendTrace` drops `data` before serializing to JSONL. Metadata (action,
+  target, actor, risk, taskId, runId, approvalId, agentId, timestamp) still
+  persists so reviewers see that the event happened; payload bytes are not
+  stored. `addAudit` propagates the flag into the mirrored runtime event so
+  the activity feed inherits the same suppression. The first consumer is
+  `browser.fill_secret` (see ADR browser-fill-secret.md), whose audit rows
+  would otherwise carry user-typed credentials.
 
 ## Deferred
 

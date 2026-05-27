@@ -47,6 +47,7 @@ export type PolicyAction =
   | "code.exec"
   | "browser.upload_file"
   | "browser.connect"
+  | "browser.fill_secret"
   | "messaging.send";
 
 export interface TerminalExecPayload {
@@ -92,6 +93,22 @@ export function resolveApprovalPolicy(
   payload?: PolicyPayload
 ): ApprovalPolicyDecision {
   const mode = effectiveApprovalMode(config);
+
+  // browser.fill_secret always gates regardless of approvalMode.
+  // There's no notion of "auto-approving" credential entry — the
+  // values come from the user via the amber chat card and the
+  // /connect endpoint, and yolo's "auto-approve side effects the
+  // agent decides on its own" intent does not apply to user-typed
+  // input. Without this guard, a yolo-mode operator would silently
+  // approve an empty fill_secret (no values submitted) and the
+  // agent would be told the fields were filled. fill_secret bypasses
+  // pendingOrAuto today (createApproval is called directly from
+  // src/execution/tool-dispatch.ts:browserFillSecretsTool), but the
+  // guard lives here for defense — if a future refactor routes
+  // fill_secret through pendingOrAuto, the contract still holds.
+  if (action === "browser.fill_secret") {
+    return { mode: "gate", reason: "fill-secret-always-gate" };
+  }
 
   if (mode === "yolo") {
     return { mode: "auto", reason: "approval-mode-yolo" };

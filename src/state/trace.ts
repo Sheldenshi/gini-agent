@@ -21,6 +21,7 @@ export function appendTrace(
     at: now(),
     ...record
   };
+  if (trace.redacted === true) trace.data = undefined;
   const path = tracePath(instance, taskId);
   const line = `${JSON.stringify(trace)}\n`;
   writeFileSync(path, line, { flag: "a" });

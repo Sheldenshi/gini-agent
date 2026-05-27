@@ -81,6 +81,23 @@ Per-action behaviour:
   the abort fires while the call is in flight; the audit reflects
   what the runtime acknowledged at cancel time, not what the page
   state eventually became.
+- **`browser.fill_secret`** — the side effect (per-slot playwright
+  fill) runs INSIDE `POST /api/approvals/<id>/connect`, not inside
+  `executeApprovedAction`, so the in-flight registry's
+  `claimApproval` / `releaseApproval` lifecycle does NOT cover the
+  fill loop. See [browser-fill-secret.md](browser-fill-secret.md)
+  for the rationale (the secret values are request-scope only and
+  can't be threaded through `runApprovedAction`'s signature without
+  persisting them). The bounded module
+  `src/execution/browser-fill-secrets.ts` substitutes a per-slot
+  `readState` task-status check before each `browserFillByLocator`
+  call: a `cancelTask` landing after the atomic resolve will be
+  observed at the next iteration, the loop bails, and the audit
+  row records `aborted: "task-cancelled-mid-fill"`. Playwright's
+  `.fill()` itself does not accept an `AbortSignal`, so the
+  granularity is "between slot N and slot N+1" rather than the
+  per-await granularity that `raceWithAbort` provides for
+  `browser.upload_file`.
 
 `cancelTask`, `failTask`, and `decideApproval-deny` each call
 `abortApprovalsForTask` from inside their own `mutateState` callback

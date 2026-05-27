@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addAudit, createEmptyState, createImprovementProposal, createPromotionProposal, createTask, decidePromotion, mutateState, readState, taskCounts } from "./state";
+import { addAudit, appendEvent, appendTrace, createEmptyState, createImprovementProposal, createPromotionProposal, createTask, decidePromotion, mutateState, readState, readTrace, taskCounts } from "./state";
 
 describe("state primitives", () => {
   test("creates instance-aware task records", () => {
@@ -161,6 +161,130 @@ describe("state primitives", () => {
       const reloaded = readState(instance);
       expect((reloaded as unknown as { lane?: unknown }).lane).toBeUndefined();
       expect(reloaded.instance).toBe(instance);
+    } finally {
+      if (previousState === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = previousState;
+      if (previousLog === undefined) delete process.env.GINI_LOG_ROOT;
+      else process.env.GINI_LOG_ROOT = previousLog;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("addAudit drops evidence when redacted is true but keeps metadata", () => {
+    const state = createEmptyState("redact-audit");
+    const audit = addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.handoff.start",
+        target: "github.com",
+        risk: "high",
+        evidence: { keystrokes: "supersecret", cookie: "tok_abc" },
+        redacted: true
+      },
+      { system: true }
+    );
+
+    expect(audit.action).toBe("browser.handoff.start");
+    expect(audit.target).toBe("github.com");
+    expect(audit.risk).toBe("high");
+    expect(audit.redacted).toBe(true);
+    expect(audit.evidence).toBeUndefined();
+
+    const storedAudit = state.audit[0];
+    expect(storedAudit?.evidence).toBeUndefined();
+    expect(storedAudit?.action).toBe("browser.handoff.start");
+
+    const mirroredEvent = state.events[0];
+    expect(mirroredEvent?.action).toBe("browser.handoff.start");
+    expect(mirroredEvent?.redacted).toBe(true);
+    expect(mirroredEvent?.data).toBeUndefined();
+  });
+
+  test("addAudit preserves evidence when redacted is false or unset", () => {
+    const state = createEmptyState("preserve-audit");
+    const audit = addAudit(
+      state,
+      {
+        actor: "agent",
+        action: "tool.run",
+        target: "browser.navigate",
+        risk: "low",
+        evidence: { url: "https://example.com" }
+      },
+      { system: true }
+    );
+
+    expect(audit.evidence).toEqual({ url: "https://example.com" });
+    expect(audit.redacted).toBeUndefined();
+
+    const mirroredEvent = state.events[0];
+    expect(mirroredEvent?.data).toEqual({ url: "https://example.com" });
+    expect(mirroredEvent?.redacted).toBeUndefined();
+  });
+
+  test("appendEvent drops data when redacted is true", () => {
+    const state = createEmptyState("redact-event");
+    const event = appendEvent(
+      state,
+      {
+        kind: "runtime",
+        action: "ws.input.dispatch",
+        target: "handoff_xyz",
+        risk: "high",
+        summary: "user keystroke",
+        data: { code: "KeyA", text: "a" },
+        redacted: true
+      },
+      { system: true }
+    );
+
+    expect(event.redacted).toBe(true);
+    expect(event.data).toBeUndefined();
+    expect(event.action).toBe("ws.input.dispatch");
+    expect(state.events[0]?.data).toBeUndefined();
+  });
+
+  test("appendTrace drops data when redacted is true but keeps the row", () => {
+    const root = mkdtempSync(join(tmpdir(), "gini-trace-redact-"));
+    const previousState = process.env.GINI_STATE_ROOT;
+    const previousLog = process.env.GINI_LOG_ROOT;
+    process.env.GINI_STATE_ROOT = root;
+    process.env.GINI_LOG_ROOT = `${root}-logs`;
+    try {
+      const instance = "trace-redact";
+      const taskId = "task_handoff";
+
+      const redacted = appendTrace(instance, taskId, {
+        type: "tool",
+        message: "browser.handoff input frame",
+        data: { keystroke: "p@ssword" },
+        redacted: true
+      });
+      expect(redacted.redacted).toBe(true);
+      expect(redacted.data).toBeUndefined();
+
+      const open = appendTrace(instance, taskId, {
+        type: "tool",
+        message: "browser.handoff start",
+        data: { target: "github.com" }
+      });
+      expect(open.data).toEqual({ target: "github.com" });
+
+      const onDisk = readTrace(instance, taskId);
+      expect(onDisk.length).toBe(2);
+
+      const redactedOnDisk = onDisk.find((r) => r.message === "browser.handoff input frame");
+      expect(redactedOnDisk?.redacted).toBe(true);
+      expect(redactedOnDisk?.data).toBeUndefined();
+
+      const openOnDisk = onDisk.find((r) => r.message === "browser.handoff start");
+      expect(openOnDisk?.data).toEqual({ target: "github.com" });
+
+      // Belt-and-braces: the raw JSONL must not contain the sensitive bytes.
+      const raw = readFileSync(join(root, "instances", instance, "traces", `${taskId}.jsonl`), "utf8");
+      expect(raw).not.toContain("p@ssword");
+      expect(raw).toContain("github.com");
     } finally {
       if (previousState === undefined) delete process.env.GINI_STATE_ROOT;
       else process.env.GINI_STATE_ROOT = previousState;

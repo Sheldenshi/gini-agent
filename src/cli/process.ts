@@ -145,11 +145,17 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   if (!alreadyRunning) {
     await install(config);
     const requestedRuntimePort = config.port;
-    const claimedPort = await availablePort(requestedRuntimePort);
-    if (claimedPort !== requestedRuntimePort && options.runtimePortPinned) {
-      // User pinned via --port / GINI_PORT; refuse to silently roll forward.
-      throw new Error(`Requested runtime port ${requestedRuntimePort} is busy. Stop the other process or pick a different --port.`);
-    }
+    // When the user pinned a port (--port / GINI_PORT) we trust the choice
+    // and skip the probe-and-walk: probing is only useful for the unpinned
+    // default, where we want to roll forward to the next free port. A
+    // pinned port that's actually busy will surface a clean EADDRINUSE
+    // from the real bind below, which is a more accurate failure than
+    // synthesizing one from net.createServer probes. Skipping the probe
+    // also dodges a class of CI failures where canListen() returns false
+    // for every port in the search window even on an idle host.
+    const claimedPort = options.runtimePortPinned
+      ? requestedRuntimePort
+      : await availablePort(requestedRuntimePort);
     config.port = claimedPort;
     await install(config);
     writeFileSync(runtimePortPath(config.instance), String(config.port));
@@ -412,25 +418,50 @@ export async function waitForWebHealthz(webUrl: string, childPid: number | undef
   throw new Error(`Next.js did not become healthy within 30s on ${webUrl}.`);
 }
 
+// Walk up to 1000 ports forward from `preferred` looking for a free
+// one. The previous range of 100 turned out to be too tight in CI:
+// multiple parallel `gini run` tests can each roll a random base in
+// the 7400-8399 window (src/cli/args.ts GINI_PORT default), and with
+// runners that also have other services holding ports, the 100-wide
+// search regularly saturated. 1000 ports gives 10x the room without
+// noticeably increasing local-dev startup time (each canListen probe
+// returns sub-millisecond when the port is free).
+const PORT_SEARCH_WINDOW = 1000;
+
 export async function availablePort(preferred: number): Promise<number> {
-  for (let port = preferred; port < preferred + 100; port += 1) {
+  for (let port = preferred; port < preferred + PORT_SEARCH_WINDOW; port += 1) {
     if (await canListen(port)) return port;
   }
-  throw new Error(`No available port found from ${preferred} to ${preferred + 99}.`);
+  throw new Error(`No available port found from ${preferred} to ${preferred + PORT_SEARCH_WINDOW - 1}.`);
 }
 
-function canListen(port: number): Promise<boolean> {
-  // Probe every host we (or downstream Next.js) might bind to. Wildcard
-  // probes alone are insufficient on macOS: binding 0.0.0.0:N succeeds even
-  // when 127.0.0.1:N is already taken (different addresses, kernel doesn't
-  // refuse). We probe 127.0.0.1 (where the Bun runtime listens), ::1 (IPv6
-  // loopback), AND 0.0.0.0 (dual-stack squatters like Next.js). If any one
-  // fails, the port is unusable and we walk to the next.
-  return Promise.all([
-    probe(port, "127.0.0.1"),
-    probe(port, "::1"),
-    probe(port, "0.0.0.0")
-  ]).then((results) => results.every(Boolean));
+// Detect IPv6 availability ONCE per process by attempting to bind
+// ::1 on an OS-assigned port. Ubuntu CI runners ship with IPv6
+// disabled, and without this gate the per-port ::1 probe below
+// returns false on every port (EADDRNOTAVAIL), exhausting the
+// 1000-port search on a totally idle host. Promise resolves to
+// true if ::1 is bindable, false otherwise. Memoized so the
+// detection cost is paid once.
+const ipv6AvailablePromise: Promise<boolean> = new Promise((resolve) => {
+  const server = createServer()
+    .once("error", () => resolve(false))
+    .once("listening", () => server.close(() => resolve(true)))
+    .listen(0, "::1");
+});
+
+async function canListen(port: number): Promise<boolean> {
+  // Probe every host we (or downstream Next.js) might bind to.
+  // Wildcard probes alone are insufficient on macOS: binding
+  // 0.0.0.0:N succeeds even when 127.0.0.1:N is already taken
+  // (different addresses, kernel doesn't refuse). On v4-only
+  // hosts (CI), the ::1 probe is skipped — a v6 squatter can't
+  // exist on a host that doesn't have v6 enabled.
+  const ipv6Available = await ipv6AvailablePromise;
+  const probes = ipv6Available
+    ? [probe(port, "127.0.0.1"), probe(port, "::1"), probe(port, "0.0.0.0")]
+    : [probe(port, "127.0.0.1"), probe(port, "0.0.0.0")];
+  const results = await Promise.all(probes);
+  return results.every(Boolean);
 }
 
 function probe(port: number, host: string): Promise<boolean> {

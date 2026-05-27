@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { instanceRoot } from "../paths";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
+import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
 import type { BrowserConnectionRecord, Instance, RuntimeConfig } from "../types";
 
 // Per-instance Chrome profile directory. The agent persists ALL sign-ins
@@ -121,6 +122,71 @@ let pendingAdmissions = 0;
 // call than to wedge disconnect forever waiting on a hung page.goto.
 const DISCONNECT_DRAIN_DEADLINE_MS = 5_000;
 const sessions = new Map<string, Session>();
+// Per-task registry of literal secret values that browserFillByLocator
+// has typed into the page. Populated BEFORE the .fill() call so a
+// page that synchronously clears or copies the input on the `input`
+// event still has its typed bytes recorded — without this, a page
+// that clears its own input post-fill would leave the
+// data-gini-secret-stamped element empty and the live-DOM-only
+// collector at collectSecretValuesFromPageWithSession would return
+// nothing for that task, defeating redaction in subsequent
+// browser_console / browser_snapshot / browser_vision calls. Read
+// alongside the live-DOM collector to catch BOTH (a) values typed
+// via fill_secret that the page has since cleared/moved, and
+// (b) values the page itself populated into data-gini-secret-stamped
+// elements (e.g. server-side prefilled credentials revealed via
+// hover). The registry is per-task so closing a session
+// (closeSession or sweep) deletes the entry, bounding memory.
+const filledSecretValues = new Map<string, Set<string>>();
+// Minimum length below which a typed value is NOT registered as a
+// redaction target. A single-character secret would otherwise
+// turn every literal occurrence of that character into
+// "[redacted]" — including digits inside snapshot ref tokens
+// like `[@e1]`, which would shred the snapshot and break the
+// agent's locator references. Multi-character secrets are
+// vanishingly unlikely to collide with structural snapshot
+// tokens. Real credentials are always ≥ this length in
+// practice (PINs are typically 4+, OTPs 6+, passwords 8+).
+export const FILLED_SECRET_MIN_REDACTION_LENGTH = 4;
+// Record a secret value typed for a task. Called by
+// browserFillByLocator immediately before .fill() runs. Empty
+// strings and short strings are not recorded so the redactor's
+// substring match stays safe against structural tokens.
+function recordFilledSecret(taskId: string, value: string): void {
+  if (typeof value !== "string" || value.length < FILLED_SECRET_MIN_REDACTION_LENGTH) return;
+  let set = filledSecretValues.get(taskId);
+  if (!set) {
+    set = new Set<string>();
+    filledSecretValues.set(taskId, set);
+  }
+  set.add(value);
+}
+// Drop the per-task registry when the task's session closes (idle
+// sweep, explicit close, or browser disconnect). Memory-bound
+// cleanup — the union-across-tasks redaction (see
+// allRegisteredSecrets below) keeps secrets visible to other
+// active tasks until each task's own session terminates.
+function clearFilledSecrets(taskId: string): void {
+  filledSecretValues.delete(taskId);
+}
+// Union of every known secret across every active task's registry.
+// The shared-BrowserContext architecture (persistent / CDP profile
+// is shared across tasks per src/tools/browser.ts:495-502) means
+// Task A can type a credential, the page can JS-copy it into
+// document.title, and Task B can read that title via its own
+// snapshot/navigate response. Task B's per-task registry is empty,
+// but Task A's is non-empty until Task A's session closes — so
+// reading the union catches cross-task leaks via shared DOM state.
+// Returns [] when no task has any registered secrets so the
+// redactor's empty-set fast path stays cheap in the common case.
+function allRegisteredSecrets(): string[] {
+  if (filledSecretValues.size === 0) return [];
+  const out = new Set<string>();
+  for (const set of filledSecretValues.values()) {
+    for (const v of set) out.add(v);
+  }
+  return Array.from(out);
+}
 // Set at runtime startup via setBrowserInstance(). Lets ensureBrowser()
 // look up state.browser to decide between connectOverCDP() and launch().
 // Stays undefined in standalone test contexts that import the tools
@@ -531,6 +597,11 @@ async function closeSession(taskId: string): Promise<void> {
   if (!session) return;
   sessions.delete(taskId);
   consoleLogs.delete(taskId);
+  // Drop the per-task secret-redaction registry when the session
+  // closes. The DOM is gone (the page closes below), so the
+  // registry would never be consulted again for this task —
+  // keeping it would just leak memory across many tasks.
+  clearFilledSecrets(taskId);
   try {
     // Shared context (persistent/cdp): close every page the agent opened
     // during this task. The user's window, tabs the user opened
@@ -610,6 +681,11 @@ export async function disconnectSharedBrowser(): Promise<void> {
     for (const id of ids) {
       const session = sessions.get(id);
       sessions.delete(id);
+      // Clear the per-task secret-redaction registry along with
+      // the session — the DOM is going away. Without this, the
+      // registry would leak across many disconnects, bounded only
+      // by process exit.
+      clearFilledSecrets(id);
       if (!session) continue;
       try {
         // Persistent and cdp both share a single context — close just the
@@ -678,6 +754,9 @@ export async function closeAll(): Promise<void> {
   for (const id of ids) {
     const session = sessions.get(id);
     sessions.delete(id);
+    // Match closeSession / disconnectSharedBrowser: drop the
+    // per-task secret-redaction registry alongside the session.
+    clearFilledSecrets(id);
     if (!session) continue;
     try {
       // Close every agent-owned page. In CDP mode this is the only thing
@@ -852,12 +931,18 @@ interface SnapshotResult {
   truncated: boolean;
 }
 
+// Marker attribute stamped on snapshot-rendered elements so the
+// "@<id>" ref tokens the LLM sees in a snapshot can be translated
+// back into playwright locators by callers outside snapshot() —
+// principally browserFillByLocator below.
+const REF_ATTR_GLOBAL = "data-gini-ref";
+
 // Walk the page in the browser and return a flat list of "interesting"
 // nodes plus a unique CSS-attribute ref we can use to resolve a Locator
 // later. Built in a single page.evaluate so we minimize round-trips and
 // reuse one DOM walk for both the snapshot text and the locator map.
-async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
-  const REF_ATTR = "data-gini-ref";
+async function snapshot(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
+  const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
   // stable across calls.
   await page.evaluate((attr) => {
@@ -944,6 +1029,15 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
           const placeholder = el.getAttribute("placeholder");
           if (placeholder) return placeholder.trim();
         }
+        // For elements stamped with data-gini-secret (contenteditable
+        // fields filled via fill_secret), the textContent holds the
+        // typed value — same risk as <input>.value would carry. Mask
+        // the name with "[redacted]" so the snapshot doesn't leak the
+        // typed bytes via the entry's name field.
+        if (el.getAttribute("data-gini-secret") !== null) {
+          const raw = (el.textContent ?? "").trim();
+          return raw.length > 0 ? "[redacted]" : "";
+        }
         const text = (el.textContent ?? "").replace(/\s+/g, " ").trim();
         return text.slice(0, 120);
       };
@@ -979,7 +1073,35 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
           el.setAttribute(attr, ref.slice(1));
           let value = "";
           if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
-            value = (el as HTMLInputElement).value ?? "";
+            // Suppress sensitive input values so a user-typed
+            // credential filled via browser.fill_secret does not
+            // round-trip back into the LLM through the next
+            // browser_snapshot. Trigger conditions:
+            //   - type="password" (matches what the rendered
+            //     browser visually masks)
+            //   - autocomplete hints that the field is a credential
+            //     or one-time code (covers cases where the page uses
+            //     a custom text input + JS reveal)
+            //   - data-gini-secret attribute stamped by
+            //     browserFillByLocator after a successful fill, so a
+            //     filled field stays masked even if the page swaps
+            //     out the type (some SPAs flip type=text after fill
+            //     to show the value visually)
+            const input = el as HTMLInputElement;
+            const inputType = (input.type || "").toLowerCase();
+            const autocomplete = (input.getAttribute("autocomplete") || "").toLowerCase();
+            // `getAttribute(...) !== null` works on both real DOM Element
+            // and any minimal stub that implements only getAttribute (the
+            // unit test fakes in browser.test.ts don't have hasAttribute).
+            const isSecretField = inputType === "password"
+              || autocomplete === "current-password"
+              || autocomplete === "new-password"
+              || autocomplete === "one-time-code"
+              || input.getAttribute("data-gini-secret") !== null;
+            const rawValue = input.value ?? "";
+            value = isSecretField
+              ? (rawValue.length > 0 ? "[redacted]" : "")
+              : rawValue;
           } else if (el.tagName === "SELECT") {
             value = (el as HTMLSelectElement).value ?? "";
           }
@@ -1117,15 +1239,73 @@ async function snapshot(page: Page, full: boolean): Promise<SnapshotResult> {
   // "more interactive elements exist on the page, just hidden" apart
   // from "snapshot text was clipped at the char budget".
   if (hiddenTotal > hiddenEmitted) text += "\n[...hidden truncated]";
+  // Defense in depth: redact any literal occurrence of a known
+  // data-gini-secret value from the assembled snapshot text. The
+  // walker's element-local redaction only catches the stamped
+  // element itself — a page that JS-copies the typed value into
+  // another DOM node (a "you typed: ..." preview, password-strength
+  // widget echo, password-match indicator, hidden mirror input)
+  // would otherwise emit the copy verbatim through the unmarked
+  // element's name / textContent. Post-processing the assembled
+  // snapshot text against the live secret list closes this gap
+  // with the same primitive browserConsole and browserVision use.
+  const secretValues = await collectSecretValuesFromPageWithSession(page, taskId);
+  if (secretValues.length > 0) {
+    text = redactSecretValuesFromString(text, secretValues);
+  }
   return { text, refs, elementCount, truncated };
 }
 
-function ok(payload: Record<string, unknown>): string {
-  return JSON.stringify({ success: true, ...payload });
+// Build a browser tool response, applying a redaction pass over
+// EVERY string leaf when the per-task secret registry has any
+// recorded values. The snapshot text is already redacted inside
+// snapshot(), and browserConsole/browserVision redact their
+// eval/answer fields explicitly — but every browser tool response
+// also includes raw `url: page.url()`, `title: await page.title()`,
+// and (for browser_tabs) tab arrays with both. A page can write
+// the typed credential into document.title (via an input handler)
+// or push it into the URL state (via history.pushState / hash),
+// and those metadata fields would otherwise leak through. Walking
+// the entire payload through redactSecretValuesDeep catches every
+// string leaf — url, title, tab.url, tab.title, plus anything
+// future tool responses surface.
+//
+// taskId is accepted for API symmetry but the redaction consults
+// allRegisteredSecrets() across every active task's registry, not
+// just this task's. The shared BrowserContext (CDP / persistent
+// profile) bleeds DOM state across tasks — Task A's page can copy
+// a typed credential into document.title, then Task B reads that
+// title via its own snapshot/navigate response. A purely
+// per-task lookup would miss this because Task B's registry is
+// empty. The union catches cross-task leaks at the cost of
+// over-redacting in edge cases where two tasks coincidentally
+// typed the same long string (vanishingly unlikely given the
+// 4-char minimum).
+function ok(payload: Record<string, unknown>, _taskId?: string): string {
+  void _taskId;
+  const secrets = allRegisteredSecrets();
+  if (secrets.length === 0) {
+    return JSON.stringify({ success: true, ...payload });
+  }
+  const redacted = redactSecretValuesDeep({ success: true, ...payload }, secrets);
+  return JSON.stringify(redacted);
 }
 
 function fail(error: string): string {
-  return JSON.stringify({ success: false, error });
+  // Mirror ok()'s redaction so an error message that contains a
+  // registered secret value (playwright's "Call log: fill(...)"
+  // verbiage, or any error whose text was built from page state
+  // like a contenteditable's textContent) doesn't leak the secret
+  // into the tool result that flows back to the LLM. All browser
+  // tools' top-level catch-handlers return `fail(error.message)`,
+  // so this one place covers every browser tool's failure path
+  // — the bounded fill module's pre-redaction is now defense in
+  // depth, not the sole guard.
+  const secrets = allRegisteredSecrets();
+  const sanitized = secrets.length > 0
+    ? redactSecretValuesFromString(error, secrets)
+    : error;
+  return JSON.stringify({ success: false, error: sanitized });
 }
 
 function bool(value: unknown, fallback: boolean): boolean {
@@ -1145,7 +1325,7 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1154,7 +1334,7 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1165,7 +1345,7 @@ export async function browserSnapshot(taskId: string, args: Record<string, unkno
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
-      const snap = await snapshot(session.page, full);
+      const snap = await snapshot(session.page, full, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1173,7 +1353,7 @@ export async function browserSnapshot(taskId: string, args: Record<string, unkno
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1189,7 +1369,7 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.click({ timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1197,7 +1377,7 @@ export async function browserClick(taskId: string, args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1214,17 +1394,295 @@ export async function browserType(taskId: string, args: Record<string, unknown>)
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.fill(text, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
+  }
+}
+
+// Collects the values of every element on the live page that
+// carries the data-gini-secret attribute (stamped by
+// browserFillByLocator after a successful fill_secret submission)
+// AND merges in the per-task secret registry populated BEFORE the
+// fill. The registry catches values the page has since cleared,
+// detached, or copied to an unstamped element on the input handler
+// — without it, those bytes would not appear in the live DOM under
+// any stamped element and the redactor would let them through.
+//
+// Used by browser_console, browser_vision, and the snapshot walker
+// to redact literal occurrences of typed credentials from any
+// tool result that flows back to the LLM. Callers pass their
+// already-acquired playwright Page so the collection inherits the
+// surrounding withSession lock and the secret-list snapshot lives
+// in closure scope BEFORE the agent-controlled side effect runs
+// (eval, screenshot, walk) — so an agent-supplied expression that
+// navigates the page can't empty the secret list mid-call.
+//
+// taskId is optional so the existing browser-tool call sites can
+// be incrementally migrated; when omitted, only the live-DOM
+// collection runs (legacy behavior).
+async function collectSecretValuesFromPageWithSession(page: import("playwright-core").Page, taskId?: string): Promise<string[]> {
+  let liveValues: string[] = [];
+  try {
+    liveValues = await page.evaluate(() => {
+      const nodes = Array.from(document.querySelectorAll("[data-gini-secret]"));
+      const values: string[] = [];
+      for (const el of nodes) {
+        // <input>/<textarea>/<select> elements expose the typed
+        // bytes via the .value property. Non-input fill targets
+        // (e.g. [contenteditable] <div> elements — playwright's
+        // .fill() supports these) hold the typed bytes in
+        // textContent instead. Collect BOTH so the redactor knows
+        // every literal secret occurrence regardless of which
+        // surface the fill landed on.
+        const value = (el as HTMLInputElement).value;
+        if (typeof value === "string" && value.length > 0) values.push(value);
+        const text = el.textContent;
+        if (typeof text === "string" && text.length > 0) values.push(text);
+      }
+      return values;
+    });
+  } catch {
+    liveValues = [];
+  }
+  // Merge in EVERY active task's registry (not just this task's).
+  // Shared BrowserContext means another task's typed credential
+  // could be visible on this page's title / DOM / URL even though
+  // this task never typed it. taskId is accepted for API
+  // symmetry; the union read makes it advisory.
+  void taskId;
+  const registered = allRegisteredSecrets();
+  if (registered.length > 0) {
+    const out: string[] = [...liveValues];
+    for (const v of registered) {
+      if (!out.includes(v)) out.push(v);
+    }
+    return out;
+  }
+  return liveValues;
+}
+
+// Replace every occurrence of any secret value in `text` with
+// "[redacted]". Sorts secrets by length descending so longer
+// secrets are replaced before shorter prefixes (avoids leaking a
+// suffix when one secret contains another). Empty / zero-length
+// secrets are skipped to prevent global replacement runaway.
+export function redactSecretValuesFromString(text: string, secrets: readonly string[]): string {
+  if (!text || secrets.length === 0) return text;
+  let out = text;
+  for (const s of [...secrets].sort((a, b) => b.length - a.length)) {
+    if (s.length === 0) continue;
+    // String.replaceAll is preferred over global-regex because the
+    // secret may contain regex metacharacters that would otherwise
+    // need escaping.
+    out = out.split(s).join("[redacted]");
+  }
+  return out;
+}
+
+// Deep-walk any JSON-serializable value and redact secret bytes
+// from every string leaf, including string-typed values inside
+// arrays and objects. Used by browser_console where the agent's
+// eval expression can wrap a secret in a container
+// (`[input.value]`, `{v: input.value}`) to escape a string-only
+// redactor. Primitives that aren't strings are passed through;
+// circular structures are guarded so a `{ self: self }` reference
+// cycle doesn't infinite-loop.
+export function redactSecretValuesDeep(value: unknown, secrets: readonly string[], seen: WeakSet<object> = new WeakSet()): unknown {
+  if (secrets.length === 0) return value;
+  if (typeof value === "string") return redactSecretValuesFromString(value, secrets);
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value as object)) return "[circular]";
+  seen.add(value as object);
+  if (Array.isArray(value)) {
+    return value.map((item) => redactSecretValuesDeep(item, secrets, seen));
+  }
+  // Redact both KEYS and values. An agent can use a computed key
+  // to smuggle the secret bytes out via JSON serialization
+  // (`{[input.value]: 1}` → `{"hunter2": 1}`). When two keys
+  // collapse to the same redacted form, append a numeric suffix
+  // so the second hit doesn't silently overwrite the first.
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    const redactedKey = redactSecretValuesFromString(k, secrets);
+    let finalKey = redactedKey;
+    if (finalKey !== k && Object.prototype.hasOwnProperty.call(out, finalKey)) {
+      let i = 2;
+      while (Object.prototype.hasOwnProperty.call(out, `${redactedKey}_${i}`)) i++;
+      finalKey = `${redactedKey}_${i}`;
+    }
+    out[finalKey] = redactSecretValuesDeep(v, secrets, seen);
+  }
+  return out;
+}
+
+// browser.fill_secret slot writer. Takes a raw playwright selector
+// (CSS, text=, role=, or an ARIA snapshot ref token like "@e2"
+// which resolveLocator translates to [data-gini-ref="e2"]) plus the
+// value to type. Used exclusively by the POST /api/approvals/<id>/connect
+// browser.fill_secret branch; never called via the tool catalog.
+// Skips the post-fill snapshot that browser_type takes because the
+// agent will re-snapshot on its own when it resumes — and because
+// the fill might be one of several in the same submit batch, so
+// taking a snapshot per slot is wasted work.
+// Result discriminator for browserFillByLocator. Callers branch
+// on `code` rather than parsing a magic-string prefix from
+// `error` — see src/execution/browser-fill-secrets.ts which uses
+// code === "origin-mismatch" to halt the per-slot loop without
+// typing remaining secrets into a drifted origin. Future error
+// classes (e.g. timeout, detached, frame-detached) can be added
+// here without touching the consumer's branching logic.
+export type BrowserFillByLocatorResult =
+  | { ok: true }
+  | { ok: false; code: "origin-mismatch"; error: string }
+  | { ok: false; code: "validation-error"; error: string }
+  | { ok: false; code: "fill-error"; error: string };
+
+export async function browserFillByLocator(
+  taskId: string,
+  args: { locator: string; value: string; expectedUrl?: string }
+): Promise<BrowserFillByLocatorResult> {
+  if (typeof args.locator !== "string" || args.locator.length === 0) {
+    return { ok: false, code: "validation-error", error: "Missing required string argument: locator" };
+  }
+  if (typeof args.value !== "string") {
+    return { ok: false, code: "validation-error", error: "Missing required string argument: value" };
+  }
+  // Capture the live secret list into closure scope BEFORE the
+  // session work runs. disconnectSharedBrowser has a bounded
+  // DISCONNECT_DRAIN_DEADLINE_MS (5s) but locator.fill has a
+  // 10s timeout — so a disconnect that fires mid-fill can run
+  // clearFilledSecrets and empty the global registry BEFORE the
+  // fill catch runs. A purely-global-read in the catch would
+  // then redact against an empty set and leak the typed value
+  // via the Playwright "Call log: fill(...)" verbiage. The
+  // local snapshot survives teardown; we include the about-to-
+  // be-recorded value in case recordFilledSecret hasn't run
+  // yet (or skipped the value for being below the redaction
+  // floor — registering it locally for THIS error path is safe
+  // because the local list never escapes this function).
+  const secretsForCatch: string[] = [...allRegisteredSecrets()];
+  if (typeof args.value === "string" && args.value.length > 0 && !secretsForCatch.includes(args.value)) {
+    secretsForCatch.push(args.value);
+  }
+  try {
+    return await withSession(taskId, async (session) => {
+      // Per-slot URL re-check immediately before the playwright
+      // .fill() call. The /connect handler's pre-loop URL check is
+      // TOCTOU on its own: a navigation between the pre-loop check
+      // and any subsequent slot's .fill() would land the secret on
+      // a new origin. Re-reading session.page.url() inside the
+      // same withSession callback closes the window to the depth
+      // of one playwright API call. Callers that don't supply
+      // expectedUrl skip the check (existing browser tool callers
+      // that don't need the binding).
+      //
+      // expectedUrl is the page origin (protocol+host+port), the
+      // same shape the producer-side approvedUrl on the approval
+      // payload carries (both flow through sanitizeUrlForAuditTarget,
+      // which strips pathname/query/fragment because reset and
+      // magic-link URLs can carry tokens in the path).
+      if (args.expectedUrl) {
+        const liveUrl = sanitizeUrlForAuditTarget(session.page.url());
+        if (liveUrl !== args.expectedUrl) {
+          return {
+            ok: false,
+            code: "origin-mismatch",
+            error: `origin-mismatch: live=${liveUrl ?? "invalid"} expected=${args.expectedUrl}`
+          } as const;
+        }
+      }
+      const selector = args.locator.startsWith("@")
+        ? `[${REF_ATTR_GLOBAL}="${args.locator.slice(1)}"]`
+        : args.locator;
+      const locator = session.page.locator(selector);
+      // Record the value in the per-task secret registry BEFORE the
+      // fill so a page that synchronously clears the input on its
+      // `input` handler still has the typed bytes available to the
+      // redactor. Recording is best-effort; even if the .fill
+      // below throws (origin mismatch, timeout), the registry
+      // entry is fine to keep — the value was about to land in
+      // the DOM and any later snapshot that captured it pre-throw
+      // still needs redaction.
+      recordFilledSecret(taskId, args.value);
+      await locator.fill(args.value, { timeout: 10_000 });
+      // Stamp the element with data-gini-secret so subsequent
+      // browser_snapshot calls redact its value (see snapshot
+      // walker's secret-field branch). type="password" already
+      // triggers redaction on its own; this covers fields the page
+      // may flip from password→text post-fill (some SPAs do this
+      // to show the value in their own custom UI) and generic
+      // credential fields that aren't explicitly password type but
+      // were filled via fill_secret.
+      //
+      // CRITICAL: the stamping MUST NOT fail the fill outcome. The
+      // .fill() at the line above already wrote the secret to the
+      // DOM; if we let a stamp-evaluate throw (element detached,
+      // page navigated, frame-detached, serialization error) bubble
+      // out to the outer catch, the caller would record this slot
+      // as errored AND the value would be in the DOM unstamped —
+      // subsequent snapshots wouldn't redact it. Wrap the entire
+      // Node-side evaluate await in its own try/catch so the fill
+      // outcome reflects the actual DOM write, not the stamp's
+      // success. A stamp failure is a recoverable defense-in-depth
+      // miss; if it happens, the snapshot walker's other heuristics
+      // (type=password, autocomplete=current-password) still cover
+      // the common cases.
+      try {
+        await locator.evaluate((el) => {
+          try {
+            (el as Element).setAttribute("data-gini-secret", "true");
+          } catch {
+            /* attribute set best-effort */
+          }
+        });
+      } catch {
+        /* stamp evaluate threw on the Node side (detached element,
+           navigation, serialization) — keep the fill outcome and
+           rely on the snapshot walker's other redaction signals.
+           A defensive trace is emitted by the bounded fill module
+           via the per-slot result if subsequent calls observe
+           unstamped values. */
+      }
+      return { ok: true } as const;
+    });
+  } catch (error) {
+    // CRITICAL: Playwright's locator.fill embeds the typed value
+    // into its timeout-error message via "Call log: fill(\"<value>\")"
+    // (see coreBundle.js fill instrumentation). If the fill times
+    // out (disabled input, slow SPA hydration, contenteditable
+    // mismatch), the raw error.message contains the secret in
+    // plaintext. Returning it verbatim would route the value
+    // through:
+    //   - browser-fill-secrets.ts: errors[].error → appendTrace
+    //     data (NOT redacted:true → persisted to per-task JSONL)
+    //   - browser-fill-secrets.ts: resumeChatTask resumeResult
+    //     → tool_result block → LLM context
+    // Redact every literal occurrence of any registered secret
+    // for this task before returning. The registry was populated
+    // pre-fill, so even a clear-on-input page hostile script
+    // can't unregister the value.
+    const raw = error instanceof Error ? error.message : String(error);
+    // Redact against the locally-captured secret list (snapshotted
+    // BEFORE the fill, so it survives disconnect's bounded drain
+    // deadline). Falling back to the live global registry would
+    // miss the typed value if disconnectSharedBrowser fired and
+    // cleared the registry mid-fill — see the secretsForCatch
+    // capture above. The local list also defends against
+    // recordFilledSecret skipping short values (the floor would
+    // bar the registry entry but the local capture still gets
+    // redacted for this error path only).
+    void taskId;
+    const sanitized = redactSecretValuesFromString(raw, secretsForCatch);
+    return { ok: false, code: "fill-error", error: sanitized };
   }
 }
 
@@ -1235,14 +1693,14 @@ export async function browserPress(taskId: string, args: Record<string, unknown>
     return await withSession(taskId, async (session) => {
       await session.page.keyboard.press(key);
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1258,14 +1716,14 @@ export async function browserScroll(taskId: string, args: Record<string, unknown
     return await withSession(taskId, async (session) => {
       const dy = direction === "down" ? 600 : -600;
       await session.page.evaluate((delta) => window.scrollBy(0, delta), dy);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1276,7 +1734,7 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
   try {
     return await withSession(taskId, async (session) => {
       const response = await session.page.goBack({ waitUntil: "domcontentloaded" });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1285,7 +1743,7 @@ export async function browserBack(taskId: string, _args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1317,6 +1775,16 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       if (clear) {
         consoleLogs.set(taskId, []);
       }
+      // Collect data-gini-secret values BEFORE the eval. If we
+      // collected after, an agent-supplied expression that itself
+      // navigates (`location.href='...'; document.querySelector('input').value`)
+      // or clears the form would empty the secret list — leaving
+      // the captured evalResult (which read the value pre-navigation)
+      // unredacted on the way back to the LLM. Pre-collection
+      // snapshots the secret list into closure scope so the
+      // redactor's input is stable regardless of subsequent page
+      // state.
+      const secretValues = await collectSecretValuesFromPageWithSession(session.page, taskId);
       let evalResult: unknown = undefined;
       let evalError: string | undefined;
       if (expression) {
@@ -1330,12 +1798,27 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
         }
       }
       const messages = consoleLogs.get(taskId) ?? [];
+      // Redact data-gini-secret values from anywhere they could
+      // surface to the LLM. The snapshot walker's redaction handles
+      // the structured snapshot path; this catches the eval /
+      // console-log paths. Deep-redact non-string evalResult values
+      // — the agent can wrap a secret in a container like
+      // `[input.value]` or `{v: input.value}` to escape a string-only
+      // redactor, but redactSecretValuesDeep walks every string leaf
+      // inside arrays and objects.
+      const redactedMessages = messages.map((m) => ({
+        ...m,
+        text: redactSecretValuesFromString(m.text, secretValues)
+      }));
+      const redactedEvalResult = evalResult === undefined
+        ? null
+        : redactSecretValuesDeep(evalResult, secretValues);
       return ok({
         url: session.page.url(),
-        messages,
-        evalResult: evalResult === undefined ? null : evalResult,
-        evalError: evalError ?? null
-      });
+        messages: redactedMessages,
+        evalResult: redactedEvalResult,
+        evalError: evalError ? redactSecretValuesFromString(evalError, secretValues) : null
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1354,7 +1837,7 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.hover({ timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1362,7 +1845,7 @@ export async function browserHover(taskId: string, args: Record<string, unknown>
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1385,7 +1868,7 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
       if (!toLoc) return fail(`Unknown ref ${toRef}. Take a fresh snapshot first.`);
       await fromLoc.dragTo(toLoc, { timeout: 10_000 });
       await session.page.waitForLoadState("domcontentloaded").catch(() => undefined);
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1393,7 +1876,7 @@ export async function browserDrag(taskId: string, args: Record<string, unknown>)
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1470,7 +1953,7 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
         return fail("Missing required argument: provide either 'value' (string) or 'values' (string[]).");
       }
       await locator.selectOption(selection, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1478,7 +1961,7 @@ export async function browserSelectOption(taskId: string, args: Record<string, u
         elementCount: snap.elementCount,
         truncated: snap.truncated,
         selected: selection
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1539,7 +2022,7 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
         }
         return fail(message);
       }
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1547,7 +2030,7 @@ export async function browserWaitFor(taskId: string, args: Record<string, unknow
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1577,7 +2060,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
             active: p === session.page
           }))
         );
-        return ok({ url: session.page.url(), tabs });
+        return ok({ url: session.page.url(), tabs }, taskId);
       }
       if (action === "new") {
         if (args.url !== undefined && (typeof args.url !== "string" || args.url.length === 0)) {
@@ -1606,7 +2089,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.refs = new Map();
         session.page = page;
         await page.bringToFront().catch(() => undefined);
-        const snap = await snapshot(session.page, false);
+        const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
         return ok({
           url: session.page.url(),
@@ -1614,7 +2097,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           snapshot: snap.text,
           elementCount: snap.elementCount,
           truncated: snap.truncated
-        });
+        }, taskId);
       }
       if (action === "switch") {
         if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
@@ -1625,7 +2108,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         session.refs = new Map();
         session.page = target;
         await target.bringToFront().catch(() => undefined);
-        const snap = await snapshot(session.page, false);
+        const snap = await snapshot(session.page, false, taskId);
         session.refs = snap.refs;
         return ok({
           url: session.page.url(),
@@ -1633,7 +2116,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
           snapshot: snap.text,
           elementCount: snap.elementCount,
           truncated: snap.truncated
-        });
+        }, taskId);
       }
       // close
       if (typeof args.index !== "number" || !Number.isInteger(args.index) || args.index < 0) {
@@ -1670,7 +2153,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         // with the wasActive branch.
         session.refs = new Map();
       }
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1678,7 +2161,7 @@ export async function browserTabs(taskId: string, args: Record<string, unknown>)
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1689,7 +2172,7 @@ export async function browserClose(taskId: string, _args: Record<string, unknown
   try {
     consoleLogs.delete(taskId);
     await closeSession(taskId);
-    return ok({ closed: true, taskId });
+    return ok({ closed: true, taskId }, taskId);
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
   }
@@ -1726,7 +2209,55 @@ export async function browserVision(
       // a disconnect mid-await would otherwise slip past the post-fetch
       // check and let us forward stale bytes from a torn-down browser.
       const capturedGeneration = currentDisconnectGeneration();
-      const buf = await session.page.screenshot({ type: "png", fullPage: full });
+      // Pre-collect data-gini-secret values BEFORE the screenshot.
+      // If we collected after, a screenshot that itself navigates
+      // (extremely rare) or page cleanup between screenshot and
+      // collection would empty the secret list and skip the
+      // belt-and-braces post-OCR redaction.
+      const secretValues = await collectSecretValuesFromPageWithSession(session.page, taskId);
+      // Blur every data-gini-secret element before the screenshot so
+      // the vision model can't OCR a credential the user typed via
+      // fill_secret. Native browser rendering already masks
+      // type="password" inputs, but non-password inputs filled via
+      // fill_secret (OTP/recovery-code text inputs) would otherwise
+      // render in cleartext. The blur is applied via inline style
+      // immediately before the screenshot and restored immediately
+      // after — the user's actual page never sees the blur because
+      // the headless render happens in the same DOM frame.
+      // Both evaluate calls are tolerant of synthetic / mocked
+      // pages that may not implement page.evaluate at all (the
+      // browserVision unit tests use a stripped-down page mock).
+      try {
+        if (typeof session.page.evaluate === "function") {
+          await session.page.evaluate(() => {
+            const els = document.querySelectorAll("[data-gini-secret]");
+            for (const el of Array.from(els)) {
+              const h = el as HTMLElement;
+              h.dataset.giniBlurRestore = h.style.filter || "";
+              h.style.filter = "blur(12px)";
+            }
+          });
+        }
+      } catch { /* best-effort blur */ }
+      let buf: Buffer;
+      try {
+        buf = await session.page.screenshot({ type: "png", fullPage: full });
+      } finally {
+        // Always restore even if screenshot threw — otherwise the
+        // page would be left visibly blurred for the user.
+        try {
+          if (typeof session.page.evaluate === "function") {
+            await session.page.evaluate(() => {
+              const els = document.querySelectorAll("[data-gini-secret]");
+              for (const el of Array.from(els)) {
+                const h = el as HTMLElement;
+                h.style.filter = h.dataset.giniBlurRestore ?? "";
+                delete h.dataset.giniBlurRestore;
+              }
+            });
+          }
+        } catch { /* best-effort restore */ }
+      }
       if (buf.length > MAX_SCREENSHOT_BYTES) {
         return fail(
           `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
@@ -1745,14 +2276,21 @@ export async function browserVision(
       if (currentDisconnectGeneration() !== capturedGeneration) {
         return fail("Browser disconnecting, retry shortly.");
       }
+      // Defense in depth: even with the blur, post-process the
+      // vision answer to redact any literal occurrence of a known
+      // secret value — covers a model that pre-cached the value
+      // from an earlier turn or somehow recovered it from a
+      // partial blur (very small screenshot, tiny font, etc.).
+      // secretValues was snapshotted pre-screenshot above.
+      const redactedAnswer = redactSecretValuesFromString(result.text, secretValues);
       return ok({
         url: session.page.url(),
-        answer: result.text,
+        answer: redactedAnswer,
         bytes: buf.length,
         full,
         cost: result.cost ?? null,
         usage: result.usage ?? null
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1849,7 +2387,7 @@ export async function browserUploadFile(
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1857,7 +2395,7 @@ export async function browserUploadFile(
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -1894,7 +2432,7 @@ export async function browserUploadFileApproved(
       const locator = session.refs.get(ref);
       if (!locator) return fail(`Unknown ref ${ref}. Take a fresh snapshot first.`);
       await locator.setInputFiles(resolved.absolute, { timeout: 10_000 });
-      const snap = await snapshot(session.page, false);
+      const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
         url: session.page.url(),
@@ -1902,7 +2440,7 @@ export async function browserUploadFileApproved(
         snapshot: snap.text,
         elementCount: snap.elementCount,
         truncated: snap.truncated
-      });
+      }, taskId);
     });
   } catch (error) {
     return fail(error instanceof Error ? error.message : String(error));
@@ -2049,6 +2587,11 @@ export const __test = {
   },
   clearFakeSessionsForTest(): void {
     sessions.clear();
+    // Match the real session-teardown contract: also drop the
+    // per-task secret-redaction registry so tests that install
+    // fake sessions then call this helper don't leak state into
+    // subsequent tests.
+    filledSecretValues.clear();
   },
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against

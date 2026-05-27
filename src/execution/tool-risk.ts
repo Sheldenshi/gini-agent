@@ -20,7 +20,11 @@ export const ACTION_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskL
   // they happen *within* a window the user already approved; this is
   // the action that establishes that window.
   ["browser.connect", "medium"],
-  ["browser.upload_file", "high"]
+  ["browser.upload_file", "high"],
+  // Routes user-typed secrets directly into a DOM field on the
+  // agent's page. High risk because the approval card is the user's
+  // last chance to refuse before a credential leaves their keyboard.
+  ["browser.fill_secret", "high"]
   // anything not listed defaults to "low" via the helper below
 ]);
 
@@ -38,7 +42,11 @@ export const TOOL_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLev
   // so the persisted tool row in state.json carries the right risk
   // label. Without this entry the substring heuristic in
   // riskForTool below would default this to "low".
-  ["browser.connect", "medium"]
+  ["browser.connect", "medium"],
+  // Mirrors the high classification ACTION_RISK gives to
+  // browser.fill_secret. The catalog tool name is the
+  // underscore-separated form.
+  ["browser_fill_secrets", "high"]
   // Everything else falls out of the substring heuristic in defaults.ts.
 ]);
 

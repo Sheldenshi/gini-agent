@@ -70,6 +70,7 @@ export function appendEvent(
     ...event,
     agentId: resolveAgentId(state, agent)
   };
+  if (item.redacted === true) item.data = undefined;
   state.events.unshift(item);
   state.events = state.events.slice(0, 1000);
   return item;
@@ -90,10 +91,13 @@ export function addAudit(
     ...event,
     agentId
   };
+  if (audit.redacted === true) audit.evidence = undefined;
   state.audit.unshift(audit);
   // Mirror the audit row as a runtime event so the activity feed sees a
   // unified stream. Pass the same agent context so attribution stays
-  // consistent across the paired records.
+  // consistent across the paired records. The mirrored event inherits
+  // the audit's redacted flag so appendEvent's writer drops `data` for
+  // sensitive rows even though we tried to copy `evidence` across.
   appendEvent(
     state,
     {
@@ -104,7 +108,8 @@ export function addAudit(
       runId: audit.runId,
       risk: audit.risk,
       summary: audit.action,
-      data: audit.evidence
+      data: audit.evidence,
+      redacted: audit.redacted
     },
     agent
   );

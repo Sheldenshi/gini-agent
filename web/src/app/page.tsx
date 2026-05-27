@@ -136,6 +136,12 @@ export default function HomePage() {
                   // is the same reason string, so the per-row
                   // rendering stays compact.
                   const isBrowserConnect = approval.action === "browser.connect";
+                  // `browser.fill_secret` can only be resolved via /connect
+                  // with per-slot values from the amber chat card. The
+                  // generic /approve route refuses this action with 400.
+                  // Hide both action buttons and point the operator to
+                  // the chat session instead.
+                  const isBrowserFillSecret = approval.action === "browser.fill_secret";
                   // The user-facing reason for browser.connect lives on
                   // payload.reason (set by the dispatch); fall back to the
                   // approval target (same string) if it's missing. We
@@ -175,23 +181,39 @@ export default function HomePage() {
                         {isBrowserConnect ? browserConnectBody : approval.reason}
                       </p>
                     </div>
-                    <div className="flex shrink-0 gap-2">
-                      <Button
-                        size="sm"
-                        disabled={decide.isPending}
-                        onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
-                      >
-                        {isBrowserConnect ? "Connect" : "Approve"}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={decide.isPending}
-                        onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-                      >
-                        {isBrowserConnect ? "Cancel" : "Deny"}
-                      </Button>
-                    </div>
+                    {isBrowserFillSecret ? (
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="text-[11px] text-muted-foreground">
+                          Enter credentials in chat.
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                        >
+                          Deny
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="flex shrink-0 gap-2">
+                        <Button
+                          size="sm"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
+                        >
+                          {isBrowserConnect ? "Connect" : "Approve"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={decide.isPending}
+                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
+                        >
+                          {isBrowserConnect ? "Cancel" : "Deny"}
+                        </Button>
+                      </div>
+                    )}
                   </li>
                   );
                 })}

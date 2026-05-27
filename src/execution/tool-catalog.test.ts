@@ -58,6 +58,13 @@ const ALWAYS_ON = new Set([
   "run_job",
   "mcp_call",
   "request_connector",
+  // browser_fill_secrets is the meta-tool path for asking the user
+  // to type a value into a DOM field on the agent's browser tab. It
+  // never types anything itself (it just renders a chat card), so
+  // it lives outside the "browser" toolset's kill switch — same
+  // logic as request_connector being outside the "connectors"
+  // toolset.
+  "browser_fill_secrets",
   "cancel_task",
   "install_skill",
   "enable_skill",

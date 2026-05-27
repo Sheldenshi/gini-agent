@@ -506,6 +506,45 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Browser-fill-secrets affordance. When the agent's browser tool
+    // reaches a login or other input form whose values must come from
+    // the user (passwords, OTPs, account ids, MFA codes), the agent
+    // calls this tool. The user sees a card in chat with one input
+    // field per slot, types the value(s), and the gateway pipes them
+    // straight into page.locator(...).fill(...) via the same /connect
+    // endpoint connector.request uses. Submitted values are never
+    // persisted, never enter the LLM context, never reach the
+    // transcript or audit payload — see ADR browser-fill-secret.md.
+    toolset: "browser",
+    displayLabel: "Ask user for browser input",
+    type: "function",
+    function: {
+      name: "browser_fill_secrets",
+      description: "Ask the user to fill one or more input fields on the active browser page. Use this for credentials, OTPs, account ids, or any value the user must type — NEVER attempt to fill these fields yourself with browser_type. The user sees a single card in chat with one input per slot; once they submit, the gateway fills each locator on the page with the user's value via playwright. Requires an active browser session — call browser_navigate first if needed. Your tool result is a plain-text summary naming which slots filled (by slot.name, never values), which errored, and any abort condition (cancel, origin drift); you never see the values themselves. Re-snapshot the page after this returns to see the post-fill state. If more fields need filling (e.g. an MFA code on the next page), call this tool again.",
+      parameters: {
+        type: "object",
+        properties: {
+          slots: {
+            type: "array",
+            description: "One entry per input field to fill. Order matters — fields are filled in array order. Each slot's name is opaque (used only as the key in the secrets dict the user submits); locator is the playwright selector or @-ref of the input; label is the human-readable text shown next to the input in chat; kind picks the HTML input type for masking.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", description: "Slot identifier (e.g. 'username', 'password', 'otp'). Used as the secrets-dict key on submit; not shown to the user." },
+                locator: { type: "string", description: "Playwright selector (CSS, text=, etc.) or @-ref from a recent browser_snapshot. The gateway fills this locator via playwright at fill time." },
+                label: { type: "string", description: "Human-readable label rendered next to the input in chat (e.g. 'GitHub password')." },
+                kind: { type: "string", enum: ["text", "password", "email", "tel", "number", "url"], description: "HTML input type for the rendered field. Use 'password' to mask the value while the user types. Defaults to 'text'." }
+              },
+              required: ["name", "locator", "label"]
+            }
+          },
+          reason: { type: "string", description: "Short user-visible text shown above the form (e.g. 'Sign in to GitHub to continue'). One line." }
+        },
+        required: ["slots", "reason"]
+      }
+    }
+  },
+  {
     // Generic MCP tool invocation. The agent loop sees this as a single
     // tool entry; the dispatcher routes (server, tool, arguments) to the
     // matching McpServerRecord via src/integrations/mcp.ts. Each
@@ -975,6 +1014,16 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // inactive — gating on a legacy toolset would silently disable the
     // onboarding path.
     if (tool.function.name === "request_connector") return true;
+    // browser_fill_secrets is the in-chat affordance for credential
+    // entry on the agent's browser tab. Always-on for the same
+    // reason as request_connector: a fresh instance with no toolsets
+    // toggled still needs the agent to be able to ask the user for a
+    // password mid-task. The browser_type tool is gated by the
+    // browser toolset, but browser_fill_secrets is a meta-tool
+    // (renders a chat card; never types anything itself) and stays
+    // visible so the agent can always escalate to the user instead
+    // of guessing a credential.
+    if (tool.function.name === "browser_fill_secrets") return true;
     // Always expose the core agent-capability meta-tools whose owning
     // toolsets aren't in the legacy defaults (`skills`, `subagents`).
     // Gating these on a toolset toggle would mean a fresh instance

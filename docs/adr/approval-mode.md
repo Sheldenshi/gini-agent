@@ -68,11 +68,24 @@ The two original Plan corrections worth noting:
   same way a `terminal_exec` of `sudo *` would be.
 
 The approval-eligible tool surface is `file_write`, `file_patch`,
-`terminal_exec`, `code_exec`, `browser_upload_file`, and
-`send_message`. `send_message` egresses data and was folded into the
-same policy seam after the initial five so the mode contract applies
-uniformly. Under `auto` mode `send_message` auto-approves (the agent
-can drive normal automations); `strict` still gates each call.
+`terminal_exec`, `code_exec`, `browser_upload_file`, `send_message`,
+and `browser_fill_secrets`. `send_message` egresses data and was
+folded into the same policy seam after the initial five so the mode
+contract applies uniformly. Under `auto` mode `send_message`
+auto-approves (the agent can drive normal automations); `strict`
+still gates each call.
+
+`browser_fill_secrets` is the one carve-out from the
+"route-through-pendingOrAuto" rule, documented in detail in
+[browser-fill-secret.md](browser-fill-secret.md). The dispatch
+creates the approval directly via `createApproval` (the side effect
+— per-slot playwright fill — runs inside `POST /api/approvals/<id>/connect`
+from request-scope secrets, not inside `executeApprovedAction`), and
+`resolveApprovalPolicy` returns `{ mode: "gate" }` for
+`browser.fill_secret` regardless of `approvalMode` — yolo cannot
+auto-approve credential entry because the credentials come from the
+user, not the agent. The mode-uniformity claim above does not extend
+to this action.
 
 ## Required Now
 
@@ -208,7 +221,12 @@ mutated.
   forward the same `evidenceExtra` markers through `resolveApproval`.
   Side-stepping the policy seam (creating an approval and resolving
   it inline without going through the seam) would silently bypass
-  the mode contract documented here.
+  the mode contract documented here. The one exception is
+  `browser.fill_secret` — see [browser-fill-secret.md](browser-fill-secret.md)
+  for the rationale (side effect runs in `/connect` from
+  request-scope secrets, no `executeApprovedAction` frame, policy
+  hard-codes a gate for the action so the mode contract still holds
+  end-to-end).
 - Adding a new approval-gated `PolicyAction` requires:
   1. Extending the discriminated union in `policy.ts`.
   2. Adding the auto/gate decision branch in `resolveApprovalPolicy`.

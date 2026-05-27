@@ -13,6 +13,7 @@ import {
   subscribeChatBlocks
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
+import { runFillSecretConnect } from "./execution/browser-fill-secrets";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -182,7 +183,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const approvals = readState(config.instance).approvals;
       return json(agentId ? approvals.filter((a) => a.agentId === agentId) : approvals);
     }],
-    ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => json(await decideApproval(config, params[0], "approve"))],
+    ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => {
+      // browser.fill_secret cannot be resolved through the generic
+      // /approve path: the side-effecting fill happens inside /connect's
+      // request handler from the per-slot `secrets` body, so /approve
+      // would resolve the approval with status=approved while no DOM
+      // fill ever ran — the agent would then be told "fields filled"
+      // (synthesized in agent.ts:runApprovedAction) over an empty form.
+      // Refuse early so the only resolution path for fill_secret is
+      // /connect with values.
+      const approvalId = params[0];
+      const approval = readState(config.instance).approvals.find((a) => a.id === approvalId);
+      if (approval?.action === "browser.fill_secret") {
+        return json({
+          error: "browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve."
+        }, 400);
+      }
+      return json(await decideApproval(config, approvalId, "approve"));
+    }],
     ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
     // Connect endpoint for `connector.request` approvals. The chat UI's
     // Connect button POSTs here with the user-entered secrets. The
@@ -202,8 +220,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const state = readState(config.instance);
       const approval = state.approvals.find((a) => a.id === approvalId);
       if (!approval) return json({ error: "Approval not found" }, 404);
-      if (approval.action !== "connector.request") {
-        return json({ error: `Approval ${approvalId} is not a connector.request (${approval.action})` }, 400);
+      // The /connect endpoint is the shared substrate for any approval
+      // whose user-facing card asks the user to type a value (or set
+      // of named values). connector.request persists them to an
+      // encrypted connector record; browser.fill_secret pipes them
+      // through to playwright.fill on the agent's active page and
+      // discards them when the request returns.
+      if (approval.action !== "connector.request" && approval.action !== "browser.fill_secret") {
+        return json({ error: `Approval ${approvalId} does not take a /connect submission (${approval.action})` }, 400);
       }
       if (approval.status !== "pending") {
         return json({ error: `Approval is already ${approval.status}` }, 410);
@@ -212,6 +236,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
         ? payload.secrets as Record<string, string>
         : {};
+
+      if (approval.action === "browser.fill_secret") {
+        // The fill_secret flow is bounded inside
+        // src/execution/browser-fill-secrets.ts. The handler here is
+        // a thin routing seam: parse the body's `secrets` field,
+        // delegate to the module, return its {status, body} envelope
+        // as the HTTP response. All of the runtime concerns — slot
+        // validation, structural approved-URL check, atomic approval
+        // resolution, per-slot fill with per-slot origin /
+        // task-status re-checks, redacted audit row, chat-task
+        // resume — live in the bounded module so they can be
+        // unit-tested in isolation.
+        const result = await runFillSecretConnect(config, approval, secrets);
+        return json(result.body, result.status);
+      }
+
+      // connector.request path (unchanged).
       const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
       const providerId = String(approval.payload.provider ?? "");
       const providerLabel = typeof approval.payload.providerLabel === "string"

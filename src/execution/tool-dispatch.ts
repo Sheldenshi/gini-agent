@@ -71,6 +71,7 @@ import {
   peekCurrentBrowserUrl,
   resolveUploadPath
 } from "../tools/browser";
+import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
 
 export type DispatchResult =
   | { kind: "sync"; result: string }
@@ -147,6 +148,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
+    case "browser_fill_secrets":
+      return await browserFillSecretsTool(config, taskId, toolCallId, args);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -2462,6 +2465,185 @@ async function requestConnectorTool(
   return { kind: "pending", approvalId };
 }
 
+// Browser-fill-secrets tool. Mints a browser.fill_secret approval
+// whose payload carries the slots the agent wants the user to fill.
+// Same chat-block emission path as request_connector — the chat-task
+// loop's pending-approval handler emits an approval_requested block
+// into the chat stream as soon as this returns { kind: "pending" }.
+// The card renders inline. On Submit, the BFF forwards to
+// POST /api/approvals/<id>/connect, which detects the action and
+// runs the playwright-fill branch (see src/http.ts). Values are
+// never written to state, audit, or trace payloads.
+async function browserFillSecretsTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard: the amber approval card is React UI on the BFF, and
+  // the messaging bridge mirrors (telegram-poller, discord-poller) only
+  // relay assistant_text after the task reaches a terminal status.
+  // Minting a fill_secret approval would park the task in
+  // awaiting_approval, the mirror would skip with
+  // reply_skip_non_terminal, and the user on Telegram/Discord would see
+  // a typing indicator that eventually stops — no error, no card, no
+  // way to submit. Fail the tool synchronously so the agent gets a
+  // tool_result it can verbalize back as a plain assistant message
+  // ("open the web chat to enter credentials"), which the mirror will
+  // relay once the task settles.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  // Read both `source` (inbound bridge descriptor on live chat
+  // sessions) and `outboundMirror` (bridge descriptor on dedicated
+  // job-spawned sessions whose `source` is intentionally undefined
+  // so they don't compete for inbound routing — see ChatSessionRecord
+  // doc in src/types.ts). A scheduled job spawned from a Telegram
+  // chat has source=undefined but outboundMirror.kind="telegram",
+  // and submits with mode:"chat" so the full tool catalog is in
+  // scope — without checking outboundMirror, the guard would let
+  // such a job mint a fill_secret approval that no user can
+  // complete (no web card was ever rendered, finalize.ts routes
+  // the eventual reply back through outboundMirror to Telegram).
+  // Mirror finalize.ts:161's `outboundMirror ?? source` precedent.
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `browser_fill_secrets only works in the web chat (this conversation is over ${surfaceKind}). Reply to the user in text asking them to open the web chat to enter their credentials, then continue once they confirm.`
+      })
+    };
+  }
+
+  const slots = parseFillSecretSlots(args.slots);
+  if (slots.length === 0) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "browser_fill_secrets requires at least one valid slot (name + locator)."
+      })
+    };
+  }
+  // Slot names are the map key the chat card uses for both the React
+  // list key and the fillValues record (BlockApprovalRequested.tsx); the
+  // /connect handler also looks up secrets by name. Duplicate names
+  // would silently share a single user-entered value across multiple
+  // distinct DOM locators — picture an agent emitting two "password"
+  // slots whose locators target username + password fields — so the
+  // user types one value and both inputs receive it. Reject up-front
+  // with a clear error.
+  const seenNames = new Set<string>();
+  const duplicates: string[] = [];
+  for (const slot of slots) {
+    if (seenNames.has(slot.name)) {
+      duplicates.push(slot.name);
+    } else {
+      seenNames.add(slot.name);
+    }
+  }
+  if (duplicates.length > 0) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `browser_fill_secrets slot names must be unique. Duplicates: ${Array.from(new Set(duplicates)).join(", ")}.`
+      })
+    };
+  }
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `The agent is asking you to fill ${slots.length} field${slots.length === 1 ? "" : "s"} on the current page.`;
+
+  // Build a stable target string so the approval card can show
+  // which page the fill targets. The structural copy of the
+  // approved URL lives on `payload.approvedUrl` (see the
+  // createApproval call below) — the safety check in
+  // src/execution/browser-fill-secrets.ts reads from there, NOT
+  // from a parseable substring of target. `target` is the
+  // human-readable label that flows into the audit row. Strip
+  // query strings and fragments before recording — they
+  // frequently carry tokens (OAuth `code`/`state`, password-reset
+  // `token`, session ids, magic-link nonces) and the audit
+  // writer-boundary only drops `evidence` on redacted:true, leaving
+  // `target` intact.
+  const liveUrl = peekCurrentBrowserUrl(taskId);
+  const approvedUrl = sanitizeUrlForAuditTarget(liveUrl);
+  // Refuse dispatch when no live browser session exists. Without a
+  // captured origin, the user has no way to consent to a specific
+  // page, and the /connect origin guard has nothing to compare
+  // against — secrets typed into the chat card would land on
+  // whatever page the session points at by /connect time, which
+  // may not be the page the agent intended (or the page the user
+  // would have approved if they could see it). The agent should
+  // browser_navigate to the form's page first, then call
+  // browser_fill_secrets with locators from the resulting snapshot.
+  if (!approvedUrl) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "browser_fill_secrets requires an active browser session on the page being filled. Call browser_navigate (and browser_snapshot if needed) first, then re-issue this tool with locators from the snapshot."
+      })
+    };
+  }
+  const target = approvedUrl;
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createApproval(mutable, {
+      taskId: item.id,
+      action: "browser.fill_secret",
+      target,
+      risk: "high",
+      reason,
+      // Structural fields the /connect handler reads:
+      //   - slots: which DOM elements to fill (kept; parsed by
+      //     parseFillSecretSlots at every consumer).
+      //   - approvedUrl: the origin (protocol+host+port) captured
+      //     at dispatch time, used as the load-bearing equality
+      //     check against the live page URL before any .fill()
+      //     runs. Stored structurally (not encoded in target's
+      //     substring) so a future tweak to target formatting
+      //     can't silently weaken the safety check. Pathname is
+      //     stripped by sanitizeUrlForAuditTarget because
+      //     reset/magic-link URLs can carry tokens in the path
+      //     component.
+      //   - toolCallId: the originating tool_call_id the chat-task
+      //     loop uses to thread the resume tool result.
+      payload: { slots, reason, toolCallId, approvedUrl }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Mirror the reason into the chat session so it survives past
+    // approval resolution, same pattern as requestConnectorTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for browser.fill_secret",
+      data: { approvalId: approval.id, slotCount: slots.length, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
 // Routes a terminal command through the approval-policy seam.
 //
 // The allowlist fast-path stays as a no-approval-row optimization for
@@ -2618,6 +2800,7 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
   const id = payload.toolCallId;
   return typeof id === "string" ? id : undefined;
 }
+
 
 // ---------------- pendingOrAuto ----------------
 //

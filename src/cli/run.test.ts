@@ -6,8 +6,35 @@
 // developer state or with each other when bun test runs them in parallel.
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { createServer } from "node:net";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+
+// Ask the OS for a free port by binding to port 0 on 0.0.0.0, then
+// closing. The kernel won't immediately reissue the same port to
+// another caller (TIME_WAIT keeps it owned briefly), so this is a
+// good preferred port for spawnRun to pass via --port. The CLI's
+// availablePort walker then claims the same port (or, on the rare
+// race, walks one or two ports forward). Avoids the
+// "No available port found from 7396 to 8395" failure we saw on
+// Ubuntu CI runners where the default 7400-8399 random range was
+// effectively saturated.
+function pickFreePort(): Promise<number> {
+  return new Promise((resolveOut, rejectOut) => {
+    const server = createServer();
+    server.unref();
+    server.on("error", rejectOut);
+    server.listen(0, "0.0.0.0", () => {
+      const addr = server.address();
+      if (addr && typeof addr === "object") {
+        const port = addr.port;
+        server.close(() => resolveOut(port));
+      } else {
+        server.close(() => rejectOut(new Error("could not allocate port")));
+      }
+    });
+  });
+}
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 const CLI_PATH = join(PROJECT_ROOT, "src", "cli.ts");
@@ -36,6 +63,11 @@ async function spawnRun(h: RunHarness): Promise<{
   stdout: Promise<string>;
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }> {
+  // Pass an OS-allocated free port via --port so the runtime's
+  // own availablePort walker doesn't need to hunt through the
+  // 7400-8399 default range (saturated on CI). The CLI re-probes
+  // the picked port to claim it before binding.
+  const port = await pickFreePort();
   const child = spawn("bun", [
     "run",
     CLI_PATH,
@@ -43,6 +75,8 @@ async function spawnRun(h: RunHarness): Promise<{
     "--instance",
     h.instance,
     "--no-web",
+    "--port",
+    String(port),
     "--state-root",
     h.stateRoot,
     "--log-root",
@@ -167,6 +201,12 @@ describe("gini run", () => {
     try {
       // Second `gini run` against the same instance must fail loudly because we
       // can't bind a runtime we did not spawn into our signal handlers.
+      // Pass an OS-allocated free port so the second child doesn't
+      // tank on availablePort search the same way the first one
+      // would have — its rejection must be on the "instance already
+      // running" check, not on port exhaustion (which would mask
+      // the test's actual assertion).
+      const conflictPort = await pickFreePort();
       const blocked = spawn("bun", [
         "run",
         CLI_PATH,
@@ -174,6 +214,8 @@ describe("gini run", () => {
         "--instance",
         h.instance,
         "--no-web",
+        "--port",
+        String(conflictPort),
         "--state-root",
         h.stateRoot,
         "--log-root",

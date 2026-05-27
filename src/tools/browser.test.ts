@@ -14,6 +14,7 @@ import {
   closeAll,
   currentDisconnectGeneration,
   disconnectSharedBrowser,
+  redactSecretValuesFromString,
   safetyCheck,
   setBrowserInstance,
   withTeardownLock
@@ -317,6 +318,88 @@ describe("browser disconnect lifecycle", () => {
 // hand-built fake document. The walker only relies on a small slice of DOM
 // APIs (tagName, attributes, children, computed style, bounding rect), so
 // the stubs stay compact.
+describe("browserFillByLocator error redaction", () => {
+  // Pin the playwright-error-leaks-typed-value gap. Playwright's
+  // locator.fill embeds the typed value in its timeout error
+  // message via "Call log: fill(\"<value>\")". If that error.message
+  // returned verbatim from browserFillByLocator's catch, the
+  // bounded module would persist it to the unredacted trace JSONL
+  // (errors[] in appendTrace data) and pass it to the agent via
+  // resumeChatTask. The catch must run error.message through
+  // redactSecretValuesFromString against the per-task registry.
+  test("redacts known secrets out of a playwright-style error message", () => {
+    // Simulate playwright's actual error shape:
+    // Timeout 10000ms exceeded.
+    // Call log:
+    //   fill("<value>")
+    //   waiting for element to be visible, enabled and editable
+    const errorWithValue = 'Timeout 10000ms exceeded.\nCall log:\n  fill("hunter2-LEAK-MARKER")\n  waiting for element to be visible, enabled and editable';
+    const redacted = redactSecretValuesFromString(errorWithValue, ["hunter2-LEAK-MARKER"]);
+    expect(redacted).not.toContain("hunter2-LEAK-MARKER");
+    expect(redacted).toContain("[redacted]");
+    // Surrounding diagnostic context survives so the agent still
+    // sees the failure reason.
+    expect(redacted).toContain("Timeout 10000ms exceeded");
+    expect(redacted).toContain("waiting for element");
+  });
+});
+
+describe("redactSecretValuesDeep object-key redaction", () => {
+  // An agent can use a computed object key to smuggle the secret
+  // out via JSON serialization: `{[input.value]: 1}` produces
+  // `{"hunter2": 1}` and `JSON.stringify` writes the key verbatim.
+  // The walker must redact both keys and values.
+  const { redactSecretValuesDeep } = require("./browser") as typeof import("./browser");
+
+  test("redacts secret bytes when they appear as object keys", () => {
+    const result = redactSecretValuesDeep({ "hunter2-LEAK": 1, other: "ok" }, ["hunter2-LEAK"]) as Record<string, unknown>;
+    expect(Object.keys(result)).not.toContain("hunter2-LEAK");
+    expect(Object.keys(result)).toContain("[redacted]");
+    expect(result.other).toBe("ok");
+  });
+
+  test("disambiguates collisions when multiple keys redact to the same token", () => {
+    const result = redactSecretValuesDeep({
+      "alpha-secret": "a",
+      "beta-secret": "b",
+      kept: "c"
+    }, ["alpha-secret", "beta-secret"]) as Record<string, unknown>;
+    // Both secret-keyed entries survive without overwriting each other.
+    const keys = Object.keys(result).filter((k) => k !== "kept");
+    expect(keys.length).toBe(2);
+    expect(keys.every((k) => k.startsWith("[redacted]"))).toBe(true);
+    expect(result.kept).toBe("c");
+  });
+});
+
+describe("redactSecretValuesFromString", () => {
+  test("replaces every occurrence of every secret with [redacted]", () => {
+    const text = "Login attempt with username=tomsmith and password=SuperSecret123. Retried with SuperSecret123 again.";
+    const result = redactSecretValuesFromString(text, ["tomsmith", "SuperSecret123"]);
+    expect(result).toBe("Login attempt with username=[redacted] and password=[redacted]. Retried with [redacted] again.");
+  });
+
+  test("longer secrets are replaced before shorter prefixes (no partial leakage)", () => {
+    // If the shorter secret were replaced first, "abc" → "[redacted]"
+    // would leave "def" exposed when the agent had typed "abcdef".
+    const text = "input was abcdef and another abcdef";
+    const result = redactSecretValuesFromString(text, ["abc", "abcdef"]);
+    expect(result).toBe("input was [redacted] and another [redacted]");
+  });
+
+  test("no-op on empty inputs", () => {
+    expect(redactSecretValuesFromString("", ["abc"])).toBe("");
+    expect(redactSecretValuesFromString("text", [])).toBe("text");
+    expect(redactSecretValuesFromString("text", ["", ""])).toBe("text");
+  });
+
+  test("treats secret as literal string, not regex (metacharacters do not break)", () => {
+    const text = "user[1]=root password=.*";
+    const result = redactSecretValuesFromString(text, ["root", ".*"]);
+    expect(result).toBe("user[1]=[redacted] password=[redacted]");
+  });
+});
+
 describe("snapshot walker — <select> option surfacing", () => {
   test("emits <option> children as @eN-refed siblings after the select", async () => {
     type FakeEl = {

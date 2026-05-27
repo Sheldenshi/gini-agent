@@ -6,9 +6,19 @@
     "orientation": "portrait",
     "scheme": "gini",
     "userInterfaceStyle": "automatic",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/REPLACE_AFTER_EAS_INIT",
+      "fallbackToCacheTimeout": 0
+    },
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "ai.lilaclabs.gini.mobile"
+      "bundleIdentifier": "ai.lilaclabs.gini.mobile",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "package": "ai.lilaclabs.gini.mobile",
@@ -20,10 +30,18 @@
       "bundler": "metro"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      "expo-updates"
     ],
     "experiments": {
       "typedRoutes": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "d3a0b9e3-a377-4827-bf3c-274b519f305a"
+      }
+    },
+    "owner": "sheldenshi"
   }
 }

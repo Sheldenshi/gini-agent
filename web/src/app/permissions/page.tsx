@@ -101,6 +101,14 @@ function ApprovalCard({
   // audit, so render a friendlier label and use the reason as the
   // description instead of leaking the connect-endpoint internals.
   const isBrowserConnect = approval.action === "browser.connect";
+  // `browser.fill_secret` is also a special case: the only valid
+  // resolution path is /connect with per-slot values from the
+  // amber chat card. The generic /approve endpoint refuses this
+  // action with 400 (see decideApproval in src/agent.ts), so the
+  // Approve button on this page would just toast an error. Hide
+  // both action buttons and point the operator at the chat card
+  // where they can actually enter the credentials.
+  const isBrowserFillSecret = approval.action === "browser.fill_secret";
   // `||` (not `??`) so an empty-string reason also falls back to the
   // approval target. `??` only fires for null/undefined; a payload that
   // carried `reason: ""` would otherwise render a blank card body.
@@ -158,7 +166,20 @@ function ApprovalCard({
             {JSON.stringify(approval.payload, null, 2)}
           </pre>
         )}
-        {onDecide ? (
+        {isBrowserFillSecret ? (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Open the chat session to enter credentials. Approve doesn&apos;t apply here — the values must be typed into the amber card in chat. Deny still cancels the request.
+            </p>
+            {onDecide ? (
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onDecide("deny")}>
+                  Deny
+                </Button>
+              </div>
+            ) : null}
+          </>
+        ) : onDecide ? (
           <div className="flex gap-2">
             <Button size="sm" disabled={pending} onClick={() => onDecide("approve")}>
               {isBrowserConnect ? "Connect" : "Approve"}

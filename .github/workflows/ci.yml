@@ -17,6 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # Install zsh because terminal_exec / code_exec wrap commands
+      # through `zsh -lc` (src/agent.ts:buildPtySpawnArgs and the
+      # non-PTY spawn path both assume zsh is on $PATH). Ubuntu
+      # runners ship with bash only; without this step the entire
+      # terminal-exec / cron / chat-task test surface fails with
+      # "Executable not found in $PATH: zsh".
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.13
