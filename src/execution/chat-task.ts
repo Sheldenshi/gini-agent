@@ -1405,6 +1405,55 @@ async function runLoop(
   }
 }
 
+// Helper for resumeChatTask's stage-1 mutateState. Extracted so the
+// race-window poll-and-retry can re-stage from a single point.
+// Returns one of four shapes:
+//   - terminal: task in completed/failed/cancelled — bail
+//   - notYetWaiting: task in "running" still racing the loop's
+//     persist to "waiting_approval" — caller should retry briefly
+//   - hasState:false — task is waiting but its toolCallState was
+//     cleared (failure-path artifact); caller logs and exits
+//   - ready (true/false) — normal flow, ready means all pending
+//     resolved and the loop should re-enter
+async function stageResume(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  toolResult: string
+): Promise<{
+  task: Task;
+  ready: boolean;
+  hasState: boolean;
+  terminal: boolean;
+  notYetWaiting: boolean;
+}> {
+  return mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    if (item.status !== "waiting_approval") {
+      // Distinguish actually-terminal (legitimate bail) from
+      // not-yet-waiting (race-window — caller should retry).
+      const truly = isTerminalTaskStatus(item.status);
+      return {
+        task: item,
+        ready: false,
+        hasState: false,
+        terminal: truly,
+        notYetWaiting: !truly
+      };
+    }
+    if (!item.toolCallState) {
+      // Nothing to resume against — most likely the snapshot was cleared by
+      // a prior failure path. Caller can decide to fail the task.
+      return { task: item, ready: false, hasState: false, terminal: false, notYetWaiting: false };
+    }
+    const pending = item.toolCallState.pending;
+    const target = pending.find((p) => p.toolCallId === toolCallId);
+    if (target) target.result = toolResult;
+    const allResolved = pending.every((p) => typeof p.result === "string");
+    return { task: item, ready: allResolved, hasState: true, terminal: false, notYetWaiting: false };
+  });
+}
+
 // Resume a paused chat task after one of its tool approvals resolved.
 // `toolResult` is the textual result (stdout, file write status, etc.)
 // captured by agent.executeApprovedAction. The runtime calls this with the
@@ -1425,22 +1474,29 @@ export async function resumeChatTask(
   // task back to running. If the task has already failed (e.g. a sibling
   // approval was denied), been cancelled, or completed, just no-op so we
   // don't restart a terminal task's loop.
-  const stage = await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    if (item.status !== "waiting_approval") {
-      return { task: item, ready: false as const, hasState: false as const, terminal: true as const };
-    }
-    if (!item.toolCallState) {
-      // Nothing to resume against — most likely the snapshot was cleared by
-      // a prior failure path. Caller can decide to fail the task.
-      return { task: item, ready: false as const, hasState: false as const, terminal: false as const };
-    }
-    const pending = item.toolCallState.pending;
-    const target = pending.find((p) => p.toolCallId === toolCallId);
-    if (target) target.result = toolResult;
-    const allResolved = pending.every((p) => typeof p.result === "string");
-    return { task: item, ready: allResolved, hasState: true as const, terminal: false as const };
-  });
+  //
+  // Race-window fix: a fast /connect can land BEFORE the chat-task
+  // loop has persisted waiting_approval (the approval block is
+  // emitted to the SSE stream earlier than the post-loop mutateState
+  // that flips the status). In that window status is still
+  // "running" — NOT terminal — but the original code's
+  // `status !== "waiting_approval"` short-circuit lumped it in with
+  // terminal and silently orphaned the task. Distinguish the two:
+  // a truly-terminal status bails as before; a still-running task
+  // gets a brief poll-and-retry budget so the resume catches the
+  // loop's flip to waiting_approval (~one mutateState boundary
+  // away). 1000ms total budget over 10x 100ms ticks is generous
+  // for the manual-click case and bounded enough for automated
+  // /connect callers (CLI scripts, test harnesses, the messaging
+  // pollers) that race the loop more aggressively.
+  const RESUME_WAIT_FOR_WAITING_BUDGET_MS = 1000;
+  const RESUME_WAIT_FOR_WAITING_TICK_MS = 100;
+  const resumeDeadline = Date.now() + RESUME_WAIT_FOR_WAITING_BUDGET_MS;
+  let stage = await stageResume(config, taskId, toolCallId, toolResult);
+  while (stage.notYetWaiting && Date.now() < resumeDeadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, RESUME_WAIT_FOR_WAITING_TICK_MS));
+    stage = await stageResume(config, taskId, toolCallId, toolResult);
+  }
 
   if (stage.terminal) {
     appendTrace(config.instance, taskId, {

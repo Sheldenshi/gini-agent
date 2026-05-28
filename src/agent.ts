@@ -1522,9 +1522,12 @@ async function runApprovedAction(
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
 
   // SetupRequest actions (browser.connect, connector.request,
-  // browser.fill_secret) no longer reach this executor — their side
-  // effects run inside the /api/setup-requests/:id/complete endpoint,
-  // not through Authorization side-effect dispatch. See
+  // browser.fill_secret, and the messaging.* connect actions —
+  // add_bridge, approve_pairing, remove_bridge) no longer reach this
+  // executor — their side effects run inside the
+  // /api/setup-requests/:id/complete endpoint (delegating to the bounded
+  // runMessaging*Connect / runFillSecretConnect modules), not through
+  // Authorization side-effect dispatch. See
   // docs/adr/authorization-vs-setup-request.md.
 
   if (approval.action === "file.write") {
