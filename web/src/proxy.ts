@@ -208,7 +208,16 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     // attempt fails. The mobile app, when it does take the handoff, uses
     // the Bearer-token path on the proxy (see Bearer branch below) rather
     // than the cookie.
-    const tunnelOrigin = `${url.protocol}//${url.host}`;
+    //
+    // The origin must come from the inbound Host header (hostHeader, the
+    // tunnel hostname) rather than `url.host`, which reflects whatever
+    // Next.js sees internally (loopback when cloudflared rewrites). The
+    // tunnel branch only runs once `classifyHost` has confirmed the inbound
+    // Host equals the live tunnel hostname, so we know it's safe to encode
+    // as `https://<hostHeader>`. The /connect interstitial validates the
+    // resulting URL as an http/https URL before handing off; an empty or
+    // malformed Host would simply fail validation there.
+    const tunnelOrigin = `https://${hostHeader ?? ""}`;
     const target = new URL(request.url);
     target.pathname = "/connect";
     target.search =
