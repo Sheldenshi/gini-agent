@@ -1,0 +1,70 @@
+{
+  "expo": {
+    "name": "Gini",
+    "slug": "gini-mobile",
+    "version": "0.0.2",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "gini",
+    "userInterfaceStyle": "automatic",
+    "runtimeVersion": { "policy": "appVersion" },
+    "updates": {
+      "url": "https://u.expo.dev/d3a0b9e3-a377-4827-bf3c-274b519f305a",
+      "fallbackToCacheTimeout": 0
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "ai.lilaclabs.gini.mobile",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "ai.lilaclabs.gini.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#ffffff"
+      }
+    },
+    "web": { "bundler": "metro" },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-notifications",
+        { "enableBackgroundRemoteNotifications": true }
+      ],
+      [
+        "./plugins/with-approval-notification-service.js",
+        { "appleTeamId": "WB6Y3K67AB" }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Gini uses your photo library to attach images to chat messages.",
+          "cameraPermission": "Gini uses the camera to capture images to attach to chat messages."
+        }
+      ],
+      "expo-updates"
+    ],
+    "experiments": { "typedRoutes": true },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "d3a0b9e3-a377-4827-bf3c-274b519f305a",
+        "build": {
+          "experimental": {
+            "ios": {
+              "appExtensions": [
+                {
+                  "targetName": "ApprovalNotificationService",
+                  "bundleIdentifier": "ai.lilaclabs.gini.mobile.notificationservice"
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "owner": "lilac-labs"
+  }
+}

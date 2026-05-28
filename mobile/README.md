@@ -66,20 +66,22 @@ to the agent picker.
 ## Fork & re-skin
 
 Gini is open source — the iOS app is yours to fork, rebrand, and ship
-under your own Apple developer account. Edit two files, then prebuild.
+under your own Apple developer account. Two files to edit.
 
-**1. Constants at the top of `mobile/app.config.ts`:**
+**1. `mobile/app.json`:**
 
-- `IOS_BUNDLE_ID` / `ANDROID_PACKAGE` — your reverse-DNS bundle id.
-- `APP_NAME` — what users see on the home screen.
-- `APP_SLUG` — the EAS slug (lowercase, hyphenated).
-- `APP_SCHEME` — your deep-link scheme (e.g. `myagent://`).
-- `EAS_PROJECT_ID` — run `eas init` in `mobile/` to get one.
-- `EXPO_OWNER` — your Expo account or org (`expo whoami`).
-- `APPLE_TEAM_ID` — developer.apple.com → Membership → Team ID.
-
-The NSE bundle id and the OTA updates URL are derived from the values
-above, so you only edit one place.
+| Path                                                                             | Replace with                                  |
+|----------------------------------------------------------------------------------|-----------------------------------------------|
+| `expo.name`                                                                      | your app's display name                       |
+| `expo.slug`                                                                      | your EAS slug (lowercase, hyphenated)         |
+| `expo.scheme`                                                                    | your deep-link scheme (e.g. `myagent`)        |
+| `expo.ios.bundleIdentifier`                                                      | your reverse-DNS bundle id                    |
+| `expo.android.package`                                                           | same as `bundleIdentifier`                    |
+| `expo.owner`                                                                     | your Expo account or org (`expo whoami`)      |
+| `expo.extra.eas.projectId`                                                       | from `eas init` in `mobile/`                  |
+| `expo.updates.url`                                                               | `https://u.expo.dev/<your-eas-project-id>`    |
+| `expo.extra.eas.build.experimental.ios.appExtensions[0].bundleIdentifier`        | `<your-bundle-id>.notificationservice`        |
+| `expo.plugins[…with-approval-notification-service].appleTeamId`                  | developer.apple.com → Membership → Team ID    |
 
 **2. `mobile/eas.json` submit profile:** replace `appleTeamId` and
 `ascAppId` under `submit.production.ios` with your own before running
