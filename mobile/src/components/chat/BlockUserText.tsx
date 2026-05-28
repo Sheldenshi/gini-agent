@@ -1,7 +1,8 @@
-import { Image, StyleSheet, Text, View } from "react-native";
+import { Image, StyleSheet, View } from "react-native";
 import { authHeader, uploadUrl } from "@/src/api";
 import { family, theme } from "@/src/theme";
 import type { UserTextBlock } from "@/src/types";
+import { SelectableBlockText } from "./SelectableBlockText";
 
 // Right-aligned dark bubble. The asymmetric corner geometry has a
 // sharper bottom-left so the bubble visually "points" toward the
@@ -36,9 +37,9 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
       ) : null}
       {hasText ? (
         <View style={styles.bubble}>
-          <Text style={styles.text} selectable>
+          <SelectableBlockText style={styles.text}>
             {block.text}
-          </Text>
+          </SelectableBlockText>
         </View>
       ) : null}
     </View>
