@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { inferTunnelTransport } from "@/lib/transport";
+import { isQuickTunnelOrigin } from "@/lib/tunnel-policy";
 
 // Runtime-side event kinds. Source of truth: src/types.ts RuntimeEventKind.
 // The server emits each event as `event: <kind>` (named SSE events), so the
@@ -78,7 +79,7 @@ async function fetchTunnelTransport(): Promise<"sse" | "poll"> {
 // localhost while a tunnel happens to be open.
 function pageIsOnTunnelHost(): boolean {
   if (typeof window === "undefined") return false;
-  return window.location.hostname.toLowerCase().endsWith(".trycloudflare.com");
+  return isQuickTunnelOrigin(window.location.origin);
 }
 
 function openSseTransport(): void {

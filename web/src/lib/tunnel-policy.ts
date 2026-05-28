@@ -203,3 +203,17 @@ export function looksLikeSecretSegment(value: string): boolean {
   if (value.length < 8 || value.length > 128) return false;
   return /^[A-Za-z0-9_-]+$/.test(value);
 }
+
+/** True when the origin is a Cloudflare quick-tunnel hostname. Centralized
+ *  so adding more transport types later happens in one place. Uses URL
+ *  parsing rather than naive endsWith so suffix-confusion strings like
+ *  `https://example.trycloudflare.com.evil.com` don't slip through.
+ *  Returns false for non-URL inputs (parse failure) and for any non-
+ *  trycloudflare hostname. */
+export function isQuickTunnelOrigin(origin: string): boolean {
+  try {
+    return new URL(origin).hostname.toLowerCase().endsWith(".trycloudflare.com");
+  } catch {
+    return false;
+  }
+}

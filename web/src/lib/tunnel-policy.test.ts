@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildTunnelCookie,
+  isQuickTunnelOrigin,
   isTunnelDenied,
   looksLikeSecretSegment,
   matchSecretPrefix,
@@ -149,6 +150,31 @@ describe("withoutTrailingSlash", () => {
 
   test("leaves bare slash alone", () => {
     expect(withoutTrailingSlash("/")).toBe("/");
+  });
+});
+
+describe("isQuickTunnelOrigin", () => {
+  test("accepts a real quick-tunnel origin", () => {
+    expect(isQuickTunnelOrigin("https://abc.trycloudflare.com")).toBe(true);
+  });
+
+  test("rejects a suffix-confusion attempt — must end with the literal suffix", () => {
+    expect(isQuickTunnelOrigin("https://example.trycloudflare.com.evil.com")).toBe(false);
+  });
+
+  test("rejects a loopback origin", () => {
+    expect(isQuickTunnelOrigin("https://127.0.0.1:7777")).toBe(false);
+    expect(isQuickTunnelOrigin("http://localhost:7777")).toBe(false);
+  });
+
+  test("returns false on URL parse failure", () => {
+    expect(isQuickTunnelOrigin("not-a-url")).toBe(false);
+    expect(isQuickTunnelOrigin("")).toBe(false);
+  });
+
+  test("is case-insensitive on the host suffix", () => {
+    expect(isQuickTunnelOrigin("https://ABC.TRYCLOUDFLARE.COM")).toBe(true);
+    expect(isQuickTunnelOrigin("https://Mixed.TryCloudflare.com")).toBe(true);
   });
 });
 

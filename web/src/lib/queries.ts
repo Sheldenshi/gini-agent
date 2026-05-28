@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { inferTunnelTransport } from "@/lib/transport";
+import { isQuickTunnelOrigin } from "@/lib/tunnel-policy";
 import type {
   Approval,
   BrowserConnectionRecord,
@@ -291,7 +292,7 @@ const CHAT_POLL_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
 // other clients.
 function pageIsOnQuickTunnel(): boolean {
   if (typeof window === "undefined") return false;
-  return window.location.hostname.toLowerCase().endsWith(".trycloudflare.com");
+  return isQuickTunnelOrigin(window.location.origin);
 }
 
 // Merge the REST seed snapshot with whatever's already in state. A live
