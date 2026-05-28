@@ -33,8 +33,18 @@ interface ParsedCredentials {
   token: string;
 }
 
-function parseConnectUrl(url: string | null): ParsedCredentials | null {
-  if (!url) return null;
+// Three-state result so the hook can tell apart:
+//   - "not a connect URL"             → ignore entirely
+//   - "connect URL but missing creds" → user is stranded on /connect
+//                                       placeholder; show recovery
+//   - "complete connect URL"          → prompt + saveCredentials
+type ParsedConnect =
+  | { kind: "none" }
+  | { kind: "incomplete" }
+  | { kind: "complete"; creds: ParsedCredentials };
+
+function parseConnectUrl(url: string | null): ParsedConnect {
+  if (!url) return { kind: "none" };
   const parsed = Linking.parse(url);
   // Expo's parser drops the `gini://` scheme; the host portion of
   // `gini://connect?api=...` lands in `hostname`, the rest in
@@ -42,15 +52,15 @@ function parseConnectUrl(url: string | null): ParsedCredentials | null {
   // empty, hostname=connect), others as `gini:///connect`
   // (hostname empty, path=connect). Accept both shapes.
   const route = parsed.hostname ?? parsed.path?.replace(/^\//, "") ?? "";
-  if (route !== CONNECT_PATH) return null;
+  if (route !== CONNECT_PATH) return { kind: "none" };
 
   const apiParam = parsed.queryParams?.api;
   const tokenParam = parsed.queryParams?.token;
   const api = typeof apiParam === "string" ? apiParam : null;
   const token = typeof tokenParam === "string" ? tokenParam : null;
-  if (!api || !token) return null;
+  if (!api || !token) return { kind: "incomplete" };
 
-  return { baseUrl: api, token };
+  return { kind: "complete", creds: { baseUrl: api, token } };
 }
 
 export function useDeepLinkAuth(): void {
@@ -60,8 +70,45 @@ export function useDeepLinkAuth(): void {
 
   useEffect(() => {
     let active = true;
-    const creds = parseConnectUrl(url);
-    if (!creds) return;
+    const result = parseConnectUrl(url);
+    if (result.kind === "none") return;
+    if (result.kind === "incomplete") {
+      // The URL was for the /connect flow but `api` or `token` was
+      // missing/empty. The /connect placeholder renders a spinner with
+      // no fallback navigation of its own, so without recovery here
+      // the user is stranded forever staring at an ActivityIndicator.
+      // Surface a single-button Alert that routes back to `/` (the auth
+      // gate then forwards to /agents or /setup based on persisted
+      // credentials). Routing the recovery through the hook — rather
+      // than connect.tsx itself — covers warm hand-offs from any
+      // landing screen that happens to be mounted when iOS dispatches
+      // the malformed URL.
+      Alert.alert(
+        "Couldn't connect",
+        "The link was missing the API URL or token.",
+        [
+          {
+            text: "Cancel",
+            style: "cancel",
+            onPress: () => {
+              if (!active) return;
+              router.replace("/");
+            }
+          }
+        ],
+        {
+          cancelable: true,
+          onDismiss: () => {
+            if (!active) return;
+            router.replace("/");
+          }
+        }
+      );
+      return () => {
+        active = false;
+      };
+    }
+    const { creds } = result;
     // Surface the destination host (not the raw URL — Alert lines wrap
     // unpredictably on long strings, and the host is the actually
     // load-bearing thing for the user's decision). Fall back to the raw
