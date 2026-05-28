@@ -770,7 +770,7 @@ describe("provider", () => {
     // override on ProviderConfig becomes a `prompt_cache_retention`
     // field on the request body. Without this assertion the
     // promptCacheRetentionFields helper or any of its call sites could
-    // drift and silently drop the field — the eight request builders
+    // drift and silently drop the field — the nine request builders
     // funnel through a single helper precisely so the field is either
     // present everywhere or absent everywhere, and this test pins
     // that contract on a representative chat-completions path.

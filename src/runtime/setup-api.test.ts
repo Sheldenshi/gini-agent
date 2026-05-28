@@ -277,12 +277,14 @@ describe("setup-api", () => {
   });
 
   test("POST openai with disk-cleared promptCacheRetention does not resurrect from in-memory snapshot", async () => {
-    // The round-5 fix made disk authoritative: a successful disk read
+    // Disk is authoritative when readable: a successful disk read
     // returns whatever's there, including undefined. So if an operator
     // deliberately cleared the field on disk (via `gini provider set
     // --prompt-cache-retention ""` from another terminal) while the
     // gateway still has "24h" in its boot-time snapshot, the UI save
-    // must NOT resurrect "24h" from in-memory. Pin that contract here.
+    // must NOT resurrect "24h" from in-memory. Pin that contract here
+    // so a future fallback-widening to "use in-memory whenever it's
+    // set" doesn't quietly reintroduce the clear-resurrection bug.
     const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
     const seeded = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
     seeded.provider = { name: "openai", model: "gpt-5.5" };

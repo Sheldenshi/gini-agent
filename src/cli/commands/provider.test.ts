@@ -324,7 +324,12 @@ describe("provider CLI", () => {
     expect(captured.join("")).toMatch(/chatgpt\.com codex backend currently rejects/);
   });
 
-  test("local provider with all three flags emits NO warning (every flag applies)", async () => {
+  test("local provider with every flag emits NO warning (every flag applies)", async () => {
+    // local routes through chat-completions and honors all four
+    // configurable flags: --base-url, --api-key-env, --extra-body,
+    // and --prompt-cache-retention. Pin the empty-warning contract on
+    // the full flag set so a future ignored-list entry that incorrectly
+    // adds local to one of the warning branches is caught here.
     const captured: string[] = [];
     const original = process.stderr.write.bind(process.stderr);
     process.stderr.write = ((chunk: unknown) => {
@@ -336,7 +341,8 @@ describe("provider CLI", () => {
         "provider", "set", "local", "m",
         "--base-url", "http://x/v1",
         "--api-key-env", "FOO",
-        "--extra-body", "{}"
+        "--extra-body", "{}",
+        "--prompt-cache-retention", "24h"
       ]);
       await provider(ctx);
     } finally {
