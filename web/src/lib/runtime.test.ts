@@ -3,7 +3,7 @@
 // the browser-facing BFF and the bearer-gated gateway.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { guardCsrf } from "./runtime";
+import { guardCsrf, pickForwardHeaders } from "./runtime";
 
 const originalTrusted = process.env.GINI_TRUSTED_ORIGINS;
 
@@ -131,6 +131,29 @@ describe("guardCsrf — Sec-Fetch-Site still fires for vetted requests", () => {
     );
     expect(res).not.toBeNull();
     expect(res!.status).toBe(403);
+  });
+});
+
+describe("pickForwardHeaders", () => {
+  test("forwards X-Device-Token so the gateway sees it on /badge + /read", () => {
+    const incoming = new Headers({
+      "content-type": "application/json",
+      "x-device-token": "abc123"
+    });
+    const forwarded = pickForwardHeaders(incoming);
+    expect(forwarded.get("x-device-token")).toBe("abc123");
+  });
+
+  test("forwards last-event-id (SSE reconnect dedup)", () => {
+    const incoming = new Headers({ "last-event-id": "block_42:170" });
+    const forwarded = pickForwardHeaders(incoming);
+    expect(forwarded.get("last-event-id")).toBe("block_42:170");
+  });
+
+  test("drops headers not in the allowlist (e.g. cookie)", () => {
+    const incoming = new Headers({ cookie: "session=secret" });
+    const forwarded = pickForwardHeaders(incoming);
+    expect(forwarded.get("cookie")).toBeNull();
   });
 });
 

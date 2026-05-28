@@ -5,8 +5,16 @@ import { parseTrustedOriginUrls } from "./trusted-origins";
 
 // Headers we forward verbatim from the browser to the runtime. Last-Event-ID
 // is critical for SSE reconnect dedup (see src/http.ts:eventStream) — without
-// it, every reconnect re-replays the entire event log.
-const FORWARD_HEADERS = new Set(["content-type", "accept", "cache-control", "last-event-id"]);
+// it, every reconnect re-replays the entire event log. X-Device-Token is
+// required for /api/badge + /api/chat/:id/read; the mobile app sends it on
+// every authenticated call so the gateway can attribute the device.
+const FORWARD_HEADERS = new Set([
+  "content-type",
+  "accept",
+  "cache-control",
+  "last-event-id",
+  "x-device-token"
+]);
 
 // Cache the file-read values across requests but invalidate on mtime change,
 // so a gateway respawn that picks a different port doesn't strand the BFF
