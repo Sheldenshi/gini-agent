@@ -109,6 +109,16 @@ class TunnelManager {
   private shuttingDown = false;
   // Serialize every apply-path mutation. Promise chain serves as a queue.
   private applyChain: Promise<void> = Promise.resolve();
+  // Detached-kill chain for the prior cloudflared process. disable() and
+  // the kill-old branches of swapCloudflared chain their `prev.stop()`
+  // onto this Promise instead of awaiting it inline so the in-flight HTTP
+  // response (the operator clicked Disable / Rotate over the live tunnel)
+  // can flush through the still-alive OLD cloudflared BEFORE that process
+  // dies and severs the TCP connection. Subsequent operations that need
+  // to know the kill is done (enable, swapCloudflared's spawn, shutdown)
+  // await `pendingKill` to preserve the apply-chain serialization
+  // documented above swapCloudflared.
+  private pendingKill: Promise<void> = Promise.resolve();
   private notesAvailable: boolean | null = null;
   /** Last webPort enable() was called with. Used by rotateSecret to
    *  recycle cloudflared (close every open TCP / SSE connection) without
@@ -246,7 +256,11 @@ class TunnelManager {
       if (this.cloudflared) {
         const prev = this.cloudflared;
         this.cloudflared = null;
-        try { await prev.stop(); } catch { /* already gone */ }
+        // Detached kill chained onto pendingKill — see field doc above.
+        // The next operation that needs the kill complete (enable's pre-
+        // spawn await, shutdown's await) will block on pendingKill, so
+        // chain order is preserved even though this call doesn't await.
+        this.pendingKill = this.pendingKill.then(() => prev.stop().catch(() => { /* already gone */ }));
       }
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
       setRedactionPublicUrl(null);
@@ -263,15 +277,22 @@ class TunnelManager {
     if (this.cloudflared) {
       const prev = this.cloudflared;
       this.cloudflared = null;
-      try { await prev.stop(); } catch { /* already gone */ }
+      // Detached kill chained onto pendingKill — see field doc above.
+      // The await below blocks on the chain so spawn order is preserved
+      // (the new cloudflared can't bind until the prior one's stop
+      // promise settles).
+      this.pendingKill = this.pendingKill.then(() => prev.stop().catch(() => { /* already gone */ }));
     }
+    // Block on any prior detached kill before spawning so we don't race
+    // a new cloudflared against the dying one binding the same upstream.
+    await this.pendingKill;
     // Re-check shuttingDown one last time before the spawn. The probe
-    // (1500ms timeout) and `prev.stop()` (up to 5s SIGKILL fallback)
-    // are both async — SIGTERM may have arrived during either await.
-    // Without this gate, the post-banner shutdown check would still
-    // catch it, but we'd have spawned cloudflared for the duration
-    // of the banner parse before tearing it back down. Skip the
-    // spawn entirely if shutdown started.
+    // (1500ms timeout) and the prior detached kill (up to 5s SIGKILL
+    // fallback) are both async — SIGTERM may have arrived during either
+    // await. Without this gate, the post-banner shutdown check would
+    // still catch it, but we'd have spawned cloudflared for the
+    // duration of the banner parse before tearing it back down. Skip
+    // the spawn entirely if shutdown started.
     if (this.shuttingDown) {
       return { ok: false, error: "Tunnel manager shutting down" };
     }
@@ -462,6 +483,12 @@ class TunnelManager {
       if (this.shuttingDown) {
         return { ok: false, error: "Tunnel manager shutting down" };
       }
+      // Wait for any prior detached cloudflared kill (deferred by a
+      // disable / rotate / swapCloudflared kill-old branch) before
+      // spawning fresh state. swapCloudflared also awaits pendingKill
+      // before its launch call; this outer await keeps the persist+
+      // snapshot writes serialized with the kill too.
+      await this.pendingKill;
       // Reconcile-only callers (boot reconcile, internal recycle) must
       // re-check disk intent inside the queue slot. A user `disable()`
       // that enqueued between the caller's pre-check and our slot
@@ -568,16 +595,25 @@ class TunnelManager {
         configErr = err instanceof Error ? err.message : String(err);
         appendLog(this.config.instance, "tunnel.disable.config-error", { error: redact(configErr) });
       }
-      let stopErr: string | null = null;
       if (this.cloudflared) {
         const prev = this.cloudflared;
         this.cloudflared = null;
-        try {
-          await prev.stop();
-        } catch (err) {
-          stopErr = err instanceof Error ? err.message : String(err);
-          appendLog(this.config.instance, "tunnel.disable.stop-error", { error: redact(stopErr) });
-        }
+        // Detached kill chained onto pendingKill so the in-flight HTTP
+        // response (the operator clicked Disable over the live tunnel)
+        // can flush through the still-alive OLD cloudflared before its
+        // TCP connection dies. Subsequent operations await pendingKill
+        // to preserve apply-chain ordering. Logging on failure is
+        // attached to the chained Promise rather than this synchronous
+        // slot — we want to RETURN now, with the new snapshot, so the
+        // HTTP layer can flush.
+        this.pendingKill = this.pendingKill.then(async () => {
+          try {
+            await prev.stop();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            appendLog(this.config.instance, "tunnel.disable.stop-error", { error: redact(msg) });
+          }
+        });
       }
       // Stop the edge probe in lockstep with the cloudflared teardown.
       // The probe's internal !snapshot.enabled guard would also short-
@@ -593,7 +629,10 @@ class TunnelManager {
           notesErr = err instanceof Error ? err.message : String(err);
         }
       }
-      const errorMsg = configErr ?? stopErr ?? null;
+      // The stop-error path is logged inside the detached kill chain;
+      // the disable() response itself only surfaces the synchronous
+      // config-write error.
+      const errorMsg = configErr ?? null;
       this.snapshot = {
         ...this.snapshot,
         enabled: false,
@@ -896,6 +935,12 @@ class TunnelManager {
       this.cloudflared = null;
       await prev.stop();
     }
+    // Drain any detached kill scheduled by a recent disable / rotate /
+    // swapCloudflared kill-old branch so we don't leak a cloudflared
+    // process across shutdown. The chained `.catch` inside the
+    // pendingKill chain swallows individual errors, so this await
+    // never rejects.
+    await this.pendingKill;
   }
 
   /** (Re)start the periodic edge probe. Idempotent — clears any existing
