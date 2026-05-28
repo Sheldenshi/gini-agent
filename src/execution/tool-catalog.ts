@@ -571,6 +571,34 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Attach a chat-attached image to a Linear issue. Wraps Linear's
+    // prepare_attachment_upload → direct PUT → create_attachment_from_upload
+    // sequence so the model only needs the issue identifier and the upload
+    // id from the user's message. The model can't PUT raw bytes to a
+    // Linear-signed URL via mcp_call, so this orchestration lives
+    // server-side. Upload ids appear in the user message preamble — pass
+    // them through verbatim. The Linear connector must already be set up;
+    // when it isn't, the tool returns a clear error suggesting
+    // request_connector.
+    toolset: "mcp",
+    displayLabel: "Attach image to Linear",
+    type: "function",
+    function: {
+      name: "linear_attach_image",
+      description: "Attach a chat-uploaded image to a Linear issue. Use this when the user provided screenshots and you've created or identified the issue. Pass the issue identifier (e.g. 'LIN-123') plus the uploadId from the system note that listed the user's attached image upload ids. Requires the Linear connector — if not configured, ask the user via request_connector first.",
+      parameters: {
+        type: "object",
+        properties: {
+          issue: { type: "string", description: "Issue identifier (e.g. 'LIN-123') or UUID." },
+          uploadId: { type: "string", description: "Upload id of a chat-attached image (from the 'Attached image upload ids' system note in the user message)." },
+          title: { type: "string", description: "Optional attachment title shown in Linear. Defaults to the upload's filename or 'Screenshot'." },
+          subtitle: { type: "string", description: "Optional attachment subtitle shown under the title in Linear." }
+        },
+        required: ["issue", "uploadId"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -1007,6 +1035,10 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
+    // linear_attach_image rides alongside mcp_call: same always-on rationale
+    // (a fresh instance with Linear configured should be able to attach
+    // screenshots without the user toggling a toolset row first).
+    if (tool.function.name === "linear_attach_image") return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
     // rationale: a fresh instance with no toolsets toggled still needs
@@ -1182,6 +1214,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.server)}.${previewValue(safe.tool)}`
       );
+    case "linear_attach_image":
+      return truncatePreview(previewValue(safe.issue));
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
     case "create_job":

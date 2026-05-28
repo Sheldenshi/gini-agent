@@ -513,6 +513,7 @@ function buildVisionContent(
 ): MessageContentPart[] {
   const parts: MessageContentPart[] = [];
   if (text.length > 0) parts.push({ type: "text", text });
+  const loaded: string[] = [];
   for (const image of images) {
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
@@ -520,6 +521,18 @@ function buildVisionContent(
       continue;
     }
     parts.push({ type: "image_url", image_url: { url: dataUrl } });
+    loaded.push(image.id);
+  }
+  // Surface upload ids to the model so non-vision tools (e.g.
+  // linear_attach_image) can reference the same image the user just
+  // showed. The data URL itself carries no id, and we deliberately don't
+  // embed ids in the image_url payload to keep the provider call shape
+  // standard — a short trailing text marker is enough.
+  if (loaded.length > 0) {
+    parts.push({
+      type: "text",
+      text: `Attached image upload ids (in order): ${loaded.join(", ")}`
+    });
   }
   // Provider requires non-empty content. If every image failed to load and
   // there was no text, fall through to an empty text part so we never send

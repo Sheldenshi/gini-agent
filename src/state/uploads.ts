@@ -67,7 +67,7 @@ export function storeUpload(
   return { id, mimeType, size: bytes.length };
 }
 
-export function readUpload(instance: Instance, id: string): { bytes: Uint8Array; mimeType: string } | null {
+export function readUpload(instance: Instance, id: string): { bytes: Uint8Array; mimeType: string; filename?: string } | null {
   const dir = uploadsDir(instance);
   const manifestPath = join(dir, `${id}.json`);
   if (!existsSync(manifestPath)) return null;
@@ -81,7 +81,7 @@ export function readUpload(instance: Instance, id: string): { bytes: Uint8Array;
   const blobPath = join(dir, `${id}.${ext}`);
   if (!existsSync(blobPath)) return null;
   const bytes = readFileSync(blobPath);
-  return { bytes: new Uint8Array(bytes), mimeType: manifest.mimeType };
+  return { bytes: new Uint8Array(bytes), mimeType: manifest.mimeType, filename: manifest.filename };
 }
 
 export function uploadDataUrl(instance: Instance, id: string): string | null {

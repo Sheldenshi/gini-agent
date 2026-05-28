@@ -52,6 +52,7 @@ import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
+import { attachImageToLinearIssue } from "../integrations/linear-attach";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -147,6 +148,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
+    case "linear_attach_image":
+      return { kind: "sync", result: await linearAttachImageTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_fill_secrets":
@@ -601,6 +604,29 @@ async function mcpCallTool(
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n... (truncated)`;
+}
+
+// Attach a chat-uploaded image to a Linear issue. Wraps Linear's MCP
+// upload flow (prepare_attachment_upload → direct PUT → create_attachment_
+// from_upload) so the model only has to pass the issue id and upload id.
+// The orchestration helper handles auth + audit (each Linear MCP call rides
+// invokeMcpTool, which writes the standard mcp.tool.invoked audit row).
+async function linearAttachImageTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const issue = requireString(args, "issue");
+  const uploadId = requireString(args, "uploadId");
+  const title = typeof args.title === "string" ? args.title : undefined;
+  const subtitle = typeof args.subtitle === "string" ? args.subtitle : undefined;
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: `Linear attach image ${issue}`,
+    data: { issue, uploadId }
+  });
+  const result = await attachImageToLinearIssue(config, taskId, { issue, uploadId, title, subtitle });
+  return JSON.stringify(result);
 }
 
 // Spawn a constrained subagent and wait for its terminal state. The model
