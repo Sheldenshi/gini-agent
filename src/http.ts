@@ -7,6 +7,7 @@ import {
   addSseSubscription,
   appendTrace,
   getDevice,
+  clearReadState,
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
@@ -912,6 +913,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
       return json({ ok: true, readState: result });
+    }],
+    // Drop the device's read cursor for a session so the badge counts
+    // it as fully unread again. Powers the mobile chat-list swipe
+    // "Mark Unread" action — markRead is monotonic and can't regress
+    // a cursor, so the only honest way to flip a chat back to unread
+    // is to delete the row.
+    ["DELETE", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const sessionId = params[0];
+      if (!readState(config.instance).chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      clearReadState(config.instance, sessionId, dev.token);
+      return json({ ok: true });
     }],
     ["GET", /^\/api\/badge$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
