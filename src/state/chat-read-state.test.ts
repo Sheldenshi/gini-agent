@@ -12,6 +12,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
+  clearReadState,
   closeAllMemoryDbs,
   getLastReadByDevice,
   getReadState,
@@ -200,6 +201,42 @@ describe("chat-read-state", () => {
     expect(map.size).toBe(2);
     expect(map.get("chat_a")).toBe(a.id);
     expect(map.get("chat_b")).toBe(b.id);
+  });
+
+  test("clearReadState drops the row and re-inflates the badge", () => {
+    const instance = "crs-clear" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    const b = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "2"
+    });
+    markRead(instance, "chat_a", "tok_x", b.id);
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(0);
+    clearReadState(instance, "chat_a", "tok_x");
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(2);
+  });
+
+  test("clearReadState is idempotent on a missing row", () => {
+    const instance = "crs-clear-missing" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    expect(() => clearReadState(instance, "chat_a", "tok_x")).not.toThrow();
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+  });
+
+  test("clearReadState only clears the caller's device", () => {
+    const instance = "crs-clear-isolation" as Instance;
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "1"
+    });
+    markRead(instance, "chat_a", "tok_iphone_a", a.id);
+    markRead(instance, "chat_a", "tok_iphone_b", a.id);
+    clearReadState(instance, "chat_a", "tok_iphone_a");
+    expect(getReadState(instance, "chat_a", "tok_iphone_a")).toBeNull();
+    expect(getReadState(instance, "chat_a", "tok_iphone_b")?.lastReadBlockId).toBe(a.id);
   });
 
   test("read state is isolated per device", () => {

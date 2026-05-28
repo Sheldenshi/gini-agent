@@ -130,6 +130,24 @@ export function markRead(
   };
 }
 
+// Clear the per-device read cursor for a session so the badge counts
+// the entire session as unread again. Idempotent — calling on a row
+// that doesn't exist is a no-op. Used by the mobile "mark unread"
+// swipe action: the cursor's monotonicity guard prevents moving it
+// backwards by replaying an older block id, so the only honest way
+// to flip a chat back to unread for the device is to drop the row.
+export function clearReadState(
+  instance: Instance,
+  sessionId: string,
+  deviceToken: string
+): void {
+  const db = getMemoryDb(instance);
+  db.run(
+    "DELETE FROM chat_read_state WHERE session_id = ? AND device_token = ?",
+    [sessionId, deviceToken]
+  );
+}
+
 // Returns the per-session last-read cursor for a device as a Map
 // keyed by sessionId.
 export function getLastReadByDevice(

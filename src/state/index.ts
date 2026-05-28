@@ -116,6 +116,7 @@ export {
 } from "./chat-session-events";
 export {
   markRead,
+  clearReadState,
   getLastReadByDevice,
   getReadState,
   unreadCountForDevice
