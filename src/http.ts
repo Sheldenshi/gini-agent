@@ -13,6 +13,7 @@ import {
   markRead,
   mutateState,
   readState,
+  unreadCountsByDevice,
   readTrace,
   readUpload,
   removeDeviceForCredential,
@@ -939,6 +940,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
       const unread = unreadCountForDevice(config.instance, dev.token);
       return json({ unread });
+    }],
+    // Per-session unread counts for the calling device. Powers the
+    // mobile chat list's per-row badge (blue pill + count) — /badge
+    // gives the cross-session total, /unread gives the breakdown so
+    // the list can mark each row independently. Sessions with zero
+    // unread blocks are omitted; callers default to 0.
+    ["GET", /^\/api\/unread$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const counts = unreadCountsByDevice(config.instance, dev.token);
+      return json({ counts: Object.fromEntries(counts) });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],

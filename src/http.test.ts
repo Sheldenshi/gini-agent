@@ -3139,6 +3139,71 @@ describe("runtime api", () => {
       expect(noDevice.status).toBe(400);
     });
 
+    test("GET /api/unread returns per-session unread counts scoped to the device", async () => {
+      const config = testConfig("chat-unread-counts");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionA.id, text: "1" });
+      const a2 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "2"
+      });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionB.id, text: "3" });
+
+      // Fresh device A — both sessions show their full count.
+      const initial = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(initial.counts[sessionA.id]).toBe(2);
+      expect(initial.counts[sessionB.id]).toBe(1);
+
+      // A catches up on session A — it drops out of the map for A.
+      await call(handler, config, `/api/chat/${sessionA.id}/read`, {
+        method: "POST",
+        headers: headerA,
+        body: JSON.stringify({ lastReadBlockId: a2.id })
+      });
+      const after = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(after.counts[sessionA.id]).toBeUndefined();
+      expect(after.counts[sessionB.id]).toBe(1);
+
+      // Device B is unaffected.
+      const bView = await call(handler, config, "/api/unread", { headers: headerB });
+      expect(bView.counts[sessionA.id]).toBe(2);
+      expect(bView.counts[sessionB.id]).toBe(1);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        "/api/unread",
+        {},
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+
+      // Unauth: 401.
+      const noAuth = await rawCall(handler, config, "/api/unread");
+      expect(noAuth.status).toBe(401);
+    });
+
     test("read + badge endpoints require authentication", async () => {
       const config = testConfig("chat-read-auth");
       const handler = createHandler(config);
