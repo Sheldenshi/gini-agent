@@ -86,6 +86,11 @@ function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
     // image. A tunneled browser doesn't actually need it (the launcher is
     // hidden in tunneled contexts) but exposing it keeps the shape uniform.
     secretRevision: snapshot.secretRevision,
+    // Transport indicator is non-secret — the client uses it to pick
+    // between SSE and the long-poll fallback for runtime events + chat
+    // streaming. Exposing it on the redacted shape lets the tunneled
+    // browser see the same value the privileged endpoint exposes.
+    tunnelTransport: snapshot.tunnelTransport,
     lastError: snapshot.lastError,
     appleNotes: {
       enabled: snapshot.appleNotes.enabled,
@@ -291,6 +296,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // to them anyway.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
       return chatBlockStream(config, request, params[0], deviceToken);
+    }],
+    // Long-polling fallback for chat-block streaming — used by clients
+    // talking to the gateway via a Cloudflare quick tunnel
+    // (`*.trycloudflare.com`), which drops SSE at the edge. Same event-
+    // emitter source as the SSE endpoint above; semantics documented on
+    // the chatBlockPoll helper. We skip the device-token registration
+    // here because per-device APNs suppression is keyed off live SSE
+    // subscriptions; a polling client doesn't hold the socket the
+    // dispatcher uses to detect "watching now", so its completion
+    // pushes are not suppressed (correct, since the client is on a
+    // tunnel and may not have foreground attention anyway).
+    ["GET", /^\/api\/chat\/([^/]+)\/poll$/, (request, params) => {
+      return chatBlockPoll(config, request, params[0]);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -499,6 +517,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
+    // Long-polling fallback for runtime events — used by clients hitting
+    // gateway via a Cloudflare quick tunnel (`*.trycloudflare.com`), which
+    // drops SSE at the edge. Same event source as the SSE endpoint;
+    // semantics are documented above the eventsPoll helper.
+    ["GET", /^\/api\/events\/poll$/, (request) => eventsPoll(config, request)],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);
@@ -1449,6 +1472,182 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
   return 500;
+}
+
+// Long-polling fallback constants — used by `/api/events/poll` and
+// `/api/chat/:id/poll`, the JSON-over-HTTP mirrors of the SSE endpoints
+// below. Cloudflare quick tunnels (`*.trycloudflare.com`) drop
+// `text/event-stream` at the edge, so any tunneled client (web or
+// mobile) hitting a quick-tunnel host must use these endpoints instead.
+// See `src/runtime/tunnel/transport.ts` for the classifier the clients
+// consult.
+//
+// LONG_POLL_TIMEOUT_MS = 25_000: an idle long-poll resolves with an
+// empty `events` array after this. 25 s sits comfortably under the
+// 30 s timeout most proxies enforce on hung requests so we don't get
+// cut off mid-flight, and is long enough that an idle session doesn't
+// burn through HTTP overhead on every short poll.
+//
+// LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS = 25: once at least one event
+// has arrived, wait 25 ms before resolving so a burst (e.g. a chat
+// task firing multiple chat_block updates in one tick) coalesces into
+// a single response instead of N tiny ones. The coalesce delay is
+// short enough to feel real-time to the user; longer would smear
+// streaming-text deltas perceptibly.
+const LONG_POLL_TIMEOUT_MS = 25_000;
+const LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS = 25;
+
+// Mirrors `eventStream` semantics: returns events whose id is past
+// `since`, with a 25_000 ms idle timeout and a 25 ms post-first-event
+// flush window. The event-source is the same ring buffer the SSE
+// endpoint reads from (`readState(...).events`), polled at the same
+// 1 s cadence — no event emitter to subscribe to for this surface.
+// Resolves with the events accumulated since the cursor plus a fresh
+// cursor (the last event's id, or `since` unchanged on idle). Returns
+// `application/json` so Cloudflare's quick-tunnel proxy treats it as
+// an ordinary HTTP response and doesn't strip it.
+function eventsPoll(config: RuntimeConfig, request: Request): Promise<Response> {
+  const since = new URL(request.url).searchParams.get("since") ?? "";
+  // Promise.withResolvers lets us hand the timer + interval the same
+  // resolver without wrapping a `new Promise((res) => …)` callback.
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let resolved = false;
+  let interval: Timer | undefined;
+  let timeoutTimer: Timer | undefined;
+  let coalesceTimer: Timer | undefined;
+  let accumulated: unknown[] = [];
+
+  const finish = (cursor: string): void => {
+    if (resolved) return;
+    resolved = true;
+    if (interval) clearInterval(interval);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    resolve(Response.json({ events: accumulated, cursor }));
+  };
+
+  // Honor client cancellation. AbortSignal fires on browser navigation
+  // away / fetch abort; unsubscribing immediately keeps the gateway
+  // from accumulating dead timers behind clients that hung up.
+  request.signal.addEventListener("abort", () => {
+    // Match the empty-result shape so a cancelled poll doesn't claim
+    // it received events it never delivered.
+    finish(since);
+  });
+
+  // The poll resolves when EITHER (a) at least one event has been
+  // accumulated AND LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS ms have
+  // elapsed since the first event landed, OR (b) LONG_POLL_TIMEOUT_MS
+  // ms have elapsed total. Walking the ring buffer at 1 s matches the
+  // SSE endpoint's polling cadence; there's no event-emitter to
+  // subscribe to for runtime events.
+  const check = (): void => {
+    if (resolved) return;
+    const events = readState(config.instance).events.slice().reverse();
+    const cutoff = since ? events.findIndex((e) => e.id === since) : -1;
+    // Slice off the events past the cursor. cutoff < 0 means the cursor
+    // rolled out of the 1000-entry ring (or no cursor was given), so we
+    // return everything currently retained.
+    const fresh = cutoff >= 0 ? events.slice(cutoff + 1) : events;
+    if (fresh.length === 0) return;
+    accumulated = fresh;
+    if (!coalesceTimer) {
+      const last = fresh[fresh.length - 1];
+      const cursor = last && typeof last === "object" && "id" in last && typeof last.id === "string"
+        ? last.id
+        : since;
+      coalesceTimer = setTimeout(() => finish(cursor), LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    }
+  };
+
+  check();
+  if (!resolved) {
+    interval = setInterval(check, 1_000);
+    timeoutTimer = setTimeout(() => finish(since), LONG_POLL_TIMEOUT_MS);
+  }
+  return promise;
+}
+
+// Mirrors `chatBlockStream` semantics over long-polling. The
+// subscription source is `subscribeChatBlocks` (the same event-emitter
+// the SSE path uses), which fires AFTER the SQLite commit so we
+// observe durable rows. Cursor is the SSE wire id (`<block_id>:<ts>`)
+// the client received last; if the client has never connected we fall
+// back to the full block list via `listChatBlocksAfter(null)`.
+function chatBlockPoll(config: RuntimeConfig, request: Request, sessionId: string): Promise<Response> {
+  const state = readState(config.instance);
+  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+    return Promise.resolve(json({ error: `Chat session not found: ${sessionId}` }, 404));
+  }
+  const since = new URL(request.url).searchParams.get("since") ?? "";
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let resolved = false;
+  let unsubscribe: (() => void) | undefined;
+  let timeoutTimer: Timer | undefined;
+  let coalesceTimer: Timer | undefined;
+  const accumulated: ChatBlock[] = [];
+
+  // The cursor we return is `<block_id>:<ts>` (matching the SSE id
+  // line) of the last block in the response so the next poll resumes
+  // from the exact same point. listChatBlocksAfter parses the suffix
+  // to detect in-place upserts on the cursor row.
+  const wireId = (block: ChatBlock): string => {
+    const ts =
+      block.kind === "assistant_text" || block.kind === "tool_call"
+        ? block.updatedAt
+        : block.createdAt;
+    return `${block.id}:${ts}`;
+  };
+
+  const finish = (cursor: string): void => {
+    if (resolved) return;
+    resolved = true;
+    if (unsubscribe) unsubscribe();
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    resolve(Response.json({ events: accumulated, cursor }));
+  };
+
+  request.signal.addEventListener("abort", () => {
+    finish(since);
+  });
+
+  // Initial backfill — same as the SSE path's start() handler. If the
+  // cursor is fresh enough to be present in chat_blocks, replay only
+  // missing rows; otherwise replay everything (the gateway caps
+  // listChatBlocksAfter's fallback behavior).
+  const seenIds = new Set<string>();
+  const backfill = listChatBlocksAfter(config.instance, sessionId, since || null);
+  for (const block of backfill) {
+    accumulated.push(block);
+    seenIds.add(block.id);
+  }
+  if (accumulated.length > 0) {
+    const last = accumulated[accumulated.length - 1]!;
+    coalesceTimer = setTimeout(() => finish(wireId(last)), LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+  }
+
+  // Live subscription for blocks that land after the backfill snapshot.
+  // The dedup gate stays loose: assistant_text streaming deltas reuse
+  // the same block id with growing payloads, so id-dedup would drop
+  // intermediate frames. Instead we accept every emitted block; the
+  // client upserts by id and the last seen `<id>:<ts>` is what we
+  // return as the cursor.
+  unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
+    if (resolved) return;
+    accumulated.push(block);
+    if (!coalesceTimer) {
+      coalesceTimer = setTimeout(() => {
+        const last = accumulated[accumulated.length - 1]!;
+        finish(wireId(last));
+      }, LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    }
+  });
+
+  if (!resolved) {
+    timeoutTimer = setTimeout(() => finish(since), LONG_POLL_TIMEOUT_MS);
+  }
+  return promise;
 }
 
 function eventStream(config: RuntimeConfig, request: Request): Response {

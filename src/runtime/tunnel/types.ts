@@ -38,6 +38,16 @@ export interface TunnelSnapshot {
    *  invalidates the browser's painted image without putting the
    *  secret itself in the URL. */
   secretRevision: string | null;
+  /** "sse" when the live public URL is reachable via Server-Sent Events
+   *  (loopback, named tunnels, off). "poll" when the public URL is a
+   *  Cloudflare quick tunnel (`*.trycloudflare.com`) — quick tunnels
+   *  drop `text/event-stream` at the edge, so clients hitting that
+   *  hostname must fall back to long-polling for runtime events and
+   *  chat-block streaming. Derived from `publicUrl` via
+   *  `inferTunnelTransport` whenever the URL changes; nullable cases
+   *  (no live tunnel) classify as "sse" because loopback callers don't
+   *  go through Cloudflare. */
+  tunnelTransport: "sse" | "poll";
   lastError: string | null;
   appleNotes: AppleNotesState;
 }
@@ -48,6 +58,11 @@ export interface RedactedTunnelSnapshot {
   publicUrl: null;
   /** Same non-reversible secret-revision marker as the privileged shape. */
   secretRevision: string | null;
+  /** Same transport hint as the privileged shape — exposing it on the
+   *  redacted endpoint is safe because the value carries no secret
+   *  material; it's a transport indicator the client uses to pick
+   *  between SSE and long-polling. */
+  tunnelTransport: "sse" | "poll";
   lastError: string | null;
   appleNotes: {
     enabled: boolean;

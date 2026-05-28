@@ -7,6 +7,7 @@ import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./confi
 import { atomicWriteFile } from "../../atomic-write";
 import { isSupervisedWebChild } from "../health-probe";
 import { generateTunnelSecret, secretRevision } from "./secret";
+import { inferTunnelTransport } from "./transport";
 import { instanceRoot } from "../../paths";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -143,6 +144,7 @@ class TunnelManager {
       secret: persisted.secret,
       secretRevision: secretRevision(persisted.secret),
       publicUrl: null,
+      tunnelTransport: inferTunnelTransport(null),
       lastError: null,
       appleNotes: {
         enabled: persisted.appleNotes.enabled,
@@ -258,6 +260,7 @@ class TunnelManager {
       this.snapshot = {
         ...this.snapshot,
         publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
         lastError: redact(`cloudflared exited (${reason})`)
       };
       // Process death already nulls publicUrl, so any in-flight or
@@ -287,7 +290,12 @@ class TunnelManager {
           ? `code ${launch.process.exitCode}`
           : `signal ${launch.process.signalCode}`;
         const msg = redact(`cloudflared exited (${reason}) during banner parse`);
-        this.snapshot = { ...this.snapshot, publicUrl: null, lastError: msg };
+        this.snapshot = {
+          ...this.snapshot,
+          publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null),
+          lastError: msg
+        };
         return { ok: false, error: msg };
       }
       // Re-check the shutdown flag after the long await — SIGTERM may
@@ -296,7 +304,12 @@ class TunnelManager {
         this.cloudflared = null;
         try { await launch.stop(); } catch { /* already gone */ }
         try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
-        this.snapshot = { ...this.snapshot, publicUrl: null, lastError: "shutdown" };
+        this.snapshot = {
+          ...this.snapshot,
+          publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null),
+          lastError: "shutdown"
+        };
         return { ok: false, error: "shutdown" };
       }
       this.snapshot = {
@@ -305,6 +318,7 @@ class TunnelManager {
         secret,
         secretRevision: secretRevision(secret, url),
         publicUrl: url,
+        tunnelTransport: inferTunnelTransport(url),
         lastError: null
       };
       setRedactionPublicUrl(url);
@@ -338,7 +352,12 @@ class TunnelManager {
       }
       try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
       const msg = err instanceof Error ? err.message : String(err);
-      this.snapshot = { ...this.snapshot, publicUrl: null, lastError: redact(msg) };
+      this.snapshot = {
+        ...this.snapshot,
+        publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
+        lastError: redact(msg)
+      };
       setRedactionPublicUrl(null);
       return { ok: false, error: redact(msg) };
     }
@@ -424,7 +443,13 @@ class TunnelManager {
         // persisted state consistent with the in-memory snapshot.
         try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
         const msg = err instanceof Error ? err.message : String(err);
-        this.snapshot = { ...this.snapshot, enabled: false, publicUrl: null, lastError: redact(msg) };
+        this.snapshot = {
+          ...this.snapshot,
+          enabled: false,
+          publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null),
+          lastError: redact(msg)
+        };
         return { ok: false, error: redact(msg) };
       }
     });
@@ -476,6 +501,7 @@ class TunnelManager {
         ...this.snapshot,
         enabled: false,
         publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
         lastError: errorMsg ? redact(errorMsg) : null,
         appleNotes: notesErr
           ? { ...this.snapshot.appleNotes, lastError: redact(notesErr) }
@@ -878,6 +904,7 @@ class TunnelManager {
       this.snapshot = {
         ...this.snapshot,
         publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
         lastError: redact(
           `tunnel unreachable at the Cloudflare edge after ${failures} consecutive probes — the quick-tunnel hostname likely expired; recycle to restore`
         )
@@ -913,6 +940,7 @@ class TunnelManager {
         this.snapshot = {
           ...this.snapshot,
           publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null),
           lastError: redact(`tunnel unreachable; auto-recycle failed: ${swapError}`)
         };
         appendLog(this.config.instance, "tunnel.edge-unreachable.recycle-failed", { error: redact(swapError) });
