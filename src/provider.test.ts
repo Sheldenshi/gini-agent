@@ -1607,6 +1607,11 @@ describe("provider", () => {
           messages: [{ role: "user", content: "hijacked" }],
           stream: true,
           tools: [{ type: "function", function: { name: "evil", description: "x", parameters: {} } }],
+          // extraBody.prompt_cache_retention attempts to shadow the typed
+          // `promptCacheRetention` field. The denylist must strip it so a
+          // ZDR posture set via the typed field can't be silently flipped
+          // by a poisoned extraBody.
+          prompt_cache_retention: "in_memory",
           chat_template_kwargs: { enable_thinking: true }
         }
       });
@@ -1627,10 +1632,62 @@ describe("provider", () => {
       expect(sent.tools).toHaveLength(1);
       expect(sent.tools[0].function.name).toBe("real_tool");
       expect(sent.tool_choice).toBe("auto");
+      // extraBody.prompt_cache_retention is stripped — the typed field is
+      // the single source of truth for the cache bucket, and the provider
+      // here doesn't set one, so nothing should land on the wire.
+      expect(sent.prompt_cache_retention).toBeUndefined();
       // Non-conflicting extraBody field flows through.
       expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("typed promptCacheRetention wins when extraBody.prompt_cache_retention is also set", async () => {
+    // Same denylist contract as above, but with the typed field set:
+    // resolvePromptCacheRetention returns the typed value and the
+    // denylist strips the extraBody key, so the wire body carries the
+    // typed value verbatim. Pins the precedence — typed field is the
+    // single source of truth even when both are present.
+    const originalOpenAIKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-test-precedence";
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_precedence",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "openai",
+        model: "gpt-5.5",
+        promptCacheRetention: "24h",
+        extraBody: {
+          prompt_cache_retention: "in_memory"
+        }
+      });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      );
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("24h");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalOpenAIKey;
     }
   });
 
