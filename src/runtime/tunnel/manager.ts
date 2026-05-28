@@ -377,14 +377,22 @@ class TunnelManager {
     return promise;
   }
 
-  // Manual test path for the boot-reconcile rollback guard (no unit test —
-  // the rollback branch wraps swapCloudflared which depends on cloudflared
-  // spawn + banner parse, both of which would need invasive mocks to drive
-  // synthetically): persist `tunnel.enabled:true` in config, rename the
-  // cloudflared binary out of PATH (or move the listener web port), boot
-  // the gateway, observe that the reconcile attempt fails AND that
-  // tunnel.enabled on disk is still true after the failure. Restart
-  // proves the persisted intent survives so the next reboot retries.
+  // Manual test path for the boot-reconcile + shutdown rollback guards
+  // (no unit test — the rollback branch wraps swapCloudflared which
+  // depends on cloudflared spawn + banner parse, both of which would
+  // need invasive mocks to drive synthetically). Two scenarios:
+  //   1. Boot-reconcile transient failure: persist `tunnel.enabled:true`
+  //      in config, rename the cloudflared binary out of PATH (or move
+  //      the listener web port), boot the gateway, observe that the
+  //      reconcile attempt fails AND that tunnel.enabled on disk is
+  //      still true after the failure. Restart proves the persisted
+  //      intent survives so the next reboot retries.
+  //   2. SIGTERM during enable: with a live gateway and tunnel enabled,
+  //      issue a user enable() (e.g. re-enable after a brief disable)
+  //      and send SIGTERM during the cloudflared banner-parse window
+  //      (bounded at 30_000 ms by bannerTimeoutMs in cloudflared.ts).
+  //      Observe tunnel.enabled on disk is still true after shutdown
+  //      so the next boot brings the tunnel back up.
   async enable(webPort: number, opts: { reconcileOnly?: boolean } = {}): Promise<TunnelTransitionResult> {
     // Remember the port so rotateSecret can recycle without needing the
     // caller to thread it back through. Set OUTSIDE the queue so the
@@ -426,15 +434,21 @@ class TunnelManager {
         if (!result.ok) {
           // Roll back enabled:true so the next gateway boot doesn't see a
           // stale enable claim with no live tunnel — but ONLY for operator-
-          // driven enables. On the boot-reconcile path the operator's
-          // persisted intent was already enabled:true; a transient
-          // cloudflared spawn failure (binary missing, banner timeout,
-          // port flaky) must NOT silently overwrite that intent. Leaving
-          // disk's enabled:true intact lets the next reboot retry the
-          // tunnel. The in-memory snapshot still reflects the failure so
-          // the UI / status can show the degraded state until the next
-          // attempt.
-          if (!opts.reconcileOnly) {
+          // driven enables AND only when the failure wasn't caused by
+          // shutdown. On the boot-reconcile path the operator's persisted
+          // intent was already enabled:true; a transient cloudflared spawn
+          // failure (binary missing, banner timeout, port flaky) must NOT
+          // silently overwrite that intent. Similarly, if SIGTERM arrived
+          // mid-swap the inner shutdown checks return error:"shutdown" /
+          // "Tunnel manager shutting down" — rolling back here would
+          // disarm the operator's intent purely because of process
+          // teardown, and the next gateway boot would not bring the
+          // tunnel back up. The in-memory snapshot still reflects the
+          // failure so the UI / status can show the degraded state.
+          const causedByShutdown = this.shuttingDown
+            || result.error === "shutdown"
+            || result.error === "Tunnel manager shutting down";
+          if (!opts.reconcileOnly && !causedByShutdown) {
             try { this.persistTunnel({ enabled: false }); } catch { /* best-effort */ }
           }
           this.snapshot = { ...this.snapshot, enabled: false };
@@ -459,13 +473,16 @@ class TunnelManager {
       } catch (err) {
         // Outer-catch covers config-write failure before launch — keep the
         // persisted state consistent with the in-memory snapshot. Same
-        // boot-reconcile guard as the inner branch above: a transient
-        // failure during the reconcile path must not disarm the operator's
-        // persisted enable intent.
-        if (!opts.reconcileOnly) {
+        // boot-reconcile + shutdown guards as the inner branch above:
+        // neither a reconcile-only transient failure nor a SIGTERM-driven
+        // abort should disarm the operator's persisted enable intent.
+        const msg = err instanceof Error ? err.message : String(err);
+        const causedByShutdown = this.shuttingDown
+          || msg === "shutdown"
+          || msg === "Tunnel manager shutting down";
+        if (!opts.reconcileOnly && !causedByShutdown) {
           try { this.persistTunnel( { enabled: false }); } catch { /* best-effort */ }
         }
-        const msg = err instanceof Error ? err.message : String(err);
         this.snapshot = {
           ...this.snapshot,
           enabled: false,
