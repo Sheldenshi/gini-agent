@@ -216,10 +216,14 @@ function StreamingCursor() {
 const styles = StyleSheet.create({
   row: {
     alignSelf: "flex-start",
-    // Assistant replies are typically long-form and contain inline
-    // links; give them most of the viewport so URLs don't end up
-    // wrapping every few characters on a narrow phone.
-    maxWidth: "92%"
+    // Pin to a definite 92% width rather than `maxWidth`. The library's
+    // list rendering uses `flex: 1` on `bullet_list_content`, which
+    // contributes zero intrinsic width to the bubble's measurement —
+    // without a fixed parent frame the bubble sizes only to its widest
+    // non-list paragraph and list rows underneath wrap at a tiny width,
+    // visibly narrower than every other assistant message. A definite
+    // 92% gives the inner `flex: 1` columns a frame to resolve against.
+    width: "92%"
   },
   bubble: {
     backgroundColor: theme.assistantBubble,
