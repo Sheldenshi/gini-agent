@@ -19,7 +19,7 @@ Gini Agent is pre-1.0 and ships from `main`. Security fixes land on `main`; user
 
 ## Scope
 
-Gini is a local-first runtime. Reports we're particularly interested in:
+Gini is a personal agent runtime. Reports we're particularly interested in:
 
 - Authentication or authorization bypass on the gateway's `/api/*` surface.
 - Leakage of provider credentials (Codex OAuth tokens, OpenAI API keys) into logs, traces, or client responses.

@@ -10,7 +10,7 @@ metadata:
 
 # Gini Agent
 
-Gini is a local-first personal agent. The gateway owns durable state and
+Gini is a personal agent. The gateway owns durable state and
 tool execution. **Gini itself operates through `/api/*` and its registered
 tool catalog.** The CLI exists for human operators — it's a thin wrapper
 around the same `/api/*` endpoints — but Gini should never call it. The
