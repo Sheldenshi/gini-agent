@@ -221,7 +221,44 @@ class TunnelManager {
     // enable/recycle, paid only once per transition.
     const healthy = await isSupervisedWebChild(this.config.instance, webPort);
     if (!healthy) {
-      return { ok: false, error: redact(`web port ${webPort} no longer identifies as the supervised gini-web child`) };
+      // The operator's intent was to swap (rotateSecret persisted a fresh
+      // secret BEFORE this call; edge-probe auto-recycle persisted enabled
+      // intent). Leaving the old cloudflared alive after we can't spawn a
+      // new one would keep open SSE/TCP streams flowing through a process
+      // whose served secret no longer matches what the proxy reads from
+      // disk — the exact panic-button violation rotate is supposed to
+      // prevent. Tear down the old process AND the publicUrl sibling so
+      // the proxy stops accepting requests against a stale URL, stamp
+      // the snapshot into the documented degraded shape (enabled &&
+      // publicUrl===null && lastError set), and stop the edge probe so
+      // it doesn't keep counting failures against a vanished URL. The
+      // caller's `if (!swap.ok)` branch then runs (rotateSecret preserves
+      // its pre-stamped new secret on disk per the existing pre-stamp
+      // contract; auto-recycle falls back to its degraded-with-lastError
+      // log path).
+      //
+      // Manual test path: trigger rotateSecret with the Next.js
+      // supervised child killed externally between the pre-probe at
+      // rotateSecret and the re-probe in swapCloudflared; assert
+      // snapshot reports enabled && publicUrl===null && lastError,
+      // `pgrep -fl cloudflared` shows no process bound to this
+      // instance, and the next `enable()` brings it back cleanly.
+      if (this.cloudflared) {
+        const prev = this.cloudflared;
+        this.cloudflared = null;
+        try { await prev.stop(); } catch { /* already gone */ }
+      }
+      try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+      setRedactionPublicUrl(null);
+      const message = `web port ${webPort} not healthy — swap aborted, prior cloudflared stopped`;
+      this.snapshot = {
+        ...this.snapshot,
+        publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
+        lastError: redact(message)
+      };
+      this.stopEdgeProbe();
+      return { ok: false, error: redact(message) };
     }
     if (this.cloudflared) {
       const prev = this.cloudflared;
