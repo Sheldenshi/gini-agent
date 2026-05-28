@@ -146,6 +146,25 @@ export interface ProviderConfig {
   // referenced by `apiKeyEnv`, never in extraBody. Caller is responsible
   // for keeping values JSON-serializable.
   extraBody?: Record<string, unknown>;
+  // OpenAI prompt-cache retention bucket. Sent verbatim as the
+  // `prompt_cache_retention` field on outbound /responses and
+  // /chat/completions request bodies, alongside the implicit prefix-match
+  // caching OpenAI does automatically. Per
+  // https://platform.openai.com/docs/guides/prompt-caching the field
+  // currently accepts `"in_memory"` (default; 5–10 min idle, 1 h max)
+  // and `"24h"` (extended; up to 24 h). Models in the gpt-5.5 family
+  // default to and only accept `"24h"`. Cached input tokens are billed
+  // at 10% of the base input price (e.g. gpt-5.5: $5.00 input vs $0.50
+  // cached). Field is treated as a free-form string so future retention
+  // tiers OpenAI adds can be passed through without a code change.
+  // When omitted, the runtime picks a model-aware default — codex and
+  // the gpt-5.x / gpt-5-codex / gpt-4.1 families opt in to `"24h"`;
+  // other providers and models send no field and inherit the
+  // provider's default behavior. Set to an empty string to suppress
+  // the default and fall back to whatever the provider does on its own.
+  // Ignored by providers whose surface does not honor the field
+  // (openrouter, deepseek, local, echo).
+  promptCacheRetention?: string;
 }
 
 // Approval policy mode for the per-instance runtime and per-job overlay.

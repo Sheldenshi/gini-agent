@@ -328,6 +328,48 @@ function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
   return false;
 }
 
+// Resolve the value to send as `prompt_cache_retention` on outbound
+// /responses and /chat/completions requests, or `undefined` when the
+// field must be omitted. OpenAI's prompt cache is implicit (any prefix
+// of 1024 tokens or more is auto-cached); this field selects which
+// retention bucket the cache write lands in. Per
+// https://platform.openai.com/docs/guides/prompt-caching the field
+// currently accepts `"in_memory"` (default; 5–10 min idle, 1 h max)
+// and `"24h"` (extended; up to 24 h, billed at 10% of base input price
+// on the cache-read side, e.g. gpt-5.5 $5.00 input vs $0.50 cached).
+//
+// Resolution order:
+// 1. `provider.promptCacheRetention` explicit override always wins.
+//    Empty string suppresses the field entirely so a caller can
+//    deliberately fall back to the provider's own default.
+// 2. Model-aware default for the openai provider — gpt-5.x,
+//    gpt-5-codex, and gpt-4.1 model families get `"24h"`.
+// 3. Everything else (codex, openrouter, deepseek, local, echo, openai
+//    with older models) returns `undefined` and the field is not sent.
+//
+// The codex provider is intentionally NOT in the default list even
+// though it talks to a /responses-shaped endpoint: live testing showed
+// that the chatgpt.com codex backend rejects unknown body fields with
+// "Unsupported parameter: prompt_cache_retention" and a 400, breaking
+// the request entirely. The backend appears to do its own implicit
+// caching independent of the field, so omitting it costs nothing on
+// that surface. A user who needs to force the field on after a future
+// codex-backend update can still do so via `promptCacheRetention` on
+// the provider config. The runtime intentionally treats the resolved
+// value as a free-form string so future retention tiers OpenAI adds
+// can be passed through verbatim via `promptCacheRetention` without a
+// code change.
+function resolvePromptCacheRetention(provider: ProviderConfig): string | undefined {
+  if (provider.promptCacheRetention !== undefined) {
+    return provider.promptCacheRetention.length > 0 ? provider.promptCacheRetention : undefined;
+  }
+  if (provider.name === "openai") {
+    const model = provider.model ?? "";
+    if (/^gpt-(5|4\.1)/.test(model)) return "24h";
+  }
+  return undefined;
+}
+
 // When falling back to the responses API for codex, collapse all `system`
 // messages into one instructions block. tool/assistant messages are dropped
 // since the responses path doesn't model them.
@@ -363,6 +405,8 @@ async function callToolCallingChatCompletions(
     body.tools = tools;
     body.tool_choice = "auto";
   }
+  const retention = resolvePromptCacheRetention(provider);
+  if (retention) body.prompt_cache_retention = retention;
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
@@ -578,6 +622,8 @@ async function callToolCallingResponses(
       input
     };
     if (responsesTools.length > 0) body.tools = responsesTools;
+    const retention = resolvePromptCacheRetention(provider);
+    if (retention) body.prompt_cache_retention = retention;
 
     const response = await fetch(`${baseUrl}/responses`, {
       method: "POST",
@@ -1512,6 +1558,17 @@ function withDeepSeekThinkingDefaults(
   return merged;
 }
 
+// Forward an explicit `promptCacheRetention` through normalizeProvider so
+// the resolver in resolvePromptCacheRetention can see the override. The
+// field is intentionally preserved on every HTTP-backed provider branch
+// (not just the model-aware defaults) so a user can opt a non-default
+// provider in by setting the field directly — useful when a new OpenAI-
+// compatible backend adds support after this code ships.
+function preservePromptCacheRetention(provider: ProviderConfig): Partial<ProviderConfig> {
+  if (provider.promptCacheRetention === undefined) return {};
+  return { promptCacheRetention: provider.promptCacheRetention };
+}
+
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {
@@ -1519,7 +1576,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "gpt-5.4-mini",
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
+      ...preservePromptCacheRetention(provider)
     };
   }
   if (provider.name === "openrouter") {
@@ -1528,7 +1586,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "openrouter/auto",
       baseUrl: pickBaseUrl(provider.baseUrl, "https://openrouter.ai/api/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
+      ...preservePromptCacheRetention(provider)
     };
   }
   if (provider.name === "local") {
@@ -1537,7 +1596,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "local/default",
       baseUrl: pickBaseUrl(provider.baseUrl, "http://127.0.0.1:11434/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
+      ...preservePromptCacheRetention(provider)
     };
   }
   if (provider.name === "deepseek") {
@@ -1548,7 +1608,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_DEEPSEEK_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "DEEPSEEK_API_KEY",
-      ...(extraBody ? { extraBody } : {})
+      ...(extraBody ? { extraBody } : {}),
+      ...preservePromptCacheRetention(provider)
     };
   }
   if (provider.name === "codex") {
@@ -1556,7 +1617,8 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       name: "codex",
       model: provider.model || DEFAULT_CODEX_MODEL,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL),
-      apiKeyEnv: provider.apiKeyEnv
+      apiKeyEnv: provider.apiKeyEnv,
+      ...preservePromptCacheRetention(provider)
     };
   }
   return {
@@ -1579,6 +1641,9 @@ async function callOpenAIResponses(
   // second attempt after readCodexBearer re-reads auth.json. OpenAI uses
   // an env-var key with no rotation surface, so a retry would just
   // re-fail with the same bearer.
+  const retention = resolvePromptCacheRetention(provider);
+  const cacheFields = retention ? { prompt_cache_retention: retention } : {};
+
   if (provider.name === "codex") {
     return withCodexSessionRetry(async () => {
       const bearer = readCodexBearer(provider);
@@ -1602,7 +1667,8 @@ async function callOpenAIResponses(
                 { type: "input_text", text: input }
               ]
             }
-          ]
+          ],
+          ...cacheFields
         })
       });
       return readCodexStream(response, provider, onDelta);
@@ -1629,7 +1695,8 @@ async function callOpenAIResponses(
             { type: "input_text", text: input }
           ]
         }
-      ]
+      ],
+      ...cacheFields
     })
   });
 
@@ -1669,7 +1736,11 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "system", content: systemContext },
         { role: "user", content: input }
       ],
-      stream: false
+      stream: false,
+      ...(() => {
+        const retention = resolvePromptCacheRetention(provider);
+        return retention ? { prompt_cache_retention: retention } : {};
+      })()
     })
   });
   const rawPayload = await response.text();
