@@ -325,9 +325,29 @@ class TunnelManager {
       try {
         atomicWriteFile(publicUrlPath(this.config.instance), `${url}\n`);
       } catch (writeErr) {
+        // The sibling publicUrl file is what the proxy reads on every
+        // request via readPersistedPublicUrl. If the write fails, the
+        // proxy sees an empty string and 404s every request — but the
+        // snapshot would still claim publicUrl:url + enabled:true,
+        // lying to the PATCH handler, settings card, and QR launcher.
+        // Bring the snapshot back to a coherent failed state, kill the
+        // freshly spawned cloudflared so we don't leak the process, and
+        // return ok:false so the caller's existing failure-handling
+        // path (rollback the persisted enable intent, log the error)
+        // runs.
         const writeMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
-        this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
+        const redactedMsg = redact(`tunnel.publicUrl write failed: ${writeMsg}`);
         appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
+        this.cloudflared = null;
+        try { await launch.stop(); } catch { /* already gone */ }
+        setRedactionPublicUrl(null);
+        this.snapshot = {
+          ...this.snapshot,
+          publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null),
+          lastError: redactedMsg
+        };
+        return { ok: false, error: redactedMsg };
       }
       // Start the periodic edge-reachability probe. Covers enable(), the
       // inline rotate-secret recycle, and boot reconcile in one place —
