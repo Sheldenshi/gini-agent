@@ -18,6 +18,18 @@ import {
 } from "../../state/secrets-env";
 import type { RuntimeConfig } from "../../types";
 
+// Carry `promptCacheRetention` across a `gini setup` rebuild of
+// `config.provider` when the provider name is unchanged. Without this,
+// a re-run of `gini setup` to change model or rotate credentials would
+// silently drop a ZDR-relevant retention bucket that an operator set
+// via `gini provider set --prompt-cache-retention …`. Matches the same
+// preservation shape used by `gini provider set` and the setup-api.
+function carriedRetention(config: RuntimeConfig, newProviderName: string): { promptCacheRetention?: string } {
+  if (config.provider?.name !== newProviderName) return {};
+  const value = config.provider.promptCacheRetention;
+  return value == null ? {} : { promptCacheRetention: value };
+}
+
 export interface SetupIO {
   select<T>(prompt: string, choices: { label: string; value: T }[], defaultIndex?: number): Promise<T>;
   prompt(question: string, defaultValue?: string): Promise<string>;
@@ -287,7 +299,7 @@ async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<vo
     const model = config.provider?.name === "codex" && config.provider.model
       ? config.provider.model
       : codexProvider.defaultModel;
-    config.provider = normalizeProvider({ name: "codex", model });
+    config.provider = normalizeProvider({ name: "codex", model, ...carriedRetention(config, "codex") });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
     io.success(`Auto-configured: codex (${model}), credentials from ${codexStatus.source === "env" ? "CODEX_AUTH_JSON env" : "~/.codex/auth.json"}`);
     return;
@@ -301,7 +313,7 @@ async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<vo
     const model = config.provider?.name === "openai" && config.provider.model
       ? config.provider.model
       : openaiProvider.defaultModel;
-    config.provider = normalizeProvider({ name: "openai", model });
+    config.provider = normalizeProvider({ name: "openai", model, ...carriedRetention(config, "openai") });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
     io.success(`Auto-configured: openai (${model}), key from ${status.source === "env" ? "env" : "secrets.env"}`);
     return;
@@ -348,7 +360,7 @@ async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO, current: Pr
   const currentModel = config.provider?.model;
   const newModel = await selectModelForProvider(io, current, currentModel ?? null, true);
   if (newModel === null) return;
-  config.provider = normalizeProvider({ name: current.id, model: newModel });
+  config.provider = normalizeProvider({ name: current.id, model: newModel, ...carriedRetention(config, current.id) });
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   io.success(`Provider set to ${current.id} (${newModel}).`);
 }
@@ -377,7 +389,7 @@ async function runFreshFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
 
   const model = await selectModelForProvider(io, provider, null, false);
   const chosenModel = model ?? provider.defaultModel;
-  config.provider = normalizeProvider({ name: provider.id, model: chosenModel });
+  config.provider = normalizeProvider({ name: provider.id, model: chosenModel, ...carriedRetention(config, provider.id) });
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   io.success(`Provider set to ${provider.id} (${chosenModel}).`);
 }

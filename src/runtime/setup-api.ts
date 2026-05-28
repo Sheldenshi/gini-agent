@@ -43,11 +43,35 @@
 // child's responsibility.
 
 import { writeFileSync } from "node:fs";
-import { configPath } from "../paths";
+import { configPath, loadConfig } from "../paths";
 import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
+
+// Read the latest persisted `promptCacheRetention` from disk for the
+// named provider. The gateway loads `config` once at boot and reuses
+// that in-memory snapshot for every request handler, so a CLI write
+// (`gini provider set --prompt-cache-retention 24h`) that lands while
+// the gateway is running will be invisible to the in-memory snapshot.
+// If a UI save then ran the preservation off that stale snapshot, the
+// next writeFileSync would erase the CLI-written value. Re-reading the
+// disk just for this ZDR-relevant field closes that window without
+// taking a dependency on a full config reload (other fields stay
+// owned by their original surfaces).
+function diskPromptCacheRetention(instance: string, providerName: string): string | undefined {
+  try {
+    const onDisk = loadConfig(instance);
+    if (onDisk.provider?.name !== providerName) return undefined;
+    const value = onDisk.provider.promptCacheRetention;
+    return value == null ? undefined : value;
+  } catch {
+    // A malformed config.json shouldn't crash the save — fall through
+    // to "no preserved value" so the write proceeds. The user can
+    // re-set the field afterward.
+    return undefined;
+  }
+}
 
 const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
@@ -152,16 +176,16 @@ export async function setSetupProvider(
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
       : undefined;
-    // Preserve `promptCacheRetention` from the existing provider config
-    // when the same provider name is being re-saved — the web setup form
-    // currently has no field for it, so without this any unrelated save
-    // (model swap, baseUrl edit) would silently strip the retention
-    // bucket the operator chose by hand. That field is ZDR-relevant per
-    // the OpenAI prompt-caching docs, so the rewrite cannot drop it.
-    const carriedRetention =
-      config.provider?.name === providerName && config.provider.promptCacheRetention !== undefined
-        ? { promptCacheRetention: config.provider.promptCacheRetention }
-        : {};
+    // Preserve `promptCacheRetention` from the latest persisted provider
+    // config when the same provider name is being re-saved. The web
+    // setup form has no UI for the field, so without this any unrelated
+    // save (model swap, baseUrl edit) would silently strip the retention
+    // bucket the operator chose by hand. ZDR-relevant per the OpenAI
+    // prompt-caching docs, so the rewrite cannot drop it. Source the
+    // value from disk (not from in-memory config) so an interleaving CLI
+    // write that happened after gateway boot is not clobbered.
+    const carriedValue = diskPromptCacheRetention(config.instance, providerName);
+    const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
@@ -201,16 +225,14 @@ export async function setSetupProvider(
   const model = typeof payload.model === "string" && payload.model.length > 0
     ? payload.model
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
-  // Same preservation as the env-keyed branch above — a codex re-save
-  // (e.g. model swap) shouldn't drop a `promptCacheRetention` an
-  // operator set elsewhere. The codex backend currently rejects the
-  // field, but per the ProviderConfig doc-comment the runtime is a
-  // transparent forwarder so future backend support works without code
-  // changes.
-  const carriedRetention =
-    config.provider?.name === "codex" && config.provider.promptCacheRetention !== undefined
-      ? { promptCacheRetention: config.provider.promptCacheRetention }
-      : {};
+  // Same disk-sourced preservation as the env-keyed branch above — a
+  // codex re-save (e.g. model swap) shouldn't drop a
+  // `promptCacheRetention` an operator set via the CLI between gateway
+  // boot and now. The codex backend currently rejects the field, but
+  // per the ProviderConfig doc-comment the runtime is a transparent
+  // forwarder so future backend support works without code changes.
+  const carriedValue = diskPromptCacheRetention(config.instance, "codex");
+  const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
   config.provider = normalizeProvider({ name: "codex", model, ...carriedRetention } as ProviderConfig);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   // Codex switching DOES require a plist refresh: the gateway's config.json

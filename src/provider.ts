@@ -360,6 +360,21 @@ function resolvePromptCacheRetention(provider: ProviderConfig): string | undefin
   return provider.promptCacheRetention.length > 0 ? provider.promptCacheRetention : undefined;
 }
 
+// Spread-friendly wrapper around the resolver: returns the
+// `{ prompt_cache_retention }` fragment to splice into a request body, or
+// `{}` when the field must be omitted. Every outbound request builder in
+// this module funnels through this single helper instead of repeating
+// the `const retention = resolvePromptCacheRetention(...); if (retention)
+// body.prompt_cache_retention = retention;` dance — that pattern existed
+// in four different shapes across the file (mutate-body, inline spread,
+// named-const, IIFE) and made it easy for a new builder to silently drop
+// the field. With one helper at every call site, a missing
+// `...promptCacheRetentionFields(provider)` is conspicuous in review.
+function promptCacheRetentionFields(provider: ProviderConfig): { prompt_cache_retention?: string } {
+  const retention = resolvePromptCacheRetention(provider);
+  return retention ? { prompt_cache_retention: retention } : {};
+}
+
 // When falling back to the responses API for codex, collapse all `system`
 // messages into one instructions block. tool/assistant messages are dropped
 // since the responses path doesn't model them.
@@ -389,14 +404,13 @@ async function callToolCallingChatCompletions(
     ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
-    stream: wantStream
+    stream: wantStream,
+    ...promptCacheRetentionFields(provider)
   };
   if (tools.length > 0) {
     body.tools = tools;
     body.tool_choice = "auto";
   }
-  const retention = resolvePromptCacheRetention(provider);
-  if (retention) body.prompt_cache_retention = retention;
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: { ...headers, ...(wantStream ? { accept: "text/event-stream" } : {}) },
@@ -609,11 +623,10 @@ async function callToolCallingResponses(
       store: false,
       stream: true,
       instructions,
-      input
+      input,
+      ...promptCacheRetentionFields(provider)
     };
     if (responsesTools.length > 0) body.tools = responsesTools;
-    const retention = resolvePromptCacheRetention(provider);
-    if (retention) body.prompt_cache_retention = retention;
 
     const response = await fetch(`${baseUrl}/responses`, {
       method: "POST",
@@ -1404,7 +1417,6 @@ async function callStructuredCodex<T>(
   // (retain/reflect/reinforce) doesn't lose a whole structured turn to a
   // mid-stream rotation. The JSON parsing afterward stays outside the
   // retry because a malformed payload is a model failure, not an auth one.
-  const retention = resolvePromptCacheRetention(provider);
   const streamed = await withCodexSessionRetry(async () => {
     const bearer = readCodexBearer(provider);
     const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -1432,7 +1444,7 @@ async function callStructuredCodex<T>(
             ]
           }
         ],
-        ...(retention ? { prompt_cache_retention: retention } : {})
+        ...promptCacheRetentionFields(provider)
       })
     });
     // readCodexStream already handles non-OK and empty-output as throws.
@@ -1475,7 +1487,6 @@ async function callStructuredChatCompletions<T>(
     ...(provider.name === "openrouter" ? { "HTTP-Referer": "http://127.0.0.1:7337", "X-Title": "Gini Agent" } : {})
   };
   const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
-  const retention = resolvePromptCacheRetention(provider);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -1488,7 +1499,7 @@ async function callStructuredChatCompletions<T>(
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
       stream: false,
-      ...(retention ? { prompt_cache_retention: retention } : {})
+      ...promptCacheRetentionFields(provider)
     })
   });
   const rawPayload = await response.text();
@@ -1638,9 +1649,6 @@ async function callOpenAIResponses(
   // second attempt after readCodexBearer re-reads auth.json. OpenAI uses
   // an env-var key with no rotation surface, so a retry would just
   // re-fail with the same bearer.
-  const retention = resolvePromptCacheRetention(provider);
-  const cacheFields = retention ? { prompt_cache_retention: retention } : {};
-
   if (provider.name === "codex") {
     return withCodexSessionRetry(async () => {
       const bearer = readCodexBearer(provider);
@@ -1665,7 +1673,7 @@ async function callOpenAIResponses(
               ]
             }
           ],
-          ...cacheFields
+          ...promptCacheRetentionFields(provider)
         })
       });
       return readCodexStream(response, provider, onDelta);
@@ -1693,7 +1701,7 @@ async function callOpenAIResponses(
           ]
         }
       ],
-      ...cacheFields
+      ...promptCacheRetentionFields(provider)
     })
   });
 
@@ -1734,10 +1742,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "user", content: input }
       ],
       stream: false,
-      ...(() => {
-        const retention = resolvePromptCacheRetention(provider);
-        return retention ? { prompt_cache_retention: retention } : {};
-      })()
+      ...promptCacheRetentionFields(provider)
     })
   });
   const rawPayload = await response.text();
@@ -2406,7 +2411,6 @@ async function callVisionCodex(
   // session-rotation failure mode is a 401 on the initial response (not
   // a mid-stream error event). Map that to CodexSessionExpiredError so
   // withCodexSessionRetry can re-read auth.json and try again.
-  const retention = resolvePromptCacheRetention(provider);
   return withCodexSessionRetry(async () => {
     const bearer = readCodexBearer(provider);
     const baseUrl = resolveBaseUrl(provider.baseUrl, defaultBaseUrl(provider));
@@ -2434,7 +2438,7 @@ async function callVisionCodex(
           }
         ],
         max_output_tokens: maxTokens,
-        ...(retention ? { prompt_cache_retention: retention } : {})
+        ...promptCacheRetentionFields(provider)
       })
     });
     const rawPayload = await response.text();
@@ -2481,7 +2485,6 @@ async function callVisionChatCompletions(
   const tokenBudgetField = provider.name === "openai"
     ? { max_completion_tokens: maxTokens }
     : { max_tokens: maxTokens };
-  const retention = resolvePromptCacheRetention(provider);
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
@@ -2499,7 +2502,7 @@ async function callVisionChatCompletions(
       ],
       stream: false,
       ...tokenBudgetField,
-      ...(retention ? { prompt_cache_retention: retention } : {})
+      ...promptCacheRetentionFields(provider)
     })
   });
   const rawPayload = await response.text();
