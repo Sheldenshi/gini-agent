@@ -1629,8 +1629,17 @@ function chatBlockPoll(config: RuntimeConfig, request: Request, sessionId: strin
     accumulated.push(block);
   }
   if (accumulated.length > 0) {
-    const last = accumulated[accumulated.length - 1]!;
-    coalesceTimer = setTimeout(() => finish(wireId(last)), LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    // Read the latest entry INSIDE the timer callback rather than
+    // freezing the backfill's last block in this closure. If a newer
+    // block lands on the live subscription within the 25 ms coalesce
+    // window, it pushes onto `accumulated`; the cursor we return must
+    // reflect THAT block, not the backfill's. Otherwise the client's
+    // next poll resumes from the backfill cursor and re-receives the
+    // newer block on top of the one it just got.
+    coalesceTimer = setTimeout(() => {
+      const last = accumulated[accumulated.length - 1]!;
+      finish(wireId(last));
+    }, LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
   }
 
   // Live subscription for blocks that land after the backfill snapshot.

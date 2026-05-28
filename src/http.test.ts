@@ -2346,6 +2346,67 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("GET /api/chat/:id/poll cursor reflects the LATEST block when a newer block lands during the coalesce window", async () => {
+    // Pins the closure-scoped cursor race in chatBlockPoll's backfill
+    // branch. The bug: backfill captures `last` at backfill time and
+    // freezes it in the timer closure. When a newer block lands on the
+    // live subscription within the 25 ms coalesce window
+    // (LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS), it pushes onto
+    // `accumulated` but the timer still fires with the stale backfill
+    // cursor — the client's next poll resumes from the backfill point
+    // and re-receives the newer block. The fix reads
+    // `accumulated[accumulated.length - 1]` INSIDE the timer callback.
+    const { insertChatBlock } = await import("./state");
+    const config = testConfig("chat-blocks-poll-cursor-race");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "poll cursor race" })
+    });
+    // Seed a backfill block so the backfill branch arms its timer.
+    const backfillBlock = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: "backfill"
+    });
+    // Start the long poll. The handler returns a Promise<Response>;
+    // backfill arms the 25 ms timer immediately
+    // (LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS), so we have a 25 ms
+    // window to inject a fresh block via the subscription.
+    const pollPromise = rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/poll`,
+      {},
+      config.token
+    );
+    // Schedule a fresh insert mid-window — 5 ms after the timer arms,
+    // well inside the 25 ms coalesce gate but well after the backfill
+    // pushed its entry.
+    await Bun.sleep(5);
+    const laterBlock = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: "later"
+    });
+    // Wait for the poll response. With the fix, the cursor encodes
+    // laterBlock.id; pre-fix it would encode backfillBlock.id and the
+    // client would re-receive laterBlock on the next poll.
+    const response = await pollPromise;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(Array.isArray(body.events)).toBe(true);
+    expect(body.events.length).toBeGreaterThanOrEqual(2);
+    // The cursor is `<block_id>:<ts>` — split on the FIRST colon since
+    // block ids never contain `:` (block_<random>) but ISO timestamps
+    // do.
+    const colon = body.cursor.indexOf(":");
+    expect(colon).toBeGreaterThan(0);
+    const cursorBlockId = body.cursor.slice(0, colon);
+    expect(cursorBlockId).toBe(laterBlock.id);
+    expect(cursorBlockId).not.toBe(backfillBlock.id);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.
