@@ -3069,6 +3069,76 @@ describe("runtime api", () => {
       expect(badgeB.unread).toBe(1);
     });
 
+    test("DELETE /api/chat/:id/read re-inflates the badge for the caller's device only", async () => {
+      const config = testConfig("chat-unread-swipe");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "swipe" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const b = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "ping"
+      });
+
+      // Both devices catch up first so the baseline badge is 0.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerA, body: JSON.stringify({ lastReadBlockId: b.id })
+      });
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerB, body: JSON.stringify({ lastReadBlockId: b.id })
+      });
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(0);
+      expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
+
+      // iPhone A swipes "Mark unread" — its badge bounces to 1, iPhone B unchanged.
+      const cleared = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(cleared.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+      expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
+
+      // Idempotent — second call on the already-empty row stays 1.
+      const second = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(second.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "DELETE", headers: headerA },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${session.id}/read`,
+        { method: "DELETE" },
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+    });
+
     test("read + badge endpoints require authentication", async () => {
       const config = testConfig("chat-read-auth");
       const handler = createHandler(config);
