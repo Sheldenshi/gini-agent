@@ -18,19 +18,21 @@ const nextConfig: NextConfig = {
   // allow both forms explicitly. Production builds don't read this —
   // it's a dev-server concern only.
   //
-  // We deliberately do NOT allow `*.trycloudflare.com` here. The proxy
-  // matcher in web/src/proxy.ts excludes `/_next/webpack-hmr` and
-  // `/_next/static`, so the WebSocket upgrade and source-map fetches
-  // bypass the secret gate and reach Next.js dev directly. Allowing the
-  // tunnel host would let any anonymous client that can reach the live
-  // tunnel hostname open `wss://<live-tunnel>/_next/webpack-hmr` and
-  // pull `https://<live-tunnel>/_next/static/...` — leaking module HMR
-  // events and source maps without ever proving knowledge of the
-  // tunnel secret. The local browser still gets HMR over loopback;
-  // HMR-over-tunnel on mobile was already fragile across cloudflared's
-  // keepalive limits, so the convenience tradeoff is small relative to
-  // the disclosure surface.
-  allowedDevOrigins: ["127.0.0.1", "localhost"],
+  // `*.trycloudflare.com` MUST be in the allowlist for tunneled access
+  // to work in dev mode. Without it, Next.js 16 rejects every Origin
+  // check from the tunnel host: the HMR WebSocket upgrade is denied,
+  // and Client Component hydration on tunneled pages silently fails
+  // (the page renders the SSR HTML but `useEffect` never runs). That
+  // breaks the `/connect` deep-link interstitial (no setTimeout
+  // fallback fires, the page sits on "Opening Gini…" forever) and
+  // every interactive control on `/settings` / `/chat` / etc. The
+  // earlier attempt to drop the entry to gate the HMR + source-map
+  // disclosure surface (commit 47343f2) made the tunnel functionally
+  // unusable; we restored the entry and accept the dev-only HMR
+  // exposure as a tradeoff. Production builds don't ship HMR, so the
+  // disclosure surface is bounded to local dev instances reached
+  // through their quick tunnel.
+  allowedDevOrigins: ["127.0.0.1", "localhost", "*.trycloudflare.com"],
   turbopack: {
     root: resolve(import.meta.dirname)
   }
