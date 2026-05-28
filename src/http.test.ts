@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
 import { tunnelManager } from "./runtime/tunnel";
+import { removeMemoryDb } from "./state/memory-db";
 import type { RuntimeConfig } from "./types";
 
 describe("runtime api", () => {
@@ -3022,6 +3023,14 @@ function testConfig(instance: string): RuntimeConfig {
   const root = "/tmp/gini-http-tests";
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
+  // Drop the cached SQLite handle for this instance before nuking the
+  // directory. Without this, a prior test that opened the per-instance
+  // memory DB leaves an open `bun:sqlite` handle pointing at the now-
+  // unlinked file. The next call to getMemoryDb returns that cached
+  // handle (the cache key is the instance name) and any write fails
+  // because the inode is gone. removeMemoryDb closes the cached handle
+  // AND unlinks the file + WAL/SHM siblings in one shot.
+  removeMemoryDb(instance);
   rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
   return {
     instance,
