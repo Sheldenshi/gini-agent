@@ -365,7 +365,15 @@ function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
 // CLI setup carry, setup-api disk read) uses the same rule.
 export function normalizeRetentionValue(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  return value.length > 0 ? value : undefined;
+  // Trim before the empty-check so a config typo like `"24h "` or a
+  // whitespace-only value (`" "`) collapses to undefined here instead
+  // of being forwarded verbatim. OpenAI's documented retention values
+  // are short fixed tokens with no internal whitespace, and the
+  // surrounding code paths never need to preserve padding, so trimming
+  // is purely defensive — it catches typos without restricting legit
+  // values OpenAI may add in the future.
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function resolvePromptCacheRetention(provider: ProviderConfig): string | undefined {

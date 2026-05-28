@@ -2,7 +2,7 @@
 
 ## Decision
 
-`ProviderConfig` carries an optional `extraBody?: Record<string, unknown>` that the runtime merges into every chat-completions request body sent by the local, openai, and openrouter providers. A reserved-key denylist guards the merge so user-supplied extras can never override fields the runtime owns. Codex (`/responses`) and echo ignore `extraBody` entirely.
+`ProviderConfig` carries an optional `extraBody?: Record<string, unknown>` that the runtime merges into every chat-completions request body sent by the local, openai, openrouter, and deepseek providers. A reserved-key denylist guards the merge so user-supplied extras can never override fields the runtime owns. Codex (`/responses`) and echo ignore `extraBody` entirely.
 
 The CLI surfaces four flags on `gini provider set`: `--base-url`, `--api-key-env`, `--extra-body`, and `--prompt-cache-retention`. They write directly into the persisted instance config. No HTTP/BFF surface for `extraBody` ships in this iteration; that is deferred.
 

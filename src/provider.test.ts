@@ -769,9 +769,12 @@ describe("provider", () => {
     // Pin the wire-side contract: an explicit `promptCacheRetention`
     // override on ProviderConfig becomes a `prompt_cache_retention`
     // field on the request body. Without this assertion the
-    // promptCacheRetentionFields helper or its call sites could drift
-    // and silently drop the field — exactly the maintainability risk
-    // the round-3 refactor consolidated the 8 builders to prevent.
+    // promptCacheRetentionFields helper or any of its call sites could
+    // drift and silently drop the field — the eight request builders
+    // funnel through a single helper precisely so the field is either
+    // present everywhere or absent everywhere, and this test pins
+    // that contract on a representative chat-completions path.
+    const originalOpenAIKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "sk-test-fixture";
     const originalFetch = globalThis.fetch;
     let captured: { url: string; init: RequestInit } | undefined;
@@ -805,7 +808,8 @@ describe("provider", () => {
       expect(sent.prompt_cache_retention).toBe("24h");
     } finally {
       globalThis.fetch = originalFetch;
-      delete process.env.OPENAI_API_KEY;
+      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalOpenAIKey;
     }
   });
 
@@ -815,6 +819,7 @@ describe("provider", () => {
     // string drops the field entirely so a corrupted-load shape
     // (number, array, object) never reaches the provider as
     // `prompt_cache_retention: ["24h"]` and 400s server-side.
+    const originalOpenAIKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = "sk-test-fixture";
     const originalFetch = globalThis.fetch;
     let captured: { url: string; init: RequestInit } | undefined;
@@ -861,7 +866,8 @@ describe("provider", () => {
       }
     } finally {
       globalThis.fetch = originalFetch;
-      delete process.env.OPENAI_API_KEY;
+      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = originalOpenAIKey;
     }
   });
 
