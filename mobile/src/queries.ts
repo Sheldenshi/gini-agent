@@ -441,7 +441,12 @@ export function useChatBlocks(sessionId: string | null): {
             const idx = Math.min(consecutiveErrors, CHAT_POLL_BACKOFF_MS.length - 1);
             const delay = CHAT_POLL_BACKOFF_MS[idx]!;
             consecutiveErrors += 1;
-            const { promise: wait, resolve: settle } = Promise.withResolvers<void>();
+            // Hermes on RN 0.81.5 doesn't ship Promise.withResolvers (V0
+            // engine; V1 lands later), so the long-poll backoff loop uses
+            // the manual deferred pattern instead. Revisit once the RN
+            // upgrade lands Hermes V1 — `CLAUDE.md` prefers withResolvers.
+            let settle!: () => void;
+            const wait = new Promise<void>((resolve) => { settle = resolve; });
             const timer = setTimeout(settle, delay);
             controller.signal.addEventListener("abort", () => {
               clearTimeout(timer);
