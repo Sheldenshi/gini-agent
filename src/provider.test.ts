@@ -765,6 +765,106 @@ describe("provider", () => {
     }
   });
 
+  test("openai tool-calling forwards promptCacheRetention as prompt_cache_retention in the body", async () => {
+    // Pin the wire-side contract: an explicit `promptCacheRetention`
+    // override on ProviderConfig becomes a `prompt_cache_retention`
+    // field on the request body. Without this assertion the
+    // promptCacheRetentionFields helper or its call sites could drift
+    // and silently drop the field — exactly the maintainability risk
+    // the round-3 refactor consolidated the 8 builders to prevent.
+    process.env.OPENAI_API_KEY = "sk-test-fixture";
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_openai_1",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "openai",
+        model: "gpt-5.5",
+        promptCacheRetention: "24h"
+      });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hello" }],
+        []
+      );
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("24h");
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete process.env.OPENAI_API_KEY;
+    }
+  });
+
+  test("promptCacheRetention omits the wire field when unset, empty, or a non-string shape", async () => {
+    // normalizeRetentionValue is the single funnel for resolving the
+    // typed field into a wire value. Anything that is not a non-empty
+    // string drops the field entirely so a corrupted-load shape
+    // (number, array, object) never reaches the provider as
+    // `prompt_cache_retention: ["24h"]` and 400s server-side.
+    process.env.OPENAI_API_KEY = "sk-test-fixture";
+    const originalFetch = globalThis.fetch;
+    let captured: { url: string; init: RequestInit } | undefined;
+    const handler = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_openai_2",
+        choices: [{
+          finish_reason: "stop",
+          message: { role: "assistant", content: "ok" }
+        }]
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+    globalThis.fetch = handler;
+
+    const fixtures: Array<{ label: string; value: unknown }> = [
+      { label: "undefined", value: undefined },
+      { label: "empty string", value: "" },
+      { label: "array", value: ["24h"] },
+      { label: "number", value: 42 }
+    ];
+
+    try {
+      for (const fixture of fixtures) {
+        captured = undefined;
+        const provider = normalizeProvider({
+          name: "openai",
+          model: "gpt-5.5",
+          // cast to satisfy the typed field while exercising the
+          // runtime guard against non-string persisted shapes.
+          promptCacheRetention: fixture.value as string | undefined
+        });
+        await generateToolCallingResponse(
+          config(provider),
+          [{ role: "user", content: "hello" }],
+          []
+        );
+        const sent = JSON.parse(String(captured!.init!.body));
+        expect(sent.prompt_cache_retention).toBeUndefined();
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete process.env.OPENAI_API_KEY;
+    }
+  });
+
   test("local tool-calling streaming also forwards extraBody", async () => {
     const originalFetch = globalThis.fetch;
     let captured: { url: string; init: RequestInit } | undefined;

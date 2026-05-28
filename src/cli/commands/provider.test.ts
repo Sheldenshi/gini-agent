@@ -221,6 +221,101 @@ describe("provider CLI", () => {
     expect(captured.join("")).toBe("");
   });
 
+  test("--prompt-cache-retention persists the value on the typed field", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.5",
+      "--prompt-cache-retention", "24h"
+    ]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.promptCacheRetention).toBe("24h");
+  });
+
+  test("--prompt-cache-retention empty string clears the field", async () => {
+    // First set 24h, then clear via empty string. The resolver treats
+    // empty-string the same as omitting the field; persisting an empty
+    // value would round-trip as a stale "still set" signal, so the
+    // clear must remove the field entirely from the persisted shape.
+    await provider(makeCtx([
+      "provider", "set", "openai", "gpt-5.5",
+      "--prompt-cache-retention", "24h"
+    ]));
+    await provider(makeCtx([
+      "provider", "set", "openai", "gpt-5.5",
+      "--prompt-cache-retention", ""
+    ]));
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.promptCacheRetention).toBeUndefined();
+  });
+
+  test("subsequent set without --prompt-cache-retention carries the previous value forward", async () => {
+    // ZDR-relevant carry-forward: an operator that opted into "24h"
+    // and then runs `gini provider set openai gpt-5.4` to swap models
+    // must not silently lose their retention bucket. This is the
+    // shape every rebuild site in the runtime guards (CLI provider,
+    // CLI setup, web setup-api, admin install).
+    await provider(makeCtx([
+      "provider", "set", "openai", "gpt-5.5",
+      "--prompt-cache-retention", "24h"
+    ]));
+    // Each `gini provider set` invocation in production is a fresh
+    // process that loads config from disk before running. Mirror that
+    // here so the second call's carry-forward sees the previously-
+    // persisted value rather than the test-helper's stub provider.
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const reloaded = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    const ctx2 = makeCtx(["provider", "set", "openai", "gpt-5.4"]);
+    ctx2.config.provider = reloaded.provider;
+    await provider(ctx2);
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.model).toBe("gpt-5.4");
+    expect(persisted.provider.promptCacheRetention).toBe("24h");
+  });
+
+  test("switching provider drops a previous same-provider retention setting", async () => {
+    // Cross-provider rewrites (openai → openrouter, etc.) must NOT
+    // carry the retention bucket — openrouter may not even recognize
+    // the field, and the operator's opt-in was provider-scoped.
+    await provider(makeCtx([
+      "provider", "set", "openai", "gpt-5.5",
+      "--prompt-cache-retention", "24h"
+    ]));
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const reloaded = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    const ctx2 = makeCtx(["provider", "set", "openrouter", "openai/gpt-4o"]);
+    ctx2.config.provider = reloaded.provider;
+    await provider(ctx2);
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("openrouter");
+    expect(persisted.provider.promptCacheRetention).toBeUndefined();
+  });
+
+  test("codex --prompt-cache-retention emits a backend-rejects warning", async () => {
+    // The chatgpt.com codex backend rejects the field with HTTP 400.
+    // The CLI forwards the value anyway so a future backend update
+    // works without a code change, but warns loudly so the operator
+    // understands every outbound request will fail until the backend
+    // adds support.
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "codex", "gpt-5.5",
+        "--prompt-cache-retention", "24h"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).toMatch(/chatgpt\.com codex backend currently rejects/);
+  });
+
   test("local provider with all three flags emits NO warning (every flag applies)", async () => {
     const captured: string[] = [];
     const original = process.stderr.write.bind(process.stderr);

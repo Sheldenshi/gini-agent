@@ -60,28 +60,28 @@ import type { ProviderConfig, RuntimeConfig } from "../types";
 // taking a dependency on a full config reload (other fields stay
 // owned by their original surfaces).
 //
-// On a disk-read failure (malformed JSON, transient EACCES) the helper
-// falls back to the in-memory snapshot for the same-provider case
-// instead of fail-open returning undefined. Fail-open would let a
-// corrupted-config write silently erase a ZDR-relevant retention
-// bucket the operator still believes is in effect; the in-memory
-// value is the last good state we know about, so preserving it is
-// strictly safer than dropping it.
+// Disk is authoritative when readable: a successful load (even when the
+// field is absent or empty) is treated as the operator's current
+// intent. That includes the case where the operator deliberately
+// cleared the field via `gini provider set --prompt-cache-retention ""`
+// — a non-empty in-memory snapshot must NOT resurrect that value, or
+// the clear would silently fail to take and the ZDR posture would
+// drift back to "24h". The in-memory fallback only fires when the disk
+// read itself throws (malformed JSON, transient EACCES) — there we
+// preserve the last good state rather than dropping the field, since
+// we genuinely don't know what the operator's intent is.
 function diskPromptCacheRetention(instance: string, providerName: string, inMemoryConfig: RuntimeConfig): string | undefined {
   try {
     const onDisk = loadConfig(instance);
-    if (onDisk.provider?.name === providerName) {
-      const onDiskValue = normalizeRetentionValue(onDisk.provider.promptCacheRetention);
-      if (onDiskValue !== undefined) return onDiskValue;
-    }
+    return onDisk.provider?.name === providerName
+      ? normalizeRetentionValue(onDisk.provider.promptCacheRetention)
+      : undefined;
   } catch {
-    // Disk read failed — fall through to the in-memory fallback below
-    // rather than dropping the field on the floor.
+    if (inMemoryConfig.provider?.name === providerName) {
+      return normalizeRetentionValue(inMemoryConfig.provider.promptCacheRetention);
+    }
+    return undefined;
   }
-  if (inMemoryConfig.provider?.name === providerName) {
-    return normalizeRetentionValue(inMemoryConfig.provider.promptCacheRetention);
-  }
-  return undefined;
 }
 
 const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
