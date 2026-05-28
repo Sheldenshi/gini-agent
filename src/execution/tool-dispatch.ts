@@ -49,7 +49,7 @@ import {
   type IdentityFileStatus
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
-import { emitSystemNote, resolveEmitContext } from "./chat-task-emit";
+import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
@@ -3394,23 +3394,21 @@ async function waitForMessagingPairTool(
       : []
   );
 
-  // Emit a guidance message to the chat BEFORE entering the poll
-  // loop so the operator knows what to do next. The "Wait for
-  // messaging pair" card on its own just shows the bridge name —
-  // no indication that the user has to open Telegram and DM the
-  // bot. Telegram requires /start before a bot can receive any
-  // messages, so spell that out explicitly. emitSystemNote inserts
-  // a real chat block (system_note kind) that the chat UI renders
-  // inline between the bridge-add card and the wait card.
+  // Set a runningHint on this tool_call block so the chat UI upgrades
+  // the row from the 14px inline spinner to an amber waiting-card —
+  // a long, externally-gated wait (up to 600s waiting on an inbound
+  // Telegram DM) needs visual weight proportional to its duration and a
+  // cancel affordance co-located with the state. The hint folds the
+  // bot's @username into the card body so the operator doesn't have to
+  // scan a separate system_note for context.
   //
-  // Resolve the bot's @username so the message points at the right
-  // Telegram account. addMessagingBridge skips getMe — botUsername
-  // is populated by checkMessagingBridge — so a freshly-added bridge
-  // has empty metadata here. Run the probe once when missing; the
-  // merged write benefits later consumers (pairing card, operator
-  // UI) too. Best-effort: a failed probe falls back to the bridge
-  // name, which still uniquely identifies the bot the user just
-  // configured.
+  // Resolve the bot's @username. addMessagingBridge skips getMe —
+  // botUsername is populated by checkMessagingBridge — so a freshly-
+  // added bridge has empty metadata here. Run the probe once when
+  // missing; the merged write benefits later consumers (pairing card,
+  // operator UI) too. Best-effort: a failed probe falls back to the
+  // bridge name, which still uniquely identifies the bot the user
+  // just configured.
   const readBotUsername = (bridge: typeof initialBridge): string | undefined => {
     const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
     return typeof meta.botUsername === "string" ? meta.botUsername : undefined;
@@ -3437,7 +3435,7 @@ async function waitForMessagingPairTool(
     ? `Open Telegram and start a chat with @${botUsernameForGuidance}: tap Start (or send /start), then send any message. The approval card will appear here as soon as your DM lands.`
     : `Open Telegram and start a chat with the bot '${initialBridge.name}': tap Start (or send /start), then send any message. The approval card will appear here as soon as your DM lands.`;
   const guidanceCtx = resolveEmitContext(config, taskId);
-  if (guidanceCtx) emitSystemNote(guidanceCtx, guidanceText);
+  if (guidanceCtx) setToolCallRunningHint(guidanceCtx, toolCallId, guidanceText);
 
   const reasonText = typeof args.reason === "string" && args.reason.trim().length > 0
     ? args.reason.trim()

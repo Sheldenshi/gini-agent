@@ -976,19 +976,23 @@ describe("request_connector dispatch", () => {
     ).toBe(0);
   }, 10000);
 
-  test("wait_for_messaging_pair: emits a system_note guidance block telling the operator how to DM the bot", async () => {
-    // The wait card on its own only renders the bridge name — no
+  test("wait_for_messaging_pair: folds the guidance into the running tool_call's runningHint (not a separate system_note)", async () => {
+    // The wait card on its own only shows the bridge name — no
     // instruction that the user must open Telegram, tap Start, and
-    // send a message before the poller can mint a pairing row. Pin
-    // that the wait tool drops a system_note block into the chat
-    // BEFORE the poll loop runs, with text the chat UI can render
-    // inline between the bridge-add card and the wait card. We seed
-    // a pre-existing pending row so the wait returns "pending" on
-    // the first tick — the guidance emit runs before any polling.
+    // send a message before the poller can mint a pairing row. The
+    // dispatch attaches the guidance to its own tool_call block via
+    // `runningHint`, which the web/mobile chat surface renders as an
+    // amber waiting-card with the guidance folded in. Pin that the
+    // hint lands on the right block (and that we DON'T regress to the
+    // pre-folding system_note layout, which split the wait row and the
+    // guidance into two unrelated blocks). We seed a pre-existing
+    // pending row so the wait returns "pending" on the first tick —
+    // the hint write runs before any polling.
     const instance = `wait-pair-guidance-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
     const taskId = await newTask(config);
     const { listChatBlocks } = await import("../state");
+    const { emitToolCallRunning, resolveEmitContext } = await import("./chat-task-emit");
     await mutateState(instance, (state) => {
       const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
       const bridge = createMessagingBridgeRecord(state, {
@@ -1010,34 +1014,57 @@ describe("request_connector dispatch", () => {
         ]
       };
     });
+
+    // Mount the running tool_call block the same way the chat-task
+    // loop would — dispatchToolCall doesn't emit it itself, so without
+    // this the runningHint write would no-op against a missing row.
+    const callId = "call_wait_guidance";
+    const emitCtx = resolveEmitContext(config, taskId);
+    expect(emitCtx).toBeDefined();
+    emitToolCallRunning(emitCtx, {
+      toolName: "wait_for_messaging_pair",
+      callId,
+      args: { bridge: "tg-guidance", timeoutSeconds: 10 }
+    });
+
     const result = await dispatchToolCall(
       config,
       taskId,
       "wait_for_messaging_pair",
-      "call_wait_guidance",
+      callId,
       JSON.stringify({ bridge: "tg-guidance", timeoutSeconds: 10 })
     );
     // Pre-existing pending row → pending result, just confirming the
-    // dispatcher reached the poll path past the guidance emit.
+    // dispatcher reached the poll path past the runningHint write.
     expect(result.kind).toBe("pending");
 
-    // Pull the task's chat session and verify a system_note block
-    // landed with the guidance text. botUsername is empty (probe is
-    // gated on a secret ref, which test bridges don't have), so the
-    // text falls back to the bridge name.
     const state = readState(instance);
     const task = state.tasks.find((t) => t.id === taskId);
     expect(task?.chatSessionId).toBeDefined();
     const blocks = listChatBlocks(instance, task!.chatSessionId!);
+
+    // The tool_call block carries the guidance in `runningHint`.
+    // botUsername is empty (probe is gated on a secret ref, which
+    // test bridges don't have), so the text falls back to the bridge
+    // name.
+    const toolCall = blocks.find(
+      (b) => b.kind === "tool_call" && (b as { callId?: string }).callId === callId
+    );
+    expect(toolCall).toBeDefined();
+    expect(toolCall?.kind).toBe("tool_call");
+    if (toolCall?.kind === "tool_call") {
+      expect(toolCall.runningHint).toBeDefined();
+      expect(toolCall.runningHint).toContain("tg-guidance");
+      expect(toolCall.runningHint).toContain("/start");
+    }
+
+    // Regression guard: the guidance must NOT be emitted as a
+    // standalone system_note anymore (would re-introduce the split-card
+    // layout the amber waiting-card was meant to fold together).
     const guidanceNote = blocks.find(
       (b) => b.kind === "system_note" && b.text.includes("Open Telegram and start a chat")
     );
-    expect(guidanceNote).toBeDefined();
-    expect(guidanceNote?.kind).toBe("system_note");
-    if (guidanceNote?.kind === "system_note") {
-      expect(guidanceNote.text).toContain("tg-guidance");
-      expect(guidanceNote.text).toContain("/start");
-    }
+    expect(guidanceNote).toBeUndefined();
   });
 
   test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {

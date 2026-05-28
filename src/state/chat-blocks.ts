@@ -145,7 +145,8 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
           : {}),
         status: (payload.status as ToolCallStatus) ?? "running",
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
-        callId: String(payload.callId ?? "")
+        callId: String(payload.callId ?? ""),
+        runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined
       };
     case "tool_result":
       return {
@@ -229,7 +230,8 @@ function payloadFor(block: ChatBlock): string {
         argsFull: block.argsFull,
         status: block.status,
         errorMessage: block.errorMessage,
-        callId: block.callId
+        callId: block.callId,
+        runningHint: block.runningHint
       });
     case "tool_result":
       return JSON.stringify({
@@ -326,7 +328,8 @@ export function insertChatBlock(
             argsFull: input.argsFull,
             status: input.status,
             errorMessage: input.errorMessage,
-            callId: input.callId
+            callId: input.callId,
+            runningHint: input.runningHint
           };
         case "tool_result":
           return {
@@ -515,8 +518,9 @@ export function updateToolCallBlock(
   callId: string,
   sessionId: string,
   patch: {
-    status: "running" | "ok" | "error" | "denied";
+    status?: "running" | "ok" | "error" | "denied";
     errorMessage?: string;
+    runningHint?: string;
   }
 ): ChatBlock | null {
   const db = getMemoryDb(instance);
@@ -537,8 +541,12 @@ export function updateToolCallBlock(
   } catch {
     payload = {};
   }
-  payload.status = patch.status;
+  if (patch.status !== undefined) payload.status = patch.status;
   if (patch.errorMessage !== undefined) payload.errorMessage = patch.errorMessage;
+  // Clear the running hint when the tool leaves the running state — the
+  // amber waiting-card is only meaningful while we're still waiting.
+  if (patch.runningHint !== undefined) payload.runningHint = patch.runningHint;
+  if (patch.status !== undefined && patch.status !== "running") delete payload.runningHint;
   db.run(
     `UPDATE chat_blocks
        SET payload_json = ?, updated_at = ?
