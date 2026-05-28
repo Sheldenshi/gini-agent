@@ -156,4 +156,3 @@ describe("pickForwardHeaders", () => {
     expect(forwarded.get("cookie")).toBeNull();
   });
 });
-
