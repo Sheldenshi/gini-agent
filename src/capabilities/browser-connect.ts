@@ -277,7 +277,13 @@ async function connectBrowserInner(
     const validated = validateCdpUrl(input.cdpUrl);
     if (!validated.ok) throw new Error(validated.error);
     const httpForm = cdpHttpForm(validated.url);
-    const blocked = safetyCheck(httpForm);
+    // CDP endpoints are always loopback (127.0.0.1:9222 / localhost
+    // typically) — that's the whole point of CDP. Pass allowLoopback
+    // so the navigation-SSRF block on loopback doesn't refuse a
+    // legitimate CDP attach. SSRF concerns for the controlled-browser
+    // navigation surface still apply via the default safetyCheck()
+    // path that browserNavigate hits.
+    const blocked = safetyCheck(httpForm, { allowLoopback: true });
     if (blocked) throw new Error(`Invalid cdpUrl: ${blocked}`);
     validatedCallerCdp = validated.url;
   }

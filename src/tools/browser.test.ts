@@ -87,6 +87,85 @@ describe("browser safetyCheck", () => {
   test("allows ordinary https URLs", () => {
     expect(safetyCheck("https://example.com/")).toBeUndefined();
   });
+
+  test("trailing-dot bypass: localhost. / 127.0.0.1. are still loopback", () => {
+    // DNS roots can be written with a trailing "." and resolvers
+    // treat them as equivalent to the dotless form. Without the
+    // strip, endsWith(".localhost") would miss "localhost.", and the
+    // BLOCKED_HOSTNAMES literal check would miss "127.0.0.1.".
+    for (const url of ["http://localhost./api", "http://127.0.0.1./api"]) {
+      const result = safetyCheck(url);
+      expect(result).toBeDefined();
+      expect(result).toContain("loopback");
+    }
+  });
+
+  test("IPv4-compat IPv6 hex loopback bypass: [::7f00:1] decodes to 127.0.0.1", () => {
+    // Bun's URL parser normalizes [::127.0.0.1] to [::7f00:1] (hex
+    // IPv4-compat), so the literal-match path never sees the dotted
+    // form. The hex decoder must recognize it.
+    const result = safetyCheck("http://[::7f00:1]/");
+    expect(result).toBeDefined();
+    expect(result).toContain("loopback");
+  });
+
+  test("allowLoopback opts out of the loopback block for CDP-style callers", () => {
+    // browser-connect attaches over CDP to a local Chrome. The CDP
+    // endpoint is always loopback by design — refusing it would
+    // break legitimate browser attach. Pin that the opt-out works
+    // for representative loopback variants but the OTHER blocks
+    // (metadata, link-local) still fire.
+    expect(safetyCheck("http://127.0.0.1:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://localhost:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Metadata IP is NOT loopback — still blocked even with the opt-out.
+    expect(safetyCheck("http://169.254.169.254/", { allowLoopback: true })).toBeDefined();
+  });
+
+  test("IPv4-mapped IPv6 loopback respects allowLoopback (CDP attach)", () => {
+    // CDP attach can legitimately receive [::ffff:127.0.0.1]:9222
+    // because Bun normalizes various IPv6 spellings. The decoder
+    // now translates the mapped IPv6 to its IPv4 form BEFORE the
+    // loopback check, so allowLoopback applies uniformly across
+    // [127.0.0.1], [::1], [::ffff:127.0.0.1] (dot-quad), and
+    // [::ffff:7f00:1] (hex). Without the decoder, the IPv6 branch
+    // would route the mapped form through the metadata path and
+    // refuse it even under allowLoopback.
+    expect(safetyCheck("http://[::ffff:127.0.0.1]:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::ffff:7f00:1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Same forms WITHOUT allowLoopback are still refused (with the
+    // correct loopback message, not the legacy metadata one).
+    const blocked = safetyCheck("http://[::ffff:127.0.0.1]/");
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("loopback");
+    const blocked2 = safetyCheck("http://[::ffff:7f00:1]/");
+    expect(blocked2).toBeDefined();
+    expect(blocked2).toContain("loopback");
+  });
+
+  test("blocks loopback navigation (BFF / runtime SSRF surface)", () => {
+    // The BFF's catch-all /api/runtime/* proxy injects the runtime
+    // bearer for safe-method loopback requests, so an agent that
+    // navigates the controlled browser to its own host can read
+    // runtime state (including messaging.approve_pairing payloads).
+    // Pin that the loopback variants are all refused — IPv4 literal,
+    // IPv6 literal, 0.0.0.0, the localhost hostname, and the 127/8
+    // range and *.localhost.
+    const refused = [
+      "http://127.0.0.1:3082/api/runtime/approvals",
+      "http://localhost:3082/api/state",
+      "http://0.0.0.0/",
+      "http://[::1]/",
+      "http://127.5.5.5/",
+      "http://example.localhost/"
+    ];
+    for (const url of refused) {
+      const result = safetyCheck(url);
+      expect(result).toBeDefined();
+      expect(result!.startsWith("Blocked:")).toBe(true);
+      expect(result).toContain("loopback");
+    }
+  });
 });
 
 // Smoke test for the CDP-vs-launch decision. We can't actually exercise

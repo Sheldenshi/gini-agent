@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Animated, Easing, StyleSheet, View } from "react-native";
+import { Animated, Easing, StyleSheet, Text, View } from "react-native";
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
@@ -24,7 +24,11 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
   return (
     <View style={styles.row}>
       <View style={styles.bubble}>
-        <Markdown style={markdownStyles} markdownit={markdownIt}>
+        <Markdown
+          style={markdownStyles}
+          markdownit={markdownIt}
+          rules={markdownRules}
+        >
           {block.text}
         </Markdown>
         {block.streaming ? <StreamingCursor /> : null}
@@ -32,6 +36,95 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
     </View>
   );
 }
+
+// react-native-markdown-display's default paragraph/heading renderers
+// are Views with `flexDirection: "row"` + `flexWrap: "wrap"`, and each
+// inline token (text run, link, strong, em) becomes its own sibling
+// <Text>. RN's text layout doesn't span across sibling Text nodes, so a
+// paragraph mixing short prose with a long URL wraps per-token instead
+// of as one continuous text block — the bubble shrinks to fit the
+// widest stand-alone token and URLs end up broken every few characters.
+// Rendering these block-level nodes as a single Text lets all inline
+// children flow as true inline runs, which is what RN's text engine
+// actually wraps cleanly. We use the markdown body's font props so the
+// outer Text reserves the right line height before nested inline Texts
+// supply their own font styles via the lib's inherited-style cascade.
+type RenderNode = { type: string; key: string };
+type RenderRule = (
+  node: RenderNode,
+  children: React.ReactNode
+) => React.ReactNode;
+const blockTextBase = {
+  color: theme.assistantBubbleText,
+  fontFamily: family("HankenGrotesk", 500),
+  fontSize: 16,
+  lineHeight: 22
+} as const;
+const blockTextStyles = StyleSheet.create({
+  paragraph: { ...blockTextBase, marginTop: 0, marginBottom: 6 },
+  heading1: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 20,
+    lineHeight: 26,
+    marginTop: 6,
+    marginBottom: 4
+  },
+  heading2: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 18,
+    lineHeight: 24,
+    marginTop: 6,
+    marginBottom: 4
+  },
+  heading3: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 700),
+    marginTop: 6,
+    marginBottom: 4
+  },
+  heading4: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15,
+    lineHeight: 21,
+    marginTop: 6,
+    marginBottom: 4
+  },
+  heading5: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 6,
+    marginBottom: 4
+  },
+  heading6: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 6,
+    marginBottom: 4
+  }
+});
+const renderAsText =
+  (style: object): RenderRule =>
+  (node, children) => (
+    <Text key={node.key} style={style}>
+      {children}
+    </Text>
+  );
+const markdownRules: Record<string, RenderRule> = {
+  paragraph: renderAsText(blockTextStyles.paragraph),
+  heading1: renderAsText(blockTextStyles.heading1),
+  heading2: renderAsText(blockTextStyles.heading2),
+  heading3: renderAsText(blockTextStyles.heading3),
+  heading4: renderAsText(blockTextStyles.heading4),
+  heading5: renderAsText(blockTextStyles.heading5),
+  heading6: renderAsText(blockTextStyles.heading6)
+};
 
 function StreamingCursor() {
   // Opacity-pulsing block that sits at the end of the streaming text so
@@ -64,7 +157,10 @@ function StreamingCursor() {
 const styles = StyleSheet.create({
   row: {
     alignSelf: "flex-start",
-    maxWidth: "80%"
+    // Assistant replies are typically long-form and contain inline
+    // links; give them most of the viewport so URLs don't end up
+    // wrapping every few characters on a narrow phone.
+    maxWidth: "92%"
   },
   bubble: {
     backgroundColor: theme.assistantBubble,

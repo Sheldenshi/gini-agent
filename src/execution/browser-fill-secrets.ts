@@ -32,12 +32,12 @@
 //      success despite a missed resume.
 
 import type { RuntimeConfig, SetupRequest } from "../types";
-import { failTask, resolveSetupRequest } from "../agent";
+import { resolveSetupRequest } from "../agent";
 import { addAudit, appendTrace, mutateState, readState } from "../state";
 import { FILLED_SECRET_MIN_REDACTION_LENGTH, browserFillByLocator, peekCurrentBrowserUrl } from "../tools/browser";
 import { isTerminalTaskStatus } from "../state";
-import { resumeChatTask } from "./chat-task";
 import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-secrets-types";
+import { safeResume } from "./safe-resume";
 
 export interface FillSecretConnectResult {
   status: number;
@@ -313,42 +313,17 @@ export async function runFillSecretConnect(
     ? approval.payload.toolCallId
     : undefined;
   if (toolCallId) {
-    // Wrap so a terminal-task throw inside resumeChatTask doesn't
-    // mask the audited side-effect outcome. The values already
-    // landed in the DOM (or didn't) regardless of whether the
-    // chat loop can be resumed — surfacing a 200 here while
-    // logging the resume failure is more honest than 500-ing on a
-    // resume that the operator wouldn't act on anyway.
-    try {
-      await resumeChatTask(config, taskId, toolCallId, resumeResult);
-    } catch (resumeError) {
-      // resumeChatTask flips task.status to "running" then re-enters
-      // the chat-task loop. A throw from inside that loop (model
-      // provider rate limit, dispatch error, etc.) leaves the task
-      // in status="running" with no live executor, no in-flight
-      // registry entry, and no scheduler to retry — orphaning the
-      // task. Mirror the recovery the resolveAuthorization path uses
-      // (src/agent.ts: `failTask` on executeApprovedAction throw)
-      // by failing the task here too. Audit row already records
-      // the fill outcome; failTask is idempotent so a concurrent
-      // cancel that beat us doesn't double-emit.
-      appendTrace(config.instance, taskId, {
-        type: "error",
-        message: "resumeChatTask threw during fill_secret completion",
-        data: {
-          approvalId: approval.id,
-          toolCallId,
-          error: resumeError instanceof Error ? resumeError.message : String(resumeError)
-        }
-      });
-      try {
-        await failTask(config, taskId, resumeError);
-      } catch {
-        // failTask's own throw must not mask the original — the
-        // next external trigger (user message, supervisor) will
-        // reconcile via the task row's current status.
-      }
-    }
+    // Wrap resumeChatTask in the shared safeResume recovery: a
+    // terminal-task throw inside the chat loop (provider rate limit,
+    // dispatch error, etc.) flips the task into status=running with
+    // no live executor unless we trace the failure and call failTask
+    // ourselves. See src/execution/safe-resume.ts. The audit row
+    // above already recorded the fill outcome regardless of whether
+    // the resume completes.
+    await safeResume(config, taskId, toolCallId, resumeResult, {
+      context: "fill_secret",
+      approvalId: approval.id
+    });
   }
 
   if (bailedOnCancel) {

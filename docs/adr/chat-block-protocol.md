@@ -116,7 +116,7 @@ remote previews, screen readers) would need the same translation code.
     posting to `/api/authorizations/<id>/{approve,deny}`. Carries
     `risk` and `summary` so the bubble renders without a follow-up
     fetch.
-  - `SetupRequestedBlock` — user-actor card. Three layouts keyed off
+  - `SetupRequestedBlock` — user-actor card. Layouts keyed off
     `action`:
     - `connector.request` — render the Connect dialog. Submit posts
       `{ secrets, scopes, name }` to
@@ -131,7 +131,32 @@ remote previews, screen readers) would need the same translation code.
     - `browser.connect` — Connect button posts to
       `/api/setup-requests/<id>/open-browser`; the follow-up "I've
       signed in" posts to `/api/setup-requests/<id>/complete`.
-    Cancel always posts to `/api/setup-requests/<id>/cancel`.
+    - `messaging.add_bridge` — render an inline form with a name
+      input (pre-seeded from `setupRequest.payload.suggestedName`)
+      and a password-masked bot-token input. Submit posts
+      `{ secrets: { name, botToken } }` to
+      `/api/setup-requests/<id>/complete`, which runs the
+      `addMessagingBridge` side effect. The card reads
+      `setupRequest.payload.kind` (currently `"telegram"`;
+      `"discord"` is reserved but the chat card does not collect
+      channel IDs, so the dispatcher tool only advertises Telegram
+      from chat — see [telegram-bridge.md](telegram-bridge.md)).
+    - `messaging.approve_pairing` — render a confirmation card
+      showing the pending sender, chat id, chat type, verification
+      code, and expiry from `setupRequest.payload`. Two buttons:
+      Approve posts `{}` to `/complete`; Reject posts
+      `{ reject: true }` to `/complete`. Server calls `allowChat`
+      (with the `verificationCode` from the payload as
+      `expectedCode`) or `rejectPendingChat`.
+    - `messaging.remove_bridge` — render a destructive confirmation
+      card showing `setupRequest.payload.bridgeName` +
+      `payload.kind` and the irreversibility warning. Submit posts
+      `{}` to `/complete`, which routes into `removeMessagingBridge`.
+    Cancel always posts to `/api/setup-requests/<id>/cancel`. The
+    three `messaging.*` setups are SetupRequests, not Authorizations,
+    so they never appear under `/api/authorizations`; the home page
+    and /permissions list render a "resolve in chat" hint rather than
+    an inline Approve/Reject control for them.
 
 - Tool catalog labels live with the catalog. `displayLabel` on each
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`

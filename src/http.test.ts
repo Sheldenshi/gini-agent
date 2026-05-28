@@ -866,6 +866,267 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("POST /api/setup-requests/<id>/complete creates a messaging bridge and resolves the setup request", async () => {
+    // Happy-path pin for the chat-side Add Telegram flow. The card's
+    // Submit button POSTs the name + bot token under `secrets`; the
+    // gateway routes them into addMessagingBridge (the same code path
+    // the CLI and the settings page already call) and resolves the
+    // setup request so the chat-task loop can resume.
+    const config = testConfig("setup-complete-bridge-happy");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "chat-test-bridge", toolCallId: "call_bridge_happy" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "chat-test-bridge", botToken: "1234:ABCDEFGHIJKLMNOPQR" } })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.bridge?.name).toBe("chat-test-bridge");
+    expect(response.bridge?.kind).toBe("telegram");
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === setup.id);
+    expect(resolved?.status).toBe("completed");
+    const bridge = state.messagingBridges.find((b) => b.name === "chat-test-bridge");
+    expect(bridge).toBeDefined();
+    expect(bridge?.kind).toBe("telegram");
+
+    // Audit-row traceability pin: the chat-card create writes a
+    // dedicated audit row with the originating setup-request id AND the
+    // resulting bridge.id so operators can reconstruct
+    // "setup X via chat-card → bridge Y" from the activity feed.
+    // Without this row the chat path is indistinguishable from the
+    // CLI / settings dialog in the audit log (both write the same
+    // generic messaging.configured row via createMessagingBridgeRecord).
+    const chatAddRow = state.audit.find(
+      (e) => e.action === "messaging.add_bridge" && e.approvalId === setup.id
+    );
+    expect(chatAddRow).toBeDefined();
+    expect(chatAddRow?.target).toBe(bridge?.id);
+    expect((chatAddRow?.evidence as { kind?: string } | undefined)?.kind).toBe("telegram");
+    expect((chatAddRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("chat-test-bridge");
+
+    // Durable outcome pin: the /complete handler writes
+    // setup.connectOutcome so a post-reload render of the resolved
+    // card reads the truthful past-tense summary. Without this, the
+    // React component's sticky state evaporates on reload and the
+    // card would fall back to "Bridge added." even when the side
+    // effect actually failed.
+    expect(resolved?.connectOutcome?.ok).toBe(true);
+    expect(resolved?.connectOutcome?.message).toContain("chat-test-bridge");
+  });
+
+  test("POST /api/setup-requests/<id>/complete refuses messaging.add_bridge that was already cancelled, and creates no bridge", async () => {
+    // Race-safety pin: the messaging.add_bridge branch must resolve the
+    // setup request BEFORE addMessagingBridge so a concurrent /cancel
+    // (or cancel cascade) cannot leave an orphan bridge + encrypted
+    // secret on disk after the user has already abandoned the prompt.
+    // Mirrors the resolve-first contract in
+    // src/execution/browser-fill-secrets.ts. We simulate the race by
+    // pre-cancelling the setup request and then hitting /complete — the
+    // handler must short-circuit at the "already !pending" guard,
+    // return 410, and never touch addMessagingBridge.
+    const config = testConfig("setup-complete-bridge-cancel-race");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "race-bridge", toolCallId: "call_bridge_race" }
+      })
+    );
+    // Pre-cancel the setup request as if a concurrent operator had
+    // clicked Cancel between the user's typing and the Submit landing
+    // on the server.
+    await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+    const beforeBridges = readState(config.instance).messagingBridges.length;
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/setup-requests/${setup.id}/complete`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { name: "race-bridge", botToken: "1234:ABCDEFGHIJKL" } })
+      },
+      config.token
+    );
+    // 410 Gone — the resolution-before-creation contract is upheld by
+    // the outer "already !pending" guard. The load-bearing invariant
+    // is the absence of any bridge / orphan secret on the other side.
+    expect(response.status).toBe(410);
+
+    const after = readState(config.instance);
+    expect(after.messagingBridges.length).toBe(beforeBridges);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete rejects malformed messaging.add_bridge tokens BEFORE resolving the setup request", async () => {
+    // Token-format pre-check: addMessagingBridge runs
+    // assertHeaderSafeToken internally, and the chat card disappears
+    // once the setup request flips out of pending state. Without
+    // pre-resolve token validation, a malformed token would burn the
+    // request and the user could not retype from the same card.
+    // The bounded module calls assertHeaderSafeToken BEFORE resolving;
+    // this test pins that ordering by submitting a token with a control
+    // character and asserting the request stays pending.
+    const config = testConfig("setup-complete-bridge-bad-token-stays-pending");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "bad-token", toolCallId: "call_bridge_bad_token" }
+      })
+    );
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      // Control character in the token — assertHeaderSafeToken
+      // refuses any byte outside printable ASCII [\x21-\x7E].
+      body: JSON.stringify({ secrets: { name: "bad-token", botToken: "1234:abc\ndef" } })
+    });
+    expect(response.ok).toBe(false);
+    expect(typeof response.message).toBe("string");
+
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    expect(after.messagingBridges.length).toBe(0);
+  });
+
+  test("POST /api/setup-requests/<id>/complete returns ok:false when messaging.add_bridge is missing a name or token", async () => {
+    // The chat card disables Submit until both inputs are non-empty,
+    // but a CLI/API caller could POST a partial body. The gateway
+    // mirrors the same readiness gate as the card so a partial
+    // submission can't silently create a half-configured bridge.
+    const config = testConfig("setup-complete-bridge-missing");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "missing-fields", toolCallId: "call_bridge_missing" }
+      })
+    );
+    const missingToken = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "missing-fields" } })
+    });
+    expect(missingToken.ok).toBe(false);
+    expect(missingToken.message).toContain("Bot token");
+
+    const missingName = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { botToken: "1234:ABCDEFGHIJ" } })
+    });
+    expect(missingName.ok).toBe(false);
+    expect(missingName.message).toContain("name");
+
+    // Both rejections must leave the setup request pending — otherwise
+    // the chat card would flip out of pending state and the user
+    // couldn't retry.
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete refuses a code-less messaging.approve_pairing approve and keeps the request pending", async () => {
+    // allowChat's pending-row presence check is gated on `expectedCode`
+    // being defined (the legacy CLI's "operator knows what they're
+    // doing" trust model). If a chat-card pairing payload arrives
+    // without verificationCode (group chat: groups intentionally never
+    // mint a code, or a stale request whose pending row was cleared and
+    // recreated), a no-code allowChat call would bypass the pending-row
+    // check and enroll a chat that is no longer pending. Pin that
+    // messaging-pairing-connect refuses the approve branch up-front when
+    // verificationCode is missing.
+    const config = testConfig("setup-complete-pairing-codeless-refuses");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.approve_pairing",
+        target: "bridge_codeless:7",
+        reason: "Confirm pairing",
+        // Deliberately omit verificationCode — the chat card normally
+        // carries one for private chats, but a stale or group-chat
+        // payload would not.
+        payload: { bridgeId: "bridge_codeless", chatId: 7, toolCallId: "call_codeless" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(false);
+    expect(response.message).toContain("code-less");
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete removes a messaging bridge through the setup-request flow", async () => {
+    // Happy path for the chat-side Remove bridge card. The /complete
+    // handler delegates to runMessagingRemoveConnect, which resolves
+    // the setup request atomically then calls removeMessagingBridge.
+    const config = testConfig("setup-complete-remove-bridge-happy");
+    const handler = createHandler(config);
+
+    // Create a real bridge via the existing endpoint so its
+    // encrypted secret + state record exist before we try to remove it.
+    const created = await call(handler, config, `/api/messaging`, {
+      method: "POST",
+      body: JSON.stringify({ name: "remove-me", kind: "telegram", botToken: "1234:ABCDEFGHIJKLMNOPQR" })
+    });
+    expect(created.id).toBeString();
+
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.remove_bridge",
+        target: created.id,
+        reason: "Remove bridge",
+        payload: { bridgeId: created.id, bridgeName: "remove-me", kind: "telegram", toolCallId: "call_remove" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+    expect(response.removed).toBe(true);
+    expect(response.bridgeId).toBe(created.id);
+
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("completed");
+    expect(after.messagingBridges.find((b) => b.id === created.id)).toBeUndefined();
+
+    // Chat-card lineage audit row pin: the chat-card remove path
+    // writes a dedicated audit row carrying the setup-request id +
+    // bridgeId, so a chat-card remove is distinguishable from a CLI /
+    // settings remove in the activity feed.
+    const chatRemoveRow = after.audit.find(
+      (e) => e.action === "messaging.remove_bridge" && e.approvalId === setup.id
+    );
+    expect(chatRemoveRow).toBeDefined();
+    expect(chatRemoveRow?.target).toBe(created.id);
+    expect((chatRemoveRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("remove-me");
+  });
+
   test("POST /api/setup-requests/<id>/complete refuses partial browser.fill_secret submissions", async () => {
     // fillReady in BlockSetupRequested.tsx only disables the web
     // Submit button; CLI / mobile / direct API clients can still POST a
