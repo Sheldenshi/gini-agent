@@ -198,14 +198,30 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     if (isTunnelDenied(postPrefix, request.method)) {
       return notFound();
     }
+    // Redirect through /connect rather than straight to `/` so the operator's
+    // phone has a chance to hand off to the installed gini-mobile app via the
+    // `gini://connect?...` URL scheme. The /connect interstitial attempts the
+    // scheme handoff and falls back to the mobile web app on a
+    // visibilitychange timeout when the app isn't installed. We still mint
+    // the session cookie here so the web-app fallback is already authed —
+    // the user never has to re-enter the bootstrap URL after the scheme
+    // attempt fails. The mobile app, when it does take the handoff, uses
+    // the Bearer-token path on the proxy (see Bearer branch below) rather
+    // than the cookie.
+    const tunnelOrigin = `${url.protocol}//${url.host}`;
     const target = new URL(request.url);
-    target.pathname = postPrefix === "" ? "/" : postPrefix;
+    target.pathname = "/connect";
+    target.search =
+      `?api=${encodeURIComponent(tunnelOrigin)}` +
+      `&web=${encodeURIComponent(tunnelOrigin)}` +
+      `&token=${encodeURIComponent(tunnel.secret)}`;
     const redirect = NextResponse.redirect(target, 302);
     redirect.headers.set("set-cookie", buildTunnelCookie(tunnel.secret));
     // The 302 itself carries no-referrer so the brief /<secret>/ URL cannot
     // leak via Referer on subresource fetches the destination page issues.
     // See PLAN.md "URL cleanup after bootstrap".
     redirect.headers.set("referrer-policy", "no-referrer");
+    redirect.headers.set("cache-control", "no-store");
     return redirect;
   }
 
@@ -220,9 +236,40 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     return applyResponsePolicy(next);
   }
 
-  // No bootstrap, no cookie — 404 (do NOT reveal the existence of the
-  // gateway via a richer error).
+  // Bearer-token follow-up requests. The installed gini-mobile app receives
+  // the secret via the `gini://connect` deep link and sends it on every API
+  // call as `Authorization: Bearer <secret>` rather than as a cookie — the
+  // mobile RN runtime has no cookie jar that survives across app launches
+  // the way Safari does, so the Bearer path is the durable auth surface for
+  // the installed app. The compare uses the SAME constant-time helper as
+  // the cookie path so neither branch leaks the secret via timing.
+  const bearer = readTunnelBearer(request.headers);
+  if (bearer && tunnelSecretEquals(bearer, tunnel.secret)) {
+    if (isTunnelDenied(canon.path, request.method)) {
+      return notFound();
+    }
+    const headers = stampVettedHeaders(request.headers);
+    const next = NextResponse.next({ request: { headers } });
+    return applyResponsePolicy(next);
+  }
+
+  // No bootstrap, no cookie, no Bearer — 404 (do NOT reveal the existence of
+  // the gateway via a richer error).
   return notFound();
+}
+
+/** Extract the Bearer token from an `Authorization: Bearer <value>` header.
+ *  Returns null when the header is missing, malformed, or uses a different
+ *  scheme. The Authorization header itself is case-insensitive per HTTP
+ *  (handled by Headers.get); the scheme prefix is matched case-sensitively
+ *  with exactly one space because Bearer is the only shape gini-mobile
+ *  emits and we want a tight surface rather than a permissive parser. */
+function readTunnelBearer(headers: Headers): string | null {
+  const raw = headers.get("authorization");
+  if (!raw) return null;
+  const match = /^Bearer (.+)$/.exec(raw);
+  if (!match) return null;
+  return match[1];
 }
 
 export const config = {
