@@ -15,12 +15,22 @@ const nextConfig: NextConfig = {
   // other than `localhost`, which silently breaks HMR + client-component
   // hydration when the user lands on http://127.0.0.1:<port>. The Gini
   // installer and CLI consistently open the app via 127.0.0.1, so we
-  // allow both forms explicitly. We also allow `*.trycloudflare.com` so a
-  // tunneled phone or browser can complete the HMR WebSocket upgrade —
-  // without that allowlist entry, Next.js dev rejects the upgrade and the
-  // browser logs a steady stream of `WebSocket connection failed` errors.
-  // Production builds don't read this — it's a dev-server concern only.
-  allowedDevOrigins: ["127.0.0.1", "localhost", "*.trycloudflare.com"],
+  // allow both forms explicitly. Production builds don't read this —
+  // it's a dev-server concern only.
+  //
+  // We deliberately do NOT allow `*.trycloudflare.com` here. The proxy
+  // matcher in web/src/proxy.ts excludes `/_next/webpack-hmr` and
+  // `/_next/static`, so the WebSocket upgrade and source-map fetches
+  // bypass the secret gate and reach Next.js dev directly. Allowing the
+  // tunnel host would let any anonymous client that can reach the live
+  // tunnel hostname open `wss://<live-tunnel>/_next/webpack-hmr` and
+  // pull `https://<live-tunnel>/_next/static/...` — leaking module HMR
+  // events and source maps without ever proving knowledge of the
+  // tunnel secret. The local browser still gets HMR over loopback;
+  // HMR-over-tunnel on mobile was already fragile across cloudflared's
+  // keepalive limits, so the convenience tradeoff is small relative to
+  // the disclosure surface.
+  allowedDevOrigins: ["127.0.0.1", "localhost"],
   turbopack: {
     root: resolve(import.meta.dirname)
   }
