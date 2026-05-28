@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
+import { tunnelManager } from "./runtime/tunnel";
 import type { RuntimeConfig } from "./types";
 
 describe("runtime api", () => {
@@ -2950,6 +2951,43 @@ describe("runtime api", () => {
         }));
         expect(denied.headers.get("access-control-allow-origin")).toBeNull();
       });
+    });
+  });
+
+  describe("tunnel QR rotate window", () => {
+    test("QR endpoints return 503 with Retry-After while rotating is true", async () => {
+      const config = testConfig("qr-rotate-window");
+      // The tunnel manager constructor immediately writes config.json
+      // through atomic-write, which needs the per-instance directory
+      // to already exist. testConfig's rmSync leaves no directory
+      // behind, so create it before either createHandler or
+      // tunnelManager runs.
+      mkdirSync(config.stateRoot, { recursive: true });
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      // Drive the manager into the rotate window without spinning up
+      // a real cloudflared. The test-only setter mirrors what the
+      // rotateSecret try block does between the secret persist and
+      // the recycle.
+      mgr.__setRotatingForTest(true);
+      try {
+        const svg = await rawCall(handler, config, "/api/tunnel/qr.svg", {
+          headers: { authorization: `Bearer ${config.token}` }
+        });
+        expect(svg.status).toBe(503);
+        expect(svg.headers.get("retry-after")).toBe("2");
+        const svgBody = await svg.json() as { error: string; retryAfterSec: number };
+        expect(svgBody.error).toBe("tunnel_rotating");
+        expect(svgBody.retryAfterSec).toBe(2);
+
+        const txt = await rawCall(handler, config, "/api/tunnel/qr.txt", {
+          headers: { authorization: `Bearer ${config.token}` }
+        });
+        expect(txt.status).toBe(503);
+        expect(txt.headers.get("retry-after")).toBe("2");
+      } finally {
+        mgr.__setRotatingForTest(false);
+      }
     });
   });
 });

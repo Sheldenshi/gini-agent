@@ -132,6 +132,13 @@ class TunnelManager {
    *  reachable probe and on probe start/stop. Surfaced to the dead-flip
    *  branch via `evaluateEdgeProbe` for the threshold check. */
   private edgeProbeFailures = 0;
+  /** True while rotateSecret is mid-flight, from the moment the new
+   *  secret is persisted to disk until the recycle finishes (or fails).
+   *  Read by the QR endpoint to suppress emission during the window
+   *  where the new on-disk secret is bonded to the old publicUrl —
+   *  handing out that mix would yield a bootstrap URL the old tunnel
+   *  immediately rejects with HTTP 404 once its cookie compare fails. */
+  private rotating = false;
 
   constructor(private readonly config: RuntimeConfig) {
     // Eagerly populate config (mints secret if missing). The on-disk write is
@@ -185,6 +192,22 @@ class TunnelManager {
 
   current(): TunnelSnapshot {
     return this.snapshot;
+  }
+
+  /** True between the on-disk secret persist and the recycle finishing
+   *  (success or failure). The QR endpoint reads this so it doesn't
+   *  hand out a bootstrap URL that pairs the new secret with the old
+   *  publicUrl. */
+  isRotating(): boolean {
+    return this.rotating;
+  }
+
+  /** TEST-ONLY: directly set the rotating flag so http.test.ts can
+   *  drive the QR endpoint's rotate-window suppression branch without
+   *  spinning up a real cloudflared. Production code never calls this
+   *  — rotateSecret manages the flag through its try/finally. */
+  __setRotatingForTest(value: boolean): void {
+    this.rotating = value;
   }
 
   /** Current persisted-config view. Cheap; reads memory then disk. */
@@ -739,6 +762,20 @@ class TunnelManager {
             return { ok: false, error: `web port ${this.lastWebPort} not healthy — rotation aborted before commit` };
           }
         }
+        // Open the rotate window. From this point until the recycle
+        // settles, the on-disk secret is the new value but the still-
+        // live publicUrl belongs to the OLD cloudflared. The QR
+        // endpoint reads this.rotating and returns 503 until the
+        // window closes, so a tunneled caller can't pick up a
+        // bootstrap URL whose secret+url pair would immediately fail
+        // the proxy's cookie compare. Cleared in the outer finally so
+        // a thrown / rejected recycle still releases the flag.
+        this.rotating = true;
+        this.snapshot = {
+          ...this.snapshot,
+          publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null)
+        };
         const next = this.persistTunnel( { secret: generateTunnelSecret() });
         setRedactionSecret(next.secret);
         scheduledGeneration = this.generation;
@@ -788,6 +825,12 @@ class TunnelManager {
         const msg = err instanceof Error ? err.message : String(err);
         this.snapshot = { ...this.snapshot, lastError: redact(msg) };
         return { ok: false, error: redact(msg) };
+      } finally {
+        // Always release the rotate window — without this a thrown
+        // recycle (e.g. cloudflared banner timeout) would leave the QR
+        // endpoint returning 503 forever, with no operator-visible
+        // recovery short of restarting the gateway.
+        this.rotating = false;
       }
     });
     if (!result.ok) return result;

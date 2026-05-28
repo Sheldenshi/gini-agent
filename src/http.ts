@@ -175,8 +175,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(result.snapshot);
     }],
     ["GET", /^\/api\/tunnel\/qr\.svg$/, () => {
-      const snap = tunnelManager(config).current();
-      if (!snap.publicUrl || !snap.secret) {
+      const mgr = tunnelManager(config);
+      const snap = mgr.current();
+      // Rotate window: the new on-disk secret is bonded to the OLD
+      // publicUrl until the recycle finishes. Handing out that mix
+      // would yield a bootstrap the old tunnel immediately rejects.
+      // Tell the caller to retry shortly; the rotate window is
+      // bounded by the cloudflared banner timeout.
+      if (mgr.isRotating() || !snap.publicUrl) {
+        return new Response(JSON.stringify({ error: "tunnel_rotating", retryAfterSec: 2 }), {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "retry-after": "2",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!snap.secret) {
         return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
       }
       const svg = renderQrSvg(bootstrapUrl(snap.publicUrl, snap.secret));
@@ -186,8 +202,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       });
     }],
     ["GET", /^\/api\/tunnel\/qr\.txt$/, () => {
-      const snap = tunnelManager(config).current();
-      if (!snap.publicUrl || !snap.secret) {
+      const mgr = tunnelManager(config);
+      const snap = mgr.current();
+      if (mgr.isRotating() || !snap.publicUrl) {
+        return new Response(JSON.stringify({ error: "tunnel_rotating", retryAfterSec: 2 }), {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "retry-after": "2",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!snap.secret) {
         return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
       }
       const ansi = renderQrAnsi(bootstrapUrl(snap.publicUrl, snap.secret));
