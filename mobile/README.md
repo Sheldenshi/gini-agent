@@ -162,6 +162,44 @@ from there. The approval remains pending in the runtime until acted
 on — the runtime does not have a retry loop that re-emits approval
 requests.
 
+## OTA updates
+
+JS-only changes ship over the air via EAS Update. Native config changes
+(`app.json` native fields, `eas.json`, `plugins/`, `ios-extensions/`)
+still require a fresh TestFlight build. The
+`.github/workflows/mobile-update.yml` workflow publishes an OTA on every
+push to `main` that touches `mobile/**` without changing native config.
+
+The runtime version policy in `mobile/app.json` is `"appVersion"`, so the
+`runtimeVersion` an update is published against equals the `version`
+field at publish time. A TestFlight build is locked to the
+`runtimeVersion` it was compiled with — bumping `mobile/app.json`
+`version` cuts a fresh runtime boundary that older builds will never
+consume.
+
+For an OTA to actually reach a device, the EAS channel that the build
+listens on must be linked to a publish branch. The `production` build
+profile in `eas.json` ships on channel `production`, which must point at
+the `production` update branch:
+
+```bash
+eas channel:view production --json
+eas channel:edit production --branch production   # one-time, if missing
+```
+
+If the channel has no branch mapping, every manifest request returns
+HTTP 400 (`no branches linked to channel`) and the app silently falls
+back to the embedded bundle — even though the EAS dashboard shows the
+update as published.
+
+To pick up an OTA on a TestFlight build, fully force-quit twice:
+
+1. Cold start #1 — embedded bundle runs; new bundle downloads in the
+   background.
+2. Cold start #2 — new bundle is applied.
+
+Backgrounding the app is not enough; iOS keeps the JS context alive.
+
 ## Known limitations (v1)
 
 - No pairing-code flow (yet). The setup screen takes a base URL +
