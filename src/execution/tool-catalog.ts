@@ -106,6 +106,33 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Web search via a configured provider connector (Brave Search or Exa).
+    // Backed by `src/integrations/connectors/{brave-search,exa}.ts`. The
+    // tool picks a healthy backend automatically when `provider` is
+    // omitted, preferring Brave (free tier) over Exa (paid). Returns up
+    // to `count` ranked results as compact text the model can cite.
+    toolset: "web_search",
+    displayLabel: "Web search",
+    type: "function",
+    function: {
+      name: "web_search",
+      description: "Search the public web via Brave Search or Exa. Returns up to `count` ranked results, each as `[N] title — url\\n    snippet`. Requires a configured + healthy connector for the chosen provider; if none exists the tool returns an error and you should call request_connector for 'brave-search' or 'exa'. Use this instead of guessing URLs or asking the user — it's the agent's primary way to discover fresh information.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query." },
+          count: { type: "number", description: "Max results to return. Defaults to 5; capped at 10.", default: 5 },
+          provider: {
+            type: "string",
+            enum: ["brave-search", "exa"],
+            description: "Optional explicit backend. When omitted, picks the first healthy connector (Brave preferred)."
+          }
+        },
+        required: ["query"]
+      }
+    }
+  },
+  {
     toolset: "messaging",
     displayLabel: "Fetch URL",
     type: "function",
@@ -1139,6 +1166,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.path) || previewValue(safe.pattern));
     case "web_fetch":
       return truncatePreview(previewValue(safe.url));
+    case "web_search":
+      return truncatePreview(previewValue(safe.query));
     case "terminal_exec":
       return truncatePreview(previewValue(safe.command));
     case "code_exec":

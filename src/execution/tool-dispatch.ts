@@ -51,7 +51,9 @@ import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
+import { resolveConnectorSecret } from "../integrations/connectors";
 import { invokeMcpTool } from "../integrations/mcp";
+import { braveWebSearch, exaWebSearch, formatWebSearchResults } from "../tools/web-search";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -113,6 +115,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await fileSearch(config, taskId, args) };
     case "web_fetch":
       return { kind: "sync", result: await webFetchTool(config, taskId, args) };
+    case "web_search":
+      return { kind: "sync", result: await webSearchTool(config, taskId, args) };
     case "read_skill":
       return { kind: "sync", result: await readSkillTool(config, taskId, args) };
     case "spawn_subagent":
@@ -506,6 +510,69 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
   });
   await recordLowRiskAudit(config, taskId, "web.fetch", parsed.toString(), { status: response.status, bytes: text.length });
   return text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`;
+}
+
+// Web search via Brave or Exa. Pick a healthy connector by provider id
+// (model-supplied `provider` arg wins; otherwise Brave > Exa). The token
+// is resolved through the standard connector secrets path so the audit
+// trail records the resolution without ever logging the key.
+type WebSearchProvider = "brave-search" | "exa";
+
+const WEB_SEARCH_PREFERENCE: WebSearchProvider[] = ["brave-search", "exa"];
+
+async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const query = requireString(args, "query");
+  const count = Math.min(Math.max(Math.trunc(optionalNumber(args, "count", 5)), 1), 10);
+  const requested = (args.provider === undefined || args.provider === null || args.provider === "")
+    ? undefined
+    : requireString(args, "provider");
+  if (requested && requested !== "brave-search" && requested !== "exa") {
+    throw new Error(`Unsupported web_search provider: ${requested}. Use 'brave-search' or 'exa'.`);
+  }
+
+  const state = readState(config.instance);
+  const candidates: WebSearchProvider[] = requested
+    ? [requested as WebSearchProvider]
+    : WEB_SEARCH_PREFERENCE;
+
+  let connector: typeof state.connectors[number] | undefined;
+  let providerId: WebSearchProvider | undefined;
+  for (const id of candidates) {
+    const found = state.connectors.find(
+      (c) => c.provider === id && c.status === "configured" && c.health === "healthy"
+    );
+    if (found) {
+      connector = found;
+      providerId = id;
+      break;
+    }
+  }
+  if (!connector || !providerId) {
+    const wanted = requested ?? "brave-search or exa";
+    throw new Error(
+      `No healthy ${wanted} connector configured. Call request_connector with provider '${requested ?? "brave-search"}' to ask the user for an API key.`
+    );
+  }
+
+  const token = await resolveConnectorSecret(config, connector.id, "token", taskId);
+  if (!token) throw new Error(`Connector ${connector.name} is missing its token secret.`);
+
+  const results = providerId === "brave-search"
+    ? await braveWebSearch(token, query, count)
+    : await exaWebSearch(token, query, count);
+
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Web search completed",
+    data: { provider: providerId, query, count: results.length }
+  });
+  await recordLowRiskAudit(config, taskId, "web.search", query, {
+    provider: providerId,
+    requested,
+    count: results.length,
+    connectorId: connector.id
+  });
+  return formatWebSearchResults(providerId, query, results);
 }
 
 // Skill catalog access. Returns the full markdown body of an enabled skill
