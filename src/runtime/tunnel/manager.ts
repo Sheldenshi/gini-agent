@@ -41,6 +41,39 @@ export function readPersistedPublicUrl(instance: string): string {
 
 const NOTES_FOLDER = "gini";
 
+// Periodic edge-reachability probe. cloudflared's process can stay healthy
+// long after the *.trycloudflare.com hostname has de-routed at Cloudflare's
+// edge — observed live with an 18-hour-old child whose hostname stopped
+// resolving in DNS while the local process kept reporting ok. The existing
+// `exit` listener only fires on process death, so it can't catch this. We
+// HEAD the publicUrl on an interval; only a thrown fetch (DNS failure,
+// connection refused, timeout) counts as unreachable. ANY resolved HTTP
+// response — including 404 / 530 / 502 — means the edge is still routing
+// us, so it counts as reachable. Detection only: after the threshold of
+// consecutive failures the snapshot flips into the existing `degraded`
+// shape (enabled && publicUrl === null && lastError set), the publicUrl
+// sibling file is removed, and the probe stops. Recovery is operator-
+// driven (manual recycle) — silent auto-rotation is forbidden per the
+// "rotation never happens implicitly" contract.
+const EDGE_PROBE_INTERVAL_MS = 120_000;
+const EDGE_PROBE_TIMEOUT_MS = 8_000;
+const EDGE_PROBE_FAILURE_THRESHOLD = 3;
+
+/** Pure decision function for the edge-reachability probe — exported so
+ *  unit tests can pin the failure-counting semantics without standing up a
+ *  full TunnelManager. A reachable probe resets the failure count to zero;
+ *  an unreachable probe increments and flags `dead` once the running count
+ *  reaches the threshold. */
+export function evaluateEdgeProbe(
+  prevFailures: number,
+  reachable: boolean,
+  threshold: number
+): { failures: number; dead: boolean } {
+  if (reachable) return { failures: 0, dead: false };
+  const failures = prevFailures + 1;
+  return { failures, dead: failures >= threshold };
+}
+
 let manager: TunnelManager | null = null;
 
 export function tunnelManager(config: RuntimeConfig): TunnelManager {
@@ -72,6 +105,14 @@ class TunnelManager {
    *  recycle cloudflared (close every open TCP / SSE connection) without
    *  the caller having to know the port. Null until the first enable(). */
   private lastWebPort: number | null = null;
+  /** Interval handle for the periodic edge-reachability probe. Non-null
+   *  only while a tunnel is live; cleared on disable / shutdown / probe-
+   *  observed-dead so the probe never runs against a stale snapshot. */
+  private edgeProbeTimer: ReturnType<typeof setInterval> | null = null;
+  /** Running count of consecutive unreachable probes — reset to 0 on any
+   *  reachable probe and on probe start/stop. Surfaced to the dead-flip
+   *  branch via `evaluateEdgeProbe` for the threshold check. */
+  private edgeProbeFailures = 0;
 
   constructor(private readonly config: RuntimeConfig) {
     // Eagerly populate config (mints secret if missing). The on-disk write is
@@ -211,6 +252,11 @@ class TunnelManager {
         publicUrl: null,
         lastError: redact(`cloudflared exited (${reason})`)
       };
+      // Process death already nulls publicUrl, so any in-flight or
+      // future probe would no-op on the !url guard — but stop the
+      // interval anyway so we don't burn an event-loop wake every
+      // EDGE_PROBE_INTERVAL_MS for a tunnel that's gone.
+      this.stopEdgeProbe();
       appendLog(this.config.instance, "tunnel.cloudflared.exit", {
         code: code ?? null,
         signal: signal ?? null
@@ -261,6 +307,14 @@ class TunnelManager {
         this.snapshot = { ...this.snapshot, lastError: redact(`tunnel.publicUrl write failed: ${writeMsg}`) };
         appendLog(this.config.instance, "tunnel.publicUrl.write-error", { error: redact(writeMsg) });
       }
+      // Start the periodic edge-reachability probe. Covers enable(), the
+      // inline rotate-secret recycle, and boot reconcile in one place —
+      // every successful publicUrl stamp for a live tunnel flows through
+      // this branch. Safe to call when a probe is already running:
+      // startEdgeProbe stops the existing timer and resets the failure
+      // count before starting fresh, so a recycle's URL swap doesn't
+      // inherit the old hostname's accumulated failures.
+      this.startEdgeProbe();
       return { ok: true, snapshot: this.snapshot };
     } catch (err) {
       // Banner-parse failure or process exit reject. If the process
@@ -395,6 +449,11 @@ class TunnelManager {
           appendLog(this.config.instance, "tunnel.disable.stop-error", { error: redact(stopErr) });
         }
       }
+      // Stop the edge probe in lockstep with the cloudflared teardown.
+      // The probe's internal !snapshot.enabled guard would also short-
+      // circuit it once the snapshot stamp below lands, but killing the
+      // interval here avoids the wake-and-skip cost.
+      this.stopEdgeProbe();
       // Clear iCloud Notes copy on disable transition if Notes mirror is on.
       let notesErr: string | null = null;
       if (this.snapshot.appleNotes.enabled && this.notesAvailable) {
@@ -694,12 +753,115 @@ class TunnelManager {
    *  active. */
   async stopForShutdown(): Promise<void> {
     this.shuttingDown = true;
+    // Stop the edge probe before awaiting cloudflared so the SIGTERM
+    // drain's 5000ms cap isn't competing with a probe wake. The probe's
+    // own shuttingDown guard would also bail any in-flight fetch's
+    // result-handling, but unscheduling the interval first is the
+    // cleaner termination order.
+    this.stopEdgeProbe();
     try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
     if (this.cloudflared) {
       const prev = this.cloudflared;
       this.cloudflared = null;
       await prev.stop();
     }
+  }
+
+  /** (Re)start the periodic edge probe. Idempotent — clears any existing
+   *  timer and zeros the failure count so a hostname rotation (rotate-
+   *  secret recycle) doesn't inherit the prior hostname's accumulated
+   *  failures. `.unref()` lets the Bun process exit naturally if the
+   *  probe is the only remaining handle keeping the event loop alive. */
+  private startEdgeProbe(): void {
+    this.stopEdgeProbe();
+    this.edgeProbeFailures = 0;
+    const timer = setInterval(() => void this.probeEdge(), EDGE_PROBE_INTERVAL_MS);
+    timer.unref();
+    this.edgeProbeTimer = timer;
+  }
+
+  /** Cancel the periodic edge probe and reset the failure count. Called on
+   *  disable, shutdown, cloudflared exit, and once the probe itself
+   *  declares the hostname dead (no point continuing to poll a URL we
+   *  just nulled in the snapshot). */
+  private stopEdgeProbe(): void {
+    if (this.edgeProbeTimer !== null) {
+      clearInterval(this.edgeProbeTimer);
+      this.edgeProbeTimer = null;
+    }
+    this.edgeProbeFailures = 0;
+  }
+
+  /** One probe tick. Captures the generation + URL up-front so a concurrent
+   *  rotate / disable / boot reconcile that bumps the generation or swaps
+   *  publicUrl between the fetch issue and the dead-flip can be detected
+   *  and skipped — we must not stamp lastError onto a fresh, healthy
+   *  tunnel that happens to share the now-stale failure count. */
+  private async probeEdge(): Promise<void> {
+    const url = this.snapshot.publicUrl;
+    const gen = this.generation;
+    if (this.shuttingDown || !this.snapshot.enabled || !url) {
+      // If the tunnel is no longer enabled there's nothing for the probe
+      // to do — kill the interval rather than wake every probe interval
+      // just to no-op. The enabled-but-no-url case is "already degraded";
+      // leave the timer in place so a future recycle can reuse it.
+      if (!this.snapshot.enabled) this.stopEdgeProbe();
+      return;
+    }
+    let reachable: boolean;
+    try {
+      // HEAD with `redirect: manual` so a 301/302 to an error page still
+      // counts as the edge routing us. AbortSignal.timeout bounds the
+      // probe at EDGE_PROBE_TIMEOUT_MS — DNS resolution alone can take
+      // tens of seconds against a dead authority.
+      await fetch(url, {
+        method: "HEAD",
+        redirect: "manual",
+        signal: AbortSignal.timeout(EDGE_PROBE_TIMEOUT_MS)
+      });
+      reachable = true;
+    } catch {
+      // ONLY a thrown fetch counts as unreachable: DNS failure, TCP
+      // refused, TLS failure, or timeout. Any resolved HTTP Response
+      // (including 404, 502, 530) means the edge is still routing
+      // requests to us, so a misconfigured origin doesn't get
+      // misclassified as a dead hostname.
+      reachable = false;
+    }
+    const { failures, dead } = evaluateEdgeProbe(
+      this.edgeProbeFailures,
+      reachable,
+      EDGE_PROBE_FAILURE_THRESHOLD
+    );
+    this.edgeProbeFailures = failures;
+    if (!dead) return;
+    // Re-validate before stamping degraded. Between the await and now a
+    // rotate-secret recycle could have swapped publicUrl, a disable
+    // could have nulled it, or SIGTERM could have started the drain.
+    // Flipping the snapshot in any of those races would clobber a
+    // fresh, healthy state with a stale failure count.
+    if (
+      gen !== this.generation ||
+      this.shuttingDown ||
+      !this.snapshot.enabled ||
+      this.snapshot.publicUrl !== url
+    ) {
+      return;
+    }
+    try { unlinkSync(publicUrlPath(this.config.instance)); } catch { /* may not exist */ }
+    setRedactionPublicUrl(null);
+    this.snapshot = {
+      ...this.snapshot,
+      publicUrl: null,
+      lastError: redact(
+        `tunnel unreachable at the Cloudflare edge after ${failures} consecutive probes — the quick-tunnel hostname likely expired; recycle to restore`
+      )
+    };
+    appendLog(this.config.instance, "tunnel.edge-unreachable", { failures });
+    // Stop polling now that we've flipped to degraded — publicUrl is
+    // null, so further probes would no-op anyway, and the operator-
+    // driven recycle is what restores the tunnel.
+    this.stopEdgeProbe();
   }
 
   private notesNoteName(): string {
