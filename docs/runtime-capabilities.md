@@ -45,6 +45,7 @@ bun run gini evidence
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |
 | Messaging bridge records | `gini messaging list/add/health/receive/send/messages/disable/remove`; inbound messages create tasks. Telegram bridges support per-chat enrollment via `gini messaging allow/deny/reject-pending/chats` (no trust-on-first-use; on each DM from an unrecognized chat the poller mints a short verification code in `F971-8261` format, DMs it to the user, and records the same code on `recentDeniedChats` so the operator can confirm a match before clicking Approve; `reject-pending` clears a pending request row without granting allowlist access). Discord uses channel-as-auth — every non-bot poster in a configured `deliveryTargets` channel can submit, see [Discord bridge ADR](adr/discord-bridge.md) for the Message Content Intent setup step |
 | Agents/config | `gini agents list/create/use/delete`, instance-aware config |
+| Tunnel + mobile QR onboarding | Cloudflare quick-tunnel managed via `/api/tunnel` (PATCH `{enabled}` / `{rotateSecret}` / `{appleNotes}`), browser-safe view at `/api/tunnel/redacted`, scannable QR at `/api/tunnel/qr.svg` and `/api/tunnel/qr.txt`. Scanning the QR opens the tunneled bootstrap URL which 302s to the runtime's `/connect` interstitial; on mobile user agents the page builds a `gini://connect?host=…&secret=…` deep link that the Expo app's URL scheme handler claims, validates against `GET /api/status`, and persists with `saveCredentials`. `POST /api/tunnel/refresh-notes` re-writes the iCloud Notes mirror with the live bootstrap URL. Full contract in ADR [tunnel-and-mobile-access.md](adr/tunnel-and-mobile-access.md) |
 | Import inspection and migration | `gini import inspect openclaw <path>` (read-only summary), `gini import plan openclaw [path]` (dry-run with redacted secret summary), `gini import apply openclaw [path] [--force]` (mutates gini state — creates agents, encrypted bridge tokens, skills, workspace bootstrap files). See [openclaw migration ADR](adr/openclaw-migration.md) and [migration guide](migration-from-openclaw.md) |
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
@@ -61,6 +62,7 @@ Stable local clients use the gateway API:
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
+- `/api/tunnel`, `/api/tunnel/redacted`, `/api/tunnel/qr.svg`, `/api/tunnel/qr.txt`, `POST /api/tunnel/refresh-notes`, and the `/connect` interstitial that mints the `gini://connect` deep link
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/settings/auto-approve`
