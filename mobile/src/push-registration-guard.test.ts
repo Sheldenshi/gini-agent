@@ -76,4 +76,25 @@ describe("push-registration-guard", () => {
     bumpGeneration();
     expect(isStillCurrent(captured)).toBe(false);
   });
+
+  test("a credential swap (modeled as a single generation bump) invalidates the prior session's capture but lets a follow-up capture start fresh", () => {
+    // Models resetRegistrationForCredentialSwap: the deep-link path
+    // calls bumpGeneration to drop any in-flight registration that
+    // captured the prior credential's generation. After the bump, a
+    // brand-new registerForPushAsync invocation captures the new
+    // generation and proceeds normally.
+    const priorSessionCapture = captureGeneration();
+    expect(isStillCurrent(priorSessionCapture)).toBe(true);
+
+    // Simulate the credential swap reset.
+    bumpGeneration();
+
+    // The prior session's capture must short-circuit.
+    expect(isStillCurrent(priorSessionCapture)).toBe(false);
+
+    // A new capture (the next registerForPushAsync) tracks the new
+    // generation and stays current.
+    const newSessionCapture = captureGeneration();
+    expect(isStillCurrent(newSessionCapture)).toBe(true);
+  });
 });

@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { Alert } from "react-native";
 import { router } from "expo-router";
 import { saveCredentials } from "@/src/auth";
+import { resetRegistrationForCredentialSwap } from "@/src/push";
 
 // Handles `gini://connect?api=<base-url>&token=<bearer>` deep links by
 // prompting the user, then persisting the credentials and navigating
@@ -147,6 +148,16 @@ export function useDeepLinkAuth(): void {
             // `router.replace` explicitly so a user who tapped the deep
             // link while sitting on /setup is moved off it immediately
             // instead of waiting for state propagation.
+            //
+            // The deep-link payload may point at a different runtime
+            // instance than the one this process is currently signed
+            // into (different gateway, different devices table). Reset
+            // every short-circuit gate from the prior session BEFORE
+            // the credential swap commits, so the next
+            // registerForPushAsync runs the full POST + listener install
+            // against the new gateway instead of treating itself as
+            // already-registered.
+            resetRegistrationForCredentialSwap();
             saveCredentials(creds)
               .then(() => {
                 if (!active) return;
