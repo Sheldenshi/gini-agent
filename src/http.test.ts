@@ -489,7 +489,7 @@ describe("runtime api", () => {
       body: JSON.stringify({ input: "patch README.md :: Gini => Gini" })
     });
     const detail = await waitForTask(handler, config, task.id);
-    const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
+    const approval = readState(config.instance).authorizations.find((item) => item.taskId === task.id);
 
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");
@@ -589,9 +589,9 @@ describe("runtime api", () => {
     const detail = await waitForTask(handler, config, submitted.id);
     expect(detail.task.status).toBe("waiting_approval");
 
-    const approval = readState(config.instance).approvals.find((item) => item.taskId === submitted.id);
+    const approval = readState(config.instance).authorizations.find((item) => item.taskId === submitted.id);
     expect(approval).toBeDefined();
-    await call(handler, config, `/api/approvals/${approval!.id}/approve`, { method: "POST" });
+    await call(handler, config, `/api/authorizations/${approval!.id}/approve`, { method: "POST" });
 
     const finalDetail = await waitForTask(handler, config, submitted.id);
     expect(finalDetail.task.status).toBe("completed");
@@ -764,18 +764,17 @@ describe("runtime api", () => {
     expect(ids).toContain("codex");
   });
 
-  test("POST /api/approvals/<id>/connect creates a connector and resolves the approval on probe success", async () => {
-    const config = testConfig("approvals-connect-happy");
+  test("POST /api/setup-requests/<id>/complete creates a connector and resolves the setup request on probe success", async () => {
+    const config = testConfig("setup-requests-complete-happy");
     const handler = createHandler(config);
-    // Stage a connector.request approval row directly. Demo provider has no
-    // probe, so checkConnector falls back to presence-only ⇒ healthy without
-    // any network mocking.
-    const { createApproval } = await import("./state");
+    // Stage a connector.request setup-request row directly. Demo provider has
+    // no probe, so checkConnector falls back to presence-only => healthy
+    // without any network mocking.
+    const { createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "connector.request",
         target: "demo",
-        risk: "low",
         reason: "test connect",
         payload: {
           provider: "demo",
@@ -788,7 +787,7 @@ describe("runtime api", () => {
       })
     );
 
-    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
       method: "POST",
       body: JSON.stringify({ secrets: {}, scopes: [] })
     });
@@ -797,20 +796,19 @@ describe("runtime api", () => {
     expect(response.connector.health).toBe("healthy");
 
     const state = readState(config.instance);
-    const resolved = state.approvals.find((a) => a.id === approval.id);
-    expect(resolved?.status).toBe("approved");
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("completed");
     expect(state.connectors.some((c) => c.provider === "demo" && c.health === "healthy")).toBe(true);
   });
 
-  test("POST /api/approvals/<id>/connect returns ok:false and leaves the approval pending on probe failure", async () => {
-    const config = testConfig("approvals-connect-probe-fail");
+  test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
+    const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "connector.request",
         target: "linear",
-        risk: "low",
         reason: "fetch issues",
         payload: {
           provider: "linear",
@@ -829,7 +827,7 @@ describe("runtime api", () => {
       headers: { "content-type": "application/json" }
     })) as unknown as typeof fetch;
     try {
-      const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
         method: "POST",
         body: JSON.stringify({ secrets: { token: "not-a-real-token" } })
       });
@@ -839,16 +837,16 @@ describe("runtime api", () => {
       globalThis.fetch = originalFetch;
     }
     const state = readState(config.instance);
-    const after = state.approvals.find((a) => a.id === approval.id);
+    const after = state.setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect rejects approvals whose action is not connector.request", async () => {
-    const config = testConfig("approvals-connect-wrong-action");
+  test("POST /api/setup-requests/<id>/complete 404s for an authorization id", async () => {
+    const config = testConfig("setup-requests-complete-wrong-collection");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createAuthorization } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createAuthorization(state, {
         action: "file.write",
         target: "/tmp/x",
         risk: "high",
@@ -859,112 +857,34 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       { method: "POST", body: JSON.stringify({ secrets: {} }) },
       config.token
     );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("does not take a /connect submission");
+    // Authorization ids never appear in the setupRequests collection, so
+    // /complete returns 404 — the two endpoint families are independent.
+    expect(response.status).toBe(404);
   });
 
-  test("POST /api/approvals/<id>/approve refuses browser.fill_secret action", async () => {
-    // The generic /approve route would flip status=approved and trigger
-    // runApprovedAction's browser.fill_secret branch, which synthesizes a
-    // "fields filled" tool result for the agent even though no DOM fill
-    // ever happened (the side effect lives inside /connect's per-slot
-    // loop). Refuse early so the only resolution path for fill_secret is
-    // /connect with values.
-    const config = testConfig("approve-refuses-fill-secret");
-    const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
-        action: "browser.fill_secret",
-        target: "https://example.com/login#@e1,@e2",
-        risk: "high",
-        reason: "Sign in to the test site",
-        payload: {
-          slots: [
-            { name: "username", locator: "@e1", label: "Username", kind: "text" },
-            { name: "password", locator: "@e2", label: "Password", kind: "password" }
-          ],
-          reason: "Sign in",
-          toolCallId: "call_fill"
-        }
-      })
-    );
-    const response = await rawCall(
-      handler,
-      config,
-      `/api/approvals/${approval.id}/approve`,
-      { method: "POST" },
-      config.token
-    );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("/connect");
-    expect(body.error).toContain("not /approve");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
-    expect(after?.status).toBe("pending");
-  });
-
-  test("POST /api/approvals/<id>/approve refuses messaging.add_bridge action", async () => {
-    // The chat-side messaging.add_bridge flow needs the bridge name +
-    // bot token from the user, both of which only travel on the
-    // /connect path. The generic /approve route would flip the
-    // approval to status=approved without ever calling
-    // addMessagingBridge, and runApprovedAction's matching branch
-    // would synthesize "Bridge added" for the agent over a bridge
-    // that doesn't exist. Refuse early so /connect is the only
-    // resolution path.
-    const config = testConfig("approve-refuses-messaging-add-bridge");
-    const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
-        action: "messaging.add_bridge",
-        target: "telegram",
-        risk: "high",
-        reason: "Add a Telegram bridge",
-        payload: { kind: "telegram", suggestedName: "my-telegram-bot", toolCallId: "call_bridge" }
-      })
-    );
-    const response = await rawCall(
-      handler,
-      config,
-      `/api/approvals/${approval.id}/approve`,
-      { method: "POST" },
-      config.token
-    );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("/connect");
-    expect(body.error).toContain("not /approve");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
-    expect(after?.status).toBe("pending");
-  });
-
-  test("POST /api/approvals/<id>/connect creates a messaging bridge and resolves the approval", async () => {
+  test("POST /api/setup-requests/<id>/complete creates a messaging bridge and resolves the setup request", async () => {
     // Happy-path pin for the chat-side Add Telegram flow. The card's
     // Submit button POSTs the name + bot token under `secrets`; the
     // gateway routes them into addMessagingBridge (the same code path
     // the CLI and the settings page already call) and resolves the
-    // approval so the chat-task loop can resume.
-    const config = testConfig("approvals-connect-bridge-happy");
+    // setup request so the chat-task loop can resume.
+    const config = testConfig("setup-complete-bridge-happy");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
         action: "messaging.add_bridge",
         target: "telegram",
-        risk: "high",
         reason: "Add a Telegram bridge",
         payload: { kind: "telegram", suggestedName: "chat-test-bridge", toolCallId: "call_bridge_happy" }
       })
     );
 
-    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
       method: "POST",
       body: JSON.stringify({ secrets: { name: "chat-test-bridge", botToken: "1234:ABCDEFGHIJKLMNOPQR" } })
     });
@@ -973,137 +893,106 @@ describe("runtime api", () => {
     expect(response.bridge?.kind).toBe("telegram");
 
     const state = readState(config.instance);
-    const resolved = state.approvals.find((a) => a.id === approval.id);
-    expect(resolved?.status).toBe("approved");
+    const resolved = state.setupRequests.find((s) => s.id === setup.id);
+    expect(resolved?.status).toBe("completed");
     const bridge = state.messagingBridges.find((b) => b.name === "chat-test-bridge");
     expect(bridge).toBeDefined();
     expect(bridge?.kind).toBe("telegram");
 
     // Audit-row traceability pin: the chat-card create writes a
-    // dedicated audit row with the originating approvalId AND the
+    // dedicated audit row with the originating setup-request id AND the
     // resulting bridge.id so operators can reconstruct
-    // "approval X via chat-card → bridge Y" from the activity feed.
+    // "setup X via chat-card → bridge Y" from the activity feed.
     // Without this row the chat path is indistinguishable from the
     // CLI / settings dialog in the audit log (both write the same
     // generic messaging.configured row via createMessagingBridgeRecord).
     const chatAddRow = state.audit.find(
-      (e) => e.action === "messaging.add_bridge" && e.approvalId === approval.id
+      (e) => e.action === "messaging.add_bridge" && e.approvalId === setup.id
     );
     expect(chatAddRow).toBeDefined();
     expect(chatAddRow?.target).toBe(bridge?.id);
     expect((chatAddRow?.evidence as { kind?: string } | undefined)?.kind).toBe("telegram");
     expect((chatAddRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("chat-test-bridge");
 
-    // Durable outcome pin: the /connect handler writes
-    // approval.connectOutcome so a post-reload render of the
-    // resolved card reads the truthful past-tense summary.
-    // Without this, the React component's sticky state evaporates
-    // on reload and the card would fall back to "Bridge added."
-    // even when the side effect actually failed.
+    // Durable outcome pin: the /complete handler writes
+    // setup.connectOutcome so a post-reload render of the resolved
+    // card reads the truthful past-tense summary. Without this, the
+    // React component's sticky state evaporates on reload and the
+    // card would fall back to "Bridge added." even when the side
+    // effect actually failed.
     expect(resolved?.connectOutcome?.ok).toBe(true);
     expect(resolved?.connectOutcome?.message).toContain("chat-test-bridge");
   });
 
-  test("POST /api/approvals/<id>/connect refuses messaging.add_bridge that was already denied, and creates no bridge", async () => {
-    // Race-safety pin: the messaging.add_bridge branch must call
-    // resolveApproval BEFORE addMessagingBridge so a concurrent
-    // /deny (or cancel cascade) cannot leave an orphan bridge +
-    // encrypted secret on disk after the user has already
-    // abandoned the prompt. Mirrors the resolve-first contract in
-    // src/execution/browser-fill-secrets.ts. We simulate the race
-    // by pre-denying the approval and then hitting /connect — the
-    // handler must short-circuit at the atomic resolve call, return
-    // ok:false, and never touch addMessagingBridge.
-    const config = testConfig("approvals-connect-bridge-deny-race");
+  test("POST /api/setup-requests/<id>/complete refuses messaging.add_bridge that was already cancelled, and creates no bridge", async () => {
+    // Race-safety pin: the messaging.add_bridge branch must resolve the
+    // setup request BEFORE addMessagingBridge so a concurrent /cancel
+    // (or cancel cascade) cannot leave an orphan bridge + encrypted
+    // secret on disk after the user has already abandoned the prompt.
+    // Mirrors the resolve-first contract in
+    // src/execution/browser-fill-secrets.ts. We simulate the race by
+    // pre-cancelling the setup request and then hitting /complete — the
+    // handler must short-circuit at the "already !pending" guard,
+    // return 410, and never touch addMessagingBridge.
+    const config = testConfig("setup-complete-bridge-cancel-race");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
         action: "messaging.add_bridge",
         target: "telegram",
-        risk: "high",
         reason: "Add a Telegram bridge",
         payload: { kind: "telegram", suggestedName: "race-bridge", toolCallId: "call_bridge_race" }
       })
     );
-    // Pre-deny the approval as if a concurrent operator had
-    // clicked Cancel between the user's typing and the Submit
-    // landing on the server.
-    const { decideApproval } = await import("./agent");
-    await decideApproval(config, approval.id, "deny");
-    expect(readState(config.instance).approvals.find((a) => a.id === approval.id)?.status).toBe("denied");
+    // Pre-cancel the setup request as if a concurrent operator had
+    // clicked Cancel between the user's typing and the Submit landing
+    // on the server.
+    await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
     const beforeBridges = readState(config.instance).messagingBridges.length;
 
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${setup.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { name: "race-bridge", botToken: "1234:ABCDEFGHIJKL" } })
       },
       config.token
     );
-    // 410 Gone — the resolution-before-creation contract is upheld
-    // whether the refusal comes from the outer "already !pending"
-    // guard or the inner resolveApproval throw. The load-bearing
-    // invariant is the absence of any bridge / orphan secret on the
-    // other side.
+    // 410 Gone — the resolution-before-creation contract is upheld by
+    // the outer "already !pending" guard. The load-bearing invariant
+    // is the absence of any bridge / orphan secret on the other side.
     expect(response.status).toBe(410);
-    const body = await response.json();
-    expect(body.error ?? body.message).toMatch(/denied/);
 
     const after = readState(config.instance);
     expect(after.messagingBridges.length).toBe(beforeBridges);
-    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("denied");
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
   });
 
-  test("decideApproval refuses messaging.add_bridge approve at the state-machine layer", async () => {
-    // Defense-in-depth pin for the same gate the HTTP /approve route
-    // enforces. Any non-HTTP caller of decideApproval (CLI, future
-    // API client, internal job runner) must hit the same refusal so
-    // the runApprovedAction branch (which has been a no-op since
-    // /connect owns the lifecycle) cannot accidentally fire over a
-    // bridge that was never created.
-    const config = testConfig("decide-refuses-messaging-add-bridge");
-    const { createApproval } = await import("./state");
-    const { decideApproval } = await import("./agent");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
-        action: "messaging.add_bridge",
-        target: "telegram",
-        risk: "high",
-        reason: "Add a Telegram bridge",
-        payload: { kind: "telegram", suggestedName: "decide-guard", toolCallId: "call_decide_guard" }
-      })
-    );
-    await expect(decideApproval(config, approval.id, "approve")).rejects.toThrow(/\/connect/);
-    expect(readState(config.instance).approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
-  });
-
-  test("POST /api/approvals/<id>/connect rejects malformed messaging.add_bridge tokens BEFORE resolving the approval", async () => {
-    // Token-format pre-check fix: addMessagingBridge runs
+  test("POST /api/setup-requests/<id>/complete rejects malformed messaging.add_bridge tokens BEFORE resolving the setup request", async () => {
+    // Token-format pre-check: addMessagingBridge runs
     // assertHeaderSafeToken internally, and the chat card disappears
-    // once the approval flips out of pending state. Without
+    // once the setup request flips out of pending state. Without
     // pre-resolve token validation, a malformed token would burn the
-    // approval and the user could not retype from the same card.
-    // The bounded module now calls assertHeaderSafeToken BEFORE
-    // resolveApproval; this test pins that ordering by submitting a
-    // token with a control character and asserting the approval
-    // stays pending.
-    const config = testConfig("connect-bridge-bad-token-stays-pending");
+    // request and the user could not retype from the same card.
+    // The bounded module calls assertHeaderSafeToken BEFORE resolving;
+    // this test pins that ordering by submitting a token with a control
+    // character and asserting the request stays pending.
+    const config = testConfig("setup-complete-bridge-bad-token-stays-pending");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
         action: "messaging.add_bridge",
         target: "telegram",
-        risk: "high",
         reason: "Add a Telegram bridge",
         payload: { kind: "telegram", suggestedName: "bad-token", toolCallId: "call_bridge_bad_token" }
       })
     );
-    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
       method: "POST",
       // Control character in the token — assertHeaderSafeToken
       // refuses any byte outside printable ASCII [\x21-\x7E].
@@ -1113,122 +1002,64 @@ describe("runtime api", () => {
     expect(typeof response.message).toBe("string");
 
     const after = readState(config.instance);
-    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
     expect(after.messagingBridges.length).toBe(0);
   });
 
-  test("POST /api/approvals/<id>/connect returns ok:false when messaging.add_bridge is missing a name or token", async () => {
+  test("POST /api/setup-requests/<id>/complete returns ok:false when messaging.add_bridge is missing a name or token", async () => {
     // The chat card disables Submit until both inputs are non-empty,
     // but a CLI/API caller could POST a partial body. The gateway
     // mirrors the same readiness gate as the card so a partial
     // submission can't silently create a half-configured bridge.
-    const config = testConfig("approvals-connect-bridge-missing");
+    const config = testConfig("setup-complete-bridge-missing");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
         action: "messaging.add_bridge",
         target: "telegram",
-        risk: "high",
         reason: "Add a Telegram bridge",
         payload: { kind: "telegram", suggestedName: "missing-fields", toolCallId: "call_bridge_missing" }
       })
     );
-    const missingToken = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const missingToken = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
       method: "POST",
       body: JSON.stringify({ secrets: { name: "missing-fields" } })
     });
     expect(missingToken.ok).toBe(false);
     expect(missingToken.message).toContain("Bot token");
 
-    const missingName = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const missingName = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
       method: "POST",
       body: JSON.stringify({ secrets: { botToken: "1234:ABCDEFGHIJ" } })
     });
     expect(missingName.ok).toBe(false);
     expect(missingName.message).toContain("name");
 
-    // Both rejections must leave the approval pending — otherwise the
-    // chat card would flip out of pending state and the user couldn't
-    // retry.
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    // Both rejections must leave the setup request pending — otherwise
+    // the chat card would flip out of pending state and the user
+    // couldn't retry.
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/approve refuses messaging.approve_pairing and messaging.remove_bridge actions", async () => {
-    // Symmetry with the messaging.add_bridge / browser.fill_secret
-    // refusals: the connect-only actions can't be resolved through
-    // the generic /approve route because their side effects need
-    // payload context (verification code, reject flag, bridge id)
-    // that only /connect carries.
-    const config = testConfig("approve-refuses-messaging-pairing-remove");
-    const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-
-    const pairing = await mutateState(config.instance, (state) =>
-      createApproval(state, {
-        action: "messaging.approve_pairing",
-        target: "bridge_x:42",
-        risk: "medium",
-        reason: "Confirm pairing",
-        payload: { bridgeId: "bridge_x", chatId: 42, verificationCode: "ABCD-1234", toolCallId: "call_p1" }
-      })
-    );
-    const remove = await mutateState(config.instance, (state) =>
-      createApproval(state, {
-        action: "messaging.remove_bridge",
-        target: "bridge_x",
-        risk: "high",
-        reason: "Remove bridge",
-        payload: { bridgeId: "bridge_x", bridgeName: "doomed", kind: "telegram", toolCallId: "call_r1" }
-      })
-    );
-
-    const pairingResponse = await rawCall(
-      handler,
-      config,
-      `/api/approvals/${pairing.id}/approve`,
-      { method: "POST" },
-      config.token
-    );
-    expect(pairingResponse.status).toBe(400);
-    const pairingBody = await pairingResponse.json();
-    expect(pairingBody.error).toContain("/connect");
-
-    const removeResponse = await rawCall(
-      handler,
-      config,
-      `/api/approvals/${remove.id}/approve`,
-      { method: "POST" },
-      config.token
-    );
-    expect(removeResponse.status).toBe(400);
-    const removeBody = await removeResponse.json();
-    expect(removeBody.error).toContain("/connect");
-
-    const after = readState(config.instance);
-    expect(after.approvals.find((a) => a.id === pairing.id)?.status).toBe("pending");
-    expect(after.approvals.find((a) => a.id === remove.id)?.status).toBe("pending");
-  });
-
-  test("POST /api/approvals/<id>/connect refuses a code-less messaging.approve_pairing approve and keeps the approval pending", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses a code-less messaging.approve_pairing approve and keeps the request pending", async () => {
     // allowChat's pending-row presence check is gated on `expectedCode`
     // being defined (the legacy CLI's "operator knows what they're
-    // doing" trust model). If a chat-card approval payload arrives
-    // without verificationCode (group chat: groups intentionally
-    // never mint a code, or a stale approval whose pending row was
-    // cleared and recreated), a no-code allowChat call would bypass
-    // the pending-row check and enroll a chat that is no longer
-    // pending. Pin that messaging-pairing-connect refuses the
-    // approve branch up-front when verificationCode is missing.
-    const config = testConfig("connect-pairing-codeless-refuses");
+    // doing" trust model). If a chat-card pairing payload arrives
+    // without verificationCode (group chat: groups intentionally never
+    // mint a code, or a stale request whose pending row was cleared and
+    // recreated), a no-code allowChat call would bypass the pending-row
+    // check and enroll a chat that is no longer pending. Pin that
+    // messaging-pairing-connect refuses the approve branch up-front when
+    // verificationCode is missing.
+    const config = testConfig("setup-complete-pairing-codeless-refuses");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
         action: "messaging.approve_pairing",
         target: "bridge_codeless:7",
-        risk: "medium",
         reason: "Confirm pairing",
         // Deliberately omit verificationCode — the chat card normally
         // carries one for private chats, but a stale or group-chat
@@ -1237,21 +1068,21 @@ describe("runtime api", () => {
       })
     );
 
-    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
       method: "POST",
       body: JSON.stringify({})
     });
     expect(response.ok).toBe(false);
     expect(response.message).toContain("code-less");
     const after = readState(config.instance);
-    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("pending");
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect removes a messaging bridge through the approval flow", async () => {
-    // Happy path for the chat-side Remove bridge card. The /connect
+  test("POST /api/setup-requests/<id>/complete removes a messaging bridge through the setup-request flow", async () => {
+    // Happy path for the chat-side Remove bridge card. The /complete
     // handler delegates to runMessagingRemoveConnect, which resolves
-    // the approval atomically then calls removeMessagingBridge.
-    const config = testConfig("connect-remove-bridge-happy");
+    // the setup request atomically then calls removeMessagingBridge.
+    const config = testConfig("setup-complete-remove-bridge-happy");
     const handler = createHandler(config);
 
     // Create a real bridge via the existing endpoint so its
@@ -1262,18 +1093,17 @@ describe("runtime api", () => {
     });
     expect(created.id).toBeString();
 
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
         action: "messaging.remove_bridge",
         target: created.id,
-        risk: "high",
         reason: "Remove bridge",
         payload: { bridgeId: created.id, bridgeName: "remove-me", kind: "telegram", toolCallId: "call_remove" }
       })
     );
 
-    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
       method: "POST",
       body: JSON.stringify({})
     });
@@ -1282,32 +1112,32 @@ describe("runtime api", () => {
     expect(response.bridgeId).toBe(created.id);
 
     const after = readState(config.instance);
-    expect(after.approvals.find((a) => a.id === approval.id)?.status).toBe("approved");
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("completed");
     expect(after.messagingBridges.find((b) => b.id === created.id)).toBeUndefined();
 
     // Chat-card lineage audit row pin: the chat-card remove path
-    // writes a dedicated audit row carrying approvalId + bridgeId,
-    // so a chat-card remove is distinguishable from a CLI / settings
-    // remove in the activity feed.
+    // writes a dedicated audit row carrying the setup-request id +
+    // bridgeId, so a chat-card remove is distinguishable from a CLI /
+    // settings remove in the activity feed.
     const chatRemoveRow = after.audit.find(
-      (e) => e.action === "messaging.remove_bridge" && e.approvalId === approval.id
+      (e) => e.action === "messaging.remove_bridge" && e.approvalId === setup.id
     );
     expect(chatRemoveRow).toBeDefined();
     expect(chatRemoveRow?.target).toBe(created.id);
     expect((chatRemoveRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("remove-me");
   });
 
-  test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {
-    // fillReady in BlockApprovalRequested.tsx only disables the web
+  test("POST /api/setup-requests/<id>/complete refuses partial browser.fill_secret submissions", async () => {
+    // fillReady in BlockSetupRequested.tsx only disables the web
     // Submit button; CLI / mobile / direct API clients can still POST a
     // partial body. The gateway must enforce that every declared slot
     // has a non-empty value before any DOM fill happens — otherwise
-    // /connect would resolve with some slots silently unfilled and the
+    // /complete would resolve with some slots silently unfilled and the
     // agent would be told (in agent.ts:runApprovedAction) that every
     // declared slot was filled.
-    const config = testConfig("connect-rejects-partial-fill-secret");
+    const config = testConfig("complete-rejects-partial-fill-secret");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const { createTask, upsertTask } = require("./state") as typeof import("./state");
       const task = createTask(state.instance, "partial-test");
@@ -1318,11 +1148,10 @@ describe("runtime api", () => {
     // doesn't fire before the missing-slot check; this test is about
     // partial submission, not origin binding.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -1346,7 +1175,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: "tomsmith" } })
@@ -1358,11 +1187,11 @@ describe("runtime api", () => {
     expect(body.ok).toBe(false);
     expect(body.message).toContain("password");
     expect(body.message).toContain("Missing");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect: submitted fill_secret values never appear in state.json, trace JSONL, or runtime.jsonl", async () => {
+  test("POST /api/setup-requests/<id>/complete: submitted fill_secret values never appear in state.json, trace JSONL, or runtime.jsonl", async () => {
     // End-to-end absence pin for the ADR's secret-handling guarantee:
     // submitted credential values must flow request-scope only and
     // never reach any persisted artifact. Without this test the only
@@ -1373,7 +1202,7 @@ describe("runtime api", () => {
     // the value.
     const config = testConfig("fill-secret-no-state-leak");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "fill secret leak guard");
       upsertTask(state, task);
@@ -1387,11 +1216,10 @@ describe("runtime api", () => {
     // never reach state/trace/log even when the runtime tries to
     // record what happened.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -1421,7 +1249,7 @@ describe("runtime api", () => {
     await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: USERNAME_MARKER, password: PASSWORD_MARKER } })
@@ -1475,7 +1303,7 @@ describe("runtime api", () => {
     expect(row.target ?? "").not.toContain(PASSWORD_MARKER);
   });
 
-  test("POST /api/approvals/<id>/connect refuses fill_secret when page navigated away from approved origin", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses fill_secret when page navigated away from approved origin", async () => {
     // The approval.target encodes the origin the user consented
     // to fill into (protocol+host+port; pathname is stripped by
     // sanitizeUrlForAuditTarget). If the page has navigated to a
@@ -1487,20 +1315,19 @@ describe("runtime api", () => {
     // peekCurrentBrowserUrl returns undefined,
     // which the handler treats as "no live page to fill" — same
     // refusal path.
-    const config = testConfig("connect-fill-secret-origin-mismatch");
+    const config = testConfig("complete-fill-secret-origin-mismatch");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1521,7 +1348,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
@@ -1532,7 +1359,7 @@ describe("runtime api", () => {
     const body = await response.json();
     expect(body.ok).toBe(false);
     // The browser session was never opened, so peekCurrentBrowserUrl
-    // returns undefined and the /connect handler takes the
+    // returns undefined and the /complete handler takes the
     // "session expired" branch (distinct from the "page navigated"
     // branch where a live session exists but its URL differs from
     // approvedUrl). Without that split the operator would see
@@ -1540,11 +1367,11 @@ describe("runtime api", () => {
     expect(body.message).toContain("Browser session expired");
     expect(body.message).toContain("https://example.com");
     // Approval stayed pending — no resolveApproval call ran.
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect refuses fill_secret slot values shorter than 4 chars", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses fill_secret slot values shorter than 4 chars", async () => {
     // The snapshot post-redactor uses literal substring replacement;
     // single-character (and other very short) values would shred
     // structural tokens like [@e1] in snapshot text. The 4-char
@@ -1552,20 +1379,19 @@ describe("runtime api", () => {
     // redactor safe, and /connect refuses values below that floor
     // so the registry-skip-for-short-values doesn't leak the
     // value via subsequent unredacted tool results.
-    const config = testConfig("connect-fill-secret-too-short");
+    const config = testConfig("complete-fill-secret-too-short");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "short value test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1585,7 +1411,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { pin: "12" } })
@@ -1597,30 +1423,29 @@ describe("runtime api", () => {
     expect(body.ok).toBe(false);
     expect(body.message).toContain("too short");
     expect(body.message).toContain("pin");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect: distinct 409 when live session exists but page navigated to a different origin", async () => {
+  test("POST /api/setup-requests/<id>/complete: distinct 409 when live session exists but page navigated to a different origin", async () => {
     // Pin the OTHER 409 branch: a live session whose current URL no
     // longer matches the approved origin. This is the genuine
     // page-navigated case (agent click, JS redirect, phishing
     // redirect), distinct from the session-expired idle-sweep case
     // covered by the previous test.
-    const config = testConfig("connect-fill-secret-real-navigation");
+    const config = testConfig("complete-fill-secret-real-navigation");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "real navigation test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1644,7 +1469,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
@@ -1657,7 +1482,7 @@ describe("runtime api", () => {
     expect(body.message).toContain("Page navigated");
     expect(body.message).toContain("https://example.com");
     expect(body.message).toContain("https://evil.example.org");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -1948,13 +1773,13 @@ describe("runtime api", () => {
     // created under the originating task, so it must carry the default
     // agent's id regardless of whoever is active now.
     await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
-    const approvals = readState(config.instance).approvals.filter((a) => a.taskId === task.id);
+    const approvals = readState(config.instance).authorizations.filter((a) => a.taskId === task.id);
     expect(approvals.length).toBeGreaterThan(0);
     expect(approvals.every((a) => a.agentId === defaultAgentId)).toBe(true);
-    const scopedDefault = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(defaultAgentId)}`);
+    const scopedDefault = await call(handler, config, `/api/authorizations?agentId=${encodeURIComponent(defaultAgentId)}`);
     expect(scopedDefault.every((a: { agentId?: string }) => a.agentId === defaultAgentId)).toBe(true);
     expect(scopedDefault.some((a: { taskId?: string }) => a.taskId === task.id)).toBe(true);
-    const scopedScout = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(second.id)}`);
+    const scopedScout = await call(handler, config, `/api/authorizations?agentId=${encodeURIComponent(second.id)}`);
     expect(scopedScout.some((a: { taskId?: string }) => a.taskId === task.id)).toBe(false);
   });
 
@@ -2661,6 +2486,183 @@ describe("runtime api", () => {
     expect(buffer).toContain("stream this");
   });
 
+  test("GET /api/chat/:id/stream emits id frames as <block_id>:<iso_ts>", async () => {
+    // Pins the SSE wire contract: each chat_block frame's `id:` line
+    // carries `<block_id>:<iso_timestamp>`. The mobile/browser client
+    // round-trips that string as Last-Event-ID on reconnect, and the
+    // gateway parses the `:<ts>` suffix to detect in-place updates on
+    // the cursor row (see listChatBlocksAfter). A regression that
+    // strips the suffix would silently break resume semantics for the
+    // streaming assistant_text case, so we pin the format at the HTTP
+    // boundary.
+    const config = testConfig("chat-blocks-stream-id-format");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "stream id format" })
+    });
+    const submitted = await call(handler, config, `/api/chat/${session.id}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "id format check" })
+    });
+    await waitForTask(handler, config, submitted.taskId);
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_block")) break;
+      }
+      await reader.cancel();
+    }
+    // Frame shape: `id: <block_id>:<iso_ts>\nevent: chat_block\n...`.
+    // Block ids are `block_<random>` (no `:`); ISO timestamps look like
+    // `YYYY-MM-DDTHH:MM:SS.sssZ`. The whole line must match this pattern.
+    const idLineMatch = buffer.match(
+      /^id: ([A-Za-z0-9_-]+):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)$/m
+    );
+    expect(idLineMatch).not.toBeNull();
+    // Sanity: the captured block id portion does not itself contain `:`,
+    // so splitting on the first colon in listChatBlocksAfter is safe.
+    expect(idLineMatch?.[1]).not.toContain(":");
+  });
+
+  test("GET /api/chat/:id/stream emits chat_session frame on initial connect", async () => {
+    // The mobile client reads the chat-detail header title from the
+    // session record this frame carries. Without an initial emit,
+    // there's a window where the header would render "Chat" / the
+    // first-message fallback even though the gateway already knows
+    // the canonical title (e.g. on reconnect to an already-renamed
+    // session).
+    const config = testConfig("chat-stream-session-initial");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "before-rename" })
+    });
+    await call(handler, config, `/api/chat/${session.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: "Renamed in the lobby" })
+    });
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_session");
+    expect(buffer).toContain("Renamed in the lobby");
+  });
+
+  test("GET /api/chat/:id/stream pushes chat_session frame on rename", async () => {
+    // The auto-rename path (chat-task → autoRenameChatAfterTurn) fires
+    // after task completion and the mobile chat-detail header must
+    // pick up the new title without polling. Stand-in for the auto
+    // case by hitting /rename explicitly — both paths route through
+    // renameChat → publishChatSession.
+    const config = testConfig("chat-stream-session-rename");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "" })
+    });
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+
+    // Drain the initial chat_session frame (the one emitted on connect)
+    // so the assertion below targets the rename-driven frame.
+    let buffer = "";
+    if (reader) {
+      const initialDeadline = Date.now() + 500;
+      while (Date.now() < initialDeadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+      // Clear the buffer so we can detect the second emit independently.
+      buffer = "";
+
+      // Trigger the publish from another concurrent caller, then drain.
+      await call(handler, config, `/api/chat/${session.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: "Streamed rename" })
+      });
+
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("Streamed rename")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_session");
+    expect(buffer).toContain("Streamed rename");
+  });
+
   test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
     const config = testConfig("chat-blocks-stream-404");
     const handler = createHandler(config);
@@ -2741,7 +2743,7 @@ describe("runtime api", () => {
       expect(dump.userProfile.budget.overCap).toBe(false);
       // INSTRUCTIONS.md is materialized by scaffold; the route returns
       // its content trimmed.
-      expect(dump.instructions.content).toMatch(/local-first personal agent/);
+      expect(dump.instructions.content).toMatch(/You are Gini, a personal agent/);
     });
 
     test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
@@ -2801,6 +2803,422 @@ describe("runtime api", () => {
       });
       expect(result.ok).toBe(false);
       expect(result.reason).toBe("no snapshot");
+    });
+  });
+
+  describe("push device endpoints", () => {
+    test("POST /api/push/devices upserts a token scoped to the caller's credential", async () => {
+      const config = testConfig("push-devices-upsert");
+      const handler = createHandler(config);
+      // Two distinct credentials: the runtime "owner" (config.token)
+      // and a paired mobile device that gets its own credential id.
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      const ownerReg = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const phoneReg = await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      expect(ownerReg.ok).toBe(true);
+      expect(ownerReg.device.credentialId).toBe("owner");
+      expect(ownerReg.device.token).toBe("tok_owner");
+      expect(phoneReg.ok).toBe(true);
+      expect(phoneReg.device.credentialId).toBe(claimed.device.id);
+      expect(phoneReg.device.token).toBe("tok_phone");
+
+      // Re-register the same token under the owner — idempotent rebind.
+      const rebind = await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile.dev" })
+      });
+      expect(rebind.device.bundleId).toBe("ai.lilaclabs.gini.mobile.dev");
+      expect(rebind.device.credentialId).toBe("owner");
+    });
+
+    test("POST /api/push/devices validates inputs", async () => {
+      const config = testConfig("push-devices-validate");
+      const handler = createHandler(config);
+
+      const missingToken = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(missingToken.status).toBe(400);
+
+      const wrongPlatform = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "android", bundleId: "ai.lilaclabs.gini.mobile" })
+      }, config.token);
+      expect(wrongPlatform.status).toBe(400);
+
+      const missingBundle = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios" })
+      }, config.token);
+      expect(missingBundle.status).toBe(400);
+    });
+
+    test("DELETE /api/push/devices/:token removes only the caller's tokens", async () => {
+      const config = testConfig("push-devices-delete");
+      const handler = createHandler(config);
+      const pairing = await call(handler, config, "/api/pairing", { method: "POST", body: JSON.stringify({ ttlSeconds: 60 }) });
+      const claimed = await callPublic(handler, config, "/api/pairing/claim", {
+        method: "POST",
+        body: JSON.stringify({ code: pairing.code, deviceName: "Phone" })
+      });
+
+      // Register two tokens — one per credential.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await callWithToken(handler, config, claimed.token, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_phone", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      // Owner cannot delete the paired device's token — 404 (we
+      // intentionally don't surface which of "missing" vs "wrong
+      // owner" so credentials can't probe each other).
+      const crossDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, config.token);
+      expect(crossDelete.status).toBe(404);
+
+      // The paired device deleting its own token succeeds.
+      const ownDelete = await callWithToken(handler, config, claimed.token, "/api/push/devices/tok_phone", { method: "DELETE" });
+      expect(ownDelete.ok).toBe(true);
+
+      // Second delete of the same token: 404.
+      const repeatDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, claimed.token);
+      expect(repeatDelete.status).toBe(404);
+    });
+
+    test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
+      const config = testConfig("chat-read-badge");
+      const handler = createHandler(config);
+
+      // Register a device first — read/badge now key per device, not
+      // per credential, so the mobile client identifies itself via
+      // X-Device-Token on every call.
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "read state" })
+      });
+      // Plant two visible blocks via the persistence layer — the read
+      // endpoint validates the block id, but the unread aggregate is
+      // what we're measuring here.
+      const { insertChatBlock } = await import("./state");
+      const b1 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hi"
+      });
+      insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "follow up"
+      });
+
+      // Fresh device: no read state yet, both blocks unread.
+      const before = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(before.unread).toBe(2);
+
+      const marked = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        headers: deviceHeader,
+        body: JSON.stringify({ lastReadBlockId: b1.id })
+      });
+      expect(marked.ok).toBe(true);
+      expect(marked.readState.lastReadBlockId).toBe(b1.id);
+
+      const after = await call(handler, config, "/api/badge", { headers: deviceHeader });
+      expect(after.unread).toBe(1);
+    });
+
+    test("POST /api/chat/:id/read rejects bad input and cross-session ids", async () => {
+      const config = testConfig("chat-read-validate");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_owner_device", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const deviceHeader = { "x-device-token": "tok_owner_device" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const bA = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "in A"
+      });
+
+      // Missing lastReadBlockId.
+      const missing = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({}) },
+        config.token
+      );
+      expect(missing.status).toBe(400);
+
+      // Block belongs to A — POSTing it on B's cursor is rejected.
+      const cross = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionB.id}/read`,
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(cross.status).toBe(400);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "POST", headers: deviceHeader, body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400 (mobile-only endpoint).
+      const missingDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        { method: "POST", body: JSON.stringify({ lastReadBlockId: bA.id }) },
+        config.token
+      );
+      expect(missingDevice.status).toBe(400);
+
+      // Foreign device token (not registered to this credential): 403.
+      const foreignDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${sessionA.id}/read`,
+        {
+          method: "POST",
+          headers: { "x-device-token": "tok_someone_else" },
+          body: JSON.stringify({ lastReadBlockId: bA.id })
+        },
+        config.token
+      );
+      expect(foreignDevice.status).toBe(403);
+    });
+
+    test("read state is scoped per device, not per credential", async () => {
+      // Two iPhones owned by the same human (both register under the
+      // "owner" credential). iPhone A reading the chat must NOT clear
+      // iPhone B's badge — that's the load-bearing per-device guarantee.
+      const config = testConfig("chat-read-device");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "shared" })
+      });
+      const { insertChatBlock } = await import("./state");
+      const block = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: session.id,
+        text: "hello"
+      });
+
+      // iPhone A marks read; its badge drops to 0. iPhone B's badge
+      // is still 1 because read state is per-device.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST",
+        headers: { "x-device-token": "tok_iphone_a" },
+        body: JSON.stringify({ lastReadBlockId: block.id })
+      });
+      const badgeA = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_a" }
+      });
+      const badgeB = await call(handler, config, "/api/badge", {
+        headers: { "x-device-token": "tok_iphone_b" }
+      });
+      expect(badgeA.unread).toBe(0);
+      expect(badgeB.unread).toBe(1);
+    });
+
+    test("read + badge endpoints require authentication", async () => {
+      const config = testConfig("chat-read-auth");
+      const handler = createHandler(config);
+      const read = await rawCall(handler, config, "/api/chat/chat_x/read", {
+        method: "POST",
+        body: JSON.stringify({ lastReadBlockId: "block_x" })
+      });
+      expect(read.status).toBe(401);
+      const badge = await rawCall(handler, config, "/api/badge");
+      expect(badge.status).toBe(401);
+    });
+
+    test("push device endpoints require authentication", async () => {
+      const config = testConfig("push-devices-auth");
+      const handler = createHandler(config);
+
+      const post = await rawCall(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      expect(post.status).toBe(401);
+
+      const del = await rawCall(handler, config, "/api/push/devices/tok", { method: "DELETE" });
+      expect(del.status).toBe(401);
+    });
+  });
+
+  describe("cors", () => {
+    // Save/restore the env override so individual cases don't leak.
+    function withEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+      const prior = process.env.GINI_CORS_ORIGINS;
+      if (value === undefined) delete process.env.GINI_CORS_ORIGINS;
+      else process.env.GINI_CORS_ORIGINS = value;
+      return fn().finally(() => {
+        if (prior === undefined) delete process.env.GINI_CORS_ORIGINS;
+        else process.env.GINI_CORS_ORIGINS = prior;
+      });
+    }
+
+    test("preflight from an allowed origin returns 204 with CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://localhost:8090",
+            "access-control-request-method": "GET",
+            "access-control-request-headers": "authorization"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+        expect(response.headers.get("access-control-allow-methods")).toContain("POST");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Authorization");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("X-Device-Token");
+        expect(response.headers.get("access-control-allow-headers") ?? "").toContain("Last-Event-ID");
+        expect(response.headers.get("access-control-max-age")).toBe("600");
+      });
+    });
+
+    test("preflight from a disallowed origin returns 204 without allow-origin", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-preflight-disallowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          method: "OPTIONS",
+          headers: {
+            origin: "http://evil.example.com",
+            "access-control-request-method": "GET"
+          }
+        }));
+        expect(response.status).toBe(204);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        // The protocol-level headers still go out — they describe what
+        // the server *would* accept; the browser rejects because of the
+        // missing allow-origin.
+        expect(response.headers.get("access-control-allow-methods")).toContain("GET");
+      });
+    });
+
+    test("normal GET from an allowed origin gets CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-get-allowed");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:3045",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:3045");
+        expect(response.headers.get("access-control-allow-credentials")).toBe("true");
+        expect(response.headers.get("vary")).toBe("Origin");
+        expect(response.headers.get("access-control-expose-headers")).toBe("Last-Event-ID");
+      });
+    });
+
+    test("non-browser caller without Origin gets no CORS headers", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-no-origin");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { authorization: `Bearer ${config.token}` }
+        }));
+        expect(response.status).toBe(200);
+        expect(response.headers.get("access-control-allow-origin")).toBeNull();
+        expect(response.headers.get("vary")).toBeNull();
+      });
+    });
+
+    test("401 responses still carry CORS headers so the browser sees the status", async () => {
+      await withEnv(undefined, async () => {
+        const config = testConfig("cors-401");
+        const handler = createHandler(config);
+        const response = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: { origin: "http://localhost:8090" } // no Authorization
+        }));
+        expect(response.status).toBe(401);
+        expect(response.headers.get("access-control-allow-origin")).toBe("http://localhost:8090");
+      });
+    });
+
+    test("GINI_CORS_ORIGINS env var overrides the default allowlist", async () => {
+      await withEnv("https://example.com", async () => {
+        const config = testConfig("cors-custom-env");
+        const handler = createHandler(config);
+
+        const allowed = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "https://example.com",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(allowed.headers.get("access-control-allow-origin")).toBe("https://example.com");
+
+        // The defaults (localhost:8090, etc) should NOT be honored when
+        // the env var is set — it's a full override, not an additive list.
+        const denied = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`, {
+          headers: {
+            origin: "http://localhost:8090",
+            authorization: `Bearer ${config.token}`
+          }
+        }));
+        expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+      });
     });
   });
 });

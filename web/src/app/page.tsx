@@ -10,14 +10,15 @@ import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { RiskPill, StatusPill } from "@/components/StatusPill";
 import { api } from "@/lib/api";
 import {
-  useApprovals,
+  useAuthorizations,
   useChatSessions,
   useEvents,
   useInvalidate,
+  useSetupRequests,
   useStatus,
   useTasks
 } from "@/lib/queries";
-import type { Approval } from "@runtime/types";
+import type { Authorization, SetupRequest } from "@runtime/types";
 
 const HOME_APPROVAL_LIMIT = 3;
 
@@ -26,7 +27,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export default function HomePage() {
   const status = useStatus();
   const tasks = useTasks();
-  const approvals = useApprovals();
+  const authorizations = useAuthorizations();
+  const setupRequests = useSetupRequests();
   const events = useEvents();
   const chatSessions = useChatSessions();
   const invalidate = useInvalidate();
@@ -34,12 +36,21 @@ export default function HomePage() {
   // SSE invalidation is handled globally by RuntimeStreamBridge — no local
   // useRuntimeStream subscription needed.
 
-  const decide = useMutation({
+  const decideAuth = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "approve" | "deny" }) =>
-      api<Approval>(`/approvals/${id}/${op}`, { method: "POST" }),
+      api<Authorization>(`/authorizations/${id}/${op}`, { method: "POST" }),
     onSuccess: (_, vars) => {
       toast.success(`${vars.op}: ${vars.id}`);
-      invalidate(["approvals", "tasks", "task", "state", "events", "audit"]);
+      invalidate(["authorizations", "approvals", "tasks", "task", "state", "events", "audit"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+  const cancelSetup = useMutation({
+    mutationFn: (id: string) =>
+      api<SetupRequest>(`/setup-requests/${id}/cancel`, { method: "POST" }),
+    onSuccess: (_, id) => {
+      toast.success(`cancelled: ${id}`);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "state", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
@@ -58,9 +69,13 @@ export default function HomePage() {
   }, [chatSessions.data]);
 
   const activeTasks = (tasks.data ?? []).filter((t) => ["queued", "running", "waiting_approval"].includes(t.status));
-  const pending = (approvals.data ?? []).filter((a) => a.status === "pending");
-  const pendingVisible = pending.slice(0, HOME_APPROVAL_LIMIT);
-  const pendingExtra = pending.length - pendingVisible.length;
+  const pendingAuth = (authorizations.data ?? []).filter((a) => a.status === "pending");
+  const pendingSetup = (setupRequests.data ?? []).filter((s) => s.status === "pending");
+  const pendingAuthVisible = pendingAuth.slice(0, HOME_APPROVAL_LIMIT);
+  const pendingSetupVisible = pendingSetup.slice(0, HOME_APPROVAL_LIMIT);
+  const pendingAuthExtra = pendingAuth.length - pendingAuthVisible.length;
+  const pendingSetupExtra = pendingSetup.length - pendingSetupVisible.length;
+  const pendingTotal = pendingAuth.length + pendingSetup.length;
   const recent = (events.data ?? []).slice().reverse().slice(0, 8);
 
   // "Today's cost" = sum of estimatedUsd on tasks updated in the last 24h.
@@ -89,7 +104,7 @@ export default function HomePage() {
         <div className="grid gap-3 sm:grid-cols-3">
           <Stat title="Health" value={status.data?.ok ? "Healthy" : status.isLoading ? "…" : "Down"} sub={`port ${status.data?.port ?? "—"}`} />
           <Stat title="Active tasks" value={String(activeTasks.length)} sub={activeTasks.length > 0 ? "in flight" : "no work in flight"} />
-          <Stat title="Pending approvals" value={String(pending.length)} sub={pending.length > 0 ? "needs review" : "all clear"} />
+          <Stat title="Pending approvals" value={String(pendingTotal)} sub={pendingTotal > 0 ? "needs review" : "all clear"} />
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
@@ -110,166 +125,111 @@ export default function HomePage() {
               runtime-identity-files.md. */}
         </div>
 
-        {pending.length > 0 ? (
+        {pendingAuth.length > 0 ? (
           <Card>
             <CardHeader>
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
-                  <CardTitle className="text-sm">Needs your approval</CardTitle>
-                  <CardDescription>Pending actions blocking tasks</CardDescription>
+                  <CardTitle className="text-sm">Pending authorizations</CardTitle>
+                  <CardDescription>Agent actions blocked on your approval</CardDescription>
                 </div>
-                {pendingExtra > 0 ? (
+                {pendingAuthExtra > 0 ? (
                   <Link
                     href="/permissions"
                     className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent"
                   >
-                    View all ({pending.length})
+                    View all ({pendingAuth.length})
                   </Link>
                 ) : null}
               </div>
             </CardHeader>
             <CardContent>
               <ul className="divide-y divide-border">
-                {pendingVisible.map((approval) => {
-                  // browser.connect uses the reason as the body and a
-                  // friendlier label as the title — the raw target
-                  // is the same reason string, so the per-row
-                  // rendering stays compact.
-                  const isBrowserConnect = approval.action === "browser.connect";
-                  // `browser.fill_secret` can only be resolved via /connect
-                  // with per-slot values from the amber chat card. The
-                  // generic /approve route refuses this action with 400.
-                  // Hide both action buttons and point the operator to
-                  // the chat session instead.
-                  const isBrowserFillSecret = approval.action === "browser.fill_secret";
-                  // Same gate as fill_secret: /approve refuses
-                  // messaging.add_bridge — only the inline chat card
-                  // can resolve it. Hide Approve here and leave Deny
-                  // so the operator can still cancel from the home
-                  // list.
-                  const isMessagingAddBridge = approval.action === "messaging.add_bridge";
-                  // Same hide-approve treatment for the other
-                  // chat-only messaging actions. The home pending
-                  // list never has the right surface to show
-                  // verification codes or destructive confirmations,
-                  // so it renders Deny + a pointer at chat.
-                  const isMessagingApprovePairing = approval.action === "messaging.approve_pairing";
-                  const isMessagingRemoveBridge = approval.action === "messaging.remove_bridge";
-                  // The user-facing reason for browser.connect lives on
-                  // payload.reason (set by the dispatch); fall back to the
-                  // approval target (same string) if it's missing. We
-                  // surface this instead of `approval.reason` (the policy
-                  // engine's internal "why this needs approval" text)
-                  // because the chat-side ApprovalActions card shows the
-                  // user-facing reason — the home pending list should match.
-                  // `||` (not `??`) so an empty-string reason also falls
-                  // back to the approval target. `??` only fires for
-                  // null/undefined; a payload that carried `reason: ""`
-                  // would otherwise render a blank card body.
-                  const browserConnectBody =
-                    (typeof approval.payload.reason === "string" && approval.payload.reason.length > 0
-                      ? approval.payload.reason
-                      : undefined) || approval.target;
-                  return (
-                  <li key={approval.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                {pendingAuthVisible.map((authorization) => (
+                  <li key={authorization.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
                     <div className="min-w-0 flex-1 space-y-1">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="font-mono text-[11px]">
-                          {isBrowserConnect ? "Connect to agent's browser" : approval.action}
-                        </span>
-                        {/*
-                          Suppress the MEDIUM-RISK badge for `browser.connect`.
-                          The action is still gated (the user still has to
-                          click Connect to consent) but the visual framing is
-                          softer because this is a benign sign-in step, not a
-                          destructive action. All other approvals keep the
-                          badge.
-                        */}
-                        {isBrowserConnect ? null : <RiskPill value={approval.risk} />}
+                        <span className="font-mono text-[11px]">{authorization.action}</span>
+                        <RiskPill value={authorization.risk} />
                       </div>
-                      {isBrowserConnect ? null : (
-                        <p className="truncate font-mono text-[11px] text-muted-foreground">{approval.target}</p>
-                      )}
-                      <p className="line-clamp-2 text-sm">
-                        {isBrowserConnect ? browserConnectBody : approval.reason}
-                      </p>
+                      <p className="truncate font-mono text-[11px] text-muted-foreground">{authorization.target}</p>
+                      <p className="line-clamp-2 text-sm">{authorization.reason}</p>
                     </div>
-                    {isBrowserFillSecret ? (
-                      <div className="flex shrink-0 flex-col items-end gap-1">
-                        <span className="text-[11px] text-muted-foreground">
-                          Enter credentials in chat.
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={decide.isPending}
-                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-                        >
-                          Deny
-                        </Button>
-                      </div>
-                    ) : isMessagingAddBridge ? (
-                      <div className="flex shrink-0 flex-col items-end gap-1">
-                        <span className="text-[11px] text-muted-foreground">
-                          Add the bridge in chat.
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={decide.isPending}
-                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-                        >
-                          Deny
-                        </Button>
-                      </div>
-                    ) : isMessagingApprovePairing ? (
-                      <div className="flex shrink-0 flex-col items-end gap-1">
-                        <span className="text-[11px] text-muted-foreground">
-                          Approve/Reject in chat.
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={decide.isPending}
-                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-                        >
-                          Deny
-                        </Button>
-                      </div>
-                    ) : isMessagingRemoveBridge ? (
-                      <div className="flex shrink-0 flex-col items-end gap-1">
-                        <span className="text-[11px] text-muted-foreground">
-                          Confirm in chat.
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={decide.isPending}
-                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-                        >
-                          Deny
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="flex shrink-0 gap-2">
-                        <Button
-                          size="sm"
-                          disabled={decide.isPending}
-                          onClick={() => decide.mutate({ id: approval.id, op: "approve" })}
-                        >
-                          {isBrowserConnect ? "Connect" : "Approve"}
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={decide.isPending}
-                          onClick={() => decide.mutate({ id: approval.id, op: "deny" })}
-                        >
-                          {isBrowserConnect ? "Cancel" : "Deny"}
-                        </Button>
-                      </div>
-                    )}
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="sm"
+                        disabled={decideAuth.isPending}
+                        onClick={() => decideAuth.mutate({ id: authorization.id, op: "approve" })}
+                      >
+                        Approve
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        disabled={decideAuth.isPending}
+                        onClick={() => decideAuth.mutate({ id: authorization.id, op: "deny" })}
+                      >
+                        Deny
+                      </Button>
+                    </div>
                   </li>
+                ))}
+              </ul>
+            </CardContent>
+          </Card>
+        ) : null}
+
+        {pendingSetup.length > 0 ? (
+          <Card>
+            <CardHeader>
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <CardTitle className="text-sm">Pending setup steps</CardTitle>
+                  <CardDescription>The agent is waiting for you to finish a setup step</CardDescription>
+                </div>
+                {pendingSetupExtra > 0 ? (
+                  <Link
+                    href="/permissions"
+                    className="shrink-0 rounded-md border border-border bg-card px-2 py-1 text-[11px] font-medium hover:bg-accent"
+                  >
+                    View all ({pendingSetup.length})
+                  </Link>
+                ) : null}
+              </div>
+            </CardHeader>
+            <CardContent>
+              <ul className="divide-y divide-border">
+                {pendingSetupVisible.map((setup) => {
+                  const isBrowserConnect = setup.action === "browser.connect";
+                  const title = isBrowserConnect ? "Connect to agent's browser" : setup.action;
+                  const body = isBrowserConnect
+                    ? (typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
+                        ? setup.payload.reason
+                        : setup.target)
+                    : setup.reason;
+                  return (
+                    <li key={setup.id} className="flex items-start justify-between gap-3 py-3 first:pt-0 last:pb-0">
+                      <div className="min-w-0 flex-1 space-y-1">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-mono text-[11px]">{title}</span>
+                        </div>
+                        {isBrowserConnect ? null : (
+                          <p className="truncate font-mono text-[11px] text-muted-foreground">{setup.target}</p>
+                        )}
+                        <p className="line-clamp-2 text-sm">{body}</p>
+                      </div>
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <span className="text-[11px] text-muted-foreground">Open chat to continue.</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={cancelSetup.isPending}
+                          onClick={() => cancelSetup.mutate(setup.id)}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </li>
                   );
                 })}
               </ul>

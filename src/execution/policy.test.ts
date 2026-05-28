@@ -85,15 +85,9 @@ describe("resolveApprovalPolicy - yolo mode", () => {
     });
   });
 
-  test("STILL gates browser.fill_secret — yolo cannot auto-approve credential entry", () => {
-    // The user-typed credential is what makes fill_secret meaningful;
-    // auto-approving an empty fill_secret would have the runtime
-    // synthesize "fields filled" to the agent over an empty form.
-    expect(resolveApprovalPolicy(cfg({ approvalMode: "yolo" }), "browser.fill_secret")).toEqual({
-      mode: "gate",
-      reason: "fill-secret-always-gate"
-    });
-  });
+  // (Removed) browser.fill_secret no longer flows through resolveApprovalPolicy:
+  // it's a SetupRequest action (user-actor) and never auto-resolves. See
+  // docs/adr/authorization-vs-setup-request.md.
 });
 
 describe("resolveApprovalPolicy - auto mode (default)", () => {

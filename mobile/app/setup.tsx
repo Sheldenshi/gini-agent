@@ -2,6 +2,7 @@ import { Stack, router } from "expo-router";
 import { useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -72,6 +73,11 @@ export default function SetupScreen() {
           contentContainerStyle={styles.scroll}
           keyboardShouldPersistTaps="handled"
         >
+          <Image
+            source={require("../assets/icon.png")}
+            style={styles.logo}
+            accessibilityLabel="Gini"
+          />
           <Text style={styles.heading}>Connect to Gini</Text>
           <Text style={styles.subhead}>
             Paste the runtime's base URL and bearer token. You can find the
@@ -135,6 +141,12 @@ const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
   scroll: { padding: 20, paddingTop: 24, gap: 12 },
+  logo: {
+    width: 64,
+    height: 64,
+    alignSelf: "flex-start",
+    marginBottom: 4
+  },
   heading: {
     color: theme.text,
     fontFamily: family("HankenGrotesk", 700),

@@ -45,7 +45,9 @@ parsing runtime artifacts that were never meant to drive a UI directly:
 - Approval bubbles came from a separate `/api/approvals` poll, joined
   back to the chat by `taskId`. The Connect dialog vs the regular
   Approve/Deny pair was disambiguated by reading `approval.action`
-  from a different endpoint.
+  from a different endpoint. Today the surface is split into
+  `/api/authorizations*` and `/api/setup-requests*` (see ADR
+  authorization-vs-setup-request.md).
 
 The web client carried this translation logic. When the mobile client
 landed (`mobile/`), it had to reimplement the same vocabulary —
@@ -72,7 +74,8 @@ remote previews, screen readers) would need the same translation code.
     | ToolCallBlock
     | ToolResultBlock
     | PhaseBlock
-    | ApprovalRequestedBlock
+    | AuthorizationRequestedBlock
+    | SetupRequestedBlock
     | SystemNoteBlock;
   ```
 
@@ -106,56 +109,54 @@ remote previews, screen readers) would need the same translation code.
   preserves the partial text the user already saw — cancellation and
   failure paths intentionally do not drop the in-flight row.
 
-- `ApprovalRequestedBlock.action` is part of the wire contract so
-  clients can branch on the card variant without a cross-endpoint
-  join. Six branches (five /connect-resolved actions plus a default
-  Approve/Deny pair for everything else):
-  - `connector.request` — render the Connect dialog. Submit posts
-    `{ secrets, scopes, name }` to `/api/approvals/<id>/connect`.
-  - `browser.fill_secret` — render an inline form with one input
-    per slot in `approval.payload.slots`. Submit posts
-    `{ secrets: { <slot.name>: <value>, ... } }` to
-    `/api/approvals/<id>/connect`. The card also reads
-    `approval.payload.approvedUrl` to render the "fill destination"
-    badge so the human reviewer can spot a target mismatch. The
-    generic `/approve` endpoint refuses this action (only `/connect`
-    completes the fill); `/deny` is still valid. See ADR
-    [browser-fill-secret.md](browser-fill-secret.md).
-  - `messaging.add_bridge` — render an inline form with a name
-    input (pre-seeded from `approval.payload.suggestedName`) and a
-    password-masked bot-token input. Submit posts
-    `{ secrets: { name, botToken } }` to
-    `/api/approvals/<id>/connect`. The card reads
-    `approval.payload.kind` (currently `"telegram"`; `"discord"`
-    is reserved but the chat card does not collect channel IDs, so
-    the dispatcher tool only advertises Telegram from chat — see
-    [telegram-bridge.md](telegram-bridge.md)). The generic
-    `/approve` endpoint refuses this action (only `/connect` runs
-    the addMessagingBridge side effect); `/deny` is still valid.
-    The other resolution surfaces (home page, /permissions list)
-    therefore render only Deny + a "resolve in chat" hint for this
-    action.
-  - `messaging.approve_pairing` — render a confirmation card
-    showing the pending sender, chat id, chat type, verification
-    code, and expiry from `approval.payload`. Two buttons: Approve
-    posts `{}` to `/connect`; Reject posts `{ reject: true }` to
-    `/connect`. Server calls `allowChat` (with the
-    `verificationCode` from the payload as `expectedCode`) or
-    `rejectPendingChat`. `/approve` refuses this action because
-    `/approve` cannot express the Approve-vs-Reject discriminant;
-    `/deny` is still valid. Same hide-approve treatment on home /
-    permissions list (Deny + "Approve/Reject in chat" hint).
-  - `messaging.remove_bridge` — render a destructive confirmation
-    card showing `approval.payload.bridgeName` + `payload.kind` and
-    the irreversibility warning. Submit posts `{}` to `/connect`,
-    which routes into `removeMessagingBridge`. `/approve` refuses;
-    `/deny` is still valid. Same hide-approve treatment on home /
-    permissions list (Deny + "Confirm in chat" hint).
-  - everything else — standard Approve / Deny pair posting to
-    `/api/approvals/<id>/{approve,deny}`.
-
-  The block also carries `risk` and `summary` so the bubble can
-  render without a follow-up `/api/approvals` fetch.
+- `AuthorizationRequestedBlock.action` and `SetupRequestedBlock.action`
+  are part of the wire contract so clients can branch on the card
+  variant without a cross-endpoint join.
+  - `AuthorizationRequestedBlock` — standard Approve / Deny pair
+    posting to `/api/authorizations/<id>/{approve,deny}`. Carries
+    `risk` and `summary` so the bubble renders without a follow-up
+    fetch.
+  - `SetupRequestedBlock` — user-actor card. Layouts keyed off
+    `action`:
+    - `connector.request` — render the Connect dialog. Submit posts
+      `{ secrets, scopes, name }` to
+      `/api/setup-requests/<id>/complete`.
+    - `browser.fill_secret` — render an inline form with one input
+      per slot in `setupRequest.payload.slots`. Submit posts
+      `{ secrets: { <slot.name>: <value>, ... } }` to
+      `/api/setup-requests/<id>/complete`. The card also reads
+      `setupRequest.payload.approvedUrl` to render the "fill
+      destination" badge so the human reviewer can spot a target
+      mismatch. See ADR [browser-fill-secret.md](browser-fill-secret.md).
+    - `browser.connect` — Connect button posts to
+      `/api/setup-requests/<id>/open-browser`; the follow-up "I've
+      signed in" posts to `/api/setup-requests/<id>/complete`.
+    - `messaging.add_bridge` — render an inline form with a name
+      input (pre-seeded from `setupRequest.payload.suggestedName`)
+      and a password-masked bot-token input. Submit posts
+      `{ secrets: { name, botToken } }` to
+      `/api/setup-requests/<id>/complete`, which runs the
+      `addMessagingBridge` side effect. The card reads
+      `setupRequest.payload.kind` (currently `"telegram"`;
+      `"discord"` is reserved but the chat card does not collect
+      channel IDs, so the dispatcher tool only advertises Telegram
+      from chat — see [telegram-bridge.md](telegram-bridge.md)).
+    - `messaging.approve_pairing` — render a confirmation card
+      showing the pending sender, chat id, chat type, verification
+      code, and expiry from `setupRequest.payload`. Two buttons:
+      Approve posts `{}` to `/complete`; Reject posts
+      `{ reject: true }` to `/complete`. Server calls `allowChat`
+      (with the `verificationCode` from the payload as
+      `expectedCode`) or `rejectPendingChat`.
+    - `messaging.remove_bridge` — render a destructive confirmation
+      card showing `setupRequest.payload.bridgeName` +
+      `payload.kind` and the irreversibility warning. Submit posts
+      `{}` to `/complete`, which routes into `removeMessagingBridge`.
+    Cancel always posts to `/api/setup-requests/<id>/cancel`. The
+    three `messaging.*` setups are SetupRequests, not Authorizations,
+    so they never appear under `/api/authorizations`; the home page
+    and /permissions list render a "resolve in chat" hint rather than
+    an inline Approve/Reject control for them.
 
 - Tool catalog labels live with the catalog. `displayLabel` on each
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`
@@ -237,6 +238,20 @@ remote previews, screen readers) would need the same translation code.
   - SSE frames carry `id: <blockId>\nevent: chat_block\ndata: <json>\n\n`.
     Browsers' `EventSource` auto-attaches the last `id` as
     `Last-Event-ID` on reconnect.
+  - The same SSE connection also delivers a second event kind,
+    `chat_session`, carrying the current `ChatSessionRecord` payload.
+    The gateway emits it once on initial connect (so the client has
+    the canonical title without a separate REST round-trip) and again
+    whenever the session is renamed — both via `PATCH /api/chat/:id`
+    and via the auto-rename path in
+    `src/execution/chat.ts:autoRenameChatAfterTurn`. The pub/sub lives
+    in `src/state/chat-session-events.ts`; publishers fire **after**
+    `mutateState` resolves so subscribers only observe durable
+    records, matching the chat-block post-commit semantics. The
+    `chat_session` event has no `id:` line and is not part of the
+    `Last-Event-ID` resume cursor — every reconnect re-emits the
+    current record from the initial-send path, so a missed transient
+    rename frame is harmless.
 
 ## Alternatives Considered
 

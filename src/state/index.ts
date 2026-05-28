@@ -76,6 +76,13 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
+  storeUpload,
+  readUpload,
+  uploadDataUrl,
+  uploadExists,
+  uploadStat
+} from "./uploads";
+export {
   insertChatBlock,
   upsertAssistantTextBlock,
   updateToolCallBlock,
@@ -83,10 +90,37 @@ export {
   listChatBlocksAfter,
   deleteChatBlocksForSession,
   findInFlightAssistantTextForTask,
+  taskProducedAssistantText,
   getLatestMessagesBySession,
-  subscribeChatBlocks
+  subscribeChatBlocks,
+  subscribeAllChatBlocks
 } from "./chat-blocks";
 export type { InsertChatBlockInput } from "./chat-blocks";
+export {
+  upsertDevice,
+  listDevicesForCredential,
+  listAllDevices,
+  getDevice,
+  removeDevice,
+  removeDeviceForCredential
+} from "./devices";
+export type { PushDevice, UpsertDeviceInput } from "./devices";
+export {
+  addSseSubscription,
+  isDeviceWatching,
+  hasAnyActiveSubscription
+} from "./sse-subscriptions";
+export {
+  subscribeChatSession,
+  publishChatSession
+} from "./chat-session-events";
+export {
+  markRead,
+  getLastReadByDevice,
+  getReadState,
+  unreadCountForDevice
+} from "./chat-read-state";
+export type { ChatReadState } from "./chat-read-state";
 export {
   taskCounts,
   upsertTask,
@@ -98,7 +132,8 @@ export {
   deleteChatSession,
   renameChatSession,
   createChatMessage,
-  createApproval,
+  createAuthorization,
+  createSetupRequest,
   createSkill,
   createJob,
   createJobRun,

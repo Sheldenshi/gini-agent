@@ -36,9 +36,12 @@ import {
 } from "../state";
 import type {
   AssistantTextBlock,
+  AuthorizationAction,
   ChatBlock,
   Instance,
+  RiskLevel,
   RuntimeConfig,
+  SetupRequestAction,
   Task,
   ToolCallStatus
 } from "../types";
@@ -269,25 +272,45 @@ export function emitToolResult(
   });
 }
 
-// Insert an approval_requested block when a tool call is gated pending
-// human approval. Includes `action` so clients can distinguish
-// `connector.request` (Connect dialog) from regular approvals
-// (Approve/Deny pair).
-export function emitApprovalRequested(
+// Insert an authorization_requested block when a tool call is gated
+// pending user approval/denial (agent-actor flow).
+export function emitAuthorizationRequested(
   ctx: ChatEmitContext | undefined,
   params: {
-    approvalId: string;
-    action: string;
-    risk: string;
+    authorizationId: string;
+    action: AuthorizationAction;
+    risk: RiskLevel;
     summary: string;
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
   return insertChatBlock(ctx.instance, {
-    kind: "approval_requested",
-    approvalId: params.approvalId,
+    kind: "authorization_requested",
+    authorizationId: params.authorizationId,
     action: params.action,
     risk: params.risk,
+    summary: params.summary,
+    ...bookkeepingFor(ctx)
+  });
+}
+
+// Insert a setup_requested block when a tool call needs the user to
+// perform a setup step (browser.connect, connector.request, or
+// browser.fill_secret). No risk pill is rendered — the rule is
+// structural per docs/adr/authorization-vs-setup-request.md.
+export function emitSetupRequested(
+  ctx: ChatEmitContext | undefined,
+  params: {
+    setupRequestId: string;
+    action: SetupRequestAction;
+    summary: string;
+  }
+): ChatBlock | undefined {
+  if (!ctx) return undefined;
+  return insertChatBlock(ctx.instance, {
+    kind: "setup_requested",
+    setupRequestId: params.setupRequestId,
+    action: params.action,
     summary: params.summary,
     ...bookkeepingFor(ctx)
   });

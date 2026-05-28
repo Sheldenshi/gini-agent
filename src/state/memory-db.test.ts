@@ -7,6 +7,7 @@ import {
   countByNetwork,
   countMemoryUnits,
   deserializeEmbedding,
+  ensureChatReadStateDeviceTokenSchema,
   ensureDefaultBank,
   getMemoryDb,
   getMemoryUnit,
@@ -368,6 +369,93 @@ describe("memory-db schema and storage", () => {
     });
     const scoped = listMemoryUnits(instance, "bank_default", { agentId: "agent_test" });
     expect(scoped.map((unit) => unit.id)).toEqual([stamped.id]);
+  });
+
+  test("v5 → v6 chat_read_state migration copies cursors forward per device", () => {
+    // Set up an in-memory v5-shape DB with one credential that has two
+    // registered devices and one chat_read_state row. The migration
+    // must fan that single row out to one row per device, preserving
+    // the cursor value.
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE chat_read_state (
+        session_id TEXT NOT NULL,
+        credential_id TEXT NOT NULL,
+        last_read_block_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, credential_id)
+      );
+      CREATE INDEX chat_read_state_by_credential ON chat_read_state(credential_id);
+      CREATE TABLE devices (
+        token TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        bundle_id TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+    `);
+    db.run(
+      "INSERT INTO devices VALUES ('tokA','cred1','ios','com.example','2024-01-01','2024-01-01')"
+    );
+    db.run(
+      "INSERT INTO devices VALUES ('tokB','cred1','ios','com.example','2024-01-01','2024-01-01')"
+    );
+    // A second credential with zero devices — its row must NOT appear in v6.
+    db.run(
+      "INSERT INTO chat_read_state VALUES ('chat_1','cred1','blk_9','2024-02-01')"
+    );
+    db.run(
+      "INSERT INTO chat_read_state VALUES ('chat_orphan','credX','blk_5','2024-02-01')"
+    );
+
+    ensureChatReadStateDeviceTokenSchema(db);
+
+    const rows = db
+      .query<{ session_id: string; device_token: string; last_read_block_id: string }, []>(
+        "SELECT session_id, device_token, last_read_block_id FROM chat_read_state ORDER BY device_token"
+      )
+      .all();
+    expect(rows).toEqual([
+      { session_id: "chat_1", device_token: "tokA", last_read_block_id: "blk_9" },
+      { session_id: "chat_1", device_token: "tokB", last_read_block_id: "blk_9" }
+    ]);
+    // Confirm the orphan credential (no devices) contributed nothing.
+    expect(rows.find((r) => r.session_id === "chat_orphan")).toBeUndefined();
+
+    // Confirm the new index is in place by exercising a device-token lookup.
+    const lookup = db
+      .query<{ c: number }, [string]>(
+        "SELECT COUNT(*) AS c FROM chat_read_state WHERE device_token = ?"
+      )
+      .get("tokA");
+    expect(lookup?.c).toBe(1);
+
+    db.close();
+  });
+
+  test("ensureChatReadStateDeviceTokenSchema is a no-op when already on v6", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE chat_read_state (
+        session_id TEXT NOT NULL,
+        device_token TEXT NOT NULL,
+        last_read_block_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, device_token)
+      );
+    `);
+    db.run(
+      "INSERT INTO chat_read_state VALUES ('chat_1','tokA','blk_9','2024-02-01')"
+    );
+    ensureChatReadStateDeviceTokenSchema(db);
+    const row = db
+      .query<{ last_read_block_id: string }, []>(
+        "SELECT last_read_block_id FROM chat_read_state WHERE session_id = 'chat_1' AND device_token = 'tokA'"
+      )
+      .get();
+    expect(row?.last_read_block_id).toBe("blk_9");
+    db.close();
   });
 
   test("resetInstance clears the memory DB and probe reports zero units", async () => {

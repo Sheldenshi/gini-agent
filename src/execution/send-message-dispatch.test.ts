@@ -52,7 +52,7 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
     instance: "test",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
-    tasks: [], approvals: [], audit: [], skills: [], jobs: [],
+    tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
     connectors: [], improvements: [], pairingCodes: [], devices: [],
     promotions: [], snapshots: [], tools: [], toolsets, subagents: [],
     mcpServers: [], messagingBridges: [], importReports: [], agents: [],
@@ -106,7 +106,7 @@ describe("send_message dispatch", () => {
     );
     expect(result.kind).toBe("pending");
 
-    const approvals = readState(config.instance).approvals;
+    const approvals = readState(config.instance).authorizations;
     const pending = approvals.find((a) => a.action === "messaging.send" && a.status === "pending");
     expect(pending).toBeDefined();
     expect(pending?.target).toBe(bridge.id);
@@ -178,7 +178,7 @@ describe("send_message dispatch", () => {
       )
     ).rejects.toThrow(/allow-list/);
     // No approval row should land for a refused target.
-    const approvals = readState(config.instance).approvals;
+    const approvals = readState(config.instance).authorizations;
     const created = approvals.filter((a) => a.action === "messaging.send");
     expect(created.length).toBe(0);
   });

@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { BookOpen, FileText, Globe, Package, Terminal, type LucideIcon } from "lucide-react";
 import type { ToolCallBlock, ToolResultBlock } from "@runtime/types";
+import { iconForTool } from "./tool-icons";
 
 // Pencil "Gini Webapp" tool call row:
 //   [icon 15px #9A9AA0] [label HankenGrotesk 13/600 #D6D6DC] [chip flex-1 #2B2B31 monospace 12 #C8C8D2]
@@ -13,17 +13,6 @@ import type { ToolCallBlock, ToolResultBlock } from "@runtime/types";
 //
 // Error/denied calls surface the error string in red below the row;
 // happy path stays quiet (no status badge, no chevron).
-
-function iconForTool(toolName: string): LucideIcon {
-  const name = toolName.toLowerCase();
-  if (name.startsWith("terminal") || name.includes("exec")) return Terminal;
-  if (name.startsWith("file_")) return BookOpen;
-  if (name.startsWith("read") || name.includes("skill")) return FileText;
-  if (name.startsWith("browser") || name.startsWith("web") || name.includes("fetch")) {
-    return Globe;
-  }
-  return Package;
-}
 
 export function BlockToolCall({
   block,

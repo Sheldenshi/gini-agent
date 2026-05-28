@@ -20,7 +20,8 @@ import {
   withTeardownLock
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
-import { resolveApproval } from "../agent";
+import { resolveSetupRequest } from "../agent";
+import { completeBrowserConnectSetup } from "../capabilities/browser-connect";
 import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
 import { createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -1958,7 +1959,7 @@ describe("dispatchToolCall(browser_upload_file)", () => {
     expect(result.kind).toBe("pending");
 
     const state = readState(config.instance);
-    const approval = state.approvals.find((a) =>
+    const approval = state.authorizations.find((a) =>
       result.kind === "pending" && a.id === result.approvalId
     );
     expect(approval).toBeDefined();
@@ -1997,7 +1998,7 @@ describe("dispatchToolCall(browser_upload_file)", () => {
     ).rejects.toThrow(/outside workspace/);
     // No approval row should exist.
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.authorizations.length).toBe(0);
 
     rmSync(ROOT, { recursive: true, force: true });
   });
@@ -2051,14 +2052,13 @@ describe("dispatchToolCall(browser_connect)", () => {
     expect(result.kind).toBe("pending");
 
     const state = readState(config.instance);
-    const approval = state.approvals.find((a) =>
+    const approval = state.setupRequests.find((a) =>
       result.kind === "pending" && a.id === result.approvalId
     );
     expect(approval).toBeDefined();
-    expect(approval!.risk).toBe("medium");
     expect(approval!.action).toBe("browser.connect");
-    // The reason flows onto the approval target so the UI surfaces it
-    // prominently in the approval card.
+    // The reason flows onto the setup-request target so the UI surfaces it
+    // prominently in the setup card.
     expect(approval!.target).toBe("Sign in to Google Cloud Console");
     expect(approval!.payload.reason).toBe("Sign in to Google Cloud Console");
     expect(approval!.payload.toolCallId).toBe("call_connect_1");
@@ -2087,7 +2087,7 @@ describe("dispatchToolCall(browser_connect)", () => {
     ).rejects.toThrow(/reason/);
     // No approval row should exist.
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
 
     rmSync(ROOT, { recursive: true, force: true });
   });
@@ -2151,13 +2151,16 @@ describe("dispatchToolCall(browser_connect)", () => {
       );
       expect(result.kind).toBe("pending");
       if (result.kind !== "pending") throw new Error("unreachable");
-      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+      const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
+      if (!pendingSetup) throw new Error("setup request not minted");
+      const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
+      const setup = await resolveSetupRequest(config, result.approvalId, "complete", {
         actor: "user",
+        toolResult,
         resumeChatTask: false
       });
-      expect(approval.status).toBe("approved");
-      expect(toolResult).toBeDefined();
-      const parsed = JSON.parse(toolResult!) as {
+      expect(setup.status).toBe("completed");
+      const parsed = JSON.parse(toolResult) as {
         success: boolean;
         connected: boolean;
         mode?: string;
@@ -2170,16 +2173,15 @@ describe("dispatchToolCall(browser_connect)", () => {
       // Persisted record matches.
       const persisted = readState(config.instance).browser;
       expect(persisted?.mode).toBe("managed");
-      // Exactly one browser.connect audit row — the dispatch path passes
-      // skipAudit: true so the capability does not write its own row.
-      // Two rows would mean the capability's reasonless row leaked
-      // alongside the dispatch's richer row (round-9 finding 2).
+      // Exactly one browser.connect audit row — completeBrowserConnectSetup
+      // calls connectBrowser with skipAudit and writes the richer row
+      // itself. Two rows would mean the capability's reasonless row
+      // leaked alongside.
       const connectRows = readState(config.instance).audit.filter(
         (row) => row.action === "browser.connect"
       );
       expect(connectRows.length).toBe(1);
-      // The single row is the dispatch's row — carries the user-facing
-      // reason and the approval id.
+      // The single row carries the user-facing reason and the setup id.
       expect(connectRows[0]!.approvalId).toBe(result.approvalId);
       expect(connectRows[0]!.target).toBe("Sign in to Google Cloud Console");
     } finally {
@@ -2235,15 +2237,18 @@ describe("dispatchToolCall(browser_connect)", () => {
       );
       expect(result.kind).toBe("pending");
       if (result.kind !== "pending") throw new Error("unreachable");
-      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+      const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
+      if (!pendingSetup) throw new Error("setup request not minted");
+      // Flag rode the setup payload from request -> /complete.
+      expect(pendingSetup.payload.headless).toBe(true);
+      const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
+      const setup = await resolveSetupRequest(config, result.approvalId, "complete", {
         actor: "user",
+        toolResult,
         resumeChatTask: false
       });
-      expect(approval.status).toBe("approved");
-      // Flag rode the approval payload from request → executor.
-      expect(approval.payload.headless).toBe(true);
-      expect(toolResult).toBeDefined();
-      const parsed = JSON.parse(toolResult!) as {
+      expect(setup.status).toBe("completed");
+      const parsed = JSON.parse(toolResult) as {
         success: boolean;
         connected: boolean;
         mode?: string;

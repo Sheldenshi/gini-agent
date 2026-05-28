@@ -1,5 +1,6 @@
 import type { ChatBlock, ToolResultBlock } from "@/src/types";
-import { BlockApprovalRequested } from "./BlockApprovalRequested";
+import { BlockAuthorizationRequested } from "./BlockAuthorizationRequested";
+import { BlockSetupRequested } from "./BlockSetupRequested";
 import { BlockAssistantText } from "./BlockAssistantText";
 import { BlockPhase } from "./BlockPhase";
 import { BlockSystemNote } from "./BlockSystemNote";
@@ -32,8 +33,10 @@ export function BlockRenderer({
       return null;
     case "phase":
       return <BlockPhase block={block} />;
-    case "approval_requested":
-      return <BlockApprovalRequested block={block} />;
+    case "authorization_requested":
+      return <BlockAuthorizationRequested block={block} />;
+    case "setup_requested":
+      return <BlockSetupRequested block={block} />;
     case "system_note":
       return <BlockSystemNote block={block} />;
     default: {

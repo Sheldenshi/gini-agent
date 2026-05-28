@@ -23,6 +23,11 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
+import {
+  primeDeviceTokenFromStorage,
+  refreshBadge,
+  registerApprovalCategoryAsync
+} from "@/src/push";
 import { family, theme } from "@/src/theme";
 
 // Single shared client across the tree so navigating between screens
@@ -49,9 +54,24 @@ export default function RootLayout() {
   const [primed, setPrimed] = useState(false);
   useEffect(() => {
     let active = true;
-    primeCredentials().then(() => {
+    // Sequence the cold-start primes so by the time AuthCacheGuard
+    // fires its first refreshBadge() the X-Device-Token header is
+    // already in place AND the APPROVAL_REQUEST notification category
+    // exists. Without the device-token prime, /badge and /read would
+    // 400 (missing header) for the brief window between credential
+    // rehydration and registerForPushAsync() completing. Without the
+    // category await, an immediate-on-launch approval push could land
+    // before iOS has the Approve / Deny buttons wired.
+    // registerApprovalCategoryAsync is iOS-gated and idempotent — the
+    // promise it returns is cached at module scope so awaiting it
+    // here doesn't race the implicit invocation inside
+    // registerForPushAsync.
+    (async () => {
+      await primeCredentials();
+      await primeDeviceTokenFromStorage();
+      await registerApprovalCategoryAsync();
       if (active) setPrimed(true);
-    });
+    })();
     return () => {
       active = false;
     };
@@ -147,6 +167,16 @@ function AuthCacheGuard() {
       qc.clear();
     }
     prevKeyRef.current = identity;
+    // Sync the app icon badge once per (newly-authed) identity. The
+    // gateway computes the unread total from chat_read_state across
+    // every session for the credential, so a cold launch that opened
+    // straight to setup picks up everything that arrived while the
+    // app was killed. Subsequent badge updates ride on silent pushes
+    // (push.ts:refreshBadge in the receive handler) and on chat-detail
+    // mount.
+    if (identity) {
+      void refreshBadge();
+    }
   }, [identity, qc]);
 
   return null;

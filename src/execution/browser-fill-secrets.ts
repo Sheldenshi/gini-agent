@@ -9,8 +9,8 @@
 //   3. Compare the live browser URL against the structured
 //      `approvedUrl` in payload (NOT a parseable substring of
 //      `target`) — refuse if the page has navigated since approval.
-//   4. resolveApproval(resumeChatTask: false) — atomic check-and-flip
-//      from pending → approved that closes the deny-mid-fill race.
+//   4. resolveSetupRequest(complete) — atomic check-and-flip from
+//      pending → completed that closes the cancel-mid-fill race.
 //   5. Per-slot fill loop with TWO guards at DIFFERENT layers:
 //      a) Task-status check INSIDE this loop (readState per
 //         iteration BEFORE the browserFillByLocator call): a cancel
@@ -31,8 +31,8 @@
 //      task-already-terminal throw doesn't make the handler claim
 //      success despite a missed resume.
 
-import type { Approval, RuntimeConfig } from "../types";
-import { resolveApproval } from "../agent";
+import type { RuntimeConfig, SetupRequest } from "../types";
+import { resolveSetupRequest } from "../agent";
 import { addAudit, appendTrace, mutateState, readState } from "../state";
 import { FILLED_SECRET_MIN_REDACTION_LENGTH, browserFillByLocator, peekCurrentBrowserUrl } from "../tools/browser";
 import { isTerminalTaskStatus } from "../state";
@@ -50,7 +50,7 @@ export interface FillSecretConnectResult {
 
 export async function runFillSecretConnect(
   config: RuntimeConfig,
-  approval: Approval,
+  approval: SetupRequest,
   secrets: Record<string, string>
 ): Promise<FillSecretConnectResult> {
   const slots = parseFillSecretSlots(approval.payload.slots);
@@ -184,12 +184,16 @@ export async function runFillSecretConnect(
     };
   }
 
-  // Atomic check-and-flip closes the deny-mid-fill race.
+  // Atomic check-and-flip closes the cancel-mid-fill race. Marks the
+  // SetupRequest completed BEFORE the per-slot fill loop runs, so a
+  // concurrent /cancel can no longer pull the rug out mid-fill. We pass
+  // resumeChatTask: false because we own the resume after the fill loop
+  // — the result string reflects what actually filled vs errored.
   try {
-    await resolveApproval(config, approval.id, { actor: "user", resumeChatTask: false });
+    await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { status: 410, body: { ok: false, message: `Could not lock approval for fill: ${message}` } };
+    return { status: 410, body: { ok: false, message: `Could not lock setup request for fill: ${message}` } };
   }
 
   const filledSlots: string[] = [];

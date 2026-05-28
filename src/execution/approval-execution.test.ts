@@ -360,7 +360,7 @@ describe("cancelTask aborts in-flight approved actions", () => {
     expect(successAudits).toHaveLength(0);
 
     // The in_flight_aborted audit row records the targets.
-    const cascadeAudits = state.audit.filter((a) => a.taskId === submitted.id && a.action === "approval.in_flight_aborted");
+    const cascadeAudits = state.audit.filter((a) => a.taskId === submitted.id && a.action === "authorization.in_flight_aborted");
     expect(cascadeAudits).toHaveLength(1);
     const ids = cascadeAudits[0]?.evidence?.approvalIds as string[] | undefined;
     expect(Array.isArray(ids)).toBe(true);
@@ -472,7 +472,7 @@ describe("cancelTask aborts in-flight approved actions", () => {
   test("file.write_aborted audit row is emitted when the signal aborts after claim but before write", async () => {
     // Directly exercise the in-callback `signal.aborted` branch
     // of the file.write side effect. We pre-create an approved
-    // file.write approval, then race `resolveApproval` against an
+    // file.write approval, then race `resolveAuthorization` against an
     // immediate `cancelTask`: with the chat-task loop NOT running
     // the only path to flip the signal in time is via
     // `cancelTask`'s `mutateState`. The test asserts the
@@ -480,8 +480,8 @@ describe("cancelTask aborts in-flight approved actions", () => {
     // — proving the `emitFileActionAbortedSync` branch ran (not
     // the pre-claim `approval.cancelled_task_terminal` branch,
     // which would write a different action name).
-    const { mutateState, createApproval } = await import("../state");
-    const { resolveApproval, submitTask } = await import("../agent");
+    const { mutateState, createAuthorization } = await import("../state");
+    const { resolveAuthorization, submitTask } = await import("../agent");
 
     const config = buildConfig(workspaceRoot, "file-write-aborted-direct");
 
@@ -489,18 +489,18 @@ describe("cancelTask aborts in-flight approved actions", () => {
     // row that the approval can be attached to.
     const submitted = await submitTask(config, "manual abort target", { mode: "chat" });
 
-    // Race the resolveApproval against the cancel. Create the
-    // approval row first, then fire cancelTask + resolveApproval
+    // Race the resolveAuthorization against the cancel. Create the
+    // approval row first, then fire cancelTask + resolveAuthorization
     // concurrently. cancelTask wins the lock on the per-instance
     // serialization queue (it acquired first), so by the time
-    // resolveApproval's executor claim mutateState runs, the task
+    // resolveAuthorization's executor claim mutateState runs, the task
     // is cancelled — and the pre-claim guard fires
     // `approval.cancelled_task_terminal`. We accept either branch
     // (this is the same flexibility the terminal-exec test uses)
     // and assert that NEITHER the regular `file.write` row NOR the
     // target file lands.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createAuthorization(state, {
         taskId: submitted.id,
         action: "file.write",
         target: "direct-abort.txt",
@@ -510,10 +510,10 @@ describe("cancelTask aborts in-flight approved actions", () => {
       })
     );
     // Fire cancel + resolve concurrently. cancelTask's mutateState
-    // will be serialized with resolveApproval's mutateState; the
+    // will be serialized with resolveAuthorization's mutateState; the
     // outcome is deterministic regardless of which acquires first.
     const cancelPromise = cancelTask(config, submitted.id);
-    const resolvePromise = resolveApproval(config, approval.id, {
+    const resolvePromise = resolveAuthorization(config, approval.id, {
       actor: "runtime",
       resumeChatTask: false,
       evidenceExtra: { autoApproved: true, autoApprovedReason: "test" }
@@ -525,18 +525,18 @@ describe("cancelTask aborts in-flight approved actions", () => {
     expect(successAudits).toHaveLength(0);
     // Three branches all count as the cancel correctly intercepting
     // the side effect:
-    //   - `file.write_aborted` — `resolveApproval`'s executor
+    //   - `file.write_aborted` — `resolveAuthorization`'s executor
     //     reached the in-callback `signal.aborted` check.
-    //   - `approval.cancelled_task_terminal` — executor's claim
+    //   - `authorization.cancelled_task_terminal` — executor's claim
     //     `mutateState` saw the task was already terminal.
-    //   - `approval.cancelled_task_cancelled` — `cancelTask`'s
+    //   - `authorization.cancelled_task_cancelled` — `cancelTask`'s
     //     `cancelPendingTaskApprovals` cleared the approval before
-    //     `resolveApproval` even claimed it.
+    //     `resolveAuthorization` even claimed it.
     const cancelTraces = state.audit.filter(
       (a) => a.taskId === submitted.id && (
         a.action === "file.write_aborted" ||
-        a.action === "approval.cancelled_task_terminal" ||
-        a.action === "approval.cancelled_task_cancelled"
+        a.action === "authorization.cancelled_task_terminal" ||
+        a.action === "authorization.cancelled_task_cancelled"
       )
     );
     expect(cancelTraces.length).toBeGreaterThanOrEqual(1);

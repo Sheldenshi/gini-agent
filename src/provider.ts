@@ -11,6 +11,8 @@ const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_AUTH_PATH = "~/.codex/auth.json";
+const DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1";
+const DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash";
 
 export function providerHealth(config: RuntimeConfig) {
   const provider = normalizeProvider(config.provider);
@@ -45,6 +47,46 @@ export function providerHealth(config: RuntimeConfig) {
     configured,
     message: configured ? `${provider.name} provider is configured.` : `Set ${envName} to use the ${provider.name} provider.`
   };
+}
+
+// Per-provider env var that holds the bearer token. Mirrors the apiKeyEnv
+// defaults in normalizeProvider, and is the single source of truth for
+// the "is this provider configured?" gate the settings UI uses to decide
+// which rows to render.
+const PROVIDER_API_KEY_ENV: Record<string, string> = {
+  openai: "OPENAI_API_KEY",
+  openrouter: "OPENROUTER_API_KEY",
+  deepseek: "DEEPSEEK_API_KEY",
+  local: "GINI_LOCAL_API_KEY"
+};
+
+// Whether a provider has usable credentials in the current process env.
+// echo is dev-only and never reported as configured. codex consults
+// readCodexCredentials so we honor CODEX_AUTH_JSON and the default path.
+// local is a special case: most local gateways (Ollama, LM Studio)
+// accept no-auth requests so the env var is optional — we still gate
+// the row on the user having explicitly opted in by either setting the
+// env var or making local the active provider.
+export function isProviderConfigured(name: string, activeProviderName?: string): boolean {
+  if (name === "echo") return false;
+  if (name === "codex") return hasUsableCodexCredentials();
+  const envVar = PROVIDER_API_KEY_ENV[name];
+  if (envVar && process.env[envVar]) return true;
+  if (name === "local" && activeProviderName === "local") return true;
+  return false;
+}
+
+// Catalog enriched with the per-provider configured flag. Used by the
+// settings UI to hide rows the user hasn't connected; the static
+// providerCatalog() stays in place for callers that just need the list of
+// known provider shapes (e.g. setup-api default-model resolution).
+export function providerCatalogWithStatus(
+  activeProviderName?: string
+): Array<ProviderCatalogItem & { configured: boolean }> {
+  return providerCatalog().map((item) => ({
+    ...item,
+    configured: isProviderConfigured(item.name, activeProviderName)
+  }));
 }
 
 export function providerCatalog(): ProviderCatalogItem[] {
@@ -89,6 +131,16 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "external"
     },
     {
+      id: "deepseek",
+      name: "deepseek",
+      displayName: "DeepSeek",
+      baseUrl: DEFAULT_DEEPSEEK_BASE_URL,
+      auth: "env",
+      models: ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner"],
+      capabilities: ["chat-completions", "tool-calling"],
+      costHint: "external"
+    },
+    {
       id: "local",
       name: "local",
       displayName: "Local OpenAI-Compatible",
@@ -124,9 +176,18 @@ export interface ToolCall {
 
 export type ChatMessageRole = "system" | "user" | "assistant" | "tool";
 
+// Vision-capable content part. user-role messages can carry a content
+// array mixing text and image_url parts so the provider sees both. The
+// image_url.url field carries a data URL (data:image/png;base64,...) inlined
+// at dispatch time — we do not pass a fetchable URL because the runtime
+// auth-gates upload reads and the provider can't authenticate.
+export type MessageContentPart =
+  | { type: "text"; text: string }
+  | { type: "image_url"; image_url: { url: string } };
+
 export interface ToolCallingMessage {
   role: ChatMessageRole;
-  content: string | null;
+  content: string | MessageContentPart[] | null;
   // tool result messages carry the originating call id; assistant messages
   // that triggered tool calls carry `tool_calls`.
   name?: string;
@@ -549,6 +610,18 @@ function translateMessagesToResponsesInput(messages: ToolCallingMessage[]): Resp
       continue;
     }
     if (message.role === "user") {
+      // Vision-capable user messages arrive as a parts array (text +
+      // image_url). Map text parts → input_text and image_url parts →
+      // input_image, mirroring the OpenAI Responses API content schema.
+      if (Array.isArray(message.content)) {
+        const parts: Array<Record<string, unknown>> = [];
+        for (const part of message.content) {
+          if (part.type === "text") parts.push({ type: "input_text", text: part.text });
+          else if (part.type === "image_url") parts.push({ type: "input_image", image_url: part.image_url.url });
+        }
+        input.push({ role: "user", content: parts });
+        continue;
+      }
       const text = typeof message.content === "string" ? message.content : "";
       input.push({
         role: "user",
@@ -1167,7 +1240,7 @@ export async function generateTaskSummary(
     soul: soulBlock,
     userProfile: userProfileBlock
   });
-  if (provider.name === "openrouter" || provider.name === "local") {
+  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
     return callChatCompletions(provider, input, systemContext);
   }
   return callOpenAIResponses(provider, input, systemContext, onDelta);
@@ -1273,7 +1346,12 @@ export async function generateStructured<T>(
   // OpenAI / OpenRouter / local OpenAI-compatible: chat-completions with
   // response_format json_object. We deliberately don't push json_schema —
   // many compat providers reject the field. Validator re-checks shape.
-  if (provider.name === "openrouter" || provider.name === "local" || provider.name === "openai") {
+  if (
+    provider.name === "openrouter" ||
+    provider.name === "local" ||
+    provider.name === "openai" ||
+    provider.name === "deepseek"
+  ) {
     return callStructuredChatCompletions(provider, request);
   }
   // Codex doesn't expose /chat/completions and the /responses API doesn't
@@ -1401,6 +1479,39 @@ function pickBaseUrl(persisted: string | undefined, fallback: string): string {
   return persisted && persisted.trim().length > 0 ? persisted : fallback;
 }
 
+// DeepSeek V4 family + deepseek-reasoner (R1) accept a top-level
+// `thinking: {type: "enabled"|"disabled"}` flag plus
+// `reasoning_effort: "low"|"medium"|"high"|"max"` on their OpenAI-compat
+// chat-completions endpoint. The API defaults to thinking-on for these
+// models, which then enforces a `reasoning_content` echo-back contract on
+// subsequent turns. We default-on explicitly so the wire shape matches
+// what DeepSeek expects, and crank `reasoning_effort` to "max" so callers
+// pick the strongest setting without extra config. User-supplied
+// extraBody wins on conflicts.
+function deepseekSupportsThinking(model: string): boolean {
+  const m = model.trim().toLowerCase();
+  if (!m) return false;
+  if (m === "deepseek-reasoner") return true;
+  // deepseek-v4-*, deepseek-v5-*, ...  Excludes V3 explicitly.
+  return m.startsWith("deepseek-v") && !m.startsWith("deepseek-v3");
+}
+
+function withDeepSeekThinkingDefaults(
+  model: string,
+  extraBody: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined {
+  if (!deepseekSupportsThinking(model)) {
+    return extraBody;
+  }
+  const merged: Record<string, unknown> = { thinking: { type: "enabled" }, reasoning_effort: "max" };
+  if (extraBody) {
+    for (const [key, value] of Object.entries(extraBody)) {
+      merged[key] = value;
+    }
+  }
+  return merged;
+}
+
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {
@@ -1427,6 +1538,17 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       baseUrl: pickBaseUrl(provider.baseUrl, "http://127.0.0.1:11434/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
       ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
+    };
+  }
+  if (provider.name === "deepseek") {
+    const model = provider.model || DEFAULT_DEEPSEEK_MODEL;
+    const extraBody = withDeepSeekThinkingDefaults(model, provider.extraBody);
+    return {
+      name: "deepseek",
+      model,
+      baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_DEEPSEEK_BASE_URL),
+      apiKeyEnv: provider.apiKeyEnv ?? "DEEPSEEK_API_KEY",
+      ...(extraBody ? { extraBody } : {})
     };
   }
   if (provider.name === "codex") {
@@ -2132,6 +2254,7 @@ function defaultBaseUrl(provider: ProviderConfig): string {
   if (provider.name === "codex") return DEFAULT_CODEX_BASE_URL;
   if (provider.name === "openrouter") return "https://openrouter.ai/api/v1";
   if (provider.name === "local") return "http://127.0.0.1:11434/v1";
+  if (provider.name === "deepseek") return DEFAULT_DEEPSEEK_BASE_URL;
   return DEFAULT_OPENAI_BASE_URL;
 }
 

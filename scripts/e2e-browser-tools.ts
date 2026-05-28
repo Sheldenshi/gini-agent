@@ -159,11 +159,11 @@ async function waitForCompletion(taskId: string, timeoutMs: number): Promise<Tas
     // tools (e.g. browser_upload_file) end-to-end without a human in the
     // loop. This harness is local-only and the user explicitly invokes it.
     if (task.status === "waiting_approval" || task.status === "awaiting_approval" || (task.status === "running" && task.currentStep?.toLowerCase().includes("approval"))) {
-      const approvals = (await api(`/api/approvals`)) as Array<{ id: string; taskId: string; status: string }>;
+      const approvals = (await api(`/api/authorizations`)) as Array<{ id: string; taskId: string; status: string }>;
       const pending = approvals.find((a) => a.taskId === taskId && a.status === "pending");
       if (pending) {
         process.stdout.write(`    → auto-approving ${pending.id}\n`);
-        await api(`/api/approvals/${pending.id}/approve`, { method: "POST" });
+        await api(`/api/authorizations/${pending.id}/approve`, { method: "POST" });
       }
     }
     if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") {

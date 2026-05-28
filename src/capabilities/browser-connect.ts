@@ -700,6 +700,88 @@ async function disconnectBrowserInner(config: RuntimeConfig): Promise<Status> {
   return { connected: false };
 }
 
+// Drives the user-side completion of a `browser.connect` SetupRequest:
+//   1. Switch the per-instance profile to managed mode (headless if the
+//      stage-1 /open-browser already ran the visible sign-in flow).
+//   2. Write the rich `browser.connect` audit row carrying the originating
+//      setup id and user-facing reason (the connectBrowser call uses
+//      skipAudit so this is the only row, success OR failure).
+//   3. Return the JSON tool-result string the chat-task loop expects.
+// The caller (HTTP /complete handler or test) hands the result to
+// `resolveSetupRequest` to flip status and resume the chat loop.
+export async function completeBrowserConnectSetup(
+  config: RuntimeConfig,
+  setup: {
+    id: string;
+    target: string;
+    taskId?: string;
+    agentId?: string;
+    payload: Record<string, unknown>;
+  }
+): Promise<{ ok: boolean; result: string }> {
+  const signInStarted = setup.payload.signInStarted === true;
+  const explicitHeadless = setup.payload.headless === true;
+  const headless = signInStarted ? true : explicitHeadless;
+  let succeeded = false;
+  let result: string;
+  let connectStatus: Status | undefined;
+  let errorMessage: string | undefined;
+  try {
+    connectStatus = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
+    succeeded = connectStatus.connected;
+    result = JSON.stringify({
+      success: succeeded,
+      connected: connectStatus.connected,
+      mode: connectStatus.record?.mode,
+      dataDir: connectStatus.record?.dataDir,
+      headless: connectStatus.record?.headless
+    });
+  } catch (error) {
+    errorMessage = error instanceof Error ? error.message : String(error);
+    result = JSON.stringify({ success: false, error: errorMessage });
+  }
+  const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
+    ? setup.payload.reason
+    : setup.target;
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "browser.connect",
+        target: reasonTarget,
+        risk: "medium",
+        taskId: setup.taskId,
+        runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
+        approvalId: setup.id,
+        evidence: succeeded && connectStatus
+          ? {
+              success: true,
+              mode: connectStatus.record?.mode,
+              headless: connectStatus.record?.headless ?? false,
+              pid: connectStatus.record?.pid ?? null
+            }
+          : { success: false, error: errorMessage ?? "Browser failed to launch." }
+      },
+      setupAuditContext(setup)
+    );
+  });
+  return { ok: succeeded, result };
+}
+
+// Inlined here (rather than importing approvalAgentContext from src/agent.ts)
+// because capabilities/* must not depend on agent.ts — that would create a
+// cycle. Matches approvalAgentContext: prefer task scope, then agent scope,
+// then system.
+function setupAuditContext(setup: {
+  taskId?: string;
+  agentId?: string;
+}): { taskId: string } | { agentId: string } | { system: true } {
+  if (setup.taskId) return { taskId: setup.taskId };
+  if (setup.agentId) return { agentId: setup.agentId };
+  return { system: true };
+}
+
 // Internal helpers exported only for unit tests.
 export const __test = {
   redactUrlCredentials,

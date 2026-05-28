@@ -17,6 +17,12 @@ import type { Instance } from "../types";
 import { instanceRoot } from "../paths";
 import { id, now } from "./ids";
 
+// Bumped to 4 for the push-device registry: adds the `devices` table used
+// by src/state/devices.ts to persist iOS APNs push tokens. Lookup is keyed
+// by credential_id (the paired-device id or "owner" for the runtime
+// config token) so the APNs dispatcher can fan a notification out to every
+// iOS install that belongs to the same human credential.
+//
 // Bumped to 3 for the ChatBlock protocol (ADR chat-block-protocol.md):
 // adds the `chat_blocks` table used by src/state/chat-blocks.ts to
 // persist runtime-emitted semantic conversation blocks (user_text,
@@ -27,7 +33,15 @@ import { id, now } from "./ids";
 // memory_units for per-agent memory isolation. New SQLite installs add the
 // columns through CREATE TABLE; existing installs add them via the additive
 // migration in applyMigrations().
-export const MEMORY_SCHEMA_VERSION = 3;
+// Bumped to 6 for per-device chat_read_state: switches the read-state
+// PK from (session_id, credential_id) to (session_id, device_token) so
+// two iPhones owned by the same human (sharing one "owner" credential)
+// don't share a cursor. Implemented as a copy-forward migration:
+// existing v5 rows are joined against the devices table to duplicate
+// each credential's cursor onto every device registered to that
+// credential. Sessions owned by credentials with no registered
+// devices are dropped (no devices → no badge to bias).
+export const MEMORY_SCHEMA_VERSION = 6;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -328,7 +342,8 @@ function applyMigrations(db: Database): void {
       ordinal INTEGER NOT NULL,
       kind TEXT NOT NULL CHECK (kind IN (
         'user_text','assistant_text','tool_call','tool_result',
-        'phase','approval_requested','system_note'
+        'phase','approval_requested','authorization_requested',
+        'setup_requested','system_note'
       )),
       payload_json TEXT NOT NULL,
       task_id TEXT,
@@ -342,6 +357,48 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
   `);
 
+  // Step 5 — devices table (schema version 4). Stores APNs push tokens
+  // per credential so the runtime can fan an `approval_requested` block
+  // out to every iOS install that belongs to the same paired credential.
+  // `credential_id` is the upstream caller's identity as resolved by
+  // governance/pairing.ts:authorizedBearer — the PairedDevice id for
+  // mobile clients or the literal "owner" string for the runtime's
+  // config token. Indexed on credential_id because the dispatcher's hot
+  // path is "give me every device for this credential". The CHECK on
+  // platform pins us to iOS for now; Step 2/3/4 are iOS-only this round.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS devices (
+      token TEXT PRIMARY KEY,
+      credential_id TEXT NOT NULL,
+      platform TEXT NOT NULL CHECK (platform IN ('ios')),
+      bundle_id TEXT NOT NULL,
+      registered_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
+  `);
+
+  // Step 6 — chat_read_state table (schema version 6). Tracks the
+  // last block id each device has acknowledged seeing on a given chat
+  // session. Used to compute the iOS app's badge count and to drive
+  // silent-push suppression for completion phases. Composite primary
+  // key on (session_id, device_token) so two iPhones owned by the
+  // same human (sharing one "owner" credential under the runtime's
+  // single-tenant credential model) each track their own per-session
+  // cursor.
+  //
+  // Upgrade from v5: the previous schema used (session_id, credential_id).
+  // Under multi-device ownership those rows collapsed every device's
+  // read state onto one credential cursor. The migration duplicates
+  // each v5 row onto every device currently registered under the same
+  // credential — the resulting v6 rows may over-report unread (a device
+  // that never actually opened the session inherits a "read"
+  // acknowledgement from a sibling device's cursor), but that's
+  // strictly better than the v5 collapse and far better than dropping
+  // every cursor and over-counting unread badges across the install
+  // base on first launch.
+  ensureChatReadStateDeviceTokenSchema(db);
+
   db.run(
     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
     [String(MEMORY_SCHEMA_VERSION)]
@@ -354,6 +411,80 @@ function ensureColumn(db: Database, table: string, column: string, type: string)
     .all();
   if (rows.some((row) => row.name === column)) return;
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+}
+
+// Migration helper for the v5 → v6 chat_read_state shape change.
+// Creates the device-keyed table from scratch if missing; if a v5
+// (credential_id-keyed) table exists, copies each v5 row forward
+// into one v6 row per registered device for that credential.
+//
+// Migration semantics:
+//   - v5 schema: PRIMARY KEY (session_id, credential_id). One cursor
+//     per credential, regardless of how many physical iPhones the
+//     credential authorised. Under multi-device ownership two iPhones
+//     would clobber each other's cursor.
+//   - v6 schema: PRIMARY KEY (session_id, device_token). Each
+//     physical iPhone tracks its own cursor.
+//   - Migration: JOIN chat_read_state v5 against devices on
+//     credential_id. Every device registered under credential C
+//     inherits credential C's session cursors. The inherited cursor
+//     may over-report "read" (a device that never opened the session
+//     starts out marked-as-read up to the credential's last position),
+//     but that's strictly less wrong than the v5 collapse and far
+//     better than dropping all cursors and badge-spiking every
+//     session as unread on first launch after upgrade.
+//   - Credentials with no registered devices contribute nothing to
+//     v6: no device means no badge to bias.
+export function ensureChatReadStateDeviceTokenSchema(db: Database): void {
+  const cols = db
+    .query<{ name: string }, []>("PRAGMA table_info(chat_read_state)")
+    .all();
+  const hasCredentialId = cols.some((c) => c.name === "credential_id");
+  const hasDeviceToken = cols.some((c) => c.name === "device_token");
+
+  if (cols.length === 0) {
+    // Fresh DB — create the device-keyed table directly.
+    db.exec(`
+      CREATE TABLE chat_read_state (
+        session_id TEXT NOT NULL,
+        device_token TEXT NOT NULL,
+        last_read_block_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, device_token)
+      );
+      CREATE INDEX chat_read_state_by_device ON chat_read_state(device_token);
+    `);
+    return;
+  }
+
+  if (hasDeviceToken && !hasCredentialId) {
+    // Already on v6 schema (or post-v6 fresh install). No-op.
+    return;
+  }
+
+  if (hasCredentialId) {
+    // v5 → v6: copy v5 rows forward onto every device registered for
+    // the same credential, then drop the old table. The copy uses a
+    // staging table so the drop + rename pattern keeps the final
+    // table name identical and indexed correctly.
+    db.exec(`
+      CREATE TABLE chat_read_state_v6 (
+        session_id TEXT NOT NULL,
+        device_token TEXT NOT NULL,
+        last_read_block_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, device_token)
+      );
+      INSERT INTO chat_read_state_v6 (session_id, device_token, last_read_block_id, updated_at)
+        SELECT cr.session_id, d.token, cr.last_read_block_id, cr.updated_at
+        FROM chat_read_state cr
+        JOIN devices d ON d.credential_id = cr.credential_id;
+      DROP INDEX IF EXISTS chat_read_state_by_credential;
+      DROP TABLE chat_read_state;
+      ALTER TABLE chat_read_state_v6 RENAME TO chat_read_state;
+      CREATE INDEX chat_read_state_by_device ON chat_read_state(device_token);
+    `);
+  }
 }
 
 // Float32Array <-> Buffer round-trip.

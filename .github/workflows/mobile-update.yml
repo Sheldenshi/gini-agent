@@ -39,8 +39,8 @@ jobs:
           changed=$(git diff --name-only "$base" "$head" -- mobile/)
           echo "Changed files in mobile/:"
           echo "$changed"
-          if echo "$changed" | grep -E '^mobile/(app\.json|eas\.json|ios/|android/)' >/dev/null; then
-            echo "::error::Native config changed (app.json / eas.json / ios/ / android/). Run \`eas build\` + \`eas submit\` manually instead of OTA."
+          if echo "$changed" | grep -E '^mobile/(app\.json|eas\.json|plugins/|ios-extensions/|ios/|android/)' >/dev/null; then
+            echo "::error::Native config changed (app.json / eas.json / plugins/ / ios-extensions/ / ios/ / android/). Run \`eas build\` + \`eas submit\` manually instead of OTA."
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
             exit 1
           fi

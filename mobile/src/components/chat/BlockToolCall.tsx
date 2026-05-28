@@ -3,6 +3,7 @@ import { useState } from "react";
 import { StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { family, theme } from "@/src/theme";
 import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
+import { iconForTool } from "./tool-icons";
 
 // Single horizontal row per the Pencil design:
 //   [icon + Hanken-Grotesk-600 label]  [monospace code chip filling rest]
@@ -13,26 +14,6 @@ import type { ToolCallBlock, ToolResultBlock } from "@/src/types";
 // indicate what kind of tool ran.
 //
 // On error / denied the row gets a red error string below.
-
-type FeatherName = React.ComponentProps<typeof Feather>["name"];
-
-// Tool name → Feather icon. The runtime emits names like
-// "terminal_exec", "file_read", "browser_navigate", "web_fetch".
-// We map by leading prefix so any new tool that starts with a known
-// stem picks up the right icon without code changes.
-function iconForTool(toolName: string): FeatherName {
-  const name = toolName.toLowerCase();
-  if (name.startsWith("terminal") || name.includes("exec")) return "terminal";
-  if (name.startsWith("file_") || name.startsWith("read") || name.startsWith("write")) {
-    return "book-open";
-  }
-  if (name.startsWith("browser") || name.startsWith("web") || name.includes("fetch")) {
-    return "globe";
-  }
-  // Feather doesn't ship a "tool" icon — `package` is the closest stand-in
-  // for generic capability calls (settings doesn't read as a tool action).
-  return "package";
-}
 
 export function BlockToolCall({
   block,
@@ -54,7 +35,7 @@ export function BlockToolCall({
         style={styles.body}
       >
         <View style={styles.labelGroup}>
-          <Feather name={icon} size={15} color={theme.toolIcon} />
+          <Feather name={icon.name} size={15} color={theme.toolIcon} />
           <Text style={styles.label} numberOfLines={1}>
             {block.displayLabel}
           </Text>

@@ -1707,7 +1707,7 @@ export function redactSecretValuesDeep(value: unknown, secrets: readonly string[
 // browser.fill_secret slot writer. Takes a raw playwright selector
 // (CSS, text=, role=, or an ARIA snapshot ref token like "@e2"
 // which resolveLocator translates to [data-gini-ref="e2"]) plus the
-// value to type. Used exclusively by the POST /api/approvals/<id>/connect
+// value to type. Used exclusively by the POST /api/setup-requests/<id>/complete
 // browser.fill_secret branch; never called via the tool catalog.
 // Skips the post-fill snapshot that browser_type takes because the
 // agent will re-snapshot on its own when it resumes — and because

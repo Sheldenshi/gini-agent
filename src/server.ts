@@ -13,6 +13,7 @@ import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
+import { createApnsDispatcher } from "./integrations/apns/dispatcher";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -129,6 +130,12 @@ syncProviderMcpServers(config)
       error: error instanceof Error ? error.message : String(error)
     });
   });
+
+// APNs push dispatcher. Subscribes to the instance-wide chat-blocks
+// stream and fans `approval_requested` events out to every registered
+// iOS device. The dispatcher itself no-ops when APNS_* env vars are
+// unset, so dev installs without push creds are unaffected.
+const apnsDispatcher = createApnsDispatcher(config.instance);
 
 const server = Bun.serve({
   port: config.port,
@@ -276,6 +283,10 @@ process.on("SIGTERM", async () => {
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
+  // Tear down the chat-blocks subscription so the dispatcher stops
+  // emitting pushes during drain. The APNs HTTP/2 client owns its own
+  // session and will close lazily when garbage-collected.
+  try { apnsDispatcher.stop(); } catch { /* swallow — shutdown must continue */ }
   // Abort all in-flight Telegram long-polls so they don't keep us alive
   // waiting out their 25s timeout, and abort every Discord poll cycle
   // so the runtime exits promptly even if a fetch is in-flight. The

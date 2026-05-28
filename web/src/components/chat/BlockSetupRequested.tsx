@@ -5,61 +5,47 @@ import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { RiskPill, StatusPill } from "@/components/StatusPill";
+import { StatusPill } from "@/components/StatusPill";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
 import { api } from "@/lib/api";
-import { useApprovals, useInvalidate, useProviders } from "@/lib/queries";
-import type { Approval, ApprovalRequestedBlock } from "@runtime/types";
+import { useSetupRequests, useInvalidate, useProviders } from "@/lib/queries";
+import type { SetupRequest, SetupRequestedBlock } from "@runtime/types";
 import { parseFillSecretSlots, type FillSecretSlot } from "@/lib/fill-secrets-types";
 
-// Inline Approve / Deny / Connect actions for an approval_requested block.
-// The block itself carries `approvalId`, `action`, `risk`, and `summary`
-// directly from the wire, so the bubble can render without a join. The
-// `connector.request` Connect flow still needs the approval payload
-// (provider id, provider label) for the AddConnectorDialog — we fetch
-// that lazily through the existing useApprovals() cache rather than
-// adding a new per-id endpoint.
-//
-// Once the approval is resolved (approved / denied / connected), the
-// runtime updates the corresponding tool_call block's status and the
-// approval_requested block becomes historical. We keep rendering the
-// bubble so the chat log stays complete; the buttons disable themselves
-// once the approval is no longer pending.
-export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBlock }) {
+// User-actor gate: the user performs a setup step (sign in, enter
+// credentials, fill a form, stand up a messaging bridge, approve an
+// inbound pairing). No risk pill — the rule is structural per
+// docs/adr/authorization-vs-setup-request.md. The action determines the
+// layout (Connect button vs credential dialog vs inline inputs vs
+// messaging-bridge form vs pairing/removal confirmation); every path POSTs
+// to /api/setup-requests/<id>/{complete,cancel,open-browser}.
+export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
   const invalidate = useInvalidate();
-  const approvals = useApprovals();
+  const setupRequests = useSetupRequests();
   const providers = useProviders();
   const [expanded, setExpanded] = useState(false);
   const [connectOpen, setConnectOpen] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
 
-  // Find the matching approval row so the Connect dialog has the
-  // provider id from `approval.payload.provider`. The approval may not
-  // yet be in the cache on first render — the Connect button stays
-  // disabled until the row loads so the dialog never opens without the
-  // provider id it needs.
-  const approval = (approvals.data ?? []).find((a) => a.id === block.approvalId) ?? null;
-  const isPending = approval ? approval.status === "pending" : true;
+  const setup = (setupRequests.data ?? []).find((s) => s.id === block.setupRequestId) ?? null;
+  const isPending = setup ? setup.status === "pending" : true;
 
-  const decide = useMutation({
-    mutationFn: ({ op }: { op: "approve" | "deny" }) =>
-      api<Approval>(`/approvals/${block.approvalId}/${op}`, { method: "POST" }),
+  const cancel = useMutation({
+    mutationFn: () =>
+      api<SetupRequest>(`/setup-requests/${block.setupRequestId}/cancel`, { method: "POST" }),
     onSuccess: () => {
-      // Refresh the surfaces that mirror approval state. The chat page
-      // itself updates via the per-session SSE block stream, but
-      // /permissions and /activity rely on the React Query cache.
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message),
     onSettled: () => {
-      // Clear any typed credentials regardless of outcome. The Deny
-      // button on a fill_secret or messaging.add_bridge card never
-      // invokes the respective submit mutation (and therefore never
-      // hits its onSettled clear), so without this hook a user who
-      // typed a credential and then clicked Deny would leave the
-      // typed value sitting in React state until the chat view
-      // unmounts. Cheap on every other approval action — the setters
-      // are no-ops when the record / string is already empty.
+      // Clear any typed credentials regardless of outcome. The Cancel
+      // button on a fill_secret or messaging.add_bridge card never invokes
+      // the respective submit mutation (and therefore never hits its
+      // onSettled clear), so without this hook a user who typed a
+      // credential and then clicked Cancel would leave the typed value
+      // sitting in React state until the chat view unmounts. Cheap on
+      // every other action — the setters are no-ops when the record /
+      // string is already empty.
       setFillValues({});
       setBridgeToken("");
     }
@@ -67,111 +53,121 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
 
   const connect = useMutation({
     mutationFn: async (body: CreateConnectorBody) => {
-      const response = await api<{ ok: boolean; message?: string; connector?: unknown }>(
-        `/approvals/${block.approvalId}/connect`,
+      return api<{ ok: boolean; message?: string; connector?: unknown }>(
+        `/setup-requests/${block.setupRequestId}/complete`,
         {
           method: "POST",
-          body: JSON.stringify({
-            secrets: body.secrets,
-            scopes: body.scopes,
-            name: body.name
-          })
+          body: JSON.stringify({ secrets: body.secrets, scopes: body.scopes, name: body.name })
         }
       );
-      return response;
     },
     onSuccess: (result) => {
       if (result.ok) {
         setConnectOpen(false);
         setConnectError(null);
-        invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
+        invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       } else {
-        setConnectError(
-          result.message ?? "Could not connect. Please verify the credentials and try again."
-        );
+        setConnectError(result.message ?? "Could not connect. Please verify the credentials and try again.");
         invalidate(["connectors"]);
       }
     },
-    onError: (error: Error) => {
-      setConnectError(error.message);
-    }
+    onError: (error: Error) => setConnectError(error.message)
   });
 
+  const browserConnect = useMutation({
+    mutationFn: async () => {
+      const signInStarted = setup?.payload?.signInStarted === true;
+      if (signInStarted) {
+        return api<{ ok: boolean }>(`/setup-requests/${block.setupRequestId}/complete`, {
+          method: "POST",
+          body: JSON.stringify({})
+        });
+      }
+      return api<{ ok: boolean }>(`/setup-requests/${block.setupRequestId}/open-browser`, {
+        method: "POST"
+      });
+    },
+    onSuccess: () => {
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "browser"]);
+    },
+    onError: (error: Error) => toast.error(error.message)
+  });
+
+  const isBrowserConnect = block.action === "browser.connect";
   const isConnectorRequest = block.action === "connector.request";
   const isBrowserFillSecret = block.action === "browser.fill_secret";
   const isMessagingAddBridge = block.action === "messaging.add_bridge";
   const isMessagingApprovePairing = block.action === "messaging.approve_pairing";
   const isMessagingRemoveBridge = block.action === "messaging.remove_bridge";
-  const providerId = isConnectorRequest && approval
-    ? String(approval.payload?.provider ?? "")
-    : "";
-  const providerLabel = isConnectorRequest && approval
-    ? typeof approval.payload?.providerLabel === "string"
-      ? (approval.payload.providerLabel as string)
+
+  const providerId = isConnectorRequest && setup ? String(setup.payload?.provider ?? "") : "";
+  const providerLabel = isConnectorRequest && setup
+    ? typeof setup.payload?.providerLabel === "string"
+      ? (setup.payload.providerLabel as string)
       : providerId
     : "";
-  const fillSlots: FillSecretSlot[] = isBrowserFillSecret && approval
-    ? parseFillSecretSlots(approval.payload?.slots)
+  const fillSlots: FillSecretSlot[] = isBrowserFillSecret && setup
+    ? parseFillSecretSlots(setup.payload?.slots)
     : [];
-  const bridgeKind = isMessagingAddBridge && approval
-    ? (approval.payload?.kind === "telegram" || approval.payload?.kind === "discord"
-        ? (approval.payload.kind as "telegram" | "discord")
+
+  // === messaging.add_bridge card state ===
+  const bridgeKind = isMessagingAddBridge && setup
+    ? (setup.payload?.kind === "telegram" || setup.payload?.kind === "discord"
+        ? (setup.payload.kind as "telegram" | "discord")
         : "telegram")
     : null;
   const bridgeKindLabel = bridgeKind === "discord" ? "Discord" : "Telegram";
-  const suggestedBridgeName = isMessagingAddBridge && approval
-    && typeof approval.payload?.suggestedName === "string"
-    ? (approval.payload.suggestedName as string)
+  const suggestedBridgeName = isMessagingAddBridge && setup
+    && typeof setup.payload?.suggestedName === "string"
+    ? (setup.payload.suggestedName as string)
     : "";
+
   const [fillValues, setFillValues] = useState<Record<string, string>>({});
   const [bridgeName, setBridgeName] = useState("");
   const [bridgeToken, setBridgeToken] = useState("");
   const [bridgeError, setBridgeError] = useState<string | null>(null);
-  // Sticky outcome marker. The /connect handler resolves the approval
+  // Sticky outcome marker. The /complete handler resolves the setup request
   // BEFORE addMessagingBridge runs, so a create-after-resolve failure
-  // returns ok:false while the approval is already approved. Without
-  // this state, the past-tense summary would unconditionally read
-  // "Bridge added" on any approved row — including the failed-create
-  // case. Track the last submit's outcome so the resolved-state
-  // summary can tell the truth.
+  // returns ok:false while the row is already completed. Without this
+  // state, the past-tense summary would unconditionally read "Bridge added"
+  // on any completed row — including the failed-create case. Track the last
+  // submit's outcome so the resolved-state summary can tell the truth.
   const [bridgeResultOk, setBridgeResultOk] = useState<boolean | null>(null);
   const [bridgeResultMessage, setBridgeResultMessage] = useState<string | null>(null);
-  // Synchronous single-flight guard for the Add-bridge click. The
-  // button's `disabled={bridgeSubmit.isPending}` only flips on the
-  // next React render — a same-frame double-click can fire the
-  // mutation twice before that render lands, and the runtime has no
-  // name-uniqueness check on bridges, so two creates would produce
-  // two encrypted secret files keyed off two distinct bridge ids
-  // (one of which is orphaned). Mirrors the submittingRef pattern in
-  // web/src/app/settings/_components/MessagingCard.tsx that was
-  // added for the same reason on the settings dialog.
+  // Synchronous single-flight guard for the Add-bridge click. The button's
+  // `disabled={bridgeSubmit.isPending}` only flips on the next React render
+  // — a same-frame double-click can fire the mutation twice before that
+  // render lands, and the runtime has no name-uniqueness check on bridges,
+  // so two creates would produce two encrypted secret files keyed off two
+  // distinct bridge ids (one of which is orphaned). Mirrors the
+  // submittingRef pattern in web/src/app/settings/_components/MessagingCard.tsx
+  // that was added for the same reason on the settings dialog.
   const bridgeSubmittingRef = useRef(false);
-  // Seed the name input with the agent's suggestedName the first time
-  // the approval row resolves out of the cache. Without this, the
-  // first render fires before useApprovals() lands the row and the
-  // input would stay empty even after the suggestion arrives. Keyed
-  // on approvalId so a brand-new card (e.g. the agent re-issues the
-  // tool after a denied submission) re-seeds rather than carrying
-  // the prior session's value.
+  // Seed the name input with the agent's suggestedName the first time the
+  // setup row resolves out of the cache. Without this, the first render
+  // fires before useSetupRequests() lands the row and the input would stay
+  // empty even after the suggestion arrives. Keyed on setupRequestId so a
+  // brand-new card (e.g. the agent re-issues the tool after a cancelled
+  // submission) re-seeds rather than carrying the prior session's value.
   useEffect(() => {
     if (!isMessagingAddBridge) return;
     if (bridgeName.length > 0) return;
     if (suggestedBridgeName.length === 0) return;
     setBridgeName(suggestedBridgeName);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMessagingAddBridge, suggestedBridgeName, block.approvalId]);
+  }, [isMessagingAddBridge, suggestedBridgeName, block.setupRequestId]);
+
   const fillSubmit = useMutation({
     mutationFn: async () => {
-      // Submit value never leaves this function's request scope.
-      // The /connect endpoint detects action=browser.fill_secret and
-      // pipes each entry's value into playwright.fill on the live
-      // page. Local state is cleared in onSettled below regardless of
-      // outcome so the value never lingers in React state past the
-      // click — including on partial-fail (where the gateway has
-      // already resolved the approval and retry is meaningless) and
-      // on network/abort errors.
+      // Submit value never leaves this function's request scope. The
+      // /complete endpoint detects action=browser.fill_secret and pipes
+      // each entry's value into playwright.fill on the live page. Local
+      // state is cleared in onSettled below regardless of outcome so the
+      // value never lingers in React state past the click — including on
+      // partial-fail (where the gateway has already resolved the request
+      // and retry is meaningless) and on network/abort errors.
       const response = await api<{ ok: boolean; message?: string; filledSlots?: string[] }>(
-        `/approvals/${block.approvalId}/connect`,
+        `/setup-requests/${block.setupRequestId}/complete`,
         {
           method: "POST",
           body: JSON.stringify({ secrets: fillValues })
@@ -183,41 +179,30 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       if (!result.ok) {
         toast.error(result.message ?? "Fill failed; the agent will decide whether to retry.");
       }
-      // Always invalidate approvals: the gateway resolves the
-      // approval atomically before running fills, so on both ok and
-      // !ok paths the approval status has flipped out of "pending"
-      // and the card needs to re-render with isPending=false (Submit
-      // disabled, inputs hidden). Without this, ok:false would leave
-      // a stale "pending" cache and the Submit button would stay
-      // enabled offering a retry that the gateway would 410-Gone.
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit"]);
+      // Always invalidate: the gateway resolves the setup request
+      // atomically before running fills, so on both ok and !ok paths the
+      // status has flipped out of "pending" and the card needs to
+      // re-render with isPending=false (Submit disabled, inputs hidden).
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit"]);
     },
     onError: (error: Error) => toast.error(error.message),
-    onSettled: () => {
-      // Belt-and-braces: clear typed credentials from React state
-      // regardless of outcome (success, partial-fail, network error,
-      // abort). The card stays mounted across the chat session for
-      // history-completeness, so without this hook a stale value
-      // would linger in the React fiber tree (and React DevTools)
-      // for the duration of the session.
-      setFillValues({});
-    }
+    onSettled: () => setFillValues({})
   });
   const fillReady = isBrowserFillSecret
     && fillSlots.length > 0
     && fillSlots.every((s) => typeof fillValues[s.name] === "string" && fillValues[s.name].length > 0);
 
-  // Submitter for the messaging.add_bridge card. Same shape as
-  // fillSubmit above — POST /api/approvals/<id>/connect with a
-  // `secrets` envelope, clear the typed token on success/error/abort
-  // so it never lingers in the React fiber tree past the click.
-  // Failures surface inline (so the operator can retry without the
-  // card tearing down) AND invalidate the approval cache so a
-  // 410-Gone follow-up flips the card out of pending state.
+  // Submitter for the messaging.add_bridge card. Same shape as fillSubmit
+  // above — POST /api/setup-requests/<id>/complete with a `secrets`
+  // envelope, clear the typed token on success/error/abort so it never
+  // lingers in the React fiber tree past the click. Failures surface inline
+  // (so the operator can retry without the card tearing down) AND invalidate
+  // the setup-requests cache so a 410-Gone follow-up flips the card out of
+  // pending state.
   const bridgeSubmit = useMutation({
     mutationFn: async () => {
       const response = await api<{ ok: boolean; message?: string; bridge?: { id?: string; name?: string } }>(
-        `/approvals/${block.approvalId}/connect`,
+        `/setup-requests/${block.setupRequestId}/complete`,
         {
           method: "POST",
           body: JSON.stringify({ secrets: { name: bridgeName.trim(), botToken: bridgeToken } })
@@ -228,14 +213,13 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     onSuccess: (result) => {
       setBridgeResultOk(result.ok);
       setBridgeResultMessage(result.message ?? null);
-      // Always invalidate approvals/tasks/chat — the gateway resolves
-      // the approval BEFORE addMessagingBridge runs, so even on
-      // ok:false the approval status has flipped out of "pending"
-      // and the card must re-render with isPending=false. Without
-      // this, a failed create would leave the Submit button enabled
-      // and a retry would be 410-Gone. Mirrors the fillSubmit
-      // precedent above.
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      // Always invalidate setup-requests/tasks/chat — the gateway resolves
+      // the setup request BEFORE addMessagingBridge runs, so even on
+      // ok:false the status has flipped out of "pending" and the card must
+      // re-render with isPending=false. Without this, a failed create would
+      // leave the Add button enabled and a retry would be 410-Gone. Mirrors
+      // the fillSubmit precedent above.
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       if (!result.ok) {
         setBridgeError(result.message ?? "Could not add bridge. Please verify the bot token and try again.");
         return;
@@ -248,24 +232,22 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       setBridgeResultOk(false);
       setBridgeResultMessage(error.message);
       // Network/abort failures can arrive AFTER the server-side
-      // resolveApproval landed, so the cache must refresh to flip
-      // the card out of the stale pending state. The fillSubmit
-      // precedent fires its own invalidate via onSuccess on both
-      // ok and !ok paths; the onError seam is the equivalent for
-      // pre-response throws.
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      // resolveSetupRequest landed, so the cache must refresh to flip the
+      // card out of the stale pending state. The fillSubmit precedent fires
+      // its own invalidate via onSuccess on both ok and !ok paths; the
+      // onError seam is the equivalent for pre-response throws.
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
-      // Drop the typed bot token regardless of outcome — the token
-      // has either landed in the encrypted per-instance secret store
-      // (success) or been rejected upstream (failure), and there's
-      // no replay value in keeping it inspectable in React DevTools.
+      // Drop the typed bot token regardless of outcome — the token has
+      // either landed in the encrypted per-instance secret store (success)
+      // or been rejected upstream (failure), and there's no replay value in
+      // keeping it inspectable in React DevTools.
       setBridgeToken("");
-      // Release the synchronous click guard so a follow-up retry
-      // (after an ok:false from /connect) actually fires. Reset here
-      // — not in onSuccess or onError alone — so every termination
-      // path (success, server-side ok:false, network error, abort)
-      // clears the ref.
+      // Release the synchronous click guard so a follow-up retry (after an
+      // ok:false from /complete) actually fires. Reset here — not in
+      // onSuccess or onError alone — so every termination path (success,
+      // server-side ok:false, network error, abort) clears the ref.
       bridgeSubmittingRef.current = false;
     }
   });
@@ -274,7 +256,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     && bridgeToken.trim().length > 0;
 
   // === messaging.approve_pairing card state ===
-  const pairingPayload = isMessagingApprovePairing && approval ? approval.payload : null;
+  const pairingPayload = isMessagingApprovePairing && setup ? setup.payload : null;
   const pairingBridgeName = typeof pairingPayload?.bridgeName === "string"
     ? (pairingPayload.bridgeName as string)
     : "";
@@ -297,27 +279,26 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     ? (pairingPayload.verificationCodeExpiresAt as string)
     : "";
   const [pairingError, setPairingError] = useState<string | null>(null);
-  // Track which side of the resolved card the user took so the
-  // past-tense summary distinguishes "Pairing approved" from
-  // "Pairing rejected" instead of leaning on `approval.status` alone
-  // (which is just `approved` in both cases — Reject is also a
-  // /connect call, not a /deny).
+  // Track which side of the resolved card the user took so the past-tense
+  // summary distinguishes "Pairing approved" from "Pairing rejected" instead
+  // of leaning on `setup.status` alone (which is just `completed` in both
+  // cases — Reject is also a /complete call, not a /cancel).
   const [pairingOutcome, setPairingOutcome] = useState<"approved" | "rejected" | null>(null);
-  // Sticky ok/message marker mirroring bridgeResultOk. The /connect
-  // handler resolves the approval BEFORE allowChat / rejectPendingChat
-  // runs, so a server-side failure (e.g. rotated verification code,
-  // already-enrolled chat) returns ok:false with approval.status
-  // already flipped to approved. Without this state, the past-tense
-  // summary would unconditionally read "Pairing resolved." on every
-  // approved row — masking real failures. The displaySummary branch
-  // reads this to render "Pairing failed: ..." truthfully.
+  // Sticky ok/message marker mirroring bridgeResultOk. The /complete handler
+  // resolves the setup request BEFORE allowChat / rejectPendingChat runs, so
+  // a server-side failure (e.g. rotated verification code, already-enrolled
+  // chat) returns ok:false with status already flipped to completed. Without
+  // this state, the past-tense summary would unconditionally read "Pairing
+  // resolved." on every completed row — masking real failures. The
+  // displaySummary branch reads this to render "Pairing failed: ..."
+  // truthfully.
   const [pairingResultOk, setPairingResultOk] = useState<boolean | null>(null);
   const [pairingResultMessage, setPairingResultMessage] = useState<string | null>(null);
   const pairingSubmittingRef = useRef(false);
   const pairingSubmit = useMutation({
     mutationFn: async (variant: { reject: boolean }) => {
       const response = await api<{ ok: boolean; message?: string; enrolled?: boolean; rejected?: boolean }>(
-        `/approvals/${block.approvalId}/connect`,
+        `/setup-requests/${block.setupRequestId}/complete`,
         {
           method: "POST",
           body: JSON.stringify(variant.reject ? { reject: true } : {})
@@ -326,11 +307,11 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       return { response, variant };
     },
     onSuccess: ({ response, variant }) => {
-      // Always invalidate — server resolves the approval BEFORE the
-      // side effect, so the cache must refresh regardless of ok value
-      // to flip the card out of pending state. Same precedent as the
-      // bridge submitter and fillSubmit.
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      // Always invalidate — server resolves the setup request BEFORE the
+      // side effect, so the cache must refresh regardless of ok value to
+      // flip the card out of pending state. Same precedent as the bridge
+      // submitter and fillSubmit.
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       setPairingResultOk(response.ok);
       setPairingResultMessage(response.message ?? null);
       if (!response.ok) {
@@ -345,7 +326,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       setPairingError(error.message);
       setPairingResultOk(false);
       setPairingResultMessage(error.message);
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
       pairingSubmittingRef.current = false;
@@ -353,7 +334,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   });
 
   // === messaging.remove_bridge card state ===
-  const removePayload = isMessagingRemoveBridge && approval ? approval.payload : null;
+  const removePayload = isMessagingRemoveBridge && setup ? setup.payload : null;
   const removeBridgeName = typeof removePayload?.bridgeName === "string"
     ? (removePayload.bridgeName as string)
     : "";
@@ -366,13 +347,13 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
   const removeSubmit = useMutation({
     mutationFn: async () => {
       const response = await api<{ ok: boolean; message?: string; removed?: boolean }>(
-        `/approvals/${block.approvalId}/connect`,
+        `/setup-requests/${block.setupRequestId}/complete`,
         { method: "POST", body: JSON.stringify({}) }
       );
       return response;
     },
     onSuccess: (response) => {
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
       setRemoveResultOk(response.ok);
       if (!response.ok) {
         setRemoveError(response.message ?? "Could not remove bridge.");
@@ -384,38 +365,31 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     onError: (error: Error) => {
       setRemoveError(error.message);
       setRemoveResultOk(false);
-      invalidate(["approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
+      invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "messaging"]);
     },
     onSettled: () => {
       removeSubmittingRef.current = false;
     }
   });
 
-  // Once the approval is no longer pending, drop the amber accent so
-  // the bubble visually reads as historical rather than an active
-  // prompt. The buttons still render in their resolved-state form
-  // below (status pill instead of dead Submit/Deny) so the user
-  // sees what happened without it looking like they still need
-  // to act.
+  const signInStarted = setup?.payload?.signInStarted === true;
+
   const cardClass = isPending
     ? "rounded-lg border border-amber-500/30 bg-amber-500/5 p-3"
     : "rounded-lg border border-border bg-background/40 p-3";
-  // Server-side persisted outcome is the source of truth — the
-  // /connect handlers write it inside the same mutateState that
-  // commits the side effect. React sticky state (bridgeResultOk,
-  // pairingResultOk, removeResultOk) is the fast-path signal for
-  // the in-flight window before useApprovals() refetches, but it
-  // can disagree with the server in one specific case: a
-  // network/abort error fires onError on the client AFTER the
-  // server already committed and persistConnectOutcome wrote
-  // ok:true. The earlier "sticky-then-persisted" priority let the
-  // client's incorrect ok:false win over the server truth.
-  // Reverse it: trust persistedOutcome when present, fall back to
-  // sticky only when the server hasn't written one yet (purely
-  // in-flight, no commit). On reload sticky is gone and
-  // persistedOutcome remains durable, so the post-reload render
-  // still reads the truthful past-tense summary.
-  const persistedOutcome = approval?.connectOutcome;
+
+  // Server-side persisted outcome is the source of truth — the /complete
+  // handlers write it inside the same mutateState that commits the side
+  // effect. React sticky state (bridgeResultOk, pairingResultOk,
+  // removeResultOk) is the fast-path signal for the in-flight window before
+  // useSetupRequests() refetches, but it can disagree with the server in one
+  // specific case: a network/abort error fires onError on the client AFTER
+  // the server already committed and persistConnectOutcome wrote ok:true.
+  // Trust persistedOutcome when present, fall back to sticky only when the
+  // server hasn't written one yet (purely in-flight, no commit). On reload
+  // sticky is gone and persistedOutcome remains durable, so the post-reload
+  // render still reads the truthful past-tense summary.
+  const persistedOutcome = setup?.connectOutcome;
   const effectiveBridgeOk = persistedOutcome
     ? persistedOutcome.ok
     : bridgeResultOk;
@@ -428,39 +402,39 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
     ? persistedOutcome.ok
     : removeResultOk;
   const effectiveRemoveMessage = persistedOutcome?.message ?? removeError ?? null;
-  // Past-tense the summary once resolved so "Enter credentials..."
-  // doesn't keep reading as an active ask after the user has
-  // already submitted (or denied). Display-only — the underlying
-  // block.summary on the wire stays as the agent's original
-  // reason text.
-  const displaySummary = !isPending && approval && isBrowserFillSecret
-    ? approval.status === "approved"
+
+  // Past-tense the summary once resolved so "Enter credentials..." doesn't
+  // keep reading as an active ask after the user has already submitted (or
+  // cancelled). Display-only — the underlying block.summary on the wire
+  // stays as the agent's original reason text.
+  const displaySummary = !isPending && setup && isBrowserFillSecret
+    ? setup.status === "completed"
       ? `Credentials submitted. (${block.summary})`
-      : approval.status === "denied"
-        ? `Request denied. (${block.summary})`
+      : setup.status === "cancelled"
+        ? `Request cancelled. (${block.summary})`
         : block.summary
-    : !isPending && approval && isMessagingAddBridge
-      ? approval.status === "approved"
-        // The /connect handler resolves the approval BEFORE
-        // addMessagingBridge runs, so a successful resolve does NOT
-        // imply the bridge exists. Trust the effective outcome
-        // (sticky-then-persisted); only render "added" when we
-        // have positive evidence the side effect actually completed.
+    : !isPending && setup && isMessagingAddBridge
+      ? setup.status === "completed"
+        // The /complete handler resolves the setup request BEFORE
+        // addMessagingBridge runs, so a successful resolve does NOT imply
+        // the bridge exists. Trust the effective outcome
+        // (sticky-then-persisted); only render "added" when we have
+        // positive evidence the side effect actually completed.
         ? effectiveBridgeOk === false
           ? `Bridge create failed${effectiveBridgeMessage ? `: ${effectiveBridgeMessage}` : ""}. (${block.summary})`
           : `${bridgeKindLabel} bridge added. (${block.summary})`
-        : approval.status === "denied"
-          ? `Request denied. (${block.summary})`
+        : setup.status === "cancelled"
+          ? `Request cancelled. (${block.summary})`
           : block.summary
-      : !isPending && approval && isMessagingApprovePairing
-        ? approval.status === "approved"
-          // Same resolve-before-side-effect ordering as add_bridge:
-          // approval flips to approved AT resolveApproval time,
-          // BEFORE allowChat/rejectPendingChat runs. A server-side
-          // failure (rotated code, already-enrolled chat, etc.)
-          // returns ok:false while the approval is already approved.
-          // Effective outcome falls through sticky → persisted so
-          // the past-tense summary stays truthful after reload.
+      : !isPending && setup && isMessagingApprovePairing
+        ? setup.status === "completed"
+          // Same resolve-before-side-effect ordering as add_bridge: status
+          // flips to completed AT resolve time, BEFORE
+          // allowChat/rejectPendingChat runs. A server-side failure
+          // (rotated code, already-enrolled chat, etc.) returns ok:false
+          // while the row is already completed. Effective outcome falls
+          // through sticky → persisted so the past-tense summary stays
+          // truthful after reload.
           ? effectivePairingOk === false
             ? `Pairing failed${effectivePairingMessage ? `: ${effectivePairingMessage}` : ""}. (${block.summary})`
             : pairingOutcome === "rejected"
@@ -468,24 +442,26 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
               : pairingOutcome === "approved"
                 ? `Pairing approved. (${block.summary})`
                 : `Pairing resolved. (${block.summary})`
-          : approval.status === "denied"
-            ? `Request denied. (${block.summary})`
+          : setup.status === "cancelled"
+            ? `Request cancelled. (${block.summary})`
             : block.summary
-        : !isPending && approval && isMessagingRemoveBridge
-          ? approval.status === "approved"
+        : !isPending && setup && isMessagingRemoveBridge
+          ? setup.status === "completed"
             ? effectiveRemoveOk === false
               ? `Bridge removal failed${effectiveRemoveMessage ? `: ${effectiveRemoveMessage}` : ""}. (${block.summary})`
               : `Bridge removed. (${block.summary})`
-            : approval.status === "denied"
-              ? `Request denied. (${block.summary})`
+            : setup.status === "cancelled"
+              ? `Request cancelled. (${block.summary})`
               : block.summary
           : block.summary;
+
   return (
     <div className={cardClass}>
       <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-xs text-foreground">{block.action}</span>
-        <RiskPill value={block.risk} />
-        {!isPending && approval ? <StatusPill value={approval.status} /> : null}
+        <span className="font-mono text-xs text-foreground">
+          {isBrowserConnect ? "Connect to agent's browser" : block.action}
+        </span>
+        {!isPending && setup ? <StatusPill value={setup.status} /> : null}
         <button
           type="button"
           className="ml-auto text-[11px] text-muted-foreground underline-offset-2 hover:underline"
@@ -495,39 +471,26 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
         </button>
       </div>
       <p className="mt-1 text-xs text-muted-foreground">{displaySummary}</p>
-      {expanded && approval ? (
+      {expanded && setup ? (
         <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
-          {JSON.stringify(approval.payload, null, 2)}
+          {JSON.stringify(setup.payload, null, 2)}
         </pre>
       ) : null}
       {isBrowserFillSecret && fillSlots.length > 0 && isPending ? (
         <div className="mt-2 space-y-2">
           {/*
             Prominent "fill destination" badge so the user can spot a
-            mismatch between the agent's claimed labels and the actual
-            page the secret will land on. The agent controls
-            slot.label and block.summary; the page URL is captured by
-            the gateway at approval-creation time and is the only
-            non-spoofable element on this card. If the agent were
-            prompt-injected to ask for "GitHub password" while the
-            captured page is `https://evil.com/phishing`, this badge
-            is what lets the user see the mismatch.
+            mismatch between the agent's claimed labels and the actual page
+            the secret will land on. The agent controls slot.label and
+            block.summary; the page URL is captured by the gateway at
+            request-creation time and is the only non-spoofable element on
+            this card.
           */}
           {(() => {
-            // Read from approval.payload.approvedUrl — the canonical
-            // load-bearing field the gateway compares against the
-            // live page URL. approval.target currently mirrors the
-            // same value, but the dispatcher's own comment marks
-            // target as "the human-readable label" and approvedUrl
-            // as "the load-bearing equality check," so a future
-            // change to target's format must not silently change
-            // what the user sees on the card. Fall back to target
-            // for legacy approvals minted before the payload field
-            // existed.
-            const approvedUrlField = typeof approval?.payload?.approvedUrl === "string"
-              ? approval.payload.approvedUrl
+            const approvedUrlField = typeof setup?.payload?.approvedUrl === "string"
+              ? setup.payload.approvedUrl
               : undefined;
-            const destination = approvedUrlField ?? approval?.target;
+            const destination = approvedUrlField ?? setup?.target;
             if (!destination) return null;
             return (
               <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
@@ -538,11 +501,11 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           })()}
           {fillSlots.map((slot) => (
             <div key={slot.name} className="space-y-1">
-              <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-${slot.name}`}>
+              <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.setupRequestId}-${slot.name}`}>
                 {slot.label}
               </label>
               <Input
-                id={`${block.approvalId}-${slot.name}`}
+                id={`${block.setupRequestId}-${slot.name}`}
                 type={slot.kind}
                 value={fillValues[slot.name] ?? ""}
                 onChange={(e) => setFillValues((prev) => ({ ...prev, [slot.name]: e.target.value }))}
@@ -562,23 +525,23 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
       {isMessagingAddBridge && isPending ? (
         <div className="mt-2 space-y-2">
           {/*
-            Kind badge mirroring the fill-secret "Fill destination"
-            band — gives the operator a non-spoofable signal of what
-            kind of bridge will be created. The agent supplies the
-            suggested name + reason text; the kind is structurally
-            pinned in the approval payload at dispatch time and is
-            the only field the model cannot rewrite at /connect time.
+            Kind badge mirroring the fill-secret "Fill destination" band —
+            gives the operator a non-spoofable signal of what kind of bridge
+            will be created. The agent supplies the suggested name + reason
+            text; the kind is structurally pinned in the payload at dispatch
+            time and is the only field the model cannot rewrite at /complete
+            time.
           */}
           <div className="rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
             <span className="text-muted-foreground">Bridge kind: </span>
             <span className="font-mono">{bridgeKindLabel}</span>
           </div>
           <div className="space-y-1">
-            <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-bridge-name`}>
+            <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.setupRequestId}-bridge-name`}>
               Name
             </label>
             <Input
-              id={`${block.approvalId}-bridge-name`}
+              id={`${block.setupRequestId}-bridge-name`}
               type="text"
               value={bridgeName}
               onChange={(e) => setBridgeName(e.target.value)}
@@ -591,11 +554,11 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             />
           </div>
           <div className="space-y-1">
-            <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.approvalId}-bridge-token`}>
+            <label className="block text-[11px] text-muted-foreground" htmlFor={`${block.setupRequestId}-bridge-token`}>
               Bot token
             </label>
             <Input
-              id={`${block.approvalId}-bridge-token`}
+              id={`${block.setupRequestId}-bridge-token`}
               type="password"
               value={bridgeToken}
               onChange={(e) => setBridgeToken(e.target.value)}
@@ -687,11 +650,29 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
         </div>
       ) : null}
       <div className={isPending ? "mt-2 flex gap-2" : "hidden"}>
-        {isConnectorRequest ? (
+        {isBrowserConnect ? (
           <>
             <Button
               size="sm"
-              disabled={connect.isPending || !isPending || !approval}
+              disabled={browserConnect.isPending || !isPending}
+              onClick={() => browserConnect.mutate()}
+            >
+              {signInStarted ? "I've signed in" : "Connect"}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
+            >
+              Cancel
+            </Button>
+          </>
+        ) : isConnectorRequest ? (
+          <>
+            <Button
+              size="sm"
+              disabled={connect.isPending || !isPending || !setup}
               onClick={() => {
                 setConnectError(null);
                 setConnectOpen(true);
@@ -702,8 +683,8 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="outline"
-              disabled={decide.isPending || !isPending}
-              onClick={() => decide.mutate({ op: "deny" })}
+              disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
             >
               Cancel
             </Button>
@@ -720,10 +701,10 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="outline"
-              disabled={decide.isPending || !isPending}
-              onClick={() => decide.mutate({ op: "deny" })}
+              disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
             >
-              Deny
+              Cancel
             </Button>
           </>
         ) : isMessagingAddBridge ? (
@@ -732,10 +713,10 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
               size="sm"
               disabled={bridgeSubmit.isPending || !isPending || !bridgeReady}
               onClick={() => {
-                // Synchronous ref flip BEFORE mutate() so a
-                // same-frame second click (before React commits the
-                // disabled={isPending} render) short-circuits here
-                // instead of minting a second bridge.
+                // Synchronous ref flip BEFORE mutate() so a same-frame
+                // second click (before React commits the disabled={isPending}
+                // render) short-circuits here instead of minting a second
+                // bridge.
                 if (bridgeSubmittingRef.current) return;
                 bridgeSubmittingRef.current = true;
                 setBridgeError(null);
@@ -747,8 +728,8 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="outline"
-              disabled={decide.isPending || !isPending}
-              onClick={() => decide.mutate({ op: "deny" })}
+              disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
             >
               Cancel
             </Button>
@@ -757,7 +738,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
           <>
             <Button
               size="sm"
-              disabled={pairingSubmit.isPending || !isPending || !approval}
+              disabled={pairingSubmit.isPending || !isPending || !setup}
               onClick={() => {
                 if (pairingSubmittingRef.current) return;
                 pairingSubmittingRef.current = true;
@@ -770,7 +751,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="outline"
-              disabled={pairingSubmit.isPending || !isPending || !approval}
+              disabled={pairingSubmit.isPending || !isPending || !setup}
               onClick={() => {
                 if (pairingSubmittingRef.current) return;
                 pairingSubmittingRef.current = true;
@@ -786,7 +767,7 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="destructive"
-              disabled={removeSubmit.isPending || !isPending || !approval}
+              disabled={removeSubmit.isPending || !isPending || !setup}
               onClick={() => {
                 if (removeSubmittingRef.current) return;
                 removeSubmittingRef.current = true;
@@ -799,31 +780,13 @@ export function BlockApprovalRequested({ block }: { block: ApprovalRequestedBloc
             <Button
               size="sm"
               variant="outline"
-              disabled={decide.isPending || !isPending}
-              onClick={() => decide.mutate({ op: "deny" })}
+              disabled={cancel.isPending || !isPending}
+              onClick={() => cancel.mutate()}
             >
               Cancel
             </Button>
           </>
-        ) : (
-          <>
-            <Button
-              size="sm"
-              disabled={decide.isPending || !isPending}
-              onClick={() => decide.mutate({ op: "approve" })}
-            >
-              Approve
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={decide.isPending || !isPending}
-              onClick={() => decide.mutate({ op: "deny" })}
-            >
-              Deny
-            </Button>
-          </>
-        )}
+        ) : null}
       </div>
       {connectOpen ? (
         <AddConnectorDialog

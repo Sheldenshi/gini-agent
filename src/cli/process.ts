@@ -631,7 +631,9 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),
     tasks: state.tasks.length,
-    pendingApprovals: state.approvals.filter((item) => item.status === "pending").length,
+    pendingApprovals:
+      state.authorizations.filter((item) => item.status === "pending").length +
+      state.setupRequests.filter((item) => item.status === "pending").length,
     memory,
     legacyMigration,
     embedding,

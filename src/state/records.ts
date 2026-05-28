@@ -1,5 +1,5 @@
 import type {
-  Approval,
+  Authorization,
   ChatMessageRecord,
   ChatSessionRecord,
   ConnectorRecord,
@@ -20,6 +20,7 @@ import type {
   RelayRecord,
   RunRecord,
   RuntimeState,
+  SetupRequest,
   SkillRecord,
   SnapshotRecord,
   SubagentRecord,
@@ -364,34 +365,85 @@ export function createChatMessage(
   return item;
 }
 
-export function createApproval(
+// Mint an Authorization (agent-actor gate). Resolves via
+// /api/authorizations/<id>/{approve,deny}; the runtime performs the
+// side-effecting action on approval. See
+// docs/adr/authorization-vs-setup-request.md.
+export function createAuthorization(
   state: RuntimeState,
-  approval: Omit<Approval, "id" | "instance" | "status" | "createdAt" | "updatedAt">
-): Approval {
+  authorization: Omit<Authorization, "id" | "instance" | "status" | "createdAt" | "updatedAt">
+): Authorization {
   const at = now();
   // Inherit agentId from the originating task when the caller didn't supply
-  // one. Approvals follow the task that requested them — that's the agent
-  // whose inbox the row should land in.
-  const taskAgentId = approval.taskId
-    ? state.tasks.find((task) => task.id === approval.taskId)?.agentId
+  // one. Authorizations follow the task that requested them — that's the
+  // agent whose inbox the row should land in.
+  const taskAgentId = authorization.taskId
+    ? state.tasks.find((task) => task.id === authorization.taskId)?.agentId
     : undefined;
-  const item: Approval = {
-    id: id("approval"),
+  const item: Authorization = {
+    id: id("authz"),
     instance: state.instance,
     status: "pending",
     createdAt: at,
     updatedAt: at,
-    ...approval,
-    agentId: approval.agentId ?? taskAgentId
+    ...authorization,
+    agentId: authorization.agentId ?? taskAgentId
   };
-  state.approvals.unshift(item);
+  state.authorizations.unshift(item);
   addAudit(
     state,
     {
       actor: "runtime",
-      action: "approval.requested",
+      action: "authorization.requested",
       target: item.target,
       risk: item.risk,
+      taskId: item.taskId,
+      approvalId: item.id,
+      evidence: { action: item.action, reason: item.reason }
+    },
+    item.taskId
+      ? { taskId: item.taskId, agentId: item.agentId }
+      : item.agentId
+        ? { agentId: item.agentId }
+        : { system: true }
+  );
+  return item;
+}
+
+// Mint a SetupRequest (user-actor gate). Resolves via
+// /api/setup-requests/<id>/{complete,cancel}. The side effect (e.g.
+// connectBrowser, createConnector, playwright.fill) executes inside the
+// /complete endpoint before the request is marked completed. See
+// docs/adr/authorization-vs-setup-request.md.
+export function createSetupRequest(
+  state: RuntimeState,
+  setupRequest: Omit<SetupRequest, "id" | "instance" | "status" | "createdAt" | "updatedAt">
+): SetupRequest {
+  const at = now();
+  const taskAgentId = setupRequest.taskId
+    ? state.tasks.find((task) => task.id === setupRequest.taskId)?.agentId
+    : undefined;
+  const item: SetupRequest = {
+    id: id("setup"),
+    instance: state.instance,
+    status: "pending",
+    createdAt: at,
+    updatedAt: at,
+    ...setupRequest,
+    agentId: setupRequest.agentId ?? taskAgentId
+  };
+  state.setupRequests.unshift(item);
+  // Per-action audit risk is preserved by the calling site (e.g. the
+  // browser-fill-secret dispatcher stamps `risk: "high"` on its credential
+  // audit row). The setup.requested envelope itself is informational and
+  // carries no risk classification.
+  addAudit(
+    state,
+    {
+      actor: "runtime",
+      action: "setup.requested",
+      target: item.target,
+      risk: "low",
       taskId: item.taskId,
       approvalId: item.id,
       evidence: { action: item.action, reason: item.reason }

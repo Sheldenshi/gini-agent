@@ -1,9 +1,10 @@
 "use client";
 
 import { useState } from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Boxes, ChevronsUpDown } from "lucide-react";
+import { ChevronsUpDown } from "lucide-react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -62,7 +63,7 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
         title="Home"
         aria-current={homeActive ? "page" : undefined}
         className={cn(
-          "flex shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground outline-none transition-shadow",
+          "flex shrink-0 items-center justify-center rounded-md outline-none transition-shadow",
           isMobile ? "h-6 w-6" : "h-7 w-7",
           "focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
           isMobile ? "focus-visible:ring-offset-background" : "focus-visible:ring-offset-sidebar",
@@ -73,7 +74,14 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
             : null
         )}
       >
-        <Boxes className={isMobile ? "h-3.5 w-3.5" : "h-4 w-4"} />
+        <Image
+          src="/gini-agent-logo.png"
+          alt="Gini"
+          width={isMobile ? 24 : 28}
+          height={isMobile ? 24 : 28}
+          priority
+          className={isMobile ? "h-6 w-6" : "h-7 w-7"}
+        />
       </Link>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>

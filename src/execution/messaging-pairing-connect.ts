@@ -17,8 +17,8 @@
 // the prompt. The chat-task resume is fired from this module via
 // the shared safeResume helper.
 
-import type { Approval, RuntimeConfig } from "../types";
-import { resolveApproval } from "../agent";
+import type { RuntimeConfig, SetupRequest } from "../types";
+import { resolveSetupRequest } from "../agent";
 import { allowChat, rejectPendingChat } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
 import { addAudit, mutateState } from "../state";
@@ -36,7 +36,7 @@ export interface MessagingPairingConnectResult {
 
 export async function runMessagingPairingConnect(
   config: RuntimeConfig,
-  approval: Approval,
+  approval: SetupRequest,
   body: {
     reject?: unknown;
   }
@@ -86,10 +86,9 @@ export async function runMessagingPairingConnect(
 
   // Atomic check-and-flip BEFORE either side effect — mirrors the
   // browser.fill_secret / messaging.add_bridge ordering.
-  let resolved: Approval;
+  let resolved: SetupRequest;
   try {
-    const result = await resolveApproval(config, approval.id, { actor: "user", resumeChatTask: false });
-    resolved = result.approval;
+    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -97,7 +96,7 @@ export async function runMessagingPairingConnect(
       body: { ok: false, message: `Could not lock approval for pairing resolution: ${message}` }
     };
   }
-  if (resolved.status !== "approved") {
+  if (resolved.status !== "completed") {
     return {
       status: 410,
       body: {

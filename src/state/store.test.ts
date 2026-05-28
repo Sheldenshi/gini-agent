@@ -429,3 +429,94 @@ describe("dropDeadMemoryImprovements", () => {
     expect(audit?.evidence?.title).toBe("remember preferences");
   });
 });
+
+describe("normalizeState approval -> authorization/setup-request migration", () => {
+  test("partitions a legacy approvals array by action", () => {
+    const at = new Date().toISOString();
+    const state = createEmptyState("test-approval-split");
+    // Simulate a pre-split state file: drop the new arrays, install a
+    // mixed `approvals` array.
+    const legacy = [
+      {
+        id: "approval_1",
+        instance: "test-approval-split",
+        status: "pending",
+        createdAt: at,
+        updatedAt: at,
+        action: "file.write",
+        target: "/tmp/x",
+        risk: "medium",
+        reason: "write a file",
+        payload: { path: "/tmp/x" }
+      },
+      {
+        id: "approval_2",
+        instance: "test-approval-split",
+        status: "approved",
+        createdAt: at,
+        updatedAt: at,
+        action: "browser.connect",
+        target: "https://example.com",
+        risk: "low",
+        reason: "sign in",
+        payload: {}
+      },
+      {
+        id: "approval_3",
+        instance: "test-approval-split",
+        status: "denied",
+        createdAt: at,
+        updatedAt: at,
+        action: "connector.request",
+        target: "openai",
+        risk: "medium",
+        reason: "enter creds",
+        payload: { provider: "openai" }
+      },
+      {
+        id: "approval_4",
+        instance: "test-approval-split",
+        status: "pending",
+        createdAt: at,
+        updatedAt: at,
+        action: "browser.fill_secret",
+        target: "https://login.example.com",
+        risk: "high",
+        reason: "type password",
+        payload: { slots: [] }
+      }
+    ];
+    const legacyState = state as RuntimeState & { approvals?: unknown };
+    legacyState.approvals = legacy as unknown;
+    // Force the new arrays empty so the migration path runs.
+    (legacyState as { authorizations?: unknown }).authorizations = undefined;
+    (legacyState as { setupRequests?: unknown }).setupRequests = undefined;
+
+    const normalized = normalizeState("test-approval-split", state);
+
+    expect((normalized as unknown as { approvals?: unknown }).approvals).toBeUndefined();
+    expect(normalized.authorizations).toHaveLength(1);
+    expect(normalized.authorizations[0]!.id).toBe("approval_1");
+    expect(normalized.authorizations[0]!.action).toBe("file.write");
+
+    expect(normalized.setupRequests).toHaveLength(3);
+    const byId = new Map(normalized.setupRequests.map((row) => [row.id, row]));
+    expect(byId.get("approval_2")!.action).toBe("browser.connect");
+    expect(byId.get("approval_2")!.status).toBe("completed");
+    expect(byId.get("approval_3")!.action).toBe("connector.request");
+    expect(byId.get("approval_3")!.status).toBe("cancelled");
+    expect(byId.get("approval_4")!.action).toBe("browser.fill_secret");
+    expect(byId.get("approval_4")!.status).toBe("pending");
+    // Risk is structurally absent from SetupRequest.
+    expect((byId.get("approval_4") as { risk?: unknown }).risk).toBeUndefined();
+  });
+
+  test("is a no-op when the legacy field is absent", () => {
+    const state = createEmptyState("test-approval-noop");
+    expect((state as RuntimeState & { approvals?: unknown }).approvals).toBeUndefined();
+    const normalized = normalizeState("test-approval-noop", state);
+    expect(normalized.authorizations).toEqual([]);
+    expect(normalized.setupRequests).toEqual([]);
+    expect((normalized as unknown as { approvals?: unknown }).approvals).toBeUndefined();
+  });
+});

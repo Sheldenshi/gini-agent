@@ -211,7 +211,7 @@ describe("request_connector dispatch", () => {
     }
     // No approval should have been created.
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("creates a pending connector.request approval when no connector exists", async () => {
@@ -228,7 +228,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("linear");
@@ -266,7 +266,7 @@ describe("request_connector dispatch", () => {
     }
     // The gate must short-circuit BEFORE any approval row is created.
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("setupSkill provider: proceeds when task history contains a read_skill for the setup skill", async () => {
@@ -317,7 +317,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("google-oauth-desktop");
@@ -369,7 +369,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("google-oauth-desktop");
@@ -400,7 +400,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("messaging.add_bridge");
       expect(approval!.target).toBe("telegram");
@@ -541,7 +541,7 @@ describe("request_connector dispatch", () => {
     expect(happy.kind).toBe("pending");
     if (happy.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === happy.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === happy.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("messaging.approve_pairing");
       expect(approval!.payload.chatId).toBe(99);
@@ -578,7 +578,7 @@ describe("request_connector dispatch", () => {
       expect(parsed.error).toContain("web chat session");
     }
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === task.id).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
   });
 
   test("request_messaging_pairing: refuses a code-less pending row (group chat) up-front", async () => {
@@ -628,7 +628,7 @@ describe("request_connector dispatch", () => {
     // Critically: no approval row was minted.
     const state = readState(instance);
     expect(
-      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+      state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
   });
 
@@ -793,7 +793,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("messaging.approve_pairing");
       expect(approval!.payload.chatId).toBe(77);
@@ -851,7 +851,7 @@ describe("request_connector dispatch", () => {
     // No approval was minted for the expired row.
     const state = readState(instance);
     expect(
-      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+      state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
   }, 30000);
 
@@ -908,7 +908,7 @@ describe("request_connector dispatch", () => {
     // request_messaging_pairing path fired.
     const state = readState(instance);
     expect(
-      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+      state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
   }, 15000);
 
@@ -972,7 +972,7 @@ describe("request_connector dispatch", () => {
     // already-enrolled chat.
     const state = readState(instance);
     expect(
-      state.approvals.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
+      state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
   }, 10000);
 
@@ -1033,8 +1033,11 @@ describe("request_connector dispatch", () => {
       (b) => b.kind === "system_note" && b.text.includes("Open Telegram and start a chat")
     );
     expect(guidanceNote).toBeDefined();
-    expect(guidanceNote!.kind === "system_note" && guidanceNote.text).toContain("tg-guidance");
-    expect(guidanceNote!.kind === "system_note" && guidanceNote.text).toContain("/start");
+    expect(guidanceNote?.kind).toBe("system_note");
+    if (guidanceNote?.kind === "system_note") {
+      expect(guidanceNote.text).toContain("tg-guidance");
+      expect(guidanceNote.text).toContain("/start");
+    }
   });
 
   test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {
@@ -1059,7 +1062,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("messaging.remove_bridge");
       expect(approval!.payload.bridgeName).toBe("doomed");
@@ -1124,7 +1127,7 @@ describe("request_connector dispatch", () => {
     }
     // No approval rows minted on either refused path.
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("request_remove_messaging_bridge: refuses unknown bridge synchronously", async () => {
@@ -1145,7 +1148,7 @@ describe("request_connector dispatch", () => {
       expect(parsed.error).toContain("not found");
     }
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("request_messaging_bridge: rejects unknown kind synchronously", async () => {
@@ -1172,7 +1175,7 @@ describe("request_connector dispatch", () => {
     }
     // No approval row should have been minted on the failure path.
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("request_messaging_bridge: rejects kind=discord with a points-to-settings error", async () => {
@@ -1201,7 +1204,7 @@ describe("request_connector dispatch", () => {
       expect(parsed.error).toContain("settings page");
     }
     const state = readState(instance);
-    expect(state.approvals.filter((a) => a.taskId === taskId).length).toBe(0);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
   });
 
   test("non-setupSkill provider: gate does not apply regardless of read_skill history", async () => {
@@ -1223,7 +1226,7 @@ describe("request_connector dispatch", () => {
     expect(result.kind).toBe("pending");
     if (result.kind === "pending") {
       const state = readState(instance);
-      const approval = state.approvals.find((a) => a.id === result.approvalId);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
       expect(approval).toBeDefined();
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("linear");

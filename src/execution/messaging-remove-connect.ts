@@ -4,8 +4,8 @@
 // cannot land a removal after the operator has clicked Cancel,
 // then safeResume back into the chat-task loop.
 
-import type { Approval, RuntimeConfig } from "../types";
-import { resolveApproval } from "../agent";
+import type { RuntimeConfig, SetupRequest } from "../types";
+import { resolveSetupRequest } from "../agent";
 import { removeMessagingBridge } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
 import { addAudit, mutateState } from "../state";
@@ -23,7 +23,7 @@ export interface MessagingRemoveConnectResult {
 
 export async function runMessagingRemoveConnect(
   config: RuntimeConfig,
-  approval: Approval
+  approval: SetupRequest
 ): Promise<MessagingRemoveConnectResult> {
   const bridgeId = typeof approval.payload.bridgeId === "string"
     ? approval.payload.bridgeId
@@ -39,10 +39,9 @@ export async function runMessagingRemoveConnect(
   }
 
   // Atomic check-and-flip BEFORE the destructive call.
-  let resolved: Approval;
+  let resolved: SetupRequest;
   try {
-    const result = await resolveApproval(config, approval.id, { actor: "user", resumeChatTask: false });
-    resolved = result.approval;
+    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -50,7 +49,7 @@ export async function runMessagingRemoveConnect(
       body: { ok: false, message: `Could not lock approval for bridge removal: ${message}` }
     };
   }
-  if (resolved.status !== "approved") {
+  if (resolved.status !== "completed") {
     return {
       status: 410,
       body: {

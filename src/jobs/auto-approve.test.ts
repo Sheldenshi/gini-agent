@@ -168,7 +168,7 @@ describe("per-job auto-approve envelope", () => {
     expect(task?.status).toBe("completed");
 
     // No approval row was created — allowlist bypasses approval entirely.
-    const approvals = stateAfter.approvals.filter((a) => a.taskId === taskId);
+    const approvals = stateAfter.authorizations.filter((a) => a.taskId === taskId);
     expect(approvals).toHaveLength(0);
 
     // But the side-effect audit row records why the human gate was skipped,
@@ -237,14 +237,14 @@ describe("per-job auto-approve envelope", () => {
     expect(task?.status).toBe("completed");
 
     // The approval row was written AND marked approved by the runtime.
-    const approvals = stateAfter.approvals.filter((a) => a.taskId === taskId);
+    const approvals = stateAfter.authorizations.filter((a) => a.taskId === taskId);
     expect(approvals).toHaveLength(1);
     expect(approvals[0]?.status).toBe("approved");
     expect(approvals[0]?.action).toBe("file.write");
 
-    // approval.approved audit row carries the auto-approve marker — actor
+    // authorization.approved audit row carries the auto-approve marker — actor
     // is "runtime" because the bypass auto-resolved instead of a human.
-    const approveAudits = stateAfter.audit.filter((a) => a.action === "approval.approved" && a.taskId === taskId);
+    const approveAudits = stateAfter.audit.filter((a) => a.action === "authorization.approved" && a.taskId === taskId);
     expect(approveAudits).toHaveLength(1);
     expect(approveAudits[0]?.actor).toBe("runtime");
     // Legacy `dangerouslyAutoApprove: true` aliases to approval-mode-yolo

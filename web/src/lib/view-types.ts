@@ -9,7 +9,8 @@ import type {
   ChatSessionRecord,
   ChatMessageRecord,
   Task,
-  Approval,
+  Authorization,
+  SetupRequest,
   AuditEvent,
   SkillRecord,
   JobRecord,
@@ -21,7 +22,14 @@ import type {
 } from "@runtime/types";
 
 // UI-friendly aliases for chat records.
-export type ChatSession = ChatSessionRecord;
+//
+// The /api/chat list endpoint enriches each ChatSessionRecord with derived
+// fields the sidebar needs (e.g. `pendingApprovalCount` drives the
+// "awaiting approval" indicator on the row). The underlying record stays
+// disk-clean; enrichment is wire-only.
+export interface ChatSession extends ChatSessionRecord {
+  pendingApprovalCount?: number;
+}
 export type ChatMessage = ChatMessageRecord;
 
 // Trimmed agent shape returned by `GET /api/agents`. The runtime
@@ -39,7 +47,8 @@ export interface AgentRow {
 export interface RuntimeStateSnapshot {
   instance: string;
   tasks: Task[];
-  approvals: Approval[];
+  authorizations: Authorization[];
+  setupRequests: SetupRequest[];
   audit: AuditEvent[];
   skills: SkillRecord[];
   jobs: JobRecord[];

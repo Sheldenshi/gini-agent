@@ -1,16 +1,26 @@
 import { writeFileSync } from "node:fs";
-import type { ApprovalMode, RuntimeConfig } from "./types";
-import { cancelTask, decideApproval, resolveApproval, retryTask, submitTask } from "./agent";
+import type { ApprovalMode, ChatBlock, RuntimeConfig } from "./types";
+import { cancelTask, decideApproval, resolveSetupRequest, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import {
   addAudit,
+  addSseSubscription,
   appendTrace,
+  getDevice,
   listChatBlocks,
   listChatBlocksAfter,
+  markRead,
   mutateState,
   readState,
   readTrace,
-  subscribeChatBlocks
+  readUpload,
+  removeDeviceForCredential,
+  storeUpload,
+  subscribeChatBlocks,
+  subscribeChatSession,
+  unreadCountForDevice,
+  uploadStat,
+  upsertDevice
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
@@ -27,7 +37,7 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
-import { authorizedBearer, claimPairing, createPairing, revokePairedDevice } from "./governance/pairing";
+import { authorizedBearer, claimPairing, createPairing, resolveCredentialFromBearer, revokePairedDevice } from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
 import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
@@ -36,7 +46,7 @@ import { cancelSubagent, listSubagents, spawnSubagent } from "./capabilities/sub
 import { addMcpServer, checkMcpServer, invokeMcpTool, removeMcpServer } from "./integrations/mcp";
 import { addMessagingBridge, allowChat, checkMessagingBridge, denyChat, disableMessagingBridge, listAllowedChats, listMessagingMessages, receiveMessagingInput, rejectPendingChat, removeMessagingBridge, sendMessagingOutput } from "./integrations/messaging";
 import { inspectImportSource } from "./integrations/importers";
-import { providerCatalog } from "./provider";
+import { providerCatalogWithStatus } from "./provider";
 import { createAgent, deleteAgent, listAgents, useAgent } from "./capabilities/agents";
 import {
   approveSoul,
@@ -56,10 +66,10 @@ import {
 } from "./runtime/identity-files";
 import { SOUL_SOFT_CAP_CHARS, USER_SOFT_CAP_CHARS, identityBudgetState } from "./system-prompt";
 import { resolveEffectiveContext } from "./execution/effective-context";
-import { connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
+import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
-import { getSetupStatus, setSetupProvider } from "./runtime/setup-api";
+import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
@@ -68,6 +78,43 @@ import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersion
 import { projectRoot } from "./paths";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
+
+// Per-action audit row for connector.request completion. createConnector
+// and checkConnector emit their own connector.create / connector.health
+// rows, but neither carries the originating setup id — the audit trail
+// would otherwise lose the link between the agent's request and the
+// user's resolution. Low risk: the user is the actor and they've already
+// inspected the provider before submitting credentials.
+async function emitConnectorRequestAudit(
+  config: RuntimeConfig,
+  setup: { id: string; target: string; taskId?: string; agentId?: string; payload: Record<string, unknown> },
+  connectorId: string
+): Promise<void> {
+  await mutateState(config.instance, (state) => {
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "connector.request",
+        target: setup.target,
+        risk: "low",
+        taskId: setup.taskId,
+        runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
+        approvalId: setup.id,
+        evidence: {
+          provider: String(setup.payload.provider ?? ""),
+          providerLabel: typeof setup.payload.providerLabel === "string" ? setup.payload.providerLabel : null,
+          connectorId
+        }
+      },
+      setup.taskId
+        ? { taskId: setup.taskId }
+        : setup.agentId
+          ? { agentId: setup.agentId }
+          : { system: true }
+    );
+  });
+}
 
 export function createHandler(config: RuntimeConfig): (request: Request) => Response | Promise<Response> {
   const routes: Array<[string, RegExp, Handler]> = [
@@ -149,6 +196,51 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
+    // Image upload. Accepts multipart/form-data with a `file` part. The bytes
+    // are stored on disk under ~/.gini/instances/<instance>/uploads/<id>.<ext>
+    // and the response carries the upload ref the client attaches to the
+    // next chat message via /messages { content, images: [{ id, ... }] }.
+    ["POST", /^\/api\/uploads$/, async (request) => {
+      const contentType = request.headers.get("content-type") ?? "";
+      if (!contentType.toLowerCase().includes("multipart/form-data")) {
+        return json({ error: "Expected multipart/form-data with a 'file' part" }, 400);
+      }
+      const form = await request.formData();
+      const file = form.get("file");
+      if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
+      const filename = file instanceof File ? file.name : undefined;
+      const mimeType = file.type || "application/octet-stream";
+      if (!mimeType.startsWith("image/")) {
+        return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
+      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const stored = storeUpload(config.instance, bytes, mimeType, filename);
+      return json(stored, 201);
+    }],
+    ["HEAD", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
+      const meta = uploadStat(config.instance, params[0]);
+      if (!meta) return new Response(null, { status: 404 });
+      return new Response(null, {
+        status: 200,
+        headers: { "content-type": meta.mimeType, "content-length": String(meta.size) }
+      });
+    }],
+    ["GET", /^\/api\/uploads\/([^/]+)$/, (_request, params) => {
+      const upload = readUpload(config.instance, params[0]);
+      if (!upload) return json({ error: "Upload not found" }, 404);
+      const buffer = upload.bytes.buffer.slice(
+        upload.bytes.byteOffset,
+        upload.bytes.byteOffset + upload.bytes.byteLength
+      ) as ArrayBuffer;
+      return new Response(buffer, {
+        status: 200,
+        headers: {
+          "content-type": upload.mimeType,
+          "content-length": String(upload.bytes.length),
+          "cache-control": "private, max-age=31536000, immutable"
+        }
+      });
+    }],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
     // /blocks endpoint returns the full ordered list for initial render;
@@ -163,7 +255,25 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return json(listChatBlocks(config.instance, sessionId));
     }],
-    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, (request, params) => chatBlockStream(config, request, params[0])],
+    ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {
+      // Resolve the credential before opening the SSE stream so the
+      // optional X-Device-Token header can be validated. The
+      // `authorized` gate above already accepted the bearer, so a
+      // null here means the bearer is valid for `authorizedBearer`
+      // but not for credential resolution — treat as unauthenticated
+      // rather than falling through anonymously.
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      // X-Device-Token is optional — mobile clients send it after
+      // they've registered their APNs token via POST /push/devices, so
+      // the dispatcher can per-device suppress completion silent pushes
+      // while they're watching. Web/CLI clients don't send it (they
+      // have no APNs token); they simply aren't tracked in the
+      // suppression registry, which is correct — no push is ever sent
+      // to them anyway.
+      const deviceToken = deviceTokenFromRequest(config, request, credential);
+      return chatBlockStream(config, request, params[0], deviceToken);
+    }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
     ["GET", /^\/api\/tasks$/, (request) => {
@@ -181,241 +291,171 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     }],
     ["POST", /^\/api\/tasks\/([^/]+)\/retry$/, async (_request, params) => json(await retryTask(config, params[0]))],
     ["POST", /^\/api\/tasks\/([^/]+)\/cancel$/, async (_request, params) => json(await cancelTask(config, params[0]))],
-    ["GET", /^\/api\/approvals$/, (request) => {
+    // -------------------------------------------------------------------
+    // Authorization endpoints (agent-actor): the user approves or denies;
+    // the runtime then performs the side-effecting action. See
+    // docs/adr/authorization-vs-setup-request.md.
+    ["GET", /^\/api\/authorizations$/, (request) => {
       const agentId = agentIdFilter(request);
-      const approvals = readState(config.instance).approvals;
-      return json(agentId ? approvals.filter((a) => a.agentId === agentId) : approvals);
+      const rows = readState(config.instance).authorizations;
+      return json(agentId ? rows.filter((a) => a.agentId === agentId) : rows);
     }],
-    ["POST", /^\/api\/approvals\/([^/]+)\/approve$/, async (_request, params) => {
-      // browser.fill_secret cannot be resolved through the generic
-      // /approve path: the side-effecting fill happens inside /connect's
-      // request handler from the per-slot `secrets` body, so /approve
-      // would resolve the approval with status=approved while no DOM
-      // fill ever ran — the agent would then be told "fields filled"
-      // (synthesized in agent.ts:runApprovedAction) over an empty form.
-      // Refuse early so the only resolution path for fill_secret is
-      // /connect with values.
-      const approvalId = params[0];
-      const approval = readState(config.instance).approvals.find((a) => a.id === approvalId);
-      if (approval?.action === "browser.fill_secret") {
-        return json({
-          error: "browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve."
-        }, 400);
-      }
-      if (approval?.action === "messaging.add_bridge") {
-        // Same rationale as browser.fill_secret: the side effect
-        // (addMessagingBridge) needs the name + bot-token values that
-        // only /connect carries. /approve would resolve the approval
-        // with no bridge created and the agent would be told
-        // "bridge added" over nothing.
-        return json({
-          error: "messaging.add_bridge approvals must be resolved via /connect with the bridge name + bot token, not /approve."
-        }, 400);
-      }
-      if (approval?.action === "messaging.approve_pairing") {
-        // /connect carries the optional `reject: true` flag that
-        // distinguishes Approve vs Reject; /approve has no way to
-        // express that. Both outcomes also rely on payload context
-        // (verificationCode) the connect handler reads.
-        return json({
-          error: "messaging.approve_pairing approvals must be resolved via /connect (with optional reject:true), not /approve."
-        }, 400);
-      }
-      if (approval?.action === "messaging.remove_bridge") {
-        // Symmetry with the other messaging.* card actions — the
-        // /connect handler owns the destructive call so the resolve
-        // and side effect stay in one atomic seam.
-        return json({
-          error: "messaging.remove_bridge approvals must be resolved via /connect, not /approve."
-        }, 400);
-      }
-      return json(await decideApproval(config, approvalId, "approve"));
+    ["POST", /^\/api\/authorizations\/([^/]+)\/approve$/, async (_request, params) =>
+      json(await decideApproval(config, params[0], "approve"))],
+    ["POST", /^\/api\/authorizations\/([^/]+)\/deny$/, async (_request, params) =>
+      json(await decideApproval(config, params[0], "deny"))],
+
+    // -------------------------------------------------------------------
+    // SetupRequest endpoints (user-actor): the user performs a setup step
+    // and signals completion. The /complete handler owns the per-action
+    // side effect (createConnector + checkConnector for connector.request;
+    // playwright.fill for browser.fill_secret; addMessagingBridge /
+    // allowChat / removeMessagingBridge for the messaging.* actions;
+    // nothing extra for browser.connect — its side effect ran inside
+    // /open-browser). The messaging.* and browser.fill_secret branches
+    // delegate to bounded runtime modules in src/execution/* that own the
+    // atomic resolve-then-side-effect-then-resume sequence; the connector
+    // and browser.connect branches resolve inline.
+    ["GET", /^\/api\/setup-requests$/, (request) => {
+      const agentId = agentIdFilter(request);
+      const rows = readState(config.instance).setupRequests;
+      return json(agentId ? rows.filter((s) => s.agentId === agentId) : rows);
     }],
-    ["POST", /^\/api\/approvals\/([^/]+)\/deny$/, async (_request, params) => json(await decideApproval(config, params[0], "deny"))],
-    // Connect endpoint: the shared five-action seam for any
-    // approval whose card asks the user to type a value (or
-    // confirm a side effect with structured payload context). The
-    // chat UI's Submit/Connect/Add/Approve/Remove button POSTs
-    // here with the user-entered secrets or confirmation body. The
-    // endpoint:
-    //   1. Validates the approval exists, is pending, and carries
-    //      one of the five /connect-eligible actions:
-    //        - `connector.request` (request_connector tool)
-    //        - `browser.fill_secret` (browser_fill_secrets tool)
-    //        - `messaging.add_bridge` (request_messaging_bridge tool)
-    //        - `messaging.approve_pairing` (request_messaging_pairing tool)
-    //        - `messaging.remove_bridge` (request_remove_messaging_bridge tool)
-    //   2. Dispatches per action:
-    //        - connector.request: createConnector + checkConnector
-    //          inline below; on probe failure returns ok:false so the
-    //          dialog can keep itself open and let the user retry.
-    //        - browser.fill_secret: delegates to runFillSecretConnect
-    //          (src/execution/browser-fill-secrets.ts).
-    //        - messaging.add_bridge: delegates to
-    //          runMessagingBridgeConnect (src/execution/messaging-bridge-connect.ts).
-    //        - messaging.approve_pairing: delegates to
-    //          runMessagingPairingConnect (src/execution/messaging-pairing-connect.ts);
-    //          body's `reject:true` flips Approve vs Reject.
-    //        - messaging.remove_bridge: delegates to
-    //          runMessagingRemoveConnect (src/execution/messaging-remove-connect.ts).
-    //   3. The four bounded modules return a {status, body} envelope
-    //      that this handler forwards verbatim. All follow the
-    //      atomic-resolve-then-side-effect pattern: resolveApproval
-    //      runs first so a concurrent /deny can't leave an orphan
-    //      side effect; the bounded module then runs the create /
-    //      enroll / reject / remove and fires resumeChatTask itself
-    //      via safeResume (shared trace + failTask recovery).
-    ["POST", /^\/api\/approvals\/([^/]+)\/connect$/, async (request, params) => {
-      const approvalId = params[0];
+    ["POST", /^\/api\/setup-requests\/([^/]+)\/complete$/, async (request, params) => {
+      const setupId = params[0];
       const state = readState(config.instance);
-      const approval = state.approvals.find((a) => a.id === approvalId);
-      if (!approval) return json({ error: "Approval not found" }, 404);
-      // The /connect endpoint is the shared substrate for any approval
-      // whose user-facing card asks the user to type a value (or set
-      // of named values). connector.request persists them to an
-      // encrypted connector record; browser.fill_secret pipes them
-      // through to playwright.fill on the agent's active page and
-      // discards them when the request returns.
-      if (
-        approval.action !== "connector.request"
-        && approval.action !== "browser.fill_secret"
-        && approval.action !== "messaging.add_bridge"
-        && approval.action !== "messaging.approve_pairing"
-        && approval.action !== "messaging.remove_bridge"
-      ) {
-        return json({ error: `Approval ${approvalId} does not take a /connect submission (${approval.action})` }, 400);
-      }
-      if (approval.status !== "pending") {
-        return json({ error: `Approval is already ${approval.status}` }, 410);
-      }
+      const setup = state.setupRequests.find((s) => s.id === setupId);
+      if (!setup) return json({ error: "Setup request not found" }, 404);
+      if (setup.status !== "pending") return json({ error: `Setup request is already ${setup.status}` }, 410);
       const payload = await body(request);
       const secrets = payload.secrets && typeof payload.secrets === "object" && !Array.isArray(payload.secrets)
         ? payload.secrets as Record<string, string>
         : {};
 
-      if (approval.action === "messaging.add_bridge") {
+      if (setup.action === "messaging.add_bridge") {
         // Thin delegate to the bounded module — mirrors the
         // browser.fill_secret branch's two-line shape. The lifecycle
         // (kind parsing, pre-resolve field + token-format validation,
-        // atomic resolve, addMessagingBridge, resumeChatTask with
+        // atomic resolve, addMessagingBridge, chat resume with
         // failTask recovery) lives in src/execution/messaging-bridge-connect.ts
         // so it can be unit-tested in isolation and so http.ts stays
         // a routing layer per the AGENTS.md boundary rule.
-        const result = await runMessagingBridgeConnect(config, approval, secrets, payload.deliveryTargets);
+        const result = await runMessagingBridgeConnect(config, setup, secrets, payload.deliveryTargets);
         return json(result.body, result.status);
       }
 
-      if (approval.action === "messaging.approve_pairing") {
+      if (setup.action === "messaging.approve_pairing") {
         // Approve / Reject for an inbound Telegram pairing request.
         // Delegate forwards `payload.reject` so a single endpoint
         // covers both outcomes; allowChat / rejectPendingChat live
         // inside the bounded module along with the atomic
-        // resolveApproval + safeResume wrapping.
-        const result = await runMessagingPairingConnect(config, approval, { reject: payload.reject });
+        // resolveSetupRequest + safeResume wrapping.
+        const result = await runMessagingPairingConnect(config, setup, { reject: payload.reject });
         return json(result.body, result.status);
       }
 
-      if (approval.action === "messaging.remove_bridge") {
+      if (setup.action === "messaging.remove_bridge") {
         // Destructive bridge teardown from chat. Same shape as
-        // add_bridge — atomic resolveApproval BEFORE
+        // add_bridge — atomic resolveSetupRequest BEFORE
         // removeMessagingBridge, then safeResume back into the
         // chat-task loop with the outcome.
-        const result = await runMessagingRemoveConnect(config, approval);
+        const result = await runMessagingRemoveConnect(config, setup);
         return json(result.body, result.status);
       }
 
-      if (approval.action === "browser.fill_secret") {
+      if (setup.action === "browser.fill_secret") {
         // The fill_secret flow is bounded inside
         // src/execution/browser-fill-secrets.ts. The handler here is
         // a thin routing seam: parse the body's `secrets` field,
         // delegate to the module, return its {status, body} envelope
         // as the HTTP response. All of the runtime concerns — slot
-        // validation, structural approved-URL check, atomic approval
+        // validation, structural approved-URL check, atomic setup-request
         // resolution, per-slot fill with per-slot origin /
         // task-status re-checks, redacted audit row, chat-task
         // resume — live in the bounded module so they can be
         // unit-tested in isolation.
-        const result = await runFillSecretConnect(config, approval, secrets);
+        const result = await runFillSecretConnect(config, setup, secrets);
         return json(result.body, result.status);
       }
 
-      // connector.request path (unchanged).
-      const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
-      const providerId = String(approval.payload.provider ?? "");
-      const providerLabel = typeof approval.payload.providerLabel === "string"
-        ? approval.payload.providerLabel
-        : providerId;
-      const overrideName = typeof payload.name === "string" && payload.name.trim().length > 0
-        ? payload.name.trim()
-        : providerLabel;
-      const connector = await createConnector(config, {
-        name: overrideName,
-        provider: providerId,
-        scopes,
-        secrets
-      });
-      const probed = await checkConnector(config, connector.id);
-      if (probed.health !== "healthy") {
-        return json({
-          ok: false,
-          connector: probed,
-          message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
+      if (setup.action === "connector.request") {
+        const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
+        const providerId = String(setup.payload.provider ?? "");
+        const providerLabel = typeof setup.payload.providerLabel === "string"
+          ? setup.payload.providerLabel
+          : providerId;
+        const overrideName = typeof payload.name === "string" && payload.name.trim().length > 0
+          ? payload.name.trim()
+          : providerLabel;
+        const connector = await createConnector(config, {
+          name: overrideName,
+          provider: providerId,
+          scopes,
+          secrets
         });
+        const probed = await checkConnector(config, connector.id);
+        if (probed.health !== "healthy") {
+          return json({
+            ok: false,
+            connector: probed,
+            message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
+          });
+        }
+        await emitConnectorRequestAudit(config, setup, connector.id);
+        await resolveSetupRequest(config, setupId, "complete", {
+          actor: "user",
+          toolResult: `Connected to ${providerLabel}. Proceed with the original request.`
+        });
+        return json({ ok: true, connector: probed });
       }
-      await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
-      return json({ ok: true, connector: probed });
+
+      if (setup.action === "browser.connect") {
+        const { ok, result } = await completeBrowserConnectSetup(config, setup);
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result });
+        return json({ ok });
+      }
+
+      return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
     }],
+    ["POST", /^\/api\/setup-requests\/([^/]+)\/cancel$/, async (_request, params) =>
+      json(await resolveSetupRequest(config, params[0], "cancel", { actor: "user" }))],
     // Stage 1 of the browser.connect two-stage flow. The chat UI's
-    // "Connect" button POSTs here on a `browser.connect` approval. We:
-    //   1. Validate the approval is `browser.connect` and pending.
-    //   2. Launch the per-instance managed Chrome (visible) via the
-    //      same connectBrowser capability the legacy single-stage path
-    //      uses. Idempotent — re-clicking Connect is a no-op.
-    //   3. If the approval payload carries a `url` (the page the agent
-    //      was trying to reach), navigate the visible window there so
+    // "Connect" button POSTs here on a browser.connect SetupRequest:
+    //   1. Validate the setup-request is browser.connect and pending.
+    //   2. Launch the per-instance managed Chrome (visible) via the same
+    //      connectBrowser capability. Idempotent — re-clicking is a no-op.
+    //   3. If the payload carries a url, navigate the visible window so
     //      the user lands directly on the sign-in form.
-    //   4. Mark the approval payload `signInStarted: true` while keeping
-    //      it pending. The UI re-renders with "I've signed in" / "Cancel"
-    //      buttons. Clicking "I've signed in" hits the regular /approve
-    //      endpoint, and executeApprovedAction's browser.connect branch
-    //      reads signInStarted to switch the browser to headless instead
-    //      of re-launching.
-    ["POST", /^\/api\/approvals\/([^/]+)\/open-browser$/, async (_request, params) => {
-      const approvalId = params[0];
+    //   4. Mark payload.signInStarted = true while keeping the row
+    //      pending. The UI re-renders with "I've signed in" / "Cancel"
+    //      buttons; "I've signed in" POSTs to /complete which switches
+    //      the browser to headless and resumes.
+    ["POST", /^\/api\/setup-requests\/([^/]+)\/open-browser$/, async (_request, params) => {
+      const setupId = params[0];
       const before = readState(config.instance);
-      const approval = before.approvals.find((a) => a.id === approvalId);
-      if (!approval) return json({ error: "Approval not found" }, 404);
-      if (approval.action !== "browser.connect") {
-        return json({ error: `Approval ${approvalId} is not a browser.connect (${approval.action})` }, 400);
+      const setup = before.setupRequests.find((s) => s.id === setupId);
+      if (!setup) return json({ error: "Setup request not found" }, 404);
+      if (setup.action !== "browser.connect") {
+        return json({ error: `Setup request ${setupId} is not a browser.connect (${setup.action})` }, 400);
       }
-      if (approval.status !== "pending") {
-        return json({ error: `Approval is already ${approval.status}` }, 410);
+      if (setup.status !== "pending") {
+        return json({ error: `Setup request is already ${setup.status}` }, 410);
       }
-      const targetUrl = typeof approval.payload.url === "string" ? approval.payload.url : "";
+      const targetUrl = typeof setup.payload.url === "string" ? setup.payload.url : "";
       if (targetUrl) {
-        // Block SSRF / loopback / file:// before launching. Same guard
-        // browserNavigate would apply on its first call; we surface it
-        // earlier so the visible window doesn't open at all when the
-        // target is unsafe.
         const blocked = safetyCheck(targetUrl);
         if (blocked) return json({ error: blocked }, 400);
       }
-      // Launch visible managed Chrome. skipAudit is false here so the
-      // capability writes its own browser.connect audit row; the second
-      // stage (executeApprovedAction on /approve) writes a richer row
-      // carrying the approval reason.
-      const status = await connectBrowser(config, { mode: "managed" });
+      // skipAudit so the capability does not write a reasonless row;
+      // we write a setup-aware row below that carries the originating
+      // setup id and reason.
+      const status = await connectBrowser(config, { mode: "managed" }, { skipAudit: true });
       if (!status.connected) {
         return json({ ok: false, error: "Browser failed to launch." }, 500);
       }
-      // Navigate the visible Chrome to the target page so the user lands
-      // on the sign-in form. browserNavigate uses the per-task session
-      // which reuses the persistent context's first page (the about:blank
-      // tab Chromium opened at launch). Failure to navigate is non-fatal
-      // — the window is still up; the user can navigate manually.
       let openedUrl: string | undefined;
       let navigateError: string | undefined;
-      if (targetUrl && approval.taskId) {
+      if (targetUrl && setup.taskId) {
         try {
           // browserNavigate returns a JSON envelope rather than
           // throwing on a soft failure (safetyCheck refusal of a
@@ -424,8 +464,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           // unconditionally — so a refused navigation falsely
           // reported "user landed on the page." Parse the envelope
           // and treat success:false as an error path so the
-          // approval row records the navigateError truthfully.
-          const navResult = await browserNavigate(approval.taskId, { url: targetUrl });
+          // setup-request row records the navigateError truthfully.
+          const navResult = await browserNavigate(setup.taskId, { url: targetUrl });
           let parsed: { success?: boolean; error?: string } | undefined;
           try {
             parsed = JSON.parse(navResult) as { success?: boolean; error?: string };
@@ -444,7 +484,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         }
       }
       await mutateState(config.instance, (state) => {
-        const item = state.approvals.find((a) => a.id === approvalId);
+        const item = state.setupRequests.find((s) => s.id === setupId);
         if (!item) return;
         item.payload = {
           ...item.payload,
@@ -453,17 +493,46 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           openedUrl: openedUrl ?? null,
           navigateError: navigateError ?? null
         };
+        const reasonTarget = typeof setup.payload.reason === "string" && setup.payload.reason.length > 0
+          ? setup.payload.reason
+          : setup.target;
+        addAudit(
+          state,
+          {
+            actor: "user",
+            action: "browser.connect",
+            target: reasonTarget,
+            risk: "medium",
+            taskId: setup.taskId,
+            runId: setup.taskId ? state.tasks.find((task) => task.id === setup.taskId)?.runId : undefined,
+            approvalId: setup.id,
+            evidence: {
+              stage: "open-browser",
+              mode: status.record?.mode,
+              headless: status.record?.headless ?? false,
+              pid: status.record?.pid ?? null,
+              openedUrl: openedUrl ?? null,
+              navigateError: navigateError ?? null
+            }
+          },
+          setup.taskId
+            ? { taskId: setup.taskId }
+            : setup.agentId
+              ? { agentId: setup.agentId }
+              : { system: true }
+        );
         if (item.taskId) {
           appendTrace(config.instance, item.taskId, {
             type: "approval",
             message: "Browser connect: visible window opened, awaiting sign-in",
-            data: { approvalId, openedUrl, navigateError }
+            data: { setupRequestId: setupId, openedUrl, navigateError }
           });
         }
       });
-      const refreshed = readState(config.instance).approvals.find((a) => a.id === approvalId);
-      return json({ ok: true, approval: refreshed, openedUrl: openedUrl ?? null, navigateError: navigateError ?? null });
+      const refreshed = readState(config.instance).setupRequests.find((s) => s.id === setupId);
+      return json({ ok: true, setupRequest: refreshed, openedUrl: openedUrl ?? null, navigateError: navigateError ?? null });
     }],
+
     ["GET", /^\/api\/audit$/, (request) => {
       const agentId = agentIdFilter(request);
       const audit = readState(config.instance).audit;
@@ -769,6 +838,90 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/devices$/, () => json(publicState(config).devices)],
     ["POST", /^\/api\/devices\/([^/]+)\/revoke$/, async (_request, params) => json(await revokePairedDevice(config, params[0]))],
     ["POST", /^\/api\/pairing$/, async (request) => json(await createPairing(config, await body(request)), 201)],
+    // Push-device registry endpoints. The mobile app POSTs its APNs
+    // token here on first launch (and on rotation via
+    // addPushTokenListener); DELETE prunes a token when the app
+    // signs out. Both routes scope the row to the calling credential
+    // — a paired device id (from the pairing claim flow) or the
+    // literal "owner" for the runtime config token. The CHECK
+    // constraint on the devices table pins platform to "ios" for now.
+    ["POST", /^\/api\/push\/devices$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const payload = await body(request);
+      const token = typeof payload.token === "string" ? payload.token.trim() : "";
+      const platform = typeof payload.platform === "string" ? payload.platform.trim() : "";
+      const bundleId = typeof payload.bundleId === "string" ? payload.bundleId.trim() : "";
+      if (!token) return json({ error: "token is required" }, 400);
+      if (platform !== "ios") return json({ error: "platform must be 'ios'" }, 400);
+      if (!bundleId) return json({ error: "bundleId is required" }, 400);
+      const device = upsertDevice(config.instance, {
+        token,
+        credentialId: credential,
+        platform: "ios",
+        bundleId
+      });
+      return json({ ok: true, device });
+    }],
+    ["DELETE", /^\/api\/push\/devices\/([^/]+)$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const removed = removeDeviceForCredential(config.instance, params[0], credential);
+      // 404 distinguishes "token does not exist OR belongs to a
+      // different credential" — we don't surface which because
+      // either leaks information about other credentials' devices.
+      if (!removed) return json({ error: "Device not found" }, 404);
+      return json({ ok: true });
+    }],
+    // Chat read-state + badge endpoints. The mobile app POSTs to
+    // /read every time the user lands on a chat detail so the gateway
+    // can compute the cross-session badge count; GET /badge returns
+    // the total unread block count for the caller's credential.
+    // Credential scoping happens on every read/write so a paired
+    // device can never see or mutate another credential's cursor.
+    ["POST", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      // Read state is keyed per device, not per credential — two
+      // iPhones owned by the same human each track their own cursor.
+      // The X-Device-Token header is mandatory here; web/CLI clients
+      // don't post reads because there's no device-specific badge to
+      // sync for them.
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      const payload = await body(request);
+      const lastReadBlockId =
+        typeof payload.lastReadBlockId === "string" ? payload.lastReadBlockId.trim() : "";
+      if (!lastReadBlockId) {
+        return json({ error: "lastReadBlockId is required" }, 400);
+      }
+      // Validate the block belongs to this session — the cursor would
+      // be meaningless otherwise, and accepting cross-session ids would
+      // let a client smuggle a foreign block into another device's
+      // read state.
+      const blockBelongs = listChatBlocks(config.instance, sessionId).some(
+        (b) => b.id === lastReadBlockId
+      );
+      if (!blockBelongs) {
+        return json({ error: "Block does not belong to this session" }, 400);
+      }
+      const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
+      return json({ ok: true, readState: result });
+    }],
+    ["GET", /^\/api\/badge$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      // Badge totals are per-device (see /read endpoint comment).
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const unread = unreadCountForDevice(config.instance, dev.token);
+      return json({ unread });
+    }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
     ["POST", /^\/api\/promotions\/([^/]+)\/approve$/, async (_request, params) => json(await reviewPromotion(config, params[0], "approve"))],
@@ -825,7 +978,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const chatId = parseChatIdStrict(payload.chatId);
       return json(await rejectPendingChat(config, params[0], chatId));
     }],
-    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalog())],
+    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name))],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
     // /api/setup/status to decide whether to render the form, and POSTs
     // /api/setup/provider to set credentials. The runtime writes
@@ -837,6 +990,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/setup\/provider$/, async (request) => {
       const payload = await body(request);
       const result = await setSetupProvider(config, payload);
+      return json(result, result.ok ? 200 : 400);
+    }],
+    ["POST", /^\/api\/setup\/provider\/remove$/, async (request) => {
+      const payload = await body(request);
+      const providerName = typeof payload.provider === "string" ? payload.provider : "";
+      const result = removeSetupProvider(config, providerName);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
@@ -862,39 +1021,119 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
   return async (request: Request) => {
     const url = new URL(request.url);
+    // CORS preflight: short-circuit before auth so browsers can probe
+    // protected endpoints. Returning a 401 on OPTIONS would prevent the
+    // browser from ever sending the real bearer-carrying request.
+    if (request.method === "OPTIONS" && request.headers.get("access-control-request-method")) {
+      return preflightResponse(request);
+    }
     if (url.pathname.startsWith("/api/")) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
         try {
-          return json(await claimPairing(config, await body(request)), 201);
+          return withCors(request, json(await claimPairing(config, await body(request)), 201));
         } catch (error) {
-          return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+          return withCors(request, json({ error: error instanceof Error ? error.message : String(error) }, 400));
         }
       }
-      if (!await authorized(request, config)) return json({ error: "Unauthorized" }, 401);
+      if (!await authorized(request, config)) return withCors(request, json({ error: "Unauthorized" }, 401));
       for (const [method, pattern, handler] of routes) {
         const match = url.pathname.match(pattern);
         if (request.method === method && match) {
           try {
-            return await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value])));
+            return withCors(request, await handler(request, Object.fromEntries(match.slice(1).map((value, index) => [String(index), value]))));
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            return json({ error: message }, statusFromErrorMessage(message));
+            return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
           }
         }
       }
-      return json({ error: "Not found" }, 404);
+      return withCors(request, json({ error: "Not found" }, 404));
     }
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
-      return json({
+      return withCors(request, json({
         name: "gini-runtime",
         instance: config.instance,
         port: config.port,
         message: "Gini runtime API. The Next.js control plane runs on a separate port; see `gini status`.",
         ui_url_hint: process.env.GINI_WEB_URL ?? null
-      });
+      }));
     }
-    return json({ error: "Not found" }, 404);
+    return withCors(request, json({ error: "Not found" }, 404));
   };
+}
+
+// CORS allowlist for browser-origin clients. The mobile app's RN-Web
+// target (Expo on :8090 or :8081) and the Next.js BFF dev server
+// (:3045) need cross-origin access to the gateway so Playwright/MCP
+// can drive the actual UI. Native iOS/Android, CLI, MCP, and the
+// Next.js BFF (which calls the gateway server-side) are NOT browser
+// origins and never trigger CORS preflight — they aren't affected.
+//
+// Allowlist-only: when the Origin header doesn't match, no CORS
+// headers are added and the browser blocks the response. No wildcard
+// is supported because we send Access-Control-Allow-Credentials: true
+// (browsers reject `*` + credentials together).
+const DEFAULT_CORS_ORIGINS = [
+  "http://localhost:3045",
+  "http://localhost:8081",
+  "http://localhost:8090",
+  "http://127.0.0.1:3045",
+  "http://127.0.0.1:8081",
+  "http://127.0.0.1:8090"
+];
+
+function allowedOrigins(): string[] {
+  const raw = process.env.GINI_CORS_ORIGINS;
+  if (raw === undefined) return DEFAULT_CORS_ORIGINS;
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function corsOriginFor(request: Request): string | undefined {
+  const origin = request.headers.get("origin");
+  if (!origin) return undefined;
+  return allowedOrigins().includes(origin) ? origin : undefined;
+}
+
+// Wrap any Response with the CORS allow-origin headers when the
+// caller's Origin matches the allowlist. Returns the response
+// untouched for non-browser callers (no Origin header) so curl/CLI
+// behavior is preserved. Errors (4xx/5xx) and SSE responses are also
+// CORS-stamped so the browser surfaces the real status to JS rather
+// than collapsing to a network error.
+function withCors(request: Request, response: Response): Response {
+  const origin = corsOriginFor(request);
+  if (!origin) return response;
+  const headers = new Headers(response.headers);
+  headers.set("Access-Control-Allow-Origin", origin);
+  headers.set("Access-Control-Allow-Credentials", "true");
+  headers.set("Vary", "Origin");
+  headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+// Preflight short-circuits the normal route matcher: the browser
+// asks "may I send a <method> with these headers?" and expects a 204
+// without auth (the actual GET/POST still requires the bearer).
+function preflightResponse(request: Request): Response {
+  const headers = new Headers();
+  const origin = corsOriginFor(request);
+  if (origin) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    headers.set("Access-Control-Allow-Credentials", "true");
+    headers.set("Vary", "Origin");
+    headers.set("Access-Control-Expose-Headers", "Last-Event-ID");
+  }
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Device-Token, Last-Event-ID, Accept, Cache-Control, X-Requested-With");
+  headers.set("Access-Control-Max-Age", "600");
+  return new Response(null, { status: 204, headers });
 }
 
 // Strict parse for Telegram chat_id values on the allow/deny endpoints.
@@ -1139,6 +1378,64 @@ async function authorized(request: Request, config: RuntimeConfig): Promise<bool
   return authorizedBearer(config, bearer ?? undefined);
 }
 
+// Pull the bearer off a request the same way `authorized` does so
+// per-route credential lookups stay consistent with the gate above.
+function bearerFromRequest(request: Request): string | undefined {
+  const header = request.headers.get("authorization") ?? "";
+  const queryToken = new URL(request.url).searchParams.get("token");
+  const bearer = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : queryToken;
+  return bearer ?? undefined;
+}
+
+// Resolve and validate the optional X-Device-Token header. Returns the
+// token string when present AND it belongs to the caller's credential;
+// returns null when absent (web/CLI clients) or when the device row
+// doesn't exist; throws nothing.
+//
+// Validation is mandatory: a malicious caller with a valid bearer
+// could otherwise smuggle another credential's APNs token into the
+// SSE registry or read-state, causing cross-account read cursors or
+// silent-push suppression bypass. The devices table's `credential_id`
+// column is the source of truth — the token only counts as "yours" if
+// upsertDevice recorded it under your credential.
+function deviceTokenFromRequest(
+  config: RuntimeConfig,
+  request: Request,
+  credentialId: string
+): string | null {
+  const raw = request.headers.get("x-device-token");
+  if (!raw) return null;
+  const token = raw.trim();
+  if (!token) return null;
+  const row = getDevice(config.instance, token);
+  if (!row) return null;
+  if (row.credentialId !== credentialId) return null;
+  return token;
+}
+
+// Variant that throws (caller catches and 403s). Used by routes where
+// the device token is mandatory (read-state writes and the badge
+// endpoint — both are mobile-only, no good fallback when the header
+// is missing or mismatched). Returns:
+//   - { ok: true, token }    when valid
+//   - { ok: false, reason }  when missing, malformed, or mismatched
+function requireDeviceToken(
+  config: RuntimeConfig,
+  request: Request,
+  credentialId: string
+): { ok: true; token: string } | { ok: false; reason: string; status: number } {
+  const raw = request.headers.get("x-device-token");
+  if (!raw || !raw.trim()) {
+    return { ok: false, reason: "X-Device-Token header is required", status: 400 };
+  }
+  const token = raw.trim();
+  const row = getDevice(config.instance, token);
+  if (!row || row.credentialId !== credentialId) {
+    return { ok: false, reason: "Device token is not registered to this credential", status: 403 };
+  }
+  return { ok: true, token };
+}
+
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
 }
@@ -1290,19 +1587,32 @@ function eventStream(config: RuntimeConfig, request: Request): Response {
 }
 
 // ChatBlock SSE stream. Per ADR chat-block-protocol.md, each frame is
-// `id: <blockId>\nevent: chat_block\ndata: <json>\n\n` so a browser
-// EventSource auto-attaches Last-Event-ID on reconnect and the runtime
-// resumes from the cursor instead of re-replaying the full list.
+// `id: <block_id>:<ts>\nevent: chat_block\ndata: <json>\n\n` where `ts`
+// is the row's `updated_at` snapshot at emit time (or `created_at` for
+// insert-only kinds; they're equal at insert). The browser/EventSource
+// client auto-attaches the composite string as `Last-Event-ID` on
+// reconnect, and `listChatBlocksAfter` in src/state/chat-blocks.ts
+// parses the `:<ts>` suffix to detect in-place updates that happened on
+// the cursor row itself (e.g. an `assistant_text` streaming:false flip
+// or a `tool_call` status flip) since the client last saw it — without
+// requiring a per-row version bump or a separate ack channel.
 //
 // Differs from `eventStream` above: that route polls the global ring
 // buffer at 1s. Here we use the in-process EventEmitter wired into
 // insertChatBlock / upsertAssistantTextBlock / updateToolCallBlock —
 // inserts and upserts both fire AFTER the SQLite commit so subscribers
 // observe durable rows.
-function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: string): Response {
+function chatBlockStream(
+  config: RuntimeConfig,
+  request: Request,
+  sessionId: string,
+  deviceToken: string | null
+): Response {
   let closed = false;
   let keepalive: Timer | undefined;
   let unsubscribe: (() => void) | undefined;
+  let unsubscribeSession: (() => void) | undefined;
+  let unregisterSubscription: (() => void) | undefined;
   const encoder = new TextEncoder();
   const seen = new Set<string>();
   const lastEventId =
@@ -1315,7 +1625,8 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
   // content-type semantics for clients that route both error and
   // success branches through the same EventSource handler.
   const state = readState(config.instance);
-  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+  const initialSession = state.chatSessions.find((s) => s.id === sessionId);
+  if (!initialSession) {
     return new Response(JSON.stringify({ error: `Chat session not found: ${sessionId}` }), {
       status: 404,
       headers: { "content-type": "application/json" }
@@ -1324,6 +1635,22 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
 
   const stream = new ReadableStream({
     start(controller) {
+      // Record this subscription on the active-watch registry so the
+      // APNs dispatcher can skip terminal-phase silent pushes for the
+      // device currently watching this session. Registered inside
+      // `start` (rather than at the route handler) so it always pairs
+      // with `cancel` — if the response is created but never consumed
+      // (rare, but possible on certain client disconnects), the
+      // registry doesn't pick up a phantom entry.
+      //
+      // Web/CLI clients (no X-Device-Token) skip registration: there's
+      // no APNs device behind them, so per-device suppression doesn't
+      // apply. Registering under a credential key would also incorrectly
+      // suppress pushes to a foregrounded mobile device sharing the
+      // same credential.
+      if (deviceToken) {
+        unregisterSubscription = addSseSubscription(config.instance, deviceToken, sessionId);
+      }
       // Two enqueue paths:
       //   - `enqueueBackfill` dedupes by block id so an initial replay
       //     doesn't double-send a row that we already sent (relevant
@@ -1336,20 +1663,33 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
       //     every frame. Skipping by id here was the previous bug —
       //     terminal `streaming: false` flips never reached the
       //     client.
-      const enqueueFrame = (block: { id: string }): void => {
+      const enqueueFrame = (block: ChatBlock): void => {
+        // Event id is `<block_id>:<ts>` where `ts` is the row's
+        // updated_at when the block kind exposes one (assistant_text,
+        // tool_call) and createdAt otherwise — these two fields hold
+        // the same ISO string for insert-only kinds, so the wire format
+        // is uniform across kinds. The mobile client stores this string
+        // verbatim and replays it via Last-Event-ID; the gateway parses
+        // the suffix in listChatBlocksAfter to detect in-place updates
+        // that happened on the cursor row itself (e.g. an assistant_text
+        // streaming:false flip) since the client last saw it.
+        const ts =
+          block.kind === "assistant_text" || block.kind === "tool_call"
+            ? block.updatedAt
+            : block.createdAt;
         controller.enqueue(
           encoder.encode(
-            `id: ${block.id}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
+            `id: ${block.id}:${ts}\nevent: chat_block\ndata: ${JSON.stringify(block)}\n\n`
           )
         );
       };
-      const enqueueBackfill = (block: { id: string }): void => {
+      const enqueueBackfill = (block: ChatBlock): void => {
         if (closed) return;
         if (seen.has(block.id)) return;
         seen.add(block.id);
         enqueueFrame(block);
       };
-      const enqueueLive = (block: { id: string }): void => {
+      const enqueueLive = (block: ChatBlock): void => {
         if (closed) return;
         // Mark live-delivered blocks so a hypothetical mid-stream
         // backfill (we don't issue one today, but the wiring is
@@ -1357,6 +1697,21 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
         seen.add(block.id);
         enqueueFrame(block);
       };
+
+      // Emit the current session record so subscribers always have a
+      // title without a separate REST round-trip. The mobile chat
+      // detail header reads from this; the web client can use it too
+      // (or ignore it). Live updates flow through subscribeChatSession
+      // below — currently fired on rename (explicit + auto-generated).
+      // Frames omit an `id:` line; chat_session events are not
+      // Last-Event-ID replayable. Reconnects always re-emit the
+      // current record from this initial send, so missing a transient
+      // rename frame is harmless.
+      controller.enqueue(
+        encoder.encode(
+          `event: chat_session\ndata: ${JSON.stringify(initialSession)}\n\n`
+        )
+      );
 
       // Initial backfill: send any blocks the client is missing.
       // listChatBlocksAfter honors Last-Event-ID (or falls back to the
@@ -1371,6 +1726,18 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
         enqueueLive(block);
       });
 
+      // Subscribe to session-record updates (title renames). Publishers
+      // fire after mutateState resolves so the on-disk state matches the
+      // event payload.
+      unsubscribeSession = subscribeChatSession(config.instance, sessionId, (session) => {
+        if (closed) return;
+        controller.enqueue(
+          encoder.encode(
+            `event: chat_session\ndata: ${JSON.stringify(session)}\n\n`
+          )
+        );
+      });
+
       // Idle keepalive (mirrors eventStream above). Proxies often cap
       // idle streams around 30-60s; a comment line resets the idle-byte
       // clock at every hop without surfacing as an event.
@@ -1383,6 +1750,10 @@ function chatBlockStream(config: RuntimeConfig, request: Request, sessionId: str
       closed = true;
       if (keepalive) clearInterval(keepalive);
       if (unsubscribe) unsubscribe();
+      if (unsubscribeSession) unsubscribeSession();
+      // Drop the active-watch entry. The cleanup helper is idempotent
+      // so a duplicate call from an error path is a no-op.
+      if (unregisterSubscription) unregisterSubscription();
     }
   });
   return new Response(stream, {

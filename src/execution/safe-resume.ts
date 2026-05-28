@@ -58,10 +58,13 @@ export async function persistConnectOutcome(
 ): Promise<void> {
   try {
     await mutateState(config.instance, (state) => {
-      const approval = state.approvals.find((a) => a.id === approvalId);
-      if (!approval) return;
-      approval.connectOutcome = outcome;
-      approval.updatedAt = new Date().toISOString();
+      // Messaging connect actions are SetupRequests on the post-merge
+      // model, so the outcome record lands on state.setupRequests
+      // (the UI reads setup.connectOutcome via useSetupRequests()).
+      const setupRequest = state.setupRequests.find((s) => s.id === approvalId);
+      if (!setupRequest) return;
+      setupRequest.connectOutcome = outcome;
+      setupRequest.updatedAt = new Date().toISOString();
     });
   } catch {
     // Outcome persistence is a UI honesty postscript, not load-

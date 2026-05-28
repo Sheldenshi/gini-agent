@@ -78,9 +78,10 @@ still gates each call.
 `browser_fill_secrets` is the one carve-out from the
 "route-through-pendingOrAuto" rule, documented in detail in
 [browser-fill-secret.md](browser-fill-secret.md). The dispatch
-creates the approval directly via `createApproval` (the side effect
-— per-slot playwright fill — runs inside `POST /api/approvals/<id>/connect`
-from request-scope secrets, not inside `executeApprovedAction`), and
+creates the setup request directly via `createSetupRequest` (the side
+effect — per-slot playwright fill — runs inside
+`POST /api/setup-requests/<id>/complete` from request-scope secrets, not
+inside `executeApprovedAction`), and
 `resolveApprovalPolicy` returns `{ mode: "gate" }` for
 `browser.fill_secret` regardless of `approvalMode` — yolo cannot
 auto-approve credential entry because the credentials come from the

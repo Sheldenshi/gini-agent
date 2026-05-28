@@ -3,7 +3,7 @@
 // task; the actual exec runs from agent.executeApprovedAction once the
 // user approves.
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
-import { appendTrace, createApproval, isTerminalTaskStatus, mutateState, now } from "../state";
+import { appendTrace, createAuthorization, isTerminalTaskStatus, mutateState, now } from "../state";
 import { findTask } from "../agent";
 import { resolveApprovalPolicy } from "../execution/policy";
 
@@ -24,7 +24,7 @@ export async function requestShell(config: RuntimeConfig, task: Task): Promise<T
     // and (under yolo / auto) execute a side effect against a
     // cancelled task.
     if (isTerminalTaskStatus(item.status)) return item;
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "terminal.exec",
       target: command,

@@ -1,3 +1,4 @@
+import * as FileSystem from "expo-file-system/legacy";
 import { readCachedCredentials, type AuthCredentials } from "./auth";
 
 // Mirrors web/src/lib/api.ts in shape (`api<T>(path, init)`), but talks
@@ -40,6 +41,12 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${creds.token}`,
+    // Attach the cached APNs device token automatically when present.
+    // Routes that key per-device (e.g. /chat/:id/read, /badge) need
+    // it; routes that don't simply ignore the header. Resolved
+    // lazily via require() so api.ts doesn't create an import cycle
+    // with push.ts (which imports api).
+    ...resolveDeviceTokenHeader(),
     ...(init.headers ?? {})
   };
 
@@ -75,4 +82,117 @@ function safeParse(text: string): unknown {
   } catch {
     return text;
   }
+}
+
+// Uploaded image ref returned by POST /api/uploads. Matches the runtime's
+// ImageAttachment shape — the client only carries this descriptor and
+// attaches it to the next /messages call's `images` array.
+export interface UploadRef {
+  id: string;
+  mimeType: string;
+  size: number;
+}
+
+// Multipart upload to the gateway. We can't reuse api() because it pins
+// content-type: application/json, which would strip the multipart
+// boundary. We also can't use fetch() with FormData here: Expo SDK 56
+// installs a winter-fetch polyfill whose convertFormDataAsync rejects
+// React Native's classic `{uri, name, type}` part shape (see
+// node_modules/expo/src/winter/fetch/convertFormData.ts — "Unsupported
+// FormDataPart implementation"). FileSystem.uploadAsync streams the
+// file from disk through native URLSession, sidestepping the polyfill
+// and avoiding loading the bytes into JS memory at all.
+export async function uploadImage(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  let origin: string;
+  try {
+    origin = new URL(creds.baseUrl).origin;
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  const response = await FileSystem.uploadAsync(`${origin}/api/uploads`, file.uri, {
+    httpMethod: "POST",
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: "file",
+    mimeType: file.mimeType,
+    headers: { Authorization: `Bearer ${creds.token}` }
+  });
+  const value = response.body ? safeParse(response.body) : null;
+  if (response.status < 200 || response.status >= 300) {
+    const message =
+      value && typeof value === "object" && "error" in value && typeof value.error === "string"
+        ? value.error
+        : `HTTP ${response.status}`;
+    throw new ApiError(response.status, message);
+  }
+  return value as UploadRef;
+}
+
+// Absolute URL for a stored upload. The gateway serves the bytes with
+// long-lived immutable cache headers; the request still needs the bearer
+// token, so callers must pass it via an Image source's `headers` prop.
+export function uploadUrl(id: string): string {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  const origin = new URL(creds.baseUrl).origin;
+  return `${origin}/api/uploads/${encodeURIComponent(id)}`;
+}
+
+export function authHeader(): Record<string, string> {
+  const creds = readCachedCredentials();
+  if (!creds) return {};
+  return { Authorization: `Bearer ${creds.token}` };
+}
+
+// Resolve the absolute gateway URL + auth headers for an SSE subscription.
+// react-native-sse opens its own XHR, so we can't reuse the `api()` fetcher;
+// this helper centralizes origin normalization and bearer injection so the
+// streaming hook doesn't reimplement either. Throws ApiError(401) when no
+// credentials are configured — the caller surfaces that the same way the
+// /blocks fetch does so the chat detail screen's redirect-to-setup effect
+// still fires.
+export function resolveStreamEndpoint(path: string): {
+  url: string;
+  headers: Record<string, string>;
+} {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  let origin: string;
+  try {
+    origin = new URL(creds.baseUrl).origin;
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  return {
+    url: `${origin}/api${path}`,
+    headers: {
+      authorization: `Bearer ${creds.token}`,
+      // SSE endpoint resolver also injects X-Device-Token so the
+      // gateway's per-device watch registry can credit this device's
+      // open stream and suppress redundant silent pushes to it.
+      ...resolveDeviceTokenHeader()
+    }
+  };
+}
+
+// Pull the cached APNs token from push.ts on every call. We avoid a
+// static import because push.ts depends on this module (transitively
+// through ApiError), and bundlers handle the cycle inconsistently
+// when require()'d lazily. Returns an empty object when no token is
+// cached so the header simply isn't sent.
+function resolveDeviceTokenHeader(): Record<string, string> {
+  try {
+    const pushModule = require("./push") as { getCachedDeviceToken?: () => string | null };
+    const token = pushModule.getCachedDeviceToken?.();
+    if (token) return { "X-Device-Token": token };
+  } catch {
+    // Test envs without RN: push.ts side effects fail to load; that's
+    // fine — the header is best-effort.
+  }
+  return {};
 }

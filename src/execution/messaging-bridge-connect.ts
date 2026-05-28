@@ -26,8 +26,8 @@
 //      must be told the create failed instead of being left
 //      waiting indefinitely.
 
-import type { Approval, MessagingBridgeRecord, RuntimeConfig } from "../types";
-import { resolveApproval } from "../agent";
+import type { MessagingBridgeRecord, RuntimeConfig, SetupRequest } from "../types";
+import { resolveSetupRequest } from "../agent";
 import { addMessagingBridge, assertHeaderSafeToken } from "../integrations/messaging";
 import { sanitizeBridgeStatusMessage } from "../integrations/messaging-poller-helpers";
 import { addAudit, mutateState } from "../state";
@@ -44,7 +44,7 @@ export interface MessagingBridgeConnectResult {
 
 export async function runMessagingBridgeConnect(
   config: RuntimeConfig,
-  approval: Approval,
+  approval: SetupRequest,
   secrets: Record<string, string>,
   deliveryTargetsRaw: unknown
 ): Promise<MessagingBridgeConnectResult> {
@@ -100,10 +100,9 @@ export async function runMessagingBridgeConnect(
   // landing, the approval comes back denied; proceeding to
   // addMessagingBridge in that state would create a bridge for a
   // cancelled task and audit it as approved.
-  let resolved: Approval;
+  let resolved: SetupRequest;
   try {
-    const result = await resolveApproval(config, approval.id, { actor: "user", resumeChatTask: false });
-    resolved = result.approval;
+    resolved = await resolveSetupRequest(config, approval.id, "complete", { actor: "user", resumeChatTask: false });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return {
@@ -111,7 +110,7 @@ export async function runMessagingBridgeConnect(
       body: { ok: false, message: `Could not lock approval for bridge create: ${message}` }
     };
   }
-  if (resolved.status !== "approved") {
+  if (resolved.status !== "completed") {
     return {
       status: 410,
       body: {

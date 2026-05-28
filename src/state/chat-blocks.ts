@@ -19,9 +19,12 @@
 import { EventEmitter } from "node:events";
 import type {
   AssistantTextBlock,
+  AuthorizationAction,
   ChatBlock,
   ChatBlockKind,
   Instance,
+  RiskLevel,
+  SetupRequestAction,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -71,7 +74,10 @@ interface ChatBlockRow {
   instance: string;
   agent_id: string | null;
   ordinal: number;
-  kind: ChatBlockKind;
+  // Includes "approval_requested" as a legacy value still resident in
+  // pre-split DBs (the CHECK constraint accepts it; rowToBlock migrates
+  // it on read).
+  kind: ChatBlockKind | "approval_requested";
   payload_json: string;
   task_id: string | null;
   run_id: string | null;
@@ -100,8 +106,24 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
     runId: row.run_id ?? undefined
   };
   switch (row.kind) {
-    case "user_text":
-      return { ...base, kind: "user_text", text: String(payload.text ?? "") };
+    case "user_text": {
+      const images = Array.isArray(payload.images)
+        ? payload.images
+            .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+            .map((item) => ({
+              id: String(item.id ?? ""),
+              mimeType: String(item.mimeType ?? ""),
+              size: Number(item.size ?? 0)
+            }))
+            .filter((image) => image.id.length > 0)
+        : undefined;
+      return {
+        ...base,
+        kind: "user_text",
+        text: String(payload.text ?? ""),
+        ...(images && images.length > 0 ? { images } : {})
+      };
+    }
     case "assistant_text":
       return {
         ...base,
@@ -135,13 +157,44 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
       };
     case "phase":
       return { ...base, kind: "phase", label: String(payload.label ?? "") };
-    case "approval_requested":
+    case "approval_requested": {
+      // Legacy block kind from before the Authorization/SetupRequest split.
+      // Partition by action so old rows render with the right new card
+      // type. See docs/adr/authorization-vs-setup-request.md.
+      const action = String(payload.action ?? "");
+      if (action === "browser.connect" || action === "connector.request" || action === "browser.fill_secret") {
+        return {
+          ...base,
+          kind: "setup_requested",
+          setupRequestId: String(payload.approvalId ?? ""),
+          action: action as SetupRequestAction,
+          summary: String(payload.summary ?? "")
+        };
+      }
       return {
         ...base,
-        kind: "approval_requested",
-        approvalId: String(payload.approvalId ?? ""),
-        action: String(payload.action ?? ""),
-        risk: String(payload.risk ?? "low"),
+        kind: "authorization_requested",
+        authorizationId: String(payload.approvalId ?? ""),
+        action: action as AuthorizationAction,
+        risk: (payload.risk as RiskLevel) ?? "low",
+        summary: String(payload.summary ?? "")
+      };
+    }
+    case "authorization_requested":
+      return {
+        ...base,
+        kind: "authorization_requested",
+        authorizationId: String(payload.authorizationId ?? ""),
+        action: String(payload.action ?? "") as AuthorizationAction,
+        risk: (payload.risk as RiskLevel) ?? "low",
+        summary: String(payload.summary ?? "")
+      };
+    case "setup_requested":
+      return {
+        ...base,
+        kind: "setup_requested",
+        setupRequestId: String(payload.setupRequestId ?? ""),
+        action: String(payload.action ?? "") as SetupRequestAction,
         summary: String(payload.summary ?? "")
       };
     case "system_note":
@@ -162,7 +215,10 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
 function payloadFor(block: ChatBlock): string {
   switch (block.kind) {
     case "user_text":
-      return JSON.stringify({ text: block.text });
+      return JSON.stringify({
+        text: block.text,
+        ...(block.images && block.images.length > 0 ? { images: block.images } : {})
+      });
     case "assistant_text":
       return JSON.stringify({ text: block.text, streaming: block.streaming });
     case "tool_call":
@@ -183,11 +239,17 @@ function payloadFor(block: ChatBlock): string {
       });
     case "phase":
       return JSON.stringify({ label: block.label });
-    case "approval_requested":
+    case "authorization_requested":
       return JSON.stringify({
-        approvalId: block.approvalId,
+        authorizationId: block.authorizationId,
         action: block.action,
         risk: block.risk,
+        summary: block.summary
+      });
+    case "setup_requested":
+      return JSON.stringify({
+        setupRequestId: block.setupRequestId,
+        action: block.action,
         summary: block.summary
       });
     case "system_note":
@@ -239,7 +301,12 @@ export function insertChatBlock(
       };
       switch (input.kind) {
         case "user_text":
-          return { ...base, kind: "user_text", text: input.text };
+          return {
+            ...base,
+            kind: "user_text",
+            text: input.text,
+            ...(input.images && input.images.length > 0 ? { images: input.images } : {})
+          };
         case "assistant_text":
           return {
             ...base,
@@ -271,13 +338,21 @@ export function insertChatBlock(
           };
         case "phase":
           return { ...base, kind: "phase", label: input.label };
-        case "approval_requested":
+        case "authorization_requested":
           return {
             ...base,
-            kind: "approval_requested",
-            approvalId: input.approvalId,
+            kind: "authorization_requested",
+            authorizationId: input.authorizationId,
             action: input.action,
             risk: input.risk,
+            summary: input.summary
+          };
+        case "setup_requested":
+          return {
+            ...base,
+            kind: "setup_requested",
+            setupRequestId: input.setupRequestId,
+            action: input.action,
             summary: input.summary
           };
         case "system_note":
@@ -354,6 +429,38 @@ export function findInFlightAssistantTextForTask(
     sessionId: row.session_id,
     text: String(payload.text ?? "")
   };
+}
+
+// Returns true when the given task has emitted at least one
+// assistant_text block whose text is non-empty after trimming. The push
+// dispatcher consults this on terminal `phase: Completed` blocks to
+// decide between an alert (the task produced a user-visible message) and
+// a silent badge tick (only tool calls / system notes — nothing for the
+// user to read). Uses LIMIT 1 + EXISTS-style early exit so the lookup
+// stays O(rows-until-first-hit) rather than scanning the whole task.
+export function taskProducedAssistantText(
+  instance: Instance,
+  taskId: string
+): boolean {
+  const db = getMemoryDb(instance);
+  const row = db
+    .query<{ payload_json: string }, [string]>(
+      `SELECT payload_json FROM chat_blocks
+       WHERE task_id = ? AND kind = 'assistant_text'
+       ORDER BY ordinal ASC`
+    )
+    .all(taskId);
+  for (const r of row) {
+    try {
+      const payload = JSON.parse(r.payload_json) as { text?: unknown };
+      if (typeof payload.text === "string" && payload.text.trim().length > 0) {
+        return true;
+      }
+    } catch {
+      // malformed row — skip
+    }
+  }
+  return false;
 }
 
 // Updates an existing assistant_text block's text + updated_at without
@@ -456,33 +563,84 @@ export function listChatBlocks(instance: Instance, sessionId: string): ChatBlock
     .map(rowToBlock);
 }
 
-// Returns blocks added (or last-updated, for assistant_text) AFTER the
-// given block id. Used by the SSE handler to honor Last-Event-ID so a
-// reconnecting client gets only what it missed. When `afterBlockId` is
-// not found in the table (rolled-out / wrong session), returns the full
-// list — best-effort recovery, mirroring the legacy eventStream ring-
-// buffer behavior in src/http.ts.
+// Returns blocks added (or last-updated, for assistant_text and tool_call)
+// AFTER the given Last-Event-ID cursor. Used by the SSE handler so a
+// reconnecting client gets only what it missed. When the cursor row is
+// not found in the table (rolled out / wrong session), returns the full
+// list — best-effort recovery, mirroring the legacy eventStream
+// ring-buffer behavior in src/http.ts.
+//
+// Cursor format: the SSE emitter writes `id: <block_id>:<ts>` where `ts`
+// is the row's `updated_at` snapshot at emit time. On reconnect the
+// client (react-native-sse or any compliant EventSource) round-trips
+// that string as `Last-Event-ID`. Parsing it back gives us:
+//   - `cursor_id`  — used to read the cursor row's current `ordinal`
+//                     (so the >ordinal half of the resume filter keeps
+//                     working for late-arriving insert-only kinds)
+//   - `client_ts`  — the timestamp the client actually saw, NOT the
+//                     row's current `updated_at`. This is what makes
+//                     in-place mutations (assistant_text deltas,
+//                     tool_call status flips) on the cursor row itself
+//                     replay correctly — the row's updated_at moved
+//                     forward while the client was offline, and the
+//                     comparison must be against the older snapshot.
+//
+// Back-compat: an old client without the `:<ts>` suffix falls back to
+// reading the cursor row's CURRENT `updated_at` as `client_ts`. Combined
+// with the `>=` comparison below, this means the cursor row itself is
+// still replayed with whatever payload it currently holds. The semantic
+// gap vs. the suffixed path: if the cursor row was upserted between the
+// snapshot the client saw and the resume, the bare-id client receives
+// the latest payload (correct) but cannot prove which version it had.
+// Earlier-ordinal in-place mutations that landed strictly before the
+// fallback's `cutoff.updated_at` are not replayed — only the suffixed
+// `<id>:<ts>` form preserves the client's actual snapshot timestamp.
+//
+// Resume filter: `(ordinal > cursor.ordinal OR updated_at >= client_ts)`.
+// The `>=` handles same-ms ties — two events sharing an ISO timestamp
+// would otherwise cause one to be skipped. The client's id-keyed upsert
+// collapses any benign re-replay of the unchanged cursor row.
 export function listChatBlocksAfter(
   instance: Instance,
   sessionId: string,
   afterBlockId: string | null
 ): ChatBlock[] {
   if (!afterBlockId) return listChatBlocks(instance, sessionId);
+  // Parse the optional `:<ts>` suffix off the cursor. ISO timestamps
+  // never contain `:` outside the time portion, so we split on the FIRST
+  // `:` to separate the block id from the remainder; the block id format
+  // (`block_<random>`) does not contain `:` either.
+  const colonIdx = afterBlockId.indexOf(":");
+  const cursorId =
+    colonIdx === -1 ? afterBlockId : afterBlockId.slice(0, colonIdx);
+  const clientTsFromCursor =
+    colonIdx === -1 ? null : afterBlockId.slice(colonIdx + 1);
+
   const db = getMemoryDb(instance);
   const cutoff = db
-    .query<{ ordinal: number }, [string, string]>(
-      "SELECT ordinal FROM chat_blocks WHERE id = ? AND session_id = ?"
+    .query<{ ordinal: number; updated_at: string }, [string, string]>(
+      "SELECT ordinal, updated_at FROM chat_blocks WHERE id = ? AND session_id = ?"
     )
-    .get(afterBlockId, sessionId);
+    .get(cursorId, sessionId);
   if (!cutoff) {
     // Cursor is unknown to this session — replay everything we have.
     return listChatBlocks(instance, sessionId);
   }
+  // If the client sent a snapshot timestamp, use it; otherwise (legacy
+  // client) compare against the cursor row's CURRENT updated_at. With the
+  // `>=` filter that follows, the cursor row still replays with its
+  // current payload — but the fallback can't recover earlier-ordinal
+  // in-place mutations that landed strictly before the cursor's current
+  // updated_at, because no older snapshot is available.
+  const clientTs = clientTsFromCursor ?? cutoff.updated_at;
   return db
-    .query<ChatBlockRow, [string, number]>(
-      "SELECT * FROM chat_blocks WHERE session_id = ? AND ordinal > ? ORDER BY ordinal ASC"
+    .query<ChatBlockRow, [string, number, string]>(
+      `SELECT * FROM chat_blocks
+       WHERE session_id = ?
+         AND (ordinal > ? OR updated_at >= ?)
+       ORDER BY ordinal ASC`
     )
-    .all(sessionId, cutoff.ordinal)
+    .all(sessionId, cutoff.ordinal, clientTs)
     .map(rowToBlock);
 }
 
@@ -568,4 +726,39 @@ export function subscribeChatBlocks(
 
 function publish(instance: Instance, block: ChatBlock): void {
   emitter.emit(subscriptionKey(instance, block.sessionId), block);
+  // Fan out to instance-wide subscribers too — the APNs dispatcher
+  // listens here so it sees every block for the instance without
+  // having to enumerate sessions and re-subscribe as they spawn.
+  emitter.emit(instanceKey(instance), block);
+}
+
+function instanceKey(instance: Instance): string {
+  return `${instance}::*`;
+}
+
+// Subscribe to every block emitted on this instance, across all
+// sessions. Returns an unsubscribe function. Used by long-lived
+// observers (e.g. the APNs push dispatcher) that need a fan-out point
+// independent of which session is active. Per-session SSE handlers
+// continue to use subscribeChatBlocks(instance, sessionId, handler) so
+// they only see their own traffic.
+export function subscribeAllChatBlocks(
+  instance: Instance,
+  handler: (block: ChatBlock) => void
+): () => void {
+  const key = instanceKey(instance);
+  const wrapped = (block: ChatBlock): void => {
+    try {
+      handler(block);
+    } catch (error) {
+      console.warn(
+        `[chat-blocks] instance subscriber for ${key} threw:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
+  };
+  emitter.on(key, wrapped);
+  return () => {
+    emitter.off(key, wrapped);
+  };
 }

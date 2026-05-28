@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn } from "bun";
-import type { Approval, RuntimeConfig, RuntimeState, Task } from "./types";
+import type { Authorization, ImageAttachment, RuntimeConfig, RuntimeState, SetupRequest, Task } from "./types";
 import { statePath, traceDir } from "./paths";
 import {
   addAudit,
@@ -31,14 +31,36 @@ import {
 } from "./state";
 import type { AgentContext } from "./state/audit";
 
-// Helper: resolve the AgentContext for an approval row. Approvals carry
-// either a taskId (then the task owns attribution) or an agentId (when
-// the approval was minted outside a task context); fall back to system
-// only if both are absent, which only happens for legacy rows.
-function approvalAgentContext(approval: Approval): AgentContext {
-  if (approval.taskId) return { taskId: approval.taskId, agentId: approval.agentId };
-  if (approval.agentId) return { agentId: approval.agentId };
+// Helper: resolve the AgentContext for an authorization/setup-request row.
+// Both record kinds carry either a taskId (then the task owns attribution)
+// or an agentId (minted outside a task context); fall back to system only
+// if both are absent, which only happens for legacy rows.
+function approvalAgentContext(row: { taskId?: string; agentId?: string }): AgentContext {
+  if (row.taskId) return { taskId: row.taskId, agentId: row.agentId };
+  if (row.agentId) return { agentId: row.agentId };
   return { system: true };
+}
+
+// Find any pending or resolved row by id across both collections. After the
+// Authorization / SetupRequest split callers that only know the id (HTTP
+// handlers, the chat-task resume path, the imperative dispatch fallback)
+// use this to avoid leaking the split into every call site. Returns the
+// row and which collection it lives in.
+function findAuthorization(state: RuntimeState, id: string): Authorization | undefined {
+  return state.authorizations.find((row) => row.id === id);
+}
+function findSetupRequest(state: RuntimeState, id: string): SetupRequest | undefined {
+  return state.setupRequests.find((row) => row.id === id);
+}
+function findApprovalRow(state: RuntimeState, id: string):
+  | { kind: "authorization"; row: Authorization }
+  | { kind: "setup_request"; row: SetupRequest }
+  | undefined {
+  const auth = findAuthorization(state, id);
+  if (auth) return { kind: "authorization", row: auth };
+  const setup = findSetupRequest(state, id);
+  if (setup) return { kind: "setup_request", row: setup };
+  return undefined;
 }
 import { generateTaskSummary } from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
@@ -106,6 +128,10 @@ export interface SubmitTaskOptions {
   // message. Stamped on the task so the UI can resolve task -> session
   // without fetching the unscoped chatMessages list.
   chatSessionId?: string;
+  // Image refs attached to the user message that spawned this task.
+  // Threaded through to Task.images so the chat-task loop can dispatch
+  // vision content without re-reading the chat message.
+  images?: ImageAttachment[];
 }
 
 export async function submitTask(
@@ -133,6 +159,7 @@ export async function submitTask(
     options.chatSessionId
   );
   if (options.mode) created.mode = options.mode;
+  if (options.images && options.images.length > 0) created.images = options.images;
   // When a parentTaskId is set, the upsert + the parent-status
   // check must serialize together. Without this, `spawnSubagent`'s
   // in-callback check inside `createSubagentRecord` can pass, then
@@ -292,7 +319,7 @@ export async function cancelTask(
   return task;
 }
 
-// Centralize the abortApprovalsForTask + approval.in_flight_aborted
+// Centralize the abortApprovalsForTask + authorization.in_flight_aborted
 // audit emission so cancelTask, failTask, and decideApproval-deny
 // share the same exact behavior. Runs INSIDE the caller's mutateState
 // callback so the abort fan-out and the audit row write happen under
@@ -312,7 +339,7 @@ function recordInFlightAborted(
     state,
     {
       actor: "runtime",
-      action: "approval.in_flight_aborted",
+      action: "authorization.in_flight_aborted",
       target: task.id,
       risk: "low",
       taskId: task.id,
@@ -335,7 +362,7 @@ function cancelPendingTaskApprovals(
   reason: "task.cancelled" | "sibling.denied",
   excludeApprovalId?: string
 ): void {
-  for (const sibling of state.approvals) {
+  for (const sibling of state.authorizations) {
     if (sibling.taskId !== taskId) continue;
     if (sibling.status !== "pending") continue;
     if (excludeApprovalId && sibling.id === excludeApprovalId) continue;
@@ -346,10 +373,33 @@ function cancelPendingTaskApprovals(
       {
         actor: "runtime",
         action: reason === "sibling.denied"
-          ? "approval.cancelled_sibling_denial"
-          : "approval.cancelled_task_cancelled",
+          ? "authorization.cancelled_sibling_denial"
+          : "authorization.cancelled_task_cancelled",
         target: sibling.target,
         risk: sibling.risk,
+        taskId: sibling.taskId,
+        runId: state.tasks.find((task) => task.id === sibling.taskId)?.runId,
+        approvalId: sibling.id,
+        evidence: { reason, originatingApprovalId: excludeApprovalId }
+      },
+      { taskId }
+    );
+  }
+  for (const sibling of state.setupRequests) {
+    if (sibling.taskId !== taskId) continue;
+    if (sibling.status !== "pending") continue;
+    if (excludeApprovalId && sibling.id === excludeApprovalId) continue;
+    sibling.status = "cancelled";
+    sibling.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: reason === "sibling.denied"
+          ? "setup.cancelled_sibling_denial"
+          : "setup.cancelled_task_cancelled",
+        target: sibling.target,
+        risk: "low",
         taskId: sibling.taskId,
         runId: state.tasks.find((task) => task.id === sibling.taskId)?.runId,
         approvalId: sibling.id,
@@ -478,7 +528,11 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
       // recorded on the task.
       if (next.status === "waiting_approval" && next.approvalIds.length > 0) {
         const approvalId = next.approvalIds[next.approvalIds.length - 1]!;
-        const approval = readState(config.instance).approvals.find((a) => a.id === approvalId);
+        // Imperative dispatch only ever mints authorizations (file/web/
+        // terminal/code). SetupRequest actions (browser.connect /
+        // connector.request / browser.fill_secret) come from the chat-task
+        // tool catalog, not from the prefix-dispatch path here.
+        const approval = findAuthorization(readState(config.instance), approvalId);
         const policyAction = approval
           ? mapApprovalToPolicyAction(approval.action, approval.payload)
           : undefined;
@@ -508,7 +562,7 @@ export async function runTask(config: RuntimeConfig, taskId: string): Promise<Ta
           const decision = resolveApprovalPolicy(config, policyAction, payload);
           if (decision.mode === "auto") {
             try {
-              await resolveApproval(config, approvalId, {
+              await resolveAuthorization(config, approvalId, {
                 actor: "runtime",
                 resumeChatTask: false,
                 evidenceExtra: { autoApproved: true, autoApprovedReason: decision.reason }
@@ -874,60 +928,23 @@ export async function completeLowRiskToolTask(
 // `dangerouslyAutoApprove`), call `resolveApproval` directly with
 // `actor: "runtime"` and the matching `evidenceExtra` marker — that
 // path is the right one to reach for, not this function.
-export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Approval> {
+export async function decideApproval(config: RuntimeConfig, approvalId: string, decision: "approve" | "deny"): Promise<Authorization> {
   if (decision === "approve") {
-    // browser.fill_secret approvals can only be resolved via /connect
-    // with the per-slot values. Routing through resolveApproval would
-    // flip status to approved but no DOM fill ever ran (the side
-    // effect lives inside POST /api/approvals/<id>/connect), and the
-    // chat-task loop would either hang in waiting_approval (if
-    // runApprovedAction's branch returns undefined) or resume with a
-    // false "fields filled" message. Refuse early so the contract
-    // holds across every caller (HTTP /approve, CLI, /permissions UI,
-    // future API clients).
-    const existing = readState(config.instance).approvals.find((a) => a.id === approvalId);
-    if (existing?.action === "browser.fill_secret") {
-      throw new Error("browser.fill_secret approvals must be resolved via /connect with the per-slot values, not /approve.");
-    }
-    if (existing?.action === "messaging.add_bridge") {
-      // Same defense-in-depth as browser.fill_secret: the side effect
-      // (addMessagingBridge) needs the name + bot-token values that
-      // only the /connect path carries. Routing through resolveApproval
-      // would flip the approval to approved with no bridge ever created.
-      // Holds the contract across every caller (HTTP /approve, CLI,
-      // /permissions UI, future API clients) — the HTTP refusal at
-      // src/http.ts is the outer layer; this is the load-bearing one.
-      throw new Error("messaging.add_bridge approvals must be resolved via /connect with the bridge name + bot token, not /approve.");
-    }
-    if (existing?.action === "messaging.approve_pairing") {
-      // /connect carries the Approve vs Reject discriminant (the
-      // `reject` flag on the body); /approve cannot express it. Also
-      // the side effect (allowChat / rejectPendingChat) needs the
-      // bridgeId + chatId from the payload, which the connect handler
-      // already reads. Defense in depth alongside the HTTP refusal.
-      throw new Error("messaging.approve_pairing approvals must be resolved via /connect (with optional reject:true), not /approve.");
-    }
-    if (existing?.action === "messaging.remove_bridge") {
-      // Destructive bridge teardown lives in the /connect handler's
-      // bounded module so the resolve + side effect stay atomic.
-      // Defense in depth.
-      throw new Error("messaging.remove_bridge approvals must be resolved via /connect, not /approve.");
-    }
-    const { approval } = await resolveApproval(config, approvalId, { actor: "user", resumeChatTask: true });
+    const { approval } = await resolveAuthorization(config, approvalId, { actor: "user", resumeChatTask: true });
     return approval;
   }
 
   const approval = await mutateState(config.instance, (state) => {
-    const item = state.approvals.find((candidate) => candidate.id === approvalId);
-    if (!item) throw new Error(`Approval not found: ${approvalId}`);
-    if (item.status !== "pending") throw new Error(`Approval is already ${item.status}`);
+    const item = state.authorizations.find((candidate) => candidate.id === approvalId);
+    if (!item) throw new Error(`Authorization not found: ${approvalId}`);
+    if (item.status !== "pending") throw new Error(`Authorization is already ${item.status}`);
     item.status = "denied";
     item.updatedAt = now();
     addAudit(
       state,
       {
         actor: "user",
-        action: "approval.denied",
+        action: "authorization.denied",
         target: item.target,
         risk: item.risk,
         taskId: item.taskId,
@@ -984,7 +1001,7 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
             risk: "low",
             taskId: task.id,
             runId: task.runId,
-            evidence: { error: message, viaApprovalDenied: item.id }
+            evidence: { error: message, viaAuthorizationDenied: item.id }
           },
           { taskId: task.id }
         );
@@ -1111,14 +1128,14 @@ export interface AutoApproveMarkers {
 // `requestCodeExecution`) persist `source` on the payload exactly so
 // this re-resolution can find it.
 export function mapApprovalToPolicyAction(
-  action: Approval["action"],
+  action: Authorization["action"],
   payload?: Record<string, unknown>
 ): PolicyAction | undefined {
   if (action === "terminal.exec") {
     if (payload && typeof payload.source === "string") return "code.exec";
     return "terminal.exec";
   }
-  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file" || action === "browser.connect") {
+  if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
     return action;
   }
   if (action === "messaging.send") {
@@ -1186,16 +1203,16 @@ export class TaskAlreadyTerminalError extends Error {
   }
 }
 
-export async function resolveApproval(
+export async function resolveAuthorization(
   config: RuntimeConfig,
   approvalId: string,
   opts: { actor?: "user" | "runtime"; resumeChatTask?: boolean; evidenceExtra?: AutoApproveMarkers } = {}
-): Promise<{ approval: Approval; toolResult: string | undefined }> {
+): Promise<{ approval: Authorization; toolResult: string | undefined }> {
   const actor = opts.actor ?? "user";
   const resumeChatTaskOpt = opts.resumeChatTask ?? true;
   const approval = await mutateState(config.instance, (state) => {
-    const item = state.approvals.find((candidate) => candidate.id === approvalId);
-    if (!item) throw new Error(`Approval not found: ${approvalId}`);
+    const item = state.authorizations.find((candidate) => candidate.id === approvalId);
+    if (!item) throw new Error(`Authorization not found: ${approvalId}`);
     if (item.status !== "pending") throw new ApprovalRaceLostError(approvalId, item.status);
     item.status = "approved";
     item.updatedAt = now();
@@ -1203,7 +1220,7 @@ export async function resolveApproval(
       state,
       {
         actor,
-        action: "approval.approved",
+        action: "authorization.approved",
         target: item.target,
         risk: item.risk,
         taskId: item.taskId,
@@ -1241,11 +1258,11 @@ export async function resolveApproval(
     // Re-read the approval row to pick up any guard flip (the
     // task-terminal guard inside `executeApprovedAction` can mark
     // the approval as `denied` via the
-    // `approval.cancelled_task_terminal` path while returning
+    // `authorization.cancelled_task_terminal` path while returning
     // `toolResult === undefined`). Returning the stale pre-guard
     // `approval` object would let `pendingOrAuto` mis-report
     // success to the model on a cancelled side effect.
-    const refreshed = readState(config.instance).approvals.find((a) => a.id === approvalId) ?? approval;
+    const refreshed = readState(config.instance).authorizations.find((a) => a.id === approvalId) ?? approval;
     return { approval: refreshed, toolResult };
   } catch (error) {
     if (error instanceof ApprovalRaceLostError) throw error;
@@ -1278,8 +1295,94 @@ export async function resolveApproval(
   }
 }
 
-// Internal side-effect executor. Assumes the caller (resolveApproval) has
-// ALREADY marked the approval as approved and emitted the approval.approved
+// Resolve a SetupRequest. The user-actor flow: the HTTP handler ran the
+// side effect (connectBrowser, createConnector, playwright.fill) and then
+// calls this to mark the row completed/cancelled and resume the chat-task
+// loop. No side-effect dispatch happens here — that's the difference from
+// resolveAuthorization. See docs/adr/authorization-vs-setup-request.md.
+export async function resolveSetupRequest(
+  config: RuntimeConfig,
+  approvalId: string,
+  decision: "complete" | "cancel",
+  opts: { actor?: "user" | "runtime"; toolResult?: string; resumeChatTask?: boolean } = {}
+): Promise<SetupRequest> {
+  const actor = opts.actor ?? "user";
+  const resume = opts.resumeChatTask ?? true;
+  const result = await mutateState(config.instance, (state) => {
+    const item = state.setupRequests.find((candidate) => candidate.id === approvalId);
+    if (!item) throw new Error(`Setup request not found: ${approvalId}`);
+    if (item.status !== "pending") throw new ApprovalRaceLostError(approvalId, item.status);
+    item.status = decision === "complete" ? "completed" : "cancelled";
+    item.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor,
+        action: decision === "complete" ? "setup.completed" : "setup.cancelled",
+        target: item.target,
+        risk: "low",
+        taskId: item.taskId,
+        runId: item.taskId ? state.tasks.find((task) => task.id === item.taskId)?.runId : undefined,
+        approvalId: item.id,
+        evidence: { action: item.action }
+      },
+      approvalAgentContext(item)
+    );
+    // On cancel, also fail the owning task (mirrors the authorization
+    // deny path so the chat loop doesn't keep waiting). Skip if the
+    // task is already terminal.
+    let taskRow: Task | undefined;
+    if (decision === "cancel" && item.taskId) {
+      cancelPendingTaskApprovals(state, item.taskId, "sibling.denied", item.id);
+      const task = state.tasks.find((t) => t.id === item.taskId);
+      if (task && !isTerminalTaskStatus(task.status)) {
+        task.toolCallState = undefined;
+        const message = `Setup cancelled: ${item.target}`;
+        task.status = "failed";
+        task.currentStep = "Failed";
+        task.error = message;
+        task.updatedAt = item.updatedAt;
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "task.failed",
+            target: task.id,
+            risk: "low",
+            taskId: task.id,
+            runId: task.runId,
+            evidence: { error: message, viaSetupCancelled: item.id }
+          },
+          { taskId: task.id }
+        );
+        recordInFlightAborted(state, config.instance, task, "sibling.denied", { originatingApprovalId: item.id });
+        taskRow = task;
+      }
+    }
+    return { item, task: taskRow };
+  });
+
+  if (decision === "cancel" && result.task) {
+    await updateRunFromTask(config, result.task);
+    if (result.task.jobId) await finalizeJobRunFromTask(config, result.task);
+    await syncSubagentFromTask(config, result.task);
+    await cancelDescendantTasks(config, result.task.id);
+  }
+
+  // Resume the chat-task loop with the synthesized tool result. The
+  // /complete handler computes the result string (e.g. "Connected to X.
+  // Proceed.") since it owns the side-effect outcome.
+  if (resume && decision === "complete" && opts.toolResult !== undefined && result.item.taskId) {
+    const toolCallId = approvalToolCallId(result.item.payload);
+    if (toolCallId) {
+      await resumeChatTask(config, result.item.taskId, toolCallId, opts.toolResult);
+    }
+  }
+  return result.item;
+}
+
+// Internal side-effect executor. Assumes the caller (resolveAuthorization) has
+// ALREADY marked the approval as approved and emitted the authorization.approved
 // audit row. This function runs the per-action work, emits the
 // `<action>` audit row, optionally resumes the chat-task loop, and
 // returns the per-action result string (the same string the chat-task
@@ -1289,7 +1392,7 @@ export async function resolveApproval(
 // or `decideApproval` so the approval state machine stays consistent.
 async function executeApprovedAction(
   config: RuntimeConfig,
-  approval: Approval,
+  approval: Authorization,
   opts: { resumeChatTask?: boolean; evidenceExtra?: AutoApproveMarkers } = {}
 ): Promise<string | undefined> {
   const shouldResumeChat = opts.resumeChatTask ?? true;
@@ -1328,7 +1431,7 @@ async function executeApprovedAction(
         ? state.tasks.find((t) => t.id === approval.taskId)
         : undefined;
       if (taskNow && isTerminalTaskStatus(taskNow.status)) {
-        const item = state.approvals.find((a) => a.id === approval.id);
+        const item = state.authorizations.find((a) => a.id === approval.id);
         if (item && item.status === "approved") {
           item.status = "denied";
           item.updatedAt = now();
@@ -1336,7 +1439,7 @@ async function executeApprovedAction(
             state,
             {
               actor: "runtime",
-              action: "approval.cancelled_task_terminal",
+              action: "authorization.cancelled_task_terminal",
               target: item.target,
               risk: item.risk,
               taskId: item.taskId,
@@ -1376,7 +1479,7 @@ async function executeApprovedAction(
     // dispatch turn). If we kept the claim alive through resume, a
     // cancel landing during the resumed turn would fire
     // `controller.abort()` against an already-finished approval,
-    // emitting a stale `approval.in_flight_aborted` row for a side
+    // emitting a stale `authorization.in_flight_aborted` row for a side
     // effect that already wrote its normal audit row. Pass
     // `shouldResumeChat: false` to `runApprovedAction` and call
     // `resumeChatTask` AFTER releasing.
@@ -1412,97 +1515,20 @@ interface RunApprovedActionContext {
 // signal and reports the result as `_aborted` if the signal wins.
 async function runApprovedAction(
   config: RuntimeConfig,
-  approval: Approval,
+  approval: Authorization,
   signal: AbortSignal,
   ctx: RunApprovedActionContext
 ): Promise<string | undefined> {
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
 
-  if (approval.action === "connector.request") {
-    // The side effect (createConnector + checkConnector) already ran
-    // inside POST /api/approvals/<id>/connect — that endpoint only
-    // resolves the approval after the connector probes healthy. There's
-    // nothing for us to do here except feed back a synthesized tool
-    // result that tells the chat-task loop to resume from the
-    // request_connector tool call. `extraEvidence` is intentionally
-    // dropped: the auto-approve path never reaches this branch (the
-    // connect endpoint is the only resolver), so there's no marker to
-    // stamp on a side-effect audit row that doesn't exist.
-    void extraEvidence;
-    const providerLabel =
-      typeof approval.payload.providerLabel === "string"
-        ? approval.payload.providerLabel
-        : String(approval.payload.provider ?? "provider");
-    if (approval.taskId) {
-      appendTrace(config.instance, approval.taskId, {
-        type: "tool",
-        message: "Connector connected via connect endpoint",
-        data: { provider: approval.payload.provider, approvalId: approval.id }
-      });
-    }
-    const result = `Connected to ${providerLabel}. Proceed with the original request.`;
-    if (shouldResumeChat && chatToolCallId && approval.taskId) {
-      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
-    }
-    return result;
-  }
-
-  if (approval.action === "messaging.add_bridge") {
-    // The /connect handler owns the entire add_bridge lifecycle now:
-    // it calls resolveApproval(resumeChatTask:false) to atomically
-    // close the deny-mid-create race BEFORE addMessagingBridge runs,
-    // then calls resumeChatTask with the actual outcome string. By
-    // the time resolveApproval invokes this branch the bridge has
-    // not yet been created — we can't synthesize a truthful result
-    // here because the side effect comes AFTER this point. Return
-    // undefined; /connect handles resume. /approve route refuses
-    // messaging.add_bridge (see src/http.ts and the decideApproval
-    // guard above), so /connect is the only resolver and this branch
-    // is the resolveApproval-side no-op for that single path.
-    void extraEvidence;
-    void shouldResumeChat;
-    void chatToolCallId;
-    return undefined;
-  }
-
-  if (approval.action === "messaging.approve_pairing") {
-    // Same no-op pattern as messaging.add_bridge. The /connect
-    // handler runs allowChat or rejectPendingChat AFTER the atomic
-    // resolveApproval, then calls resumeChatTask with the
-    // appropriate outcome string itself.
-    void extraEvidence;
-    void shouldResumeChat;
-    void chatToolCallId;
-    return undefined;
-  }
-
-  if (approval.action === "messaging.remove_bridge") {
-    // Same no-op pattern: /connect handler owns the
-    // removeMessagingBridge call + the resume.
-    void extraEvidence;
-    void shouldResumeChat;
-    void chatToolCallId;
-    return undefined;
-  }
-
-  if (approval.action === "browser.fill_secret") {
-    // The /connect handler owns the entire fill_secret lifecycle now:
-    // it calls resolveApproval(resumeChatTask:false) to atomically
-    // close the deny race BEFORE per-slot playwright fills, then runs
-    // the fills, writes the redacted audit row, and calls
-    // resumeChatTask with a result string that reflects actual filled
-    // / errored slots. By the time resolveApproval invokes this
-    // branch the agent has not yet been told what happened — and we
-    // can't synthesize a truthful result here because the fills come
-    // AFTER this point. Return undefined; /connect handles resume.
-    // The /approve route refuses fill_secret (see src/http.ts), so
-    // /connect is the only resolver and this branch is the
-    // resolveApproval-side no-op for that single path.
-    void extraEvidence;
-    void shouldResumeChat;
-    void chatToolCallId;
-    return undefined;
-  }
+  // SetupRequest actions (browser.connect, connector.request,
+  // browser.fill_secret, and the messaging.* connect actions —
+  // add_bridge, approve_pairing, remove_bridge) no longer reach this
+  // executor — their side effects run inside the
+  // /api/setup-requests/:id/complete endpoint (delegating to the bounded
+  // runMessaging*Connect / runFillSecretConnect modules), not through
+  // Authorization side-effect dispatch. See
+  // docs/adr/authorization-vs-setup-request.md.
 
   if (approval.action === "file.write") {
     // Do the abort check, path validation, file I/O, and audit-row
@@ -2038,124 +2064,6 @@ async function runApprovedAction(
     return resultStr;
   }
 
-  if (approval.action === "browser.connect") {
-    // Reason is captured at request time so the audit row preserves
-    // WHY the user was asked to consent (e.g. "Sign in to Google
-    // Cloud Console"). The actual side effect — spawning a managed
-    // Chrome — runs through the same `connectBrowser` capability
-    // a `gini browser connect` CLI call uses, so the lifecycle is
-    // identical from the runtime's perspective.
-    const reason = typeof approval.payload.reason === "string" ? approval.payload.reason : "(no reason given)";
-    // Headless rides on the approval payload, captured at request time
-    // by requestBrowserConnect. Only an explicit boolean true unlocks
-    // the windowless launch — any other value (undefined, false,
-    // non-boolean) falls back to the visible default.
-    const explicitHeadless = approval.payload.headless === true;
-    // Two-stage flow: when the user clicks "Connect" first, the HTTP
-    // `/open-browser` endpoint launches the visible Chrome and navigates
-    // to the target URL, then sets `signInStarted: true` on the payload.
-    // The user signs in inside that window and clicks "I've signed in",
-    // which routes here through the regular /approve endpoint. At that
-    // point we switch the same per-instance profile to headless so the
-    // window closes and the agent continues invisibly with the persisted
-    // cookies. When signInStarted is false (legacy auto-approve / yolo
-    // path with no prior open-browser call), we honor the explicit
-    // headless flag the agent passed.
-    const signInStarted = approval.payload.signInStarted === true;
-    const headless = signInStarted ? true : explicitHeadless;
-    let result: string;
-    let succeeded = false;
-    let mode: string | undefined;
-    let dataDir: string | null | undefined;
-    let recordHeadless: boolean | undefined;
-    try {
-      if (signal.aborted) {
-        result = JSON.stringify({ success: false, aborted: true, error: "Browser connect aborted: task was cancelled." });
-      } else {
-        // connectBrowser is idempotent — if the user already has a
-        // managed Chrome attached, it returns the existing record
-        // without relaunching. That's the right shape for an agent
-        // calling this after an earlier connect.
-        //
-        // `mode: "managed"` enforces the approval card's contract: the
-        // user just consented to "Connect to agent's browser," so a stale
-        // CDP-mode record (which may be headless or attached to a
-        // browser the user can't see) must be torn down and replaced
-        // with a fresh managed launch — never silently returned as-is.
-        //
-        // `headless` is passed through verbatim from the approval
-        // payload. When true, Playwright launches the same per-instance
-        // profile dir with headless: true — cookies from a prior
-        // visible session replay so the new context is already signed
-        // in.
-        //
-        // `skipAudit: true` because this dispatch already records a
-        // richer browser.connect audit row below (with the user-facing
-        // `reason` and the `approvalId`); letting the capability also
-        // write its own row would double-count the action and leave a
-        // reasonless row in the activity log. `skipAudit` lives on the
-        // third (internal) argument — NOT on the public `ConnectInput` —
-        // so an HTTP caller hitting `POST /api/browser/connect` with body
-        // `{"skipAudit": true}` cannot suppress its own audit row.
-        const status = await connectBrowser(config, { mode: "managed", headless }, { skipAudit: true });
-        succeeded = status.connected;
-        mode = status.record?.mode;
-        dataDir = status.record?.dataDir;
-        recordHeadless = status.record?.headless;
-        result = JSON.stringify({
-          success: succeeded,
-          connected: status.connected,
-          mode,
-          dataDir,
-          headless: recordHeadless
-        });
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      result = JSON.stringify({ success: false, error: message });
-    }
-    const task = await mutateState(config.instance, (state) => {
-      addAudit(
-        state,
-        {
-          actor: "runtime",
-          action: "browser.connect",
-          target: reason,
-          risk: "medium",
-          taskId: approval.taskId,
-          runId: approval.taskId ? state.tasks.find((t) => t.id === approval.taskId)?.runId : undefined,
-          approvalId: approval.id,
-          // Spread caller markers FIRST so canonical runtime fields can't
-          // be overwritten by smuggled keys. The side-effect audit
-          // mirrors the per-action shape of file.write / browser.upload_file.
-          evidence: { ...extraEvidence, reason, success: succeeded, mode, dataDir, headless: recordHeadless }
-        },
-        approvalAgentContext(approval)
-      );
-      if (approval.taskId && !chatToolCallId) {
-        completeApprovedTask(
-          state,
-          approval.taskId,
-          succeeded ? "Browser connect completed." : "Browser connect failed.",
-          succeeded ? undefined : "Browser connect failed."
-        );
-      }
-      return approval.taskId ? state.tasks.find((item) => item.id === approval.taskId) : undefined;
-    });
-    if (approval.taskId) {
-      appendTrace(config.instance, approval.taskId, {
-        type: succeeded ? "tool" : "error",
-        message: "Browser connect approved",
-        data: { reason, success: succeeded, mode, headless: recordHeadless }
-      });
-    }
-    if (task) await updateRunFromTask(config, task);
-    if (shouldResumeChat && chatToolCallId && approval.taskId) {
-      await resumeChatTask(config, approval.taskId, chatToolCallId, result);
-    }
-    return result;
-  }
-
   return undefined;
 }
 
@@ -2184,7 +2092,7 @@ function readSignalReason(signal: AbortSignal): string | undefined {
 interface ObserveLateCompletionInput {
   config: RuntimeConfig;
   outcome: { kind: "aborted"; started: true; detached: Promise<{ resolved: true; value: string } | { resolved: false; error: unknown }> };
-  approval: Approval;
+  approval: Authorization;
   ref: string;
   displayPath: string;
   extraEvidence: AutoApproveMarkers;
@@ -2250,7 +2158,7 @@ function observeBrowserUploadLateCompletion(input: ObserveLateCompletionInput): 
 // records WHICH terminal transition triggered the abort.
 function emitFileActionAbortedSync(
   state: RuntimeState,
-  approval: Approval,
+  approval: Authorization,
   action: "file.write_aborted" | "file.patch_aborted",
   extraEvidence: AutoApproveMarkers,
   signal: AbortSignal
@@ -2281,7 +2189,7 @@ function emitFileActionAbortedSync(
 // aborted path's audit shape minus the exit code / output.
 async function emitTerminalAborted(
   config: RuntimeConfig,
-  approval: Approval,
+  approval: Authorization,
   extraEvidence: AutoApproveMarkers,
   meta: { command: string; usePty: boolean; signal: AbortSignal }
 ): Promise<string> {

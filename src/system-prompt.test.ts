@@ -167,7 +167,7 @@ describe("buildAgentSystemContext", () => {
       instructionsOverride: "Custom rules only."
     });
     expect(out).toBe("Custom rules only.");
-    expect(out).not.toContain("local-first personal agent");
+    expect(out).not.toContain("You are Gini");
   });
 
   test("blank instructionsOverride falls back to the default", () => {

@@ -28,10 +28,31 @@ export async function revokePairedDevice(config: RuntimeConfig, deviceId: string
 }
 
 export async function authorizedBearer(config: RuntimeConfig, bearer: string | undefined): Promise<boolean> {
-  if (bearer === config.token) return true;
-  if (!bearer) return false;
+  return Boolean(await resolveCredentialFromBearer(config, bearer));
+}
+
+// Resolves an incoming bearer to a stable credential identifier so
+// per-credential state (push devices today, read state and unread
+// counters in Step 3) can be scoped without giving every caller a
+// view of every other paired device's state.
+//
+// Returns:
+//   - "owner"  — when the bearer matches the runtime's config token
+//                (CLI, BFF, web). Single shared identity since the
+//                config token is a singleton.
+//   - "<deviceId>" — when the bearer matches an active PairedDevice
+//                row in state.devices. Each paired mobile install
+//                has its own credential id.
+//   - null    — bearer is absent or doesn't match anything active
+//                (mapped to 401 at the HTTP boundary).
+export async function resolveCredentialFromBearer(
+  config: RuntimeConfig,
+  bearer: string | undefined
+): Promise<string | null> {
+  if (!bearer) return null;
+  if (bearer === config.token) return "owner";
   const device = await mutateState(config.instance, (state) => findActiveDeviceByToken(state, bearer));
-  return Boolean(device);
+  return device ? device.id : null;
 }
 
 export function redactDevice(device: ReturnType<typeof readState>["devices"][number]) {

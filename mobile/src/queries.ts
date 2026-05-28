@@ -4,26 +4,17 @@ import {
   useQueryClient,
   type UseQueryOptions
 } from "@tanstack/react-query";
-import { api } from "./api";
+import { useEffect, useRef, useState } from "react";
+import { AppState, type AppStateStatus } from "react-native";
+import EventSource from "react-native-sse";
+import { api, ApiError, resolveStreamEndpoint, type UploadRef } from "./api";
 import type {
   AgentRecord,
   AgentsResponse,
   ChatBlock,
   ChatSession,
-  ChatSessionDetail,
   RuntimeStatus
 } from "./types";
-
-// Web parity: chat task statuses where partial text is no longer arriving.
-// `waiting_approval` is included here on the polling side because the
-// runtime can't make further progress without user input; we don't poll
-// faster while sitting on it.
-const CHAT_TERMINAL_TASK_STATUSES = new Set<string>([
-  "completed",
-  "failed",
-  "cancelled",
-  "waiting_approval"
-]);
 
 export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
   return useQuery<RuntimeStatus>({
@@ -88,25 +79,6 @@ export function useChats(agentId: string | null) {
   });
 }
 
-export function useChatSession(id: string | null) {
-  return useQuery<ChatSessionDetail>({
-    queryKey: ["chat", id],
-    queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
-    enabled: Boolean(id),
-    // Match the web client: 800ms while a task is in flight so the
-    // assistant placeholder phase indicator updates briskly, 3s when
-    // everything is settled.
-    refetchInterval: (query) => {
-      const data = query.state.data;
-      if (!data) return 3000;
-      const hasInflight = data.tasks?.some(
-        (t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status)
-      );
-      return hasInflight ? 800 : 3000;
-    }
-  });
-}
-
 // Phase labels that mean "no task in flight". Anything else (Thinking,
 // Working: <tool>, Waiting for approval, …) keeps the in-flight flag
 // raised so the polling cadence stays brisk and the composer's busy
@@ -114,8 +86,9 @@ export function useChatSession(id: string | null) {
 const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
 
 // Derives "is the runtime still doing work?" from the block list. The
-// web client gets this for free from SSE; on mobile we poll, so the
-// cadence below is what makes streaming text feel live.
+// chat detail screen drives its composer busy state off this — block
+// deltas now arrive over SSE, so the signal updates as soon as the
+// gateway emits, without any polling cadence in the loop.
 //
 // Rules (mirror src/execution/chat-task.ts emission anchors):
 //   - The most recent phase block dictates the high-level state. If its
@@ -125,9 +98,10 @@ const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed
 //     (e.g. the model said "Thinking" while a long-running parallel tool
 //     is still going). callId pairs the running entry with its terminal
 //     status, so we count distinct callIds with no later non-running row.
-//   - An approval_requested block whose tool_call still reads "running"
-//     means we're paused on the user — keep polling at the brisk cadence
-//     so the bubble reflects the eventual approve/deny flip.
+//   - An authorization_requested or setup_requested block whose
+//     tool_call still reads "running" means we're paused on the user —
+//     the composer stays busy until the eventual approve/deny/complete
+//     flip arrives on the stream.
 export function isTaskInFlight(blocks: ChatBlock[]): boolean {
   if (blocks.length === 0) return false;
 
@@ -165,23 +139,358 @@ export function isTaskInFlight(blocks: ChatBlock[]): boolean {
   return !TERMINAL_PHASE_LABELS.has(latestPhaseLabel);
 }
 
-// ChatBlock consumer for the detail screen. Polls /blocks at 800ms while
-// any block-derived signal says a task is in flight, 3s otherwise.
-// Mobile doesn't run SSE in this round (React Native's EventSource
-// situation is messy), so polling is the live-update mechanism.
+// Chat-detail stream consumer. Combines a one-shot /blocks fetch (seeds
+// the initial render and gives us a Last-Event-ID cursor) with an SSE
+// subscription to /stream for live updates. The same SSE connection
+// delivers two event kinds:
+//   - `chat_block` — block inserts / upserts (assistant_text deltas,
+//     tool_call status flips, phase markers, …). Backed by chat-blocks
+//     pub/sub on the server; client merges by id.
+//   - `chat_session` — session-record updates (currently: title renames).
+//     Sent once on initial connect so the client always has a title
+//     without a separate REST round-trip, then again whenever the
+//     gateway renames the chat (explicit /rename or the auto-rename
+//     after the first qualifying turn).
 //
-// Returns the typed block list directly — no derivation, no normalization;
-// the renderer is exhaustive over the discriminated union.
-export function useChatBlocks(sessionId: string | null) {
-  return useQuery<ChatBlock[]>({
-    queryKey: ["chat-blocks", sessionId],
-    queryFn: () => api<ChatBlock[]>(`/chat/${sessionId}/blocks`),
-    enabled: Boolean(sessionId),
-    refetchInterval: (query) => {
-      const blocks = query.state.data ?? [];
-      return isTaskInFlight(blocks) ? 800 : 3000;
-    }
+// Trust + lifecycle model (4-6 lines per CLAUDE.md):
+//   - Bearer token is read from the in-memory credential cache on every
+//     EventSource open via resolveStreamEndpoint; a 401 from the initial
+//     /blocks fetch surfaces as ApiError so the screen's redirect-to-setup
+//     effect still fires.
+//   - We manage Last-Event-ID ourselves. react-native-sse only retains
+//     its `lastEventId` for the life of one EventSource instance; every
+//     reconstruction (sessionId change, AppState toggle, error-driven
+//     reopen, initial connect after seed) would otherwise reset it. We
+//     stash the wire id (`<block_id>:<ts>` for SSE frames, the bare id
+//     for the /blocks seed) in lastSeenIdRef and rewrite the header on
+//     every open; the gateway parses the suffix in listChatBlocksAfter
+//     to replay in-place upserts to the cursor row. chat_session events
+//     are not part of the Last-Event-ID cursor — every reconnect re-emits
+//     the current session record from the server's initial-send path.
+//   - AppState 'background' tears the connection down so an idle device
+//     doesn't hold an open XHR; 'active' rebuilds it and the same
+//     Last-Event-ID path replays only what was missed.
+//
+// Returns the typed block list and the session record directly — no
+// derivation, no normalization; the renderer is exhaustive over the
+// block discriminated union, and the session field is just the wire
+// shape from the gateway.
+export function useChatStream(sessionId: string | null): {
+  blocks: ChatBlock[] | undefined;
+  session: ChatSession | undefined;
+  isPending: boolean;
+  error: Error | null;
+} {
+  // Stream state is tagged with the sessionId it was loaded for so a
+  // chat A → chat B switch doesn't paint chat A's blocks under chat B's
+  // header for one frame. The reset useEffect only runs after render,
+  // so without this gate the very first render after sessionId changes
+  // would still see the previous chat's blocks in state. Reading via
+  // `forSessionId === sessionId ? blocks : undefined` collapses that
+  // window to a single empty paint, matching the loading skeleton. The
+  // session field follows the same gate so a stale title from chat A
+  // doesn't briefly head chat B.
+  type StreamState = {
+    forSessionId: string | null;
+    blocks: ChatBlock[] | undefined;
+    session: ChatSession | undefined;
+  };
+  const [state, setState] = useState<StreamState>({
+    forSessionId: null,
+    blocks: undefined,
+    session: undefined
   });
+  const [error, setError] = useState<Error | null>(null);
+
+  // Latest setters live in refs so the long-lived effect closures (SSE
+  // listeners, AppState subscription) don't get torn down on every state
+  // update. Without this, every block delta would unsubscribe and
+  // reopen the EventSource, defeating the point of streaming.
+  const dataRef = useRef<StreamState>({
+    forSessionId: null,
+    blocks: undefined,
+    session: undefined
+  });
+  useEffect(() => {
+    dataRef.current = state;
+  }, [state]);
+
+  // Tracks the id of the most recent block observed so we can carry
+  // Last-Event-ID across every EventSource reconstruction — react-native-sse
+  // tracks its own lastEventId per instance, but a fresh `new EventSource()`
+  // after AppState transitions, error-driven reopen, or initial connect
+  // starts blank. Passing the header explicitly lets the gateway's
+  // listChatBlocksAfter replay only what was missed. The SSE wire id is
+  // the same string the server assigns as the block id, so we update this
+  // wherever we mutate dataRef.
+  const lastSeenIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    // Reset unconditionally before branching so a sessionId change
+    // (chat A → chat B) doesn't leave chat A's blocks rendered until
+    // chat B's seed resolves. The previous effect's cleanup tears down
+    // the old subscription; this clears the view so the next paint
+    // doesn't briefly mix the two chats' contents. Tagging the state
+    // with `forSessionId = sessionId` lets the render-time read return
+    // `undefined` until the seed for the new chat lands.
+    setState({ forSessionId: sessionId, blocks: undefined, session: undefined });
+    setError(null);
+    dataRef.current = { forSessionId: sessionId, blocks: undefined, session: undefined };
+    lastSeenIdRef.current = null;
+
+    if (!sessionId) return;
+
+    let cancelled = false;
+    let seeded = false;
+    let es: EventSource<"chat_block" | "chat_session"> | null = null;
+    let appStateSub: { remove(): void } | null = null;
+
+    // Merge a single block into the list. assistant_text streams in as
+    // repeated frames with the same id and a growing `text` payload; we
+    // upsert by id so the final list contains one entry per block, with
+    // the latest payload. Other kinds also upsert (tool_call status
+    // flips reuse the call's block id, etc.) — see chat-block-protocol.md.
+    //
+    // Race guard: if a stale event from chat A arrives after the
+    // sessionId effect has reset to chat B (or vice versa), drop it.
+    // dataRef.current.forSessionId is the source of truth — it's set
+    // synchronously at the top of this effect, before any async work.
+    //
+    // `wireEventId` is the raw `id:` line value (e.g. `<block_id>:<ts>`),
+    // distinct from `block.id` (the JSON payload's id field). We store
+    // the wire form so the next Last-Event-ID header carries the
+    // gateway's updated_at snapshot suffix; the gateway parses that
+    // suffix to detect in-place upserts to the cursor row.
+    const upsert = (block: ChatBlock, wireEventId: string | null): void => {
+      if (dataRef.current.forSessionId !== sessionId) return;
+      if (block.sessionId !== sessionId) return;
+      const current = dataRef.current.blocks ?? [];
+      const idx = current.findIndex((b) => b.id === block.id);
+      const next =
+        idx >= 0
+          ? current.map((b, i) => (i === idx ? block : b))
+          : [...current, block];
+      const session = dataRef.current.session;
+      dataRef.current = { forSessionId: sessionId, blocks: next, session };
+      if (wireEventId) lastSeenIdRef.current = wireEventId;
+      setState({ forSessionId: sessionId, blocks: next, session });
+    };
+
+    // Apply a chat_session frame. Race-guarded by forSessionId the same
+    // way upsert() is, so a delayed frame from chat A can't overwrite
+    // chat B's session record. Not part of the Last-Event-ID cursor:
+    // the gateway re-emits the current record on every reconnect, so
+    // missing a transient rename frame is harmless.
+    const applySession = (session: ChatSession): void => {
+      if (dataRef.current.forSessionId !== sessionId) return;
+      if (session.id !== sessionId) return;
+      const blocks = dataRef.current.blocks;
+      dataRef.current = { forSessionId: sessionId, blocks, session };
+      setState({ forSessionId: sessionId, blocks, session });
+    };
+
+    const openStream = (): void => {
+      if (cancelled || es) return;
+      let endpoint: { url: string; headers: Record<string, string> };
+      try {
+        endpoint = resolveStreamEndpoint(`/chat/${sessionId}/stream`);
+      } catch (err) {
+        if (!cancelled) setError(err as Error);
+        return;
+      }
+      // Build a fresh header set per open so a Last-Event-ID accumulated
+      // by upsert() or the seed handler rides along on every new XHR.
+      // react-native-sse keeps the header for as long as the instance
+      // lives; reconstruction (AppState toggle, error reopen, sessionId
+      // change) is exactly when the cursor would otherwise reset.
+      const headers: Record<string, string> = { ...endpoint.headers };
+      if (lastSeenIdRef.current) {
+        headers["Last-Event-ID"] = lastSeenIdRef.current;
+      }
+      const source = new EventSource<"chat_block" | "chat_session">(endpoint.url, {
+        headers,
+        // 0 disables auto-reconnect; we want it on. The library default
+        // (5000ms) is fine — a longer gap means slower recovery from a
+        // tunnel restart but doesn't lose data thanks to Last-Event-ID.
+        pollingInterval: 5000
+      });
+      source.addEventListener("chat_block", (ev) => {
+        if (cancelled) return;
+        if (!ev.data) return;
+        try {
+          const block = JSON.parse(ev.data) as ChatBlock;
+          upsert(block, ev.lastEventId ?? null);
+        } catch {
+          // Drop malformed frames; the server controls this format and a
+          // parse failure here is a wire-protocol bug, not a user one.
+        }
+      });
+      source.addEventListener("chat_session", (ev) => {
+        if (cancelled) return;
+        if (!ev.data) return;
+        try {
+          applySession(JSON.parse(ev.data) as ChatSession);
+        } catch {
+          // Same rationale as chat_block — wire format is server-controlled.
+        }
+      });
+      source.addEventListener("error", (ev) => {
+        if (cancelled) return;
+        // 401 means our bearer token was rejected — the library will
+        // happily keep retrying with the same dead token, so we surface
+        // it to the screen (which already routes 401s to the setup flow)
+        // and tear the connection down. Other errors are transient
+        // network blips; let the library reconnect on its polling
+        // interval, where Last-Event-ID will resume the stream.
+        if (ev.type === "error" && "xhrStatus" in ev && ev.xhrStatus === 401) {
+          setError(new ApiError(401, "Unauthorized"));
+          closeStream();
+        }
+      });
+      es = source;
+    };
+
+    const closeStream = (): void => {
+      if (!es) return;
+      // react-native-sse schedules a reconnect poll AFTER our error
+      // handler returns: on a non-2xx XHR finish the library dispatches
+      // 'error', then unconditionally calls `_pollAgain(interval)` which
+      // sets `_pollTimer = setTimeout(open, interval)`. Our inline
+      // `close()` clears `_pollTimer` BEFORE the library has set it, so
+      // an orphan timer would later fire `open()` and resurrect the
+      // dead connection (re-hitting /stream with the same dead bearer
+      // token on 401). Capture the dying instance, run the inline
+      // teardown, and schedule a deferred `close()` that runs AFTER the
+      // library's `_pollAgain` so the post-dispatch timer gets cleared.
+      const dying = es;
+      es = null;
+      dying.removeAllEventListeners();
+      dying.close();
+      setTimeout(() => {
+        try {
+          dying.close();
+        } catch {
+          // close() is idempotent in react-native-sse; the catch is
+          // belt-and-suspenders against a future internal change.
+        }
+      }, 0);
+    };
+
+    // Gated open: we must never spin up an EventSource before the seed
+    // has resolved (so the seed merge sees an authoritative baseline) or
+    // while the app is backgrounded (iOS will tear the XHR down anyway).
+    // The AppState callback and the seed completion both route through
+    // here so neither path can race past the other.
+    const maybeOpenStream = (): void => {
+      if (!seeded) return;
+      if (cancelled) return;
+      if (es) return;
+      if (AppState.currentState !== "active") return;
+      openStream();
+    };
+
+    // Seed both blocks and the session record before opening the stream
+    // so the chat renders its persisted history AND its canonical title
+    // in a single first paint. The two REST calls fire in parallel
+    // (Promise.all) because the chat detail screen needs both up front:
+    // without the session in the seed, the header would briefly show
+    // the first-user-text fallback before the SSE chat_session frame
+    // lands and overwrites it — a visible flash on chat-open.
+    //
+    // The seed resolve stashes the last block's id into lastSeenIdRef;
+    // openStream() reads that ref and injects it as `Last-Event-ID` on
+    // the first SSE connect, so the gateway's listChatBlocksAfter only
+    // replays what's actually new (typically nothing). If `merged` is
+    // empty (fresh chat with no blocks), the header is omitted and the
+    // gateway falls back to full backfill; the id-keyed upsert collapses
+    // any duplicates.
+    (async () => {
+      try {
+        const [blocks, session] = await Promise.all([
+          api<ChatBlock[]>(`/chat/${sessionId}/blocks`),
+          api<ChatSession>(`/chat/${sessionId}`)
+        ]);
+        if (cancelled) return;
+        // Merge by id rather than overwrite. If the AppState handler or
+        // any other path opened a stream while the seed was in flight,
+        // dataRef may already hold deltas that arrived ahead of the
+        // /blocks response; overwriting would drop them. Seeded rows
+        // win for their own ids; any extra ids already in dataRef are
+        // preserved at the tail.
+        const existing = dataRef.current.blocks ?? [];
+        const seededIds = new Set(blocks.map((b) => b.id));
+        const merged: ChatBlock[] = [
+          ...blocks,
+          ...existing.filter((b) => !seededIds.has(b.id))
+        ];
+        // Prefer a session record that already arrived over SSE (a
+        // mid-seed reconnect could plausibly land one, though with
+        // Promise.all the REST response usually wins) — the SSE frame
+        // is the more recent snapshot from the same source.
+        const liveSession = dataRef.current.session ?? session;
+        dataRef.current = { forSessionId: sessionId, blocks: merged, session: liveSession };
+        // Seed the resume cursor so the very first SSE open skips
+        // the redundant full replay listChatBlocksAfter(null) emits.
+        // The /blocks REST response only carries the block's id (no
+        // updated_at suffix), so we stash the bare id; the gateway's
+        // listChatBlocksAfter falls back to reading the row's current
+        // updated_at when the suffix is absent. Subsequent SSE frames
+        // will rewrite this with the wire `<id>:<ts>` form.
+        lastSeenIdRef.current = merged[merged.length - 1]?.id ?? null;
+        setState({ forSessionId: sessionId, blocks: merged, session: liveSession });
+        setError(null);
+        seeded = true;
+        maybeOpenStream();
+      } catch (err) {
+        if (cancelled) return;
+        setError(err as Error);
+        // Don't open the stream on a 401 — the screen redirects to setup.
+        if (!(err instanceof ApiError && err.status === 401)) {
+          // Mark as seeded even on transport failure so a foregrounding
+          // user can retry via the AppState handler; the gateway will
+          // backfill via listChatBlocksAfter(null) on first connect.
+          seeded = true;
+          maybeOpenStream();
+        }
+      }
+    })();
+
+    // AppState: drop the connection in background, reopen on foreground.
+    // iOS may keep the XHR alive briefly after backgrounding, but the OS
+    // can suspend it at any time without notifying the JS layer; tearing
+    // down explicitly avoids holding a half-dead socket that doesn't
+    // resume cleanly on return.
+    const onAppState = (state: AppStateStatus): void => {
+      if (cancelled) return;
+      if (state === "active") {
+        maybeOpenStream();
+      } else if (state === "background" || state === "inactive") {
+        closeStream();
+      }
+    };
+    appStateSub = AppState.addEventListener("change", onAppState);
+
+    return () => {
+      cancelled = true;
+      closeStream();
+      if (appStateSub) appStateSub.remove();
+    };
+  }, [sessionId]);
+
+  // Gate the rendered value on the loaded-for sessionId. Between the
+  // moment `sessionId` flips (chat A → chat B) and the reset effect
+  // running, render-time `state` still carries chat A's blocks; the
+  // gate returns `undefined` for that one paint so the screen shows
+  // the empty/loading state instead of the previous chat's history.
+  // The same gate applies to the session record — a stale chat-A title
+  // would otherwise briefly head chat B.
+  const matches = state.forSessionId === sessionId;
+  const blocks: ChatBlock[] | undefined = matches ? state.blocks : undefined;
+  const session: ChatSession | undefined = matches ? state.session : undefined;
+  const isPending: boolean =
+    Boolean(sessionId) && (!matches || state.blocks === undefined);
+
+  return { blocks, session, isPending, error };
 }
 
 // POST /api/chat always creates the chat under the runtime's currently
@@ -210,23 +519,29 @@ export function useCreateChat(agentId: string | null) {
   });
 }
 
+export interface SendMessageInput {
+  content: string;
+  images?: UploadRef[];
+}
+
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
-  return useMutation<{ taskId: string }, Error, string>({
-    mutationFn: (content: string) => {
+  return useMutation<{ taskId: string }, Error, SendMessageInput>({
+    mutationFn: ({ content, images }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
+      const body: Record<string, unknown> = { content };
+      if (images && images.length > 0) body.images = images;
       return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content })
+        body: JSON.stringify(body)
       });
     },
     onSuccess: () => {
-      // Invalidate both the legacy session query and the block list so the
-      // chat detail screen picks up the new user_text block (and the
-      // runtime's follow-up phase / assistant_text blocks) on the next
-      // poll tick rather than waiting for the 3s idle cadence to expire.
+      // useChatBlocks is now SSE-driven, so the new user_text + assistant
+      // blocks arrive without an explicit invalidation. We still bump the
+      // legacy session query (used by older list affordances) and the
+      // sidebar chat list so titles + previews refresh promptly.
       qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-      qc.invalidateQueries({ queryKey: ["chat-blocks", sessionId] });
       qc.invalidateQueries({ queryKey: ["chats"] });
     }
   });
