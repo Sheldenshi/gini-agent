@@ -181,7 +181,6 @@ export default function AgentsScreen() {
       <View style={styles.header}>
         <TouchableOpacity
           onPress={() => setPickerOpen(true)}
-          disabled={list.length === 0}
           hitSlop={8}
           style={styles.headerIconButton}
           accessibilityRole="button"
