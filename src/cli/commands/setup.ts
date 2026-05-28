@@ -9,7 +9,7 @@ import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { configPath } from "../../paths";
-import { hasUsableCodexCredentials, normalizeProvider } from "../../provider";
+import { hasUsableCodexCredentials, normalizeProvider, normalizeRetentionValue } from "../../provider";
 import {
   ensureSecretsEnvPerms,
   secretsEnvPath,
@@ -23,11 +23,13 @@ import type { RuntimeConfig } from "../../types";
 // a re-run of `gini setup` to change model or rotate credentials would
 // silently drop a ZDR-relevant retention bucket that an operator set
 // via `gini provider set --prompt-cache-retention …`. Matches the same
-// preservation shape used by `gini provider set` and the setup-api.
+// preservation shape used by `gini provider set` and the setup-api. The
+// value goes through `normalizeRetentionValue` so a corrupted-load
+// non-string shape (number, array) cannot ride the carry-forward.
 function carriedRetention(config: RuntimeConfig, newProviderName: string): { promptCacheRetention?: string } {
   if (config.provider?.name !== newProviderName) return {};
-  const value = config.provider.promptCacheRetention;
-  return value == null ? {} : { promptCacheRetention: value };
+  const value = normalizeRetentionValue(config.provider.promptCacheRetention);
+  return value === undefined ? {} : { promptCacheRetention: value };
 }
 
 export interface SetupIO {

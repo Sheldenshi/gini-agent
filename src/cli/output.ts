@@ -111,6 +111,7 @@ Usage:
   bun run gini snapshots list|create|restore
   bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
                   [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
+                  [--prompt-cache-retention <value>]
                   --base-url and --api-key-env work for local / openai /
                   openrouter (point at OpenAI-compatible servers like oMLX,
                   vLLM, LM Studio) AND for codex (override the backend URL
@@ -118,6 +119,12 @@ Usage:
                   specific request fields like \`chat_template_kwargs\` and
                   applies to local / openai / openrouter chat-completions
                   calls; codex (/responses) and echo ignore it.
+                  --prompt-cache-retention sets the OpenAI prompt-cache
+                  bucket sent as \`prompt_cache_retention\` on /responses
+                  and /chat/completions ("in_memory" — the default;
+                  "24h" — extended, not ZDR eligible). An empty string
+                  suppresses the field; codex rejects it with HTTP 400
+                  until the chatgpt.com backend adds support.
   bun run gini trace <task-id>
   bun run gini events
   bun run gini audit

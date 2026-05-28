@@ -349,27 +349,35 @@ function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
 // An empty string explicitly opts the request back to the provider's
 // own default. Future retention tiers OpenAI adds can be passed
 // through verbatim via the same field with no code change.
+// Narrow an unknown value (loaded from JSON, passed through a normalize
+// boundary, or extracted from `extraBody`) into either a usable
+// `promptCacheRetention` string or `undefined`. The load path at
+// src/paths.ts JSON.parses config.json with a pure type cast, so a
+// hand-edited or tool-corrupted file can carry a non-string value here.
+// `null`/`undefined` and empty strings collapse to undefined (the
+// resolver semantics for "send nothing"); anything that is not a string
+// of length > 0 is rejected so a non-string shape (number, array,
+// object) never reaches the wire — the array case in particular has
+// `.length > 0` true and would otherwise spread `["24h"]` into the
+// JSON body, producing a provider-side 400 that this guard catches
+// locally. Exported as the single normalization point so every
+// preservation/resolve seam (provider.ts resolver, normalizeProvider,
+// CLI setup carry, setup-api disk read) uses the same rule.
+export function normalizeRetentionValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.length > 0 ? value : undefined;
+}
+
 function resolvePromptCacheRetention(provider: ProviderConfig): string | undefined {
-  // `== null` matches both `undefined` and `null`. A persisted config.json
-  // with `promptCacheRetention: null` (hand-edit, or a JSON tool that
-  // serializes undefined as null) lands here unchanged because the load
-  // path JSON.parses without type narrowing, so widening from `===
-  // undefined` to `== null` keeps the resolver from blowing up on
-  // `.length` of null and crashing every outbound request.
-  if (provider.promptCacheRetention == null) return undefined;
-  return provider.promptCacheRetention.length > 0 ? provider.promptCacheRetention : undefined;
+  return normalizeRetentionValue(provider.promptCacheRetention);
 }
 
 // Spread-friendly wrapper around the resolver: returns the
 // `{ prompt_cache_retention }` fragment to splice into a request body, or
 // `{}` when the field must be omitted. Every outbound request builder in
-// this module funnels through this single helper instead of repeating
-// the `const retention = resolvePromptCacheRetention(...); if (retention)
-// body.prompt_cache_retention = retention;` dance — that pattern existed
-// in four different shapes across the file (mutate-body, inline spread,
-// named-const, IIFE) and made it easy for a new builder to silently drop
-// the field. With one helper at every call site, a missing
-// `...promptCacheRetentionFields(provider)` is conspicuous in review.
+// this module funnels through this single helper so the field is either
+// present on every call site or absent on every call site — there is no
+// per-builder branch where the resolver could be silently skipped.
 function promptCacheRetentionFields(provider: ProviderConfig): { prompt_cache_retention?: string } {
   const retention = resolvePromptCacheRetention(provider);
   return retention ? { prompt_cache_retention: retention } : {};
@@ -1570,11 +1578,12 @@ function withDeepSeekThinkingDefaults(
 // provider in by setting the field directly — useful when a new OpenAI-
 // compatible backend adds support after this code ships.
 function preservePromptCacheRetention(provider: ProviderConfig): Partial<ProviderConfig> {
-  // `== null` so a persisted `promptCacheRetention: null` survives
-  // normalize as "not set" instead of being copied through to the
-  // resolver where `.length` would throw.
-  if (provider.promptCacheRetention == null) return {};
-  return { promptCacheRetention: provider.promptCacheRetention };
+  // Funnel the persisted value through `normalizeRetentionValue` so a
+  // non-string shape (number, array, object) from a corrupted load is
+  // dropped at the normalize boundary instead of being copied through
+  // to the resolver.
+  const value = normalizeRetentionValue(provider.promptCacheRetention);
+  return value === undefined ? {} : { promptCacheRetention: value };
 }
 
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {

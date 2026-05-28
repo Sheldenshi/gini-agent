@@ -44,7 +44,7 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, loadConfig } from "../paths";
-import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { hasUsableCodexCredentials, normalizeProvider, normalizeRetentionValue, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -59,18 +59,29 @@ import type { ProviderConfig, RuntimeConfig } from "../types";
 // disk just for this ZDR-relevant field closes that window without
 // taking a dependency on a full config reload (other fields stay
 // owned by their original surfaces).
-function diskPromptCacheRetention(instance: string, providerName: string): string | undefined {
+//
+// On a disk-read failure (malformed JSON, transient EACCES) the helper
+// falls back to the in-memory snapshot for the same-provider case
+// instead of fail-open returning undefined. Fail-open would let a
+// corrupted-config write silently erase a ZDR-relevant retention
+// bucket the operator still believes is in effect; the in-memory
+// value is the last good state we know about, so preserving it is
+// strictly safer than dropping it.
+function diskPromptCacheRetention(instance: string, providerName: string, inMemoryConfig: RuntimeConfig): string | undefined {
   try {
     const onDisk = loadConfig(instance);
-    if (onDisk.provider?.name !== providerName) return undefined;
-    const value = onDisk.provider.promptCacheRetention;
-    return value == null ? undefined : value;
+    if (onDisk.provider?.name === providerName) {
+      const onDiskValue = normalizeRetentionValue(onDisk.provider.promptCacheRetention);
+      if (onDiskValue !== undefined) return onDiskValue;
+    }
   } catch {
-    // A malformed config.json shouldn't crash the save — fall through
-    // to "no preserved value" so the write proceeds. The user can
-    // re-set the field afterward.
-    return undefined;
+    // Disk read failed — fall through to the in-memory fallback below
+    // rather than dropping the field on the floor.
   }
+  if (inMemoryConfig.provider?.name === providerName) {
+    return normalizeRetentionValue(inMemoryConfig.provider.promptCacheRetention);
+  }
+  return undefined;
 }
 
 const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
@@ -184,7 +195,7 @@ export async function setSetupProvider(
     // prompt-caching docs, so the rewrite cannot drop it. Source the
     // value from disk (not from in-memory config) so an interleaving CLI
     // write that happened after gateway boot is not clobbered.
-    const carriedValue = diskPromptCacheRetention(config.instance, providerName);
+    const carriedValue = diskPromptCacheRetention(config.instance, providerName, config);
     const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
@@ -231,7 +242,7 @@ export async function setSetupProvider(
   // boot and now. The codex backend currently rejects the field, but
   // per the ProviderConfig doc-comment the runtime is a transparent
   // forwarder so future backend support works without code changes.
-  const carriedValue = diskPromptCacheRetention(config.instance, "codex");
+  const carriedValue = diskPromptCacheRetention(config.instance, "codex", config);
   const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
   config.provider = normalizeProvider({ name: "codex", model, ...carriedRetention } as ProviderConfig);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
