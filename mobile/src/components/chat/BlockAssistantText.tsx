@@ -1,8 +1,15 @@
 import { useEffect, useRef } from "react";
 import { Animated, Easing, StyleSheet, View } from "react-native";
-import Markdown from "react-native-markdown-display";
+import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+
+// `linkify: true` autolinks bare URLs (e.g. `https://example.com`) that
+// arrive in assistant text without explicit `[label](url)` markdown, so
+// they render as tappable anchors. The library's default press handler
+// hands the URL to `Linking.openURL`, which on iOS 14+ and Android
+// respects the user's configured default browser (Chrome if set).
+const markdownIt = MarkdownIt({ typographer: true, linkify: true });
 
 // Left-aligned light-gray bubble. Mirror of the user bubble's corner
 // pattern — sharp bottom-left so the bubble points toward the agent's
@@ -17,7 +24,9 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
   return (
     <View style={styles.row}>
       <View style={styles.bubble}>
-        <Markdown style={markdownStyles}>{block.text}</Markdown>
+        <Markdown style={markdownStyles} markdownit={markdownIt}>
+          {block.text}
+        </Markdown>
         {block.streaming ? <StreamingCursor /> : null}
       </View>
     </View>
