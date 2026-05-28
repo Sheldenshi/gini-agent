@@ -24,6 +24,9 @@ import {
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
+import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
+import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
+import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
@@ -306,8 +309,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // SetupRequest endpoints (user-actor): the user performs a setup step
     // and signals completion. The /complete handler owns the per-action
     // side effect (createConnector + checkConnector for connector.request;
-    // playwright.fill for browser.fill_secret; nothing extra for
-    // browser.connect — its side effect ran inside /open-browser).
+    // playwright.fill for browser.fill_secret; addMessagingBridge /
+    // allowChat / removeMessagingBridge for the messaging.* actions;
+    // nothing extra for browser.connect — its side effect ran inside
+    // /open-browser). The messaging.* and browser.fill_secret branches
+    // delegate to bounded runtime modules in src/execution/* that own the
+    // atomic resolve-then-side-effect-then-resume sequence; the connector
+    // and browser.connect branches resolve inline.
     ["GET", /^\/api\/setup-requests$/, (request) => {
       const agentId = agentIdFilter(request);
       const rows = readState(config.instance).setupRequests;
@@ -324,9 +332,48 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         ? payload.secrets as Record<string, string>
         : {};
 
+      if (setup.action === "messaging.add_bridge") {
+        // Thin delegate to the bounded module — mirrors the
+        // browser.fill_secret branch's two-line shape. The lifecycle
+        // (kind parsing, pre-resolve field + token-format validation,
+        // atomic resolve, addMessagingBridge, chat resume with
+        // failTask recovery) lives in src/execution/messaging-bridge-connect.ts
+        // so it can be unit-tested in isolation and so http.ts stays
+        // a routing layer per the AGENTS.md boundary rule.
+        const result = await runMessagingBridgeConnect(config, setup, secrets, payload.deliveryTargets);
+        return json(result.body, result.status);
+      }
+
+      if (setup.action === "messaging.approve_pairing") {
+        // Approve / Reject for an inbound Telegram pairing request.
+        // Delegate forwards `payload.reject` so a single endpoint
+        // covers both outcomes; allowChat / rejectPendingChat live
+        // inside the bounded module along with the atomic
+        // resolveSetupRequest + safeResume wrapping.
+        const result = await runMessagingPairingConnect(config, setup, { reject: payload.reject });
+        return json(result.body, result.status);
+      }
+
+      if (setup.action === "messaging.remove_bridge") {
+        // Destructive bridge teardown from chat. Same shape as
+        // add_bridge — atomic resolveSetupRequest BEFORE
+        // removeMessagingBridge, then safeResume back into the
+        // chat-task loop with the outcome.
+        const result = await runMessagingRemoveConnect(config, setup);
+        return json(result.body, result.status);
+      }
+
       if (setup.action === "browser.fill_secret") {
-        // Bounded module owns slot validation, atomic flip, per-slot fill
-        // loop, redacted audit, and chat resume.
+        // The fill_secret flow is bounded inside
+        // src/execution/browser-fill-secrets.ts. The handler here is
+        // a thin routing seam: parse the body's `secrets` field,
+        // delegate to the module, return its {status, body} envelope
+        // as the HTTP response. All of the runtime concerns — slot
+        // validation, structural approved-URL check, atomic setup-request
+        // resolution, per-slot fill with per-slot origin /
+        // task-status re-checks, redacted audit row, chat-task
+        // resume — live in the bounded module so they can be
+        // unit-tested in isolation.
         const result = await runFillSecretConnect(config, setup, secrets);
         return json(result.body, result.status);
       }
@@ -410,8 +457,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       let navigateError: string | undefined;
       if (targetUrl && setup.taskId) {
         try {
-          await browserNavigate(setup.taskId, { url: targetUrl });
-          openedUrl = targetUrl;
+          // browserNavigate returns a JSON envelope rather than
+          // throwing on a soft failure (safetyCheck refusal of a
+          // loopback redirect target, an unsupported URL, etc.).
+          // The previous code only caught throws and set openedUrl
+          // unconditionally — so a refused navigation falsely
+          // reported "user landed on the page." Parse the envelope
+          // and treat success:false as an error path so the
+          // setup-request row records the navigateError truthfully.
+          const navResult = await browserNavigate(setup.taskId, { url: targetUrl });
+          let parsed: { success?: boolean; error?: string } | undefined;
+          try {
+            parsed = JSON.parse(navResult) as { success?: boolean; error?: string };
+          } catch {
+            // Non-JSON return: treat as success for back-compat
+            // with any caller that might not stringify.
+            parsed = { success: true };
+          }
+          if (parsed && parsed.success === false) {
+            navigateError = parsed.error ?? "browser navigation refused";
+          } else {
+            openedUrl = targetUrl;
+          }
         } catch (error) {
           navigateError = error instanceof Error ? error.message : String(error);
         }
@@ -1417,6 +1484,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Messaging bridge not found")) return 404;
   if (message.startsWith("Messaging bridge is not configured")) return 400;
   if (message.startsWith("Messaging bridge name is required")) return 400;
+  // rejectPendingChat throws these when the operator clicks Reject
+  // on a stale card (the pending row was re-DM'd and the code rotated)
+  // or on a card whose chat was already enrolled by a parallel
+  // operator. Both are user-input class — 400, not 500.
+  if (message.startsWith("Cannot reject")) return 400;
+  if (message.startsWith("Pairing request for chat")) return 400;
   if (/^(Telegram|Discord) bridges require a botToken/.test(message)) return 400;
   if (/^(Telegram|Discord) bot token contains invalid characters/.test(message)) return 400;
   if (message.startsWith("Inbound message text or media is required")) return 400;

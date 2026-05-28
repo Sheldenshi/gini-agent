@@ -26,6 +26,8 @@
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { isIP } from "node:net";
+import { lookup } from "node:dns/promises";
 import { instanceRoot } from "../paths";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
@@ -789,7 +791,19 @@ const BLOCKED_HOSTNAMES = new Set([
   "169.254.169.254",
   "100.100.100.200",
   "metadata.google.internal",
-  "metadata.goog"
+  "metadata.goog",
+  // Loopback + unspecified — the agent's BFF and runtime listen on
+  // these addresses, and the BFF's catch-all /api/runtime/* proxy
+  // injects the runtime bearer for any safe-method loopback request
+  // (no Origin header from a server-driven browser navigation). Without
+  // these entries an agent could navigate the controlled browser to
+  // http://127.0.0.1:<bff-port>/api/runtime/approvals and read state
+  // including the messaging.approve_pairing payload's verificationCode.
+  // Mirrors the broader loopback block on the web_fetch tool.
+  "127.0.0.1",
+  "0.0.0.0",
+  "localhost",
+  "::1"
 ]);
 
 const SECRET_PATTERNS = [
@@ -804,6 +818,31 @@ const SECRET_PATTERNS = [
 function isLinkLocal(host: string): boolean {
   // 169.254.0.0/16
   return /^169\.254\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
+// Decode IPv4-mapped IPv6 forms to their embedded dotted-IPv4
+// representation, so downstream checks can apply uniform IPv4 logic
+// (loopback / metadata / link-local) without three separate paths
+// for the equivalent IPv6 spellings. Returns undefined when the
+// host is not an IPv4-mapped IPv6 literal.
+function decodeIpv4Mapped(host: string): string | undefined {
+  // Mixed dot-quad form: ::ffff:127.0.0.1
+  const dotQuad = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i.exec(host);
+  if (dotQuad) return dotQuad[1]!;
+  // Hex IPv4-mapped: ::ffff:wwxx:yyzz
+  const hexMapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  // Deprecated IPv4-compatible: ::wwxx:yyzz (no ffff). Bun
+  // normalizes [::127.0.0.1] to [::7f00:1].
+  const compatHex = /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  const hex = hexMapped ?? compatHex;
+  if (hex) {
+    const hi = parseInt(hex[1]!, 16);
+    const lo = parseInt(hex[2]!, 16);
+    if (Number.isFinite(hi) && Number.isFinite(lo)) {
+      return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    }
+  }
+  return undefined;
 }
 
 // Lightweight IPv6 guard. WHATWG URL hands back hostnames in canonical
@@ -861,7 +900,13 @@ function isBlockedIpv6(host: string): string | undefined {
 // Exported for direct unit testing in src/tools/browser.test.ts.
 // Returns undefined when the URL is allowed; otherwise a human-readable
 // reason starting with "Blocked:" or "Invalid URL:".
-export function safetyCheck(rawUrl: string): string | undefined {
+// `allowLoopback` opts out of the loopback block for callers that
+// LEGITIMATELY need loopback access. The browser-connect CDP path
+// uses this — the runtime connects to a local Chrome over CDP
+// (always 127.0.0.1:9222 or similar), and that's exactly the
+// loopback target the SSRF block was added to refuse for agent
+// navigation. Two intents, one validator.
+export function safetyCheck(rawUrl: string, options: { allowLoopback?: boolean } = {}): string | undefined {
   // Run the secret-pattern scan against the raw input *before* attempting
   // to parse the URL. A malformed-but-secret-bearing input would otherwise
   // fall through to the `Invalid URL: ${rawUrl}` branch and leak the token
@@ -895,15 +940,59 @@ export function safetyCheck(rawUrl: string): string | undefined {
     return `Blocked: only http(s) URLs are allowed (got ${parsed.protocol}).`;
   }
   // Strip IPv6 brackets so the comparisons below see the bare host.
-  const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  // Also strip a trailing dot — DNS roots are written with a trailing
+  // "." (e.g. "localhost." or "127.0.0.1.") and resolvers treat them
+  // as equivalent to the dotless form. Without the strip,
+  // host.endsWith(".localhost") would miss "localhost.", letting a
+  // crafted URL bypass the loopback block.
+  const rawHost = parsed.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+  // Decode IPv4-mapped IPv6 forms to their embedded IPv4 BEFORE
+  // running any checks, so a mapped loopback (e.g. ::ffff:127.0.0.1
+  // or ::ffff:7f00:1) goes through the same loopback gate as the
+  // bare IPv4 form — and respects allowLoopback uniformly. Without
+  // this, the IPv6 branch's classifier would route mapped loopback
+  // through the metadata path and refuse it even under
+  // allowLoopback, breaking CDP attach to [::ffff:127.0.0.1]:9222.
+  const host = decodeIpv4Mapped(rawHost) ?? rawHost;
+  const loopbackHosts = new Set(["127.0.0.1", "0.0.0.0", "localhost", "::1"]);
+  if (loopbackHosts.has(host) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) || host.endsWith(".localhost")) {
+    if (options.allowLoopback) return undefined;
+    return `Blocked: ${host} is a loopback address; the agent's browser may not reach the local BFF / runtime.`;
+  }
   if (BLOCKED_HOSTNAMES.has(host)) {
+    // Loopback entries are handled above; what reaches here is
+    // cloud-metadata. (BLOCKED_HOSTNAMES still includes the loopback
+    // entries so they get blocked even when the explicit-literal path
+    // above misses an oddity, but the messaging here is cosmetic.)
     return `Blocked: ${host} is a cloud metadata endpoint.`;
   }
   if (isLinkLocal(host)) {
     return `Blocked: ${host} is a link-local address.`;
   }
   const ipv6Block = isBlockedIpv6(host);
-  if (ipv6Block) return ipv6Block;
+  if (ipv6Block) {
+    // The IPv4-mapped IPv6 forms are loopback iff the decoded IPv4
+    // is loopback — but isBlockedIpv6 only matches metadata + link-
+    // local IPv4. Decode again here for the loopback case so
+    // [::7f00:1] (deprecated IPv4-compat for 127.0.0.1) doesn't
+    // bypass the loopback block.
+    return ipv6Block;
+  }
+  // Deprecated IPv4-compatible IPv6 form `::wwxx:yyzz` decodes to
+  // IPv4 a.b.c.d where (a<<8|b) = wwxx and (c<<8|d) = yyzz. Bun
+  // normalizes [::127.0.0.1] to [::7f00:1], so the explicit-literal
+  // path above never sees the loopback form. Reclassify the decoded
+  // IPv4 and reuse the loopback check.
+  const compatHex = /^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host);
+  if (compatHex) {
+    const high = parseInt(compatHex[1]!, 16);
+    const low = parseInt(compatHex[2]!, 16);
+    const ipv4 = `${(high >> 8) & 0xff}.${high & 0xff}.${(low >> 8) & 0xff}.${low & 0xff}`;
+    if (loopbackHosts.has(ipv4) || /^127\./.test(ipv4)) {
+      if (options.allowLoopback) return undefined;
+      return `Blocked: ${host} maps to ${ipv4}, a loopback address.`;
+    }
+  }
   return undefined;
 }
 
@@ -942,6 +1031,35 @@ const REF_ATTR_GLOBAL = "data-gini-ref";
 // later. Built in a single page.evaluate so we minimize round-trips and
 // reuse one DOM walk for both the snapshot text and the locator map.
 async function snapshot(page: Page, full: boolean, taskId?: string): Promise<SnapshotResult> {
+  // Single-point loopback check before reading page state. Any
+  // browser action — direct navigate, click, type, scroll — can
+  // settle the page on a different URL than the agent originally
+  // requested, via JS navigation / meta-refresh / link click. The
+  // R14 fix protected browser_navigate's post-redirect URL but
+  // didn't cover those other paths. Snapshotting / returning the
+  // URL of a loopback page would expose any local BFF / runtime
+  // state the page rendered. Refuse at the snapshot boundary so
+  // every caller (browser_snapshot, browser_click, browser_type,
+  // browser_back, etc.) inherits the same gate. Try to clean up
+  // by navigating the page away to about:blank — best-effort.
+  //
+  // Test mocks for the snapshot walker pass minimal page stubs
+  // (only evaluate is mocked, since the walker only needs DOM
+  // access). Guard the url()/goto() calls behind typeof checks so
+  // existing unit tests don't have to grow the mock surface.
+  if (typeof page.url === "function") {
+    const currentUrl = page.url();
+    if (currentUrl && currentUrl !== "about:blank") {
+      const blocked = safetyCheck(currentUrl);
+      if (blocked) {
+        if (typeof page.goto === "function") {
+          try { await page.goto("about:blank", { waitUntil: "domcontentloaded" }); }
+          catch { /* best-effort */ }
+        }
+        throw new Error(`${blocked} (page settled on disallowed URL after a navigation; agent must not inspect this surface)`);
+      }
+    }
+  }
   const REF_ATTR = REF_ATTR_GLOBAL;
   // First, clear stale refs from prior snapshots so id allocation stays
   // stable across calls.
@@ -1324,11 +1442,73 @@ export async function browserNavigate(taskId: string, args: Record<string, unkno
   if (blocked) return fail(blocked);
   try {
     return await withSession(taskId, async (session) => {
+      // DNS pre-flight: the literal-only safetyCheck above misses
+      // DNS aliases that resolve to loopback / private IPs (e.g.
+      // an attacker-controlled "evil.example" A record pointing
+      // at 127.0.0.1). Resolve the hostname and re-run safetyCheck
+      // on the resolved address before handing the URL to Chrome.
+      // Run AFTER withSession admission (not before) so the
+      // disconnect-bail race the test suite covers fires first
+      // and the lookup doesn't add an await boundary that shifts
+      // admission timing. The check doesn't fully close DNS
+      // rebinding (a TTL=0 swap between our lookup and Chrome's
+      // own lookup is still possible), but it catches the common
+      // case and matches what the web_fetch tool already does.
+      try {
+        const parsed = new URL(url);
+        if (isIP(parsed.hostname) === 0) {
+          const { address } = await lookup(parsed.hostname);
+          // IPv6 addresses MUST be wrapped in brackets to form a
+          // valid URL authority. Without brackets,
+          // "https://2606:4700:4700::1111/" parses with the first
+          // ":4700" as a port, corrupting the host parse and
+          // causing safetyCheck to throw on the malformed URL —
+          // which my catch then swallowed, silently bypassing the
+          // resolved-host check for every legitimate IPv6 DNS
+          // target. Wrap if the resolved address parses as IPv6.
+          const authority = isIP(address) === 6 ? `[${address}]` : address;
+          const resolvedBlocked = safetyCheck(`${parsed.protocol}//${authority}/`);
+          if (resolvedBlocked) {
+            return fail(`${resolvedBlocked} (resolved from ${parsed.hostname})`);
+          }
+        }
+      } catch (err) {
+        // DNS failure (NXDOMAIN, network-down) — let Chrome's
+        // navigation surface the error organically rather than
+        // collapsing into a generic fail() here.
+        void err;
+      }
       const response = await session.page.goto(url, { waitUntil: "domcontentloaded" });
+      // Re-validate after navigation completes — playwright's goto
+      // follows server redirects (302/303/307/308 + meta-refresh),
+      // so a public allowed URL could land the page on a loopback
+      // origin after the pre-flight check passed. Snapshotting +
+      // returning the URL with that resolved origin would let an
+      // attacker exfiltrate /api/runtime state through a redirect
+      // chain the agent didn't directly request. Block the
+      // resolved URL with the same safetyCheck and navigate the
+      // page away to about:blank so the loopback page doesn't sit
+      // in the session's history for the next tool call to read.
+      const finalUrl = session.page.url();
+      // about:blank is the legitimate "page is idle" state — either
+      // the goto didn't actually settle (mocked / dummy backend) or
+      // a prior cleanup landed us there. Skip the post-nav block
+      // for it; the snapshot() boundary check already special-
+      // cases it the same way.
+      const postBlock = finalUrl === "about:blank" ? undefined : safetyCheck(finalUrl);
+      if (postBlock) {
+        try {
+          await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
+        } catch {
+          // Best-effort cleanup; if even about:blank fails, the
+          // returned error still tells the operator what happened.
+        }
+        return fail(`${postBlock} (final URL after redirect from ${url})`);
+      }
       const snap = await snapshot(session.page, false, taskId);
       session.refs = snap.refs;
       return ok({
-        url: session.page.url(),
+        url: finalUrl,
         status: response?.status() ?? null,
         title: await session.page.title(),
         snapshot: snap.text,

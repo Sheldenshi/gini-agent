@@ -13,6 +13,7 @@ type RuleArgs = [
   styles: MarkdownStylesMap,
   inheritedStyles?: object
 ];
+type RenderRule = (...args: RuleArgs) => React.ReactNode;
 
 // Left-aligned light-gray bubble. Mirror of the user bubble's corner
 // pattern — sharp bottom-left so the bubble points toward the agent's
@@ -27,7 +28,7 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
   return (
     <View style={styles.row}>
       <View style={styles.bubble}>
-        <Markdown style={markdownStyles} rules={selectableRules}>
+        <Markdown style={markdownStyles} rules={markdownRules}>
           {block.text}
         </Markdown>
         {block.streaming ? <StreamingCursor /> : null}
@@ -36,62 +37,129 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
   );
 }
 
-// react-native-markdown-display renders inline content through several
-// `<Text>` wrappers (textgroup, link, strong, em, s, inline) plus the
-// leaf `text` rule. The defaults omit `selectable`, so on iOS the
-// long-press gesture hits the wrapper and finds nothing to copy. Override
-// every text-emitting rule so the whole chain opts in to selection.
-const selectableRules = {
-  text: (...args: RuleArgs) => {
-    const [node, , , styles, inheritedStyles = {}] = args;
-    return (
-      <Text key={node.key} style={[inheritedStyles, styles.text]} selectable>
-        {node.content}
-      </Text>
-    );
+// react-native-markdown-display's default paragraph/heading renderers
+// are Views with `flexDirection: "row"` + `flexWrap: "wrap"`, and each
+// inline token (text run, link, strong, em) becomes its own sibling
+// <Text>. RN's text layout doesn't span across sibling Text nodes, so a
+// paragraph mixing short prose with a long URL wraps per-token instead
+// of as one continuous text block — the bubble shrinks to fit the
+// widest stand-alone token and URLs end up broken every few characters.
+// Rendering these block-level nodes as a single Text lets all inline
+// children flow as true inline runs, which is what RN's text engine
+// actually wraps cleanly. We use the markdown body's font props so the
+// outer Text reserves the right line height before nested inline Texts
+// supply their own font styles via the lib's inherited-style cascade.
+const blockTextBase = {
+  color: theme.assistantBubbleText,
+  fontFamily: family("HankenGrotesk", 500),
+  fontSize: 16,
+  lineHeight: 22
+} as const;
+const blockTextStyles = StyleSheet.create({
+  paragraph: { ...blockTextBase, marginTop: 0, marginBottom: 6 },
+  heading1: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 20,
+    lineHeight: 26,
+    marginTop: 6,
+    marginBottom: 4
   },
-  textgroup: (...args: RuleArgs) => {
-    const [node, children, , styles] = args;
-    return (
-      <Text key={node.key} style={styles.textgroup} selectable>
-        {children}
-      </Text>
-    );
+  heading2: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 18,
+    lineHeight: 24,
+    marginTop: 6,
+    marginBottom: 4
   },
-  strong: (...args: RuleArgs) => {
-    const [node, children, , styles] = args;
-    return (
-      <Text key={node.key} style={styles.strong} selectable>
-        {children}
-      </Text>
-    );
+  heading3: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 700),
+    marginTop: 6,
+    marginBottom: 4
   },
-  em: (...args: RuleArgs) => {
-    const [node, children, , styles] = args;
-    return (
-      <Text key={node.key} style={styles.em} selectable>
-        {children}
-      </Text>
-    );
+  heading4: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15,
+    lineHeight: 21,
+    marginTop: 6,
+    marginBottom: 4
   },
-  s: (...args: RuleArgs) => {
-    const [node, children, , styles] = args;
-    return (
-      <Text key={node.key} style={styles.s} selectable>
-        {children}
-      </Text>
-    );
+  heading5: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14,
+    lineHeight: 20,
+    marginTop: 6,
+    marginBottom: 4
   },
-  inline: (...args: RuleArgs) => {
-    const [node, children, , styles] = args;
-    return (
-      <Text key={node.key} style={styles.inline} selectable>
-        {children}
-      </Text>
-    );
-  },
-  link: (...args: RuleArgs) => {
-    const [node, children, , styles] = args;
+  heading6: {
+    ...blockTextBase,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 13,
+    lineHeight: 19,
+    marginTop: 6,
+    marginBottom: 4
+  }
+});
+// Block-level renderers wrap inline children in a single Text so the
+// text engine can wrap runs cleanly (see comment above). `selectable`
+// is set on the wrapper so iOS' long-press gesture has something to
+// latch onto — without it, the inner inline overrides below get short-
+// circuited by a non-selectable parent.
+const renderAsText =
+  (style: object): RenderRule =>
+  (node, children) => (
+    <Text key={node.key} style={style} selectable>
+      {children}
+    </Text>
+  );
+// Inline rules (text/textgroup/link/strong/em/s/inline) need their own
+// `selectable` because react-native-markdown-display emits <Text>
+// wrappers per rule and the defaults omit the prop — without these
+// overrides a long-press in the middle of a paragraph hits an inner
+// non-selectable Text and the gesture finds nothing to copy.
+const markdownRules: Record<string, RenderRule> = {
+  paragraph: renderAsText(blockTextStyles.paragraph),
+  heading1: renderAsText(blockTextStyles.heading1),
+  heading2: renderAsText(blockTextStyles.heading2),
+  heading3: renderAsText(blockTextStyles.heading3),
+  heading4: renderAsText(blockTextStyles.heading4),
+  heading5: renderAsText(blockTextStyles.heading5),
+  heading6: renderAsText(blockTextStyles.heading6),
+  text: (node, _children, _parent, styles, inheritedStyles = {}) => (
+    <Text key={node.key} style={[inheritedStyles, styles.text]} selectable>
+      {node.content}
+    </Text>
+  ),
+  textgroup: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.textgroup} selectable>
+      {children}
+    </Text>
+  ),
+  strong: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.strong} selectable>
+      {children}
+    </Text>
+  ),
+  em: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.em} selectable>
+      {children}
+    </Text>
+  ),
+  s: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.s} selectable>
+      {children}
+    </Text>
+  ),
+  inline: (node, children, _parent, styles) => (
+    <Text key={node.key} style={styles.inline} selectable>
+      {children}
+    </Text>
+  ),
+  link: (node, children, _parent, styles) => {
     const href = node.attributes?.href;
     return (
       <Text
@@ -137,7 +205,10 @@ function StreamingCursor() {
 const styles = StyleSheet.create({
   row: {
     alignSelf: "flex-start",
-    maxWidth: "80%"
+    // Assistant replies are typically long-form and contain inline
+    // links; give them most of the viewport so URLs don't end up
+    // wrapping every few characters on a narrow phone.
+    maxWidth: "92%"
   },
   bubble: {
     backgroundColor: theme.assistantBubble,

@@ -830,6 +830,16 @@ export async function allowChat(
       },
       { system: true }
     );
+    // Pre-create the Telegram chat session at enrollment time so it
+    // shows up in the operator's sidebar immediately — before this
+    // change, the session was only created lazily on the FIRST
+    // inbound message AFTER enrollment (receiveMessagingInput's
+    // findOrCreateTelegramChatSession call), so the operator had to
+    // wait for the user to DM again to see any sign the pairing
+    // worked. Bot-authored confirmation DMs land in this session
+    // too once they're observed by the poller, so a fresh enrollment
+    // immediately surfaces with the "Paired." greeting visible.
+    findOrCreateTelegramChatSession(state, live.id, chatId);
     return { bridgeId: live.id, view: chatAllowlistView(live), alreadyAllowed };
   });
   // Best-effort greeting back to the chat so the user knows they
@@ -898,7 +908,20 @@ export async function denyChat(config: RuntimeConfig, idOrName: string, chatId: 
 // row is cleared from the pending list so it doesn't keep nagging the
 // operator. If the same chat sends another message after this it'll
 // re-appear in `recentDeniedChats` because there is no long-term denylist.
-export async function rejectPendingChat(config: RuntimeConfig, idOrName: string, chatId: number) {
+//
+// Options:
+//   expectedCode: refuse the reject if the live pending row's
+//     verificationCode no longer matches. Without this, a stale Reject
+//     click on an old card would clear a fresh pending row that the
+//     user just minted by re-DMing the bot. The compare-and-delete
+//     happens inside the same mutateState so a code rotation between
+//     read and delete cannot slip through.
+export async function rejectPendingChat(
+  config: RuntimeConfig,
+  idOrName: string,
+  chatId: number,
+  options: { expectedCode?: string } = {}
+) {
   if (!Number.isFinite(chatId)) throw new Error("chatId must be a finite number.");
   return mutateState(config.instance, (state) => {
     const live = state.messagingBridges.find((b) => b.id === idOrName || b.name === idOrName);
@@ -907,6 +930,43 @@ export async function rejectPendingChat(config: RuntimeConfig, idOrName: string,
       // Reuse the existing allowlist-only prefix so statusFromErrorMessage
       // already maps this to a 400 the way it does for allowChat / denyChat.
       throw new Error(`Chat allowlist only applies to telegram bridges (got '${live.kind}').`);
+    }
+    const allowedChatIds = readAllowedChatIds(live);
+    if (allowedChatIds.includes(chatId)) {
+      // Pairing was already approved (likely by a parallel operator or
+      // the CLI). Reporting "rejected" here would lie — the chat is
+      // enrolled and posting will route through. Surface that explicitly
+      // so the chat-task loop can tell the user what actually happened.
+      throw new Error(`Cannot reject: chat ${chatId} is already enrolled on bridge '${live.name}'. Use the settings page to remove the enrollment if you meant to revoke it.`);
+    }
+    const pending = readRecentDeniedChats(live).find((entry) => entry.chatId === chatId);
+    if (options.expectedCode !== undefined) {
+      // Three stale-card cases the chat-side Reject must refuse so
+      // it doesn't silently report success:
+      //   1. pending row was already cleared (parallel operator
+      //      Reject or settings-page click) — there's nothing to
+      //      reject; the chat card is dead.
+      //   2. pending row exists but has no verificationCode (group
+      //      chat regrown from a different message after the
+      //      original code-bearing row was approved) — the chat-side
+      //      Reject doesn't apply to group rows.
+      //   3. pending row exists, has a code, but the code doesn't
+      //      match the approval's expectedCode — the user re-DM'd
+      //      and the code rotated. Rejecting now would clear the
+      //      fresh pending row.
+      if (!pending) {
+        throw new Error(`Pairing request for chat ${chatId} was already cleared (likely by a parallel Reject or a settings-page action). Nothing to do; the chat card is stale.`);
+      }
+      if (!pending.verificationCode) {
+        throw new Error(`Pairing request for chat ${chatId} now has no verification code (a different message replaced the original pending row). This chat-card Reject no longer matches.`);
+      }
+      if (pending.verificationCode !== options.expectedCode) {
+        // Code rotated between mint and click — the stale card would
+        // otherwise clear the fresh pending row. Atomic check-and-delete
+        // closes the TOCTOU window that a pre-mutateState lookup left
+        // open.
+        throw new Error(`Pairing request for chat ${chatId} was re-DM'd since this card was minted — its verification code rotated. Approve or Reject the current pending card instead; this stale card no longer matches.`);
+      }
     }
     const meta = { ...(live.metadata ?? {}) };
     meta.recentDeniedChats = readRecentDeniedChats(live).filter((entry) => entry.chatId !== chatId);

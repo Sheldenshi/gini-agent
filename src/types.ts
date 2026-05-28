@@ -353,6 +353,21 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 //   - `browser.fill_secret` → inline credential inputs with destination URL
 //     prominent. Submit POSTs `{ secrets: { <slot>: <value> } }` to
 //     /api/setup-requests/<id>/complete.
+//   - `messaging.add_bridge` → inline form with name + password-masked
+//     bot-token inputs (kind is pinned in payload). Submit POSTs
+//     `{ secrets: { name, botToken } }` to /api/setup-requests/<id>/complete,
+//     which routes into addMessagingBridge. Other surfaces (home page,
+//     /permissions list) render a "resolve in chat" hint because they can't
+//     display the form. See docs/adr/telegram-bridge.md and
+//     chat-block-protocol.md.
+//   - `messaging.approve_pairing` → confirmation card showing the pending
+//     sender, chat type, verification code, expiry. Two buttons: Approve
+//     (POSTs `{}` to /complete → server calls allowChat with expectedCode);
+//     Reject (POSTs `{ reject: true }` to /complete → server calls
+//     rejectPendingChat).
+//   - `messaging.remove_bridge` → destructive confirmation card showing
+//     bridge name + irreversibility warning. Submit POSTs `{}` to /complete
+//     → server calls removeMessagingBridge.
 // Cancel always POSTs to /api/setup-requests/<id>/cancel.
 export interface SetupRequestedBlock extends ChatBlockBase {
   kind: "setup_requested";
@@ -1041,12 +1056,22 @@ export interface Authorization {
 }
 
 // User-actor gate: the user performs a setup step (sign in via browser,
-// enter credentials, fill a form). The runtime resumes after the user
-// signals completion via the /setup-requests/:id/complete endpoint.
+// enter credentials, fill a form, or confirm a messaging side effect). The
+// runtime resumes after the user signals completion via the
+// /setup-requests/:id/complete endpoint.
+//
+// The messaging.* actions (add_bridge, approve_pairing, remove_bridge) are
+// connect-only: like browser.connect / connector.request, their side effect
+// (addMessagingBridge / allowChat / removeMessagingBridge) runs inside the
+// /complete handler before the request is marked completed. They carry no
+// approve/deny semantics, so they live here rather than on AuthorizationAction.
 export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"
-  | "browser.fill_secret";
+  | "browser.fill_secret"
+  | "messaging.add_bridge"
+  | "messaging.approve_pairing"
+  | "messaging.remove_bridge";
 
 export interface SetupRequest {
   id: string;
@@ -1060,12 +1085,25 @@ export interface SetupRequest {
   taskId?: string;
   action: SetupRequestAction;
   // Trust anchor shown to the user before they complete the request: the
-  // destination URL for browser.connect / browser.fill_secret, or the
-  // provider id for connector.request.
+  // destination URL for browser.connect / browser.fill_secret, the provider
+  // id for connector.request, or the bridge kind / id for the messaging.*
+  // actions.
   target: string;
   // Human-language ask shown to the user in the chat card.
   reason: string;
   payload: Record<string, unknown>;
+  // Set by the messaging.* /complete handlers (add_bridge, approve_pairing,
+  // remove_bridge) after the post-completion side effect runs. `ok: true`
+  // means the side effect succeeded (bridge created, pairing approved,
+  // etc.); `ok: false` plus `message` carries the sanitized failure reason.
+  // The chat card reads this as the source of truth for the past-tense
+  // summary after reload — React-component-local sticky state is cleared on
+  // reload, so without a persisted outcome a failed side effect on a
+  // status="completed" row would fall back to rendering as success.
+  // browser.fill_secret could adopt the same field; today it only tracks
+  // success via the request status because its failure modes bounce the
+  // request pending state instead of completing + failing.
+  connectOutcome?: { ok: boolean; message?: string };
 }
 
 export interface SkillRecord {

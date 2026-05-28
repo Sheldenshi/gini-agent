@@ -88,6 +88,19 @@ auto-approve credential entry because the credentials come from the
 user, not the agent. The mode-uniformity claim above does not extend
 to this action.
 
+The three messaging chat-card actions (`messaging.add_bridge`,
+`messaging.approve_pairing`, `messaging.remove_bridge`) follow the
+same `/connect`-only carve-out as `browser.fill_secret` — the
+inline cards collect request-scope state (bot tokens, verification
+codes, bridge-removal confirmations) that doesn't fit through
+`executeApprovedAction`. Each is mode-gated with the same
+`{ mode: "gate" }` regardless of `approvalMode`. Defense-in-depth:
+`/approve` refuses these actions at both the HTTP layer and inside
+`decideApproval`, and the home / permissions pages render Deny +
+"resolve in chat" instead of the generic Approve. See
+[chat-block-protocol.md](chat-block-protocol.md) for the wire shape
+and [telegram-bridge.md](telegram-bridge.md) for the lifecycle.
+
 ## Required Now
 
 - `RuntimeConfig.approvalMode?: ApprovalMode` field, defaulting to
