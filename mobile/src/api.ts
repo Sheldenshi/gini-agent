@@ -1,4 +1,5 @@
 import { readCachedCredentials, type AuthCredentials } from "./auth";
+import { inferTunnelTransport } from "./transport";
 
 // Mirrors web/src/lib/api.ts in shape (`api<T>(path, init)`), but talks
 // to the runtime gateway directly with a bearer token instead of routing
@@ -120,16 +121,14 @@ export function resolveStreamEndpoint(path: string): {
  *  to fall back to long-polling — `react-native-sse` would otherwise
  *  open an XHR that never receives frames. Returns false on missing /
  *  malformed credentials so the SSE path (which handles its own 401)
- *  stays the default. */
+ *  stays the default.
+ *
+ *  Delegates host classification to the shared `inferTunnelTransport`
+ *  helper so the mobile, web, and runtime copies stay in lockstep —
+ *  parity is pinned in src/runtime/tunnel/transport.parity.test.ts. */
 export function gatewayUsesQuickTunnel(): boolean {
   const creds = readCachedCredentials();
-  if (!creds) return false;
-  try {
-    const host = new URL(creds.baseUrl).hostname.toLowerCase();
-    return host.endsWith(".trycloudflare.com");
-  } catch {
-    return false;
-  }
+  return inferTunnelTransport(creds?.baseUrl ?? null) === "poll";
 }
 
 // Pull the cached APNs token from push.ts on every call. We avoid a
