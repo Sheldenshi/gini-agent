@@ -7,7 +7,7 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 import EventSource from "react-native-sse";
-import { api, ApiError, resolveStreamEndpoint } from "./api";
+import { api, ApiError, gatewayUsesQuickTunnel, resolveStreamEndpoint } from "./api";
 import type {
   AgentRecord,
   AgentsResponse,
@@ -27,6 +27,14 @@ const CHAT_TERMINAL_TASK_STATUSES = new Set<string>([
   "cancelled",
   "waiting_approval"
 ]);
+
+// Backoff schedule for the chat-block long-poll fallback used when the
+// gateway is reachable only via a Cloudflare quick tunnel
+// (`*.trycloudflare.com`). Quick tunnels strip Server-Sent Events at
+// the edge, so react-native-sse would open an XHR that never receives
+// frames. Doubles up to 8 s, then stays there — matches the web
+// fallback so the two transports feel similar.
+const CHAT_POLL_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
 
 export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
   return useQuery<RuntimeStatus>({
@@ -254,6 +262,15 @@ export function useChatBlocks(sessionId: string | null): {
     let seeded = false;
     let es: EventSource<"chat_block"> | null = null;
     let appStateSub: { remove(): void } | null = null;
+    // Cloudflare quick tunnels (`*.trycloudflare.com`) drop SSE at the
+    // edge, so when the gateway is reachable only via a quick tunnel we
+    // skip react-native-sse and run a long-polling loop against
+    // /chat/:id/poll instead. The controller below is the abort handle
+    // that lets the cleanup function tear the loop down (matching the
+    // role `es` plays for the SSE path). Computed once per effect run;
+    // a baseUrl change re-runs the effect via the sessionId dep below.
+    const useLongPoll = gatewayUsesQuickTunnel();
+    let pollAbort: AbortController | null = null;
 
     // Merge a single block into the list. assistant_text streams in as
     // repeated frames with the same id and a growing `text` payload; we
@@ -286,7 +303,13 @@ export function useChatBlocks(sessionId: string | null): {
     };
 
     const openStream = (): void => {
-      if (cancelled || es) return;
+      if (cancelled) return;
+      if (useLongPoll) {
+        if (pollAbort) return;
+        openLongPoll();
+        return;
+      }
+      if (es) return;
       let endpoint: { url: string; headers: Record<string, string> };
       try {
         endpoint = resolveStreamEndpoint(`/chat/${sessionId}/stream`);
@@ -338,6 +361,10 @@ export function useChatBlocks(sessionId: string | null): {
     };
 
     const closeStream = (): void => {
+      if (pollAbort) {
+        pollAbort.abort();
+        pollAbort = null;
+      }
       if (!es) return;
       // react-native-sse schedules a reconnect poll AFTER our error
       // handler returns: on a non-2xx XHR finish the library dispatches
@@ -363,15 +390,82 @@ export function useChatBlocks(sessionId: string | null): {
       }, 0);
     };
 
-    // Gated open: we must never spin up an EventSource before the seed
-    // has resolved (so the seed merge sees an authoritative baseline) or
-    // while the app is backgrounded (iOS will tear the XHR down anyway).
-    // The AppState callback and the seed completion both route through
-    // here so neither path can race past the other.
+    // Long-polling chat-block transport. Used when the gateway is
+    // reachable only via a Cloudflare quick tunnel — quick tunnels drop
+    // `text/event-stream` at the edge, so the react-native-sse path
+    // above never receives frames. Cursor is the SSE wire id
+    // (`<block_id>:<ts>`) from the previous poll; on first connect we
+    // use whatever the seed dropped into lastSeenIdRef so the gateway's
+    // listChatBlocksAfter only replays what's actually new. Errors back
+    // off through CHAT_POLL_BACKOFF_MS and retry.
+    const openLongPoll = (): void => {
+      if (cancelled || pollAbort) return;
+      const controller = new AbortController();
+      pollAbort = controller;
+      const loop = async (): Promise<void> => {
+        let consecutiveErrors = 0;
+        while (!controller.signal.aborted) {
+          if (cancelled) return;
+          let endpoint: { url: string; headers: Record<string, string> };
+          try {
+            endpoint = resolveStreamEndpoint(`/chat/${sessionId}/poll`);
+          } catch (err) {
+            if (!cancelled) setError(err as Error);
+            return;
+          }
+          const cursor = lastSeenIdRef.current ?? "";
+          const url = `${endpoint.url}?since=${encodeURIComponent(cursor)}`;
+          try {
+            const res = await fetch(url, {
+              headers: endpoint.headers,
+              signal: controller.signal
+            });
+            if (res.status === 401) {
+              setError(new ApiError(401, "Unauthorized"));
+              closeStream();
+              return;
+            }
+            if (!res.ok) throw new Error(`chat poll failed (${res.status})`);
+            const payload = (await res.json()) as { events: ChatBlock[]; cursor: string };
+            consecutiveErrors = 0;
+            // Cursor returned by the gateway is the wire id of the
+            // last block in the response (`<id>:<ts>`); pass it
+            // through upsert() so the next request's Last-Event-ID
+            // equivalent is correct.
+            for (const block of payload.events) {
+              upsert(block, payload.cursor || block.id);
+            }
+            if (payload.cursor) lastSeenIdRef.current = payload.cursor;
+          } catch (err) {
+            if (controller.signal.aborted) return;
+            const idx = Math.min(consecutiveErrors, CHAT_POLL_BACKOFF_MS.length - 1);
+            const delay = CHAT_POLL_BACKOFF_MS[idx]!;
+            consecutiveErrors += 1;
+            const { promise: wait, resolve: settle } = Promise.withResolvers<void>();
+            const timer = setTimeout(settle, delay);
+            controller.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              settle();
+            });
+            await wait;
+          }
+        }
+      };
+      void loop();
+    };
+
+    // Gated open: we must never spin up an EventSource (or the
+    // long-poll loop) before the seed has resolved (so the seed merge
+    // sees an authoritative baseline) or while the app is backgrounded
+    // (iOS will tear the XHR down anyway). The AppState callback and
+    // the seed completion both route through here so neither path can
+    // race past the other. The transport-already-open guard covers
+    // both `es` (SSE) and `pollAbort` (long-poll); openStream picks
+    // the right transport based on `useLongPoll`.
     const maybeOpenStream = (): void => {
       if (!seeded) return;
       if (cancelled) return;
-      if (es) return;
+      if (es || pollAbort) return;
       if (AppState.currentState !== "active") return;
       openStream();
     };

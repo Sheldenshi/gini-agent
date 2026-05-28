@@ -114,6 +114,24 @@ export function resolveStreamEndpoint(path: string): {
   };
 }
 
+/** True when the cached gateway base URL points at a Cloudflare quick
+ *  tunnel hostname (`*.trycloudflare.com`, case-insensitive). Quick
+ *  tunnels drop `text/event-stream` at the edge, so chat streaming has
+ *  to fall back to long-polling — `react-native-sse` would otherwise
+ *  open an XHR that never receives frames. Returns false on missing /
+ *  malformed credentials so the SSE path (which handles its own 401)
+ *  stays the default. */
+export function gatewayUsesQuickTunnel(): boolean {
+  const creds = readCachedCredentials();
+  if (!creds) return false;
+  try {
+    const host = new URL(creds.baseUrl).hostname.toLowerCase();
+    return host.endsWith(".trycloudflare.com");
+  } catch {
+    return false;
+  }
+}
+
 // Pull the cached APNs token from push.ts on every call. We avoid a
 // static import because push.ts depends on this module (transitively
 // through ApiError), and bundlers handle the cycle inconsistently
