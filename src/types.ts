@@ -1173,6 +1173,30 @@ export interface SkillRecord {
   // to "user" for legacy records via normalizeState so older state files keep
   // loading.
   source?: "bundled" | "user";
+  // Frontmatter `metadata.gini.scripts` — each entry is a runtime tool that
+  // the skill ships as an executable companion (Anthropic Agent Skills
+  // `scripts/` convention). The script file lives next to SKILL.md, the
+  // runtime auto-registers a tool with the declared name + JSON schema, and
+  // when the agent invokes it the dispatcher spawns the script with
+  // connector env injected. This is how skills carry orchestration code
+  // that the model can't drive itself (signed-URL uploads, multi-step API
+  // flows). Only bundled skills' scripts are trusted today; user/imported
+  // skills' scripts are ignored at registration time.
+  scripts?: SkillScript[];
+}
+
+export interface SkillScript {
+  // Skill-folder-relative path, e.g. "scripts/attach.ts". Resolved against
+  // the dirname of SkillRecord.manifestPath at invocation time.
+  file: string;
+  // The tool spec the agent sees. Name is treated as the catalog tool name
+  // (must be unique across enabled skills). Parameters is a JSON Schema
+  // object passed straight through to the provider.
+  tool: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
 }
 
 export interface SkillVersion {

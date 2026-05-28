@@ -55,7 +55,7 @@ import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
-import { attachImageToLinearIssue } from "../integrations/linear-attach";
+import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
 import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
 import {
@@ -152,8 +152,6 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
-    case "linear_attach_image":
-      return { kind: "sync", result: await linearAttachImageTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_fill_secrets":
@@ -245,8 +243,21 @@ export async function dispatchToolCall(
       // gets gated the same way a terminal_exec would). The
       // `command` field on the payload is what the policy inspects.
       return codeExecDispatch(config, taskId, toolCallId, args);
-    default:
+    default: {
+      // Skill-script-derived tools (Anthropic Agent Skills `scripts/`
+      // convention; see src/capabilities/skill-scripts.ts) live outside
+      // the static TOOL_DEFS switch — they're registered from
+      // `state.skills[*].scripts[*]` at catalog-build time, so the
+      // dispatcher's last resort is a lookup against that registry. If we
+      // can't resolve the tool name to either branch, the model called
+      // something we never advertised and we surface the same error as
+      // any other unknown tool.
+      const invocation = findSkillScript(readState(config.instance), toolName);
+      if (invocation) {
+        return { kind: "sync", result: await skillScriptDispatch(config, taskId, invocation, args) };
+      }
       throw new Error(`Unknown tool: ${toolName}`);
+    }
   }
 }
 
@@ -781,27 +792,25 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max)}\n... (truncated)`;
 }
 
-// Attach a chat-uploaded image to a Linear issue. Wraps Linear's MCP
-// upload flow (prepare_attachment_upload → direct PUT → create_attachment_
-// from_upload) so the model only has to pass the issue id and upload id.
-// The orchestration helper handles auth + audit (each Linear MCP call rides
-// invokeMcpTool, which writes the standard mcp.tool.invoked audit row).
-async function linearAttachImageTool(
+// Generic dispatch for skill-script-derived tools (Anthropic Agent Skills
+// `scripts/` convention). Each enabled bundled skill that declares
+// `metadata.gini.scripts` exposes its scripts as tools the agent can
+// invoke. The runtime spawns the script with connector env injected, pipes
+// the args as JSON via stdin, and parses stdout as JSON. Failures (non-zero
+// exit, malformed stdout, missing output) come back as JSON `{ ok: false,
+// error: ... }` rather than thrown exceptions so the agent loop can
+// surface the failure to the model.
+async function skillScriptDispatch(
   config: RuntimeConfig,
   taskId: string,
+  invocation: ReturnType<typeof findSkillScript> & object,
   args: Record<string, unknown>
 ): Promise<string> {
-  const issue = requireString(args, "issue");
-  const uploadId = requireString(args, "uploadId");
-  const title = typeof args.title === "string" ? args.title : undefined;
-  const subtitle = typeof args.subtitle === "string" ? args.subtitle : undefined;
-  appendTrace(config.instance, taskId, {
-    type: "tool",
-    message: `Linear attach image ${issue}`,
-    data: { issue, uploadId }
-  });
-  const result = await attachImageToLinearIssue(config, taskId, { issue, uploadId, title, subtitle });
-  return JSON.stringify(result);
+  const result = await invokeSkillScript(config, invocation, args, { taskId });
+  if (result.parsed !== null && result.parsed !== undefined) {
+    return typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
+  }
+  return JSON.stringify({ ok: result.ok, error: result.error ?? "Skill script returned no output." });
 }
 
 // Spawn a constrained subagent and wait for its terminal state. The model

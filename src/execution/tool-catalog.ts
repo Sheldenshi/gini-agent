@@ -10,6 +10,14 @@
 import { createHash } from "node:crypto";
 import type { ToolFunctionSpec } from "../provider";
 import type { RuntimeState } from "../types";
+import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
+
+// Skill-script-derived tools (Anthropic Agent Skills `scripts/` convention)
+// are appended to the catalog at build time from `state.skills`. We give
+// them their own synthetic toolset name so the always-on filter and the
+// chat-block display layer can pick them out without sniffing each entry's
+// origin separately.
+export const SKILL_SCRIPT_TOOLSET = "skill_script";
 
 // Canonical tool list. Initial set mirrors src/tools/* one-for-one. We keep
 // each entry small and self-documenting so models with weaker tool-calling
@@ -750,34 +758,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // Attach a chat-attached image to a Linear issue. Wraps Linear's
-    // prepare_attachment_upload → direct PUT → create_attachment_from_upload
-    // sequence so the model only needs the issue identifier and the upload
-    // id from the user's message. The model can't PUT raw bytes to a
-    // Linear-signed URL via mcp_call, so this orchestration lives
-    // server-side. Upload ids appear in the user message preamble — pass
-    // them through verbatim. The Linear connector must already be set up;
-    // when it isn't, the tool returns a clear error suggesting
-    // request_connector.
-    toolset: "mcp",
-    displayLabel: "Attach image to Linear",
-    type: "function",
-    function: {
-      name: "linear_attach_image",
-      description: "Attach a chat-uploaded image to a Linear issue. Use this when the user provided screenshots and you've created or identified the issue. Pass the issue identifier (e.g. 'LIN-123') plus the uploadId from the system note that listed the user's attached image upload ids. Requires the Linear connector — if not configured, ask the user via request_connector first.",
-      parameters: {
-        type: "object",
-        properties: {
-          issue: { type: "string", description: "Issue identifier (e.g. 'LIN-123') or UUID." },
-          uploadId: { type: "string", description: "Upload id of a chat-attached image (from the 'Attached image upload ids' system note in the user message)." },
-          title: { type: "string", description: "Optional attachment title shown in Linear. Defaults to the upload's filename or 'Screenshot'." },
-          subtitle: { type: "string", description: "Optional attachment subtitle shown under the title in Linear." }
-        },
-        required: ["issue", "uploadId"]
-      }
-    }
-  },
-  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -1163,6 +1143,38 @@ export function allTools(): ToolCatalogTool[] {
   return TOOL_DEFS.map((t) => ({ ...t, function: { ...t.function, parameters: { ...t.function.parameters } } }));
 }
 
+// Materialize one ToolCatalogTool per (enabled bundled skill, declared
+// script) pair. We hand-build the toolset / displayLabel fields so the
+// always-on branch and the chat-block label helper recognize them by
+// toolset name rather than by hand-maintained allowlists.
+export function skillScriptCatalogEntries(state: RuntimeState): ToolCatalogTool[] {
+  const seen = new Set<string>();
+  const out: ToolCatalogTool[] = [];
+  // Skill order is stable across boots because we sort by skill name then
+  // by declared file path. Same hash-stability property the rest of the
+  // catalog relies on.
+  const sorted = [...listEnabledSkillScripts(state)].sort((a, b) => {
+    const skillCmp = a.skill.name.localeCompare(b.skill.name);
+    if (skillCmp !== 0) return skillCmp;
+    return a.script.file.localeCompare(b.script.file);
+  });
+  for (const inv of sorted) {
+    const name = inv.script.tool.name;
+    if (seen.has(name)) continue; // first-declaration-wins on duplicate names.
+    seen.add(name);
+    out.push({
+      toolset: SKILL_SCRIPT_TOOLSET,
+      type: "function",
+      function: {
+        name,
+        description: inv.script.tool.description,
+        parameters: inv.script.tool.parameters
+      }
+    });
+  }
+  return out;
+}
+
 // Filter tools by enabled toolsets in state. The web_fetch tool is grouped
 // under "messaging" only because the legacy defaults didn't include a "web"
 // toolset; if state has no `web` toolset the tool stays available unless an
@@ -1183,7 +1195,11 @@ export function allTools(): ToolCatalogTool[] {
 // hide outbound messaging entirely.
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
-  return allTools().filter((tool) => {
+  // Append skill-script-derived tools so the rest of the filter chain can
+  // treat them like any other catalog entry. The synthetic toolset name
+  // `SKILL_SCRIPT_TOOLSET` is what the always-on branch above keys on.
+  const base = [...allTools(), ...skillScriptCatalogEntries(state)];
+  return base.filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
@@ -1214,10 +1230,12 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
-    // linear_attach_image rides alongside mcp_call: same always-on rationale
-    // (a fresh instance with Linear configured should be able to attach
-    // screenshots without the user toggling a toolset row first).
-    if (tool.function.name === "linear_attach_image") return true;
+    // Skill-script-derived tools (Anthropic Agent Skills `scripts/`
+    // convention; see src/capabilities/skill-scripts.ts) ride alongside
+    // mcp_call: when an enabled bundled skill ships a script, the model
+    // needs that tool exposed on every fresh instance without a toolset
+    // toggle. The skill's status (`enabled`/`disabled`) is the gate.
+    if (tool.toolset === SKILL_SCRIPT_TOOLSET) return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
     // rationale: a fresh instance with no toolsets toggled still needs
@@ -1419,8 +1437,6 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.server)}.${previewValue(safe.tool)}`
       );
-    case "linear_attach_image":
-      return truncatePreview(previewValue(safe.issue));
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
     case "request_messaging_bridge":

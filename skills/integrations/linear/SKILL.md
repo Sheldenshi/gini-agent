@@ -8,9 +8,17 @@ metadata:
     version: 1.0.0
     author: Gini
     platforms: [macos, linux]
+    prerequisites:
+      env: [LINEAR_API_KEY]
     requires:
       connectors:
         - provider: linear
+    scripts:
+      - file: scripts/attach.ts
+        tool:
+          name: linear_attach_image
+          description: "Attach a chat-uploaded image to a Linear issue. Pass the issue identifier and the uploadId from the 'Attached image upload ids' system note in the user message."
+          parameters: '{"type":"object","properties":{"issue":{"type":"string","description":"Issue identifier (e.g. ENG-1234) or UUID."},"uploadId":{"type":"string","description":"Upload id of a chat-attached image."},"title":{"type":"string","description":"Optional attachment title shown in Linear."},"subtitle":{"type":"string","description":"Optional attachment subtitle."}},"required":["issue","uploadId"]}'
 ---
 
 # Linear

@@ -61,11 +61,6 @@ const ALWAYS_ON = new Set([
   "delete_job",
   "run_job",
   "mcp_call",
-  // linear_attach_image rides alongside mcp_call. The model needs it
-  // whenever Linear is connected and the user has uploaded screenshots —
-  // gating it on a toolset toggle would silently hide the screenshot
-  // attachment path on fresh instances.
-  "linear_attach_image",
   "request_connector",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It
@@ -193,6 +188,132 @@ describe("buildToolCatalog", () => {
     expect(tool).toBeDefined();
     expect(tool?.toolset).toBe("jobs");
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
+  });
+
+  test("skill-script-derived tools surface when their bundled skill is enabled", () => {
+    // Skill-script tools (Anthropic Agent Skills `scripts/` convention) are
+    // not in the static TOOL_DEFS — they're appended at catalog-build time
+    // from `state.skills[*].scripts[*]`. Always-on regardless of toolset
+    // state so a fresh instance with no toggles still exposes them.
+    const state = stateWithToolsets([]);
+    state.skills.push({
+      id: "skill_linear",
+      instance: "test",
+      name: "linear",
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: "enabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      manifestPath: "/repo/skills/integrations/linear/SKILL.md",
+      source: "bundled",
+      scripts: [
+        {
+          file: "scripts/attach.ts",
+          tool: {
+            name: "linear_attach_image",
+            description: "Attach a chat-uploaded image to a Linear issue.",
+            parameters: {
+              type: "object",
+              properties: { issue: { type: "string" }, uploadId: { type: "string" } },
+              required: ["issue", "uploadId"]
+            }
+          }
+        }
+      ]
+    });
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "linear_attach_image");
+    expect(tool).toBeDefined();
+    expect(tool?.toolset).toBe("skill_script");
+    expect(tool?.function.parameters.required).toEqual(["issue", "uploadId"]);
+  });
+
+  test("user-imported skill scripts are NOT exposed (trust boundary)", () => {
+    // Only bundled skills' scripts are trusted. A user-imported skill that
+    // declares a script must not get its tool wired into the catalog —
+    // running arbitrary code from a third-party install needs a separate
+    // trust review.
+    const state = stateWithToolsets([]);
+    state.skills.push({
+      id: "skill_user",
+      instance: "test",
+      name: "evil-linear",
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: "enabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      manifestPath: "/home/user/.gini/instances/x/skills/evil-linear/SKILL.md",
+      source: "user",
+      scripts: [
+        {
+          file: "scripts/evil.ts",
+          tool: {
+            name: "evil_tool",
+            description: "Should never appear.",
+            parameters: { type: "object", properties: {} }
+          }
+        }
+      ]
+    });
+    const catalog = buildToolCatalog(state);
+    expect(catalog.find((t) => t.function.name === "evil_tool")).toBeUndefined();
+  });
+
+  test("disabled bundled skills do not expose their scripts", () => {
+    const state = stateWithToolsets([]);
+    state.skills.push({
+      id: "skill_linear",
+      instance: "test",
+      name: "linear",
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: "disabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      manifestPath: "/repo/skills/integrations/linear/SKILL.md",
+      source: "bundled",
+      scripts: [
+        {
+          file: "scripts/attach.ts",
+          tool: {
+            name: "linear_attach_image",
+            description: "Attach a chat-uploaded image to a Linear issue.",
+            parameters: { type: "object", properties: {} }
+          }
+        }
+      ]
+    });
+    const catalog = buildToolCatalog(state);
+    expect(catalog.find((t) => t.function.name === "linear_attach_image")).toBeUndefined();
   });
 
   test("agent filter for a globally-disabled toolset still produces an empty (non-always-on) catalog", () => {
