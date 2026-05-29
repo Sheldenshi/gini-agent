@@ -872,7 +872,31 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // marker on tunneled requests. We tag the resulting row with its
       // origin so rotateSecret / disable can purge every tunneled
       // registration without disturbing loopback rows.
-      const origin = request.headers.get("x-gini-tunnel-vetted") === "1" ? "tunnel" : "loopback";
+      const vetted = request.headers.get("x-gini-tunnel-vetted") === "1";
+      // Recheck the live tunnel state under the marker so a request that
+      // passed the proxy gate before tunnel.disable runs can't sneak a
+      // new tunnel-origin row in AFTER the purge runs. Mobile retries
+      // the registration once /api/tunnel reports the new state, so a
+      // 503 + Retry-After is the cooperative answer here. The bearer
+      // reaching this handler is the BFF-injected runtime token, not
+      // the proxy's tunnel secret, so the recheck gates on the
+      // enabled/secret-presence state rather than a bearer comparison —
+      // a rotated-secret in-flight request still satisfies
+      // `enabled && secret`, and the new row stays attributable to a
+      // surviving credential.
+      if (vetted) {
+        const live = tunnelManager(config).current();
+        if (!live.enabled || !live.secret) {
+          return new Response(
+            JSON.stringify({ error: "tunnel_state_changed" }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json", "Retry-After": "2" }
+            }
+          );
+        }
+      }
+      const origin = vetted ? "tunnel" : "loopback";
       const device = upsertDevice(config.instance, {
         token,
         credentialId: credential,

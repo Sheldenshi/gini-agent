@@ -210,6 +210,20 @@ class TunnelManager {
     this.rotating = value;
   }
 
+  /** TEST-ONLY: drive `enabled` / `secret` directly so handler tests can
+   *  cover the live-state recheck paths (disable-in-flight, rotate-in-
+   *  flight) without spinning up a real cloudflared. Production code
+   *  always routes these transitions through enable / disable /
+   *  rotateSecret so the on-disk config, cloudflared lifecycle, and
+   *  in-memory snapshot stay in lockstep. */
+  __setSnapshotForTest(patch: { enabled?: boolean; secret?: string | null }): void {
+    this.snapshot = {
+      ...this.snapshot,
+      ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+      ...(patch.secret !== undefined ? { secret: patch.secret } : {})
+    };
+  }
+
   /** Current persisted-config view. Cheap; reads memory then disk. */
   private readPersisted(): TunnelPersistedConfig {
     return readTunnelConfig(this.config.instance);

@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
-import { tunnelManager } from "./runtime/tunnel";
+import { __resetTunnelManagerForTests, tunnelManager } from "./runtime/tunnel";
+import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import type { RuntimeConfig } from "./types";
 
@@ -2631,6 +2632,143 @@ describe("runtime api", () => {
       // Second delete of the same token: 404.
       const repeatDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, claimed.token);
       expect(repeatDelete.status).toBe(404);
+    });
+
+    test("vetted POST with tunnel enabled + secret present → 200 row written with origin='tunnel'", async () => {
+      // The happy path: the request carries the proxy-stamped vetted
+      // marker AND the live tunnel state has enabled=true with a
+      // populated secret, so the handler proceeds and tags the row as
+      // tunneled. The bearer the gateway sees here is the BFF-injected
+      // runtime token (config.token); the tunnel secret is the proxy's
+      // concern, not the gateway's.
+      const config = testConfig("push-devices-vetted-ok");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: true,
+        secret: "T".repeat(48)
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_t", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
+          headers: { "x-gini-tunnel-vetted": "1" }
+        },
+        config.token
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.device.origin).toBe("tunnel");
+      const all = listAllDevices(config.instance);
+      expect(all.length).toBe(1);
+      expect(all[0]!.origin).toBe("tunnel");
+      __resetTunnelManagerForTests();
+    });
+
+    test("vetted POST with tunnel disabled in-flight → 503 Retry-After, no row written", async () => {
+      // A vetted request that arrives after the operator disables the
+      // tunnel must NOT write a new tunnel-origin row — the purge that
+      // ran during disable would already have deleted the rest, and this
+      // late insert would be an orphan against a dead lane.
+      const config = testConfig("push-devices-vetted-disabled");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      // Tunnel is disabled at the moment the in-flight request is
+      // processed by the handler. The secret may still be on disk
+      // (disable doesn't null it), but enabled=false is the gate.
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: false,
+        secret: "T".repeat(48)
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_dis", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
+          headers: { "x-gini-tunnel-vetted": "1" }
+        },
+        config.token
+      );
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("2");
+      const body = await res.json();
+      expect(body.error).toBe("tunnel_state_changed");
+      expect(listAllDevices(config.instance).length).toBe(0);
+      __resetTunnelManagerForTests();
+    });
+
+    test("vetted POST with null secret in-flight → 503 Retry-After, no row written", async () => {
+      // Defense in depth: a vetted marker with a null on-disk secret
+      // means the tunnel state file is in an inconsistent shape (no
+      // production write path leaves enabled=true with secret=null, but
+      // a partial disable / boot-reconcile race could). 503 keeps the
+      // gateway from writing a tunnel-tagged row against a missing
+      // identity.
+      const config = testConfig("push-devices-vetted-no-secret");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: true,
+        secret: null
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_ns", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
+          headers: { "x-gini-tunnel-vetted": "1" }
+        },
+        config.token
+      );
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("2");
+      const body = await res.json();
+      expect(body.error).toBe("tunnel_state_changed");
+      expect(listAllDevices(config.instance).length).toBe(0);
+      __resetTunnelManagerForTests();
+    });
+
+    test("non-vetted POST (loopback) → 200 row written with origin='loopback' regardless of tunnel state", async () => {
+      // Loopback POSTs from the local web UI don't carry the marker and
+      // shouldn't be affected by the live-state recheck — the handler
+      // proceeds as today and writes a loopback row even when the live
+      // tunnel is fully off.
+      const config = testConfig("push-devices-loopback");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: false,
+        secret: null
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_loop", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+        },
+        config.token
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.device.origin).toBe("loopback");
+      __resetTunnelManagerForTests();
     });
 
     test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
