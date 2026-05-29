@@ -750,97 +750,53 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // signed_upload: PUT a chat-uploaded image/file to a signed URL the
-    // caller already obtained from some API (Linear's prepare_attachment_
-    // upload, GitHub's uploads.github.com, etc.). The body is constrained
-    // to "bytes of a Gini upload"; the model picks the URL and headers
-    // from a prior API response. This is the generic primitive that lets
-    // the model complete signed-PUT upload flows without per-provider
-    // runtime code.
+    // skill_run: invoke a script that ships with an enabled skill. The
+    // skill's SKILL.md documents what scripts it offers and what args
+    // each takes; the runtime spawns the script with stdin = JSON args,
+    // env = connector secrets + GINI_* context, and returns stdout
+    // parsed as JSON. This is the dispatch surface for recipe-shaped
+    // procedures that live in skills (signed-URL upload flows, multi-
+    // step orchestrations, format conversions) — distinct from `mcp_call`
+    // (which hits external MCP servers) and from the primitive tools in
+    // the catalog (which expose raw runtime capabilities).
     //
-    // Pair with mcp_call (or any other API call) on either side: get the
-    // signed URL + headers from the provider's prepare step, run
-    // signed_upload, then call the provider's finalize step. The skill
-    // for each integration documents the specific 3-step sequence.
+    // Read the skill's body via read_skill first to know which scripts
+    // exist and what args they take.
     toolset: "mcp",
-    displayLabel: "Upload to signed URL",
+    displayLabel: "Run skill script",
     type: "function",
     function: {
-      name: "signed_upload",
-      description: "PUT a chat-uploaded file's bytes to a signed URL. Use this for attachment / file-upload flows where an API (Linear, GitHub, S3, etc.) handed you a short-lived signed URL plus headers — you call signed_upload between the prepare step and the finalize step. The uploadId is the id from the 'Attached image uploads' system note in the user's message; url + headers come from the prepare-step response verbatim. Returns { ok, status, error?, bytesSent? }. Only https URLs are accepted.",
+      name: "skill_run",
+      description: "Invoke a script that ships with an enabled skill. Use this for skill-bundled procedures (e.g. `skill_run({skill:'attachments', script:'signed-upload', args:{uploadId, url, headers}})` for signed-PUT upload flows). The skill's SKILL.md is the reference for which scripts it offers and what args each takes — read_skill it first. Returns the script's JSON result verbatim, or `{ok:false, error}` on script failure / non-JSON output.",
       parameters: {
         type: "object",
         properties: {
-          uploadId: { type: "string", description: "Upload id of a chat-attached file (from the 'Attached image uploads' system note in the user message)." },
-          url: { type: "string", description: "Signed PUT URL returned by the API's prepare step. Must be https." },
-          headers: { type: "object", description: "Headers the API said to send verbatim with the PUT (e.g. content-type, x-goog-content-length-range). Pass them through exactly; omitting one usually means a 403 from the storage backend.", additionalProperties: { type: "string" } }
+          skill: { type: "string", description: "Name of the enabled skill that owns the script (e.g. 'attachments')." },
+          script: { type: "string", description: "Script basename (no extension) inside the skill's scripts/ folder (e.g. 'signed-upload')." },
+          args: { type: "object", description: "Args object passed to the script as JSON on stdin. Shape is per-script; the skill's SKILL.md documents it.", additionalProperties: true }
         },
-        required: ["uploadId", "url"]
-      }
-    }
-  },
-  {
-    // signed_download: GET bytes from a URL and store them as a Gini
-    // upload. Inverse of signed_upload — lets the model bridge external
-    // content (Linear attachment URLs, GitHub raw files, user-pasted
-    // URLs, S3 presigned downloads) into the upload-addressable space.
-    // Once landed as an uploadId, the bytes work with signed_upload (to
-    // re-send), vision_query (to inspect), and any other tool that takes
-    // an uploadId.
-    toolset: "mcp",
-    displayLabel: "Download to upload",
-    type: "function",
-    function: {
-      name: "signed_download",
-      description: "GET bytes from a URL and store them as a Gini upload. Use this when an API returns a URL pointing to file content (e.g. Linear's get_attachment, GitHub raw, S3 presigned download) and you want to do something with the bytes — vision_query, signed_upload to a different destination, attach to a Linear issue, etc. Returns { ok, uploadId, mimeType, size, error? }. Only https URLs accepted. Body capped at 50MB.",
-      parameters: {
-        type: "object",
-        properties: {
-          url: { type: "string", description: "Source URL to GET. Must be https." },
-          headers: { type: "object", description: "Optional request headers (auth tokens, etc.).", additionalProperties: { type: "string" } },
-          filename: { type: "string", description: "Optional filename to record in the upload manifest. Defaults to the URL basename." }
-        },
-        required: ["url"]
-      }
-    }
-  },
-  {
-    // promote_file: register a workspace file as a Gini upload. Closes
-    // the agent-produced-bytes gap — anything code_exec, terminal_exec,
-    // or future browser_capture leaves on disk can be promoted into the
-    // upload system so the model can then signed_upload / vision_query
-    // / attach it.
-    toolset: "mcp",
-    displayLabel: "Promote workspace file",
-    type: "function",
-    function: {
-      name: "promote_file",
-      description: "Register a workspace file as a Gini upload and return its uploadId. Use this when code_exec / terminal_exec / a future browser tool produced a file (chart PNG, generated PDF, downloaded artifact) and you want to attach it somewhere or vision_query it. The path is workspace-relative and validated for escape (same guard file_read uses). Returns { ok, uploadId, mimeType, size, error? }. Mime defaults from the file extension.",
-      parameters: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "Workspace-relative path to the file to promote." },
-          mimeType: { type: "string", description: "Optional explicit mime type. Overrides the extension-based default." }
-        },
-        required: ["path"]
+        required: ["skill", "script"]
       }
     }
   },
   {
     // vision_query: ask the configured vision model a question about a
     // Gini upload. Like browser_vision but for arbitrary uploads — pairs
-    // with signed_download / promote_file / chat-attached images so the
-    // model can "see" content it didn't start with as a data URL.
+    // with skill-managed downloads/uploads and chat-attached images so
+    // the model can "see" content it didn't start with as a data URL.
+    // Stays in core (not a skill script) because it's a thin wrapper
+    // over the model's internal multimodal capability — same shape as
+    // browser_vision and web_fetch.
     toolset: "mcp",
     displayLabel: "Vision query",
     type: "function",
     function: {
       name: "vision_query",
-      description: "Ask the configured vision model a question about an existing Gini upload (image/png or image/jpeg). Use this for chat-attached screenshots when you need to inspect details beyond what's already in vision context, or after signed_download / promote_file landed an image and you want the model to describe / extract from it. Returns { ok, answer, usage?, error? }. Costs a vision-model call.",
+      description: "Ask the configured vision model a question about an existing Gini upload (image/png or image/jpeg). Use this for chat-attached screenshots when you need to inspect details beyond what's already in vision context, or after skill scripts (e.g. attachments/signed-download) landed an image and you want the model to describe / extract from it. Returns { ok, answer, usage?, error? }. Costs a vision-model call.",
       parameters: {
         type: "object",
         properties: {
-          uploadId: { type: "string", description: "Id of the image upload to query (from the chat marker, signed_download, or promote_file)." },
+          uploadId: { type: "string", description: "Id of the image upload to query (from the chat marker, or from a skill script that landed an upload)." },
           question: { type: "string", description: "What to ask about the image." },
           maxTokens: { type: "number", description: "Optional cap on the response length. Default 512." }
         },
@@ -1286,17 +1242,16 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
-    // signed_upload / signed_download / promote_file / vision_query are
-    // the generic upload-space primitives. signed_upload PUTs Gini bytes
-    // out, signed_download GETs external bytes in, promote_file lifts
-    // workspace artifacts into the upload space, vision_query inspects
-    // an upload with the configured vision model. All four are always-on
-    // alongside mcp_call so a fresh instance can complete any
-    // signed-URL upload / download / vision flow without toolset
-    // toggling.
-    if (tool.function.name === "signed_upload") return true;
-    if (tool.function.name === "signed_download") return true;
-    if (tool.function.name === "promote_file") return true;
+    // skill_run is the generic dispatch surface for skill-bundled
+    // procedures (recipe-shaped operations that live in skills, not in
+    // core). Always-on alongside mcp_call so a fresh instance can invoke
+    // any skill script without toolset toggling — the skill's `enabled`
+    // status is the gate.
+    if (tool.function.name === "skill_run") return true;
+    // vision_query is the base primitive that exposes the model's
+    // multimodal capability against arbitrary uploads — like
+    // browser_vision but not tied to the browser session. Always-on
+    // alongside mcp_call for the same reasons.
     if (tool.function.name === "vision_query") return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
@@ -1499,18 +1454,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.server)}.${previewValue(safe.tool)}`
       );
-    case "signed_upload": {
-      let host = "";
-      try { host = new URL(String(safe.url ?? "")).host; } catch { host = "?"; }
-      return truncatePreview(`${previewValue(safe.uploadId)} → ${host}`);
-    }
-    case "signed_download": {
-      let host = "";
-      try { host = new URL(String(safe.url ?? "")).host; } catch { host = "?"; }
-      return truncatePreview(host);
-    }
-    case "promote_file":
-      return truncatePreview(previewValue(safe.path));
+    case "skill_run":
+      return truncatePreview(`${previewValue(safe.skill)}/${previewValue(safe.script)}`);
     case "vision_query":
       return truncatePreview(`${previewValue(safe.uploadId)}: ${previewValue(safe.question)}`);
     case "request_connector":

@@ -2,7 +2,7 @@
 name: linear
 description: "Read and write Linear issues, comments, projects, cycles, users, documents, initiatives, milestones, and more via the Linear MCP server. Attach chat-uploaded screenshots to issues."
 license: MIT
-allowed-tools: "mcp_call signed_upload read_skill"
+allowed-tools: "mcp_call skill_run read_skill"
 metadata:
   gini:
     version: 1.0.0
@@ -65,36 +65,13 @@ Useful argument quirks Linear's tool descriptions sometimes leave terse:
 
 ### Attaching screenshots / images
 
-When the user provides images in chat and asks you to file or update a Linear issue, attach them after you know the issue identifier. The flow is three steps — the middle one uses the generic `signed_upload` primitive:
+When the user provides images in chat and asks you to file or update a Linear issue, attach them after you know the issue identifier. The flow is three steps; the middle step (PUT bytes to Linear's signed URL) lives in the **`attachments` skill** — `read_skill name='attachments'` for the full reference. Linear-specific args are documented here.
 
-1. **Prepare** — call `mcp_call({ server: "linear", tool: "prepare_attachment_upload", arguments: { issue, filename, contentType, size } })`. The response carries `uploadRequest.url`, `uploadRequest.headers`, and `assetUrl`. The signed URL expires in 60 seconds; move quickly.
+1. **Prepare (Linear-specific)** — `mcp_call({ server: "linear", tool: "prepare_attachment_upload", arguments: { issue, filename, contentType, size } })`. The response carries `uploadRequest.url`, `uploadRequest.headers`, and `assetUrl`. The signed URL expires in 60 seconds; move immediately.
 
-2. **PUT the bytes** — call `signed_upload({ uploadId, url, headers })` with the chat-uploaded file's id (from the "Attached image upload ids" system note in the user's message) plus the `url` and `headers` from step 1's response. The runtime reads the upload off disk and PUTs it; the model never has to touch raw bytes.
+2. **PUT the bytes (attachments skill)** — `skill_run({ skill: "attachments", script: "signed-upload", args: { uploadId, url: prep.uploadRequest.url, headers: prep.uploadRequest.headers } })`. The script reads the upload off disk and PUTs it; the model never has to touch raw bytes. Returns `{ ok, status, bytesSent }`.
 
-3. **Finalize** — call `mcp_call({ server: "linear", tool: "create_attachment_from_upload", arguments: { issue, assetUrl, title, subtitle } })` with the `assetUrl` from step 1 and an optional `title` / `subtitle`. This creates the attachment row on the issue.
-
-Example sequence (issue ENG-123, an image upload `abc-…` of size 36116 bytes, mime `image/png`):
-
-```
-const prep = mcp_call({
-  server: "linear", tool: "prepare_attachment_upload",
-  arguments: { issue: "ENG-123", filename: "screenshot.png",
-               contentType: "image/png", size: 36116 }
-})
-// prep.uploadRequest.url + prep.uploadRequest.headers + prep.assetUrl
-
-signed_upload({
-  uploadId: "abc-...",
-  url: prep.uploadRequest.url,
-  headers: prep.uploadRequest.headers
-})
-
-mcp_call({
-  server: "linear", tool: "create_attachment_from_upload",
-  arguments: { issue: "ENG-123", assetUrl: prep.assetUrl,
-               title: "Login screen — error toast" }
-})
-```
+3. **Finalize (Linear-specific)** — `mcp_call({ server: "linear", tool: "create_attachment_from_upload", arguments: { issue, assetUrl, title, subtitle } })` with the `assetUrl` from step 1 and an optional `title` / `subtitle`.
 
 Each user message that carries attachments ends with a system note listing each upload's id, mime type, and size:
 
@@ -106,7 +83,11 @@ Attached image uploads (in order):
 
 Read the size and mimeType from that marker — `prepare_attachment_upload` rejects requests where `size` doesn't match the actual bytes (GCS returns `EntityTooLarge` / `EntityTooSmall`). One 3-step sequence per image.
 
-If `signed_upload` returns `ok: false`, the bytes did not land. Don't run the finalize step; either retry from step 1 (the signed URL is dead) or tell the user the upload failed and offer to paste the `assetUrl` into the issue body manually.
+If the `skill_run` step returns `ok: false`, the bytes did not land. Don't run the finalize step; either re-prepare (the signed URL is dead after 60s) or tell the user the upload failed and offer to paste the `assetUrl` into the issue body manually.
+
+### Reading attachments on existing issues
+
+To inspect or describe an attachment that's already on a Linear issue: combine `mcp_call(get_attachment)` with the **attachments skill's `signed-download` script** to land the bytes as a Gini upload, then `vision_query` to ask the model about the image. The attachments skill documents the full pattern — `read_skill name='attachments'`.
 
 ### Everything else (projects, cycles, comments, documents, initiatives, milestones, status updates, labels, diffs, users, teams)
 

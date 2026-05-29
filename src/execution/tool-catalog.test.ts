@@ -61,15 +61,12 @@ const ALWAYS_ON = new Set([
   "delete_job",
   "run_job",
   "mcp_call",
-  // The upload-space primitives ride alongside mcp_call. signed_upload
-  // PUTs Gini bytes out; signed_download GETs external bytes in;
-  // promote_file lifts workspace artifacts; vision_query inspects an
-  // upload with the configured vision model. All always-on so a fresh
-  // instance can complete any signed-URL upload / download / vision
-  // flow without toolset toggling.
-  "signed_upload",
-  "signed_download",
-  "promote_file",
+  // skill_run is the generic dispatch surface for skill-bundled
+  // procedures (signed-URL uploads/downloads, format conversions,
+  // multi-step orchestrations). vision_query is the base primitive that
+  // exposes the model's multimodal capability on arbitrary uploads.
+  // Both always-on alongside mcp_call.
+  "skill_run",
   "vision_query",
   "request_connector",
   // browser_fill_secrets is the meta-tool path for asking the user
@@ -200,15 +197,27 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
-  test("signed_upload is always-on", () => {
-    // signed_upload is the generic primitive for "PUT a Gini upload to a
-    // signed URL" — used by Linear attachments and any other API that
-    // returns a signed PUT URL. Always-on alongside mcp_call.
+  test("skill_run is always-on with the expected required args", () => {
+    // skill_run is the generic dispatch surface for skill-bundled
+    // procedures (signed-URL upload flows, format conversions, multi-
+    // step orchestrations) — always-on alongside mcp_call so a fresh
+    // instance can invoke any enabled skill's scripts.
     const state = stateWithToolsets([]);
     const catalog = buildToolCatalog(state);
-    const tool = catalog.find((t) => t.function.name === "signed_upload");
+    const tool = catalog.find((t) => t.function.name === "skill_run");
     expect(tool).toBeDefined();
-    expect(tool?.function.parameters.required).toEqual(["uploadId", "url"]);
+    expect(tool?.function.parameters.required).toEqual(["skill", "script"]);
+  });
+
+  test("vision_query is always-on (stays a base primitive in core)", () => {
+    // vision_query exposes the model's internal multimodal capability —
+    // same shape as browser_vision / web_fetch. Stays in core; not a
+    // skill script.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "vision_query");
+    expect(tool).toBeDefined();
+    expect(tool?.function.parameters.required).toEqual(["uploadId", "question"]);
   });
 
   test("agent filter for a globally-disabled toolset still produces an empty (non-always-on) catalog", () => {

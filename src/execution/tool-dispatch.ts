@@ -55,9 +55,7 @@ import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { invokeMcpTool } from "../integrations/mcp";
-import { invokeSignedUpload } from "../capabilities/signed-upload";
-import { invokeSignedDownload } from "../capabilities/signed-download";
-import { invokePromoteFile } from "../capabilities/promote-file";
+import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
 import { invokeVisionQuery } from "../capabilities/vision-query";
 import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
@@ -155,12 +153,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
-    case "signed_upload":
-      return { kind: "sync", result: await signedUploadTool(config, taskId, args) };
-    case "signed_download":
-      return { kind: "sync", result: await signedDownloadTool(config, taskId, args) };
-    case "promote_file":
-      return { kind: "sync", result: await promoteFileTool(config, taskId, args) };
+    case "skill_run":
+      return { kind: "sync", result: await skillRunTool(config, taskId, args) };
     case "vision_query":
       return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
@@ -790,49 +784,33 @@ function truncate(text: string, max: number): string {
   return `${text.slice(0, max)}\n... (truncated)`;
 }
 
-// signed_upload dispatch: bridges a Gini upload's bytes to a signed PUT
-// URL the model obtained from a prior API call. See
-// src/capabilities/signed-upload.ts for the helper's safety rationale.
-async function signedUploadTool(
+// skill_run dispatch: looks up the requested skill+script and spawns the
+// script with stdin = JSON args. Returns the script's JSON stdout
+// verbatim, or a clear { ok: false, error } envelope on script failure
+// / missing script / malformed output. See src/capabilities/skill-
+// scripts.ts for the spawn + env-injection details.
+async function skillRunTool(
   config: RuntimeConfig,
   taskId: string,
   args: Record<string, unknown>
 ): Promise<string> {
-  const uploadId = requireString(args, "uploadId");
-  const url = requireString(args, "url");
-  const headers = args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)
-    ? args.headers as Record<string, string>
+  const skillName = requireString(args, "skill");
+  const scriptName = requireString(args, "script");
+  const scriptArgs = args.args && typeof args.args === "object" && !Array.isArray(args.args)
+    ? args.args as Record<string, unknown>
     : {};
-  const result = await invokeSignedUpload(config, { uploadId, url, headers }, { taskId });
-  return JSON.stringify(result);
-}
-
-// signed_download dispatch: fetches bytes from a URL and lands them as a
-// Gini upload. Inverse of signed_upload.
-async function signedDownloadTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const url = requireString(args, "url");
-  const headers = args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)
-    ? args.headers as Record<string, string>
-    : undefined;
-  const filename = typeof args.filename === "string" ? args.filename : undefined;
-  const result = await invokeSignedDownload(config, { url, headers, filename }, { taskId });
-  return JSON.stringify(result);
-}
-
-// promote_file dispatch: registers a workspace file as an upload.
-async function promoteFileTool(
-  config: RuntimeConfig,
-  taskId: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  const path = requireString(args, "path");
-  const mimeType = typeof args.mimeType === "string" ? args.mimeType : undefined;
-  const result = await invokePromoteFile(config, { path, mimeType }, { taskId });
-  return JSON.stringify(result);
+  const handle = findSkillScript(readState(config.instance), skillName, scriptName);
+  if (!handle) {
+    return JSON.stringify({
+      ok: false,
+      error: `Skill script not found: ${skillName}/${scriptName}. The skill must be enabled and ship a top-level file named ${scriptName}.<ext> under scripts/.`
+    });
+  }
+  const result = await invokeSkillScript(config, handle, scriptArgs, { taskId });
+  if (result.parsed !== null && result.parsed !== undefined) {
+    return typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
+  }
+  return JSON.stringify({ ok: result.ok, error: result.error ?? "Skill script returned no output." });
 }
 
 // vision_query dispatch: runs the configured vision model against an
