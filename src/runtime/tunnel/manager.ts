@@ -11,14 +11,14 @@ import { inferTunnelTransport } from "./transport";
 import { instanceRoot } from "../../paths";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import type { AppleNotesState, TunnelSnapshot, TunnelTransitionResult, TunnelPersistedConfig } from "./types";
+import { TUNNEL_PUBLIC_URL_FILENAME, type AppleNotesState, type TunnelSnapshot, type TunnelTransitionResult, type TunnelPersistedConfig } from "./types";
 
 /** Path of the sibling file the runtime writes when the tunnel is up so the
  *  Next.js proxy (a separate process) can match the live tunnel hostname per
  *  request instead of trusting any `*.trycloudflare.com`. The file is removed
  *  on disable / shutdown / failed enable. */
 function publicUrlPath(instance: string): string {
-  return join(instanceRoot(instance), "tunnel.publicUrl");
+  return join(instanceRoot(instance), TUNNEL_PUBLIC_URL_FILENAME);
 }
 
 /** Read-only view of the persisted tunnel hostname for callers in other

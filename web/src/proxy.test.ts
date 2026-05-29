@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest, type NextResponse } from "next/server";
 import { proxy } from "./proxy";
+import { TUNNEL_PUBLIC_URL_FILENAME } from "@runtime/runtime/tunnel/types";
 
 const STATE_ROOT = mkdtempSync(join(tmpdir(), "gini-proxy-test-"));
 const INSTANCE = "default";
@@ -35,7 +36,7 @@ function writeConfig(opts: { enabled: boolean; secret: string }): void {
 
 function writePublicUrl(url: string | null): void {
   mkdirSync(instanceDir(), { recursive: true });
-  const p = join(instanceDir(), "tunnel.publicUrl");
+  const p = join(instanceDir(), TUNNEL_PUBLIC_URL_FILENAME);
   if (url === null) {
     try { rmSync(p); } catch { /* may not exist */ }
     return;

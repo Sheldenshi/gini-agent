@@ -79,6 +79,15 @@ export interface RedactedTunnelSnapshot {
  *  for client display; the code is the load-bearing contract. */
 export type TunnelTransitionErrorCode = "web_port_unhealthy";
 
+/** Filename for the sibling file the runtime writes inside
+ *  `~/.gini/instances/<inst>/` when the tunnel is up. The Next.js proxy
+ *  reads it on every request to compare the inbound Host against the
+ *  live trycloudflare hostname (no permissive suffix match). Centralized
+ *  here so both the runtime (which writes it) and the BFF (which reads
+ *  it) reference the same literal; renaming the file in one place would
+ *  otherwise silently desynchronize the two trust layers. */
+export const TUNNEL_PUBLIC_URL_FILENAME = "tunnel.publicUrl";
+
 // Manager status reasons that bubble into `lastError` strings.
 export type TunnelTransitionResult =
   | { ok: true; snapshot: TunnelSnapshot }

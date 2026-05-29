@@ -11,6 +11,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+// Reach into the runtime tree to share the publicUrl filename constant.
+// The runtime is what writes this file; importing the literal from the
+// authoritative source means renaming the file in one place fans out to
+// both trust layers without a silent desynchronization. The runtime
+// tunnel `types` module is type-only plus a pair of bare constants —
+// no node: imports — so this pulls nothing fs- or cloudflared-shaped
+// into the BFF bundle.
+import { TUNNEL_PUBLIC_URL_FILENAME } from "@runtime/runtime/tunnel/types";
 
 function instanceStateDir(): string {
   const instance = process.env.GINI_INSTANCE ?? "default";
@@ -49,7 +57,7 @@ export function readTunnelConfigFromDisk(): { enabled: boolean; secret: string }
  *  treats that as "no tunnel branch matches" and rejects at the Host
  *  classifier. */
 export function readLiveTunnelHost(): string {
-  const p = join(instanceStateDir(), "tunnel.publicUrl");
+  const p = join(instanceStateDir(), TUNNEL_PUBLIC_URL_FILENAME);
   if (!existsSync(p)) return "";
   try {
     const url = readFileSync(p, "utf8").trim();

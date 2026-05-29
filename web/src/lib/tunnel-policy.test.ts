@@ -13,6 +13,7 @@ import {
   withoutTrailingSlash
 } from "./tunnel-policy";
 import { readLiveTunnelHost, readTunnelConfigFromDisk } from "./tunnel-policy.server";
+import { TUNNEL_PUBLIC_URL_FILENAME } from "@runtime/runtime/tunnel/types";
 
 describe("isTunnelDenied", () => {
   test("denies entire /api/runtime/pairing subtree on every method", () => {
@@ -268,7 +269,7 @@ describe("readLiveTunnelHost", () => {
   });
 
   test("returns lowercased host when the publicUrl file is present", () => {
-    const f = join(tmpRoot, "instances", "test-instance", "tunnel.publicUrl");
+    const f = join(tmpRoot, "instances", "test-instance", TUNNEL_PUBLIC_URL_FILENAME);
     writeFileSync(f, "https://ABC.trycloudflare.com\n", "utf8");
     expect(readLiveTunnelHost()).toBe("abc.trycloudflare.com");
   });
@@ -278,13 +279,13 @@ describe("readLiveTunnelHost", () => {
   });
 
   test("returns empty string when the file is blank", () => {
-    const f = join(tmpRoot, "instances", "test-instance", "tunnel.publicUrl");
+    const f = join(tmpRoot, "instances", "test-instance", TUNNEL_PUBLIC_URL_FILENAME);
     writeFileSync(f, "  \n", "utf8");
     expect(readLiveTunnelHost()).toBe("");
   });
 
   test("returns empty string when the file contents are not a valid URL", () => {
-    const f = join(tmpRoot, "instances", "test-instance", "tunnel.publicUrl");
+    const f = join(tmpRoot, "instances", "test-instance", TUNNEL_PUBLIC_URL_FILENAME);
     writeFileSync(f, "not a url", "utf8");
     expect(readLiveTunnelHost()).toBe("");
   });
