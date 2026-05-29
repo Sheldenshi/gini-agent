@@ -806,6 +806,13 @@ class TunnelManager {
       // a prior enable() / rotateSecret() bails before writing the now-
       // stale URL/secret to iCloud Notes.
       this.generation += 1;
+      // True once the new secret has been written to disk. Gates the
+      // finally-block purge: rows are bound to the OLD secret and
+      // become unreachable only after the NEW secret hits disk. A
+      // pre-commit abort (web port unhealthy) leaves the old secret
+      // live, so purging device rows would silently revoke phones
+      // whose cookie still validly matches what's running.
+      let didCommitNewSecret = false;
       try {
         // Pre-flight port re-probe BEFORE committing the new secret to
         // disk. If the supervised web child is gone (or some other
@@ -838,6 +845,10 @@ class TunnelManager {
           tunnelTransport: inferTunnelTransport(null)
         };
         const next = this.persistTunnel( { secret: generateTunnelSecret() });
+        // Flip the commit-marker the instant persistTunnel returns —
+        // every device row tagged against the old secret is now
+        // unreachable, so the finally-block purge is authorized.
+        didCommitNewSecret = true;
         setRedactionSecret(next.secret);
         scheduledGeneration = this.generation;
         // Stamp the new secret + revision into the snapshot BEFORE
@@ -876,20 +887,32 @@ class TunnelManager {
         this.snapshot = { ...this.snapshot, lastError: redact(msg) };
         return { ok: false, error: redact(msg) };
       } finally {
-        // Wipe every tunneled push-device row regardless of how the
-        // rotate exited (success, swap early-return, or throw). The
-        // rows are bound to the OLD secret; once the new secret has
-        // hit disk (the persistTunnel call above) those subscriptions
-        // are unreachable. Keeping the purge in finally ensures a
-        // swap failure (e.g. cloudflared banner timeout) or a thrown
-        // recycle still drops the stale rows — otherwise a leaked
-        // bootstrap holder retains a permanent APNs subscription window
-        // even though their cookie no longer matches the live secret.
-        const purgedOnRotate = purgeTunnelDevices(this.config.instance);
-        appendLog(this.config.instance, "tunnel.secret-rotated", {
-          recycled: didRecycle,
-          tunnelDevicesPurged: purgedOnRotate.deleted
-        });
+        // Only wipe device rows when the new secret actually landed on
+        // disk. If the rotate aborted before the persist call (e.g. the
+        // pre-flight `web_port_unhealthy` return), the OLD secret is
+        // still the live one — purging would silently drop every phone
+        // that still has a valid cookie, breaking push delivery until
+        // each device re-launches and re-registers. Once the commit has
+        // happened, every old-secret-bound row is unreachable and the
+        // purge is mandatory whether the recycle succeeded, returned
+        // early, or threw — a leaked bootstrap holder would otherwise
+        // retain a permanent APNs subscription window even though
+        // their cookie no longer matches the live secret. The purge
+        // count is logged below so an operator inspecting the audit
+        // trail can see how many subscriptions were dropped on each
+        // successful rotation.
+        if (didCommitNewSecret) {
+          const purgedOnRotate = purgeTunnelDevices(this.config.instance);
+          appendLog(this.config.instance, "tunnel.secret-rotated", {
+            recycled: didRecycle,
+            tunnelDevicesPurged: purgedOnRotate.deleted
+          });
+        } else {
+          appendLog(this.config.instance, "tunnel.secret-rotate-aborted", {
+            recycled: didRecycle,
+            tunnelDevicesPurged: 0
+          });
+        }
         // Always release the rotate window — without this a thrown
         // recycle (e.g. cloudflared banner timeout) would leave the QR
         // endpoint returning 503 forever, with no operator-visible
