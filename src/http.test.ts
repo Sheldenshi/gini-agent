@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
 import { __resetTunnelManagerForTests, tunnelManager } from "./runtime/tunnel";
+import { webPortPath } from "./paths";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import type { RuntimeConfig } from "./types";
@@ -3127,6 +3128,103 @@ describe("runtime api", () => {
       } finally {
         mgr.__setRotatingForTest(false);
       }
+    });
+  });
+
+  describe("PATCH /api/tunnel error code → HTTP status mapping", () => {
+    // The HTTP status mapping must key off the typed `code` field on
+    // the manager's error result, not a substring of the prose. Pin
+    // both branches so a future reword of the human-readable message
+    // cannot silently flip an operator-actionable 409 into a generic
+    // 500 (and vice versa).
+    test("enable() returning code=web_port_unhealthy → 409", async () => {
+      const config = testConfig("tunnel-enable-unhealthy-409");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      // Plant a web.port so the pre-enable readWebPort gate passes
+      // and execution reaches mgr.enable(), where the override fires.
+      writeFileSync(webPortPath(config.instance), "7338", "utf8");
+      mgr.__setNextEnableResultForTest({
+        ok: false,
+        error: "web port 7338 not healthy — swap aborted, prior cloudflared stopped",
+        code: "web_port_unhealthy"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toContain("not healthy");
+      __resetTunnelManagerForTests();
+    });
+
+    test("enable() returning generic failure (no code) → 500", async () => {
+      const config = testConfig("tunnel-enable-generic-500");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      writeFileSync(webPortPath(config.instance), "7338", "utf8");
+      mgr.__setNextEnableResultForTest({
+        ok: false,
+        error: "cloudflared banner timeout"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toBe("cloudflared banner timeout");
+      __resetTunnelManagerForTests();
+    });
+
+    test("rotateSecret() returning code=web_port_unhealthy → 409", async () => {
+      const config = testConfig("tunnel-rotate-unhealthy-409");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      mgr.__setNextRotateSecretResultForTest({
+        ok: false,
+        error: "web port 7338 not healthy — rotation aborted before commit",
+        code: "web_port_unhealthy"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ rotateSecret: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toContain("not healthy");
+      __resetTunnelManagerForTests();
+    });
+
+    test("rotateSecret() returning generic failure (no code) → 500", async () => {
+      const config = testConfig("tunnel-rotate-generic-500");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      mgr.__setNextRotateSecretResultForTest({
+        ok: false,
+        error: "swap recycle failed"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ rotateSecret: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toBe("swap recycle failed");
+      __resetTunnelManagerForTests();
     });
   });
 });

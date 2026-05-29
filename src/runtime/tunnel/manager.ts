@@ -224,6 +224,21 @@ class TunnelManager {
     };
   }
 
+  /** TEST-ONLY: queue a single override result for the next `enable()` /
+   *  `rotateSecret()` call so handler tests can pin the HTTP-status
+   *  mapping without spinning up a real cloudflared. The override is
+   *  consumed once; subsequent calls fall back to the real apply chain.
+   *  Production code never sets these — the manager owns its own result
+   *  generation through the queue. */
+  private nextEnableResultOverride: TunnelTransitionResult | null = null;
+  private nextRotateSecretResultOverride: TunnelTransitionResult | null = null;
+  __setNextEnableResultForTest(result: TunnelTransitionResult): void {
+    this.nextEnableResultOverride = result;
+  }
+  __setNextRotateSecretResultForTest(result: TunnelTransitionResult): void {
+    this.nextRotateSecretResultOverride = result;
+  }
+
   /** Current persisted-config view. Cheap; reads memory then disk. */
   private readPersisted(): TunnelPersistedConfig {
     return readTunnelConfig(this.config.instance);
@@ -321,7 +336,7 @@ class TunnelManager {
         lastError: redact(message)
       };
       this.stopEdgeProbe();
-      return { ok: false, error: redact(message) };
+      return { ok: false, error: redact(message), code: "web_port_unhealthy" };
     }
     if (this.cloudflared) {
       const prev = this.cloudflared;
@@ -536,6 +551,11 @@ class TunnelManager {
     // caller to thread it back through. Set OUTSIDE the queue so the
     // value is visible to a concurrent rotateSecret read-then-recycle.
     this.lastWebPort = webPort;
+    if (this.nextEnableResultOverride !== null) {
+      const override = this.nextEnableResultOverride;
+      this.nextEnableResultOverride = null;
+      return override;
+    }
     return this.enqueue(async () => {
       // Bail before any write/spawn if shutdown has already started — the
       // drain has already run, so finishing this task would resurrect a
@@ -758,6 +778,11 @@ class TunnelManager {
    *  whole rotate+recycle atomic against any other apply-chain
    *  operation. */
   async rotateSecret(): Promise<TunnelTransitionResult> {
+    if (this.nextRotateSecretResultOverride !== null) {
+      const override = this.nextRotateSecretResultOverride;
+      this.nextRotateSecretResultOverride = null;
+      return override;
+    }
     let scheduledGeneration = 0;
     let didRecycle = false;
     const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
@@ -779,7 +804,7 @@ class TunnelManager {
           const healthy = await isSupervisedWebChild(this.config.instance, this.lastWebPort);
           if (!healthy) {
             this.snapshot = { ...this.snapshot, lastError: redact(`web port ${this.lastWebPort} not healthy — rotation aborted before commit`) };
-            return { ok: false, error: `web port ${this.lastWebPort} not healthy — rotation aborted before commit` };
+            return { ok: false, error: `web port ${this.lastWebPort} not healthy — rotation aborted before commit`, code: "web_port_unhealthy" };
           }
         }
         // Open the rotate window. From this point until the recycle

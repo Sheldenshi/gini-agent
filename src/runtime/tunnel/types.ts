@@ -71,7 +71,15 @@ export interface RedactedTunnelSnapshot {
   };
 }
 
+/** Discrete failure code for transition results. The HTTP layer keys
+ *  status mapping on this enum instead of substring-matching the
+ *  human-readable `error` prose, so a future rewording of the error
+ *  message can't silently flip a 409 (operator-actionable: bring the
+ *  web child back) into a 500 (gateway-internal). The prose is kept
+ *  for client display; the code is the load-bearing contract. */
+export type TunnelTransitionErrorCode = "web_port_unhealthy";
+
 // Manager status reasons that bubble into `lastError` strings.
 export type TunnelTransitionResult =
   | { ok: true; snapshot: TunnelSnapshot }
-  | { ok: false; error: string };
+  | { ok: false; error: string; code?: TunnelTransitionErrorCode };

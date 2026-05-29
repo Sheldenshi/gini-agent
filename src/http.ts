@@ -129,7 +129,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const mgr = tunnelManager(config);
       if (typeof payload.rotateSecret === "boolean" && payload.rotateSecret) {
         const result = await mgr.rotateSecret();
-        if (!result.ok) return json({ error: result.error }, 500);
+        if (!result.ok) return json({ error: result.error }, result.code === "web_port_unhealthy" ? 409 : 500);
       }
       if (typeof payload.enabled === "boolean") {
         if (payload.enabled) {
@@ -147,13 +147,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           // re-enabling a tunnel the operator just disabled. Calling
           // mgr.enable() synchronously after body parse keeps queue
           // arrival order = request order, so the later disable
-          // wins. The not-healthy 409 is preserved by detecting
-          // swapCloudflared's "web port ... not healthy" sentinel
-          // in the manager's error payload.
+          // wins. The not-healthy 409 is preserved by keying off the
+          // typed `code` field on the manager's error payload — the
+          // human-readable prose is for client display, the discrete
+          // code is what gates the HTTP status mapping.
           const result = await mgr.enable(port);
           if (!result.ok) {
-            const notHealthy = typeof result.error === "string" && result.error.includes("not healthy");
-            return json({ error: result.error }, notHealthy ? 409 : 500);
+            return json({ error: result.error }, result.code === "web_port_unhealthy" ? 409 : 500);
           }
         } else {
           const result = await mgr.disable();
