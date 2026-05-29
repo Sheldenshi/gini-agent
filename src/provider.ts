@@ -2196,6 +2196,14 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "functions",
   "function_call",
   "store",
+  // Pinned at "in_memory" on every OpenAI-compatible chat-completions
+  // builder. Defense-in-depth: a future refactor that reorders the
+  // body spread so the typed field comes BEFORE sanitizeExtraBody
+  // would silently let extraBody.prompt_cache_retention shadow our
+  // explicit opt-out of the "24h" extended tier (documented as not
+  // Zero Data Retention eligible). Stripping the key here keeps the
+  // protection independent of spread order. See ADR cache-warmer.md.
+  "prompt_cache_retention",
   "__proto__",
   "constructor",
   "prototype",
