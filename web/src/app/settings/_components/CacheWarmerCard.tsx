@@ -5,78 +5,23 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { InfoIcon } from "lucide-react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { api } from "@/lib/api";
+import {
+  TRACK_MAX,
+  UPPER_BREAKPOINT_MIN,
+  formatMinutes,
+  formatRefresh,
+  minutesToPosition,
+  positionToMinutes
+} from "./cache-warmer-math";
 
 // Cache warmer is model-agnostic: every modern provider (OpenAI, Anthropic,
 // OpenRouter, DeepSeek, ...) does some flavor of prompt caching, and the
 // warmer's only job is to fire a minimal probe before the cache would
 // expire so the next real turn pays the cache-hit rate instead of a full
 // re-prefill.
-//
-// Piecewise slider scale: prompt cache TTLs cluster heavily in the
-// 5-60 min range, so the lower half of the track maps to 0-60 min in
-// 1-min snap and the upper half maps to 60-1440 min in 5-min snap. The
-// native <input type="range"> still moves linearly across the underlying
-// 0-1000 nominal position; we translate position → minutes for display
-// and only the snapped minute value is persisted.
 
-const TRACK_MAX = 1000;
-const SPLIT = 500;
-const LOWER_BREAKPOINT_MIN = 60;
-const UPPER_BREAKPOINT_MIN = 1440;
 const SAVE_DEBOUNCE_MS = 500;
 const SAVED_NOTICE_MS = 1500;
-
-// Lower half (0..SPLIT positions) covers 0-60 min in 1-min snap, upper
-// half (SPLIT..TRACK_MAX) covers 60-1440 min in 5-min snap. The 1-min
-// lower-half granularity is intentional: with a 5-min snap, 500 nominal
-// positions / 12 minute-values = 41.67 positions per value-change, which
-// felt like the slider was ignoring small drags. 1-min snap brings that
-// down to 500/60 = 8.33 positions per value-change, so the displayed
-// number ticks visibly as the thumb moves.
-function positionToMinutes(pos: number): number {
-  if (pos <= SPLIT) {
-    return Math.round((pos / SPLIT) * LOWER_BREAKPOINT_MIN);
-  }
-  const raw =
-    LOWER_BREAKPOINT_MIN +
-    ((pos - SPLIT) / SPLIT) * (UPPER_BREAKPOINT_MIN - LOWER_BREAKPOINT_MIN);
-  return Math.round(raw / 5) * 5;
-}
-
-function minutesToPosition(min: number): number {
-  if (min <= 0) return 0;
-  return min <= LOWER_BREAKPOINT_MIN
-    ? (min / LOWER_BREAKPOINT_MIN) * SPLIT
-    : SPLIT +
-        ((min - LOWER_BREAKPOINT_MIN) /
-          (UPPER_BREAKPOINT_MIN - LOWER_BREAKPOINT_MIN)) *
-          SPLIT;
-}
-
-function formatMinutes(min: number): string {
-  if (min === 0) return "Off";
-  const hours = Math.floor(min / 60);
-  const remainder = min % 60;
-  if (hours === 0) return `${remainder} min`;
-  if (remainder === 0) return `${hours} h`;
-  return `${hours} h ${remainder} min`;
-}
-
-// Refresh is fixed at 90% of the chosen interval — exactly minutes × 54
-// seconds. Format with sub-minute precision so a 5-min interval reads
-// "4 min 30 sec", not the misleading "5 min" that would land the probe
-// at the exact expiry instead of before it.
-function formatRefresh(min: number): string {
-  const seconds = min * 54;
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const sec = seconds % 60;
-  const parts: string[] = [];
-  if (hours > 0) parts.push(`${hours} h`);
-  if (minutes > 0) parts.push(`${minutes} min`);
-  if (sec > 0) parts.push(`${sec} sec`);
-  return parts.join(" ");
-}
 
 const TICKS: { min: number; label: string }[] = [
   { min: 0, label: "Off" },
