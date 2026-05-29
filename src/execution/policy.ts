@@ -40,14 +40,17 @@ import {
 // code_exec (it really runs as one) — only the POLICY decision
 // branches separately so the matcher sees the raw `Bun.spawn(["sudo",
 // ...])` source the wrapper would otherwise hide.
+// Approval-policy actions are the subset of agent-actor gates that flow
+// through resolveApprovalPolicy. SetupRequest actions (browser.connect,
+// connector.request, browser.fill_secret) are user-actor and never auto-
+// resolve, so they don't appear here. See
+// docs/adr/authorization-vs-setup-request.md.
 export type PolicyAction =
   | "file.write"
   | "file.patch"
   | "terminal.exec"
   | "code.exec"
   | "browser.upload_file"
-  | "browser.connect"
-  | "browser.fill_secret"
   | "messaging.send";
 
 export interface TerminalExecPayload {
@@ -94,22 +97,6 @@ export function resolveApprovalPolicy(
 ): ApprovalPolicyDecision {
   const mode = effectiveApprovalMode(config);
 
-  // browser.fill_secret always gates regardless of approvalMode.
-  // There's no notion of "auto-approving" credential entry — the
-  // values come from the user via the amber chat card and the
-  // /connect endpoint, and yolo's "auto-approve side effects the
-  // agent decides on its own" intent does not apply to user-typed
-  // input. Without this guard, a yolo-mode operator would silently
-  // approve an empty fill_secret (no values submitted) and the
-  // agent would be told the fields were filled. fill_secret bypasses
-  // pendingOrAuto today (createApproval is called directly from
-  // src/execution/tool-dispatch.ts:browserFillSecretsTool), but the
-  // guard lives here for defense — if a future refactor routes
-  // fill_secret through pendingOrAuto, the contract still holds.
-  if (action === "browser.fill_secret") {
-    return { mode: "gate", reason: "fill-secret-always-gate" };
-  }
-
   if (mode === "yolo") {
     return { mode: "auto", reason: "approval-mode-yolo" };
   }
@@ -130,15 +117,6 @@ export function resolveApprovalPolicy(
   if (action === "messaging.send") {
     return { mode: "auto", reason: "approval-mode-auto" };
   }
-
-  // browser.connect intentionally falls through to the default
-  // `{ mode: "gate" }` at the bottom rather than being auto-approved
-  // under "auto" mode. Spawning a visible Chrome with a persistent
-  // per-instance profile is the trust-establishment moment that
-  // warrants explicit user consent — every subsequent click/type
-  // happens within a window the user already approved opening. It's
-  // the second exception to the browser carve-out alongside
-  // browser.upload_file (which egresses workspace bytes).
 
   if (action === "terminal.exec") {
     const command = typeof (payload as TerminalExecPayload | undefined)?.command === "string"

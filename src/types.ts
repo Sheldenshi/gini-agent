@@ -7,7 +7,17 @@ export type Instance = "default" | string;
 
 export type TaskStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
-export type ApprovalStatus = "pending" | "approved" | "denied";
+// Authorization (agent-actor): user approves/denies, runtime then performs
+// the action. SetupRequest (user-actor): user performs a setup step in the
+// browser or with credentials, runtime resumes once they signal complete.
+// See docs/adr/authorization-vs-setup-request.md.
+export type AuthorizationStatus = "pending" | "approved" | "denied";
+export type SetupRequestStatus = "pending" | "completed" | "cancelled";
+
+// Deprecated alias retained so legacy code paths (and any external consumer
+// that imported the enum) keep type-checking during the split. New code
+// should use AuthorizationStatus directly.
+export type ApprovalStatus = AuthorizationStatus;
 
 export type RiskLevel = "low" | "medium" | "high";
 
@@ -15,7 +25,7 @@ export type SkillStatus = "enabled" | "disabled" | "archived";
 
 export type JobStatus = "active" | "paused" | "failed";
 
-export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local";
+export type ProviderName = "echo" | "openai" | "codex" | "openrouter" | "local" | "deepseek";
 
 export type ImprovementStatus = "proposed" | "approved" | "rejected" | "applied";
 
@@ -247,7 +257,8 @@ export type ChatBlockKind =
   | "tool_call"
   | "tool_result"
   | "phase"
-  | "approval_requested"
+  | "authorization_requested"
+  | "setup_requested"
   | "system_note";
 
 interface ChatBlockBase {
@@ -260,9 +271,21 @@ interface ChatBlockBase {
   runId?: string;
 }
 
+// Inline image attached to a user message. The runtime stores the bytes on
+// disk under ~/.gini/instances/<instance>/uploads/<id>.<ext> and references
+// them by id; clients fetch them via GET /api/uploads/:id. We never embed
+// base64 in chat blocks or state.json — the upload id is the canonical
+// reference, and the provider call inlines a data URL only at dispatch time.
+export interface ImageAttachment {
+  id: string;
+  mimeType: string;
+  size: number;
+}
+
 export interface UserTextBlock extends ChatBlockBase {
   kind: "user_text";
   text: string;
+  images?: ImageAttachment[];
 }
 
 export interface AssistantTextBlock extends ChatBlockBase {
@@ -297,6 +320,17 @@ export interface ToolCallBlock extends ChatBlockBase {
   // associate result with call, and by resume paths to flip the
   // matching running block to `ok`/`error` after the approval lands.
   callId: string;
+  // Optional context message a tool emits while parked in `running`,
+  // describing why it's waiting and what (if anything) the user can do
+  // to unblock it. Reserved for tools that block on an external event
+  // the agent cannot drive — currently only `wait_for_messaging_pair`
+  // (waiting on an inbound Telegram DM, up to 600s). Clients MAY render
+  // a running tool_call more prominently when this field is set; the
+  // wire contract is that the hint is advisory, not a separate kind.
+  // The runtime clears it automatically when the tool's status leaves
+  // `running`, so resolution/error/cancellation collapse the block back
+  // to its default render.
+  runningHint?: string;
 }
 
 export interface ToolResultBlock extends ChatBlockBase {
@@ -320,24 +354,46 @@ export interface PhaseBlock extends ChatBlockBase {
   label: string;
 }
 
-export interface ApprovalRequestedBlock extends ChatBlockBase {
-  kind: "approval_requested";
-  approvalId: string;
-  // Approval action (`file.write`, `terminal.exec`, `connector.request`,
-  // `browser.fill_secret`, etc.). Clients branch on `action` to render
-  // the right card variant:
-  //   - `connector.request` → Connect dialog (collects OAuth/API
-  //     creds via /api/approvals/<id>/connect).
-  //   - `browser.fill_secret` → inline Submit form with one input
-  //     per slot in approval.payload.slots; Submit POSTs the per-slot
-  //     values to /api/approvals/<id>/connect with body
-  //     `{ secrets: { <slot.name>: <value>, ... } }`. The generic
-  //     /approve endpoint refuses this action — Deny is still valid.
-  //     See docs/adr/browser-fill-secret.md.
-  //   - everything else → standard Approve / Deny pair (POST to
-  //     /api/approvals/<id>/{approve,deny}).
-  action: string;
-  risk: string;
+// Agent-actor: user approves or denies; runtime then performs the action.
+// Renders with a risk pill + Approve/Deny buttons. POSTs to
+// /api/authorizations/<id>/{approve,deny}.
+export interface AuthorizationRequestedBlock extends ChatBlockBase {
+  kind: "authorization_requested";
+  authorizationId: string;
+  action: AuthorizationAction;
+  risk: RiskLevel;
+  summary: string;
+}
+
+// User-actor: user performs a setup step. No risk pill. Card layout is
+// chosen by `action`:
+//   - `browser.connect` → "Connect" button that opens visible Chrome
+//     (POST /api/setup-requests/<id>/open-browser), then signals complete.
+//   - `connector.request` → credential dialog. Submit POSTs the credential
+//     payload to /api/setup-requests/<id>/complete.
+//   - `browser.fill_secret` → inline credential inputs with destination URL
+//     prominent. Submit POSTs `{ secrets: { <slot>: <value> } }` to
+//     /api/setup-requests/<id>/complete.
+//   - `messaging.add_bridge` → inline form with name + password-masked
+//     bot-token inputs (kind is pinned in payload). Submit POSTs
+//     `{ secrets: { name, botToken } }` to /api/setup-requests/<id>/complete,
+//     which routes into addMessagingBridge. Other surfaces (home page,
+//     /permissions list) render a "resolve in chat" hint because they can't
+//     display the form. See docs/adr/telegram-bridge.md and
+//     chat-block-protocol.md.
+//   - `messaging.approve_pairing` → confirmation card showing the pending
+//     sender, chat type, verification code, expiry. Two buttons: Approve
+//     (POSTs `{}` to /complete → server calls allowChat with expectedCode);
+//     Reject (POSTs `{ reject: true }` to /complete → server calls
+//     rejectPendingChat).
+//   - `messaging.remove_bridge` → destructive confirmation card showing
+//     bridge name + irreversibility warning. Submit POSTs `{}` to /complete
+//     → server calls removeMessagingBridge.
+// Cancel always POSTs to /api/setup-requests/<id>/cancel.
+export interface SetupRequestedBlock extends ChatBlockBase {
+  kind: "setup_requested";
+  setupRequestId: string;
+  action: SetupRequestAction;
   summary: string;
 }
 
@@ -352,7 +408,8 @@ export type ChatBlock =
   | ToolCallBlock
   | ToolResultBlock
   | PhaseBlock
-  | ApprovalRequestedBlock
+  | AuthorizationRequestedBlock
+  | SetupRequestedBlock
   | SystemNoteBlock;
 
 export interface RuntimeState {
@@ -361,7 +418,12 @@ export interface RuntimeState {
   createdAt: string;
   updatedAt: string;
   tasks: Task[];
-  approvals: Approval[];
+  // Agent-actor gates: approved/denied by the user, then the runtime
+  // performs the action.
+  authorizations: Authorization[];
+  // User-actor gates: the user performs a setup step (browser sign-in,
+  // credential entry), then the runtime resumes.
+  setupRequests: SetupRequest[];
   audit: AuditEvent[];
   skills: SkillRecord[];
   jobs: JobRecord[];
@@ -522,6 +584,12 @@ export interface Task {
   // (oldest dropped). Not persisted as audit truth — these are a display
   // convenience only.
   recentToolCalls?: ToolCallSummary[];
+  // Image attachments carried by the user message that spawned this task.
+  // Stamped on submission so the agent loop can build vision content from a
+  // single record instead of racing the chat-message write. The bytes live
+  // under ~/.gini/instances/<inst>/uploads/<id>.<ext>; this array only
+  // carries the refs.
+  images?: ImageAttachment[];
 }
 
 export interface RuntimeEvent {
@@ -667,6 +735,11 @@ export interface ChatMessageRecord {
   createdAt: string;
   taskId?: string;
   runId?: string;
+  // User-role messages carry images attached at submit time. Stored as upload
+  // refs (id + mimeType + size) — bytes live on disk under
+  // ~/.gini/instances/<inst>/uploads/. Mirrored on the user_text ChatBlock so
+  // either persistence path can drive transcript rendering.
+  images?: ImageAttachment[];
   // Optional tag used to distinguish multiple assistant messages emitted by
   // the same task. Today only "approval_reason" is set — when an approval
   // (e.g. connector.request) is created, the runtime persists its `reason`
@@ -974,21 +1047,84 @@ export interface AuditEvent {
   redacted?: boolean;
 }
 
-export interface Approval {
+// Agent-actor gate: the user approves or denies; the runtime then performs
+// the side-effecting action. See docs/adr/authorization-vs-setup-request.md.
+export type AuthorizationAction =
+  | "file.write"
+  | "file.patch"
+  | "terminal.exec"
+  | "memory.activate"
+  | "skill.enable"
+  | "connector.enable"
+  | "browser.upload_file"
+  | "messaging.send";
+
+export interface Authorization {
   id: string;
   instance: Instance;
   // Requesting agent. Optional — backfilled by normalizeState; system-driven
-  // approvals without an active agent leave it undefined.
+  // authorizations without an active agent leave it undefined.
   agentId?: string;
-  status: ApprovalStatus;
+  status: AuthorizationStatus;
   createdAt: string;
   updatedAt: string;
   taskId?: string;
-  action: "file.write" | "file.patch" | "terminal.exec" | "memory.activate" | "skill.enable" | "connector.enable" | "connector.request" | "browser.upload_file" | "browser.connect" | "browser.fill_secret" | "messaging.send";
+  action: AuthorizationAction;
   target: string;
   risk: RiskLevel;
   reason: string;
   payload: Record<string, unknown>;
+}
+
+// User-actor gate: the user performs a setup step (sign in via browser,
+// enter credentials, fill a form, or confirm a messaging side effect). The
+// runtime resumes after the user signals completion via the
+// /setup-requests/:id/complete endpoint.
+//
+// The messaging.* actions (add_bridge, approve_pairing, remove_bridge) are
+// connect-only: like browser.connect / connector.request, their side effect
+// (addMessagingBridge / allowChat / removeMessagingBridge) runs inside the
+// /complete handler before the request is marked completed. They carry no
+// approve/deny semantics, so they live here rather than on AuthorizationAction.
+export type SetupRequestAction =
+  | "browser.connect"
+  | "connector.request"
+  | "browser.fill_secret"
+  | "messaging.add_bridge"
+  | "messaging.approve_pairing"
+  | "messaging.remove_bridge";
+
+export interface SetupRequest {
+  id: string;
+  instance: Instance;
+  // Requesting agent. Optional — backfilled by normalizeState; system-driven
+  // setup requests without an active agent leave it undefined.
+  agentId?: string;
+  status: SetupRequestStatus;
+  createdAt: string;
+  updatedAt: string;
+  taskId?: string;
+  action: SetupRequestAction;
+  // Trust anchor shown to the user before they complete the request: the
+  // destination URL for browser.connect / browser.fill_secret, the provider
+  // id for connector.request, or the bridge kind / id for the messaging.*
+  // actions.
+  target: string;
+  // Human-language ask shown to the user in the chat card.
+  reason: string;
+  payload: Record<string, unknown>;
+  // Set by the messaging.* /complete handlers (add_bridge, approve_pairing,
+  // remove_bridge) after the post-completion side effect runs. `ok: true`
+  // means the side effect succeeded (bridge created, pairing approved,
+  // etc.); `ok: false` plus `message` carries the sanitized failure reason.
+  // The chat card reads this as the source of truth for the past-tense
+  // summary after reload — React-component-local sticky state is cleared on
+  // reload, so without a persisted outcome a failed side effect on a
+  // status="completed" row would fall back to rendering as success.
+  // browser.fill_secret could adopt the same field; today it only tracks
+  // success via the request status because its failure modes bounce the
+  // request pending state instead of completing + failing.
+  connectOutcome?: { ok: boolean; message?: string };
 }
 
 export interface SkillRecord {

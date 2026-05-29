@@ -7,6 +7,7 @@ import {
   countByNetwork,
   countMemoryUnits,
   deserializeEmbedding,
+  ensureChatBlocksKindConstraint,
   ensureChatReadStateDeviceTokenSchema,
   ensureDefaultBank,
   getMemoryDb,
@@ -455,6 +456,97 @@ describe("memory-db schema and storage", () => {
       )
       .get();
     expect(row?.last_read_block_id).toBe("blk_9");
+    db.close();
+  });
+
+  test("ensureChatBlocksKindConstraint recreates a pre-split table and preserves rows", () => {
+    const db = new Database(":memory:");
+    // Pre-split schema: CHECK omits authorization_requested / setup_requested.
+    db.exec(`
+      CREATE TABLE chat_blocks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        instance TEXT NOT NULL,
+        agent_id TEXT,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN (
+          'user_text','assistant_text','tool_call','tool_result',
+          'phase','approval_requested','system_note'
+        )),
+        payload_json TEXT NOT NULL,
+        task_id TEXT,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (session_id, ordinal)
+      );
+    `);
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_1','chat_1','inst',NULL,0,'approval_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    // Pre-migration the new kind is rejected by the stale constraint.
+    expect(() =>
+      db.run(
+        "INSERT INTO chat_blocks VALUES ('blk_x','chat_1','inst',NULL,1,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+      )
+    ).toThrow();
+
+    ensureChatBlocksKindConstraint(db);
+
+    // The legacy row survived the table recreation.
+    const kept = db
+      .query<{ kind: string }, []>("SELECT kind FROM chat_blocks WHERE id = 'blk_1'")
+      .get();
+    expect(kept?.kind).toBe("approval_requested");
+    // The recreated table now accepts the new kinds.
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_2','chat_1','inst',NULL,2,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_3','chat_1','inst',NULL,3,'authorization_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    const count = db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM chat_blocks").get();
+    expect(count?.c).toBe(3);
+    db.close();
+  });
+
+  test("ensureChatBlocksKindConstraint is a no-op when the table already allows setup_requested", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE chat_blocks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        instance TEXT NOT NULL,
+        agent_id TEXT,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN (
+          'user_text','assistant_text','tool_call','tool_result',
+          'phase','approval_requested','authorization_requested',
+          'setup_requested','system_note'
+        )),
+        payload_json TEXT NOT NULL,
+        task_id TEXT,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (session_id, ordinal)
+      );
+    `);
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_1','chat_1','inst',NULL,0,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    ensureChatBlocksKindConstraint(db);
+    const row = db
+      .query<{ kind: string }, []>("SELECT kind FROM chat_blocks WHERE id = 'blk_1'")
+      .get();
+    expect(row?.kind).toBe("setup_requested");
+    db.close();
+  });
+
+  test("ensureChatBlocksKindConstraint is a no-op when the table is absent", () => {
+    const db = new Database(":memory:");
+    // No chat_blocks table at all — nothing to recreate, must not throw.
+    expect(() => ensureChatBlocksKindConstraint(db)).not.toThrow();
     db.close();
   });
 

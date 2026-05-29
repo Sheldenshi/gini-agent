@@ -16,9 +16,11 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
+import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
 import { Composer } from "@/components/chat/Composer";
 import { SessionItem } from "@/components/chat/SessionItem";
-import { api } from "@/lib/api";
+import { api, type UploadRef } from "@/lib/api";
+import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   useCancelTask,
   useChatBlocks,
@@ -116,10 +118,10 @@ export default function ChatPage() {
   });
 
   const send = useMutation({
-    mutationFn: (content: string) =>
+    mutationFn: ({ content, images }: { content: string; images: UploadRef[] }) =>
       api<{ taskId: string }>(`/chat/${selected}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content })
+        body: JSON.stringify({ content, ...(images.length > 0 ? { images } : {}) })
       }),
     onSuccess: () => {
       setText("");
@@ -136,10 +138,11 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [blocks.length, selected]);
 
-  const submit = () => {
+  const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
-    if (!trimmed || send.isPending || !selected) return;
-    send.mutate(trimmed);
+    if (send.isPending || !selected) return;
+    if (!trimmed && images.length === 0) return;
+    send.mutate({ content: trimmed, images });
   };
 
   // The in-flight task id is derived from the block stream: scan from the
@@ -216,6 +219,15 @@ export default function ChatPage() {
     return map;
   }, [blocks]);
 
+  // Once an exchange (user_text → final assistant_text) has finished
+  // streaming, fold every tool_call inside it into one collapsed row
+  // so the transcript shows the question and the answer without a
+  // wall of intermediate tool steps. In-flight exchanges stay inline.
+  const renderItems = useMemo<ChatRenderItem[]>(
+    () => groupExchanges(visibleBlocks),
+    [visibleBlocks]
+  );
+
   const sessionTitle = selectedSession?.title || "New chat";
   const hasBlocks = visibleBlocks.length > 0;
 
@@ -277,18 +289,27 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {visibleBlocks.map((block) => (
-                      <li key={block.id}>
-                        <BlockRenderer
-                          block={block}
-                          toolResult={
-                            block.kind === "tool_call"
-                              ? toolResultsByCallId.get(block.callId)
-                              : undefined
-                          }
-                        />
-                      </li>
-                    ))}
+                    {renderItems.map((item) =>
+                      item.kind === "tool_group" ? (
+                        <li key={item.id}>
+                          <BlockToolCallsCollapsed
+                            calls={item.calls}
+                            resultsByCallId={toolResultsByCallId}
+                          />
+                        </li>
+                      ) : (
+                        <li key={item.block.id}>
+                          <BlockRenderer
+                            block={item.block}
+                            toolResult={
+                              item.block.kind === "tool_call"
+                                ? toolResultsByCallId.get(item.block.callId)
+                                : undefined
+                            }
+                          />
+                        </li>
+                      )
+                    )}
                   </ul>
                 )}
                 <div ref={messagesEndRef} />

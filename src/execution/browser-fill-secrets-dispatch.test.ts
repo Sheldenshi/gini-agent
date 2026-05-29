@@ -92,7 +92,7 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     // No approval row should have been created — the guard fires before
     // mutateState/createApproval runs.
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
   });
 
   test("returns sync error when chat session originates from Discord", async () => {
@@ -114,7 +114,7 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(parsed.error).toContain("discord");
 
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
   });
 
   test("refuses dispatch when chat session is a dedicated job session mirroring to Telegram", async () => {
@@ -148,7 +148,7 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(parsed.error).toContain("telegram");
 
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
   });
 
   test("rejects duplicate slot names with a sync error", async () => {
@@ -172,7 +172,7 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(parsed.error).toContain("password");
 
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
   });
 
   test("sanitizeUrlForAuditTarget keeps origin only — strips pathname/query/fragment/userinfo", () => {
@@ -216,7 +216,7 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(parsed.error).toContain("browser_navigate");
 
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
   });
 
   test("mints a pending approval when a browser session is bound to the task", async () => {
@@ -237,7 +237,7 @@ describe("browser_fill_secrets dispatch surface guard", () => {
     expect(typeof result.approvalId).toBe("string");
 
     const state = readState(config.instance);
-    const approval = state.approvals.find((a) => a.id === result.approvalId);
+    const approval = state.setupRequests.find((a) => a.id === result.approvalId);
     expect(approval).toBeDefined();
     expect(approval?.action).toBe("browser.fill_secret");
     // approvedUrl is stripped to origin only by sanitizeUrlForAuditTarget;

@@ -1,3 +1,4 @@
+import * as FileSystem from "expo-file-system/legacy";
 import {
   isLocalGatewayHost,
   PUBLIC_HTTP_REJECTION,
@@ -105,6 +106,68 @@ function safeParse(text: string): unknown {
   } catch {
     return text;
   }
+}
+
+// Uploaded image ref returned by POST /api/uploads. Matches the runtime's
+// ImageAttachment shape — the client only carries this descriptor and
+// attaches it to the next /messages call's `images` array.
+export interface UploadRef {
+  id: string;
+  mimeType: string;
+  size: number;
+}
+
+// Multipart upload to the gateway. We can't reuse api() because it pins
+// content-type: application/json, which would strip the multipart
+// boundary. We also can't use fetch() with FormData here: Expo SDK 56
+// installs a winter-fetch polyfill whose convertFormDataAsync rejects
+// React Native's classic `{uri, name, type}` part shape (see
+// node_modules/expo/src/winter/fetch/convertFormData.ts — "Unsupported
+// FormDataPart implementation"). FileSystem.uploadAsync streams the
+// file from disk through native URLSession, sidestepping the polyfill
+// and avoiding loading the bytes into JS memory at all.
+export async function uploadImage(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  // Same transport guard as api(): block public-http origins before the
+  // bearer ever leaves the device, even on the multipart upload path.
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  const response = await FileSystem.uploadAsync(`${parsed.origin}/api/uploads`, file.uri, {
+    httpMethod: "POST",
+    uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+    fieldName: "file",
+    mimeType: file.mimeType,
+    headers: { Authorization: `Bearer ${creds.token}` }
+  });
+  const value = response.body ? safeParse(response.body) : null;
+  if (response.status < 200 || response.status >= 300) {
+    const message =
+      value && typeof value === "object" && "error" in value && typeof value.error === "string"
+        ? value.error
+        : `HTTP ${response.status}`;
+    throw new ApiError(response.status, message);
+  }
+  return value as UploadRef;
+}
+
+// Absolute URL for a stored upload. The gateway serves the bytes with
+// long-lived immutable cache headers; the request still needs the bearer
+// token, so callers must pass it via an Image source's `headers` prop.
+export function uploadUrl(id: string): string {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  return `${parsed.origin}/api/uploads/${encodeURIComponent(id)}`;
+}
+
+export function authHeader(): Record<string, string> {
+  const creds = readCachedCredentials();
+  if (!creds) return {};
+  return { Authorization: `Bearer ${creds.token}` };
 }
 
 // Resolve the absolute gateway URL + auth headers for an SSE subscription.

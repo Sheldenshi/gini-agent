@@ -1,20 +1,14 @@
 import { StyleSheet, Text, View } from "react-native";
 import { family, theme } from "@/src/theme";
-import type { ApprovalRequestedBlock } from "@/src/types";
+import type { AuthorizationRequestedBlock } from "@/src/types";
 
-// Approval bubble. Mobile in this round doesn't have the approve/deny
-// mutations wired (web carries the AddConnectorDialog + the
-// /approvals/:id/{approve,deny,connect} POSTs), so we render a quiet
-// white card with the summary and a hint to open the chat on the web.
-// Future rounds can layer the actions onto this same component.
-//
-// The bubble stays in the chat log forever — the runtime never deletes
-// approval rows, and the visual treatment lets the user see the
-// historical gate decision without losing the chat narrative.
-export function BlockApprovalRequested({
+// Authorization bubble: agent-actor gate. Read-only on mobile — the
+// approve/deny actions are driven from the web client. See
+// docs/adr/authorization-vs-setup-request.md.
+export function BlockAuthorizationRequested({
   block
 }: {
-  block: ApprovalRequestedBlock;
+  block: AuthorizationRequestedBlock;
 }) {
   return (
     <View style={styles.row}>
@@ -28,8 +22,6 @@ export function BlockApprovalRequested({
   );
 }
 
-// Color the risk pill so the user gets a quick glanceable severity cue.
-// We keep the warning amber for medium and reserve red only for high.
 function riskStyle(risk: string) {
   if (risk === "high")
     return { backgroundColor: "rgba(255, 59, 48, 0.12)", color: theme.danger };

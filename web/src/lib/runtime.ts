@@ -166,9 +166,24 @@ export async function proxyRequest(
       }
     });
   }
+  const upstreamContentType = upstream.headers.get("content-type") ?? "application/json";
+  // Binary passthrough for non-text payloads (image uploads, future
+  // file downloads). Routing on text() would UTF-8-decode bytes and
+  // corrupt them. Anything not obviously text gets ArrayBuffer'd.
+  const isText = /^(application\/(json|xml|.*\+json|.*\+xml)|text\/)/i.test(upstreamContentType);
+  if (!isText) {
+    const buffer = await upstream.arrayBuffer();
+    const passthroughHeaders = new Headers();
+    passthroughHeaders.set("content-type", upstreamContentType);
+    const cacheControl = upstream.headers.get("cache-control");
+    if (cacheControl) passthroughHeaders.set("cache-control", cacheControl);
+    const contentLength = upstream.headers.get("content-length");
+    if (contentLength) passthroughHeaders.set("content-length", contentLength);
+    return new Response(buffer, { status: upstream.status, headers: passthroughHeaders });
+  }
   const text = await upstream.text();
   const outHeaders: Record<string, string> = {
-    "content-type": upstream.headers.get("content-type") ?? "application/json"
+    "content-type": upstreamContentType
   };
   // Forward a small allowlist of response headers from the upstream runtime.
   // The QR endpoints (and any future bearer-gated response that needs

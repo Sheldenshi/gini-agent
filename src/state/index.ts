@@ -76,6 +76,13 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
+  storeUpload,
+  readUpload,
+  uploadDataUrl,
+  uploadExists,
+  uploadStat
+} from "./uploads";
+export {
   insertChatBlock,
   upsertAssistantTextBlock,
   updateToolCallBlock,
@@ -105,10 +112,17 @@ export {
   hasAnyActiveSubscription
 } from "./sse-subscriptions";
 export {
+  subscribeChatSession,
+  publishChatSession
+} from "./chat-session-events";
+export {
   markRead,
+  markUnread,
+  clearReadState,
   getLastReadByDevice,
   getReadState,
-  unreadCountForDevice
+  unreadCountForDevice,
+  unreadCountsByDevice
 } from "./chat-read-state";
 export type { ChatReadState } from "./chat-read-state";
 export {
@@ -122,7 +136,8 @@ export {
   deleteChatSession,
   renameChatSession,
   createChatMessage,
-  createApproval,
+  createAuthorization,
+  createSetupRequest,
   createSkill,
   createJob,
   createJobRun,

@@ -6,7 +6,7 @@
 // `code_exec`, `browser_upload_file`). We use the echo provider with
 // stubbed tool-calling responses to drive the chat-task loop end-to-end
 // without a real LLM, then verify both the task outcome and the audit
-// trail (approval.requested -> approval.approved -> <action>) carries
+// trail (authorization.requested -> authorization.approved -> <action>) carries
 // the expected `autoApprovedReason`.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -18,8 +18,8 @@ import {
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
-import { submitTask, resolveApproval, decideApproval } from "../agent";
-import { readState, mutateState, createApproval } from "../state";
+import { submitTask, resolveAuthorization, decideApproval } from "../agent";
+import { readState, mutateState, createAuthorization } from "../state";
 import type { RuntimeConfig, Task } from "../types";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -51,7 +51,7 @@ async function waitForTerminal(config: RuntimeConfig, taskId: string, timeoutMs 
 // Variant that waits specifically for a non-waiting_approval terminal
 // state. The imperative auto-resolve path briefly flips the task to
 // `waiting_approval` inside requestShell/requestFileWrite before
-// `resolveApproval` runs and flips it to `completed`; callers that
+// `resolveAuthorization` runs and flips it to `completed`; callers that
 // expect the final state need to poll past the intermediate one.
 async function waitForFinalTerminal(config: RuntimeConfig, taskId: string, timeoutMs = 5000): Promise<Task> {
   const deadline = Date.now() + timeoutMs;
@@ -225,7 +225,7 @@ describe("approvalMode dispatch matrix", () => {
       expect(await Bun.file(join(workspaceRoot, "auto.txt")).text()).toBe("auto");
 
       const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      const approvals = state.authorizations.filter((a) => a.taskId === task.id);
       expect(approvals).toHaveLength(1);
       expect(approvals[0]?.status).toBe("approved");
       const writeAudits = state.audit.filter((a) => a.action === "file.write" && a.taskId === task.id);
@@ -356,7 +356,7 @@ describe("approvalMode dispatch matrix", () => {
 
       const state = readState(config.instance);
       // Allowlist fast-path bypasses approval-row creation entirely.
-      expect(state.approvals.filter((a) => a.taskId === task.id)).toHaveLength(0);
+      expect(state.authorizations.filter((a) => a.taskId === task.id)).toHaveLength(0);
       const execAudits = state.audit.filter((a) => a.action === "terminal.exec" && a.taskId === task.id);
       expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("sudo apt update");
 
@@ -383,7 +383,7 @@ describe("approvalMode dispatch matrix", () => {
       expect(finished.status).toBe("completed");
 
       const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      const approvals = state.authorizations.filter((a) => a.taskId === task.id);
       expect(approvals).toHaveLength(1);
       expect(approvals[0]?.status).toBe("approved");
       const execAudits = state.audit.filter((a) => a.action === "terminal.exec" && a.taskId === task.id);
@@ -417,7 +417,7 @@ describe("approvalMode dispatch matrix", () => {
       // The approval row's reason should carry the matched-pattern id,
       // not the generic per-action copy.
       const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      const approvals = state.authorizations.filter((a) => a.taskId === task.id);
       expect(approvals[0]?.reason).toContain("dangerous-pattern:");
       expect(approvals[0]?.reason).toContain("sudo");
 
@@ -468,7 +468,7 @@ describe("approvalMode dispatch matrix", () => {
       expect(paused.status).toBe("waiting_approval");
 
       const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      const approvals = state.authorizations.filter((a) => a.taskId === task.id);
       expect(approvals[0]?.reason).toContain("dangerous-pattern:");
       expect(approvals[0]?.reason).toContain("rm-rf-dangerous-target");
 
@@ -517,7 +517,7 @@ describe("approvalMode dispatch matrix", () => {
       const state = readState(config.instance);
       const writeAudits = state.audit.filter((a) => a.action === "file.write" && a.taskId === task.id);
       expect(writeAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
-      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.taskId === task.id);
+      const approveAudits = state.audit.filter((a) => a.action === "authorization.approved" && a.taskId === task.id);
       expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
 
       rmSync(workspaceRoot, { recursive: true, force: true });
@@ -604,9 +604,9 @@ describe("approvalMode dispatch matrix", () => {
       expect(["completed", "failed"]).toContain(finished.status);
 
       const state = readState(config.instance);
-      const approvals = state.approvals.filter((a) => a.taskId === task.id);
+      const approvals = state.authorizations.filter((a) => a.taskId === task.id);
       expect(approvals[0]?.status).toBe("approved");
-      const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.approvalId === approvals[0]?.id);
+      const approveAudits = state.audit.filter((a) => a.action === "authorization.approved" && a.approvalId === approvals[0]?.id);
       expect(approveAudits[0]?.evidence?.autoApprovedReason).toBe("approval-mode-yolo");
 
       rmSync(workspaceRoot, { recursive: true, force: true });
@@ -683,7 +683,7 @@ describe("approvalMode dispatch matrix", () => {
 
     const state = readState(config.instance);
     // Allowlist path bypasses approval rows entirely.
-    expect(state.approvals.filter((a) => a.taskId === task.id)).toHaveLength(0);
+    expect(state.authorizations.filter((a) => a.taskId === task.id)).toHaveLength(0);
     const execAudits = state.audit.filter((a) => a.action === "terminal.exec" && a.taskId === task.id);
     expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("echo *");
 
@@ -714,7 +714,7 @@ describe("approvalMode dispatch matrix", () => {
     expect(finished.status).toBe("completed");
 
     const state = readState(config.instance);
-    const approveAudits = state.audit.filter((a) => a.action === "approval.approved" && a.taskId === task.id);
+    const approveAudits = state.audit.filter((a) => a.action === "authorization.approved" && a.taskId === task.id);
     expect(approveAudits[0]?.actor).toBe("user");
     expect(approveAudits[0]?.evidence?.autoApprovedReason).toBeUndefined();
 
@@ -765,7 +765,7 @@ describe("approvalMode dispatch matrix", () => {
     const finished = await waitForTerminal(config, task.id);
     expect(finished.status).toBe("failed");
     const state = readState(config.instance);
-    const approvals = state.approvals.filter((a) => a.taskId === task.id);
+    const approvals = state.authorizations.filter((a) => a.taskId === task.id);
     expect(approvals[0]?.status).toBe("approved");
     const writeAudits = state.audit.filter((a) => a.action === "file.write" && a.taskId === task.id);
     expect(writeAudits).toHaveLength(0);
@@ -867,7 +867,7 @@ describe("imperative dispatch path", () => {
     expect(paused.status).toBe("waiting_approval");
 
     const state = readState(config.instance);
-    const approvals = state.approvals.filter((a) => a.taskId === task.id);
+    const approvals = state.authorizations.filter((a) => a.taskId === task.id);
     expect(approvals[0]?.reason).toContain("dangerous-pattern:");
     expect(approvals[0]?.reason).toContain("sudo");
 
@@ -891,7 +891,7 @@ describe("imperative dispatch path", () => {
   });
 });
 
-describe("resolveApproval direct unit", () => {
+describe("resolveAuthorization direct unit", () => {
   let root: string;
   let prevState: string | undefined;
   let prevLog: string | undefined;
@@ -912,21 +912,21 @@ describe("resolveApproval direct unit", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("resolveApproval returns the per-action result string the dispatcher relays back to the model", async () => {
+  test("resolveAuthorization returns the per-action result string the dispatcher relays back to the model", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
     const config = buildConfig(workspaceRoot, "direct-resolve");
 
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createAuthorization(state, {
         action: "file.write",
         target: "direct.txt",
         risk: "high",
-        reason: "Direct resolveApproval unit test.",
+        reason: "Direct resolveAuthorization unit test.",
         payload: { path: "direct.txt", content: "direct" }
       })
     );
 
-    const { approval: resolved, toolResult } = await resolveApproval(config, approval.id, {
+    const { approval: resolved, toolResult } = await resolveAuthorization(config, approval.id, {
       actor: "runtime",
       resumeChatTask: false,
       evidenceExtra: { autoApproved: true, autoApprovedReason: "test-marker" }

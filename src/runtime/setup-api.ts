@@ -45,12 +45,23 @@
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
 import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
-import { writeKeyToSecretsEnv } from "../state/secrets-env";
+import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
-const SUPPORTED_PROVIDERS = ["openai", "codex"] as const;
+const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
+
+// OpenAI-compatible providers that authenticate via an env var written to
+// ~/.gini/secrets.env. `local` allows an empty key because many local
+// gateways (Ollama, LM Studio) accept no-auth requests. Codex is excluded
+// because it uses its own OAuth/auth.json flow.
+const ENV_KEY_PROVIDERS: Record<string, { envVar: string; allowEmptyKey: boolean; defaultModel: string }> = {
+  openai: { envVar: "OPENAI_API_KEY", allowEmptyKey: false, defaultModel: "gpt-5.4-mini" },
+  openrouter: { envVar: "OPENROUTER_API_KEY", allowEmptyKey: false, defaultModel: "openrouter/auto" },
+  deepseek: { envVar: "DEEPSEEK_API_KEY", allowEmptyKey: false, defaultModel: "deepseek-v4-flash" },
+  local: { envVar: "GINI_LOCAL_API_KEY", allowEmptyKey: true, defaultModel: "local/default" }
+};
 
 export interface SetupStatus {
   ok: true;
@@ -70,7 +81,7 @@ export function getSetupStatus(config: RuntimeConfig): SetupStatus {
   // for browser onboarding. Anyone on echo needs to pick a real
   // provider in /setup. Other configured providers (openai with key,
   // codex with auth.json) pass through.
-  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local";
+  const isRealProvider = current === "openai" || current === "codex" || current === "openrouter" || current === "local" || current === "deepseek";
   const providerConfigured = isRealProvider && Boolean(health.configured);
   return {
     ok: true,
@@ -108,30 +119,45 @@ export async function setSetupProvider(
       error: `Unsupported provider '${providerName}'. Allowed: ${SUPPORTED_PROVIDERS.join(", ")}.`
     };
   }
-  if (providerName === "openai") {
+  const envKeySpec = ENV_KEY_PROVIDERS[providerName];
+  if (envKeySpec) {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
-    if (!apiKey) {
+    // Accept a no-key payload when the env var is already set — the Edit
+    // Provider dialog uses this to update just the default model without
+    // making the user re-type their key. Initial Add Provider still
+    // requires a key because the env var is empty there.
+    const envAlreadySet = Boolean(process.env[envKeySpec.envVar]);
+    if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
         ok: false,
         provider: providerHealth(config),
         plistRefreshNeeded: false,
-        error: "apiKey is required for the openai provider."
+        error: `apiKey is required for the ${providerName} provider.`
       };
     }
-    // Persist to secrets.env so the wrapper-sourced env carries it on
-    // future shell launches. The shared writer lives in src/state/ —
-    // both CLI and runtime are allowed to depend on src/state/.
-    writeKeyToSecretsEnv("OPENAI_API_KEY", apiKey);
-    // Make the running gateway use the new key on its very next
-    // provider call. readOpenAIBearer reads process.env on each call,
-    // so this assignment is enough — no restart needed.
-    process.env.OPENAI_API_KEY = apiKey;
+    if (apiKey) {
+      // Persist to secrets.env so the wrapper-sourced env carries it on
+      // future shell launches. The shared writer lives in src/state/ —
+      // both CLI and runtime are allowed to depend on src/state/.
+      writeKeyToSecretsEnv(envKeySpec.envVar, apiKey);
+      // Make the running gateway use the new key on its very next
+      // provider call. readOpenAIBearer reads process.env on each call,
+      // so this assignment is enough — no restart needed.
+      process.env[envKeySpec.envVar] = apiKey;
+    }
 
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
-      : (config.provider?.name === "openai" && config.provider.model ? config.provider.model : "gpt-5.4-mini");
-    config.provider = normalizeProvider({ name: "openai", model });
-    writeRuntimeConfig(config);
+      : (config.provider?.name === providerName && config.provider.model ? config.provider.model : envKeySpec.defaultModel);
+    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
+      ? payload.baseUrl.trim()
+      : undefined;
+    config.provider = normalizeProvider({
+      name: providerName as ProviderConfig["name"],
+      model,
+      ...(baseUrl ? { baseUrl } : {})
+    });
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
@@ -143,7 +169,7 @@ export async function setSetupProvider(
     // SIGTERM handler reads the marker and execs the refresh as the
     // very last thing on the way out. See
     // src/runtime/autostart-refresh.ts.
-    const refreshed = requestAutostartRefresh(config.instance);
+    const refreshed = apiKey ? requestAutostartRefresh(config.instance) : false;
 
     return {
       ok: true,
@@ -177,5 +203,74 @@ export async function setSetupProvider(
     ok: true,
     provider: providerHealth(config),
     plistRefreshNeeded: false
+  };
+}
+
+export interface RemoveSetupProviderResult {
+  ok: boolean;
+  provider: ReturnType<typeof providerHealth>;
+  // True when removal flipped the gateway off the named provider, so the
+  // active row in /api/status now reflects whatever we fell back to.
+  switched: boolean;
+  error?: string;
+}
+
+// Disconnect an env-keyed provider: scrub its bearer from process.env +
+// secrets.env, and, when removing the currently-active provider, fall
+// back to codex if codex auth is available so the gateway stays usable.
+// Codex itself isn't removable through the UI because ~/.codex/auth.json
+// is owned by the `codex` CLI — the user manages it via codex --logout.
+// Local has no key to remove; the gate below mirrors that.
+export function removeSetupProvider(
+  config: RuntimeConfig,
+  providerName: string
+): RemoveSetupProviderResult {
+  if (providerName === "codex") {
+    return {
+      ok: false,
+      provider: providerHealth(config),
+      switched: false,
+      error: "Codex is managed by the codex CLI. Run `codex --logout` to sign out."
+    };
+  }
+  const envKeySpec = ENV_KEY_PROVIDERS[providerName];
+  if (!envKeySpec || providerName === "local") {
+    return {
+      ok: false,
+      provider: providerHealth(config),
+      switched: false,
+      error: `Cannot remove provider '${providerName}'.`
+    };
+  }
+
+  // Wipe the bearer from both stores so the running process and future
+  // shell launches stop seeing it. removeKeyFromSecretsEnv is a no-op if
+  // the file or the line is already absent — safe to call unconditionally.
+  removeKeyFromSecretsEnv(envKeySpec.envVar);
+  delete process.env[envKeySpec.envVar];
+
+  let switched = false;
+  if (config.provider?.name === providerName) {
+    // The instance was using this provider — falling back to codex when
+    // its OAuth is on disk keeps the gateway in a working state. Otherwise
+    // we drop to echo, which is harmless (deterministic stub) and at least
+    // doesn't crash on the next call.
+    if (hasUsableCodexCredentials()) {
+      const codexCatalog = providerCatalog().find((p) => p.id === "codex");
+      config.provider = normalizeProvider({
+        name: "codex",
+        model: codexCatalog?.models[0] ?? "gpt-5.5"
+      } as ProviderConfig);
+    } else {
+      config.provider = normalizeProvider({ name: "echo", model: "gini-echo-v0" });
+    }
+    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    switched = true;
+  }
+
+  return {
+    ok: true,
+    provider: providerHealth(config),
+    switched
   };
 }

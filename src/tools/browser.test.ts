@@ -20,7 +20,8 @@ import {
   withTeardownLock
 } from "./browser";
 import { dispatchToolCall } from "../execution/tool-dispatch";
-import { resolveApproval } from "../agent";
+import { resolveSetupRequest } from "../agent";
+import { completeBrowserConnectSetup } from "../capabilities/browser-connect";
 import { clearEchoVisionResponses, setEchoVisionResponse } from "../provider";
 import { createTask, mutateState, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
@@ -85,6 +86,85 @@ describe("browser safetyCheck", () => {
 
   test("allows ordinary https URLs", () => {
     expect(safetyCheck("https://example.com/")).toBeUndefined();
+  });
+
+  test("trailing-dot bypass: localhost. / 127.0.0.1. are still loopback", () => {
+    // DNS roots can be written with a trailing "." and resolvers
+    // treat them as equivalent to the dotless form. Without the
+    // strip, endsWith(".localhost") would miss "localhost.", and the
+    // BLOCKED_HOSTNAMES literal check would miss "127.0.0.1.".
+    for (const url of ["http://localhost./api", "http://127.0.0.1./api"]) {
+      const result = safetyCheck(url);
+      expect(result).toBeDefined();
+      expect(result).toContain("loopback");
+    }
+  });
+
+  test("IPv4-compat IPv6 hex loopback bypass: [::7f00:1] decodes to 127.0.0.1", () => {
+    // Bun's URL parser normalizes [::127.0.0.1] to [::7f00:1] (hex
+    // IPv4-compat), so the literal-match path never sees the dotted
+    // form. The hex decoder must recognize it.
+    const result = safetyCheck("http://[::7f00:1]/");
+    expect(result).toBeDefined();
+    expect(result).toContain("loopback");
+  });
+
+  test("allowLoopback opts out of the loopback block for CDP-style callers", () => {
+    // browser-connect attaches over CDP to a local Chrome. The CDP
+    // endpoint is always loopback by design — refusing it would
+    // break legitimate browser attach. Pin that the opt-out works
+    // for representative loopback variants but the OTHER blocks
+    // (metadata, link-local) still fire.
+    expect(safetyCheck("http://127.0.0.1:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://localhost:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Metadata IP is NOT loopback — still blocked even with the opt-out.
+    expect(safetyCheck("http://169.254.169.254/", { allowLoopback: true })).toBeDefined();
+  });
+
+  test("IPv4-mapped IPv6 loopback respects allowLoopback (CDP attach)", () => {
+    // CDP attach can legitimately receive [::ffff:127.0.0.1]:9222
+    // because Bun normalizes various IPv6 spellings. The decoder
+    // now translates the mapped IPv6 to its IPv4 form BEFORE the
+    // loopback check, so allowLoopback applies uniformly across
+    // [127.0.0.1], [::1], [::ffff:127.0.0.1] (dot-quad), and
+    // [::ffff:7f00:1] (hex). Without the decoder, the IPv6 branch
+    // would route the mapped form through the metadata path and
+    // refuse it even under allowLoopback.
+    expect(safetyCheck("http://[::ffff:127.0.0.1]:9222/", { allowLoopback: true })).toBeUndefined();
+    expect(safetyCheck("http://[::ffff:7f00:1]:9222/", { allowLoopback: true })).toBeUndefined();
+    // Same forms WITHOUT allowLoopback are still refused (with the
+    // correct loopback message, not the legacy metadata one).
+    const blocked = safetyCheck("http://[::ffff:127.0.0.1]/");
+    expect(blocked).toBeDefined();
+    expect(blocked).toContain("loopback");
+    const blocked2 = safetyCheck("http://[::ffff:7f00:1]/");
+    expect(blocked2).toBeDefined();
+    expect(blocked2).toContain("loopback");
+  });
+
+  test("blocks loopback navigation (BFF / runtime SSRF surface)", () => {
+    // The BFF's catch-all /api/runtime/* proxy injects the runtime
+    // bearer for safe-method loopback requests, so an agent that
+    // navigates the controlled browser to its own host can read
+    // runtime state (including messaging.approve_pairing payloads).
+    // Pin that the loopback variants are all refused — IPv4 literal,
+    // IPv6 literal, 0.0.0.0, the localhost hostname, and the 127/8
+    // range and *.localhost.
+    const refused = [
+      "http://127.0.0.1:3082/api/runtime/approvals",
+      "http://localhost:3082/api/state",
+      "http://0.0.0.0/",
+      "http://[::1]/",
+      "http://127.5.5.5/",
+      "http://example.localhost/"
+    ];
+    for (const url of refused) {
+      const result = safetyCheck(url);
+      expect(result).toBeDefined();
+      expect(result!.startsWith("Blocked:")).toBe(true);
+      expect(result).toContain("loopback");
+    }
   });
 });
 
@@ -1879,7 +1959,7 @@ describe("dispatchToolCall(browser_upload_file)", () => {
     expect(result.kind).toBe("pending");
 
     const state = readState(config.instance);
-    const approval = state.approvals.find((a) =>
+    const approval = state.authorizations.find((a) =>
       result.kind === "pending" && a.id === result.approvalId
     );
     expect(approval).toBeDefined();
@@ -1918,7 +1998,7 @@ describe("dispatchToolCall(browser_upload_file)", () => {
     ).rejects.toThrow(/outside workspace/);
     // No approval row should exist.
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.authorizations.length).toBe(0);
 
     rmSync(ROOT, { recursive: true, force: true });
   });
@@ -1972,14 +2052,13 @@ describe("dispatchToolCall(browser_connect)", () => {
     expect(result.kind).toBe("pending");
 
     const state = readState(config.instance);
-    const approval = state.approvals.find((a) =>
+    const approval = state.setupRequests.find((a) =>
       result.kind === "pending" && a.id === result.approvalId
     );
     expect(approval).toBeDefined();
-    expect(approval!.risk).toBe("medium");
     expect(approval!.action).toBe("browser.connect");
-    // The reason flows onto the approval target so the UI surfaces it
-    // prominently in the approval card.
+    // The reason flows onto the setup-request target so the UI surfaces it
+    // prominently in the setup card.
     expect(approval!.target).toBe("Sign in to Google Cloud Console");
     expect(approval!.payload.reason).toBe("Sign in to Google Cloud Console");
     expect(approval!.payload.toolCallId).toBe("call_connect_1");
@@ -2008,7 +2087,7 @@ describe("dispatchToolCall(browser_connect)", () => {
     ).rejects.toThrow(/reason/);
     // No approval row should exist.
     const state = readState(config.instance);
-    expect(state.approvals.length).toBe(0);
+    expect(state.setupRequests.length).toBe(0);
 
     rmSync(ROOT, { recursive: true, force: true });
   });
@@ -2072,13 +2151,16 @@ describe("dispatchToolCall(browser_connect)", () => {
       );
       expect(result.kind).toBe("pending");
       if (result.kind !== "pending") throw new Error("unreachable");
-      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+      const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
+      if (!pendingSetup) throw new Error("setup request not minted");
+      const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
+      const setup = await resolveSetupRequest(config, result.approvalId, "complete", {
         actor: "user",
+        toolResult,
         resumeChatTask: false
       });
-      expect(approval.status).toBe("approved");
-      expect(toolResult).toBeDefined();
-      const parsed = JSON.parse(toolResult!) as {
+      expect(setup.status).toBe("completed");
+      const parsed = JSON.parse(toolResult) as {
         success: boolean;
         connected: boolean;
         mode?: string;
@@ -2091,16 +2173,15 @@ describe("dispatchToolCall(browser_connect)", () => {
       // Persisted record matches.
       const persisted = readState(config.instance).browser;
       expect(persisted?.mode).toBe("managed");
-      // Exactly one browser.connect audit row — the dispatch path passes
-      // skipAudit: true so the capability does not write its own row.
-      // Two rows would mean the capability's reasonless row leaked
-      // alongside the dispatch's richer row (round-9 finding 2).
+      // Exactly one browser.connect audit row — completeBrowserConnectSetup
+      // calls connectBrowser with skipAudit and writes the richer row
+      // itself. Two rows would mean the capability's reasonless row
+      // leaked alongside.
       const connectRows = readState(config.instance).audit.filter(
         (row) => row.action === "browser.connect"
       );
       expect(connectRows.length).toBe(1);
-      // The single row is the dispatch's row — carries the user-facing
-      // reason and the approval id.
+      // The single row carries the user-facing reason and the setup id.
       expect(connectRows[0]!.approvalId).toBe(result.approvalId);
       expect(connectRows[0]!.target).toBe("Sign in to Google Cloud Console");
     } finally {
@@ -2156,15 +2237,18 @@ describe("dispatchToolCall(browser_connect)", () => {
       );
       expect(result.kind).toBe("pending");
       if (result.kind !== "pending") throw new Error("unreachable");
-      const { approval, toolResult } = await resolveApproval(config, result.approvalId, {
+      const pendingSetup = readState(config.instance).setupRequests.find((s) => s.id === result.approvalId);
+      if (!pendingSetup) throw new Error("setup request not minted");
+      // Flag rode the setup payload from request -> /complete.
+      expect(pendingSetup.payload.headless).toBe(true);
+      const { result: toolResult } = await completeBrowserConnectSetup(config, pendingSetup);
+      const setup = await resolveSetupRequest(config, result.approvalId, "complete", {
         actor: "user",
+        toolResult,
         resumeChatTask: false
       });
-      expect(approval.status).toBe("approved");
-      // Flag rode the approval payload from request → executor.
-      expect(approval.payload.headless).toBe(true);
-      expect(toolResult).toBeDefined();
-      const parsed = JSON.parse(toolResult!) as {
+      expect(setup.status).toBe("completed");
+      const parsed = JSON.parse(toolResult) as {
         success: boolean;
         connected: boolean;
         mode?: string;

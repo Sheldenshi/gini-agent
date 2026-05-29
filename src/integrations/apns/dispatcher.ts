@@ -159,11 +159,20 @@ export function buildMessageCompletedPayload(
 // Builds the per-call APNs payload + headers for an approval_requested
 // block. Exported for tests that want to assert payload shape without
 // mocking the entire dispatcher.
-export function buildApprovalPayload(block: ChatBlock & { kind: "approval_requested" }): APNsPayload {
+type PendingPromptBlock =
+  | (ChatBlock & { kind: "authorization_requested" })
+  | (ChatBlock & { kind: "setup_requested" });
+
+function promptIdOf(block: PendingPromptBlock): string {
+  return block.kind === "authorization_requested" ? block.authorizationId : block.setupRequestId;
+}
+
+export function buildApprovalPayload(block: PendingPromptBlock): APNsPayload {
+  const isSetup = block.kind === "setup_requested";
   return {
     aps: {
       alert: {
-        title: "Gini needs your approval",
+        title: isSetup ? "Gini needs you to finish a step" : "Gini needs your approval",
         body: "Tap to review"
       },
       sound: "default",
@@ -191,8 +200,8 @@ export function buildApprovalPayload(block: ChatBlock & { kind: "approval_reques
     body: {
       sessionId: block.sessionId,
       blockId: block.id,
-      approvalId: block.approvalId,
-      event: "approval_requested",
+      approvalId: promptIdOf(block),
+      event: block.kind,
       silent: false
     }
   };
@@ -243,7 +252,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
   }
 
   async function dispatch(block: ChatBlock): Promise<void> {
-    if (block.kind === "approval_requested") {
+    if (block.kind === "authorization_requested" || block.kind === "setup_requested") {
       await dispatchApproval(block);
       return;
     }
@@ -253,7 +262,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
     }
   }
 
-  async function dispatchApproval(block: ChatBlock & { kind: "approval_requested" }): Promise<void> {
+  async function dispatchApproval(block: PendingPromptBlock): Promise<void> {
     let devices;
     try {
       devices = listDevices(instance);
@@ -276,7 +285,7 @@ export function createApnsDispatcher(instance: Instance, deps?: DispatcherDeps):
         // installs can coexist behind the same APNs creds, but each
         // device's stored bundle id is the authoritative topic.
         // Coalesce duplicate approval pushes for the same approval id.
-        collapseId: block.approvalId.slice(0, 64)
+        collapseId: promptIdOf(block).slice(0, 64)
       })
     ));
   }

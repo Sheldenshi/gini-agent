@@ -9,8 +9,8 @@ export async function approval(ctx: CliContext): Promise<void> {
   if (sub === "approve" || sub === "deny") {
     const id = restAfter(cliArgs, sub)[0];
     if (!id) throw new Error(`Usage: gini approval ${sub} <approval-id>`);
-    print(await api(config, `/api/approvals/${id}/${sub === "approve" ? "approve" : "deny"}`, { method: "POST" }));
+    print(await api(config, `/api/authorizations/${id}/${sub === "approve" ? "approve" : "deny"}`, { method: "POST" }));
     return;
   }
-  print(await api(config, "/api/approvals"));
+  print(await api(config, "/api/authorizations"));
 }

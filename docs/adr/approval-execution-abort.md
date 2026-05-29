@@ -82,7 +82,7 @@ Per-action behaviour:
   what the runtime acknowledged at cancel time, not what the page
   state eventually became.
 - **`browser.fill_secret`** — the side effect (per-slot playwright
-  fill) runs INSIDE `POST /api/approvals/<id>/connect`, not inside
+  fill) runs INSIDE `POST /api/setup-requests/<id>/complete`, not inside
   `executeApprovedAction`, so the in-flight registry's
   `claimApproval` / `releaseApproval` lifecycle does NOT cover the
   fill loop. See [browser-fill-secret.md](browser-fill-secret.md)
@@ -98,6 +98,26 @@ Per-action behaviour:
   granularity is "between slot N and slot N+1" rather than the
   per-await granularity that `raceWithAbort` provides for
   `browser.upload_file`.
+- **`messaging.add_bridge` / `messaging.approve_pairing` /
+  `messaging.remove_bridge`** — same `/connect`-only carve-out
+  shape as `browser.fill_secret`. The chat card collects
+  request-scope state (bot token, verification code, confirmation)
+  that `executeApprovedAction` can't see. Each bounded module
+  (`src/execution/messaging-*-connect.ts`) calls
+  `resolveApproval({ resumeChatTask: false })` BEFORE the side
+  effect (`addMessagingBridge` / `allowChat` / `removeMessagingBridge`)
+  and inspects the resolved approval's status to short-circuit if
+  the owning task went terminal between card mount and submit.
+  Unlike the per-slot fill loop, each messaging side effect is a
+  single atomic call with no interior cancel-poll point — the
+  refresh-and-check at resolve time is the cancellation boundary.
+  After the side effect, `safeResume` runs first (its own throw
+  recovery covers a chat-task loop failure) and the lineage audit
+  row is written last in a try/catch so an audit failure can't
+  orphan the task. See
+  [chat-block-protocol.md](chat-block-protocol.md) for the wire
+  shape and [telegram-bridge.md](telegram-bridge.md) for the
+  lifecycle.
 
 `cancelTask`, `failTask`, and `decideApproval-deny` each call
 `abortApprovalsForTask` from inside their own `mutateState` callback

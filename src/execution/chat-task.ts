@@ -27,8 +27,10 @@ import { recall } from "../memory";
 import {
   generateToolCallingResponse,
   type ToolCallingMessage,
+  type MessageContentPart,
   type ToolCall
 } from "../provider";
+import { uploadDataUrl } from "../state/uploads";
 import {
   SOUL_SOFT_CAP_CHARS,
   USER_SOFT_CAP_CHARS,
@@ -57,7 +59,8 @@ import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
 import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
 import {
-  emitApprovalRequested,
+  emitAuthorizationRequested,
+  emitSetupRequested,
   emitAssistantTextStart,
   emitPhase,
   emitSystemNote,
@@ -390,7 +393,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const messages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
     ...prior,
-    { role: "user", content: task.input }
+    buildUserMessage(config, task)
   ];
 
   appendTrace(config.instance, taskId, {
@@ -478,7 +481,51 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   return stored
     .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
+    .map((m) => {
+      if (m.role === "user" && m.images && m.images.length > 0) {
+        return {
+          role: "user" as const,
+          content: buildVisionContent(config, m.content, m.images)
+        };
+      }
+      return { role: m.role as "user" | "assistant", content: m.content };
+    });
+}
+
+// Build the latest user-turn message. When the task carries image refs the
+// content becomes a parts array so the provider sees both text and images;
+// otherwise it stays a plain string (the legacy text-only path).
+function buildUserMessage(config: RuntimeConfig, task: Task): ToolCallingMessage {
+  if (task.images && task.images.length > 0) {
+    return { role: "user", content: buildVisionContent(config, task.input, task.images) };
+  }
+  return { role: "user", content: task.input };
+}
+
+// Render image refs as data URLs at dispatch time. The provider can't
+// authenticate against /api/uploads/:id, so we inline base64 bytes. A
+// missing/unreadable upload is dropped with a trace; the text part is
+// retained so the model still gets the user's words.
+function buildVisionContent(
+  config: RuntimeConfig,
+  text: string,
+  images: ReadonlyArray<{ id: string; mimeType: string }>
+): MessageContentPart[] {
+  const parts: MessageContentPart[] = [];
+  if (text.length > 0) parts.push({ type: "text", text });
+  for (const image of images) {
+    const dataUrl = uploadDataUrl(config.instance, image.id);
+    if (!dataUrl) {
+      appendLog(config.instance, "chat.image.missing", { uploadId: image.id });
+      continue;
+    }
+    parts.push({ type: "image_url", image_url: { url: dataUrl } });
+  }
+  // Provider requires non-empty content. If every image failed to load and
+  // there was no text, fall through to an empty text part so we never send
+  // an empty parts array.
+  if (parts.length === 0) parts.push({ type: "text", text: "" });
+  return parts;
 }
 
 // Restrict the parent-built tool catalog to the subagent's toolset
@@ -1136,21 +1183,29 @@ async function runLoop(
           // are skipped — their side effects must not race the
           // user's approval decision.
           pausedThisTurn = true;
-          // Re-read the approval row to surface action/risk/summary on
-          // the approval_requested block. The dispatch returns just
-          // the id; the full row is the source of truth for these
-          // fields (and `action` lets clients pick connector.request
-          // vs the standard Approve/Deny pair).
-          const approvalRow = readState(config.instance).approvals.find(
-            (a) => a.id === dispatch.approvalId
-          );
-          if (approvalRow) {
-            emitApprovalRequested(emitCtx, {
-              approvalId: approvalRow.id,
-              action: approvalRow.action,
-              risk: approvalRow.risk,
-              summary: approvalRow.reason ?? approvalRow.target
+          // Re-read the gate row to surface action/summary on the right
+          // block kind. Authorizations carry risk and render with an
+          // Approve/Deny pair; SetupRequests are user-actor and render
+          // with action-specific layouts (Connect / credential inputs /
+          // Submit). See docs/adr/authorization-vs-setup-request.md.
+          const stateForBlock = readState(config.instance);
+          const authRow = stateForBlock.authorizations.find((a) => a.id === dispatch.approvalId);
+          if (authRow) {
+            emitAuthorizationRequested(emitCtx, {
+              authorizationId: authRow.id,
+              action: authRow.action,
+              risk: authRow.risk,
+              summary: authRow.reason ?? authRow.target
             });
+          } else {
+            const setupRow = stateForBlock.setupRequests.find((s) => s.id === dispatch.approvalId);
+            if (setupRow) {
+              emitSetupRequested(emitCtx, {
+                setupRequestId: setupRow.id,
+                action: setupRow.action,
+                summary: setupRow.reason ?? setupRow.target
+              });
+            }
           }
           // Approval-gated tools haven't actually run yet, but from the
           // UI's perspective the agent is no longer "dispatching" this
@@ -1350,6 +1405,55 @@ async function runLoop(
   }
 }
 
+// Helper for resumeChatTask's stage-1 mutateState. Extracted so the
+// race-window poll-and-retry can re-stage from a single point.
+// Returns one of four shapes:
+//   - terminal: task in completed/failed/cancelled — bail
+//   - notYetWaiting: task in "running" still racing the loop's
+//     persist to "waiting_approval" — caller should retry briefly
+//   - hasState:false — task is waiting but its toolCallState was
+//     cleared (failure-path artifact); caller logs and exits
+//   - ready (true/false) — normal flow, ready means all pending
+//     resolved and the loop should re-enter
+async function stageResume(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  toolResult: string
+): Promise<{
+  task: Task;
+  ready: boolean;
+  hasState: boolean;
+  terminal: boolean;
+  notYetWaiting: boolean;
+}> {
+  return mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    if (item.status !== "waiting_approval") {
+      // Distinguish actually-terminal (legitimate bail) from
+      // not-yet-waiting (race-window — caller should retry).
+      const truly = isTerminalTaskStatus(item.status);
+      return {
+        task: item,
+        ready: false,
+        hasState: false,
+        terminal: truly,
+        notYetWaiting: !truly
+      };
+    }
+    if (!item.toolCallState) {
+      // Nothing to resume against — most likely the snapshot was cleared by
+      // a prior failure path. Caller can decide to fail the task.
+      return { task: item, ready: false, hasState: false, terminal: false, notYetWaiting: false };
+    }
+    const pending = item.toolCallState.pending;
+    const target = pending.find((p) => p.toolCallId === toolCallId);
+    if (target) target.result = toolResult;
+    const allResolved = pending.every((p) => typeof p.result === "string");
+    return { task: item, ready: allResolved, hasState: true, terminal: false, notYetWaiting: false };
+  });
+}
+
 // Resume a paused chat task after one of its tool approvals resolved.
 // `toolResult` is the textual result (stdout, file write status, etc.)
 // captured by agent.executeApprovedAction. The runtime calls this with the
@@ -1370,22 +1474,29 @@ export async function resumeChatTask(
   // task back to running. If the task has already failed (e.g. a sibling
   // approval was denied), been cancelled, or completed, just no-op so we
   // don't restart a terminal task's loop.
-  const stage = await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    if (item.status !== "waiting_approval") {
-      return { task: item, ready: false as const, hasState: false as const, terminal: true as const };
-    }
-    if (!item.toolCallState) {
-      // Nothing to resume against — most likely the snapshot was cleared by
-      // a prior failure path. Caller can decide to fail the task.
-      return { task: item, ready: false as const, hasState: false as const, terminal: false as const };
-    }
-    const pending = item.toolCallState.pending;
-    const target = pending.find((p) => p.toolCallId === toolCallId);
-    if (target) target.result = toolResult;
-    const allResolved = pending.every((p) => typeof p.result === "string");
-    return { task: item, ready: allResolved, hasState: true as const, terminal: false as const };
-  });
+  //
+  // Race-window fix: a fast /connect can land BEFORE the chat-task
+  // loop has persisted waiting_approval (the approval block is
+  // emitted to the SSE stream earlier than the post-loop mutateState
+  // that flips the status). In that window status is still
+  // "running" — NOT terminal — but the original code's
+  // `status !== "waiting_approval"` short-circuit lumped it in with
+  // terminal and silently orphaned the task. Distinguish the two:
+  // a truly-terminal status bails as before; a still-running task
+  // gets a brief poll-and-retry budget so the resume catches the
+  // loop's flip to waiting_approval (~one mutateState boundary
+  // away). 1000ms total budget over 10x 100ms ticks is generous
+  // for the manual-click case and bounded enough for automated
+  // /connect callers (CLI scripts, test harnesses, the messaging
+  // pollers) that race the loop more aggressively.
+  const RESUME_WAIT_FOR_WAITING_BUDGET_MS = 1000;
+  const RESUME_WAIT_FOR_WAITING_TICK_MS = 100;
+  const resumeDeadline = Date.now() + RESUME_WAIT_FOR_WAITING_BUDGET_MS;
+  let stage = await stageResume(config, taskId, toolCallId, toolResult);
+  while (stage.notYetWaiting && Date.now() < resumeDeadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, RESUME_WAIT_FOR_WAITING_TICK_MS));
+    stage = await stageResume(config, taskId, toolCallId, toolResult);
+  }
 
   if (stage.terminal) {
     appendTrace(config.instance, taskId, {

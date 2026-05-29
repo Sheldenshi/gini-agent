@@ -222,6 +222,10 @@ export function workspaceDir(instance: Instance): string {
     : join(instanceRoot(instance), "workspace");
 }
 
+export function uploadsDir(instance: Instance): string {
+  return join(instanceRoot(instance), "uploads");
+}
+
 export function defaultConfig(instance: Instance): RuntimeConfig {
   // Platform default fallback is codex/gpt-5.5. Users without `codex` CLI
   // auth will hit a runtime error on first prompt — that's the accepted

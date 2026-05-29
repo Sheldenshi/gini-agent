@@ -459,7 +459,7 @@ describe("chat-task loop", () => {
 
     // Approval payload should carry pty=true so the executor knows to wrap.
     const stateBefore = readState(config.instance);
-    const approval = stateBefore.approvals.find((a) => a.id === paused.approvalIds[0]!)!;
+    const approval = stateBefore.authorizations.find((a) => a.id === paused.approvalIds[0]!)!;
     expect(approval.payload.pty).toBe(true);
 
     await decideApproval(config, approval.id, "approve");
@@ -504,7 +504,7 @@ describe("chat-task loop", () => {
     expect(paused.status).toBe("waiting_approval");
 
     const stateBefore = readState(config.instance);
-    const approval = stateBefore.approvals.find((a) => a.id === paused.approvalIds[0]!)!;
+    const approval = stateBefore.authorizations.find((a) => a.id === paused.approvalIds[0]!)!;
     expect(approval.payload.pty).toBe(false);
 
     await decideApproval(config, approval.id, "approve");
@@ -554,7 +554,7 @@ describe("chat-task loop", () => {
 
     const state = readState(config.instance);
     // No approval row should have been created.
-    const approvalsForTask = state.approvals.filter((a) => a.taskId === task.id);
+    const approvalsForTask = state.authorizations.filter((a) => a.taskId === task.id);
     expect(approvalsForTask).toHaveLength(0);
 
     // The audit row should exist and be flagged as auto-approved.
@@ -1299,7 +1299,7 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
-  test("emits approval_requested with the action field for gated tools", async () => {
+  test("emits authorization_requested with the action field for gated tools", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-blocks-approval");
     const provider = normalizeProvider(config.provider);
@@ -1330,13 +1330,13 @@ describe("chat-task loop", () => {
 
     const { listChatBlocks } = await import("../state");
     let blocks = listChatBlocks(config.instance, session.id);
-    const approval = blocks.find((b) => b.kind === "approval_requested");
-    if (approval?.kind === "approval_requested") {
-      expect(approval.approvalId).toBe(paused.approvalIds[0]);
+    const approval = blocks.find((b) => b.kind === "authorization_requested");
+    if (approval?.kind === "authorization_requested") {
+      expect(approval.authorizationId).toBe(paused.approvalIds[0]);
       expect(approval.action).toBe("file.write");
       expect(approval.risk).toBeDefined();
     } else {
-      throw new Error("missing approval_requested block");
+      throw new Error("missing authorization_requested block");
     }
 
     // Resume by approving; the tool_call flips ok and a tool_result lands.

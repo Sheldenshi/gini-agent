@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, TaskStatus } from "../types";
+import type { Authorization, Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, SetupRequest, SetupRequestAction, SetupRequestStatus, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
@@ -23,7 +23,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
     createdAt: at,
     updatedAt: at,
     tasks: [],
-    approvals: [],
+    authorizations: [],
+    setupRequests: [],
     audit: [],
     skills: [],
     jobs: [],
@@ -147,8 +148,12 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
   }
   delete stateAny.lane;
 
-  const collectionKeys: Array<keyof RuntimeState> = [
+  const collectionKeys: Array<keyof RuntimeState | "approvals"> = [
     "tasks",
+    // Legacy collection. Pre-split state files might still carry it; the
+    // approvals→authorizations/setupRequests partitioner runs later in
+    // normalizeState, but we still strip lane fields off any rows that
+    // landed here first.
     "approvals",
     "audit",
     "skills",
@@ -174,10 +179,12 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "chatMessages",
     "messagingMessages",
     "runs",
-    "planSteps"
+    "planSteps",
+    "authorizations",
+    "setupRequests"
   ];
   for (const key of collectionKeys) {
-    const records = state[key] as unknown;
+    const records = (state as unknown as Record<string, unknown>)[key];
     if (!Array.isArray(records)) continue;
     for (const record of records) {
       if (!record || typeof record !== "object") continue;
@@ -216,6 +223,72 @@ function migrateIdentitiesToConnectors(state: RuntimeState): void {
       connector.source ??= "user";
     }
   }
+}
+
+// The split of Approval into Authorization (agent-actor) + SetupRequest
+// (user-actor) lives in docs/adr/authorization-vs-setup-request.md. Pre-split
+// state files persisted a single `state.approvals` array. On first read we
+// partition it by action — browser.connect / connector.request /
+// browser.fill_secret become SetupRequest rows (status remapped from the
+// pending/approved/denied trio to pending/completed/cancelled), everything
+// else becomes Authorization. The legacy field is cleared so the next
+// mutateState write persists the cleaned shape. Idempotent: state files
+// that already carry the split (and no `approvals` field) are no-ops.
+const SETUP_REQUEST_ACTIONS = new Set<string>([
+  "browser.connect",
+  "connector.request",
+  "browser.fill_secret"
+]);
+
+function migrateApprovalsToAuthorizationsAndSetupRequests(state: RuntimeState): void {
+  // RuntimeState no longer declares `approvals`, so read it via an unknown
+  // cast — legacy state.json files persisted the field and the migration
+  // still needs to drain them.
+  const legacyHolder = state as unknown as { approvals?: Authorization[] };
+  const legacy = legacyHolder.approvals;
+  if (!Array.isArray(legacy) || legacy.length === 0) {
+    delete legacyHolder.approvals;
+    return;
+  }
+  // Always partition. A mixed-shape file (both `approvals` and one of the
+  // new arrays populated) can happen if a process crashed mid-write or if
+  // a downgrade-then-upgrade left rows in both shapes; silently dropping
+  // the legacy rows would lose pending work. Merge by id below — any
+  // legacy row whose id already exists in the corresponding new array is
+  // skipped (the new shape wins), the rest are appended.
+  const authorizations: Authorization[] = [];
+  const setupRequests: SetupRequest[] = [];
+  for (const row of legacy) {
+    if (!row || typeof row !== "object") continue;
+    if (SETUP_REQUEST_ACTIONS.has(row.action)) {
+      const status: SetupRequestStatus = row.status === "approved"
+        ? "completed"
+        : row.status === "denied"
+          ? "cancelled"
+          : "pending";
+      // Drop the inherited `risk` field — SetupRequest carries no risk.
+      // Cast via unknown so the action narrows to SetupRequestAction.
+      const { risk: _risk, ...rest } = row;
+      setupRequests.push({ ...(rest as Omit<Authorization, "risk">), status, action: rest.action as SetupRequestAction });
+    } else {
+      authorizations.push(row);
+    }
+  }
+  // Merge: keep any rows already in the new arrays, append legacy rows
+  // whose id isn't represented yet. The new shape wins on conflict — a
+  // partial write that produced both shapes is treated as "the new array
+  // is authoritative for the rows it carries."
+  const existingAuthIds = new Set((state.authorizations ?? []).map((a) => a.id));
+  const existingSetupIds = new Set((state.setupRequests ?? []).map((s) => s.id));
+  state.authorizations = [
+    ...(state.authorizations ?? []),
+    ...authorizations.filter((a) => !existingAuthIds.has(a.id))
+  ];
+  state.setupRequests = [
+    ...(state.setupRequests ?? []),
+    ...setupRequests.filter((s) => !existingSetupIds.has(s.id))
+  ];
+  delete legacyHolder.approvals;
 }
 
 // Seed the default agent's provider fields from RuntimeConfig.provider when:
@@ -422,7 +495,8 @@ function migrateRecordAgentIds(state: RuntimeState): void {
   stamp(state.jobs, "jobs");
   stamp(state.jobRuns, "jobRuns");
   stamp(state.subagents, "subagents");
-  stamp(state.approvals, "approvals");
+  stamp(state.authorizations, "authorizations");
+  stamp(state.setupRequests, "setupRequests");
   // Events and audits are deliberately NOT backfilled here. After the
   // AgentContext refactor, a missing agentId on an event/audit is a
   // first-class signal that the row is system-attributed (instance boot,
@@ -642,7 +716,9 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.improvements ??= [];
   state.connectors ??= [];
   state.tasks ??= [];
-  state.approvals ??= [];
+  migrateApprovalsToAuthorizationsAndSetupRequests(state);
+  state.authorizations ??= [];
+  state.setupRequests ??= [];
   state.audit ??= [];
   state.skills ??= [];
   state.jobs ??= [];

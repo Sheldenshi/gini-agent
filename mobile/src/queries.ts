@@ -7,13 +7,13 @@ import {
 import { useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 import EventSource from "react-native-sse";
-import { api, ApiError, gatewayUsesQuickTunnel, resolveStreamEndpoint } from "./api";
+import { api, ApiError, gatewayUsesQuickTunnel, resolveStreamEndpoint, type UploadRef } from "./api";
+import { refreshBadge } from "./push";
 import type {
   AgentRecord,
   AgentsResponse,
   ChatBlock,
   ChatSession,
-  ChatSessionDetail,
   RuntimeStatus
 } from "./types";
 
@@ -35,6 +35,7 @@ const CHAT_TERMINAL_TASK_STATUSES = new Set<string>([
 // frames. Doubles up to 8 s, then stays there — matches the web
 // fallback so the two transports feel similar.
 const CHAT_POLL_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
+
 
 export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
   return useQuery<RuntimeStatus>({
@@ -86,6 +87,36 @@ export function useCreateAgent() {
   });
 }
 
+// Per-session unread counts for the calling device. Returns a record
+// keyed by sessionId; sessions with zero unread blocks are omitted so
+// the ChatRow can default to 0 without a separate "is this session in
+// the map" check. The query is device-scoped on the server (matches
+// /badge); skipping it on web/CLI where there's no X-Device-Token
+// avoids the predictable 400 the gateway would return.
+export function useUnreadCounts() {
+  return useQuery<{ counts: Record<string, number> }, Error, Record<string, number>>({
+    queryKey: ["unread"],
+    queryFn: () => api<{ counts: Record<string, number> }>("/unread"),
+    enabled: Boolean(getCachedDeviceTokenSafe()),
+    refetchInterval: 3000,
+    select: (data) => data.counts
+  });
+}
+
+// Lazy access to the cached APNs token. push.ts depends on this module
+// transitively through ApiError, so a static import would create a
+// cycle that some bundlers resolve to undefined at module-eval time.
+// The require() form is the same shape api.ts uses to inject
+// X-Device-Token without the cycle.
+function getCachedDeviceTokenSafe(): string | null {
+  try {
+    const mod = require("./push") as { getCachedDeviceToken?: () => string | null };
+    return mod.getCachedDeviceToken?.() ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // Per-agent chat list. The gateway filters server-side via ?agentId, so
 // the React Query key includes the agentId — switching agents triggers a
 // fresh fetch instead of briefly flashing the previous agent's chats.
@@ -96,25 +127,6 @@ export function useChats(agentId: string | null) {
       api<ChatSession[]>(`/chat?agentId=${encodeURIComponent(agentId ?? "")}`),
     enabled: Boolean(agentId),
     refetchInterval: 3000
-  });
-}
-
-export function useChatSession(id: string | null) {
-  return useQuery<ChatSessionDetail>({
-    queryKey: ["chat", id],
-    queryFn: () => api<ChatSessionDetail>(`/chat/${id}`),
-    enabled: Boolean(id),
-    // Match the web client: 800ms while a task is in flight so the
-    // assistant placeholder phase indicator updates briskly, 3s when
-    // everything is settled.
-    refetchInterval: (query) => {
-      const data = query.state.data;
-      if (!data) return 3000;
-      const hasInflight = data.tasks?.some(
-        (t) => !CHAT_TERMINAL_TASK_STATUSES.has(t.status)
-      );
-      return hasInflight ? 800 : 3000;
-    }
   });
 }
 
@@ -137,9 +149,10 @@ const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed
 //     (e.g. the model said "Thinking" while a long-running parallel tool
 //     is still going). callId pairs the running entry with its terminal
 //     status, so we count distinct callIds with no later non-running row.
-//   - An approval_requested block whose tool_call still reads "running"
-//     means we're paused on the user — the composer stays busy until
-//     the eventual approve/deny flip arrives on the stream.
+//   - An authorization_requested or setup_requested block whose
+//     tool_call still reads "running" means we're paused on the user —
+//     the composer stays busy until the eventual approve/deny/complete
+//     flip arrives on the stream.
 export function isTaskInFlight(blocks: ChatBlock[]): boolean {
   if (blocks.length === 0) return false;
 
@@ -177,9 +190,18 @@ export function isTaskInFlight(blocks: ChatBlock[]): boolean {
   return !TERMINAL_PHASE_LABELS.has(latestPhaseLabel);
 }
 
-// ChatBlock consumer for the detail screen. Combines a one-shot /blocks
-// fetch (seeds the initial render and gives us a Last-Event-ID cursor)
-// with an SSE subscription to /stream for live updates.
+// Chat-detail stream consumer. Combines a one-shot /blocks fetch (seeds
+// the initial render and gives us a Last-Event-ID cursor) with an SSE
+// subscription to /stream for live updates. The same SSE connection
+// delivers two event kinds:
+//   - `chat_block` — block inserts / upserts (assistant_text deltas,
+//     tool_call status flips, phase markers, …). Backed by chat-blocks
+//     pub/sub on the server; client merges by id.
+//   - `chat_session` — session-record updates (currently: title renames).
+//     Sent once on initial connect so the client always has a title
+//     without a separate REST round-trip, then again whenever the
+//     gateway renames the chat (explicit /rename or the auto-rename
+//     after the first qualifying turn).
 //
 // Trust + lifecycle model (4-6 lines per CLAUDE.md):
 //   - Bearer token is read from the in-memory credential cache on every
@@ -193,34 +215,41 @@ export function isTaskInFlight(blocks: ChatBlock[]): boolean {
 //     stash the wire id (`<block_id>:<ts>` for SSE frames, the bare id
 //     for the /blocks seed) in lastSeenIdRef and rewrite the header on
 //     every open; the gateway parses the suffix in listChatBlocksAfter
-//     to replay in-place upserts to the cursor row.
+//     to replay in-place upserts to the cursor row. chat_session events
+//     are not part of the Last-Event-ID cursor — every reconnect re-emits
+//     the current session record from the server's initial-send path.
 //   - AppState 'background' tears the connection down so an idle device
 //     doesn't hold an open XHR; 'active' rebuilds it and the same
 //     Last-Event-ID path replays only what was missed.
 //
-// Returns the typed block list directly — no derivation, no normalization;
-// the renderer is exhaustive over the discriminated union. The return
-// shape matches the previous React Query result the screen relied on
-// ({ data, isPending, error }) so the consumer doesn't change.
-export function useChatBlocks(sessionId: string | null): {
-  data: ChatBlock[] | undefined;
+// Returns the typed block list and the session record directly — no
+// derivation, no normalization; the renderer is exhaustive over the
+// block discriminated union, and the session field is just the wire
+// shape from the gateway.
+export function useChatStream(sessionId: string | null): {
+  blocks: ChatBlock[] | undefined;
+  session: ChatSession | undefined;
   isPending: boolean;
   error: Error | null;
 } {
-  // Block state is tagged with the sessionId it was loaded for so a
+  // Stream state is tagged with the sessionId it was loaded for so a
   // chat A → chat B switch doesn't paint chat A's blocks under chat B's
   // header for one frame. The reset useEffect only runs after render,
   // so without this gate the very first render after sessionId changes
   // would still see the previous chat's blocks in state. Reading via
   // `forSessionId === sessionId ? blocks : undefined` collapses that
-  // window to a single empty paint, matching the loading skeleton.
-  type BlockState = {
+  // window to a single empty paint, matching the loading skeleton. The
+  // session field follows the same gate so a stale title from chat A
+  // doesn't briefly head chat B.
+  type StreamState = {
     forSessionId: string | null;
     blocks: ChatBlock[] | undefined;
+    session: ChatSession | undefined;
   };
-  const [state, setState] = useState<BlockState>({
+  const [state, setState] = useState<StreamState>({
     forSessionId: null,
-    blocks: undefined
+    blocks: undefined,
+    session: undefined
   });
   const [error, setError] = useState<Error | null>(null);
 
@@ -228,7 +257,11 @@ export function useChatBlocks(sessionId: string | null): {
   // listeners, AppState subscription) don't get torn down on every state
   // update. Without this, every block delta would unsubscribe and
   // reopen the EventSource, defeating the point of streaming.
-  const dataRef = useRef<BlockState>({ forSessionId: null, blocks: undefined });
+  const dataRef = useRef<StreamState>({
+    forSessionId: null,
+    blocks: undefined,
+    session: undefined
+  });
   useEffect(() => {
     dataRef.current = state;
   }, [state]);
@@ -251,16 +284,16 @@ export function useChatBlocks(sessionId: string | null): {
     // doesn't briefly mix the two chats' contents. Tagging the state
     // with `forSessionId = sessionId` lets the render-time read return
     // `undefined` until the seed for the new chat lands.
-    setState({ forSessionId: sessionId, blocks: undefined });
+    setState({ forSessionId: sessionId, blocks: undefined, session: undefined });
     setError(null);
-    dataRef.current = { forSessionId: sessionId, blocks: undefined };
+    dataRef.current = { forSessionId: sessionId, blocks: undefined, session: undefined };
     lastSeenIdRef.current = null;
 
     if (!sessionId) return;
 
     let cancelled = false;
     let seeded = false;
-    let es: EventSource<"chat_block"> | null = null;
+    let es: EventSource<"chat_block" | "chat_session"> | null = null;
     let appStateSub: { remove(): void } | null = null;
     // Cloudflare quick tunnels (`*.trycloudflare.com`) drop SSE at the
     // edge, so when the gateway is reachable only via a quick tunnel we
@@ -297,9 +330,23 @@ export function useChatBlocks(sessionId: string | null): {
         idx >= 0
           ? current.map((b, i) => (i === idx ? block : b))
           : [...current, block];
-      dataRef.current = { forSessionId: sessionId, blocks: next };
+      const session = dataRef.current.session;
+      dataRef.current = { forSessionId: sessionId, blocks: next, session };
       if (wireEventId) lastSeenIdRef.current = wireEventId;
-      setState({ forSessionId: sessionId, blocks: next });
+      setState({ forSessionId: sessionId, blocks: next, session });
+    };
+
+    // Apply a chat_session frame. Race-guarded by forSessionId the same
+    // way upsert() is, so a delayed frame from chat A can't overwrite
+    // chat B's session record. Not part of the Last-Event-ID cursor:
+    // the gateway re-emits the current record on every reconnect, so
+    // missing a transient rename frame is harmless.
+    const applySession = (session: ChatSession): void => {
+      if (dataRef.current.forSessionId !== sessionId) return;
+      if (session.id !== sessionId) return;
+      const blocks = dataRef.current.blocks;
+      dataRef.current = { forSessionId: sessionId, blocks, session };
+      setState({ forSessionId: sessionId, blocks, session });
     };
 
     const openStream = (): void => {
@@ -326,7 +373,7 @@ export function useChatBlocks(sessionId: string | null): {
       if (lastSeenIdRef.current) {
         headers["Last-Event-ID"] = lastSeenIdRef.current;
       }
-      const source = new EventSource<"chat_block">(endpoint.url, {
+      const source = new EventSource<"chat_block" | "chat_session">(endpoint.url, {
         headers,
         // 0 disables auto-reconnect; we want it on. The library default
         // (5000ms) is fine — a longer gap means slower recovery from a
@@ -342,6 +389,15 @@ export function useChatBlocks(sessionId: string | null): {
         } catch {
           // Drop malformed frames; the server controls this format and a
           // parse failure here is a wire-protocol bug, not a user one.
+        }
+      });
+      source.addEventListener("chat_session", (ev) => {
+        if (cancelled) return;
+        if (!ev.data) return;
+        try {
+          applySession(JSON.parse(ev.data) as ChatSession);
+        } catch {
+          // Same rationale as chat_block — wire format is server-controlled.
         }
       });
       source.addEventListener("error", (ev) => {
@@ -479,19 +535,27 @@ export function useChatBlocks(sessionId: string | null): {
       openStream();
     };
 
-    // Seed the list before opening the stream so the chat renders with
-    // its persisted history immediately. The seed resolve stashes the
-    // last block's id into lastSeenIdRef; openStream() reads that ref
-    // and injects it as `Last-Event-ID` on the first SSE connect, so
-    // the gateway's listChatBlocksAfter only replays what's actually
-    // new (typically nothing, since the seed just covered everything).
-    // If the seed never lands (a `merged` of length 0 — fresh chat
-    // with no blocks), the header is omitted and the gateway falls
-    // back to full backfill; the id-keyed upsert collapses any
-    // duplicates.
+    // Seed both blocks and the session record before opening the stream
+    // so the chat renders its persisted history AND its canonical title
+    // in a single first paint. The two REST calls fire in parallel
+    // (Promise.all) because the chat detail screen needs both up front:
+    // without the session in the seed, the header would briefly show
+    // the first-user-text fallback before the SSE chat_session frame
+    // lands and overwrites it — a visible flash on chat-open.
+    //
+    // The seed resolve stashes the last block's id into lastSeenIdRef;
+    // openStream() reads that ref and injects it as `Last-Event-ID` on
+    // the first SSE connect, so the gateway's listChatBlocksAfter only
+    // replays what's actually new (typically nothing). If `merged` is
+    // empty (fresh chat with no blocks), the header is omitted and the
+    // gateway falls back to full backfill; the id-keyed upsert collapses
+    // any duplicates.
     (async () => {
       try {
-        const blocks = await api<ChatBlock[]>(`/chat/${sessionId}/blocks`);
+        const [blocks, session] = await Promise.all([
+          api<ChatBlock[]>(`/chat/${sessionId}/blocks`),
+          api<ChatSession>(`/chat/${sessionId}`)
+        ]);
         if (cancelled) return;
         // Merge by id rather than overwrite. If the AppState handler or
         // any other path opened a stream while the seed was in flight,
@@ -505,7 +569,12 @@ export function useChatBlocks(sessionId: string | null): {
           ...blocks,
           ...existing.filter((b) => !seededIds.has(b.id))
         ];
-        dataRef.current = { forSessionId: sessionId, blocks: merged };
+        // Prefer a session record that already arrived over SSE (a
+        // mid-seed reconnect could plausibly land one, though with
+        // Promise.all the REST response usually wins) — the SSE frame
+        // is the more recent snapshot from the same source.
+        const liveSession = dataRef.current.session ?? session;
+        dataRef.current = { forSessionId: sessionId, blocks: merged, session: liveSession };
         // Seed the resume cursor so the very first SSE open skips
         // the redundant full replay listChatBlocksAfter(null) emits.
         // The /blocks REST response only carries the block's id (no
@@ -514,7 +583,7 @@ export function useChatBlocks(sessionId: string | null): {
         // updated_at when the suffix is absent. Subsequent SSE frames
         // will rewrite this with the wire `<id>:<ts>` form.
         lastSeenIdRef.current = merged[merged.length - 1]?.id ?? null;
-        setState({ forSessionId: sessionId, blocks: merged });
+        setState({ forSessionId: sessionId, blocks: merged, session: liveSession });
         setError(null);
         seeded = true;
         maybeOpenStream();
@@ -559,13 +628,15 @@ export function useChatBlocks(sessionId: string | null): {
   // running, render-time `state` still carries chat A's blocks; the
   // gate returns `undefined` for that one paint so the screen shows
   // the empty/loading state instead of the previous chat's history.
-  const data: ChatBlock[] | undefined =
-    state.forSessionId === sessionId ? state.blocks : undefined;
+  // The same gate applies to the session record — a stale chat-A title
+  // would otherwise briefly head chat B.
+  const matches = state.forSessionId === sessionId;
+  const blocks: ChatBlock[] | undefined = matches ? state.blocks : undefined;
+  const session: ChatSession | undefined = matches ? state.session : undefined;
   const isPending: boolean =
-    Boolean(sessionId) &&
-    (state.forSessionId !== sessionId || state.blocks === undefined);
+    Boolean(sessionId) && (!matches || state.blocks === undefined);
 
-  return { data, isPending, error };
+  return { blocks, session, isPending, error };
 }
 
 // POST /api/chat always creates the chat under the runtime's currently
@@ -594,14 +665,72 @@ export function useCreateChat(agentId: string | null) {
   });
 }
 
+// DELETE /chat/:id. Powers the chat-list swipe Delete action. We
+// optimistically drop the row from the cached list so the swipe
+// animation doesn't snap back to "deleting…" before the server
+// confirms. The agentId is captured at mutation-construction time so
+// the cache update targets the right per-agent list — the runtime
+// cascade-deletes blocks too, so a refetch on the chat detail of a
+// just-deleted session would 404 anyway.
+export function useDeleteChat(agentId: string | null) {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true }, Error, string>({
+    mutationFn: (sessionId: string) =>
+      api<{ ok: true }>(`/chat/${sessionId}`, { method: "DELETE" }),
+    onMutate: async (sessionId) => {
+      await qc.cancelQueries({ queryKey: ["chats", agentId] });
+      const previous = qc.getQueryData<ChatSession[]>(["chats", agentId]);
+      if (previous) {
+        qc.setQueryData<ChatSession[]>(
+          ["chats", agentId],
+          previous.filter((s) => s.id !== sessionId)
+        );
+      }
+      return { previous };
+    },
+    onError: (_err, _sessionId, context) => {
+      const ctx = context as { previous?: ChatSession[] } | undefined;
+      if (ctx?.previous) qc.setQueryData(["chats", agentId], ctx.previous);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["chats", agentId] });
+      qc.invalidateQueries({ queryKey: ["unread"] });
+    }
+  });
+}
+
+// DELETE /chat/:id/read. Powers the chat-list swipe Mark Unread action.
+// The runtime cursor is monotonic, so this is the only way to put a
+// chat back into the badge from the client. Refreshes the badge after
+// the cursor drops so the app icon dot pops back up immediately.
+export function useMarkChatUnread() {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true }, Error, string>({
+    mutationFn: (sessionId: string) =>
+      api<{ ok: true }>(`/chat/${sessionId}/read`, { method: "DELETE" }),
+    onSuccess: () => {
+      void refreshBadge();
+      qc.invalidateQueries({ queryKey: ["chats"] });
+      qc.invalidateQueries({ queryKey: ["unread"] });
+    }
+  });
+}
+
+export interface SendMessageInput {
+  content: string;
+  images?: UploadRef[];
+}
+
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
-  return useMutation<{ taskId: string }, Error, string>({
-    mutationFn: (content: string) => {
+  return useMutation<{ taskId: string }, Error, SendMessageInput>({
+    mutationFn: ({ content, images }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
+      const body: Record<string, unknown> = { content };
+      if (images && images.length > 0) body.images = images;
       return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
-        body: JSON.stringify({ content })
+        body: JSON.stringify(body)
       });
     },
     onSuccess: () => {

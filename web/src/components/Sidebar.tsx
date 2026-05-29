@@ -6,6 +6,7 @@ import { cn } from "@/lib/utils";
 import {
   Activity,
   AlertTriangle,
+  Bug,
   Cog,
   Download,
   Loader2,
@@ -23,13 +24,15 @@ import type { LucideIcon } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { useState, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { useStatus } from "@/lib/queries";
 import { AgentSwitcher } from "@/components/AgentSwitcher";
 import type { GiniUpdateResult, GiniVersionInfo } from "@runtime/types";
+
+const REPORT_BUG_URL = "https://github.com/Lilac-Labs/gini-agent/issues";
 
 type NavItem = { href: string; label: string; icon: LucideIcon };
 type NavGroup = readonly NavItem[];
@@ -99,6 +102,18 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
             })}
           </div>
         ))}
+        <div className="mt-2 border-t border-sidebar-border pt-2">
+          <a
+            href={REPORT_BUG_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={onNavigate}
+            className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-1.5 text-left text-sm font-medium text-muted-foreground transition-colors hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground"
+          >
+            <Bug className="h-4 w-4" />
+            Report a bug
+          </a>
+        </div>
       </nav>
       <UpdateReminder />
     </div>
@@ -114,8 +129,9 @@ function useMounted() {
 }
 
 function UpdateReminder() {
-  const status = useStatus();
   const qc = useQueryClient();
+  const [appliedSha, setAppliedSha] = useState<string | null>(null);
+  const status = useStatus({ refetchInterval: appliedSha ? 1_500 : 60_000 });
   const statusVersion = status.data?.version;
   const updateSupported = statusVersion?.update.supported === true;
   const versionCheck = useQuery({
@@ -126,6 +142,26 @@ function UpdateReminder() {
   });
   const version = versionCheck.data ?? statusVersion;
   const updateAvailable = version?.git.updateAvailable === true;
+
+  useEffect(() => {
+    if (!appliedSha) return;
+    if (statusVersion?.git.sha === appliedSha) {
+      setAppliedSha(null);
+      qc.invalidateQueries({ queryKey: ["version", "check"] });
+    }
+  }, [appliedSha, statusVersion?.git.sha, qc]);
+
+  useEffect(() => {
+    if (!appliedSha) return;
+    const timer = setTimeout(() => {
+      setAppliedSha(null);
+      toast.error("Update applied, but the runtime hasn't reported back. Reload to check.");
+      qc.invalidateQueries({ queryKey: ["status"] });
+      qc.invalidateQueries({ queryKey: ["version", "check"] });
+    }, 30_000);
+    return () => clearTimeout(timer);
+  }, [appliedSha, qc]);
+
   const update = useMutation({
     mutationFn: () => api<GiniUpdateResult>("/update", { method: "POST" }),
     onSuccess: (result) => {
@@ -136,13 +172,12 @@ function UpdateReminder() {
         return;
       }
       toast.success("Gini updated. Restarting...");
-      setTimeout(() => {
-        qc.invalidateQueries({ queryKey: ["status"] });
-        qc.invalidateQueries({ queryKey: ["version", "check"] });
-      }, 4000);
+      setAppliedSha(result.afterSha);
     },
     onError: (error: Error) => toast.error(error.message)
   });
+
+  const showUpdate = updateAvailable && !appliedSha;
 
   return (
     <div className="border-t border-sidebar-border px-3 py-3">
@@ -151,13 +186,13 @@ function UpdateReminder() {
           <div className="truncate font-mono text-[10px] text-sidebar-foreground/65">
             v{version?.packageVersion ?? "0.0.0"}{version?.git.shortSha ? ` · ${version.git.shortSha}` : ""}
           </div>
-          {updateAvailable ? (
+          {showUpdate ? (
             <div className="text-xs font-medium text-sidebar-foreground">Update ready</div>
           ) : (
             <div className="text-xs text-sidebar-foreground/65">Gini agent</div>
           )}
         </div>
-        {updateAvailable ? (
+        {showUpdate ? (
           <Button
             size="sm"
             variant="default"

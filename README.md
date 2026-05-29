@@ -1,6 +1,6 @@
 # Gini Agent
 
-Gini Agent is a local-first personal agent runtime for people who want an agent they can install, operate, inspect, approve, and debug.
+Gini Agent is a personal agent that remembers, improves, and runs without forcing you to read a log line.
 
 Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an interaction surface. The runtime is the system of record for conversations, runs, tasks, approvals, memory, skills, jobs, tools, traces, audit events, and runtime health.
 

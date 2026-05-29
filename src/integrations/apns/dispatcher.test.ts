@@ -19,16 +19,16 @@ import type { APNsClient, APNsPayload, APNsSendOptions, APNsSendResult } from ".
 import type { ChatBlock, Instance } from "../../types";
 import type { PushDevice } from "../../state";
 
-function approvalBlock(overrides?: Partial<Extract<ChatBlock, { kind: "approval_requested" }>>): Extract<ChatBlock, { kind: "approval_requested" }> {
+function approvalBlock(overrides?: Partial<Extract<ChatBlock, { kind: "authorization_requested" }>>): Extract<ChatBlock, { kind: "authorization_requested" }> {
   return {
     id: "block_abc",
     sessionId: "chat_xyz",
     instance: "test-instance" as Instance,
     ordinal: 4,
     createdAt: new Date().toISOString(),
-    kind: "approval_requested",
-    approvalId: "appr_1",
-    action: "terminal_exec",
+    kind: "authorization_requested",
+    authorizationId: "appr_1",
+    action: "terminal.exec",
     risk: "medium",
     summary: "Run `rm -rf foo`",
     ...overrides
@@ -97,7 +97,7 @@ describe("apns dispatcher", () => {
     expect(aBody.sessionId).toBe("chat_xyz");
     expect(aBody.blockId).toBe("block_abc");
     expect(aBody.approvalId).toBe("appr_1");
-    expect(aBody.event).toBe("approval_requested");
+    expect(aBody.event).toBe("authorization_requested");
     expect(aBody.silent).toBe(false);
     const aps = a?.payload.aps as Record<string, unknown>;
     expect((aps.alert as Record<string, unknown>).title).toBe("Gini needs your approval");
@@ -608,8 +608,8 @@ describe("apns dispatcher", () => {
     const body = payload.body as Record<string, unknown>;
     expect(body.sessionId).toBe(block.sessionId);
     expect(body.blockId).toBe(block.id);
-    expect(body.approvalId).toBe(block.approvalId);
-    expect(body.event).toBe("approval_requested");
+    expect(body.approvalId).toBe(block.authorizationId);
+    expect(body.event).toBe("authorization_requested");
     expect(body.silent).toBe(false);
   });
 });

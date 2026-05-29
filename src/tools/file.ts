@@ -6,7 +6,7 @@ import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import {
   appendTrace,
   assertInsideWorkspace,
-  createApproval,
+  createAuthorization,
   isTerminalTaskStatus,
   mutateState,
   now
@@ -65,7 +65,7 @@ export async function requestFileWrite(config: RuntimeConfig, task: Task): Promi
     // Respect a prior terminal status — see requestShell for the
     // imperative-dispatch sleep-window race this guards against.
     if (isTerminalTaskStatus(item.status)) return item;
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "file.write",
       target,
@@ -96,7 +96,7 @@ export async function requestFilePatch(config: RuntimeConfig, task: Task): Promi
     // Respect a prior terminal status — see requestShell for the
     // imperative-dispatch sleep-window race this guards against.
     if (isTerminalTaskStatus(item.status)) return item;
-    const approval = createApproval(state, {
+    const approval = createAuthorization(state, {
       taskId: item.id,
       action: "file.patch",
       target,

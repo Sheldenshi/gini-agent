@@ -15,6 +15,9 @@ import {
   View,
   useWindowDimensions
 } from "react-native";
+import ReanimatedSwipeable, {
+  type SwipeableMethods
+} from "react-native-gesture-handler/ReanimatedSwipeable";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
 import { chatListTime } from "@/src/format";
@@ -23,6 +26,9 @@ import {
   useChats,
   useCreateAgent,
   useCreateChat,
+  useDeleteChat,
+  useMarkChatUnread,
+  useUnreadCounts,
   useUseAgent
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
@@ -181,7 +187,6 @@ export default function AgentsScreen() {
       <View style={styles.header}>
         <TouchableOpacity
           onPress={() => setPickerOpen(true)}
-          disabled={list.length === 0}
           hitSlop={8}
           style={styles.headerIconButton}
           accessibilityRole="button"
@@ -209,6 +214,7 @@ export default function AgentsScreen() {
       </View>
 
       <ChatList
+        agentId={agentId}
         agents={list}
         chats={orderedChats}
         isAgentsLoading={agents.isLoading}
@@ -244,6 +250,7 @@ export default function AgentsScreen() {
 }
 
 function ChatList({
+  agentId,
   agents,
   chats,
   isAgentsLoading,
@@ -258,6 +265,7 @@ function ChatList({
   onNewChat,
   creatingChat
 }: {
+  agentId: string | null;
   agents: AgentRecord[];
   chats: ChatSession[];
   isAgentsLoading: boolean;
@@ -277,6 +285,13 @@ function ChatList({
   // fall back to "New chat" for untitled sessions so empty-title rows
   // remain reachable via search.
   const [query, setQuery] = useState("");
+  // Per-session unread counts keyed by sessionId. Empty {} for clients
+  // without an APNs token (web target, pre-registration cold start) —
+  // useUnreadCounts gates the fetch on the cached device token, so the
+  // query stays disabled rather than spamming 400s. ChatRow defaults
+  // to 0 when its session is missing from the map.
+  const unreadCountsQuery = useUnreadCounts();
+  const unreadCounts = unreadCountsQuery.data ?? {};
   // User-initiated pull-to-refresh state. `isChatsFetching` from React
   // Query also flips during the 3s background poll, so binding the
   // RefreshControl to it directly makes the spinner pop at the top of
@@ -399,7 +414,13 @@ function ChatList({
               tintColor={theme.muted}
             />
           }
-          renderItem={({ item }) => <ChatRow session={item} />}
+          renderItem={({ item }) => (
+            <ChatRow
+              session={item}
+              agentId={agentId}
+              unreadCount={unreadCounts[item.id] ?? 0}
+            />
+          )}
           ListEmptyComponent={
             query.trim() ? (
               <View style={styles.searchEmpty}>
@@ -413,7 +434,15 @@ function ChatList({
   );
 }
 
-function ChatRow({ session }: { session: ChatSession }) {
+function ChatRow({
+  session,
+  agentId,
+  unreadCount
+}: {
+  session: ChatSession;
+  agentId: string | null;
+  unreadCount: number;
+}) {
   const title = session.title?.trim() || "New chat";
   // Excerpt: the server-supplied `lastMessagePreview` is the latest
   // user_text / assistant_text content for the session (already
@@ -422,27 +451,95 @@ function ChatRow({ session }: { session: ChatSession }) {
   const subtitle =
     session.lastMessagePreview?.trim() || session.summary?.trim() || "";
   const time = chatListTime(session.updatedAt ?? session.createdAt);
+  const deleteChat = useDeleteChat(agentId);
+  const markUnread = useMarkChatUnread();
+  const swipeRef = useRef<SwipeableMethods | null>(null);
+  const isUnread = unreadCount > 0;
+  // Cap the badge text at "99+" so a runaway notification stream doesn't
+  // explode the pill width. The runtime aggregates the raw count without
+  // a ceiling — clamping at render time keeps that flexibility.
+  const badgeText = unreadCount > 99 ? "99+" : String(unreadCount);
+
+  // iOS Mail/Messages pattern: left-swipe reveals Unread (blue) and
+  // Delete (red) buttons. Delete is destructive but the swipe is itself
+  // intentional, so we skip a confirmation dialog and rely on the
+  // optimistic cache rollback to recover if the request fails. Unread
+  // closes the swipe immediately so the row's row chrome doesn't sit
+  // open while the badge ticks up.
+  const renderRightActions = useCallback(() => {
+    return (
+      <View style={styles.swipeActions}>
+        <Pressable
+          onPress={() => {
+            swipeRef.current?.close();
+            markUnread.mutate(session.id);
+          }}
+          style={[styles.swipeAction, styles.swipeActionUnread]}
+          accessibilityRole="button"
+          accessibilityLabel={`Mark ${title} unread`}
+        >
+          <Feather name="mail" size={22} color="#FFFFFF" />
+          <Text style={styles.swipeActionLabel}>Unread</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => deleteChat.mutate(session.id)}
+          style={[styles.swipeAction, styles.swipeActionDelete]}
+          accessibilityRole="button"
+          accessibilityLabel={`Delete ${title}`}
+        >
+          <Feather name="trash-2" size={22} color="#FFFFFF" />
+          <Text style={styles.swipeActionLabel}>Delete</Text>
+        </Pressable>
+      </View>
+    );
+  }, [deleteChat, markUnread, session.id, title]);
 
   return (
-    <TouchableOpacity
-      onPress={() => router.push(`/chat/${session.id}`)}
-      activeOpacity={0.7}
-      style={styles.chatRow}
+    <ReanimatedSwipeable
+      ref={swipeRef}
+      friction={2}
+      rightThreshold={40}
+      overshootRight={false}
+      enableTrackpadTwoFingerGesture
+      renderRightActions={renderRightActions}
     >
-      <View style={styles.chatRowTopLine}>
-        <Text style={styles.chatRowTitle} numberOfLines={1}>
-          {title}
-        </Text>
-        <Text style={styles.chatRowTime} numberOfLines={1}>
-          {time}
-        </Text>
-      </View>
-      {subtitle ? (
-        <Text style={styles.chatRowSubtitle} numberOfLines={1}>
-          {subtitle}
-        </Text>
-      ) : null}
-    </TouchableOpacity>
+      <TouchableOpacity
+        onPress={() => router.push(`/chat/${session.id}`)}
+        activeOpacity={0.7}
+        style={[styles.chatRow, styles.chatRowSurface]}
+        accessibilityRole="button"
+        accessibilityLabel={
+          isUnread
+            ? `${title}, ${unreadCount} unread ${unreadCount === 1 ? "message" : "messages"}`
+            : title
+        }
+      >
+        <View style={styles.chatRowTopLine}>
+          <Text style={styles.chatRowTitle} numberOfLines={1}>
+            {title}
+          </Text>
+          <Text
+            style={[styles.chatRowTime, isUnread && styles.chatRowTimeUnread]}
+            numberOfLines={1}
+          >
+            {time}
+          </Text>
+        </View>
+        <View style={styles.chatRowBottomLine}>
+          <Text
+            style={styles.chatRowSubtitle}
+            numberOfLines={1}
+          >
+            {subtitle}
+          </Text>
+          {isUnread ? (
+            <View style={styles.unreadBadge} accessibilityElementsHidden>
+              <Text style={styles.unreadBadgeText}>{badgeText}</Text>
+            </View>
+          ) : null}
+        </View>
+      </TouchableOpacity>
+    </ReanimatedSwipeable>
   );
 }
 
@@ -821,13 +918,19 @@ const styles = StyleSheet.create({
   // Chat rows. Title + day/time on the top line, single-line subtitle
   // below. Bottom border on each row matches the design's hairline
   // dividers.
-  chatListContent: { paddingHorizontal: 16, paddingTop: 4 },
+  chatListContent: { paddingTop: 4 },
   chatRow: {
+    paddingHorizontal: 16,
     paddingVertical: 16,
     borderBottomWidth: 1,
     borderBottomColor: theme.border,
     gap: 6
   },
+  // Opaque surface on the chat row so the swipe-revealed action panel
+  // doesn't bleed through the row content while the gesture is in
+  // flight. Without this the colored action buttons show behind the
+  // semi-transparent default while the row translates.
+  chatRowSurface: { backgroundColor: theme.bg },
   chatRowTopLine: {
     flexDirection: "row",
     alignItems: "center",
@@ -844,11 +947,62 @@ const styles = StyleSheet.create({
     fontFamily: family("HankenGrotesk", 600),
     fontSize: 12
   },
+  // Bottom line — subtitle (flex) and the optional unread badge sit on
+  // a row so the badge floats to the right edge regardless of subtitle
+  // length. The Pencil design pins both to a `space_between` baseline.
+  chatRowBottomLine: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
+  },
   chatRowSubtitle: {
+    flex: 1,
     color: theme.subtle,
     fontFamily: family("HankenGrotesk", 400),
     fontSize: 14,
     lineHeight: 18
+  },
+  // Unread row variations from the "Chat List" Pencil frame: time
+  // turns iOS-system-blue and bumps weight; the badge is a blue pill
+  // with the per-session unread count in white. Designed to be subtle
+  // — title text stays the same weight so a long unread thread doesn't
+  // shove the read rows around as counts change.
+  chatRowTimeUnread: {
+    color: "#2F6BFF",
+    fontFamily: family("HankenGrotesk", 700)
+  },
+  unreadBadge: {
+    minWidth: 20,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: "#2F6BFF",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  unreadBadgeText: {
+    color: "#FFFFFF",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 12
+  },
+
+  // Swipe-reveal action panel — iOS Mail/Messages pattern. Two 80px
+  // buttons stacked horizontally so the user can read the labels while
+  // swiping. Colors taken straight from the Pencil design (iOS system
+  // blue and red) so the buttons read as native chrome.
+  swipeActions: { flexDirection: "row" },
+  swipeAction: {
+    width: 80,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 4
+  },
+  swipeActionUnread: { backgroundColor: "#007AFF" },
+  swipeActionDelete: { backgroundColor: "#FF3B30" },
+  swipeActionLabel: {
+    color: "#FFFFFF",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
   },
 
   // Generic states.

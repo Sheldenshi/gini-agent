@@ -19,9 +19,12 @@
 import { EventEmitter } from "node:events";
 import type {
   AssistantTextBlock,
+  AuthorizationAction,
   ChatBlock,
   ChatBlockKind,
   Instance,
+  RiskLevel,
+  SetupRequestAction,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -71,7 +74,10 @@ interface ChatBlockRow {
   instance: string;
   agent_id: string | null;
   ordinal: number;
-  kind: ChatBlockKind;
+  // Includes "approval_requested" as a legacy value still resident in
+  // pre-split DBs (the CHECK constraint accepts it; rowToBlock migrates
+  // it on read).
+  kind: ChatBlockKind | "approval_requested";
   payload_json: string;
   task_id: string | null;
   run_id: string | null;
@@ -100,8 +106,24 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
     runId: row.run_id ?? undefined
   };
   switch (row.kind) {
-    case "user_text":
-      return { ...base, kind: "user_text", text: String(payload.text ?? "") };
+    case "user_text": {
+      const images = Array.isArray(payload.images)
+        ? payload.images
+            .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+            .map((item) => ({
+              id: String(item.id ?? ""),
+              mimeType: String(item.mimeType ?? ""),
+              size: Number(item.size ?? 0)
+            }))
+            .filter((image) => image.id.length > 0)
+        : undefined;
+      return {
+        ...base,
+        kind: "user_text",
+        text: String(payload.text ?? ""),
+        ...(images && images.length > 0 ? { images } : {})
+      };
+    }
     case "assistant_text":
       return {
         ...base,
@@ -123,7 +145,8 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
           : {}),
         status: (payload.status as ToolCallStatus) ?? "running",
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
-        callId: String(payload.callId ?? "")
+        callId: String(payload.callId ?? ""),
+        runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined
       };
     case "tool_result":
       return {
@@ -135,13 +158,44 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
       };
     case "phase":
       return { ...base, kind: "phase", label: String(payload.label ?? "") };
-    case "approval_requested":
+    case "approval_requested": {
+      // Legacy block kind from before the Authorization/SetupRequest split.
+      // Partition by action so old rows render with the right new card
+      // type. See docs/adr/authorization-vs-setup-request.md.
+      const action = String(payload.action ?? "");
+      if (action === "browser.connect" || action === "connector.request" || action === "browser.fill_secret") {
+        return {
+          ...base,
+          kind: "setup_requested",
+          setupRequestId: String(payload.approvalId ?? ""),
+          action: action as SetupRequestAction,
+          summary: String(payload.summary ?? "")
+        };
+      }
       return {
         ...base,
-        kind: "approval_requested",
-        approvalId: String(payload.approvalId ?? ""),
-        action: String(payload.action ?? ""),
-        risk: String(payload.risk ?? "low"),
+        kind: "authorization_requested",
+        authorizationId: String(payload.approvalId ?? ""),
+        action: action as AuthorizationAction,
+        risk: (payload.risk as RiskLevel) ?? "low",
+        summary: String(payload.summary ?? "")
+      };
+    }
+    case "authorization_requested":
+      return {
+        ...base,
+        kind: "authorization_requested",
+        authorizationId: String(payload.authorizationId ?? ""),
+        action: String(payload.action ?? "") as AuthorizationAction,
+        risk: (payload.risk as RiskLevel) ?? "low",
+        summary: String(payload.summary ?? "")
+      };
+    case "setup_requested":
+      return {
+        ...base,
+        kind: "setup_requested",
+        setupRequestId: String(payload.setupRequestId ?? ""),
+        action: String(payload.action ?? "") as SetupRequestAction,
         summary: String(payload.summary ?? "")
       };
     case "system_note":
@@ -162,7 +216,10 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
 function payloadFor(block: ChatBlock): string {
   switch (block.kind) {
     case "user_text":
-      return JSON.stringify({ text: block.text });
+      return JSON.stringify({
+        text: block.text,
+        ...(block.images && block.images.length > 0 ? { images: block.images } : {})
+      });
     case "assistant_text":
       return JSON.stringify({ text: block.text, streaming: block.streaming });
     case "tool_call":
@@ -173,7 +230,8 @@ function payloadFor(block: ChatBlock): string {
         argsFull: block.argsFull,
         status: block.status,
         errorMessage: block.errorMessage,
-        callId: block.callId
+        callId: block.callId,
+        runningHint: block.runningHint
       });
     case "tool_result":
       return JSON.stringify({
@@ -183,11 +241,17 @@ function payloadFor(block: ChatBlock): string {
       });
     case "phase":
       return JSON.stringify({ label: block.label });
-    case "approval_requested":
+    case "authorization_requested":
       return JSON.stringify({
-        approvalId: block.approvalId,
+        authorizationId: block.authorizationId,
         action: block.action,
         risk: block.risk,
+        summary: block.summary
+      });
+    case "setup_requested":
+      return JSON.stringify({
+        setupRequestId: block.setupRequestId,
+        action: block.action,
         summary: block.summary
       });
     case "system_note":
@@ -239,7 +303,12 @@ export function insertChatBlock(
       };
       switch (input.kind) {
         case "user_text":
-          return { ...base, kind: "user_text", text: input.text };
+          return {
+            ...base,
+            kind: "user_text",
+            text: input.text,
+            ...(input.images && input.images.length > 0 ? { images: input.images } : {})
+          };
         case "assistant_text":
           return {
             ...base,
@@ -259,7 +328,8 @@ export function insertChatBlock(
             argsFull: input.argsFull,
             status: input.status,
             errorMessage: input.errorMessage,
-            callId: input.callId
+            callId: input.callId,
+            runningHint: input.runningHint
           };
         case "tool_result":
           return {
@@ -271,13 +341,21 @@ export function insertChatBlock(
           };
         case "phase":
           return { ...base, kind: "phase", label: input.label };
-        case "approval_requested":
+        case "authorization_requested":
           return {
             ...base,
-            kind: "approval_requested",
-            approvalId: input.approvalId,
+            kind: "authorization_requested",
+            authorizationId: input.authorizationId,
             action: input.action,
             risk: input.risk,
+            summary: input.summary
+          };
+        case "setup_requested":
+          return {
+            ...base,
+            kind: "setup_requested",
+            setupRequestId: input.setupRequestId,
+            action: input.action,
             summary: input.summary
           };
         case "system_note":
@@ -440,8 +518,9 @@ export function updateToolCallBlock(
   callId: string,
   sessionId: string,
   patch: {
-    status: "running" | "ok" | "error" | "denied";
+    status?: "running" | "ok" | "error" | "denied";
     errorMessage?: string;
+    runningHint?: string;
   }
 ): ChatBlock | null {
   const db = getMemoryDb(instance);
@@ -462,8 +541,12 @@ export function updateToolCallBlock(
   } catch {
     payload = {};
   }
-  payload.status = patch.status;
+  if (patch.status !== undefined) payload.status = patch.status;
   if (patch.errorMessage !== undefined) payload.errorMessage = patch.errorMessage;
+  // Clear the running hint when the tool leaves the running state — the
+  // amber waiting-card is only meaningful while we're still waiting.
+  if (patch.runningHint !== undefined) payload.runningHint = patch.runningHint;
+  if (patch.status !== undefined && patch.status !== "running") delete payload.runningHint;
   db.run(
     `UPDATE chat_blocks
        SET payload_json = ?, updated_at = ?

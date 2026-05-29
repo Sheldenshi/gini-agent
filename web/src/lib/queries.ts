@@ -4,7 +4,7 @@ import { api } from "@/lib/api";
 import { inferTunnelTransport } from "@/lib/transport";
 import { isQuickTunnelOrigin } from "@/lib/tunnel-policy";
 import type {
-  Approval,
+  Authorization,
   BrowserConnectionRecord,
   ChatBlock,
   ConnectorRecord,
@@ -13,6 +13,7 @@ import type {
   JobRunRecord,
   RuntimeEvent,
   RuntimeStatus,
+  SetupRequest,
   SkillRecord,
   SubagentRecord,
   Task,
@@ -83,10 +84,18 @@ export function useTask(id: string | null) {
   });
 }
 
-export function useApprovals() {
-  return useQuery<Approval[]>({
-    queryKey: ["approvals"],
-    queryFn: () => api<Approval[]>("/approvals"),
+export function useAuthorizations() {
+  return useQuery<Authorization[]>({
+    queryKey: ["authorizations"],
+    queryFn: () => api<Authorization[]>("/authorizations"),
+    refetchInterval: 60_000
+  });
+}
+
+export function useSetupRequests() {
+  return useQuery<SetupRequest[]>({
+    queryKey: ["setup-requests"],
+    queryFn: () => api<SetupRequest[]>("/setup-requests"),
     refetchInterval: 60_000
   });
 }

@@ -58,7 +58,9 @@ export function status(config: RuntimeConfig) {
     workspaceRoot: config.workspaceRoot,
     pid: process.pid,
     taskCounts: taskCounts(state.tasks),
-    pendingApprovals: state.approvals.filter((approval) => approval.status === "pending").length,
+    pendingApprovals:
+      state.authorizations.filter((row) => row.status === "pending").length +
+      state.setupRequests.filter((row) => row.status === "pending").length,
     activeJobs: state.jobs.filter((job) => job.status === "active").length,
     missedJobs,
     connectors: state.connectors.length,

@@ -36,9 +36,12 @@ import {
 } from "../state";
 import type {
   AssistantTextBlock,
+  AuthorizationAction,
   ChatBlock,
   Instance,
+  RiskLevel,
   RuntimeConfig,
+  SetupRequestAction,
   Task,
   ToolCallStatus
 } from "../types";
@@ -223,6 +226,26 @@ export function emitToolCallRunning(
   });
 }
 
+// Attach a `runningHint` to a tool_call block that's already mounted in
+// `running` status. The hint is advisory context a tool emits to explain
+// why it's parked — currently only used by tools that block on an
+// external event the agent can't drive (e.g. wait_for_messaging_pair
+// blocking on an inbound Telegram DM). Clients may render the row more
+// prominently when the hint is set; the wire contract is advisory, not a
+// new block kind. The hint is cleared automatically when the tool's
+// status leaves "running" (see updateToolCallBlock); a no-op when there's
+// no emit context (subagent children with no session) or when the block
+// can't be found.
+export function setToolCallRunningHint(
+  ctx: ChatEmitContext | undefined,
+  callId: string,
+  hint: string
+): ChatBlock | undefined {
+  if (!ctx) return undefined;
+  const updated = updateToolCallBlock(ctx.instance, callId, ctx.sessionId, { runningHint: hint });
+  return updated ?? undefined;
+}
+
 // Flip a tool_call row's status (running → ok | error | denied). The
 // lookup is by (sessionId, callId) so callers don't need to remember
 // the block id — the chat-task loop and the approval-resume path both
@@ -269,25 +292,45 @@ export function emitToolResult(
   });
 }
 
-// Insert an approval_requested block when a tool call is gated pending
-// human approval. Includes `action` so clients can distinguish
-// `connector.request` (Connect dialog) from regular approvals
-// (Approve/Deny pair).
-export function emitApprovalRequested(
+// Insert an authorization_requested block when a tool call is gated
+// pending user approval/denial (agent-actor flow).
+export function emitAuthorizationRequested(
   ctx: ChatEmitContext | undefined,
   params: {
-    approvalId: string;
-    action: string;
-    risk: string;
+    authorizationId: string;
+    action: AuthorizationAction;
+    risk: RiskLevel;
     summary: string;
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
   return insertChatBlock(ctx.instance, {
-    kind: "approval_requested",
-    approvalId: params.approvalId,
+    kind: "authorization_requested",
+    authorizationId: params.authorizationId,
     action: params.action,
     risk: params.risk,
+    summary: params.summary,
+    ...bookkeepingFor(ctx)
+  });
+}
+
+// Insert a setup_requested block when a tool call needs the user to
+// perform a setup step (browser.connect, connector.request, or
+// browser.fill_secret). No risk pill is rendered — the rule is
+// structural per docs/adr/authorization-vs-setup-request.md.
+export function emitSetupRequested(
+  ctx: ChatEmitContext | undefined,
+  params: {
+    setupRequestId: string;
+    action: SetupRequestAction;
+    summary: string;
+  }
+): ChatBlock | undefined {
+  if (!ctx) return undefined;
+  return insertChatBlock(ctx.instance, {
+    kind: "setup_requested",
+    setupRequestId: params.setupRequestId,
+    action: params.action,
     summary: params.summary,
     ...bookkeepingFor(ctx)
   });

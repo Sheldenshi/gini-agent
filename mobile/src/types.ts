@@ -17,7 +17,8 @@ export type {
   ToolCallStatus,
   ToolResultBlock,
   PhaseBlock,
-  ApprovalRequestedBlock,
+  AuthorizationRequestedBlock,
+  SetupRequestedBlock,
   SystemNoteBlock
 } from "@runtime/types";
 

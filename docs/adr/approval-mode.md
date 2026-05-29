@@ -78,14 +78,28 @@ still gates each call.
 `browser_fill_secrets` is the one carve-out from the
 "route-through-pendingOrAuto" rule, documented in detail in
 [browser-fill-secret.md](browser-fill-secret.md). The dispatch
-creates the approval directly via `createApproval` (the side effect
-— per-slot playwright fill — runs inside `POST /api/approvals/<id>/connect`
-from request-scope secrets, not inside `executeApprovedAction`), and
+creates the setup request directly via `createSetupRequest` (the side
+effect — per-slot playwright fill — runs inside
+`POST /api/setup-requests/<id>/complete` from request-scope secrets, not
+inside `executeApprovedAction`), and
 `resolveApprovalPolicy` returns `{ mode: "gate" }` for
 `browser.fill_secret` regardless of `approvalMode` — yolo cannot
 auto-approve credential entry because the credentials come from the
 user, not the agent. The mode-uniformity claim above does not extend
 to this action.
+
+The three messaging chat-card actions (`messaging.add_bridge`,
+`messaging.approve_pairing`, `messaging.remove_bridge`) follow the
+same `/connect`-only carve-out as `browser.fill_secret` — the
+inline cards collect request-scope state (bot tokens, verification
+codes, bridge-removal confirmations) that doesn't fit through
+`executeApprovedAction`. Each is mode-gated with the same
+`{ mode: "gate" }` regardless of `approvalMode`. Defense-in-depth:
+`/approve` refuses these actions at both the HTTP layer and inside
+`decideApproval`, and the home / permissions pages render Deny +
+"resolve in chat" instead of the generic Approve. See
+[chat-block-protocol.md](chat-block-protocol.md) for the wire shape
+and [telegram-bridge.md](telegram-bridge.md) for the lifecycle.
 
 ## Required Now
 

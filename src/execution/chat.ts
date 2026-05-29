@@ -10,10 +10,12 @@ import {
   isTerminalTaskStatus,
   listChatBlocks,
   mutateState,
+  publishChatSession,
   readState,
   renameChatSession
 } from "../state";
-import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import { uploadExists } from "../state/uploads";
 import { generateStructured } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
@@ -54,6 +56,20 @@ export function listChatSessions(config: RuntimeConfig) {
   // without N+1 fetches. Sessions with no qualifying blocks fall back to
   // null and the client renders just the title.
   const latestByCallId = getLatestMessagesBySession(config.instance);
+  // Pre-index pending gates by taskId so the per-session count below is
+  // O(taskIds) instead of O(sessions × approvals). Authorizations and
+  // SetupRequests are two parallel approval surfaces with the same
+  // "session is awaiting the user" semantics — both contribute to the
+  // sidebar indicator.
+  const pendingByTaskId = new Map<string, number>();
+  for (const auth of state.authorizations) {
+    if (auth.status !== "pending" || !auth.taskId) continue;
+    pendingByTaskId.set(auth.taskId, (pendingByTaskId.get(auth.taskId) ?? 0) + 1);
+  }
+  for (const setup of state.setupRequests) {
+    if (setup.status !== "pending" || !setup.taskId) continue;
+    pendingByTaskId.set(setup.taskId, (pendingByTaskId.get(setup.taskId) ?? 0) + 1);
+  }
   return state.chatSessions.map((session) => {
     const raw = latestByCallId.get(session.id) ?? null;
     const lastMessagePreview = raw
@@ -61,9 +77,14 @@ export function listChatSessions(config: RuntimeConfig) {
         ? `${raw.slice(0, LAST_MESSAGE_PREVIEW_CHARS).trimEnd()}…`
         : raw
       : null;
+    let pendingApprovalCount = 0;
+    for (const taskId of session.taskIds) {
+      pendingApprovalCount += pendingByTaskId.get(taskId) ?? 0;
+    }
     return {
       ...session,
       lastMessagePreview,
+      pendingApprovalCount,
       messages: state.chatMessages.filter((message) => message.sessionId === session.id),
       runs: state.runs.filter((run) => session.runIds.includes(run.id))
     };
@@ -117,19 +138,17 @@ export function getChatSession(config: RuntimeConfig, id: string) {
         (m) => m.role === "assistant" && m.taskId === task.id && m.kind === "approval_reason"
       );
       if (hasPersistedApprovalReason) continue;
-      // browser.connect approvals render their own self-describing card in
-      // chat ("Connect to agent's browser" + the reason + Connect/Cancel). A
-      // generic "Waiting for approval..." bubble next to that card is
-      // redundant noise — the card already conveys what's pending. Skip the
-      // placeholder when the pending approval(s) for this task are all
-      // browser.connect.
-      const pendingApprovals = state.approvals.filter(
+      // SetupRequest cards render their own self-describing UI (Connect /
+      // credential inputs / Submit) — a generic "Waiting for approval..."
+      // bubble next to that card is redundant. Skip the placeholder when
+      // the pending gates for this task are all SetupRequests.
+      const pendingAuthorizations = state.authorizations.filter(
         (a) => a.taskId === task.id && a.status === "pending"
       );
-      if (
-        pendingApprovals.length > 0 &&
-        pendingApprovals.every((a) => a.action === "browser.connect")
-      ) {
+      const pendingSetupRequests = state.setupRequests.filter(
+        (s) => s.taskId === task.id && s.status === "pending"
+      );
+      if (pendingAuthorizations.length === 0 && pendingSetupRequests.length > 0) {
         continue;
       }
       content = task.currentStep || "Waiting for approval...";
@@ -180,12 +199,44 @@ export async function deleteChat(config: RuntimeConfig, id: string) {
 
 export async function renameChat(config: RuntimeConfig, id: string, input: Record<string, unknown>) {
   const title = String(input.title ?? "");
-  return mutateState(config.instance, (state) => renameChatSession(state, id, title));
+  const updated = await mutateState(config.instance, (state) => renameChatSession(state, id, title));
+  // Fan the rename out over /api/chat/:id/stream so open SSE
+  // subscribers (mobile chat detail, web client) see the new title
+  // without a refetch. Publish after mutateState resolves so the
+  // disk-write commit precedes the event — matches chat-blocks
+  // post-commit semantics.
+  publishChatSession(config.instance, updated);
+  return updated;
+}
+
+function parseImageAttachments(instance: string, raw: unknown): ImageAttachment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ImageAttachment[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const id = typeof item.id === "string" ? item.id : "";
+    const mimeType = typeof item.mimeType === "string" ? item.mimeType : "";
+    const size = typeof item.size === "number" ? item.size : Number(item.size ?? 0);
+    if (!id || !mimeType) continue;
+    // Reject upload ids that haven't been registered with this instance.
+    // Submitting a phantom id would let a client pin an arbitrary value
+    // in chat history without backing bytes — the renderer would 404 and
+    // the provider would skip the image at dispatch.
+    if (!uploadExists(instance, id)) {
+      throw new Error(`Invalid input: image upload not found: ${id}`);
+    }
+    out.push({ id, mimeType, size });
+  }
+  return out;
 }
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
   const content = String(input.content ?? "").trim();
-  if (!content) throw new Error("Chat message content is required.");
+  const images = parseImageAttachments(config.instance, input.images);
+  if (!content && images.length === 0) {
+    throw new Error("Chat message content is required.");
+  }
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) throw new Error(`Chat session not found: ${sessionId}`);
@@ -198,11 +249,19 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     runId: run.id,
     mode: "chat",
     chatSessionId: sessionId,
-    agentId: session.agentId
+    agentId: session.agentId,
+    ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);
   await mutateState(config.instance, (current) => {
-    const message = createChatMessage(current, { sessionId, role: "user", content, taskId: task.id, runId: run.id });
+    const message = createChatMessage(current, {
+      sessionId,
+      role: "user",
+      content,
+      taskId: task.id,
+      runId: run.id,
+      ...(images.length > 0 ? { images } : {})
+    });
     const runRecord = current.runs.find((item) => item.id === run.id);
     if (runRecord) {
       runRecord.userMessageId = message.id;
@@ -223,7 +282,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       text: content,
       taskId: task.id,
       runId: run.id,
-      agentId: session.agentId ?? null
+      agentId: session.agentId ?? null,
+      ...(images.length > 0 ? { images } : {})
     });
   } catch (error) {
     appendLog(config.instance, "chat.user_block.insert_failed", {
@@ -339,13 +399,21 @@ export async function autoRenameChatAfterTurn(config: RuntimeConfig, sessionId: 
   const title = await generateChatTitleFromBlocks(config, blocks);
   if (!title) return;
 
-  await mutateState(config.instance, (state) => {
+  let renamed = false;
+  const updated = await mutateState(config.instance, (state) => {
     const live = state.chatSessions.find((item) => item.id === sessionId);
     if (!live) return undefined;
     if (!isDefaultChatTitle(live.title)) return live;
     if (isScheduledJobDeliverySession(state, sessionId)) return live;
+    renamed = true;
     return renameChatSession(state, sessionId, title);
   });
+  // Publish only when the title actually changed — re-emitting on
+  // every turn would push redundant events to subscribers and force
+  // them to re-render the header for no reason. The branches above
+  // that return `live` (already-titled session, scheduled-job
+  // delivery) intentionally skip the publish.
+  if (renamed && updated) publishChatSession(config.instance, updated);
 }
 
 function isDefaultChatTitle(title: string): boolean {

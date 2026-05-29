@@ -81,21 +81,23 @@ export default function SettingsPage() {
     onError: (error: Error) => toast.error(error.message)
   });
 
-  // Prefer activeAgent.resolvedProvider (Phase B) and fall back to
-  // provider.provider for safety during rollout — older runtimes that
-  // pre-date the activeAgent block still surface the legacy field.
-  const effectiveProviderName = status.data?.activeAgent?.resolvedProvider?.name
-    ?? status.data?.provider?.provider?.name;
-  const effectiveProviderModel = status.data?.activeAgent?.resolvedProvider?.model
-    ?? status.data?.provider?.provider?.model;
-  const catalogEntry = catalog.data?.find((c) => c.name === effectiveProviderName);
-  const displayName = catalogEntry?.displayName ?? effectiveProviderName;
+  // Settings card lists every provider in the catalog and marks the
+  // instance's active one. Read the instance-level provider (not the
+  // per-agent resolvedProvider) because the Settings UI controls the
+  // instance default, and showing an agent's pin here would mislead the
+  // user about which entry their "Set active" click changes.
+  const activeProviderName = status.data?.provider?.provider?.name;
+  const activeProviderModel = status.data?.provider?.provider?.model;
 
   return (
     <>
       <PageHeader title="Settings" description="Providers, browser, toolsets, integrations, devices" />
       <div className="flex-1 space-y-4 overflow-auto p-6">
-        <ProviderCard displayName={displayName} model={effectiveProviderModel} />
+        <ProviderCard
+          catalog={catalog.data ?? []}
+          activeProviderName={activeProviderName}
+          activeProviderModel={activeProviderModel}
+        />
 
         <TunnelCard />
 

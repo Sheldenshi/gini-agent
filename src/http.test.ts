@@ -493,7 +493,7 @@ describe("runtime api", () => {
       body: JSON.stringify({ input: "patch README.md :: Gini => Gini" })
     });
     const detail = await waitForTask(handler, config, task.id);
-    const approval = readState(config.instance).approvals.find((item) => item.taskId === task.id);
+    const approval = readState(config.instance).authorizations.find((item) => item.taskId === task.id);
 
     expect(detail.task.status).toBe("waiting_approval");
     expect(approval?.action).toBe("file.patch");
@@ -593,9 +593,9 @@ describe("runtime api", () => {
     const detail = await waitForTask(handler, config, submitted.id);
     expect(detail.task.status).toBe("waiting_approval");
 
-    const approval = readState(config.instance).approvals.find((item) => item.taskId === submitted.id);
+    const approval = readState(config.instance).authorizations.find((item) => item.taskId === submitted.id);
     expect(approval).toBeDefined();
-    await call(handler, config, `/api/approvals/${approval!.id}/approve`, { method: "POST" });
+    await call(handler, config, `/api/authorizations/${approval!.id}/approve`, { method: "POST" });
 
     const finalDetail = await waitForTask(handler, config, submitted.id);
     expect(finalDetail.task.status).toBe("completed");
@@ -768,18 +768,17 @@ describe("runtime api", () => {
     expect(ids).toContain("codex");
   });
 
-  test("POST /api/approvals/<id>/connect creates a connector and resolves the approval on probe success", async () => {
-    const config = testConfig("approvals-connect-happy");
+  test("POST /api/setup-requests/<id>/complete creates a connector and resolves the setup request on probe success", async () => {
+    const config = testConfig("setup-requests-complete-happy");
     const handler = createHandler(config);
-    // Stage a connector.request approval row directly. Demo provider has no
-    // probe, so checkConnector falls back to presence-only ⇒ healthy without
-    // any network mocking.
-    const { createApproval } = await import("./state");
+    // Stage a connector.request setup-request row directly. Demo provider has
+    // no probe, so checkConnector falls back to presence-only => healthy
+    // without any network mocking.
+    const { createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "connector.request",
         target: "demo",
-        risk: "low",
         reason: "test connect",
         payload: {
           provider: "demo",
@@ -792,7 +791,7 @@ describe("runtime api", () => {
       })
     );
 
-    const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
       method: "POST",
       body: JSON.stringify({ secrets: {}, scopes: [] })
     });
@@ -801,20 +800,19 @@ describe("runtime api", () => {
     expect(response.connector.health).toBe("healthy");
 
     const state = readState(config.instance);
-    const resolved = state.approvals.find((a) => a.id === approval.id);
-    expect(resolved?.status).toBe("approved");
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("completed");
     expect(state.connectors.some((c) => c.provider === "demo" && c.health === "healthy")).toBe(true);
   });
 
-  test("POST /api/approvals/<id>/connect returns ok:false and leaves the approval pending on probe failure", async () => {
-    const config = testConfig("approvals-connect-probe-fail");
+  test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
+    const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createSetupRequest } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         action: "connector.request",
         target: "linear",
-        risk: "low",
         reason: "fetch issues",
         payload: {
           provider: "linear",
@@ -833,7 +831,7 @@ describe("runtime api", () => {
       headers: { "content-type": "application/json" }
     })) as unknown as typeof fetch;
     try {
-      const response = await call(handler, config, `/api/approvals/${approval.id}/connect`, {
+      const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
         method: "POST",
         body: JSON.stringify({ secrets: { token: "not-a-real-token" } })
       });
@@ -843,16 +841,16 @@ describe("runtime api", () => {
       globalThis.fetch = originalFetch;
     }
     const state = readState(config.instance);
-    const after = state.approvals.find((a) => a.id === approval.id);
+    const after = state.setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect rejects approvals whose action is not connector.request", async () => {
-    const config = testConfig("approvals-connect-wrong-action");
+  test("POST /api/setup-requests/<id>/complete 404s for an authorization id", async () => {
+    const config = testConfig("setup-requests-complete-wrong-collection");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createAuthorization } = await import("./state");
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createAuthorization(state, {
         action: "file.write",
         target: "/tmp/x",
         risk: "high",
@@ -863,67 +861,287 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       { method: "POST", body: JSON.stringify({ secrets: {} }) },
       config.token
     );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("does not take a /connect submission");
+    // Authorization ids never appear in the setupRequests collection, so
+    // /complete returns 404 — the two endpoint families are independent.
+    expect(response.status).toBe(404);
   });
 
-  test("POST /api/approvals/<id>/approve refuses browser.fill_secret action", async () => {
-    // The generic /approve route would flip status=approved and trigger
-    // runApprovedAction's browser.fill_secret branch, which synthesizes a
-    // "fields filled" tool result for the agent even though no DOM fill
-    // ever happened (the side effect lives inside /connect's per-slot
-    // loop). Refuse early so the only resolution path for fill_secret is
-    // /connect with values.
-    const config = testConfig("approve-refuses-fill-secret");
+  test("POST /api/setup-requests/<id>/complete creates a messaging bridge and resolves the setup request", async () => {
+    // Happy-path pin for the chat-side Add Telegram flow. The card's
+    // Submit button POSTs the name + bot token under `secrets`; the
+    // gateway routes them into addMessagingBridge (the same code path
+    // the CLI and the settings page already call) and resolves the
+    // setup request so the chat-task loop can resume.
+    const config = testConfig("setup-complete-bridge-happy");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
-    const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
-        action: "browser.fill_secret",
-        target: "https://example.com/login#@e1,@e2",
-        risk: "high",
-        reason: "Sign in to the test site",
-        payload: {
-          slots: [
-            { name: "username", locator: "@e1", label: "Username", kind: "text" },
-            { name: "password", locator: "@e2", label: "Password", kind: "password" }
-          ],
-          reason: "Sign in",
-          toolCallId: "call_fill"
-        }
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "chat-test-bridge", toolCallId: "call_bridge_happy" }
       })
     );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "chat-test-bridge", botToken: "1234:ABCDEFGHIJKLMNOPQR" } })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.bridge?.name).toBe("chat-test-bridge");
+    expect(response.bridge?.kind).toBe("telegram");
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === setup.id);
+    expect(resolved?.status).toBe("completed");
+    const bridge = state.messagingBridges.find((b) => b.name === "chat-test-bridge");
+    expect(bridge).toBeDefined();
+    expect(bridge?.kind).toBe("telegram");
+
+    // Audit-row traceability pin: the chat-card create writes a
+    // dedicated audit row with the originating setup-request id AND the
+    // resulting bridge.id so operators can reconstruct
+    // "setup X via chat-card → bridge Y" from the activity feed.
+    // Without this row the chat path is indistinguishable from the
+    // CLI / settings dialog in the audit log (both write the same
+    // generic messaging.configured row via createMessagingBridgeRecord).
+    const chatAddRow = state.audit.find(
+      (e) => e.action === "messaging.add_bridge" && e.approvalId === setup.id
+    );
+    expect(chatAddRow).toBeDefined();
+    expect(chatAddRow?.target).toBe(bridge?.id);
+    expect((chatAddRow?.evidence as { kind?: string } | undefined)?.kind).toBe("telegram");
+    expect((chatAddRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("chat-test-bridge");
+
+    // Durable outcome pin: the /complete handler writes
+    // setup.connectOutcome so a post-reload render of the resolved
+    // card reads the truthful past-tense summary. Without this, the
+    // React component's sticky state evaporates on reload and the
+    // card would fall back to "Bridge added." even when the side
+    // effect actually failed.
+    expect(resolved?.connectOutcome?.ok).toBe(true);
+    expect(resolved?.connectOutcome?.message).toContain("chat-test-bridge");
+  });
+
+  test("POST /api/setup-requests/<id>/complete refuses messaging.add_bridge that was already cancelled, and creates no bridge", async () => {
+    // Race-safety pin: the messaging.add_bridge branch must resolve the
+    // setup request BEFORE addMessagingBridge so a concurrent /cancel
+    // (or cancel cascade) cannot leave an orphan bridge + encrypted
+    // secret on disk after the user has already abandoned the prompt.
+    // Mirrors the resolve-first contract in
+    // src/execution/browser-fill-secrets.ts. We simulate the race by
+    // pre-cancelling the setup request and then hitting /complete — the
+    // handler must short-circuit at the "already !pending" guard,
+    // return 410, and never touch addMessagingBridge.
+    const config = testConfig("setup-complete-bridge-cancel-race");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "race-bridge", toolCallId: "call_bridge_race" }
+      })
+    );
+    // Pre-cancel the setup request as if a concurrent operator had
+    // clicked Cancel between the user's typing and the Submit landing
+    // on the server.
+    await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+    const beforeBridges = readState(config.instance).messagingBridges.length;
+
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/approve`,
-      { method: "POST" },
+      `/api/setup-requests/${setup.id}/complete`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { name: "race-bridge", botToken: "1234:ABCDEFGHIJKL" } })
+      },
       config.token
     );
-    expect(response.status).toBe(400);
-    const body = await response.json();
-    expect(body.error).toContain("/connect");
-    expect(body.error).toContain("not /approve");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    // 410 Gone — the resolution-before-creation contract is upheld by
+    // the outer "already !pending" guard. The load-bearing invariant
+    // is the absence of any bridge / orphan secret on the other side.
+    expect(response.status).toBe(410);
+
+    const after = readState(config.instance);
+    expect(after.messagingBridges.length).toBe(beforeBridges);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete rejects malformed messaging.add_bridge tokens BEFORE resolving the setup request", async () => {
+    // Token-format pre-check: addMessagingBridge runs
+    // assertHeaderSafeToken internally, and the chat card disappears
+    // once the setup request flips out of pending state. Without
+    // pre-resolve token validation, a malformed token would burn the
+    // request and the user could not retype from the same card.
+    // The bounded module calls assertHeaderSafeToken BEFORE resolving;
+    // this test pins that ordering by submitting a token with a control
+    // character and asserting the request stays pending.
+    const config = testConfig("setup-complete-bridge-bad-token-stays-pending");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "bad-token", toolCallId: "call_bridge_bad_token" }
+      })
+    );
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      // Control character in the token — assertHeaderSafeToken
+      // refuses any byte outside printable ASCII [\x21-\x7E].
+      body: JSON.stringify({ secrets: { name: "bad-token", botToken: "1234:abc\ndef" } })
+    });
+    expect(response.ok).toBe(false);
+    expect(typeof response.message).toBe("string");
+
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    expect(after.messagingBridges.length).toBe(0);
+  });
+
+  test("POST /api/setup-requests/<id>/complete returns ok:false when messaging.add_bridge is missing a name or token", async () => {
+    // The chat card disables Submit until both inputs are non-empty,
+    // but a CLI/API caller could POST a partial body. The gateway
+    // mirrors the same readiness gate as the card so a partial
+    // submission can't silently create a half-configured bridge.
+    const config = testConfig("setup-complete-bridge-missing");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "missing-fields", toolCallId: "call_bridge_missing" }
+      })
+    );
+    const missingToken = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "missing-fields" } })
+    });
+    expect(missingToken.ok).toBe(false);
+    expect(missingToken.message).toContain("Bot token");
+
+    const missingName = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { botToken: "1234:ABCDEFGHIJ" } })
+    });
+    expect(missingName.ok).toBe(false);
+    expect(missingName.message).toContain("name");
+
+    // Both rejections must leave the setup request pending — otherwise
+    // the chat card would flip out of pending state and the user
+    // couldn't retry.
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect refuses partial browser.fill_secret submissions", async () => {
-    // fillReady in BlockApprovalRequested.tsx only disables the web
+  test("POST /api/setup-requests/<id>/complete refuses a code-less messaging.approve_pairing approve and keeps the request pending", async () => {
+    // allowChat's pending-row presence check is gated on `expectedCode`
+    // being defined (the legacy CLI's "operator knows what they're
+    // doing" trust model). If a chat-card pairing payload arrives
+    // without verificationCode (group chat: groups intentionally never
+    // mint a code, or a stale request whose pending row was cleared and
+    // recreated), a no-code allowChat call would bypass the pending-row
+    // check and enroll a chat that is no longer pending. Pin that
+    // messaging-pairing-connect refuses the approve branch up-front when
+    // verificationCode is missing.
+    const config = testConfig("setup-complete-pairing-codeless-refuses");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.approve_pairing",
+        target: "bridge_codeless:7",
+        reason: "Confirm pairing",
+        // Deliberately omit verificationCode — the chat card normally
+        // carries one for private chats, but a stale or group-chat
+        // payload would not.
+        payload: { bridgeId: "bridge_codeless", chatId: 7, toolCallId: "call_codeless" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(false);
+    expect(response.message).toContain("code-less");
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete removes a messaging bridge through the setup-request flow", async () => {
+    // Happy path for the chat-side Remove bridge card. The /complete
+    // handler delegates to runMessagingRemoveConnect, which resolves
+    // the setup request atomically then calls removeMessagingBridge.
+    const config = testConfig("setup-complete-remove-bridge-happy");
+    const handler = createHandler(config);
+
+    // Create a real bridge via the existing endpoint so its
+    // encrypted secret + state record exist before we try to remove it.
+    const created = await call(handler, config, `/api/messaging`, {
+      method: "POST",
+      body: JSON.stringify({ name: "remove-me", kind: "telegram", botToken: "1234:ABCDEFGHIJKLMNOPQR" })
+    });
+    expect(created.id).toBeString();
+
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.remove_bridge",
+        target: created.id,
+        reason: "Remove bridge",
+        payload: { bridgeId: created.id, bridgeName: "remove-me", kind: "telegram", toolCallId: "call_remove" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+    expect(response.removed).toBe(true);
+    expect(response.bridgeId).toBe(created.id);
+
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("completed");
+    expect(after.messagingBridges.find((b) => b.id === created.id)).toBeUndefined();
+
+    // Chat-card lineage audit row pin: the chat-card remove path
+    // writes a dedicated audit row carrying the setup-request id +
+    // bridgeId, so a chat-card remove is distinguishable from a CLI /
+    // settings remove in the activity feed.
+    const chatRemoveRow = after.audit.find(
+      (e) => e.action === "messaging.remove_bridge" && e.approvalId === setup.id
+    );
+    expect(chatRemoveRow).toBeDefined();
+    expect(chatRemoveRow?.target).toBe(created.id);
+    expect((chatRemoveRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("remove-me");
+  });
+
+  test("POST /api/setup-requests/<id>/complete refuses partial browser.fill_secret submissions", async () => {
+    // fillReady in BlockSetupRequested.tsx only disables the web
     // Submit button; CLI / mobile / direct API clients can still POST a
     // partial body. The gateway must enforce that every declared slot
     // has a non-empty value before any DOM fill happens — otherwise
-    // /connect would resolve with some slots silently unfilled and the
+    // /complete would resolve with some slots silently unfilled and the
     // agent would be told (in agent.ts:runApprovedAction) that every
     // declared slot was filled.
-    const config = testConfig("connect-rejects-partial-fill-secret");
+    const config = testConfig("complete-rejects-partial-fill-secret");
     const handler = createHandler(config);
-    const { createApproval } = await import("./state");
+    const { createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const { createTask, upsertTask } = require("./state") as typeof import("./state");
       const task = createTask(state.instance, "partial-test");
@@ -934,11 +1152,10 @@ describe("runtime api", () => {
     // doesn't fire before the missing-slot check; this test is about
     // partial submission, not origin binding.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -962,7 +1179,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: "tomsmith" } })
@@ -974,11 +1191,11 @@ describe("runtime api", () => {
     expect(body.ok).toBe(false);
     expect(body.message).toContain("password");
     expect(body.message).toContain("Missing");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect: submitted fill_secret values never appear in state.json, trace JSONL, or runtime.jsonl", async () => {
+  test("POST /api/setup-requests/<id>/complete: submitted fill_secret values never appear in state.json, trace JSONL, or runtime.jsonl", async () => {
     // End-to-end absence pin for the ADR's secret-handling guarantee:
     // submitted credential values must flow request-scope only and
     // never reach any persisted artifact. Without this test the only
@@ -989,7 +1206,7 @@ describe("runtime api", () => {
     // the value.
     const config = testConfig("fill-secret-no-state-leak");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "fill secret leak guard");
       upsertTask(state, task);
@@ -1003,11 +1220,10 @@ describe("runtime api", () => {
     // never reach state/trace/log even when the runtime tries to
     // record what happened.
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in to the test site",
         payload: {
           slots: [
@@ -1037,7 +1253,7 @@ describe("runtime api", () => {
     await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: USERNAME_MARKER, password: PASSWORD_MARKER } })
@@ -1091,7 +1307,7 @@ describe("runtime api", () => {
     expect(row.target ?? "").not.toContain(PASSWORD_MARKER);
   });
 
-  test("POST /api/approvals/<id>/connect refuses fill_secret when page navigated away from approved origin", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses fill_secret when page navigated away from approved origin", async () => {
     // The approval.target encodes the origin the user consented
     // to fill into (protocol+host+port; pathname is stripped by
     // sanitizeUrlForAuditTarget). If the page has navigated to a
@@ -1103,20 +1319,19 @@ describe("runtime api", () => {
     // peekCurrentBrowserUrl returns undefined,
     // which the handler treats as "no live page to fill" — same
     // refusal path.
-    const config = testConfig("connect-fill-secret-origin-mismatch");
+    const config = testConfig("complete-fill-secret-origin-mismatch");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1137,7 +1352,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
@@ -1148,7 +1363,7 @@ describe("runtime api", () => {
     const body = await response.json();
     expect(body.ok).toBe(false);
     // The browser session was never opened, so peekCurrentBrowserUrl
-    // returns undefined and the /connect handler takes the
+    // returns undefined and the /complete handler takes the
     // "session expired" branch (distinct from the "page navigated"
     // branch where a live session exists but its URL differs from
     // approvedUrl). Without that split the operator would see
@@ -1156,11 +1371,11 @@ describe("runtime api", () => {
     expect(body.message).toContain("Browser session expired");
     expect(body.message).toContain("https://example.com");
     // Approval stayed pending — no resolveApproval call ran.
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect refuses fill_secret slot values shorter than 4 chars", async () => {
+  test("POST /api/setup-requests/<id>/complete refuses fill_secret slot values shorter than 4 chars", async () => {
     // The snapshot post-redactor uses literal substring replacement;
     // single-character (and other very short) values would shred
     // structural tokens like [@e1] in snapshot text. The 4-char
@@ -1168,20 +1383,19 @@ describe("runtime api", () => {
     // redactor safe, and /connect refuses values below that floor
     // so the registry-skip-for-short-values doesn't leak the
     // value via subsequent unredacted tool results.
-    const config = testConfig("connect-fill-secret-too-short");
+    const config = testConfig("complete-fill-secret-too-short");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "short value test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1201,7 +1415,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { pin: "12" } })
@@ -1213,30 +1427,29 @@ describe("runtime api", () => {
     expect(body.ok).toBe(false);
     expect(body.message).toContain("too short");
     expect(body.message).toContain("pin");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
-  test("POST /api/approvals/<id>/connect: distinct 409 when live session exists but page navigated to a different origin", async () => {
+  test("POST /api/setup-requests/<id>/complete: distinct 409 when live session exists but page navigated to a different origin", async () => {
     // Pin the OTHER 409 branch: a live session whose current URL no
     // longer matches the approved origin. This is the genuine
     // page-navigated case (agent click, JS redirect, phishing
     // redirect), distinct from the session-expired idle-sweep case
     // covered by the previous test.
-    const config = testConfig("connect-fill-secret-real-navigation");
+    const config = testConfig("complete-fill-secret-real-navigation");
     const handler = createHandler(config);
-    const { createTask, upsertTask, createApproval } = await import("./state");
+    const { createTask, upsertTask, createSetupRequest } = await import("./state");
     const taskId = await mutateState(config.instance, (state) => {
       const task = createTask(state.instance, "real navigation test");
       upsertTask(state, task);
       return task.id;
     });
     const approval = await mutateState(config.instance, (state) =>
-      createApproval(state, {
+      createSetupRequest(state, {
         taskId,
         action: "browser.fill_secret",
         target: "https://example.com",
-        risk: "high",
         reason: "Sign in",
         payload: {
           slots: [
@@ -1260,7 +1473,7 @@ describe("runtime api", () => {
     const response = await rawCall(
       handler,
       config,
-      `/api/approvals/${approval.id}/connect`,
+      `/api/setup-requests/${approval.id}/complete`,
       {
         method: "POST",
         body: JSON.stringify({ secrets: { username: "tomsmith", password: "SuperSecretPassword!" } })
@@ -1273,7 +1486,7 @@ describe("runtime api", () => {
     expect(body.message).toContain("Page navigated");
     expect(body.message).toContain("https://example.com");
     expect(body.message).toContain("https://evil.example.org");
-    const after = readState(config.instance).approvals.find((a) => a.id === approval.id);
+    const after = readState(config.instance).setupRequests.find((a) => a.id === approval.id);
     expect(after?.status).toBe("pending");
   });
 
@@ -1564,13 +1777,13 @@ describe("runtime api", () => {
     // created under the originating task, so it must carry the default
     // agent's id regardless of whoever is active now.
     await call(handler, config, `/api/agents/${second.id}/use`, { method: "POST" });
-    const approvals = readState(config.instance).approvals.filter((a) => a.taskId === task.id);
+    const approvals = readState(config.instance).authorizations.filter((a) => a.taskId === task.id);
     expect(approvals.length).toBeGreaterThan(0);
     expect(approvals.every((a) => a.agentId === defaultAgentId)).toBe(true);
-    const scopedDefault = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(defaultAgentId)}`);
+    const scopedDefault = await call(handler, config, `/api/authorizations?agentId=${encodeURIComponent(defaultAgentId)}`);
     expect(scopedDefault.every((a: { agentId?: string }) => a.agentId === defaultAgentId)).toBe(true);
     expect(scopedDefault.some((a: { taskId?: string }) => a.taskId === task.id)).toBe(true);
-    const scopedScout = await call(handler, config, `/api/approvals?agentId=${encodeURIComponent(second.id)}`);
+    const scopedScout = await call(handler, config, `/api/authorizations?agentId=${encodeURIComponent(second.id)}`);
     expect(scopedScout.some((a: { taskId?: string }) => a.taskId === task.id)).toBe(false);
   });
 
@@ -2337,6 +2550,123 @@ describe("runtime api", () => {
     expect(idLineMatch?.[1]).not.toContain(":");
   });
 
+  test("GET /api/chat/:id/stream emits chat_session frame on initial connect", async () => {
+    // The mobile client reads the chat-detail header title from the
+    // session record this frame carries. Without an initial emit,
+    // there's a window where the header would render "Chat" / the
+    // first-message fallback even though the gateway already knows
+    // the canonical title (e.g. on reconnect to an already-renamed
+    // session).
+    const config = testConfig("chat-stream-session-initial");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "before-rename" })
+    });
+    await call(handler, config, `/api/chat/${session.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: "Renamed in the lobby" })
+    });
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    if (reader) {
+      const deadline = Date.now() + 500;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_session");
+    expect(buffer).toContain("Renamed in the lobby");
+  });
+
+  test("GET /api/chat/:id/stream pushes chat_session frame on rename", async () => {
+    // The auto-rename path (chat-task → autoRenameChatAfterTurn) fires
+    // after task completion and the mobile chat-detail header must
+    // pick up the new title without polling. Stand-in for the auto
+    // case by hitting /rename explicitly — both paths route through
+    // renameChat → publishChatSession.
+    const config = testConfig("chat-stream-session-rename");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "" })
+    });
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/stream`,
+      {},
+      config.token
+    );
+    expect(response.status).toBe(200);
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+
+    // Drain the initial chat_session frame (the one emitted on connect)
+    // so the assertion below targets the rename-driven frame.
+    let buffer = "";
+    if (reader) {
+      const initialDeadline = Date.now() + 500;
+      while (Date.now() < initialDeadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("event: chat_session")) break;
+      }
+      // Clear the buffer so we can detect the second emit independently.
+      buffer = "";
+
+      // Trigger the publish from another concurrent caller, then drain.
+      await call(handler, config, `/api/chat/${session.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title: "Streamed rename" })
+      });
+
+      const deadline = Date.now() + 1000;
+      while (Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise<{ done: boolean; value: undefined }>((resolve) =>
+            setTimeout(() => resolve({ done: false, value: undefined }), 50)
+          )
+        ]);
+        if (done) break;
+        if (value) buffer += decoder.decode(value);
+        if (buffer.includes("Streamed rename")) break;
+      }
+      await reader.cancel();
+    }
+    expect(buffer).toContain("event: chat_session");
+    expect(buffer).toContain("Streamed rename");
+  });
+
   test("GET /api/chat/:id/stream returns 404 for unknown sessions", async () => {
     const config = testConfig("chat-blocks-stream-404");
     const handler = createHandler(config);
@@ -2478,7 +2808,7 @@ describe("runtime api", () => {
       expect(dump.userProfile.budget.overCap).toBe(false);
       // INSTRUCTIONS.md is materialized by scaffold; the route returns
       // its content trimmed.
-      expect(dump.instructions.content).toMatch(/local-first personal agent/);
+      expect(dump.instructions.content).toMatch(/You are Gini, a personal agent/);
     });
 
     test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
@@ -2939,6 +3269,149 @@ describe("runtime api", () => {
       });
       expect(badgeA.unread).toBe(0);
       expect(badgeB.unread).toBe(1);
+    });
+
+    test("DELETE /api/chat/:id/read marks just the latest assistant turn unread", async () => {
+      const config = testConfig("chat-unread-swipe");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "swipe" })
+      });
+      // Realistic chat: a few user messages culminating in an assistant
+      // reply. After Mark Unread the badge should show 1 (just the
+      // assistant turn), not 4 (every visible block).
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "still hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "ok last one" });
+      const assistant = insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: session.id,
+        text: "hello back",
+        streaming: false
+      });
+
+      // Both devices catch up first so the baseline badge is 0.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerA, body: JSON.stringify({ lastReadBlockId: assistant.id })
+      });
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerB, body: JSON.stringify({ lastReadBlockId: assistant.id })
+      });
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(0);
+
+      // iPhone A swipes "Mark unread". The badge surfaces just the
+      // latest assistant turn (1), not the full session.
+      const cleared = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(cleared.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+      // iPhone B is unaffected (still caught up).
+      expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
+
+      // Idempotent — replaying lands on the same cursor; still 1.
+      const second = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(second.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "DELETE", headers: headerA },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${session.id}/read`,
+        { method: "DELETE" },
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+    });
+
+    test("GET /api/unread returns per-session unread counts scoped to the device", async () => {
+      const config = testConfig("chat-unread-counts");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionA.id, text: "1" });
+      const a2 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "2"
+      });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionB.id, text: "3" });
+
+      // Fresh device A — both sessions show their full count.
+      const initial = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(initial.counts[sessionA.id]).toBe(2);
+      expect(initial.counts[sessionB.id]).toBe(1);
+
+      // A catches up on session A — it drops out of the map for A.
+      await call(handler, config, `/api/chat/${sessionA.id}/read`, {
+        method: "POST",
+        headers: headerA,
+        body: JSON.stringify({ lastReadBlockId: a2.id })
+      });
+      const after = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(after.counts[sessionA.id]).toBeUndefined();
+      expect(after.counts[sessionB.id]).toBe(1);
+
+      // Device B is unaffected.
+      const bView = await call(handler, config, "/api/unread", { headers: headerB });
+      expect(bView.counts[sessionA.id]).toBe(2);
+      expect(bView.counts[sessionB.id]).toBe(1);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        "/api/unread",
+        {},
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+
+      // Unauth: 401.
+      const noAuth = await rawCall(handler, config, "/api/unread");
+      expect(noAuth.status).toBe(401);
     });
 
     test("read + badge endpoints require authentication", async () => {

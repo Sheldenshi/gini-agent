@@ -10,7 +10,7 @@ metadata:
 
 # Gini Agent
 
-Gini is a local-first personal agent. The gateway owns durable state and
+Gini is a personal agent. The gateway owns durable state and
 tool execution. **Gini itself operates through `/api/*` and its registered
 tool catalog.** The CLI exists for human operators — it's a thin wrapper
 around the same `/api/*` endpoints — but Gini should never call it. The
@@ -413,7 +413,7 @@ treats each `high`-risk call: `strict | auto | yolo`. Set via
 `PATCH /api/settings/auto-approve`.
 
 - **strict** — the side effect blocks until a human approves the row
-  via `POST /api/approvals/<id>/approve` (or denies it).
+  via `POST /api/authorizations/<id>/approve` (or denies it).
 - **auto** — the approval row is created with `status: "pending"`,
   then the runtime auto-resolves it (`status: "approved"`) and runs
   the side effect without waiting for a human. The audit trail is
@@ -429,9 +429,9 @@ treats each `high`-risk call: `strict | auto | yolo`. Set via
   that risk profile.
 
 ```http
-GET  /api/approvals
-POST /api/approvals/<id>/approve
-POST /api/approvals/<id>/deny
+GET  /api/authorizations
+POST /api/authorizations/<id>/approve
+POST /api/authorizations/<id>/deny
 ```
 
 Human-operator CLI mirror:
@@ -473,8 +473,8 @@ recommends managed mode. Prefer `POST /api/browser/connect` with an empty
 body (managed Chrome window) over passing a `cdpUrl`.
 
 **User says a high-risk action is "stuck"** — it is sitting in the
-approval queue. Fetch `GET /api/approvals` to see pending items, then
-`POST /api/approvals/<id>/approve` or `/deny`. (Human-operator CLI mirror:
+approval queue. Fetch `GET /api/authorizations` to see pending items, then
+`POST /api/authorizations/<id>/approve` or `/deny`. (Human-operator CLI mirror:
 `gini approval list`, then `approve <id>` or `deny <id>`.) The agent
 should never refuse a high-risk action up front — propose it, let it
 land in the queue, and wait for the user's decision.

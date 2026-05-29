@@ -4,7 +4,7 @@ These instructions apply to the whole repository unless a nested `AGENTS.md` ove
 
 ## Shape
 
-Gini is a local-first Bun TypeScript agent runtime. The gateway owns durable state and execution; CLI, Next.js, future mobile, MCP, messaging, and scripts are clients of the same `/api/*` contract.
+Gini is a Bun TypeScript personal agent runtime. The gateway owns durable state and execution; CLI, Next.js, future mobile, MCP, messaging, and scripts are clients of the same `/api/*` contract.
 
 Start with `README.md` for the docs index. Keep `docs/whitepaper.md`, `docs/architecture-overview.md`, focused docs, and `docs/adr/` in sync with architecture changes.
 
@@ -71,7 +71,13 @@ For docs-only changes, at minimum sweep for stale links and terminology:
 rg -n "v0|v1|v2|v3|lane|v1-readiness|single HTML|src/state\\.ts|src/api" README.md docs
 ```
 
-After a UI-related change or new feature, exercise it in a real browser before declaring the task done. Drive the affected screen end-to-end and confirm the change actually renders and behaves as intended — typecheck and unit tests don't catch broken layouts, missing handlers, or regressed flows.
+After a UI-related change or new feature, exercise it end-to-end on every surface it touches before declaring the task done. Don't stop at typecheck — drive the affected screen and confirm the change actually renders and behaves as intended:
+
+- Web changes (`web/`): run the Next.js dev server and drive the screen in a browser (Playwright MCP is fine).
+- Mobile changes (`mobile/`): run it on the iOS simulator (`bun run mobile:ios`) AND in the RN Web target (`cd mobile && bun run web`). The web target lets Playwright MCP drive the actual UI; the iOS simulator is what catches native-only behavior (long-press selection, gesture handling, native text input, etc.).
+- Shared changes that affect both: verify on both.
+
+"It compiles" is not "it works." Native RN behavior in particular often differs from RN Web (e.g. `selectable` on `<Text>` is a no-op on web because browser text is selectable by default), so a web-only check can pass while the native build is still broken.
 
 ## Logs
 

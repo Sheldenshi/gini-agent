@@ -29,3 +29,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Tunnel + Mobile Access Via Cloudflare Quick Tunnel](tunnel-and-mobile-access.md)
 - [Mobile Push Notifications (APNs + NSE + Inline Actions)](mobile-push-notifications.md)
 - [Codex Session-Rotation Retry, UA Mirroring, And auth.json Race Handling](codex-session-rotation-retry.md)
+- [Authorization vs SetupRequest](authorization-vs-setup-request.md)

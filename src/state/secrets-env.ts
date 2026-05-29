@@ -65,6 +65,24 @@ export function writeKeyToSecretsEnv(name: string, value: string): void {
   try { chmodSync(path, 0o600); } catch { /* best-effort tightening */ }
 }
 
+// Drop a `KEY=...` line from ~/.gini/secrets.env, matching both the
+// `export KEY=...` and bare `KEY=...` forms the writer emits. No-op
+// when the file is absent or doesn't contain the name. Returns true
+// when a line was actually removed so callers can decide whether to
+// log / nudge a plist refresh. Mode stays 0600 via the same chmod the
+// writer enforces.
+export function removeKeyFromSecretsEnv(name: string): boolean {
+  const path = secretsEnvPath();
+  if (!existsSync(path)) return false;
+  const existing = readFileSync(path, "utf8");
+  const pattern = new RegExp(`^\\s*(?:export\\s+)?${name}=.*\\r?\\n?`, "m");
+  if (!pattern.test(existing)) return false;
+  const next = existing.replace(pattern, "");
+  writeFileSync(path, next, { mode: 0o600 });
+  try { chmodSync(path, 0o600); } catch { /* best-effort */ }
+  return true;
+}
+
 // Best-effort permission-tightening for the existing file. No-op when the
 // file doesn't exist. Kept as a separate helper so callers that just want
 // to enforce mode 0600 (e.g. before reading secrets) don't have to write

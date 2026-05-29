@@ -100,6 +100,36 @@ via the deep link instead of pasting `config.json`'s token.
   `POST /api/chat/:id/tasks/:taskId/sync` if no paired assistant block
   materialised on its own.
 
+## Fork & re-skin
+
+Gini is open source — the iOS app is yours to fork, rebrand, and ship
+under your own Apple developer account. Two files to edit.
+
+**1. `mobile/app.json`:**
+
+| Path                                                                             | Replace with                                  |
+|----------------------------------------------------------------------------------|-----------------------------------------------|
+| `expo.name`                                                                      | your app's display name                       |
+| `expo.slug`                                                                      | your EAS slug (lowercase, hyphenated)         |
+| `expo.scheme`                                                                    | your deep-link scheme (e.g. `myagent`)        |
+| `expo.ios.bundleIdentifier`                                                      | your reverse-DNS bundle id                    |
+| `expo.android.package`                                                           | same as `bundleIdentifier`                    |
+| `expo.owner`                                                                     | your Expo account or org (`expo whoami`)      |
+| `expo.extra.eas.projectId`                                                       | from `eas init` in `mobile/`                  |
+| `expo.updates.url`                                                               | `https://u.expo.dev/<your-eas-project-id>`    |
+| `expo.extra.eas.build.experimental.ios.appExtensions[0].bundleIdentifier`        | `<your-bundle-id>.notificationservice`        |
+| `expo.plugins[…with-approval-notification-service].appleTeamId`                  | developer.apple.com → Membership → Team ID    |
+
+**2. `mobile/eas.json` submit profile:** replace `appleTeamId` and
+`ascAppId` under `submit.production.ios` with your own before running
+`eas submit`.
+
+Then regenerate the native project:
+
+```bash
+cd mobile && bunx expo prebuild --platform ios --clean
+```
+
 ## iOS dev client + Notification Service Extension
 
 Lock-screen Approve / Deny buttons on approval pushes are implemented
@@ -168,6 +198,44 @@ action but our JS never runs. The user must open the app and approve
 from there. The approval remains pending in the runtime until acted
 on — the runtime does not have a retry loop that re-emits approval
 requests.
+
+## OTA updates
+
+JS-only changes ship over the air via EAS Update. Native config changes
+(`app.json` native fields, `eas.json`, `plugins/`, `ios-extensions/`)
+still require a fresh TestFlight build. The
+`.github/workflows/mobile-update.yml` workflow publishes an OTA on every
+push to `main` that touches `mobile/**` without changing native config.
+
+The runtime version policy in `mobile/app.json` is `"appVersion"`, so the
+`runtimeVersion` an update is published against equals the `version`
+field at publish time. A TestFlight build is locked to the
+`runtimeVersion` it was compiled with — bumping `mobile/app.json`
+`version` cuts a fresh runtime boundary that older builds will never
+consume.
+
+For an OTA to actually reach a device, the EAS channel that the build
+listens on must be linked to a publish branch. The `production` build
+profile in `eas.json` ships on channel `production`, which must point at
+the `production` update branch:
+
+```bash
+eas channel:view production --json
+eas channel:edit production --branch production   # one-time, if missing
+```
+
+If the channel has no branch mapping, every manifest request returns
+HTTP 400 (`no branches linked to channel`) and the app silently falls
+back to the embedded bundle — even though the EAS dashboard shows the
+update as published.
+
+To pick up an OTA on a TestFlight build, fully force-quit twice:
+
+1. Cold start #1 — embedded bundle runs; new bundle downloads in the
+   background.
+2. Cold start #2 — new bundle is applied.
+
+Backgrounding the app is not enough; iOS keeps the JS context alive.
 
 ## Known limitations (v1)
 

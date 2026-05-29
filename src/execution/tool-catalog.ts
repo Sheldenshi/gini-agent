@@ -545,6 +545,185 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Messaging-bridge-request affordance. Surfaces the same inline form
+    // card used by `request_connector` / `browser_fill_secrets`, but for
+    // adding a Telegram bridge. The agent calls this when the user asks
+    // something like "add a telegram bot" or "wire up telegram"; the
+    // user sees a card with a name input and a bot-token input
+    // (password-masked) inside the chat. On Submit, the gateway
+    // forwards the values to addMessagingBridge — same code path the
+    // CLI (`gini messaging add`) and the settings page already go
+    // through. Bot token never enters the model context, the audit row
+    // evidence, or the chat transcript.
+    //
+    // Discord is deliberately NOT advertised in the kind enum: a
+    // Discord bridge requires a list of channel IDs (deliveryTargets)
+    // that the current chat card doesn't collect, so the create would
+    // always fail at the /connect handler's deliveryTargets check.
+    // Discord still flows through the CLI and the settings dialog,
+    // both of which surface the channel-ID input. When the chat card
+    // grows a channel-IDs textarea, widen the enum here.
+    toolset: "messaging",
+    displayLabel: "Add messaging bridge",
+    type: "function",
+    function: {
+      name: "request_messaging_bridge",
+      description: "Ask the user to wire up a Telegram messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', or any other Telegram onboarding ask. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits. AFTER the bridge resolves successfully, the agent SHOULD typically chain `wait_for_messaging_pair` next so the user gets walked through the DM-the-bot → approve-the-pair handshake without context-switching — only skip the wait if the user explicitly asked to just provision the bridge without pairing right now. For Discord, point the user at the settings page (Add Discord button) because Discord bridges need a channel-ID list that this chat card does not collect.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: ["telegram"],
+            description: "Which bridge kind to add. Only 'telegram' is supported from chat today; for Discord, direct the user to the settings page."
+          },
+          suggestedName: {
+            type: "string",
+            description: "Optional default name for the bridge (e.g. 'my-telegram-bot'). The user can edit this in the card before submitting. Defaults to a kind-derived placeholder when omitted."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the form explaining what the bridge will do (e.g. 'Add a Telegram bot so I can DM you updates.'). One line."
+          }
+        },
+        required: ["kind"]
+      }
+    }
+  },
+  {
+    // Read-only inventory of messaging bridges. Always-on so the agent
+    // can answer "what bridges do I have?" or "is the telegram bot
+    // configured?" without needing the messaging toolset enabled. Same
+    // always-on rationale as request_messaging_bridge: meta-tools that
+    // surface UI / read state are always available; the
+    // surface-gateway send_message tool stays gated.
+    toolset: "messaging",
+    displayLabel: "List messaging bridges",
+    type: "function",
+    function: {
+      name: "list_messaging_bridges",
+      description: "List the messaging bridges configured on this Gini instance. Returns each bridge's id, name, kind (telegram | discord | demo), status (configured | error | disabled), and bot username when present. Useful before suggesting bridge changes ('do you already have telegram?'), before calling request_remove_messaging_bridge or request_messaging_pairing (so you can target the right bridge id), or whenever the user asks 'what bots are connected?'. Read-only and cheap — call it whenever you need fresh state.",
+      parameters: {
+        type: "object",
+        properties: {}
+      }
+    }
+  },
+  {
+    // Read-only inventory of a Telegram bridge's pending pairing
+    // requests + allowlist. Always-on for the same reason as
+    // list_messaging_bridges. Cheap; call before
+    // request_messaging_pairing so the operator card shows the
+    // current row.
+    toolset: "messaging",
+    displayLabel: "List messaging pairings",
+    type: "function",
+    function: {
+      name: "list_messaging_pairings",
+      description: "List the pending Telegram pairing requests AND the currently-allowed chats for a bridge. Returns an object with `allowedChatIds` (the chats already enrolled) and `recentDeniedChats` (each pending row's chatId, sender, chatType, lastAttemptAt). Call this when the user says 'any pending bots?' / 'who DM'd the bot?' / 'show pairings'; the result tells you whether to immediately call request_messaging_pairing to surface an approve card. Verification codes are NOT returned by this tool — the operator confirms them out-of-band against the bot's DM reply, and request_messaging_pairing reads the code server-side when minting the approval. Only telegram bridges have an allowlist; calling on a discord/demo bridge returns an error envelope.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id (e.g. 'bridge_abc123') or human name (e.g. 'my-telegram-bot') of the bridge to query. Get it from list_messaging_bridges first if you're not sure."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
+    // Approval-gated affordance for confirming or rejecting an
+    // inbound Telegram pairing request from chat. The agent calls
+    // this after list_messaging_pairings shows there's a pending
+    // entry the user has likely just DM'd the bot from; the chat
+    // card displays the sender + verification code + expiry so the
+    // operator can verify the code matches what the user reports
+    // before approving. Approve / Reject both go through /connect
+    // (the agent doesn't run the side effect directly).
+    toolset: "messaging",
+    displayLabel: "Wait for messaging pair",
+    type: "function",
+    function: {
+      name: "wait_for_messaging_pair",
+      description: "Block server-side until an inbound Telegram pairing request arrives on the named bridge, then automatically surface the messaging.approve_pairing confirmation card so the user can Approve / Reject inline. Use this RIGHT AFTER request_messaging_bridge succeeds: the agent should stay engaged with the user through the bridge add → user DMs bot → approve dance instead of returning control and asking the user to come back. The tool blocks for up to `timeoutSeconds` (default 600) checking for a fresh pending row every second; the moment one appears it mints the approval card and pauses the task on it. On Approve/Reject the chat-task loop resumes with the outcome string and the agent continues. On timeout, returns `{ok: false, error: 'timeout'}` so the agent can ask the user whether to keep waiting.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id or name to watch for inbound pairings. Same shape as list_messaging_pairings."
+          },
+          timeoutSeconds: {
+            type: "number",
+            description: "Max seconds to block waiting for an inbound pair. Default 600 (10 min — matches the verification code's TTL so a slow user can still complete pairing on the same code). The runtime clamps to [10, 1800]."
+          },
+          reason: {
+            type: "string",
+            description: "Optional user-visible text shown above the eventual approval card (e.g. 'Confirm the code I'm seeing matches what your bot replied with.'). One line."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
+    toolset: "messaging",
+    displayLabel: "Approve pairing request",
+    type: "function",
+    function: {
+      name: "request_messaging_pairing",
+      description: "Surface an Approve / Reject card in chat for a single pending Telegram pairing request. Use this when list_messaging_pairings reveals a pending row that the user is asking about (e.g. they just DM'd the bot from their phone and want to be enrolled). The card shows the sender, chat id, verification code, and expiry — the user clicks Approve only after confirming the code matches what their Telegram client received. Approve enrolls the chat on the allowlist and the bot greets the user; Reject clears the pending row without enrolling. Don't call this for pairing requests with expired codes — tell the user to DM the bot again to mint a fresh code.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id or name. Same shape list_messaging_pairings accepts."
+          },
+          chatId: {
+            type: "number",
+            description: "Telegram chat id from the pending row. Negative ids are valid (groups/supergroups), positive ids are direct DMs."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the card (e.g. 'Confirm this is you on Telegram before I enroll your chat.'). One line."
+          }
+        },
+        required: ["bridge", "chatId"]
+      }
+    }
+  },
+  {
+    // Approval-gated destructive affordance for tearing down a
+    // configured bridge from chat. Same passthrough-card pattern as
+    // the other request_ tools; the card surfaces a Remove
+    // confirmation with the bridge name. On Submit the runtime calls
+    // removeMessagingBridge — same path the CLI / settings page use.
+    toolset: "messaging",
+    displayLabel: "Remove messaging bridge",
+    type: "function",
+    function: {
+      name: "request_remove_messaging_bridge",
+      description: "Ask the user to confirm tearing down a messaging bridge from chat. The card shows the bridge's name + kind + an irreversibility warning ('deletes the bridge and its bot token; past messages stay in history'). Use this when the user says 'remove my telegram bot', 'delete the discord bridge', etc. List with list_messaging_bridges first if you don't already know the bridge id. The card requires explicit Remove confirmation; the user can Cancel to back out.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id (e.g. 'bridge_abc123') or human name (e.g. 'my-telegram-bot'). Resolves to the same record list_messaging_bridges returns."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the confirmation (e.g. 'Confirm you want to delete the my-telegram-bot bridge and its bot token.'). One line."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
     // Generic MCP tool invocation. The agent loop sees this as a single
     // tool entry; the dispatcher routes (server, tool, arguments) to the
     // matching McpServerRecord via src/integrations/mcp.ts. Each
@@ -1024,6 +1203,32 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // visible so the agent can always escalate to the user instead
     // of guessing a credential.
     if (tool.function.name === "browser_fill_secrets") return true;
+    // request_messaging_bridge is the in-chat affordance for adding a
+    // Telegram / Discord bridge — peer of request_connector but for
+    // outbound messaging plumbing. Always-on for the same reason: the
+    // user should be able to ask "add a telegram bot" on a fresh
+    // instance without first toggling a toolset. The owning toolset is
+    // "messaging" (same as `send_message`), but unlike send_message
+    // this is a meta-tool that surfaces a credential form card; it
+    // doesn't egress data on its own. Always exposed so the onboarding
+    // path stays reachable even when the messaging toolset is disabled
+    // by operators who don't want the agent autonomously sending DMs.
+    if (tool.function.name === "request_messaging_bridge") return true;
+    // The rest of the chat-side messaging lifecycle: read-only
+    // inventory (list_messaging_bridges, list_messaging_pairings) so
+    // the agent can answer state questions, and approval-gated
+    // request_messaging_pairing / request_remove_messaging_bridge so
+    // the agent can drive pair-approval and removal from chat without
+    // the user needing to context-switch to the settings page. Same
+    // always-on rationale as request_messaging_bridge: meta-tools that
+    // surface UI cards or read state ride alongside it; the
+    // surface-gateway send_message tool stays gated by the messaging
+    // toolset kill switch.
+    if (tool.function.name === "list_messaging_bridges") return true;
+    if (tool.function.name === "list_messaging_pairings") return true;
+    if (tool.function.name === "wait_for_messaging_pair") return true;
+    if (tool.function.name === "request_messaging_pairing") return true;
+    if (tool.function.name === "request_remove_messaging_bridge") return true;
     // Always expose the core agent-capability meta-tools whose owning
     // toolsets aren't in the legacy defaults (`skills`, `subagents`).
     // Gating these on a toolset toggle would mean a fresh instance
@@ -1184,6 +1389,18 @@ export function chatBlockArgsPreviewFor(
       );
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
+    case "request_messaging_bridge":
+      return truncatePreview(previewValue(safe.kind));
+    case "list_messaging_bridges":
+      return "";
+    case "list_messaging_pairings":
+      return truncatePreview(previewValue(safe.bridge));
+    case "wait_for_messaging_pair":
+      return truncatePreview(previewValue(safe.bridge));
+    case "request_messaging_pairing":
+      return truncatePreview(`${previewValue(safe.bridge)} chat ${previewValue(safe.chatId)}`);
+    case "request_remove_messaging_bridge":
+      return truncatePreview(previewValue(safe.bridge));
     case "create_job":
     case "run_job":
     case "delete_job":

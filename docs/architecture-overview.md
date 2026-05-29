@@ -53,7 +53,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 
 ### Gateway
 
-- Single source of truth for tasks, conversations, runs, jobs, memory, skills, approvals, audit, traces, and events.
+- Single source of truth for tasks, conversations, runs, jobs, memory, skills, authorizations, setup requests, audit, traces, and events.
 - One process per instance.
 - Authenticated HTTP API plus SSE event stream.
 - JSON state for broad runtime records and SQLite for memory.
@@ -116,7 +116,7 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 
 - `/api/status`, `/api/healthz`, `/api/state`
 - `/api/version`, `/api/update/check`, `/api/update`
-- `/api/tasks`, `/api/chat`, `/api/runs`, `/api/approvals`
+- `/api/tasks`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/embedding/*`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
