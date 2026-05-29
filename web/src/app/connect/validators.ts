@@ -20,6 +20,28 @@ export function validateHttpUrl(value: string | undefined): string | undefined {
   }
 }
 
+// The `web` query param lands on a `redirect()` call when the visitor is
+// not on a mobile UA — so an attacker crafting
+//   https://<gini-host>/connect?api=...&web=https://phishing.example/...
+// could otherwise launder a desktop visitor straight to the phishing site
+// from a URL whose origin matches the operator's tunnel. Restrict the
+// fallback URL to the request origin so the redirect can only land back
+// on the host the user is already talking to. Compare full origins
+// (scheme + host + port) so substring confusion like `gini.example.evil`
+// vs `gini.example` is rejected.
+export function validateSameOriginUrl(
+  value: string | undefined,
+  requestOrigin: string,
+): string | undefined {
+  // `validateHttpUrl` already filters anything `new URL(value)` would
+  // throw on, so the second parse here is unconditionally safe.
+  const normalized = validateHttpUrl(value);
+  if (!normalized) return undefined;
+  const parsed = new URL(normalized);
+  if (parsed.origin !== requestOrigin) return undefined;
+  return normalized;
+}
+
 // The scheme value lands on `window.location.href` inside the
 // ConnectClient component. A `javascript:` URL with a crafted body
 // would execute same-origin JS that can fetch `/api/runtime/*` and

@@ -8,6 +8,7 @@ import {
   singleParam,
   userAgentLooksMobile,
   validateHttpUrl,
+  validateSameOriginUrl,
   validateScheme,
   validateToken,
 } from "./validators";
@@ -148,6 +149,42 @@ describe("validateHttpUrl", () => {
   test("returns undefined for empty / undefined input", () => {
     expect(validateHttpUrl(undefined)).toBeUndefined();
     expect(validateHttpUrl("")).toBeUndefined();
+  });
+});
+
+describe("validateSameOriginUrl", () => {
+  test("accepts a same-origin URL", () => {
+    expect(
+      validateSameOriginUrl("https://gini.example/foo", "https://gini.example"),
+    ).toBe("https://gini.example/foo");
+  });
+
+  test("rejects a cross-origin URL pointing at a different host", () => {
+    expect(
+      validateSameOriginUrl(
+        "https://phishing.example/foo",
+        "https://gini.example",
+      ),
+    ).toBeUndefined();
+  });
+
+  test("rejects a substring-confusion lookalike host", () => {
+    // `gini.example.evil` shares the prefix but has a different origin,
+    // so a substring-style match must NOT pass.
+    expect(
+      validateSameOriginUrl(
+        "https://gini.example.evil/foo",
+        "https://gini.example",
+      ),
+    ).toBeUndefined();
+  });
+
+  test("returns undefined for empty / undefined input", () => {
+    expect(validateSameOriginUrl(undefined, "https://gini.example")).toBeUndefined();
+  });
+
+  test("returns undefined for a malformed URL", () => {
+    expect(validateSameOriginUrl("not-a-url", "https://gini.example")).toBeUndefined();
   });
 });
 

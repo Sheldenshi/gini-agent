@@ -19,6 +19,7 @@ import {
   singleParam,
   userAgentLooksMobile,
   validateHttpUrl,
+  validateSameOriginUrl,
   validateScheme,
   validateToken,
 } from "./validators";
@@ -31,14 +32,23 @@ export default async function ConnectPage({
   searchParams: Promise<SearchParams>;
 }) {
   const params = await searchParams;
+  const requestHeaders = await headers();
+  // Build the request origin from the incoming headers so the
+  // same-origin check below uses the host the visitor is actually
+  // talking to, not whatever `request.url` carries (Next.js dev and
+  // reverse proxies often leave a stale internal hostname there).
+  const originHeader = requestHeaders.get("origin");
+  const hostHeader = requestHeaders.get("host");
+  const protoHeader = requestHeaders.get("x-forwarded-proto");
+  const requestOrigin =
+    originHeader ?? (hostHeader ? `${protoHeader ?? "https"}://${hostHeader}` : "");
   const apiUrl = validateHttpUrl(singleParam(params.api));
-  const webUrl = validateHttpUrl(singleParam(params.web));
+  const webUrl = validateSameOriginUrl(singleParam(params.web), requestOrigin);
   const token = validateToken(singleParam(params.token));
   const scheme = validateScheme(singleParam(params.scheme), DEFAULT_SCHEME);
   const fallbackMs = clampMs(singleParam(params.ms), DEFAULT_FALLBACK_MS);
 
   if (webUrl) {
-    const requestHeaders = await headers();
     const ua = requestHeaders.get("user-agent");
     if (!userAgentLooksMobile(ua)) {
       // Desktop / unknown UA — the deep-link can't succeed, so skip the
@@ -65,6 +75,9 @@ export default async function ConnectPage({
           Optional:{" "}
           <code className="font-mono text-xs">scheme=gini://connect</code>,{" "}
           <code className="font-mono text-xs">ms=1500</code>.
+        </p>
+        <p className="mt-3 text-muted-foreground">
+          The <code className="font-mono text-xs">web</code> URL must share an origin with this page, so a cross-origin value is dropped to keep the redirect anchored to the host you scanned.
         </p>
       </div>
     );
