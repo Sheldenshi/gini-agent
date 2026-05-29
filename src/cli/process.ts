@@ -84,7 +84,9 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
   // a tunnel-secret redactor before write so the secret doesn't persist on
   // disk. The redactor reads the live secret from `config.json` (cheap,
   // cached briefly) so a rotate-secret on a running gateway picks up the
-  // new value within the cache window. See PLAN.md "Log redaction".
+  // new value within the cache window. See
+  // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)" >
+  // Log redaction.
   // One redactor per stream. Sharing a single carry buffer across
   // stdout AND stderr would prepend stdout's held-back tail onto the
   // next stderr chunk (and vice versa), re-routing bytes across streams

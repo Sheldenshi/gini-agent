@@ -42,7 +42,8 @@ writePid(config);
 
 // Eagerly construct the tunnel manager so the 192-bit secret is generated on
 // first boot (whether or not tunnel.enabled is true) and the redaction set
-// is populated before any request lands. See PLAN.md "Persisted config".
+// is populated before any request lands. See
+// docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 tunnelManager(config);
 
 // Process-wide shutdown sentinel. Set by the SIGTERM handler at the bottom
@@ -60,7 +61,8 @@ let bootReconcileAbort = false;
 // spawn so we never expose a stale or squatted port to the public URL.
 // The poll also checks `bootReconcileAbort` after every await so a SIGTERM
 // landing during a probe / sleep cancels the reconcile cleanly.
-// Bounded by the 60_000 ms PLAN.md ceiling on web-port discovery.
+// Bounded by a 60_000 ms ceiling on web-port discovery — see
+// docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 {
   const initial = readTunnelConfig(config.instance);
   if (initial.enabled) {

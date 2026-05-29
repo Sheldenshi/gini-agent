@@ -301,7 +301,7 @@ export function guardCsrf(request: Request, _pathSegments: string[]): Response |
   // ran upstream; relaxing the Host check here is what lets a tunneled phone
   // reach the BFF without setting GINI_TRUSTED_ORIGINS. Origin equality
   // (when Origin is present) and the Sec-Fetch-Site gate below still fire
-  // independently — see PLAN.md "CSRF policy".
+  // independently — see docs/adr/bff-trust-boundary.md.
   const vetted = request.headers.get("x-gini-tunnel-vetted") === "1";
   if (!origin) {
     // Mobile React Native fetch never sends Origin. When the proxy has
@@ -365,8 +365,9 @@ export function guardCsrf(request: Request, _pathSegments: string[]): Response |
       // allowlist. The vetted marker is upstream-verified proof that the
       // proxy's own Host classifier accepted the inbound Host, AND the
       // browser's same-origin policy means Origin must already equal Host
-      // for the marker to have been stamped — see PLAN.md "CSRF policy"
-      // and the proxy's Host classifier at web/src/proxy.ts. Accept the
+      // for the marker to have been stamped — see
+      // docs/adr/bff-trust-boundary.md and the proxy's Host classifier at
+      // web/src/proxy.ts. Accept the
       // vetted request when Origin == Host even without an allowlist
       // entry; the allowlist still authoritatively rejects non-vetted
       // cross-origin callers.
@@ -388,7 +389,7 @@ export function guardCsrf(request: Request, _pathSegments: string[]): Response |
       // fully closed. The vetted=1 marker bypasses the loopback-Host
       // restriction because the proxy's Host classifier already
       // verified the inbound Host against the live tunnel hostname or
-      // an allowlist entry — see PLAN.md "CSRF policy".
+      // an allowlist entry — see docs/adr/bff-trust-boundary.md.
       const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
       if (!vetted && !isLoopbackHost(expectedHost)) {
         return Response.json({ error: "Forbidden" }, { status: 403 });

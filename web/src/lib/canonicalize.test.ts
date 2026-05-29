@@ -1,7 +1,8 @@
 // Mirror of src/runtime/tunnel/canonicalize.test.ts — pins the web copy
 // against the same invariants. Both files are tested independently so a
 // drift between the two (e.g., a developer edits one and forgets the
-// other) is caught by CI. PLAN.md "Path canonicalization".
+// other) is caught by CI. See docs/adr/tunnel-and-mobile-access.md
+// "Architecture (summary)".
 import { describe, expect, test } from "bun:test";
 import { canonicalizePath, noTrailingSlash } from "./canonicalize";
 

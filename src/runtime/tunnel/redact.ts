@@ -2,7 +2,8 @@
 // secret, any prior secret still inside the rotation window, the live public
 // URL, and the trycloudflare.com hostname suffix with `<redacted-secret>`.
 // Percent-encoded variants are matched too — some sinks log raw inbound paths
-// before canonicalization. See PLAN.md "Log redaction".
+// before canonicalization. See docs/adr/tunnel-and-mobile-access.md
+// "Architecture (summary)" > Log redaction.
 
 const PLACEHOLDER = "<redacted-secret>";
 const TRYCLOUDFLARE_HOSTNAME_SUFFIX = "trycloudflare.com";

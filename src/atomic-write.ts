@@ -3,7 +3,8 @@ import { dirname, basename } from "node:path";
 
 // Atomic config write: write to a sibling tempfile in the same directory,
 // fsync the data, then rename(2). Reads tolerate transient ENOENT or partial
-// parse via one retry — see PLAN.md "Operational invariants".
+// parse via one retry — see docs/adr/tunnel-and-mobile-access.md
+// "Architecture (summary)".
 export function atomicWriteFile(path: string, contents: string): void {
   const dir = dirname(path);
   const tmp = `${dir}/.${basename(path)}.${process.pid}.${Date.now()}.tmp`;

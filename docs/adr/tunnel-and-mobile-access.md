@@ -14,12 +14,9 @@ the secret, cookie, or Bearer in constant time, and stamps an internal
 marker (`x-gini-tunnel-vetted: 1`) on requests that pass before the BFF
 guard sees them.
 
-The original design contract lives in `PLAN.md` for historical context.
-The trust-radius and deny-list policy were deliberately broadened during
-implementation — the live policy is captured below and in
-`bff-trust-boundary.md`. When the two disagree, this ADR (and the
-implementation it pins) wins; `PLAN.md` has a banner in the deny-list
-section pointing back here.
+This ADR and [`bff-trust-boundary.md`](bff-trust-boundary.md) are the
+authoritative pinning of the trust radius and deny list. When the two
+disagree, this ADR (and the implementation it pins) wins.
 
 ## Context
 
@@ -55,7 +52,7 @@ phone → Cloudflare edge → cloudflared subprocess → Next.js proxy
                                                Runtime API
 ```
 
-Key invariants the proxy enforces per PLAN.md:
+Key invariants the proxy enforces:
 
 - **Host classification**: inbound Host must equal the live tunnel hostname
   (read from the sibling file the runtime writes on enable) or an explicit
@@ -118,8 +115,7 @@ Key invariants the proxy enforces per PLAN.md:
   new tunnel-surfaced endpoint requires an explicit ALLOW entry rather
   than silently inheriting the privileged exposure.
 
-  This is a deliberate broadening of PLAN.md's original conservative
-  deny list. The operator opted into surfacing the full tunnel-control
+  The operator opted into surfacing the full tunnel-control
   UI on the tunneled view so that a leaked URL can be revoked from the
   same surface the operator scanned on. The shoulder-surfing
   consequence (the QR pixels carry the bootstrap URL and a JS-level
@@ -213,8 +209,7 @@ single-operator pattern. The same-UID-local-process threat is out of scope
 
 ## Acceptance Checks
 
-PLAN.md "Test surface" enumerates the per-invariant observable checks. The
-short version:
+Per-invariant observable checks, short version:
 
 - Tunnel-branch requests with no secret-prefix, no cookie, and no
   Bearer return 404.

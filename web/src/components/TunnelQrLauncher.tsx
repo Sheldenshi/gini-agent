@@ -92,7 +92,8 @@ export function TunnelQrLauncher() {
 
   const busy = enable.isPending || disable.isPending || rotate.isPending;
 
-  // Hide on /setup/* per PLAN.md "Goals". Otherwise render the icon
+  // Hide on /setup/* (see docs/adr/tunnel-and-mobile-access.md
+  // "Decision"). Otherwise render the icon
   // unconditionally — when the tunnel is off the modal shows an Enable
   // affordance, when starting it shows a spinner, when ready it shows
   // the QR + Disable / Rotate row. The settings card still owns the full

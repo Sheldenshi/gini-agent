@@ -1,5 +1,6 @@
 // Shared path canonicalization used by the Next.js middleware (proxy) and the
-// BFF guard. Tests pin both invocation sites. See PLAN.md "Path canonicalization".
+// BFF guard. Tests pin both invocation sites. See
+// docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 
 export interface CanonicalizeResult {
   ok: true;
@@ -34,7 +35,8 @@ const MAX_LENGTH = 4096;
  * Strict percent-decoder. Stops at the first malformed sequence (`%ZZ`,
  * trailing `%`, `%2`) and returns null. Tolerant pass-through is unsafe
  * here because a downstream router with a strict decoder would diverge
- * from a tolerant one. See PLAN.md step 1.
+ * from a tolerant one. See docs/adr/tunnel-and-mobile-access.md
+ * "Architecture (summary)".
  */
 function strictPercentDecode(input: string): string | null {
   const bytes: number[] = [];

@@ -4,7 +4,8 @@
 // also handles Host classification and the session-cookie mint; this file
 // holds the path-and-method logic both layers share.
 //
-// See PLAN.md "Deny list through the tunnel" + "Path canonicalization".
+// See docs/adr/tunnel-and-mobile-access.md "Architecture (summary)" and
+// "Trust radius" + docs/adr/bff-trust-boundary.md.
 
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -25,8 +26,8 @@ const TUNNEL_PREFIX = "/api/runtime/tunnel";
 /** True when the request must be denied through the tunnel. Operates on the
  *  BFF-visible canonical form (`/api/runtime/<rest>`) and the request method.
  *
- *  Policy (revised from PLAN.md's original conservative deny list — the
- *  operator explicitly opted into surfacing the tunnel-control UI on the
+ *  Policy (the operator explicitly opted into surfacing the
+ *  tunnel-control UI on the
  *  tunneled view, gated by the click-to-reveal blur on the QR, the bold
  *  "live credential" warnings, and confirm dialogs on Disable / Rotate):
  *
@@ -108,10 +109,11 @@ function instanceStateDir(): string {
   return join(stateRoot, "instances", instance);
 }
 
-/** Read the live tunnel config from disk on every call. The PLAN.md
- *  invariant ("proxy reads tunnel.secret + tunnel.enabled on every request,
- *  uncached") means rotate-secret / disable cycles invalidate cookies on
- *  the very next hit without coordination. */
+/** Read the live tunnel config from disk on every call. The proxy reads
+ *  tunnel.secret + tunnel.enabled uncached on every request so rotate-secret
+ *  / disable cycles invalidate cookies on the very next hit without
+ *  coordination. See docs/adr/tunnel-and-mobile-access.md
+ *  "Architecture (summary)". */
 export function readTunnelConfigFromDisk(): { enabled: boolean; secret: string } {
   const configFile = join(instanceStateDir(), "config.json");
   if (!existsSync(configFile)) return { enabled: false, secret: "" };
@@ -129,7 +131,8 @@ export function readTunnelConfigFromDisk(): { enabled: boolean; secret: string }
 
 /** Read the live tunnel public URL host from the sibling file the runtime
  *  publishes (`~/.gini/instances/<inst>/tunnel.publicUrl`). The proxy uses
- *  this for an EQUALITY host match per PLAN.md "Architecture" step 3,
+ *  this for an EQUALITY host match (see
+ *  docs/adr/tunnel-and-mobile-access.md "Architecture (summary)"),
  *  rather than a permissive `.trycloudflare.com` suffix check. Returns the
  *  empty string when the file is missing (no live tunnel) — the proxy
  *  treats that as "no tunnel branch matches" and rejects at the Host

@@ -3,7 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 // 192 bits of entropy, base64url-encoded → 32 characters. Picked to fit
 // cleanly on a 32-char URL segment while keeping brute-force well past
 // physical limits at the 200 in-flight Cloudflare quick-tunnel ceiling.
-// See PLAN.md Constants > "Per-instance secret entropy".
+// See docs/adr/tunnel-and-mobile-access.md "Trust radius".
 const SECRET_BYTES = 24;
 
 export function generateTunnelSecret(): string {

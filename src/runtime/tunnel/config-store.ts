@@ -9,7 +9,7 @@ import type { TunnelPersistedConfig } from "./types";
 // rest of the file. Uses atomic-rename for writes so concurrent reads see
 // either the old or the new full document — never a partial. One immediate
 // retry on parse error covers the brief window between unlink and rename.
-// See PLAN.md "Operational invariants".
+// See docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 
 type ConfigShape = Record<string, unknown> & {
   tunnel?: Partial<TunnelPersistedConfig> & {

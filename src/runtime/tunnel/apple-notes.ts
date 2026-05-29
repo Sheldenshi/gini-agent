@@ -2,7 +2,8 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 
 // Apple Notes mirror via osascript. Defaults OFF. Opt-in extends the
-// secret's trust radius to iCloud. PLAN.md "Apple Notes mirror".
+// secret's trust radius to iCloud. See
+// docs/adr/tunnel-and-mobile-access.md "Trust radius".
 
 const OSASCRIPT_TIMEOUT_MS = 15_000;
 const NOTES_APP_PATHS = [

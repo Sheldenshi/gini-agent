@@ -2,7 +2,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 // Spawn cloudflared as a quick tunnel forwarding to 127.0.0.1:<port>, parse
 // the public URL out of stderr's banner, and provide a SIGTERM-with-SIGKILL
-// fallback for teardown. See PLAN.md "Operational invariants".
+// fallback for teardown. See docs/adr/tunnel-and-mobile-access.md
+// "Architecture (summary)".
 
 export interface CloudflaredLaunch {
   process: ChildProcess;

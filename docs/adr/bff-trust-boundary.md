@@ -104,8 +104,7 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   operator can rotate-secret, disable, or refresh the Apple Notes
   mirror from the same surface they scanned on. Unknown
   `/api/runtime/tunnel/<sub>` paths fall through to default-deny.
-  This is a deliberate broadening of PLAN.md's original deny list,
-  documented in tunnel-and-mobile-access.md. The BFF no longer
+  Documented in [tunnel-and-mobile-access.md](tunnel-and-mobile-access.md). The BFF no longer
   rewrites `GET /api/runtime/tunnel` to `/api/tunnel/redacted` —
   vetted callers now receive the privileged snapshot directly. The
   legacy `GINI_TRUSTED_ORIGINS` lane remains intact for operators

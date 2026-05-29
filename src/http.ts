@@ -121,7 +121,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
     // Tunnel surface. /api/tunnel is the privileged shape (secret + publicUrl);
     // /api/tunnel/redacted is the browser-safe shape (secret=null, publicUrl=null).
-    // PLAN.md "Public surface".
+    // See docs/adr/tunnel-and-mobile-access.md "Trust radius".
     ["GET", /^\/api\/tunnel$/, () => json(tunnelManager(config).current())],
     ["GET", /^\/api\/tunnel\/redacted$/, () => json(redactedSnapshot(tunnelManager(config).current()))],
     ["PATCH", /^\/api\/tunnel$/, async (request) => {

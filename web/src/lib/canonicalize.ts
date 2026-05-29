@@ -1,6 +1,7 @@
 // Shared path canonicalization used by the Next.js proxy (web/src/proxy.ts)
 // and the BFF guard (web/src/app/api/runtime/[...path]/route.ts). Tests pin
-// both invocation sites. See PLAN.md "Path canonicalization".
+// both invocation sites. See docs/adr/tunnel-and-mobile-access.md
+// "Architecture (summary)".
 //
 // IMPORTANT: this file is duplicated as src/runtime/tunnel/canonicalize.ts on
 // the runtime side. The duplication is deliberate — Next.js refuses to bundle

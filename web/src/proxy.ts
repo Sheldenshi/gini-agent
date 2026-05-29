@@ -4,8 +4,8 @@
 // 1. Tunnel proxy. Classify Host, gate on the secret-path bootstrap or the
 //    session cookie, stamp the `x-gini-tunnel-vetted: 1` marker on tunnel-
 //    branch forwards, and 404 anything else. Loopback callers (operator's
-//    own Mac) pass through without the marker. See PLAN.md "Architecture"
-//    + "Tunnel session cookie".
+//    own Mac) pass through without the marker. See
+//    docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 //
 // 2. Setup gate. If no provider is configured the operator is bounced to
 //    /setup so the rest of the app doesn't render in a broken state.
@@ -66,7 +66,8 @@ async function isProviderConfigured(): Promise<boolean | null> {
  *
  *  Anything else returns `unknown` and 404s before any secret/cookie
  *  check — defends against DNS-rebinding to an attacker-controlled
- *  hostname per PLAN.md "Architecture" step 3. */
+ *  hostname — see docs/adr/tunnel-and-mobile-access.md
+ *  "Architecture (summary)". */
 function classifyHost(hostHeader: string | null): "loopback" | "tunnel" | "trusted" | "unknown" {
   if (!hostHeader) return "unknown";
   const lower = hostHeader.toLowerCase();
@@ -103,8 +104,9 @@ function classifyHost(hostHeader: string | null): "loopback" | "tunnel" | "trust
 }
 
 /** Compare two Host header values applying the default-port equivalence rule
- *  PLAN.md describes in "CSRF policy": `host` and `host:443` (HTTPS) or
- *  `host:80` (HTTP) are equivalent when one side omits the port. */
+ *  the BFF trust boundary enforces (see docs/adr/bff-trust-boundary.md):
+ *  `host` and `host:443` (HTTPS) or `host:80` (HTTP) are equivalent when
+ *  one side omits the port. */
 function hostMatches(inbound: string, candidate: string): boolean {
   if (inbound === candidate) return true;
   const splitPort = (h: string): { name: string; port: string | null } => {
@@ -228,7 +230,7 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     redirect.headers.set("set-cookie", buildTunnelCookie(tunnel.secret));
     // The 302 itself carries no-referrer so the brief /<secret>/ URL cannot
     // leak via Referer on subresource fetches the destination page issues.
-    // See PLAN.md "URL cleanup after bootstrap".
+    // See docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
     redirect.headers.set("referrer-policy", "no-referrer");
     redirect.headers.set("cache-control", "no-store");
     return redirect;

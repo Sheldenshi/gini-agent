@@ -37,8 +37,8 @@ export function readPersistedPublicUrl(instance: string): string {
 
 // Tunnel manager. Owns the in-memory snapshot, the cloudflared subprocess,
 // and the Apple Notes mirror. Every state transition (enable/disable/recycle/
-// rotate) goes through a single serialized apply path. See PLAN.md
-// "Operational invariants".
+// rotate) goes through a single serialized apply path. See
+// docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 
 const NOTES_FOLDER = "gini";
 
@@ -588,8 +588,9 @@ class TunnelManager {
         appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
         // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
         // refreshNotes here would put a 15s osascript timeout ahead of a
-        // follow-up disable() in the apply chain, defeating PLAN.md's
-        // 5000ms exposure cap on disable. The bare `runRefreshNotes()`
+        // follow-up disable() in the apply chain, defeating the 5000ms
+        // exposure cap on disable (see docs/adr/tunnel-and-mobile-access.md
+        // "Architecture (summary)"). The bare `runRefreshNotes()`
         // call updates `this.snapshot` and `this.notesAvailable` outside
         // the queue. Capture the current generation at scheduling time so
         // a later disable / rotateSecret that bumps the generation makes
@@ -628,8 +629,9 @@ class TunnelManager {
   async disable(): Promise<TunnelTransitionResult> {
     return this.enqueue(async () => {
       this.generation += 1;
-      // Try to commit enabled:false BEFORE killing cloudflared (PLAN.md
-      // "Operational invariants" ordering for the 5000 ms exposure cap).
+      // Try to commit enabled:false BEFORE killing cloudflared — ordering
+      // for the 5000 ms exposure cap, see
+      // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
       // If the config write throws (EACCES, disk full), we MUST still stop
       // cloudflared so the public URL doesn't keep accepting traffic from
       // a state the operator believes is disabled. Surface both failures
@@ -856,8 +858,9 @@ class TunnelManager {
     // Split the config commit (queued — must serialize with enable / disable /
     // rotateSecret) from the actual osascript side effect (NOT queued — the
     // 15s timeout would sit ahead of a follow-up disable() on the apply chain
-    // and break PLAN.md's 5000ms exposure cap). Pattern mirrors enable()'s
-    // fire-and-forget Notes refresh.
+    // and break the 5000ms exposure cap — see
+    // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)"). Pattern
+    // mirrors enable()'s fire-and-forget Notes refresh.
     let scheduledGeneration = 0;
     const result: TunnelTransitionResult = await this.enqueue(async (): Promise<TunnelTransitionResult> => {
       try {
@@ -1229,7 +1232,7 @@ class TunnelManager {
  *  runs, dropping the Set-Cookie header the proxy would have minted. Encoding
  *  the no-slash form sidesteps that normalization entirely — the request
  *  goes straight to the proxy, which mints the cookie and 302s to `/`. See
- *  PLAN.md "Request flow — Scenario A". */
+ *  docs/adr/tunnel-and-mobile-access.md "Architecture (summary)". */
 export function bootstrapUrl(publicUrl: string, secret: string): string {
   const trimmed = publicUrl.replace(/\/+$/, "");
   return `${trimmed}/${secret}`;
