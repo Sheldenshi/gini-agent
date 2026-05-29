@@ -65,7 +65,7 @@ bun run test
 bun run gini smoke
 ```
 
-Keep the full suite under 6 seconds; profile a slow run with `bun test <file>` or `--reporter=junit`. A 10s per-test cap lives in `bun-test-setup.ts` (via the `bunfig.toml` preload).
+`bun run test` runs the suite in parallel across files (`bun test --parallel`); bare `bun test` is serial. Keep the full suite under 6 seconds; profile a slow file with `bun test <file>` or `--reporter=junit`. A 10s per-test cap lives in `bun-test-setup.ts` (via the `bunfig.toml` preload).
 
 Fast-test rules: poll instead of `sleep`; make timeouts/intervals injectable; stub expensive deps (models, network, subprocesses); use unique temp dirs and ephemeral ports.
 
