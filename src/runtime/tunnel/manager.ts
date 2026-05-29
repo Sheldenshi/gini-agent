@@ -1058,7 +1058,14 @@ class TunnelManager {
       // a fresh note. We can't undo what clearNote already did, but we
       // can schedule a recovery refresh so the steady-state matches the
       // user's most recent intent.
-      if (this.snapshot.appleNotes.enabled) {
+      //
+      // Only schedule the recovery if the generation hasn't moved since
+      // this clear was scheduled. A concurrent setAppleNotesEnabled that
+      // bumps the generation has already (or will) schedule its own
+      // refresh under the new generation — firing another one here
+      // would duplicate the writeNote and reintroduce the very race the
+      // generation gate exists to prevent.
+      if (this.snapshot.appleNotes.enabled && this.generation === scheduledGeneration) {
         void this.runRefreshNotes(this.generation).catch(() => { /* surfaced in lastError */ });
       }
       return { ok: true, snapshot: this.snapshot };
