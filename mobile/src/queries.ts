@@ -8,6 +8,7 @@ import { useEffect, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 import EventSource from "react-native-sse";
 import { api, ApiError, resolveStreamEndpoint, type UploadRef } from "./api";
+import { refreshBadge } from "./push";
 import type {
   AgentRecord,
   AgentsResponse,
@@ -64,6 +65,36 @@ export function useCreateAgent() {
       qc.invalidateQueries({ queryKey: ["agents"] });
     }
   });
+}
+
+// Per-session unread counts for the calling device. Returns a record
+// keyed by sessionId; sessions with zero unread blocks are omitted so
+// the ChatRow can default to 0 without a separate "is this session in
+// the map" check. The query is device-scoped on the server (matches
+// /badge); skipping it on web/CLI where there's no X-Device-Token
+// avoids the predictable 400 the gateway would return.
+export function useUnreadCounts() {
+  return useQuery<{ counts: Record<string, number> }, Error, Record<string, number>>({
+    queryKey: ["unread"],
+    queryFn: () => api<{ counts: Record<string, number> }>("/unread"),
+    enabled: Boolean(getCachedDeviceTokenSafe()),
+    refetchInterval: 3000,
+    select: (data) => data.counts
+  });
+}
+
+// Lazy access to the cached APNs token. push.ts depends on this module
+// transitively through ApiError, so a static import would create a
+// cycle that some bundlers resolve to undefined at module-eval time.
+// The require() form is the same shape api.ts uses to inject
+// X-Device-Token without the cycle.
+function getCachedDeviceTokenSafe(): string | null {
+  try {
+    const mod = require("./push") as { getCachedDeviceToken?: () => string | null };
+    return mod.getCachedDeviceToken?.() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // Per-agent chat list. The gateway filters server-side via ?agentId, so
@@ -515,6 +546,57 @@ export function useCreateChat(agentId: string | null) {
       qc.invalidateQueries({ queryKey: ["chats", agentId] });
       qc.invalidateQueries({ queryKey: ["agents"] });
       qc.invalidateQueries({ queryKey: ["status"] });
+    }
+  });
+}
+
+// DELETE /chat/:id. Powers the chat-list swipe Delete action. We
+// optimistically drop the row from the cached list so the swipe
+// animation doesn't snap back to "deleting…" before the server
+// confirms. The agentId is captured at mutation-construction time so
+// the cache update targets the right per-agent list — the runtime
+// cascade-deletes blocks too, so a refetch on the chat detail of a
+// just-deleted session would 404 anyway.
+export function useDeleteChat(agentId: string | null) {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true }, Error, string>({
+    mutationFn: (sessionId: string) =>
+      api<{ ok: true }>(`/chat/${sessionId}`, { method: "DELETE" }),
+    onMutate: async (sessionId) => {
+      await qc.cancelQueries({ queryKey: ["chats", agentId] });
+      const previous = qc.getQueryData<ChatSession[]>(["chats", agentId]);
+      if (previous) {
+        qc.setQueryData<ChatSession[]>(
+          ["chats", agentId],
+          previous.filter((s) => s.id !== sessionId)
+        );
+      }
+      return { previous };
+    },
+    onError: (_err, _sessionId, context) => {
+      const ctx = context as { previous?: ChatSession[] } | undefined;
+      if (ctx?.previous) qc.setQueryData(["chats", agentId], ctx.previous);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["chats", agentId] });
+      qc.invalidateQueries({ queryKey: ["unread"] });
+    }
+  });
+}
+
+// DELETE /chat/:id/read. Powers the chat-list swipe Mark Unread action.
+// The runtime cursor is monotonic, so this is the only way to put a
+// chat back into the badge from the client. Refreshes the badge after
+// the cursor drops so the app icon dot pops back up immediately.
+export function useMarkChatUnread() {
+  const qc = useQueryClient();
+  return useMutation<{ ok: true }, Error, string>({
+    mutationFn: (sessionId: string) =>
+      api<{ ok: true }>(`/chat/${sessionId}/read`, { method: "DELETE" }),
+    onSuccess: () => {
+      void refreshBadge();
+      qc.invalidateQueries({ queryKey: ["chats"] });
+      qc.invalidateQueries({ queryKey: ["unread"] });
     }
   });
 }

@@ -10,8 +10,10 @@ import {
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
+  markUnread,
   mutateState,
   readState,
+  unreadCountsByDevice,
   readTrace,
   readUpload,
   removeDeviceForCredential,
@@ -914,6 +916,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
       return json({ ok: true, readState: result });
     }],
+    // Mark a chat unread for the calling device. Pins the read cursor
+    // to the block before the latest assistant_text so the badge
+    // settles at "just the agent's last turn" (typically 1), matching
+    // iOS Mail / Messages behavior — not "every block since session
+    // start". Sessions with no assistant_text fall back to clearing
+    // the cursor entirely so the action still surfaces them as unread.
+    ["DELETE", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const sessionId = params[0];
+      if (!readState(config.instance).chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      markUnread(config.instance, sessionId, dev.token);
+      return json({ ok: true });
+    }],
     ["GET", /^\/api\/badge$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
@@ -922,6 +942,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
       const unread = unreadCountForDevice(config.instance, dev.token);
       return json({ unread });
+    }],
+    // Per-session unread counts for the calling device. Powers the
+    // mobile chat list's per-row badge (blue pill + count) — /badge
+    // gives the cross-session total, /unread gives the breakdown so
+    // the list can mark each row independently. Sessions with zero
+    // unread blocks are omitted; callers default to 0.
+    ["GET", /^\/api\/unread$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const counts = unreadCountsByDevice(config.instance, dev.token);
+      return json({ counts: Object.fromEntries(counts) });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],

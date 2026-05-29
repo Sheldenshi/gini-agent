@@ -8,7 +8,7 @@
 //   - unknown server name produces a structured error envelope
 //   - missing required args throw before reaching the network
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,10 @@ import { dispatchToolCall } from "./tool-dispatch";
 const ROOT = mkdtempSync(join(tmpdir(), "gini-mcp-dispatch-"));
 process.env.GINI_STATE_ROOT = ROOT;
 process.env.GINI_LOG_ROOT = `${ROOT}/logs`;
+// Shrink the wait_for_messaging_pair poll interval so the three pairing tests
+// don't each wait a full production 1000ms tick. Server-side env, deleted in
+// afterAll; production leaves it unset and keeps the 1000ms default.
+process.env.GINI_PAIR_POLL_MS = "10";
 
 const originalFetch = globalThis.fetch;
 
@@ -28,6 +32,10 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+});
+
+afterAll(() => {
+  delete process.env.GINI_PAIR_POLL_MS;
 });
 
 function buildConfig(instance: string): RuntimeConfig {
@@ -840,8 +848,12 @@ describe("request_connector dispatch", () => {
       "call_wait_expired",
       JSON.stringify({ bridge: "tg-expired", timeoutSeconds: 10 })
     );
-    // Cancel mid-wait so we don't sit out the full 10s timeout.
-    await Bun.sleep(1200);
+    // The expired row is filtered out on the loop's very first scan
+    // (synchronous, before the first poll sleep), so we only need the
+    // cancel to land before a subsequent tick re-scans. Cancel well
+    // inside the first 1s poll interval so the next tick exits on the
+    // task-terminal check instead of sitting out the full 10s timeout.
+    await Bun.sleep(50);
     await mutateState(instance, (state) => {
       const task = state.tasks.find((t) => t.id === taskId);
       if (task) task.status = "cancelled";
@@ -853,7 +865,7 @@ describe("request_connector dispatch", () => {
     expect(
       state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
-  }, 30000);
+  });
 
   test("wait_for_messaging_pair: detects out-of-band enrollment and exits with success", async () => {
     // While the wait loop is running, a parallel operator (settings
@@ -889,7 +901,11 @@ describe("request_connector dispatch", () => {
     );
     // Simulate another path enrolling chat 555 while the wait is
     // running (e.g. operator clicked Approve on the settings page).
-    await Bun.sleep(1200);
+    // The loop's first scan runs synchronously on entry (before the
+    // first poll sleep) and sees an empty allowlist; land the
+    // enrollment well inside the first 1s poll interval so the next
+    // tick's snapshot-diff detects the fresh chatId.
+    await Bun.sleep(50);
     await mutateState(instance, (state) => {
       const live = state.messagingBridges.find((b) => b.name === "tg-oob");
       if (live) {
@@ -910,7 +926,7 @@ describe("request_connector dispatch", () => {
     expect(
       state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
-  }, 15000);
+  });
 
   test("wait_for_messaging_pair: skips a pending row whose chat is already enrolled, then exits on task cancel", async () => {
     // Pin the second half of the new predicate: a pending row whose
@@ -952,10 +968,12 @@ describe("request_connector dispatch", () => {
       "call_wait_enrolled",
       JSON.stringify({ bridge: "tg-enrolled", timeoutSeconds: 10 })
     );
-    // Give the wait tool one full poll tick to scan and decide the
-    // already-enrolled row is unsurfacable, then cancel so the next
-    // tick's task-terminal check exits the loop.
-    await Bun.sleep(1200);
+    // The loop's first scan runs synchronously on entry (before the
+    // first poll sleep) and decides the already-enrolled row is
+    // unsurfacable. Cancel well inside the first 1s poll interval so
+    // the next tick's task-terminal check exits the loop without
+    // sitting out the full 10s timeout.
+    await Bun.sleep(50);
     await mutateState(instance, (state) => {
       const task = state.tasks.find((t) => t.id === taskId);
       if (task) task.status = "cancelled";
@@ -974,7 +992,7 @@ describe("request_connector dispatch", () => {
     expect(
       state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
-  }, 10000);
+  });
 
   test("wait_for_messaging_pair: folds the guidance into the running tool_call's runningHint (not a separate system_note)", async () => {
     // The wait card on its own only shows the bridge name — no

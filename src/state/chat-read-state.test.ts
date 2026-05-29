@@ -12,12 +12,15 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import {
+  clearReadState,
   closeAllMemoryDbs,
   getLastReadByDevice,
   getReadState,
   insertChatBlock,
   markRead,
-  unreadCountForDevice
+  markUnread,
+  unreadCountForDevice,
+  unreadCountsByDevice
 } from "./index";
 import type { Instance } from "../types";
 
@@ -190,6 +193,56 @@ describe("chat-read-state", () => {
     expect(unreadCountForDevice(instance, "tok_x")).toBe(3);
   });
 
+  test("unreadCountsByDevice groups unread blocks per session and omits zeros", () => {
+    const instance = "crs-counts-by-session" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    const a2 = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "2"
+    });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_b", text: "3" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_b", text: "4" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_c", text: "5" });
+    // Fresh device, no read cursor anywhere — every session reports its
+    // visible block count.
+    const fresh = unreadCountsByDevice(instance, "tok_fresh");
+    expect(fresh.get("chat_a")).toBe(2);
+    expect(fresh.get("chat_b")).toBe(2);
+    expect(fresh.get("chat_c")).toBe(1);
+
+    // Catch up on chat_a — it drops out of the map (zero counts omitted).
+    markRead(instance, "chat_a", "tok_fresh", a2.id);
+    const after = unreadCountsByDevice(instance, "tok_fresh");
+    expect(after.has("chat_a")).toBe(false);
+    expect(after.get("chat_b")).toBe(2);
+    expect(after.get("chat_c")).toBe(1);
+
+    // Sum equals the cross-session total.
+    const total = unreadCountForDevice(instance, "tok_fresh");
+    let sum = 0;
+    for (const n of after.values()) sum += n;
+    expect(sum).toBe(total);
+  });
+
+  test("unreadCountsByDevice is per-device, like the aggregate", () => {
+    const instance = "crs-counts-isolation" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    const a = unreadCountsByDevice(instance, "tok_iphone_a");
+    const b = unreadCountsByDevice(instance, "tok_iphone_b");
+    expect(a.get("chat_a")).toBe(1);
+    expect(b.get("chat_a")).toBe(1);
+    // Clear A's row by marking read; B's count stays put.
+    markRead(
+      instance,
+      "chat_a",
+      "tok_iphone_a",
+      insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "2" }).id
+    );
+    expect(unreadCountsByDevice(instance, "tok_iphone_a").has("chat_a")).toBe(false);
+    expect(unreadCountsByDevice(instance, "tok_iphone_b").get("chat_a")).toBe(2);
+  });
+
   test("getLastReadByDevice returns per-session map", () => {
     const instance = "crs-map" as Instance;
     const a = insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
@@ -200,6 +253,113 @@ describe("chat-read-state", () => {
     expect(map.size).toBe(2);
     expect(map.get("chat_a")).toBe(a.id);
     expect(map.get("chat_b")).toBe(b.id);
+  });
+
+  test("clearReadState drops the row and re-inflates the badge", () => {
+    const instance = "crs-clear" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    const b = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "2"
+    });
+    markRead(instance, "chat_a", "tok_x", b.id);
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(0);
+    clearReadState(instance, "chat_a", "tok_x");
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(2);
+  });
+
+  test("clearReadState is idempotent on a missing row", () => {
+    const instance = "crs-clear-missing" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
+    expect(() => clearReadState(instance, "chat_a", "tok_x")).not.toThrow();
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+  });
+
+  test("markUnread pins cursor to before the latest assistant_text (count = 1)", () => {
+    const instance = "crs-mark-unread" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "hi" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "still hi" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "ping?" });
+    const assistant = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_a",
+      text: "hello back",
+      streaming: false
+    });
+    markRead(instance, "chat_a", "tok_x", assistant.id);
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(0);
+    markUnread(instance, "chat_a", "tok_x");
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(1);
+    // Idempotent — replaying lands on the same cursor and stays at 1.
+    markUnread(instance, "chat_a", "tok_x");
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(1);
+  });
+
+  test("markUnread counts trailing tool_calls along with the latest assistant turn", () => {
+    const instance = "crs-mark-unread-tools" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "go" });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_a",
+      text: "on it",
+      streaming: false
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_a",
+      callId: "call_1",
+      toolName: "echo",
+      displayLabel: "Echo",
+      argsPreview: "{}",
+      argsFull: {},
+      status: "running"
+    });
+    markUnread(instance, "chat_a", "tok_x");
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(2);
+  });
+
+  test("markUnread falls back to clearing the cursor when there is no assistant_text", () => {
+    const instance = "crs-mark-unread-no-assistant" as Instance;
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "hi"
+    });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "hi again" });
+    markRead(instance, "chat_a", "tok_x", a.id);
+    markUnread(instance, "chat_a", "tok_x");
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(2);
+  });
+
+  test("markUnread clears the cursor when assistant_text is the only visible block", () => {
+    const instance = "crs-mark-unread-only-assistant" as Instance;
+    const assistant = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_a",
+      text: "hello",
+      streaming: false
+    });
+    markRead(instance, "chat_a", "tok_x", assistant.id);
+    markUnread(instance, "chat_a", "tok_x");
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(1);
+  });
+
+  test("clearReadState only clears the caller's device", () => {
+    const instance = "crs-clear-isolation" as Instance;
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "1"
+    });
+    markRead(instance, "chat_a", "tok_iphone_a", a.id);
+    markRead(instance, "chat_a", "tok_iphone_b", a.id);
+    clearReadState(instance, "chat_a", "tok_iphone_a");
+    expect(getReadState(instance, "chat_a", "tok_iphone_a")).toBeNull();
+    expect(getReadState(instance, "chat_a", "tok_iphone_b")?.lastReadBlockId).toBe(a.id);
   });
 
   test("read state is isolated per device", () => {

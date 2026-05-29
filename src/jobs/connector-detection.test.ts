@@ -42,6 +42,21 @@ function stubProviderDetect(providerId: string, value: { detected: boolean; sugg
   };
 }
 
+// Companion stub for the post-create health probe. A positive detection
+// materializes a connector and runConnectorDetection then runs an initial
+// checkConnector → provider.probe; for claude-code that shells out to
+// `claude auth status`, the same host-dependent subprocess detect() avoids.
+// Stubbing the probe keeps the create-path tests off the real CLI.
+function stubProviderProbe(providerId: string, value: { ok: boolean; message: string }): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.probe;
+  provider.probe = async () => value;
+  return () => {
+    provider.probe = previous;
+  };
+}
+
 describe("runConnectorDetection", () => {
   beforeEach(() => {
     rmSync(ROOT, { recursive: true, force: true });
@@ -49,6 +64,9 @@ describe("runConnectorDetection", () => {
 
   test("creates an auto-source connector when a provider detects positive", async () => {
     const restore = stubProviderDetect("claude-code", { detected: true, suggestedName: "Claude Code", message: "stub" });
+    // claude-code exposes a probe, so the create path runs checkConnector →
+    // probe; stub it so the test never shells out to `claude auth status`.
+    const restoreProbe = stubProviderProbe("claude-code", { ok: true, message: "stub" });
     try {
       // Make sure codex doesn't accidentally fire.
       const restoreCodex = stubProviderDetect("codex", { detected: false });
@@ -65,12 +83,14 @@ describe("runConnectorDetection", () => {
         restoreCodex();
       }
     } finally {
+      restoreProbe();
       restore();
     }
   });
 
   test("is idempotent when run twice in a row", async () => {
     const restore = stubProviderDetect("claude-code", { detected: true, suggestedName: "Claude Code" });
+    const restoreProbe = stubProviderProbe("claude-code", { ok: true, message: "stub" });
     const restoreCodex = stubProviderDetect("codex", { detected: false });
     try {
       const config = buildConfig("detect-idempotent");
@@ -83,6 +103,7 @@ describe("runConnectorDetection", () => {
       expect(second.skipped.find((s) => s.provider === "claude-code")?.reason).toBe("exists");
     } finally {
       restoreCodex();
+      restoreProbe();
       restore();
     }
   });
@@ -150,13 +171,25 @@ describe("runConnectorDetection", () => {
   });
 
   test("skips providers without a detect method", async () => {
-    const config = buildConfig("detect-no-method");
-    // demo + linear + generic have no detect — they should land in `skipped`
-    // with reason "no-detect" and never appear in `created`.
-    const report = await runConnectorDetection(config);
-    const noDetectIds = report.skipped.filter((s) => s.reason === "no-detect").map((s) => s.provider);
-    expect(noDetectIds).toContain("demo");
-    expect(noDetectIds).toContain("linear");
-    expect(noDetectIds).toContain("generic");
+    // This test asserts only that the no-detect providers (demo/linear/
+    // generic) are reported; it doesn't care what claude-code/codex return.
+    // Stub their detect() to a fast value so the run doesn't shell out to
+    // `which` / `claude auth status` / `codex`. They still own a detect
+    // function (the stub), so they're correctly excluded from "no-detect".
+    const restoreClaude = stubProviderDetect("claude-code", { detected: false });
+    const restoreCodex = stubProviderDetect("codex", { detected: false });
+    try {
+      const config = buildConfig("detect-no-method");
+      // demo + linear + generic have no detect — they should land in `skipped`
+      // with reason "no-detect" and never appear in `created`.
+      const report = await runConnectorDetection(config);
+      const noDetectIds = report.skipped.filter((s) => s.reason === "no-detect").map((s) => s.provider);
+      expect(noDetectIds).toContain("demo");
+      expect(noDetectIds).toContain("linear");
+      expect(noDetectIds).toContain("generic");
+    } finally {
+      restoreCodex();
+      restoreClaude();
+    }
   });
 });

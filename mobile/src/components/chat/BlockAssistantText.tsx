@@ -3,6 +3,7 @@ import { Animated, Easing, Linking, StyleSheet, Text, View } from "react-native"
 import Markdown, { MarkdownIt } from "react-native-markdown-display";
 import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
+import { SelectableBlockText } from "./SelectableBlockText";
 
 type MarkdownNode = { key: string; content: string; attributes?: { href?: string } };
 type MarkdownStylesMap = Record<string, object>;
@@ -115,17 +116,20 @@ const blockTextStyles = StyleSheet.create({
     marginBottom: 4
   }
 });
-// Block-level renderers wrap inline children in a single Text so the
-// text engine can wrap runs cleanly (see comment above). `selectable`
-// is set on the wrapper so iOS' long-press gesture has something to
-// latch onto — without it, the inner inline overrides below get short-
-// circuited by a non-selectable parent.
+// Block-level renderers wrap inline children in a single selectable
+// block. On iOS that's a `TextInput multiline editable={false}` (the
+// only RN primitive that exposes the loupe + drag handles for partial
+// selection); on web/Android it falls back to `<Text selectable>` since
+// their native Text already supports range selection. Either way, the
+// outer wrapper coalesces the library's per-token inline children into
+// one text run so RN's text engine can wrap URLs and long lines
+// cleanly (see comment above).
 const renderAsText =
   (style: object): RenderRule =>
   (node, children) => (
-    <Text key={node.key} style={style} selectable>
+    <SelectableBlockText key={node.key} style={style}>
       {children}
-    </Text>
+    </SelectableBlockText>
   );
 // Inline rules (text/textgroup/link/strong/em/s/inline) need their own
 // `selectable` because react-native-markdown-display emits <Text>
@@ -182,6 +186,36 @@ const markdownRules: Record<string, RenderRule> = {
         {children}
       </Text>
     );
+  },
+  // Code blocks render as `SelectableBlockText` so iOS gets the loupe
+  // and drag handles on multi-line snippets. The library's defaults
+  // emit a single `<Text>` here, which on iOS would otherwise collapse
+  // to a Copy-all menu. The trailing-newline trim mirrors the library's
+  // behavior — the parser appends an extra `\n` at the end of fenced /
+  // indented blocks that visually shows as an empty trailing line.
+  code_block: (node, _children, _parent, styles, inheritedStyles = {}) => {
+    const raw = node.content ?? "";
+    const content = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+    return (
+      <SelectableBlockText
+        key={node.key}
+        style={[inheritedStyles, styles.code_block]}
+      >
+        {content}
+      </SelectableBlockText>
+    );
+  },
+  fence: (node, _children, _parent, styles, inheritedStyles = {}) => {
+    const raw = node.content ?? "";
+    const content = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+    return (
+      <SelectableBlockText
+        key={node.key}
+        style={[inheritedStyles, styles.fence]}
+      >
+        {content}
+      </SelectableBlockText>
+    );
   }
 };
 
@@ -216,10 +250,14 @@ function StreamingCursor() {
 const styles = StyleSheet.create({
   row: {
     alignSelf: "flex-start",
-    // Assistant replies are typically long-form and contain inline
-    // links; give them most of the viewport so URLs don't end up
-    // wrapping every few characters on a narrow phone.
-    maxWidth: "92%"
+    // Pin to a definite 92% width rather than `maxWidth`. The library's
+    // list rendering uses `flex: 1` on `bullet_list_content`, which
+    // contributes zero intrinsic width to the bubble's measurement —
+    // without a fixed parent frame the bubble sizes only to its widest
+    // non-list paragraph and list rows underneath wrap at a tiny width,
+    // visibly narrower than every other assistant message. A definite
+    // 92% gives the inner `flex: 1` columns a frame to resolve against.
+    width: "92%"
   },
   bubble: {
     backgroundColor: theme.assistantBubble,

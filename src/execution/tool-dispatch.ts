@@ -3350,7 +3350,10 @@ async function waitForMessagingPairTool(
   // long we tie up the chat-task awaiting an external event.
   const timeoutSeconds = Math.max(10, Math.min(1800, Math.round(requestedTimeoutSeconds)));
   const deadlineMs = Date.now() + timeoutSeconds * 1000;
-  const POLL_INTERVAL_MS = 1000;
+  // Server-side env override so tests don't wait full poll ticks. Production
+  // leaves it unset and gets the 1000ms default (Number(undefined)/0/NaN all
+  // fall through the `||`).
+  const POLL_INTERVAL_MS = Number(process.env.GINI_PAIR_POLL_MS) || 1000;
 
   // Validate bridge existence + kind up-front so we don't burn
   // the timeout on a typo'd name. The wait predicate itself

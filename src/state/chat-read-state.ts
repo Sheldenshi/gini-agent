@@ -130,6 +130,82 @@ export function markRead(
   };
 }
 
+// Clear the per-device read cursor for a session so the badge counts
+// the entire session as unread again. Idempotent — calling on a row
+// that doesn't exist is a no-op. Internal helper used by markUnread
+// and exposed for tests; the HTTP route uses markUnread so the badge
+// settles at "just the latest agent turn" rather than "every block
+// in the session".
+export function clearReadState(
+  instance: Instance,
+  sessionId: string,
+  deviceToken: string
+): void {
+  const db = getMemoryDb(instance);
+  db.run(
+    "DELETE FROM chat_read_state WHERE session_id = ? AND device_token = ?",
+    [sessionId, deviceToken]
+  );
+}
+
+// Mark a chat unread for the device by pinning the read cursor to the
+// block immediately before the latest assistant_text. The badge then
+// reads as just the agent's last turn (typically count = 1) rather
+// than the cumulative count of every visible block since session
+// start — that matches iOS Mail / Messages semantics, where "mark
+// unread" flags the latest message, not the entire thread.
+//
+// Edge cases:
+//   - No assistant_text in the session: nothing meaningful to unread,
+//     so the cursor is dropped entirely (same as the old clear) and
+//     the count falls back to "everything visible". This keeps the
+//     action useful on user-only chats even if the resulting badge is
+//     less precise.
+//   - The latest assistant_text is the very first visible block: no
+//     "block before" exists, so we drop the cursor and the assistant
+//     turn (plus any later blocks) becomes the unread set.
+//   - Otherwise: pin the cursor at the immediately-preceding block.
+//     Visible blocks after that cursor (the assistant_text and any
+//     trailing tool_calls / approvals) become the unread count.
+export function markUnread(
+  instance: Instance,
+  sessionId: string,
+  deviceToken: string
+): void {
+  const db = getMemoryDb(instance);
+  const latestAssistant = db
+    .query<{ ordinal: number }, [string]>(
+      `SELECT ordinal FROM chat_blocks
+       WHERE session_id = ? AND kind = 'assistant_text'
+       ORDER BY ordinal DESC LIMIT 1`
+    )
+    .get(sessionId);
+  if (!latestAssistant) {
+    clearReadState(instance, sessionId, deviceToken);
+    return;
+  }
+  const preceding = db
+    .query<{ id: string }, [string, number]>(
+      `SELECT id FROM chat_blocks
+       WHERE session_id = ? AND ordinal < ?
+       ORDER BY ordinal DESC LIMIT 1`
+    )
+    .get(sessionId, latestAssistant.ordinal);
+  if (!preceding) {
+    clearReadState(instance, sessionId, deviceToken);
+    return;
+  }
+  const at = now();
+  db.run(
+    `INSERT INTO chat_read_state (session_id, device_token, last_read_block_id, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(session_id, device_token) DO UPDATE SET
+       last_read_block_id = excluded.last_read_block_id,
+       updated_at = excluded.updated_at`,
+    [sessionId, deviceToken, preceding.id, at]
+  );
+}
+
 // Returns the per-session last-read cursor for a device as a Map
 // keyed by sessionId.
 export function getLastReadByDevice(
@@ -204,4 +280,39 @@ export function unreadCountForDevice(
     )
     .get(deviceToken);
   return row?.unread ?? 0;
+}
+
+// Per-session unread counts for the device — same accounting as
+// unreadCountForDevice, but grouped so the mobile chat list can render
+// a badge per row instead of the cross-session total. Sessions with
+// zero unread blocks are omitted from the map (callers can default to
+// 0). A single SQL trip mirrors the aggregate query so the list
+// endpoint's render cost stays flat regardless of session count.
+export function unreadCountsByDevice(
+  instance: Instance,
+  deviceToken: string
+): Map<string, number> {
+  const db = getMemoryDb(instance);
+  const kindList = COUNTABLE_KINDS.map((k) => `'${k}'`).join(",");
+  const rows = db
+    .query<{ session_id: string; unread: number }, [string]>(
+      `WITH cursor_ordinals AS (
+         SELECT crs.session_id, cb.ordinal AS cutoff_ordinal
+         FROM chat_read_state crs
+         LEFT JOIN chat_blocks cb ON cb.id = crs.last_read_block_id
+         WHERE crs.device_token = ?
+       )
+       SELECT b.session_id, COUNT(*) AS unread
+       FROM chat_blocks b
+       LEFT JOIN cursor_ordinals co ON co.session_id = b.session_id
+       WHERE b.kind IN (${kindList})
+         AND b.ordinal > COALESCE(co.cutoff_ordinal, -1)
+       GROUP BY b.session_id`
+    )
+    .all(deviceToken);
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    if (row.unread > 0) counts.set(row.session_id, row.unread);
+  }
+  return counts;
 }

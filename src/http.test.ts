@@ -2,7 +2,45 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
+import { listProviders } from "./integrations/connectors/registry";
 import type { RuntimeConfig } from "./types";
+
+// Stub a provider's host-environment `detect()` so the connector-detection
+// endpoint test stays deterministic AND fast regardless of what's installed
+// on the developer's PATH. The production `detect()` for claude-code / codex
+// shells out via spawnSync (`which`, `claude auth status`), which on a machine
+// with those CLIs installed dominates this test's wall time (the unstubbed
+// detect endpoint test measured 1.524641s). Mirrors the same in-place
+// swap-and-restore helper used by src/jobs/connector-detection.test.ts. The
+// registry is a process-wide singleton, so the returned restore fn MUST run in
+// a finally to avoid leaking the stub into sibling tests.
+function stubProviderDetect(
+  providerId: string,
+  value: { detected: boolean; suggestedName?: string; message?: string }
+): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.detect;
+  provider.detect = async () => value;
+  return () => {
+    provider.detect = previous;
+  };
+}
+
+// Companion to stubProviderDetect. After connector auto-detection creates a
+// record for a provider that exposes a `probe()`, runConnectorDetection runs
+// an initial checkConnector → provider.probe, which for claude-code shells out
+// to `claude auth status` again. Stub the probe so the detection endpoint
+// test never touches a real subprocess. Same swap-and-restore discipline.
+function stubProviderProbe(providerId: string, value: { ok: boolean; message: string }): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.probe;
+  provider.probe = async () => value;
+  return () => {
+    provider.probe = previous;
+  };
+}
 
 describe("runtime api", () => {
   test("applies approved improvement proposals and audits the decision", async () => {
@@ -391,10 +429,13 @@ describe("runtime api", () => {
     // chunk is "".
     const reader = response.body?.getReader();
     // Race the read against a short timeout; the heartbeat doesn't fire for
-    // 1s, so an immediate read should observe an empty buffer.
+    // 1s, so an immediate read should observe an empty buffer. The timeout
+    // value only needs to lose to a real event (there are none queued) and
+    // win against the 1s heartbeat — 30ms is as conclusive as 200ms here and
+    // doesn't burn the wall when the suite runs the whole describe block.
     const winner = await Promise.race([
       reader?.read(),
-      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 200))
+      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 30))
     ]) as { value?: Uint8Array; done?: boolean };
     await reader?.cancel();
     const text = winner?.value ? new TextDecoder().decode(winner.value) : "";
@@ -741,14 +782,35 @@ describe("runtime api", () => {
   test("POST /api/connectors/detect runs the detection job and is idempotent", async () => {
     const config = testConfig("connector-detect-endpoint");
     const handler = createHandler(config);
-    const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
-    expect(first).toHaveProperty("considered");
-    expect(first).toHaveProperty("created");
-    // The second call should not create any new records — the detection
-    // logic is idempotent at the registry+state level.
-    const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
-    const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
-    expect(createdProviders).toEqual([]);
+    // Stub the only two providers with a host-shelling detect() so the run
+    // is deterministic and never spawns `which` / `claude auth status`.
+    // claude-code detects positive → the first endpoint call creates an
+    // auto-source connector; codex detects negative. The second call must
+    // then skip claude-code with reason "exists", exercising the full
+    // create-then-skip idempotency contract through the HTTP route.
+    const restoreClaude = stubProviderDetect("claude-code", {
+      detected: true,
+      suggestedName: "Claude Code",
+      message: "stub"
+    });
+    const restoreClaudeProbe = stubProviderProbe("claude-code", { ok: true, message: "stub" });
+    const restoreCodex = stubProviderDetect("codex", { detected: false });
+    try {
+      const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+      expect(first).toHaveProperty("considered");
+      expect(first).toHaveProperty("created");
+      expect((first.created as Array<{ provider: string }>).map((c) => c.provider)).toContain("claude-code");
+      // The second call should not create any new records — the detection
+      // logic is idempotent at the registry+state level.
+      const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+      const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
+      expect(createdProviders).toEqual([]);
+      expect((second.skipped as Array<{ provider: string; reason: string }>).find((s) => s.provider === "claude-code")?.reason).toBe("exists");
+    } finally {
+      restoreClaude();
+      restoreClaudeProbe();
+      restoreCodex();
+    }
   });
 
   test("GET /api/connectors/providers returns the registry", async () => {
@@ -3069,6 +3131,149 @@ describe("runtime api", () => {
       expect(badgeB.unread).toBe(1);
     });
 
+    test("DELETE /api/chat/:id/read marks just the latest assistant turn unread", async () => {
+      const config = testConfig("chat-unread-swipe");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "swipe" })
+      });
+      // Realistic chat: a few user messages culminating in an assistant
+      // reply. After Mark Unread the badge should show 1 (just the
+      // assistant turn), not 4 (every visible block).
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "still hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "ok last one" });
+      const assistant = insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: session.id,
+        text: "hello back",
+        streaming: false
+      });
+
+      // Both devices catch up first so the baseline badge is 0.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerA, body: JSON.stringify({ lastReadBlockId: assistant.id })
+      });
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerB, body: JSON.stringify({ lastReadBlockId: assistant.id })
+      });
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(0);
+
+      // iPhone A swipes "Mark unread". The badge surfaces just the
+      // latest assistant turn (1), not the full session.
+      const cleared = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(cleared.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+      // iPhone B is unaffected (still caught up).
+      expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
+
+      // Idempotent — replaying lands on the same cursor; still 1.
+      const second = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(second.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "DELETE", headers: headerA },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${session.id}/read`,
+        { method: "DELETE" },
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+    });
+
+    test("GET /api/unread returns per-session unread counts scoped to the device", async () => {
+      const config = testConfig("chat-unread-counts");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionA.id, text: "1" });
+      const a2 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "2"
+      });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionB.id, text: "3" });
+
+      // Fresh device A — both sessions show their full count.
+      const initial = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(initial.counts[sessionA.id]).toBe(2);
+      expect(initial.counts[sessionB.id]).toBe(1);
+
+      // A catches up on session A — it drops out of the map for A.
+      await call(handler, config, `/api/chat/${sessionA.id}/read`, {
+        method: "POST",
+        headers: headerA,
+        body: JSON.stringify({ lastReadBlockId: a2.id })
+      });
+      const after = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(after.counts[sessionA.id]).toBeUndefined();
+      expect(after.counts[sessionB.id]).toBe(1);
+
+      // Device B is unaffected.
+      const bView = await call(handler, config, "/api/unread", { headers: headerB });
+      expect(bView.counts[sessionA.id]).toBe(2);
+      expect(bView.counts[sessionB.id]).toBe(1);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        "/api/unread",
+        {},
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+
+      // Unauth: 401.
+      const noAuth = await rawCall(handler, config, "/api/unread");
+      expect(noAuth.status).toBe(401);
+    });
+
     test("read + badge endpoints require authentication", async () => {
       const config = testConfig("chat-read-auth");
       const handler = createHandler(config);
@@ -3253,6 +3458,24 @@ function testConfig(instance: string): RuntimeConfig {
   const root = "/tmp/gini-http-tests";
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
+  // The unreachable-CDP test posts to the real /api/browser/connect route,
+  // which omits the in-process probe override by design. Shrink the probe via
+  // the server-side env knob so the test exercises the 400 mapping without
+  // burning the production probe deadline. Server env, not POST body, so the
+  // network-input boundary stays intact.
+  process.env.GINI_CDP_PROBE_TIMEOUT_MS = "60";
+  process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
+  // resumeChatTask polls for the loop's flip to waiting_approval before
+  // staging a tool result. In-process the flip lands within a couple of
+  // mutateState boundaries, and several fill_secret / approval tests seed a
+  // task that never reaches waiting_approval at all — so the production
+  // 1000ms/100ms budget is pure dead wall here (the fill_secret leak test
+  // measured 1079.00ms in isolation, nearly all of it this poll). Shrink the
+  // budget via the server-side env knob the production code reads (default
+  // preserved at 1000/100); the race still resolves well within 40ms over 5ms
+  // ticks in-process.
+  process.env.GINI_RESUME_WAIT_BUDGET_MS = "40";
+  process.env.GINI_RESUME_WAIT_TICK_MS = "5";
   rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
   return {
     instance,

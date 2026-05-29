@@ -31,11 +31,13 @@ beforeAll(() => {
   process.env.GINI_STATE_ROOT = ROOT;
   process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
   process.env.GINI_EMBEDDING_PROVIDER = "echo";
+  process.env.GINI_RERANKER_PROVIDER = "none";
 });
 
 afterAll(() => {
   closeAllMemoryDbs();
   delete process.env.GINI_EMBEDDING_PROVIDER;
+  delete process.env.GINI_RERANKER_PROVIDER;
   rmSync(ROOT, { recursive: true, force: true });
 });
 

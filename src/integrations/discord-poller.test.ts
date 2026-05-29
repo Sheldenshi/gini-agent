@@ -828,12 +828,11 @@ describe("discord poller supervisor", () => {
   });
 
   test("gateway-pushed MESSAGE_CREATE for a delivery-target channel collapses the next poll sleep", async () => {
-    // Configure the poller with a long pollIntervalMs so the test
-    // doesn't accidentally pass by simply waiting out the periodic
-    // tick. With pollIntervalMs=5000ms and the wake fired ~50ms after
-    // the first poll cycle, the inbound message should land in well
-    // under 1s — proof that the gateway push is what drove the
-    // re-poll, not the periodic timer.
+    // Configure the poller with a pollIntervalMs comfortably longer than
+    // the success threshold below so the test doesn't accidentally pass by
+    // simply waiting out the periodic tick. With pollIntervalMs=1000ms the
+    // gateway-driven re-poll must land in under 500ms — well short of the
+    // periodic tick — proving the push drove the re-poll, not the timer.
     const config = testConfig("disc-push-wake");
     const { client, enqueue, sendCalls } = programmableClient();
     setMessagingDeps({ discordClientFactory: () => client });
@@ -848,7 +847,7 @@ describe("discord poller supervisor", () => {
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: capturingGateway(slot),
-      pollIntervalMs: 5000,
+      pollIntervalMs: 1000,
       typingRefreshMs: 20
     });
 
@@ -870,7 +869,9 @@ describe("discord poller supervisor", () => {
     slot.fire?.({ channelId: "chan-1" });
     await waitFor(() => sendCalls.length >= 1, "reply dispatched after gateway-pushed wake");
     const elapsed = Date.now() - wakeStart;
-    expect(elapsed).toBeLessThan(2500);
+    // Must be well under the 1000ms periodic tick so the pass can only be
+    // attributed to the gateway push collapsing the sleep, not the timer.
+    expect(elapsed).toBeLessThan(500);
 
     await supervisor.stopAll();
   });
@@ -893,7 +894,11 @@ describe("discord poller supervisor", () => {
     const supervisor = createDiscordPollerSupervisor(config, {
       clientFactory: () => client,
       gatewayConnector: capturingGateway(slot),
-      pollIntervalMs: 5000,
+      // Keep the periodic tick comfortably longer than the negative-window
+      // sleep below so a fired tick can't masquerade as a successful wake.
+      // 1000ms >> the 150ms wait gives the same assertion strength as the
+      // former 5000/500 pairing at a fraction of the wall time.
+      pollIntervalMs: 1000,
       typingRefreshMs: 20
     });
     enqueue("chan-1", []);
@@ -902,12 +907,14 @@ describe("discord poller supervisor", () => {
 
     // Queue an inbound for chan-1 but fire a push for an unrelated
     // channel. The wake must NOT collapse the sleep; the reply
-    // dispatch should NOT arrive in the next ~500ms.
+    // dispatch should NOT arrive in the negative window below (150ms,
+    // far short of the 1000ms periodic tick, so silence proves the
+    // unrelated push was filtered rather than the timer not yet firing).
     enqueue("chan-1", [
       makeMessage({ id: "500", content: "should not wake", author: { id: "user-1", username: "lo", bot: false } })
     ]);
     slot.fire?.({ channelId: "unrelated-9999" });
-    await Bun.sleep(500);
+    await Bun.sleep(150);
     expect(sendCalls.length).toBe(0);
 
     await supervisor.stopAll();

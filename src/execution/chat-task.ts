@@ -1489,8 +1489,14 @@ export async function resumeChatTask(
   // for the manual-click case and bounded enough for automated
   // /connect callers (CLI scripts, test harnesses, the messaging
   // pollers) that race the loop more aggressively.
-  const RESUME_WAIT_FOR_WAITING_BUDGET_MS = 1000;
-  const RESUME_WAIT_FOR_WAITING_TICK_MS = 100;
+  // The budget/tick are overridable via env so in-process test harnesses
+  // (which resolve the race within a couple of mutateState boundaries, or
+  // never enter the loop because their task never reaches waiting_approval)
+  // don't pay the full 1s wall on every resume. Production keeps the
+  // 1000/100 defaults — the `|| DEFAULT` fallback fires for unset/zero/NaN
+  // env, so the operational budget is unchanged unless an operator opts in.
+  const RESUME_WAIT_FOR_WAITING_BUDGET_MS = Number(process.env.GINI_RESUME_WAIT_BUDGET_MS) || 1000;
+  const RESUME_WAIT_FOR_WAITING_TICK_MS = Number(process.env.GINI_RESUME_WAIT_TICK_MS) || 100;
   const resumeDeadline = Date.now() + RESUME_WAIT_FOR_WAITING_BUDGET_MS;
   let stage = await stageResume(config, taskId, toolCallId, toolResult);
   while (stage.notYetWaiting && Date.now() < resumeDeadline) {
