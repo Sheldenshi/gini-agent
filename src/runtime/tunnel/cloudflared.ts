@@ -14,7 +14,7 @@ export interface CloudflaredLaunch {
 }
 
 const URL_REGEX = /https?:\/\/[A-Za-z0-9.-]+\.trycloudflare\.com/;
-const TERMINATE_CAP_MS = 5_000;
+export const TERMINATE_CAP_MS = 5_000;
 
 export interface LaunchOptions {
   /** Override the binary path. Defaults to `cloudflared` from PATH. */

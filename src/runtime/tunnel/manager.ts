@@ -1,7 +1,7 @@
 import type { RuntimeConfig } from "../../types";
 import { appendLog, purgeTunnelDevices } from "../../state";
 import { setRedactionPublicUrl, setRedactionSecret, redact } from "./redact";
-import { launchCloudflared, type CloudflaredLaunch } from "./cloudflared";
+import { launchCloudflared, TERMINATE_CAP_MS, type CloudflaredLaunch } from "./cloudflared";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
 import { atomicWriteFile } from "../../atomic-write";
@@ -621,7 +621,7 @@ class TunnelManager {
       this.generation += 1;
       try {
         // Commit enabled:true to config first. The proxy reads tunnel.enabled
-        // on every request; ordering is important for the 5000 ms exposure cap.
+        // on every request; ordering is important for the TERMINATE_CAP_MS exposure cap.
         const persisted = this.persistTunnel( { enabled: true });
         setRedactionSecret(persisted.secret);
         const result = await this.swapCloudflared(webPort, persisted.secret);
@@ -652,7 +652,7 @@ class TunnelManager {
         appendLog(this.config.instance, "tunnel.enabled", { generation: this.generation });
         // Fire-and-forget Notes refresh OUTSIDE the apply chain. Enqueuing
         // refreshNotes here would put a 15s osascript timeout ahead of a
-        // follow-up disable() in the apply chain, defeating the 5000ms
+        // follow-up disable() in the apply chain, defeating the TERMINATE_CAP_MS
         // exposure cap on disable (see docs/adr/tunnel-and-mobile-access.md
         // "Architecture (summary)"). The bare `runRefreshNotes()`
         // call updates `this.snapshot` and `this.notesAvailable` outside
@@ -695,7 +695,7 @@ class TunnelManager {
     return this.enqueue(async () => {
       this.generation += 1;
       // Try to commit enabled:false BEFORE killing cloudflared — ordering
-      // for the 5000 ms exposure cap, see
+      // for the TERMINATE_CAP_MS exposure cap, see
       // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
       // If the config write throws (EACCES, disk full), we MUST still stop
       // cloudflared so the public URL doesn't keep accepting traffic from
@@ -972,7 +972,7 @@ class TunnelManager {
     // Split the config commit (queued — must serialize with enable / disable /
     // rotateSecret) from the actual osascript side effect (NOT queued — the
     // 15s timeout would sit ahead of a follow-up disable() on the apply chain
-    // and break the 5000ms exposure cap — see
+    // and break the TERMINATE_CAP_MS exposure cap — see
     // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)"). Pattern
     // mirrors enable()'s fire-and-forget Notes refresh.
     let scheduledGeneration = 0;
@@ -1140,7 +1140,7 @@ class TunnelManager {
 
   /** Stop cloudflared as part of gateway shutdown. Does not modify config.
    *  The publicUrl sibling file is unlinked BEFORE we await cloudflared.stop()
-   *  because the SIGTERM drain is bounded at 5000 ms — if cloudflared
+   *  because the SIGTERM drain is bounded at TERMINATE_CAP_MS — if cloudflared
    *  termination overruns the cap, `process.exit(0)` fires and an
    *  unlinkSync queued after the await would never run. The proxy reads
    *  the file per-request; removing it first means a fresh boot can't
@@ -1154,7 +1154,7 @@ class TunnelManager {
   async stopForShutdown(): Promise<void> {
     this.shuttingDown = true;
     // Stop the edge probe before awaiting cloudflared so the SIGTERM
-    // drain's 5000ms cap isn't competing with a probe wake. The probe's
+    // drain's TERMINATE_CAP_MS cap isn't competing with a probe wake. The probe's
     // own shuttingDown guard would also bail any in-flight fetch's
     // result-handling, but unscheduling the interval first is the
     // cleaner termination order.
