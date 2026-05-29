@@ -180,6 +180,11 @@ curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
 # Remove one label.
 curl -s -X DELETE -H "Authorization: Bearer $GITHUB_TOKEN" \
   "https://api.github.com/repos/$OWNER/$REPO/issues/128/labels/needs-triage"
+
+# List the labels defined on the repo.
+curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+  "https://api.github.com/repos/$OWNER/$REPO/labels?per_page=100" \
+  | jq -r '.[] | "\(.name)\t\(.description // "")"'
 ```
 
 Confirm a label exists (`gh label list`) before applying it — GitHub
