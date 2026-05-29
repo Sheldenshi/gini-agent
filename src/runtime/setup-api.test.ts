@@ -276,6 +276,48 @@ describe("setup-api", () => {
     expect(persisted.provider?.promptCacheRetention).toBe("24h");
   });
 
+  test("POST openai with payload.promptCacheRetention overrides the disk-preserved value", async () => {
+    // The settings dialog sends `promptCacheRetention` in its payload
+    // when the operator picks a value other than "(no change)". The
+    // payload value must win over the disk-preserved value so the
+    // operator can change the bucket without rotating the apiKey.
+    const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+    const seeded = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    seeded.provider = { name: "openai", model: "gpt-5.5", promptCacheRetention: "in_memory" };
+    writeFileSync(cfgPath, `${JSON.stringify(seeded, null, 2)}\n`);
+    config.provider = seeded.provider;
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      model: "gpt-5.5",
+      apiKey: "sk-payload-override",
+      promptCacheRetention: "24h"
+    });
+    expect(result.ok).toBe(true);
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider?.promptCacheRetention).toBe("24h");
+  });
+
+  test("POST openai with empty-string payload.promptCacheRetention clears the field", async () => {
+    // The settings dialog maps "Default (OpenAI picks per-model)" to
+    // an explicit "" send; setSetupProvider must treat that as a
+    // clear, not preserve the prior disk value. Otherwise the operator
+    // cannot back out of "24h" once selected.
+    const cfgPath = join(s.stateRoot, "instances", config.instance, "config.json");
+    const seeded = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    seeded.provider = { name: "openai", model: "gpt-5.5", promptCacheRetention: "24h" };
+    writeFileSync(cfgPath, `${JSON.stringify(seeded, null, 2)}\n`);
+    config.provider = seeded.provider;
+    const result = await setSetupProvider(config, {
+      provider: "openai",
+      model: "gpt-5.5",
+      apiKey: "sk-clear-payload",
+      promptCacheRetention: ""
+    });
+    expect(result.ok).toBe(true);
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider?.promptCacheRetention).toBeUndefined();
+  });
+
   test("POST openai with disk-cleared promptCacheRetention does not resurrect from in-memory snapshot", async () => {
     // Disk is authoritative when readable: a successful disk read
     // returns whatever's there, including undefined. So if an operator

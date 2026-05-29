@@ -187,15 +187,25 @@ export async function setSetupProvider(
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
       : undefined;
-    // Preserve `promptCacheRetention` from the latest persisted provider
-    // config when the same provider name is being re-saved. The web
-    // setup form has no UI for the field, so without this any unrelated
-    // save (model swap, baseUrl edit) would silently strip the retention
-    // bucket the operator chose by hand. ZDR-relevant per the OpenAI
-    // prompt-caching docs, so the rewrite cannot drop it. Source the
-    // value from disk (not from in-memory config) so an interleaving CLI
-    // write that happened after gateway boot is not clobbered.
-    const carriedValue = diskPromptCacheRetention(config.instance, providerName, config);
+    // Three-state precedence for `promptCacheRetention`:
+    //   - Payload key present (any string, including ""): operator-set
+    //     value wins. Empty string is treated by normalizeRetentionValue
+    //     as "send nothing", matching the resolver semantics and the
+    //     CLI's `--prompt-cache-retention ""` clear behavior.
+    //   - Payload key absent: fall back to the latest persisted value
+    //     on disk so an unrelated save (model swap, apiKey rotation)
+    //     does not silently strip a ZDR-relevant retention bucket the
+    //     operator set elsewhere.
+    // Disk preservation re-reads from filesystem (not the gateway's
+    // boot-time in-memory snapshot) so an interleaving CLI write that
+    // happened after gateway boot is not clobbered.
+    const payloadRetention =
+      "promptCacheRetention" in payload && typeof payload.promptCacheRetention === "string"
+        ? normalizeRetentionValue(payload.promptCacheRetention)
+        : undefined;
+    const carriedValue = "promptCacheRetention" in payload && typeof payload.promptCacheRetention === "string"
+      ? payloadRetention
+      : diskPromptCacheRetention(config.instance, providerName, config);
     const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],

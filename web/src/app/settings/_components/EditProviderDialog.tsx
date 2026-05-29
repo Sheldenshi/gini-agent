@@ -41,6 +41,16 @@ export function EditProviderDialog({
   const [apiKey, setApiKey] = useState("");
   const [showKey, setShowKey] = useState(false);
   const [model, setModel] = useState<string>(currentModel ?? row.models[0] ?? "");
+  // "" means "don't send the field on this save" — preserves whatever
+  // the runtime already has on disk via the disk-sourced carry-forward
+  // in setSetupProvider. The other three values map straight to the
+  // wire field's three meanings: "default" → send "" (clear/let OpenAI
+  // pick its per-model default), "in_memory" / "24h" → send those.
+  // Per-provider note: the field is only shown for openai because the
+  // chatgpt.com codex backend rejects it with HTTP 400 and the other
+  // OpenAI-compat backends (openrouter / deepseek / local) don't
+  // document support.
+  const [retention, setRetention] = useState<string>("__keep");
 
   // Reset transient inputs whenever the dialog opens for a new row.
   // currentModel can shift if the active provider changes elsewhere; we
@@ -50,6 +60,7 @@ export function EditProviderDialog({
     setApiKey("");
     setShowKey(false);
     setModel(currentModel ?? row.models[0] ?? "");
+    setRetention("__keep");
   }, [open, row.id, currentModel, row.models]);
 
   const save = useMutation({
@@ -61,7 +72,15 @@ export function EditProviderDialog({
           // The backend treats apiKey as optional when the env var is
           // already set, so model-only edits work without a re-type.
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(model ? { model } : {})
+          ...(model ? { model } : {}),
+          // Retention follows the same "send only when the operator
+          // touched it" rule as apiKey: when the Select is left on the
+          // default "(no change)" sentinel ("__keep"), omit the key so
+          // setSetupProvider's disk-sourced carry-forward preserves
+          // whatever is currently persisted. Any other value lands on
+          // the wire — "default" sends "" to clear, "in_memory" / "24h"
+          // send themselves.
+          ...(retention !== "__keep" ? { promptCacheRetention: retention === "__default" ? "" : retention } : {})
         })
       }),
     onSuccess: async (result) => {
@@ -81,7 +100,10 @@ export function EditProviderDialog({
   // for an env-already-set edit; model is required and defaults to the
   // current selection, so toggling it back to the same value still lets
   // the user dismiss via Cancel without nagging.
-  const dirty = apiKey.trim().length > 0 || (model !== "" && model !== (currentModel ?? row.models[0] ?? ""));
+  const dirty =
+    apiKey.trim().length > 0 ||
+    (model !== "" && model !== (currentModel ?? row.models[0] ?? "")) ||
+    retention !== "__keep";
   const canSubmit = dirty && !save.isPending;
 
   return (
@@ -154,6 +176,32 @@ export function EditProviderDialog({
               </SelectContent>
             </Select>
           </div>
+
+          {row.name === "openai" ? (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="edit-retention" className="text-[13px] font-semibold text-[#C2C2C8]">Prompt cache retention</Label>
+                <span className="text-xs text-[#6A6A70]">OpenAI only</span>
+              </div>
+              <Select value={retention} onValueChange={setRetention} disabled={save.isPending}>
+                <SelectTrigger
+                  id="edit-retention"
+                  className="h-11 border-[#2A2A2E] bg-[#0E0E11] text-[13px]"
+                >
+                  <SelectValue placeholder="Select retention" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__keep" className="text-[13px]">(no change)</SelectItem>
+                  <SelectItem value="__default" className="text-[13px]">Default (OpenAI picks per-model)</SelectItem>
+                  <SelectItem value="in_memory" className="text-[13px]">In memory · 5–10 min idle, 1 h max</SelectItem>
+                  <SelectItem value="24h" className="text-[13px]">24 hours · extended (not ZDR eligible)</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">
+                Cached input bills at 10% of the base input price. Selecting <span className="font-mono text-[10px]">24h</span> persists derived cache data up to 24 hours and is not Zero Data Retention eligible per OpenAI&apos;s prompt-caching docs.
+              </p>
+            </div>
+          ) : null}
 
           <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">
             <Button
