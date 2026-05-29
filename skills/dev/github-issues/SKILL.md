@@ -133,43 +133,29 @@ curl -s -X POST -H "Authorization: Bearer $GITHUB_TOKEN" \
     '{title:$title, body:$body, labels:["bug","webhooks"], assignees:["octocat"]}')"
 ```
 
-### Bug report template
+### Body templates
 
-```text
-## Summary
-<One sentence: what breaks.>
+Two fillable templates ship alongside this skill:
 
-## Impact
-<Who or what is affected, and how badly.>
+- `templates/bug-report.md` — Summary, Impact, Steps to Reproduce,
+  Expected vs Actual, Environment, Error Output, Additional Context.
+- `templates/feature-request.md` — Problem, Who hits this, Proposed
+  direction, Alternatives considered, Out of scope, Additional Context.
 
-## Steps to Reproduce
-1. <step>
-2. <step>
+Fill one in, then pass it straight to `gh` instead of inlining a heredoc.
+The templates sit next to this SKILL.md — under the repo at
+`skills/dev/github-issues/templates/` for the bundled skill, or under
+`~/.gini/instances/<inst>/skills/dev/github-issues/templates/` for a
+user-installed copy.
 
-## Expected vs Actual
-- Expected: <what should happen>
-- Actual: <what happens instead>
-
-## Environment
-- Build / commit: <sha or version>
-- Platform: <os / browser / runtime>
+```bash
+gh issue create --title "…" --label "bug" \
+  --body-file skills/dev/github-issues/templates/bug-report.md
 ```
 
-### Feature request template
-
-```text
-## Problem
-<The user-facing problem, not a pre-chosen solution.>
-
-## Who hits this
-<Which users or workflows run into it, and how often.>
-
-## Proposed direction
-<A sketch of one way to solve it — open to alternatives.>
-
-## Out of scope
-<Adjacent things this issue deliberately does not cover.>
-```
+With curl, read the file into the `body` field: `jq -nc --arg b "$(cat
+templates/bug-report.md)" '{title:"…", body:$b}'`. Edit the placeholders
+before submitting — don't file an issue with the `<!-- … -->` hints intact.
 
 ## 3. Managing Issues
 
