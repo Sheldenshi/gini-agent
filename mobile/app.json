@@ -11,7 +11,7 @@
       "policy": "appVersion"
     },
     "updates": {
-      "url": "https://u.expo.dev/REPLACE_AFTER_EAS_INIT",
+      "url": "https://u.expo.dev/d3a0b9e3-a377-4827-bf3c-274b519f305a",
       "fallbackToCacheTimeout": 0
     },
     "ios": {
@@ -69,6 +69,6 @@
         }
       }
     },
-    "owner": "sheldenshi"
+    "owner": "lilac-labs"
   }
 }
