@@ -215,9 +215,18 @@ describe("gini run", () => {
     const h = makeHarness("shutdown-flush");
     const { child, stdout, exit } = await spawnRun(h);
     await stdout;
+    const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
+    // Wait for the runtime child to finish booting (its "listening" line lands
+    // in the log) before tearing down. The parent banner (`await stdout`)
+    // only proves the child was spawned, not that it reached steady state.
+    // Sending SIGTERM mid-boot lets the parent forward the signal before the
+    // child's scheduler loops have settled into their short steady-state
+    // sleeps; under parallel load the resulting drain can run long enough to
+    // race the parent's SIGKILL deadline, killing the child before it writes
+    // the shutdown marker this test asserts on.
+    await waitForLogMarker(logPath, "Gini runtime listening");
     child.kill("SIGTERM");
     await exit;
-    const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
     expect(existsSync(logPath)).toBe(true);
     const contents = readFileSync(logPath, "utf8");
     // Marker comes from src/server.ts SIGTERM handler. The instance suffix
