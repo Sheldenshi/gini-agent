@@ -262,8 +262,24 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     return applyResponsePolicy(forwardTunnelRequest(url, request, headers));
   }
 
+  // A Bearer was supplied but didn't match the live tunnel secret — most
+  // commonly because the operator rotated the secret while the mobile app
+  // held a stale credential. Return a generic 401 so the mobile auth gate
+  // (`isUnauthorized`, which only matches 401) can drop the bearer and
+  // bounce the user to /setup. A 401 challenge does not reveal that this
+  // is a tunneled gateway specifically — any HTTPS endpoint can issue one
+  // — so the opacity property the 404 path defends is preserved on the
+  // unauthenticated surface below.
+  if (bearer) {
+    return new NextResponse("Unauthorized", { status: 401 });
+  }
+
   // No bootstrap, no cookie, no Bearer — 404 (do NOT reveal the existence of
-  // the gateway via a richer error).
+  // the gateway via a richer error). A mismatched cookie also lands here:
+  // cookie-bearing requests are browser sessions, and a 401 would not help
+  // a browser that cannot programmatically clear its own cookie jar from
+  // an unauthenticated response, so the opaque 404 stays the right answer
+  // for that path.
   return notFound();
 }
 

@@ -139,11 +139,46 @@ describe("proxy Bearer-auth fallback", () => {
     expect(res.status).toBe(200);
   });
 
-  test("Bearer with wrong value → 404", async () => {
+  test("Bearer with wrong value → 401 so mobile drops the stale credential", async () => {
+    // A Bearer-bearing request that doesn't match the live secret most
+    // often means the operator rotated the secret while the mobile app
+    // held a stale credential. Returning 401 lets the mobile auth gate
+    // recognize the unauthorized state and bounce the user to /setup;
+    // 401 itself doesn't reveal this is a tunneled gateway specifically
+    // because any HTTPS endpoint can issue a 401 challenge.
     writeConfig({ enabled: true, secret: SECRET });
     writePublicUrl(TUNNEL_ORIGIN);
     const res = await proxy(
       makeRequest({ path: "/api/runtime/chat", authorization: `Bearer ${"Y".repeat(32)}` })
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("cookie with wrong value → 404 (browsers stay on the opaque path)", async () => {
+    // Cookie-bearing requests are browser sessions; a 401 wouldn't help a
+    // browser that can't programmatically clear its own cookie jar from an
+    // unauthenticated response, so the opaque 404 stays right for them.
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({
+        path: "/api/runtime/chat",
+        cookie: `gini_tunnel_session=${"Y".repeat(32)}`
+      })
+    );
+    expect(res.status).toBe(404);
+  });
+
+  test("Bearer with wrong value + tunnel disabled → 404 (disable wins)", async () => {
+    // Disabled tunnel must opaque-out before any 401 challenge — there is
+    // no live secret to challenge against once the tunnel is down.
+    writeConfig({ enabled: false, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({
+        path: "/api/runtime/chat",
+        authorization: `Bearer ${"Y".repeat(32)}`
+      })
     );
     expect(res.status).toBe(404);
   });
@@ -159,17 +194,31 @@ describe("proxy Bearer-auth fallback", () => {
     expect(res.status).toBe(404);
   });
 
-  test("Bearer with malformed scheme prefix → 404", async () => {
-    // Multiple spaces and missing scheme name both fall through to the
-    // unauthorized branch; only the exact `Bearer <token>` shape passes.
+  test("malformed Authorization shape (no Bearer prefix) → 404", async () => {
+    // `bearer` lowercase, `Token`, and missing-token forms all fail the
+    // `^Bearer (.+)$` parser and produce a null bearer, so they hit the
+    // "no auth at all" branch and 404. The exact `Bearer <token>` shape
+    // is the only one that even reaches the secret comparison.
     writeConfig({ enabled: true, secret: SECRET });
     writePublicUrl(TUNNEL_ORIGIN);
-    for (const bad of [`Bearer  ${SECRET}`, `bearer ${SECRET}`, `Token ${SECRET}`, "Bearer "]) {
+    for (const bad of [`bearer ${SECRET}`, `Token ${SECRET}`, "Bearer "]) {
       const res = await proxy(
         makeRequest({ path: "/api/runtime/chat", authorization: bad })
       );
       expect(res.status).toBe(404);
     }
+  });
+
+  test("Bearer with extra leading whitespace token → 401 (Bearer parsed but mismatched)", async () => {
+    // `Bearer  <secret>` parses as Bearer with a leading-space token, which
+    // doesn't constant-time-equal the live secret; so it hits the mismatch
+    // branch and gets the same 401 a rotated-secret mobile client would.
+    writeConfig({ enabled: true, secret: SECRET });
+    writePublicUrl(TUNNEL_ORIGIN);
+    const res = await proxy(
+      makeRequest({ path: "/api/runtime/chat", authorization: `Bearer  ${SECRET}` })
+    );
+    expect(res.status).toBe(401);
   });
 
   test("Bearer + denied path → 404", async () => {
