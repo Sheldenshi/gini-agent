@@ -41,9 +41,9 @@ jobs:
           echo "Changed files in mobile/:"
           echo "$changed"
           if echo "$changed" | grep -E '^mobile/(app\.json|eas\.json|plugins/|ios-extensions/|ios/|android/)' >/dev/null; then
-            echo "::error::Native config changed (app.json / eas.json / plugins/ / ios-extensions/ / ios/ / android/). Run \`eas build\` + \`eas submit\` manually instead of OTA."
+            echo "::notice::Native config changed (app.json / eas.json / plugins/ / ios-extensions/ / ios/ / android/). Skipping OTA — run \`eas build\` + \`eas submit\` manually instead."
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
-            exit 1
+            exit 0
           fi
           if echo "$changed" | grep -E '^mobile/package\.json$' >/dev/null; then
             echo "::warning::mobile/package.json changed — make sure no native dependency was added. If you added something like react-native-* or expo-* with a config plugin, cancel this run and do a full eas build."
@@ -51,23 +51,28 @@ jobs:
           echo "needs_build=false" >> "$GITHUB_OUTPUT"
 
       - uses: oven-sh/setup-bun@v2
+        if: steps.detect.outputs.needs_build == 'false'
         with:
           bun-version: 1.3.13
 
       - uses: expo/expo-github-action@v8
+        if: steps.detect.outputs.needs_build == 'false'
         with:
           eas-version: latest
           token: ${{ secrets.EXPO_TOKEN }}
 
       - name: Install mobile deps
+        if: steps.detect.outputs.needs_build == 'false'
         run: bun install --frozen-lockfile
         working-directory: mobile
 
       - name: Typecheck
+        if: steps.detect.outputs.needs_build == 'false'
         run: bun run typecheck
         working-directory: mobile
 
       - name: Publish update
+        if: steps.detect.outputs.needs_build == 'false'
         env:
           EAS_BRANCH: ${{ github.event.inputs.branch || 'production' }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message || github.sha }}
