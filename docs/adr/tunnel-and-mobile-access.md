@@ -186,6 +186,24 @@ single-operator pattern. The same-UID-local-process threat is out of scope
 - Cloudflare's free quick tunnels reject beyond 200 simultaneous in-flight
   requests with a 429. Gini surfaces the 429 to the client without retry.
 
+### Quick-tunnel URL ephemerality
+
+Cloudflare quick tunnels (`*.trycloudflare.com`) are intentionally ephemeral:
+- A fresh hostname is assigned on every `cloudflared` restart.
+- Cloudflare can revoke the hostname at any time without notice.
+- There is no DNS persistence and no SLA on quick-tunnel availability.
+
+When the hostname changes, any scanned QR code (or a deep-link saved by the
+mobile app from a prior connection) becomes invalid until the operator
+re-scans the new QR. To make this transparent to the mobile client, enable
+the Apple Notes mirror via the settings card. The mirror writes the current
+bootstrap URL to a dedicated note in iCloud; the mobile app reads that note
+on launch and recovers the live URL automatically across rotations.
+
+For deployments that need a stable URL, use a named Cloudflare tunnel with
+a custom hostname rather than the ephemeral quick-tunnel mode. That is a
+separate, future feature.
+
 ## Alternatives considered
 
 - **Named tunnel (paid Cloudflare account).** Removes the SSE-buffering and

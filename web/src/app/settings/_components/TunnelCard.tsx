@@ -16,7 +16,8 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { api } from "@/lib/api";
-import { EyeOff, Loader2, RefreshCw, RotateCw, ShieldAlert } from "lucide-react";
+import { shouldShowEphemeralWarning } from "@/lib/tunnel-warning";
+import { EyeOff, Info, Loader2, RefreshCw, RotateCw, ShieldAlert } from "lucide-react";
 
 interface TunnelSnapshot {
   enabled: boolean;
@@ -235,6 +236,23 @@ export function TunnelCard() {
           <p className="rounded bg-destructive/10 px-3 py-2 text-sm text-destructive">
             <span className="font-medium">Last error:</span> {data.lastError}
           </p>
+        ) : null}
+
+        {shouldShowEphemeralWarning({
+          tunnelEnabled: Boolean(data?.enabled),
+          notesEnabled: Boolean(data?.appleNotes.enabled)
+        }) ? (
+          <div
+            className="flex items-start gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100"
+            data-testid="tunnel-ephemeral-warning"
+          >
+            <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
+            <div>
+              Quick tunnel URLs are ephemeral — Cloudflare may rotate or revoke this hostname at any
+              time. Enable the Apple Notes mirror so your phone can read the new URL automatically
+              when this happens.
+            </div>
+          </div>
         ) : null}
 
         <div className="space-y-2 rounded border bg-muted/30 px-3 py-3 text-sm">

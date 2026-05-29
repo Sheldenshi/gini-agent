@@ -89,6 +89,8 @@ Closing the non-loopback fallback path blocks the DNS-rebinding shape where an a
 
 For Cloudflare quick tunnels, a parallel trust lane bypasses the `GINI_TRUSTED_ORIGINS` requirement on a per-request basis: the Next.js proxy (`web/src/proxy.ts`) verifies the inbound `Host` against the live tunnel hostname read from the runtime's tunnel state file and stamps `x-gini-tunnel-vetted: 1` after the secret-path / cookie gate passes. The BFF CSRF guard accepts vetted requests on a non-loopback Host without requiring an explicit `GINI_TRUSTED_ORIGINS` entry for the rotating trycloudflare URL. The marker is un-forgeable end-to-end because the proxy strips any inbound `x-gini-tunnel-vetted` header before any branching decision and only stamps it after passing the secret/cookie gate; the strip-then-stamp boundary is the trust enforcer. See [BFF trust boundary ADR](adr/bff-trust-boundary.md) for the full marker contract, threat model, and alternatives considered.
 
+The quick-tunnel hostname is ephemeral — Cloudflare assigns a fresh `*.trycloudflare.com` on every `cloudflared` restart and may revoke it without notice — so enable the Apple Notes mirror on the settings TunnelCard to let the mobile app pick up the rotated URL automatically. See the [Quick-tunnel URL ephemerality](adr/tunnel-and-mobile-access.md#quick-tunnel-url-ephemerality) section of the tunnel ADR for the full operator guidance.
+
 ## Lifecycle Commands
 
 | Command | Behavior |
