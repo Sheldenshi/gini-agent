@@ -357,7 +357,15 @@ async function callToolCallingChatCompletions(
     ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
-    stream: wantStream
+    stream: wantStream,
+    // Pin the default (non-extended) prompt cache tier on every
+    // OpenAI-compatible chat-completions call. "in_memory" is what the
+    // OpenAI docs document for prompts ≥ 1024 tokens (5–10 min idle, 1
+    // hour max) — explicitly NOT "24h", which is documented as not
+    // Zero Data Retention eligible. openrouter / deepseek / local
+    // accept-but-ignore unknown fields, so the value is a no-op there.
+    // Codex never hits this builder.
+    prompt_cache_retention: "in_memory"
   };
   if (tools.length > 0) {
     body.tools = tools;
@@ -1448,7 +1456,8 @@ async function callStructuredChatCompletions<T>(
         { role: "system", content: request.system },
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
-      stream: false
+      stream: false,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -1629,7 +1638,8 @@ async function callOpenAIResponses(
             { type: "input_text", text: input }
           ]
         }
-      ]
+      ],
+      prompt_cache_retention: "in_memory"
     })
   });
 
@@ -1669,7 +1679,8 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "system", content: systemContext },
         { role: "user", content: input }
       ],
-      stream: false
+      stream: false,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -2185,6 +2196,14 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "functions",
   "function_call",
   "store",
+  // Pinned at "in_memory" on every OpenAI-compatible chat-completions
+  // builder. Defense-in-depth: a future refactor that reorders the
+  // body spread so the typed field comes BEFORE sanitizeExtraBody
+  // would silently let extraBody.prompt_cache_retention shadow our
+  // explicit opt-out of the "24h" extended tier (documented as not
+  // Zero Data Retention eligible). Stripping the key here keeps the
+  // protection independent of spread order. See ADR cache-warmer.md.
+  "prompt_cache_retention",
   "__proto__",
   "constructor",
   "prototype",
@@ -2421,7 +2440,8 @@ async function callVisionChatCompletions(
         }
       ],
       stream: false,
-      ...tokenBudgetField
+      ...tokenBudgetField,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();

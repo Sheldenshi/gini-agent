@@ -72,6 +72,7 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
+import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { v1Readiness } from "./runtime/readiness";
@@ -1228,6 +1229,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const payload = await body(request);
       const providerName = typeof payload.provider === "string" ? payload.provider : "";
       const result = removeSetupProvider(config, providerName);
+      return json(result, result.ok ? 200 : 400);
+    }],
+    // Cache warmer: model-agnostic, single-integer-of-state knob. GET
+    // returns the persisted minutes (0 = disabled), POST validates and
+    // saves. The runtime loop in src/server.ts reads `config.cacheWarmerMinutes`
+    // every tick, so a POST takes effect on the next loop iteration
+    // without needing a restart or any pub/sub plumbing.
+    ["GET", /^\/api\/settings\/cache-warmer$/, () => json(getCacheWarmer(config))],
+    ["POST", /^\/api\/settings\/cache-warmer$/, async (request) => {
+      const payload = await body(request);
+      const result = setCacheWarmer(config, payload);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],

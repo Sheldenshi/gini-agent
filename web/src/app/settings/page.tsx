@@ -12,6 +12,7 @@ import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
 import { TunnelCard } from "./_components/TunnelCard";
+import { CacheWarmerCard } from "./_components/CacheWarmerCard";
 
 export default function SettingsPage() {
   const invalidate = useInvalidate();
@@ -100,6 +101,8 @@ export default function SettingsPage() {
         />
 
         <TunnelCard />
+
+        <CacheWarmerCard />
 
         <BrowserSettingsCard />
 

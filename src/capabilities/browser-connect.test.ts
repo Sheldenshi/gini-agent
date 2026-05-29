@@ -105,11 +105,13 @@ describe("browser-connect API surface", () => {
 
   test("connect with an unreachable cdpUrl fails after the probe timeout", async () => {
     const config = testConfig("connect-unreachable");
-    // Port 1 is reserved and refused everywhere — the probe loop will
-    // never get a response. We use a low timeout via the unreachable
-    // host instead of mocking time; the test sets its own ceiling.
+    // Port 1 is reserved and refused everywhere — the probe loop will never
+    // get a response. We shrink the probe deadline via the in-process
+    // `internal` arg (off-limits to network callers) so the failure path is
+    // exercised without burning the real 15s budget; production still
+    // defaults to PROBE_TIMEOUT_MS.
     await expect(
-      connectBrowser(config, { cdpUrl: "http://127.0.0.1:1/" })
+      connectBrowser(config, { cdpUrl: "http://127.0.0.1:1/" }, { probeTimeoutMs: 50, probeIntervalMs: 10 })
     ).rejects.toThrow(/Could not reach CDP endpoint/);
   }, 30_000);
 
@@ -153,9 +155,11 @@ describe("browser-connect API surface", () => {
 
     // Now call connect with a cdpUrl that's also unreachable. Both the
     // pre-probe and the fresh attempt should fail; the important
-    // assertion is that the dead record was cleared mid-flight.
+    // assertion is that the dead record was cleared mid-flight. The tiny
+    // probe deadline (in-process arg only) keeps both unreachable probes
+    // fast without changing the production default.
     await expect(
-      connectBrowser(config, { cdpUrl: "http://127.0.0.1:1/" })
+      connectBrowser(config, { cdpUrl: "http://127.0.0.1:1/" }, { probeTimeoutMs: 50, probeIntervalMs: 10 })
     ).rejects.toThrow();
     const state = readState(config.instance);
     expect(state.browser ?? null).toBeNull();
@@ -270,9 +274,15 @@ describe("browser-connect round-2 hardening", () => {
     // Ask for a different cdpUrl. The fresh attach will fail (unreachable
     // port), but the assertion is about the *teardown order*: the managed
     // context's close() must have run BEFORE the launch attempt rejected,
-    // and state must be cleared on failure.
+    // and state must be cleared on failure. Tiny probe deadline (in-process
+    // arg) keeps the unreachable fresh-attach probe fast; production default
+    // is unchanged.
     await expect(
-      connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
+      connectBrowser(
+        config,
+        { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" },
+        { probeTimeoutMs: 50, probeIntervalMs: 10 }
+      )
     ).rejects.toThrow();
     expect(contextCloseCount).toBe(1);
     const persisted = readState(config.instance).browser;
@@ -415,9 +425,15 @@ describe("browser-connect round-3 hardening", () => {
       };
     });
     // A different valid cdpUrl. The fresh attach will fail (unreachable
-    // port 1) but the assertion is about teardown selectivity.
+    // port 1) but the assertion is about teardown selectivity. Tiny probe
+    // deadline (in-process arg) keeps the unreachable probe fast; production
+    // default is unchanged.
     await expect(
-      connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/OTHER" })
+      connectBrowser(
+        config,
+        { cdpUrl: "ws://127.0.0.1:1/devtools/browser/OTHER" },
+        { probeTimeoutMs: 50, probeIntervalMs: 10 }
+      )
     ).rejects.toThrow();
     expect(disconnectCalled).toBe(true);
     expect(closeCalled).toBe(false);
@@ -445,7 +461,11 @@ describe("browser-connect round-3 hardening", () => {
       };
     });
     await expect(
-      connectBrowser(config, { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" })
+      connectBrowser(
+        config,
+        { cdpUrl: "ws://127.0.0.1:1/devtools/browser/NEW" },
+        { probeTimeoutMs: 50, probeIntervalMs: 10 }
+      )
     ).rejects.toThrow();
     const state = readState(config.instance);
     const disconnects = state.audit.filter((row) => row.action === "browser.disconnect");

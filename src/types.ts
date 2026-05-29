@@ -132,7 +132,9 @@ export interface ProviderConfig {
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
   // unconditionally owns: model, messages, stream, tools, tool_choice,
-  // response_format, functions, function_call, store, plus prototype-pollution
+  // response_format, functions, function_call, store, prompt_cache_retention
+  // (pinned to "in_memory" by the runtime — extraBody can't promote a
+  // request to the "24h" extended tier), plus prototype-pollution
   // payloads (__proto__, constructor, prototype) and the JSON.stringify
   // hijack vector (toJSON). Token-budget fields (max_tokens,
   // max_completion_tokens) are allowed in extraBody for
@@ -234,6 +236,12 @@ export interface RuntimeConfig {
     // non-conforming value falls back to the built-in default.
     maxIterations?: number;
   };
+  // Cache warmer interval in minutes. 0 / undefined disables the warmer.
+  // When > 0 the runtime fires a minimal probe against the active
+  // provider every `cacheWarmerMinutes * 0.9` minutes so the prompt
+  // cache stays warm. Bounded to 0..1440 by the setter. See
+  // src/runtime/cache-warmer.ts.
+  cacheWarmerMinutes?: number;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so

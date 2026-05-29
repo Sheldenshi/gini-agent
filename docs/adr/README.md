@@ -19,6 +19,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Runtime Update Surface And Automatic Restart](runtime-update-surface.md)
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
 - [Provider extraBody Escape Hatch And Reserved-Key Denylist](provider-extra-body.md)
+- [Cache Warmer And The in_memory Prompt Cache Default](cache-warmer.md)
 - [Telegram Messaging Bridge](telegram-bridge.md)
 - [Discord Messaging Bridge](discord-bridge.md)
 - [Runtime Identity Injection With Tell-Once + Delta + Periodic Refresh](runtime-identity-injection.md)

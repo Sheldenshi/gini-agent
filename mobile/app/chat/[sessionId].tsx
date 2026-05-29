@@ -91,6 +91,11 @@ export default function ChatDetailScreen() {
   const [images, setImages] = useState<PendingImage[]>([]);
   const scrollRef = useRef<ScrollView | null>(null);
 
+  // Tracks whether the ScrollView is currently pinned near the bottom.
+  // Without this, every streaming delta would yank the user back down,
+  // making it impossible to read older content while the model writes.
+  const pinnedToBottomRef = useRef<boolean>(true);
+
   // 401 → setup. Effect-driven so all later hooks still run on the
   // unauthorized render (Rules of Hooks).
   const unauthorized =
@@ -228,14 +233,24 @@ export default function ChatDetailScreen() {
 
   // Auto-scroll to bottom on new block arrival and on streaming text
   // accretion. The 50ms defer lets layout settle so the new content is
-  // measured before the scroll request lands.
+  // measured before the scroll request lands. Skipped when the user has
+  // scrolled up so streaming deltas don't fight their reading position.
+  // Re-check the pin ref inside the timeout too — the user can begin
+  // scrolling up during the 50ms window, after the effect already passed
+  // its own guard.
   useEffect(() => {
-    const id = setTimeout(
-      () => scrollRef.current?.scrollToEnd({ animated: true }),
-      50
-    );
+    if (!pinnedToBottomRef.current) return;
+    const id = setTimeout(() => {
+      if (!pinnedToBottomRef.current) return;
+      scrollRef.current?.scrollToEnd({ animated: true });
+    }, 50);
     return () => clearTimeout(id);
   }, [list.length, sessionId, lastAssistantUpdatedAt]);
+
+  // Switching sessions starts a fresh transcript pinned to the bottom.
+  useEffect(() => {
+    pinnedToBottomRef.current = true;
+  }, [sessionId]);
 
   const trimmed = text.trim();
   const readyImages = useMemo(
@@ -252,6 +267,9 @@ export default function ChatDetailScreen() {
     // also covers in-flight assistant work, not just the mutation's own
     // pending state.
     if (sendDisabled) return;
+    // The user just posted — they want to see the reply, even if they
+    // had scrolled up earlier. Re-pin before the optimistic block lands.
+    pinnedToBottomRef.current = true;
     send.mutate(
       { content: trimmed, images: readyImages },
       {
@@ -396,6 +414,15 @@ export default function ChatDetailScreen() {
             ref={scrollRef}
             contentContainerStyle={styles.messages}
             keyboardShouldPersistTaps="handled"
+            scrollEventThrottle={16}
+            onScroll={(e) => {
+              const { contentOffset, contentSize, layoutMeasurement } =
+                e.nativeEvent;
+              const distanceFromBottom =
+                contentSize.height -
+                (contentOffset.y + layoutMeasurement.height);
+              pinnedToBottomRef.current = distanceFromBottom < 40;
+            }}
           >
             {visible.length > 0 ? (
               renderItems.map((item) =>

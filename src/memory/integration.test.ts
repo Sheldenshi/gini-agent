@@ -25,6 +25,7 @@ beforeAll(() => {
   process.env.GINI_STATE_ROOT = ROOT;
   process.env.GINI_LOG_ROOT = `${ROOT}-logs`;
   process.env.GINI_EMBEDDING_PROVIDER = "echo";
+  process.env.GINI_RERANKER_PROVIDER = "none";
 });
 
 afterAll(() => {
@@ -32,6 +33,7 @@ afterAll(() => {
   clearEchoStructuredResponses();
   clearEchoToolCallingResponses();
   delete process.env.GINI_EMBEDDING_PROVIDER;
+  delete process.env.GINI_RERANKER_PROVIDER;
   rmSync(ROOT, { recursive: true, force: true });
 });
 
@@ -52,13 +54,24 @@ async function waitForCompletion(config: RuntimeConfig, taskId: string): Promise
     const state = readState(config.instance);
     const task = state.tasks.find((entry) => entry.id === taskId);
     if (task && (task.status === "completed" || task.status === "failed" || task.status === "waiting_approval")) {
-      // Wait a tiny bit more for fire-and-forget retain to flush.
-      await Bun.sleep(50);
       return;
     }
     await Bun.sleep(10);
   }
   throw new Error("task did not complete");
+}
+
+// Auto-retain is fire-and-forget: it kicks off after the task loop returns and
+// flushes a MemoryUnit into the bank's SQLite store asynchronously. Rather than
+// sleeping a fixed pad and hoping the write landed, poll the observable count
+// until the predicate holds (or a 2s ceiling trips). This is both faster (the
+// flush typically lands within a few ms) and more robust than a fixed sleep.
+async function waitForMemory(predicate: () => boolean, label: string): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return;
+    await Bun.sleep(10);
+  }
+  throw new Error(`Timed out waiting for: ${label}`);
 }
 
 describe("phase 5 — auto-retain on task completion", () => {
@@ -74,8 +87,8 @@ describe("phase 5 — auto-retain on task completion", () => {
     const config = makeConfig(instance);
     const task = await submitTask(config, "Verify that auto-retain fires after a normal task completes by storing this input.");
     await waitForCompletion(config, task.id);
-    // Wait a little longer for fire-and-forget retain.
-    await Bun.sleep(100);
+    // Poll until the fire-and-forget retain flushes the new unit.
+    await waitForMemory(() => countMemoryUnits(instance) > before, "auto-retain to grow the memory unit count");
     const after = countMemoryUnits(instance);
     expect(after).toBeGreaterThan(before);
   });
@@ -92,7 +105,11 @@ describe("phase 5 — auto-retain on task completion", () => {
     const before = countMemoryUnits(instance);
     const task = await submitTask(config, "hi");
     await waitForCompletion(config, task.id);
-    await Bun.sleep(100);
+    // Negative assertion: there's no positive signal to await on (the
+    // extractor returns zero facts, so nothing is ever written). Give the
+    // fire-and-forget retain a brief window to run and prove it added
+    // nothing. Kept short — the empty-fact path short-circuits quickly.
+    await Bun.sleep(50);
     const after = countMemoryUnits(instance);
     expect(after).toBe(before);
   });
@@ -128,9 +145,9 @@ describe("phase 5 — auto-retain on chat-mode task completion", () => {
     const before = countMemoryUnits(instance);
     const task = await submitTask(config, "my name is Shelden", { mode: "chat" });
     await waitForCompletion(config, task.id);
-    // Fire-and-forget retain — give it a moment to flush like the
+    // Poll until the fire-and-forget retain flushes, like the
     // imperative-path tests above.
-    await Bun.sleep(150);
+    await waitForMemory(() => countMemoryUnits(instance) > before, "chat-mode auto-retain to grow the memory unit count");
     const after = countMemoryUnits(instance);
     expect(after).toBeGreaterThan(before);
   });
@@ -148,10 +165,15 @@ describe("phase 5 — auto-recall on task submit", () => {
     const config = makeConfig(instance);
     const first = await submitTask(config, "Please retain the secret token swordfish for testing.");
     await waitForCompletion(config, first.id);
-    await Bun.sleep(150);
     // Phase C — auto-retain stamps the active agent, so units land in the
     // per-agent bank rather than the legacy default bank.
     const agentId = readState(config.instance).activeAgentId ?? "agent_default";
+    // Poll until the retained unit lands in the per-agent bank before the
+    // follow-up task tries to recall it.
+    await waitForMemory(
+      () => listMemoryUnits(instance, bankIdForAgent(agentId)).length > 0,
+      "retained swordfish unit to land in the per-agent bank"
+    );
     expect(listMemoryUnits(instance, bankIdForAgent(agentId)).length).toBeGreaterThan(0);
 
     const second = await submitTask(config, "Tell me about the swordfish token from earlier.");

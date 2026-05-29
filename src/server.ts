@@ -19,6 +19,7 @@ import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/br
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
+import { fireCacheWarmerProbe } from "./runtime/cache-warmer";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -355,6 +356,36 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
   }
 })();
 
+// Cache warmer loop. Reads config.cacheWarmerMinutes on every iteration
+// so a POST /api/settings/cache-warmer takes effect without restart or
+// pub/sub. When the value is 0 (or undefined) the loop polls every 30s
+// to pick up future enables. When > 0 it sleeps for minutes × 54_000 ms
+// (= minutes × 0.9 × 60 × 1000) and then fires one probe via the
+// existing provider dispatch path. Errors are logged and the next tick
+// retries; we never swallow them silently because that would mask real
+// provider auth/transport failures.
+const CACHE_WARMER_IDLE_TICK_MS = 30_000;
+let cacheWarmerStopped = false;
+const cacheWarmerDone: Promise<void> = (async function cacheWarmerLoop(): Promise<void> {
+  while (!cacheWarmerStopped) {
+    const minutes = config.cacheWarmerMinutes ?? 0;
+    if (minutes > 0) {
+      await Bun.sleep(minutes * 54_000);
+      if (cacheWarmerStopped) break;
+      try {
+        await fireCacheWarmerProbe(config);
+        appendLog(config.instance, "cache_warmer.probe.ok", { minutes });
+      } catch (error) {
+        appendLog(config.instance, "cache_warmer.probe.error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    } else {
+      await Bun.sleep(CACHE_WARMER_IDLE_TICK_MS);
+    }
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -377,6 +408,7 @@ process.on("SIGTERM", async () => {
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
+  cacheWarmerStopped = true;
   // Tear down the chat-blocks subscription so the dispatcher stops
   // emitting pushes during drain. The APNs HTTP/2 client owns its own
   // session and will close lazily when garbage-collected.
@@ -433,6 +465,7 @@ process.on("SIGTERM", async () => {
       telegramSupervisor.stopAll().catch(() => {}),
       discordDone.catch(() => {}),
       discordSupervisor.stopAll().catch(() => {}),
+      cacheWarmerDone.catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck

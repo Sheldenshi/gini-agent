@@ -6,7 +6,45 @@ import { __resetTunnelManagerForTests, tunnelManager } from "./runtime/tunnel";
 import { webPortPath } from "./paths";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
+import { listProviders } from "./integrations/connectors/registry";
 import type { RuntimeConfig } from "./types";
+
+// Stub a provider's host-environment `detect()` so the connector-detection
+// endpoint test stays deterministic AND fast regardless of what's installed
+// on the developer's PATH. The production `detect()` for claude-code / codex
+// shells out via spawnSync (`which`, `claude auth status`), which on a machine
+// with those CLIs installed dominates this test's wall time (the unstubbed
+// detect endpoint test measured 1.524641s). Mirrors the same in-place
+// swap-and-restore helper used by src/jobs/connector-detection.test.ts. The
+// registry is a process-wide singleton, so the returned restore fn MUST run in
+// a finally to avoid leaking the stub into sibling tests.
+function stubProviderDetect(
+  providerId: string,
+  value: { detected: boolean; suggestedName?: string; message?: string }
+): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.detect;
+  provider.detect = async () => value;
+  return () => {
+    provider.detect = previous;
+  };
+}
+
+// Companion to stubProviderDetect. After connector auto-detection creates a
+// record for a provider that exposes a `probe()`, runConnectorDetection runs
+// an initial checkConnector → provider.probe, which for claude-code shells out
+// to `claude auth status` again. Stub the probe so the detection endpoint
+// test never touches a real subprocess. Same swap-and-restore discipline.
+function stubProviderProbe(providerId: string, value: { ok: boolean; message: string }): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.probe;
+  provider.probe = async () => value;
+  return () => {
+    provider.probe = previous;
+  };
+}
 
 describe("runtime api", () => {
   test("applies approved improvement proposals and audits the decision", async () => {
@@ -395,10 +433,13 @@ describe("runtime api", () => {
     // chunk is "".
     const reader = response.body?.getReader();
     // Race the read against a short timeout; the heartbeat doesn't fire for
-    // 1s, so an immediate read should observe an empty buffer.
+    // 1s, so an immediate read should observe an empty buffer. The timeout
+    // value only needs to lose to a real event (there are none queued) and
+    // win against the 1s heartbeat — 30ms is as conclusive as 200ms here and
+    // doesn't burn the wall when the suite runs the whole describe block.
     const winner = await Promise.race([
       reader?.read(),
-      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 200))
+      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 30))
     ]) as { value?: Uint8Array; done?: boolean };
     await reader?.cancel();
     const text = winner?.value ? new TextDecoder().decode(winner.value) : "";
@@ -745,14 +786,35 @@ describe("runtime api", () => {
   test("POST /api/connectors/detect runs the detection job and is idempotent", async () => {
     const config = testConfig("connector-detect-endpoint");
     const handler = createHandler(config);
-    const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
-    expect(first).toHaveProperty("considered");
-    expect(first).toHaveProperty("created");
-    // The second call should not create any new records — the detection
-    // logic is idempotent at the registry+state level.
-    const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
-    const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
-    expect(createdProviders).toEqual([]);
+    // Stub the only two providers with a host-shelling detect() so the run
+    // is deterministic and never spawns `which` / `claude auth status`.
+    // claude-code detects positive → the first endpoint call creates an
+    // auto-source connector; codex detects negative. The second call must
+    // then skip claude-code with reason "exists", exercising the full
+    // create-then-skip idempotency contract through the HTTP route.
+    const restoreClaude = stubProviderDetect("claude-code", {
+      detected: true,
+      suggestedName: "Claude Code",
+      message: "stub"
+    });
+    const restoreClaudeProbe = stubProviderProbe("claude-code", { ok: true, message: "stub" });
+    const restoreCodex = stubProviderDetect("codex", { detected: false });
+    try {
+      const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+      expect(first).toHaveProperty("considered");
+      expect(first).toHaveProperty("created");
+      expect((first.created as Array<{ provider: string }>).map((c) => c.provider)).toContain("claude-code");
+      // The second call should not create any new records — the detection
+      // logic is idempotent at the registry+state level.
+      const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+      const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
+      expect(createdProviders).toEqual([]);
+      expect((second.skipped as Array<{ provider: string; reason: string }>).find((s) => s.provider === "claude-code")?.reason).toBe("exists");
+    } finally {
+      restoreClaude();
+      restoreClaudeProbe();
+      restoreCodex();
+    }
   });
 
   test("GET /api/connectors/providers returns the registry", async () => {
@@ -3740,6 +3802,24 @@ function testConfig(instance: string): RuntimeConfig {
   // because the inode is gone. removeMemoryDb closes the cached handle
   // AND unlinks the file + WAL/SHM siblings in one shot.
   removeMemoryDb(instance);
+  // The unreachable-CDP test posts to the real /api/browser/connect route,
+  // which omits the in-process probe override by design. Shrink the probe via
+  // the server-side env knob so the test exercises the 400 mapping without
+  // burning the production probe deadline. Server env, not POST body, so the
+  // network-input boundary stays intact.
+  process.env.GINI_CDP_PROBE_TIMEOUT_MS = "60";
+  process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
+  // resumeChatTask polls for the loop's flip to waiting_approval before
+  // staging a tool result. In-process the flip lands within a couple of
+  // mutateState boundaries, and several fill_secret / approval tests seed a
+  // task that never reaches waiting_approval at all — so the production
+  // 1000ms/100ms budget is pure dead wall here (the fill_secret leak test
+  // measured 1079.00ms in isolation, nearly all of it this poll). Shrink the
+  // budget via the server-side env knob the production code reads (default
+  // preserved at 1000/100); the race still resolves well within 40ms over 5ms
+  // ticks in-process.
+  process.env.GINI_RESUME_WAIT_BUDGET_MS = "40";
+  process.env.GINI_RESUME_WAIT_TICK_MS = "5";
   rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
   return {
     instance,

@@ -32,6 +32,7 @@ import { notification } from "./commands/notifications";
 import { promotion } from "./commands/promotions";
 import { snapshot } from "./commands/snapshots";
 import { provider } from "./commands/provider";
+import { cacheWarmer } from "./commands/cache-warmer";
 import { trace } from "./commands/trace";
 import { audit } from "./commands/audit";
 import { events } from "./commands/events";
@@ -148,6 +149,8 @@ export async function run(): Promise<void> {
     case "snapshot":
     case "snapshots": snapshot(ctx); break;
     case "provider": await provider(ctx); break;
+    case "cache-warmer":
+    case "warmer": await cacheWarmer(ctx); break;
     case "trace": trace(ctx); break;
     case "audit": audit(ctx); break;
     case "events":
