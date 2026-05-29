@@ -18,7 +18,7 @@ import {
 import ReanimatedSwipeable, {
   type SwipeableMethods
 } from "react-native-gesture-handler/ReanimatedSwipeable";
-import { SafeAreaView } from "react-native-safe-area-context";
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
 import { chatListTime } from "@/src/format";
 import {
@@ -594,6 +594,14 @@ function AgentPickerModal({
   // `mounted` decouples render lifetime from `visible` so the close
   // animation can run to completion before the Modal unmounts.
   const { width: screenWidth } = useWindowDimensions();
+  // Read insets from the provider via React context rather than wrapping
+  // the panel in <SafeAreaView>. The panel renders inside a <Modal>, which
+  // iOS presents in a separate native hierarchy the root SafeAreaProvider
+  // never measures into — so SafeAreaView's own native measurement resolves
+  // top to 0 on first present and the title collides with the Dynamic
+  // Island. Context flows through Modal in the React tree, so by the time
+  // the drawer opens these values are the real, already-measured insets.
+  const insets = useSafeAreaInsets();
   const panelWidth = Math.max(
     0,
     Math.min(PICKER_MAX_WIDTH, screenWidth - PICKER_DISMISS_STRIP)
@@ -645,7 +653,12 @@ function AgentPickerModal({
             { width: panelWidth, transform: [{ translateX }] }
           ]}
         >
-          <SafeAreaView edges={["top", "bottom"]} style={styles.modalSheetInner}>
+          <View
+            style={[
+              styles.modalSheetInner,
+              { paddingTop: insets.top, paddingBottom: insets.bottom }
+            ]}
+          >
             {mode === "list" ? (
               <>
                 <View style={styles.drawerHeader}>
@@ -702,7 +715,7 @@ function AgentPickerModal({
                 />
               </>
             )}
-          </SafeAreaView>
+          </View>
         </Animated.View>
         <Pressable
           onPress={onClose}
