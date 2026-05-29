@@ -2,9 +2,9 @@
 
 ## Decision
 
-`ProviderConfig` carries an optional `extraBody?: Record<string, unknown>` that the runtime merges into every chat-completions request body sent by the local, openai, openrouter, and deepseek providers. A reserved-key denylist guards the merge so user-supplied extras can never override fields the runtime owns. Codex (`/responses`) and echo ignore `extraBody` entirely.
+`ProviderConfig` carries an optional `extraBody?: Record<string, unknown>` that the runtime merges into every chat-completions request body sent by the local, openai, and openrouter providers. A reserved-key denylist guards the merge so user-supplied extras can never override fields the runtime owns. Codex (`/responses`) and echo ignore `extraBody` entirely.
 
-The CLI surfaces four flags on `gini provider set`: `--base-url`, `--api-key-env`, `--extra-body`, and `--prompt-cache-retention`. They write directly into the persisted instance config. No HTTP/BFF surface for `extraBody` ships in this iteration; that is deferred.
+The CLI surfaces three new flags on `gini provider set`: `--base-url`, `--api-key-env`, `--extra-body`. They write directly into the persisted instance config. No HTTP/BFF surface for `extraBody` ships in this iteration; that is deferred.
 
 `extraBody` is non-secret transport config. It flows through `providerHealth`, `/api/status`, and trace records. Bearer tokens belong in env vars referenced by `apiKeyEnv`, never in `extraBody`.
 
@@ -25,7 +25,6 @@ The CLI flags exist because the alternative — hand-editing `~/.gini/instances/
 - `response_format` — structured calls set this; chat-completions calls must not enable JSON mode through extraBody (it would break streaming and tool calls).
 - `functions`, `function_call` — deprecated OpenAI legacy function-calling. The runtime ignores `message.function_call` in responses, so a poisoned extraBody using the legacy schema would silently drop function results.
 - `store` — controls server-side retention of the completion. The `/responses` path pins `store: false` explicitly; chat-completions paths must stay consistent.
-- `prompt_cache_retention` — OpenAI prompt-cache retention bucket. Owned by `ProviderConfig.promptCacheRetention` via `resolvePromptCacheRetention()`. The typed field is the single source of truth for the cache bucket because extended retention (`"24h"`) is documented to be NOT Zero Data Retention eligible; letting an `extraBody.prompt_cache_retention` value silently shadow the typed override would let a careless config flip an operator's ZDR posture without any explicit action.
 - `__proto__`, `constructor`, `prototype` — JSON-loaded objects can carry these as own enumerable keys; without an explicit drop the spread would forward them to the API.
 - `toJSON` — defense-in-depth against a future internal caller constructing `ProviderConfig` programmatically with a callable `toJSON` that would replace the request body wholesale at `JSON.stringify` time.
 
@@ -39,12 +38,12 @@ When you add a runtime-owned chat-completions request field anywhere in `src/pro
 
 ## Agent Override Inheritance
 
-`AgentRecord` stores only `providerName` and `model`. `resolveEffectiveContext()` in `src/execution/effective-context.ts` decides whether an agent's override inherits the instance's transport config (`baseUrl`, `apiKeyEnv`, `extraBody`, `promptCacheRetention`) by comparing `agent.providerName` to `config.provider.name`:
+`AgentRecord` stores only `providerName` and `model`. `resolveEffectiveContext()` in `src/execution/effective-context.ts` decides whether an agent's override inherits the instance's transport config (`baseUrl`, `apiKeyEnv`, `extraBody`) by comparing `agent.providerName` to `config.provider.name`:
 
-- **Same-provider override** (agent overrides to the same provider family as the instance): the resolver spreads `config.provider` first and overwrites only `name` + `model`. Local-only transport (e.g. an `oMLX` base URL + `chat_template_kwargs` `extraBody`) is preserved across model swaps so an operator can keep their existing endpoint when swapping models on the same agent. `promptCacheRetention` rides the same spread so an explicit `"24h"` opt-in stays in effect when an agent overrides to a different model on the same provider — the field is data-retention / ZDR-relevant, so silently flipping the bucket on a model swap would be the same hazard the runtime guards against on `gini provider set` and `gini setup` rebuilds.
-- **Cross-provider override** (agent overrides to a different provider family): the resolver does NOT spread `config.provider`. Instead `normalizeProvider` supplies the per-provider defaults for `baseUrl` and `apiKeyEnv`, and `extraBody` and `promptCacheRetention` default to undefined. Local-only fields like `chat_template_kwargs` and provider-specific retention buckets therefore stay on the local instance and never leak into an OpenAI / OpenRouter call.
+- **Same-provider override** (agent overrides to the same provider family as the instance): the resolver spreads `config.provider` first and overwrites only `name` + `model`. Local-only transport (e.g. an `oMLX` base URL + `chat_template_kwargs` `extraBody`) is preserved across model swaps so an operator can keep their existing endpoint when swapping models on the same agent.
+- **Cross-provider override** (agent overrides to a different provider family): the resolver does NOT spread `config.provider`. Instead `normalizeProvider` supplies the per-provider defaults for `baseUrl` and `apiKeyEnv`, and `extraBody` defaults to undefined. Local-only fields like `chat_template_kwargs` therefore stay on the local instance and never leak into an OpenAI / OpenRouter call.
 
-This is the load-bearing invariant for the openclaw migration path (`docs/adr/openclaw-migration.md`): a migrated openrouter agent on an openai instance won't accidentally inherit the openai endpoint or auth env. Tests pin both branches in `src/execution/effective-context.test.ts` ("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv" + "same-provider agent override still inherits instance baseUrl/apiKeyEnv"), and the same file pins the `promptCacheRetention` inheritance contract on both branches.
+This is the load-bearing invariant for the openclaw migration path (`docs/adr/openclaw-migration.md`): a migrated openrouter agent on an openai instance won't accidentally inherit the openai endpoint or auth env. Tests pin both branches in `src/execution/effective-context.test.ts` ("cross-provider agent override does not inherit instance baseUrl/apiKeyEnv" + "same-provider agent override still inherits instance baseUrl/apiKeyEnv").
 
 ## Security Boundary
 
@@ -54,14 +53,11 @@ This is the load-bearing invariant for the openclaw migration path (`docs/adr/op
 
 ## Test Surface
 
-Six test layers cover the change:
+Three test layers cover the change:
 
-- `src/provider.test.ts` — fetch-mock unit tests for the merge behavior, denylist, override semantics, vision token-cap protection, baseUrl normalization, prototype-pollution defense, and `promptCacheRetention` wire forwarding (typed-field-wins-over-extraBody precedence, non-string-shape rejection, representative chat-completions and `/responses` paths).
+- `src/provider.test.ts` — fetch-mock unit tests for the merge behavior, denylist, override semantics, vision token-cap protection, baseUrl normalization, and prototype-pollution defense.
 - `src/provider.integration.test.ts` — real HTTP round-trips against the bundled mock server in `src/test-utils/openai-mock-server.ts`. Each test creates its own server and env scope inside `withMockServer()`, so the file is safe under `bun test --concurrent`.
-- `src/cli/commands/provider.test.ts` — CLI flag-parsing, malformed input rejection, `--prompt-cache-retention` persistence and clearing, same-provider carry-forward and cross-provider drop, and the warning surface for unsupported provider+flag combinations.
-- `src/runtime/setup-api.test.ts` — web setup save preserves the typed `promptCacheRetention` from disk on same-provider re-saves; a deliberate disk clear with a stale in-memory snapshot does NOT resurrect the cleared value.
-- `src/cli/commands/admin.test.ts` — `GINI_PROVIDER=… gini install` preserves an existing `promptCacheRetention` on same-provider re-install and drops it on a cross-provider switch.
-- `src/cli/setup.test.ts` and `src/execution/effective-context.test.ts` — `gini setup --yes --force` rebuild preserves the typed field; same-provider agent overrides inherit it while cross-provider overrides drop it.
+- `src/cli/commands/provider.test.ts` — CLI flag-parsing, malformed input rejection, and the warning surface for unsupported provider+flag combinations.
 
 The mock server in `src/test-utils/openai-mock-server.ts` is bundled so anyone cloning the repo can run integration tests with no API keys, no model downloads, and no native bindings — `bun install` is the only prerequisite.
 

@@ -228,49 +228,6 @@ describe("install_ provider env override", () => {
     expect(cfg.provider.model).toBe("gpt-5.5");
     expect(cfg.provider.apiKeyEnv).toBeUndefined();
   });
-
-  test("same-provider re-install preserves an existing promptCacheRetention", async () => {
-    // GINI_PROVIDER=openai gini install on an existing openai config
-    // with `promptCacheRetention: "24h"` set must carry the field
-    // forward. Conductor's setup script and legacy lane migrations
-    // both hit this code path on pre-existing instances, so silently
-    // dropping the ZDR-relevant retention bucket on every install
-    // re-run would be the same hazard the runtime guards against on
-    // gini provider set / gini setup / the web setup-api.
-    const instance = "preserve-retention-same-provider";
-    seedInstanceConfig(instance, {
-      name: "openai",
-      model: "gpt-5.5",
-      apiKeyEnv: "OPENAI_API_KEY",
-      promptCacheRetention: "24h"
-    });
-    process.env.GINI_PROVIDER = "openai";
-    process.env.GINI_MODEL = "gpt-5.4";
-    await install_(makeCtx(instance));
-    const cfg = readPersistedConfig(instance);
-    expect(cfg.provider.name).toBe("openai");
-    expect(cfg.provider.model).toBe("gpt-5.4");
-    expect(cfg.provider.promptCacheRetention).toBe("24h");
-  });
-
-  test("cross-provider re-install drops the previous promptCacheRetention", async () => {
-    // Cross-provider switches must NOT carry the retention bucket —
-    // it was provider-scoped and the new provider's backend may not
-    // even recognize the field. Pin the drop here so a careless
-    // refactor of the carry-forward gate doesn't silently broaden it.
-    const instance = "drop-retention-cross-provider";
-    seedInstanceConfig(instance, {
-      name: "openai",
-      model: "gpt-5.5",
-      apiKeyEnv: "OPENAI_API_KEY",
-      promptCacheRetention: "24h"
-    });
-    process.env.GINI_PROVIDER = "codex";
-    await install_(makeCtx(instance));
-    const cfg = readPersistedConfig(instance);
-    expect(cfg.provider.name).toBe("codex");
-    expect(cfg.provider.promptCacheRetention).toBeUndefined();
-  });
 });
 
 function restore(key: string, value: string | undefined): void {

@@ -7,7 +7,7 @@ import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
 
-const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>] [--prompt-cache-retention <value>]";
+const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
 
 // Single source of truth for value-bearing flags on `gini provider set`.
 // `parseSubArgs` uses this to both partition positionals and extract flag
@@ -16,8 +16,7 @@ const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deeps
 const PROVIDER_SET_FLAGS: ReadonlySet<string> = new Set([
   "--base-url",
   "--api-key-env",
-  "--extra-body",
-  "--prompt-cache-retention"
+  "--extra-body"
 ]);
 
 export async function provider(ctx: CliContext): Promise<void> {
@@ -52,7 +51,6 @@ export async function provider(ctx: CliContext): Promise<void> {
     const baseUrl = flags["--base-url"];
     const apiKeyEnv = flags["--api-key-env"];
     const extraBodyRaw = flags["--extra-body"];
-    const promptCacheRetention = flags["--prompt-cache-retention"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {
       // Parse and shape-validate as separate steps so a "not an object"
@@ -80,47 +78,19 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (baseUrl !== undefined) ignored.push("--base-url");
       if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
       if (extraBody !== undefined) ignored.push("--extra-body");
-      if (promptCacheRetention !== undefined) ignored.push("--prompt-cache-retention");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
       }
     } else if (name === "codex" && extraBody !== undefined) {
       process.stderr.write("gini: warning — --extra-body is ignored for the codex provider; codex uses the /responses API with its own request shape.\n");
     }
-    if (name === "codex" && promptCacheRetention !== undefined && promptCacheRetention.length > 0) {
-      // The chatgpt.com codex backend is documented to reject
-      // `prompt_cache_retention` with HTTP 400. Forward the value
-      // anyway so a future backend update doesn't require a code
-      // change, but warn loudly so the user understands the trade.
-      process.stderr.write("gini: warning — the chatgpt.com codex backend currently rejects `prompt_cache_retention` with HTTP 400; setting --prompt-cache-retention on a codex provider will break every outbound request until the backend adds support.\n");
-    }
-
-    // Preserve an existing `promptCacheRetention` when the user did not
-    // pass `--prompt-cache-retention` on this invocation AND the provider
-    // name did not change. The field is data-retention / ZDR-relevant —
-    // letting an unrelated flag change (e.g. `gini provider set openai
-    // gpt-5.5 --base-url X`) silently strip the retention bucket would
-    // flip the user's privacy posture without explicit operator action.
-    // An explicit empty `--prompt-cache-retention ""` opts out, matching
-    // the resolver semantics. extraBody intentionally does NOT get this
-    // treatment — it has always been "re-pass on every call" and
-    // changing that here is out of scope.
-    const carriedRetention =
-      promptCacheRetention === undefined &&
-      config.provider?.name === name &&
-      config.provider.promptCacheRetention !== undefined
-        ? { promptCacheRetention: config.provider.promptCacheRetention }
-        : promptCacheRetention !== undefined
-          ? { promptCacheRetention }
-          : {};
 
     config.provider = normalizeProvider({
       name,
       model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
-      ...(extraBody ? { extraBody } : {}),
-      ...carriedRetention
+      ...(extraBody ? { extraBody } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
     // If an autostart plist already exists for this instance, refresh it

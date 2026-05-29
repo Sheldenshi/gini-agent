@@ -315,81 +315,6 @@ describe("provider", () => {
         parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
         strict: false
       });
-      // No promptCacheRetention was set on this provider so the wire
-      // body must omit the field. Pins the "absent everywhere when
-      // unset" half of the present-or-absent contract for the codex
-      // /responses surface (the chat-completions half is covered by
-      // the openai chat-completions forwarding test
-      // "openai tool-calling forwards promptCacheRetention as
-      // prompt_cache_retention in the body").
-      expect(sent.prompt_cache_retention).toBeUndefined();
-    } finally {
-      globalThis.fetch = originalFetch;
-      restore();
-      void authPath;
-    }
-  });
-
-  test("codex tool-calling forwards promptCacheRetention into the /responses body when explicitly set", async () => {
-    // Twin of the openai chat-completions forwarding test, but on the
-    // codex /responses surface. The chatgpt.com codex backend is
-    // documented to reject this field with HTTP 400; the runtime is
-    // still a transparent forwarder per the ProviderConfig doc
-    // ("until that changes"), so an explicit operator opt-in MUST
-    // reach the wire body on this surface too. Pin that contract here
-    // so a future "strip on codex" patch can't silently break the
-    // forward-compat path that lets the backend's eventual support
-    // work without a code change.
-    const { authPath, restore } = installCodexAuth("codex-retention-forwarding");
-    const originalFetch = globalThis.fetch;
-    let captured: { url: string; init: RequestInit } | undefined;
-    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
-      captured = { url: String(input), init };
-      const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          const enc = new TextEncoder();
-          const events = [
-            // The /responses non-tool path runs through readCodexStream
-            // which requires at least one text delta to consider the
-            // response complete; emit a single short delta so the
-            // stream consumer doesn't throw before the test gets to
-            // assert on the captured request body.
-            { event: "response.output_text.delta", data: { type: "response.output_text.delta", delta: "ok" } },
-            { event: "response.completed", data: {
-              type: "response.completed",
-              response: {
-                id: "resp_codex_retention",
-                usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 }
-              }
-            } }
-          ];
-          for (const ev of events) {
-            controller.enqueue(enc.encode(`event: ${ev.event}\ndata: ${JSON.stringify(ev.data)}\n\n`));
-          }
-          controller.enqueue(enc.encode("data: [DONE]\n\n"));
-          controller.close();
-        }
-      });
-      return Promise.resolve(new Response(stream, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" }
-      }));
-    }) as unknown as typeof fetch;
-
-    try {
-      const provider = normalizeProvider({
-        name: "codex",
-        model: "gpt-test",
-        promptCacheRetention: "24h"
-      });
-      await generateToolCallingResponse(
-        config(provider),
-        [{ role: "user", content: "hi" }],
-        []
-      );
-      expect(captured?.url).toContain("/responses");
-      const sent = JSON.parse(String(captured!.init!.body));
-      expect(sent.prompt_cache_retention).toBe("24h");
     } finally {
       globalThis.fetch = originalFetch;
       restore();
@@ -837,112 +762,6 @@ describe("provider", () => {
       expect(Array.isArray(sent.messages)).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
-    }
-  });
-
-  test("openai tool-calling forwards promptCacheRetention as prompt_cache_retention in the body", async () => {
-    // Pin the wire-side contract: an explicit `promptCacheRetention`
-    // override on ProviderConfig becomes a `prompt_cache_retention`
-    // field on the request body. Without this assertion the
-    // promptCacheRetentionFields helper or any of its call sites could
-    // drift and silently drop the field — the nine request builders
-    // funnel through a single helper precisely so the field is either
-    // present everywhere or absent everywhere, and this test pins
-    // that contract on a representative chat-completions path.
-    const originalOpenAIKey = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = "sk-test-fixture";
-    const originalFetch = globalThis.fetch;
-    let captured: { url: string; init: RequestInit } | undefined;
-    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
-      captured = { url: String(input), init };
-      const body = {
-        id: "resp_openai_1",
-        choices: [{
-          finish_reason: "stop",
-          message: { role: "assistant", content: "ok" }
-        }]
-      };
-      return Promise.resolve(new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      }));
-    }) as unknown as typeof fetch;
-
-    try {
-      const provider = normalizeProvider({
-        name: "openai",
-        model: "gpt-5.5",
-        promptCacheRetention: "24h"
-      });
-      await generateToolCallingResponse(
-        config(provider),
-        [{ role: "user", content: "hello" }],
-        []
-      );
-      const sent = JSON.parse(String(captured!.init!.body));
-      expect(sent.prompt_cache_retention).toBe("24h");
-    } finally {
-      globalThis.fetch = originalFetch;
-      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = originalOpenAIKey;
-    }
-  });
-
-  test("promptCacheRetention omits the wire field when unset, empty, or a non-string shape", async () => {
-    // normalizeRetentionValue is the single funnel for resolving the
-    // typed field into a wire value. Anything that is not a non-empty
-    // string drops the field entirely so a corrupted-load shape
-    // (number, array, object) never reaches the provider as
-    // `prompt_cache_retention: ["24h"]` and 400s server-side.
-    const originalOpenAIKey = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = "sk-test-fixture";
-    const originalFetch = globalThis.fetch;
-    let captured: { url: string; init: RequestInit } | undefined;
-    const handler = ((input: RequestInfo | URL, init: RequestInit = {}) => {
-      captured = { url: String(input), init };
-      const body = {
-        id: "resp_openai_2",
-        choices: [{
-          finish_reason: "stop",
-          message: { role: "assistant", content: "ok" }
-        }]
-      };
-      return Promise.resolve(new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      }));
-    }) as unknown as typeof fetch;
-    globalThis.fetch = handler;
-
-    const fixtures: Array<{ label: string; value: unknown }> = [
-      { label: "undefined", value: undefined },
-      { label: "empty string", value: "" },
-      { label: "array", value: ["24h"] },
-      { label: "number", value: 42 }
-    ];
-
-    try {
-      for (const fixture of fixtures) {
-        captured = undefined;
-        const provider = normalizeProvider({
-          name: "openai",
-          model: "gpt-5.5",
-          // cast to satisfy the typed field while exercising the
-          // runtime guard against non-string persisted shapes.
-          promptCacheRetention: fixture.value as string | undefined
-        });
-        await generateToolCallingResponse(
-          config(provider),
-          [{ role: "user", content: "hello" }],
-          []
-        );
-        const sent = JSON.parse(String(captured!.init!.body));
-        expect(sent.prompt_cache_retention).toBeUndefined();
-      }
-    } finally {
-      globalThis.fetch = originalFetch;
-      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = originalOpenAIKey;
     }
   });
 
@@ -1682,11 +1501,6 @@ describe("provider", () => {
           messages: [{ role: "user", content: "hijacked" }],
           stream: true,
           tools: [{ type: "function", function: { name: "evil", description: "x", parameters: {} } }],
-          // extraBody.prompt_cache_retention attempts to shadow the typed
-          // `promptCacheRetention` field. The denylist must strip it so a
-          // ZDR posture set via the typed field can't be silently flipped
-          // by a poisoned extraBody.
-          prompt_cache_retention: "in_memory",
           chat_template_kwargs: { enable_thinking: true }
         }
       });
@@ -1707,62 +1521,10 @@ describe("provider", () => {
       expect(sent.tools).toHaveLength(1);
       expect(sent.tools[0].function.name).toBe("real_tool");
       expect(sent.tool_choice).toBe("auto");
-      // extraBody.prompt_cache_retention is stripped — the typed field is
-      // the single source of truth for the cache bucket, and the provider
-      // here doesn't set one, so nothing should land on the wire.
-      expect(sent.prompt_cache_retention).toBeUndefined();
       // Non-conflicting extraBody field flows through.
       expect(sent.chat_template_kwargs).toEqual({ enable_thinking: true });
     } finally {
       globalThis.fetch = originalFetch;
-    }
-  });
-
-  test("typed promptCacheRetention wins when extraBody.prompt_cache_retention is also set", async () => {
-    // Same denylist contract as above, but with the typed field set:
-    // resolvePromptCacheRetention returns the typed value and the
-    // denylist strips the extraBody key, so the wire body carries the
-    // typed value verbatim. Pins the precedence — typed field is the
-    // single source of truth even when both are present.
-    const originalOpenAIKey = process.env.OPENAI_API_KEY;
-    process.env.OPENAI_API_KEY = "sk-test-precedence";
-    const originalFetch = globalThis.fetch;
-    let captured: { url: string; init: RequestInit } | undefined;
-    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
-      captured = { url: String(input), init };
-      const body = {
-        id: "resp_precedence",
-        choices: [{
-          finish_reason: "stop",
-          message: { role: "assistant", content: "ok" }
-        }]
-      };
-      return Promise.resolve(new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      }));
-    }) as unknown as typeof fetch;
-
-    try {
-      const provider = normalizeProvider({
-        name: "openai",
-        model: "gpt-5.5",
-        promptCacheRetention: "24h",
-        extraBody: {
-          prompt_cache_retention: "in_memory"
-        }
-      });
-      await generateToolCallingResponse(
-        config(provider),
-        [{ role: "user", content: "hi" }],
-        []
-      );
-      const sent = JSON.parse(String(captured!.init!.body));
-      expect(sent.prompt_cache_retention).toBe("24h");
-    } finally {
-      globalThis.fetch = originalFetch;
-      if (originalOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
-      else process.env.OPENAI_API_KEY = originalOpenAIKey;
     }
   });
 

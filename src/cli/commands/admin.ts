@@ -9,7 +9,6 @@ import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { normalizeRetentionValue } from "../../provider";
 import { configPath, loadConfig, parseInstance } from "../../paths";
 import {
   awaitForegroundLogFlush,
@@ -85,21 +84,10 @@ export async function install_(ctx: CliContext): Promise<void> {
     const providerDefaultModel = envProvider === "codex" ? "gpt-5.5" : "gpt-5.4-mini";
     const model = envModel
       ?? (providerChanged ? providerDefaultModel : (config.provider?.model ?? providerDefaultModel));
-    // Preserve `promptCacheRetention` when this `gini install` is
-    // re-run against an existing config of the same provider — the
-    // Conductor `setup` script and legacy lane migrations both hit
-    // this code path on pre-existing instances, so dropping a ZDR-
-    // relevant retention bucket on every install re-run would be the
-    // same hazard the runtime guards against on `gini provider set`,
-    // `gini setup`, and the web setup-api.
-    const carriedRetention = providerChanged
-      ? undefined
-      : normalizeRetentionValue(config.provider?.promptCacheRetention);
     config.provider = {
       name: envProvider,
       model,
-      apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined,
-      ...(carriedRetention !== undefined ? { promptCacheRetention: carriedRetention } : {})
+      apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined
     };
     writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
   } else if (envModel !== undefined && config.provider) {

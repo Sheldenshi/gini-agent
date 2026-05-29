@@ -43,46 +43,11 @@
 // child's responsibility.
 
 import { writeFileSync } from "node:fs";
-import { configPath, loadConfig } from "../paths";
-import { hasUsableCodexCredentials, normalizeProvider, normalizeRetentionValue, providerCatalog, providerHealth } from "../provider";
+import { configPath } from "../paths";
+import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
-
-// Read the latest persisted `promptCacheRetention` from disk for the
-// named provider. The gateway loads `config` once at boot and reuses
-// that in-memory snapshot for every request handler, so a CLI write
-// (`gini provider set --prompt-cache-retention 24h`) that lands while
-// the gateway is running will be invisible to the in-memory snapshot.
-// If a UI save then ran the preservation off that stale snapshot, the
-// next writeFileSync would erase the CLI-written value. Re-reading the
-// disk just for this ZDR-relevant field closes that window without
-// taking a dependency on a full config reload (other fields stay
-// owned by their original surfaces).
-//
-// Disk is authoritative when readable: a successful load (even when the
-// field is absent or empty) is treated as the operator's current
-// intent. That includes the case where the operator deliberately
-// cleared the field via `gini provider set --prompt-cache-retention ""`
-// — a non-empty in-memory snapshot must NOT resurrect that value, or
-// the clear would silently fail to take and the ZDR posture would
-// drift back to "24h". The in-memory fallback only fires when the disk
-// read itself throws (malformed JSON, transient EACCES) — there we
-// preserve the last good state rather than dropping the field, since
-// we genuinely don't know what the operator's intent is.
-function diskPromptCacheRetention(instance: string, providerName: string, inMemoryConfig: RuntimeConfig): string | undefined {
-  try {
-    const onDisk = loadConfig(instance);
-    return onDisk.provider?.name === providerName
-      ? normalizeRetentionValue(onDisk.provider.promptCacheRetention)
-      : undefined;
-  } catch {
-    if (inMemoryConfig.provider?.name === providerName) {
-      return normalizeRetentionValue(inMemoryConfig.provider.promptCacheRetention);
-    }
-    return undefined;
-  }
-}
 
 const SUPPORTED_PROVIDERS = ["openai", "codex", "openrouter", "deepseek", "local"] as const;
 type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
@@ -187,31 +152,10 @@ export async function setSetupProvider(
     const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
       ? payload.baseUrl.trim()
       : undefined;
-    // Three-state precedence for `promptCacheRetention`:
-    //   - Payload key present (any string, including ""): operator-set
-    //     value wins. Empty string is treated by normalizeRetentionValue
-    //     as "send nothing", matching the resolver semantics and the
-    //     CLI's `--prompt-cache-retention ""` clear behavior.
-    //   - Payload key absent: fall back to the latest persisted value
-    //     on disk so an unrelated save (model swap, apiKey rotation)
-    //     does not silently strip a ZDR-relevant retention bucket the
-    //     operator set elsewhere.
-    // Disk preservation re-reads from filesystem (not the gateway's
-    // boot-time in-memory snapshot) so an interleaving CLI write that
-    // happened after gateway boot is not clobbered.
-    const payloadRetention =
-      "promptCacheRetention" in payload && typeof payload.promptCacheRetention === "string"
-        ? normalizeRetentionValue(payload.promptCacheRetention)
-        : undefined;
-    const carriedValue = "promptCacheRetention" in payload && typeof payload.promptCacheRetention === "string"
-      ? payloadRetention
-      : diskPromptCacheRetention(config.instance, providerName, config);
-    const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
-      ...(baseUrl ? { baseUrl } : {}),
-      ...carriedRetention
+      ...(baseUrl ? { baseUrl } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
@@ -246,15 +190,7 @@ export async function setSetupProvider(
   const model = typeof payload.model === "string" && payload.model.length > 0
     ? payload.model
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
-  // Same disk-sourced preservation as the env-keyed branch above — a
-  // codex re-save (e.g. model swap) shouldn't drop a
-  // `promptCacheRetention` an operator set via the CLI between gateway
-  // boot and now. The codex backend currently rejects the field, but
-  // per the ProviderConfig doc-comment the runtime is a transparent
-  // forwarder so future backend support works without code changes.
-  const carriedValue = diskPromptCacheRetention(config.instance, "codex", config);
-  const carriedRetention = carriedValue !== undefined ? { promptCacheRetention: carriedValue } : {};
-  config.provider = normalizeProvider({ name: "codex", model, ...carriedRetention } as ProviderConfig);
+  config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
   writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's

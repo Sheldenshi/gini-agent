@@ -109,30 +109,15 @@ Usage:
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore
-  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local|deepseek [model]
+  bun run gini provider show|catalog|set echo|openai|codex|openrouter|local [model]
                   [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]
-                  [--prompt-cache-retention <value>]
                   --base-url and --api-key-env work for local / openai /
-                  openrouter / deepseek (point at OpenAI-compatible servers
-                  like oMLX, vLLM, LM Studio) AND for codex (override the
-                  backend URL or auth-file env var). --extra-body forwards
-                  server-specific request fields like
-                  \`chat_template_kwargs\` and applies to local / openai /
-                  openrouter / deepseek chat-completions calls; codex
-                  (/responses) and echo ignore it.
-                  --prompt-cache-retention sets the OpenAI prompt-cache
-                  bucket sent as \`prompt_cache_retention\` on /responses
-                  and /chat/completions. The runtime forwards any non-
-                  empty string verbatim (after trimming whitespace) so
-                  new retention tiers OpenAI adds work without a code
-                  change; currently documented values are "in_memory"
-                  (most models default here; 5–10 min idle, 1 h max)
-                  and "24h" (extended; up to 24 h, NOT ZDR eligible).
-                  Per-model defaults vary — gpt-5.5 defaults to and only
-                  accepts "24h"; older models default to "in_memory".
-                  An empty string suppresses the field; codex rejects
-                  any value with HTTP 400 until the chatgpt.com backend
-                  adds support.
+                  openrouter (point at OpenAI-compatible servers like oMLX,
+                  vLLM, LM Studio) AND for codex (override the backend URL
+                  or auth-file env var). --extra-body forwards server-
+                  specific request fields like \`chat_template_kwargs\` and
+                  applies to local / openai / openrouter chat-completions
+                  calls; codex (/responses) and echo ignore it.
   bun run gini trace <task-id>
   bun run gini events
   bun run gini audit

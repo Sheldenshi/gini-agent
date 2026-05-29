@@ -130,8 +130,7 @@ export interface ProviderConfig {
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
   // unconditionally owns: model, messages, stream, tools, tool_choice,
-  // response_format, functions, function_call, store, prompt_cache_retention
-  // (owned by the typed `promptCacheRetention` field below), plus
+  // response_format, functions, function_call, store, plus
   // prototype-pollution payloads (__proto__, constructor, prototype) and the
   // JSON.stringify hijack vector (toJSON). Token-budget fields (max_tokens,
   // max_completion_tokens) are allowed in extraBody for
@@ -147,34 +146,6 @@ export interface ProviderConfig {
   // referenced by `apiKeyEnv`, never in extraBody. Caller is responsible
   // for keeping values JSON-serializable.
   extraBody?: Record<string, unknown>;
-  // OpenAI prompt-cache retention bucket. Funneled through
-  // `normalizeRetentionValue` and forwarded as the
-  // `prompt_cache_retention` field on outbound /responses and
-  // /chat/completions request bodies, alongside the implicit prefix-match
-  // caching OpenAI does automatically. Per
-  // https://platform.openai.com/docs/guides/prompt-caching the field
-  // currently accepts `"in_memory"` (default; 5–10 min idle, 1 h max)
-  // and `"24h"` (extended; up to 24 h). Models in the gpt-5.5 family
-  // default to and only accept `"24h"`. Cached input tokens are billed
-  // at 10% of the base input price (e.g. gpt-5.5: $5.00 input vs $0.50
-  // cached). The runtime trims surrounding whitespace as a defensive
-  // typo guard but otherwise treats the value as a free-form string
-  // so future retention tiers OpenAI adds can be passed through
-  // without a code change. A whitespace-only value collapses to
-  // undefined and the field is not sent.
-  //
-  // No runtime default. When omitted the field is not sent and the
-  // provider's own model default applies — this matters because
-  // `"24h"` is NOT Zero Data Retention eligible per the OpenAI docs,
-  // so a silent opt-in would quietly invalidate a customer's ZDR
-  // posture. Set explicitly to opt in. An empty string sends nothing
-  // and is equivalent to omitting the field. The runtime forwards an
-  // explicit value to every HTTP-backed provider (openai, openrouter,
-  // deepseek, local, codex); whether the upstream surface honors the
-  // field is up to the provider — the chatgpt.com codex backend is
-  // currently known to reject the field with a 400, so users on the
-  // codex provider should not set this until that changes.
-  promptCacheRetention?: string;
 }
 
 // Approval policy mode for the per-instance runtime and per-job overlay.

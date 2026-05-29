@@ -328,69 +328,6 @@ function messagesContainToolTraffic(messages: ToolCallingMessage[]): boolean {
   return false;
 }
 
-// Resolve the value to send as `prompt_cache_retention` on outbound
-// /responses and /chat/completions requests, or `undefined` when the
-// field must be omitted. OpenAI's prompt cache is implicit (any prefix
-// of 1024 tokens or more is auto-cached); this field selects which
-// retention bucket the cache write lands in. Per
-// https://platform.openai.com/docs/guides/prompt-caching the field
-// currently accepts `"in_memory"` (default; 5–10 min idle, 1 h max)
-// and `"24h"` (extended; up to 24 h, billed at 10% of base input price
-// on the cache-read side, e.g. gpt-5.5 $5.00 input vs $0.50 cached).
-//
-// IMPORTANT: extended retention (`"24h"`) is NOT Zero Data Retention
-// eligible per the OpenAI docs, and `"in_memory"` is the per-model
-// default for everything except gpt-5.5 (which has no `in_memory`
-// option). A silent runtime opt-in to `"24h"` would quietly disqualify
-// every gpt-5/gpt-4.1 request from a customer's ZDR posture without
-// any operator action, so this resolver intentionally NEVER defaults
-// to a non-empty value: the field is only sent when
-// `provider.promptCacheRetention` is set explicitly on the config.
-// An empty string explicitly opts the request back to the provider's
-// own default. Future retention tiers OpenAI adds can be passed
-// through verbatim via the same field with no code change.
-// Narrow an unknown value (loaded from JSON, passed through a normalize
-// boundary, or extracted from `extraBody`) into either a usable
-// `promptCacheRetention` string or `undefined`. The load path at
-// src/paths.ts JSON.parses config.json with a pure type cast, so a
-// hand-edited or tool-corrupted file can carry a non-string value here.
-// `null`/`undefined` and empty strings collapse to undefined (the
-// resolver semantics for "send nothing"); anything that is not a string
-// of length > 0 is rejected so a non-string shape (number, array,
-// object) never reaches the wire — the array case in particular has
-// `.length > 0` true and would otherwise spread `["24h"]` into the
-// JSON body, producing a provider-side 400 that this guard catches
-// locally. Exported as the single normalization point so every
-// preservation/resolve seam (provider.ts resolver, normalizeProvider,
-// CLI setup carry, setup-api disk read) uses the same rule.
-export function normalizeRetentionValue(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  // Trim before the empty-check so a config typo like `"24h "` or a
-  // whitespace-only value (`" "`) collapses to undefined here instead
-  // of being forwarded verbatim. OpenAI's documented retention values
-  // are short fixed tokens with no internal whitespace, and the
-  // surrounding code paths never need to preserve padding, so trimming
-  // is purely defensive — it catches typos without restricting legit
-  // values OpenAI may add in the future.
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function resolvePromptCacheRetention(provider: ProviderConfig): string | undefined {
-  return normalizeRetentionValue(provider.promptCacheRetention);
-}
-
-// Spread-friendly wrapper around the resolver: returns the
-// `{ prompt_cache_retention }` fragment to splice into a request body, or
-// `{}` when the field must be omitted. Every outbound request builder in
-// this module funnels through this single helper so the field is either
-// present on every call site or absent on every call site — there is no
-// per-builder branch where the resolver could be silently skipped.
-function promptCacheRetentionFields(provider: ProviderConfig): { prompt_cache_retention?: string } {
-  const retention = resolvePromptCacheRetention(provider);
-  return retention ? { prompt_cache_retention: retention } : {};
-}
-
 // When falling back to the responses API for codex, collapse all `system`
 // messages into one instructions block. tool/assistant messages are dropped
 // since the responses path doesn't model them.
@@ -421,7 +358,14 @@ async function callToolCallingChatCompletions(
     model: provider.model,
     messages: messages.map(serializeChatMessage),
     stream: wantStream,
-    ...promptCacheRetentionFields(provider)
+    // Pin the default (non-extended) prompt cache tier on every
+    // OpenAI-compatible chat-completions call. "in_memory" is what the
+    // OpenAI docs document for prompts ≥ 1024 tokens (5–10 min idle, 1
+    // hour max) — explicitly NOT "24h", which is documented as not
+    // Zero Data Retention eligible. openrouter / deepseek / local
+    // accept-but-ignore unknown fields, so the value is a no-op there.
+    // Codex never hits this builder.
+    prompt_cache_retention: "in_memory"
   };
   if (tools.length > 0) {
     body.tools = tools;
@@ -639,8 +583,7 @@ async function callToolCallingResponses(
       store: false,
       stream: true,
       instructions,
-      input,
-      ...promptCacheRetentionFields(provider)
+      input
     };
     if (responsesTools.length > 0) body.tools = responsesTools;
 
@@ -1459,8 +1402,7 @@ async function callStructuredCodex<T>(
               }
             ]
           }
-        ],
-        ...promptCacheRetentionFields(provider)
+        ]
       })
     });
     // readCodexStream already handles non-OK and empty-output as throws.
@@ -1515,7 +1457,7 @@ async function callStructuredChatCompletions<T>(
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
       stream: false,
-      ...promptCacheRetentionFields(provider)
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -1579,21 +1521,6 @@ function withDeepSeekThinkingDefaults(
   return merged;
 }
 
-// Forward an explicit `promptCacheRetention` through normalizeProvider so
-// the resolver in resolvePromptCacheRetention can see the override. The
-// field is intentionally preserved on every HTTP-backed provider branch
-// (not just the model-aware defaults) so a user can opt a non-default
-// provider in by setting the field directly — useful when a new OpenAI-
-// compatible backend adds support after this code ships.
-function preservePromptCacheRetention(provider: ProviderConfig): Partial<ProviderConfig> {
-  // Funnel the persisted value through `normalizeRetentionValue` so a
-  // non-string shape (number, array, object) from a corrupted load is
-  // dropped at the normalize boundary instead of being copied through
-  // to the resolver.
-  const value = normalizeRetentionValue(provider.promptCacheRetention);
-  return value === undefined ? {} : { promptCacheRetention: value };
-}
-
 export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
   if (provider.name === "openai") {
     return {
@@ -1601,8 +1528,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "gpt-5.4-mini",
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_OPENAI_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENAI_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
-      ...preservePromptCacheRetention(provider)
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "openrouter") {
@@ -1611,8 +1537,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "openrouter/auto",
       baseUrl: pickBaseUrl(provider.baseUrl, "https://openrouter.ai/api/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "OPENROUTER_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
-      ...preservePromptCacheRetention(provider)
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "local") {
@@ -1621,8 +1546,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model: provider.model || "local/default",
       baseUrl: pickBaseUrl(provider.baseUrl, "http://127.0.0.1:11434/v1"),
       apiKeyEnv: provider.apiKeyEnv ?? "GINI_LOCAL_API_KEY",
-      ...(provider.extraBody ? { extraBody: provider.extraBody } : {}),
-      ...preservePromptCacheRetention(provider)
+      ...(provider.extraBody ? { extraBody: provider.extraBody } : {})
     };
   }
   if (provider.name === "deepseek") {
@@ -1633,8 +1557,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       model,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_DEEPSEEK_BASE_URL),
       apiKeyEnv: provider.apiKeyEnv ?? "DEEPSEEK_API_KEY",
-      ...(extraBody ? { extraBody } : {}),
-      ...preservePromptCacheRetention(provider)
+      ...(extraBody ? { extraBody } : {})
     };
   }
   if (provider.name === "codex") {
@@ -1642,8 +1565,7 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
       name: "codex",
       model: provider.model || DEFAULT_CODEX_MODEL,
       baseUrl: pickBaseUrl(provider.baseUrl, DEFAULT_CODEX_BASE_URL),
-      apiKeyEnv: provider.apiKeyEnv,
-      ...preservePromptCacheRetention(provider)
+      apiKeyEnv: provider.apiKeyEnv
     };
   }
   return {
@@ -1689,8 +1611,7 @@ async function callOpenAIResponses(
                 { type: "input_text", text: input }
               ]
             }
-          ],
-          ...promptCacheRetentionFields(provider)
+          ]
         })
       });
       return readCodexStream(response, provider, onDelta);
@@ -1718,7 +1639,7 @@ async function callOpenAIResponses(
           ]
         }
       ],
-      ...promptCacheRetentionFields(provider)
+      prompt_cache_retention: "in_memory"
     })
   });
 
@@ -1759,7 +1680,7 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "user", content: input }
       ],
       stream: false,
-      ...promptCacheRetentionFields(provider)
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -2275,12 +2196,6 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "functions",
   "function_call",
   "store",
-  // Owned by ProviderConfig.promptCacheRetention via
-  // resolvePromptCacheRetention. Stripping it from extraBody means an
-  // operator who sets `extraBody.prompt_cache_retention` cannot silently
-  // shadow the typed override on chat-completions paths — the typed
-  // field is the single source of truth for cache retention.
-  "prompt_cache_retention",
   "__proto__",
   "constructor",
   "prototype",
@@ -2454,8 +2369,7 @@ async function callVisionCodex(
             ]
           }
         ],
-        max_output_tokens: maxTokens,
-        ...promptCacheRetentionFields(provider)
+        max_output_tokens: maxTokens
       })
     });
     const rawPayload = await response.text();
@@ -2519,7 +2433,7 @@ async function callVisionChatCompletions(
       ],
       stream: false,
       ...tokenBudgetField,
-      ...promptCacheRetentionFields(provider)
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();

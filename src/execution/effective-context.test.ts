@@ -173,45 +173,6 @@ describe("resolveEffectiveContext", () => {
     expect(ctx.provider.apiKeyEnv).toBe("MY_LOCAL_KEY");
   });
 
-  test("same-provider agent override inherits instance promptCacheRetention", () => {
-    // `promptCacheRetention` is part of the same-provider inheritance
-    // set documented in docs/adr/provider-extra-body.md. A model-only
-    // agent override on an openai instance that opted into "24h" must
-    // not silently flip the bucket back to the provider default — that
-    // would be the same ZDR-relevant posture change the runtime guards
-    // against on every other rebuild site (`gini provider set`,
-    // `gini setup`, the web setup-api).
-    const agent = buildAgent({ providerName: "openai", model: "gpt-5.4-mini" });
-    const state = buildState({ agents: [agent], activeAgentId: agent.id });
-    const config = buildConfig({
-      name: "openai",
-      model: "gpt-5.4",
-      promptCacheRetention: "24h"
-    });
-    const ctx = resolveEffectiveContext(state, config);
-    expect(ctx.provider.name).toBe("openai");
-    expect(ctx.provider.model).toBe("gpt-5.4-mini");
-    expect(ctx.provider.promptCacheRetention).toBe("24h");
-  });
-
-  test("cross-provider agent override drops instance promptCacheRetention", () => {
-    // The cross-provider strip already drops `baseUrl`, `apiKeyEnv`,
-    // and `extraBody`; `promptCacheRetention` rides the same exclusion
-    // so an openrouter agent on an openai instance does not carry an
-    // openai-specific retention bucket to a backend whose request
-    // surface may not even recognize the field.
-    const agent = buildAgent({ providerName: "openrouter", model: "openai/gpt-4o" });
-    const state = buildState({ agents: [agent], activeAgentId: agent.id });
-    const config = buildConfig({
-      name: "openai",
-      model: "gpt-5.4-mini",
-      promptCacheRetention: "24h"
-    });
-    const ctx = resolveEffectiveContext(state, config);
-    expect(ctx.provider.name).toBe("openrouter");
-    expect(ctx.provider.promptCacheRetention).toBeUndefined();
-  });
-
   test("agent without providerName falls back to instance provider", () => {
     const agent = buildAgent({ providerName: undefined, model: undefined });
     const state = buildState({ agents: [agent], activeAgentId: agent.id });
