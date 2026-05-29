@@ -36,6 +36,7 @@ jobs:
           fi
           base="${{ github.event.before }}"
           head="${{ github.sha }}"
+          git fetch --depth=1 origin "$base"
           changed=$(git diff --name-only "$base" "$head" -- mobile/)
           echo "Changed files in mobile/:"
           echo "$changed"
