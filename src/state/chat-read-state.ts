@@ -132,10 +132,10 @@ export function markRead(
 
 // Clear the per-device read cursor for a session so the badge counts
 // the entire session as unread again. Idempotent — calling on a row
-// that doesn't exist is a no-op. Used by the mobile "mark unread"
-// swipe action: the cursor's monotonicity guard prevents moving it
-// backwards by replaying an older block id, so the only honest way
-// to flip a chat back to unread for the device is to drop the row.
+// that doesn't exist is a no-op. Internal helper used by markUnread
+// and exposed for tests; the HTTP route uses markUnread so the badge
+// settles at "just the latest agent turn" rather than "every block
+// in the session".
 export function clearReadState(
   instance: Instance,
   sessionId: string,
@@ -145,6 +145,64 @@ export function clearReadState(
   db.run(
     "DELETE FROM chat_read_state WHERE session_id = ? AND device_token = ?",
     [sessionId, deviceToken]
+  );
+}
+
+// Mark a chat unread for the device by pinning the read cursor to the
+// block immediately before the latest assistant_text. The badge then
+// reads as just the agent's last turn (typically count = 1) rather
+// than the cumulative count of every visible block since session
+// start — that matches iOS Mail / Messages semantics, where "mark
+// unread" flags the latest message, not the entire thread.
+//
+// Edge cases:
+//   - No assistant_text in the session: nothing meaningful to unread,
+//     so the cursor is dropped entirely (same as the old clear) and
+//     the count falls back to "everything visible". This keeps the
+//     action useful on user-only chats even if the resulting badge is
+//     less precise.
+//   - The latest assistant_text is the very first visible block: no
+//     "block before" exists, so we drop the cursor and the assistant
+//     turn (plus any later blocks) becomes the unread set.
+//   - Otherwise: pin the cursor at the immediately-preceding block.
+//     Visible blocks after that cursor (the assistant_text and any
+//     trailing tool_calls / approvals) become the unread count.
+export function markUnread(
+  instance: Instance,
+  sessionId: string,
+  deviceToken: string
+): void {
+  const db = getMemoryDb(instance);
+  const latestAssistant = db
+    .query<{ ordinal: number }, [string]>(
+      `SELECT ordinal FROM chat_blocks
+       WHERE session_id = ? AND kind = 'assistant_text'
+       ORDER BY ordinal DESC LIMIT 1`
+    )
+    .get(sessionId);
+  if (!latestAssistant) {
+    clearReadState(instance, sessionId, deviceToken);
+    return;
+  }
+  const preceding = db
+    .query<{ id: string }, [string, number]>(
+      `SELECT id FROM chat_blocks
+       WHERE session_id = ? AND ordinal < ?
+       ORDER BY ordinal DESC LIMIT 1`
+    )
+    .get(sessionId, latestAssistant.ordinal);
+  if (!preceding) {
+    clearReadState(instance, sessionId, deviceToken);
+    return;
+  }
+  const at = now();
+  db.run(
+    `INSERT INTO chat_read_state (session_id, device_token, last_read_block_id, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(session_id, device_token) DO UPDATE SET
+       last_read_block_id = excluded.last_read_block_id,
+       updated_at = excluded.updated_at`,
+    [sessionId, deviceToken, preceding.id, at]
   );
 }
 

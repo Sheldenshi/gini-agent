@@ -18,6 +18,7 @@ import {
   getReadState,
   insertChatBlock,
   markRead,
+  markUnread,
   unreadCountForDevice,
   unreadCountsByDevice
 } from "./index";
@@ -274,6 +275,77 @@ describe("chat-read-state", () => {
     insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "1" });
     expect(() => clearReadState(instance, "chat_a", "tok_x")).not.toThrow();
     expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+  });
+
+  test("markUnread pins cursor to before the latest assistant_text (count = 1)", () => {
+    const instance = "crs-mark-unread" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "hi" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "still hi" });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "ping?" });
+    const assistant = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_a",
+      text: "hello back",
+      streaming: false
+    });
+    markRead(instance, "chat_a", "tok_x", assistant.id);
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(0);
+    markUnread(instance, "chat_a", "tok_x");
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(1);
+    // Idempotent — replaying lands on the same cursor and stays at 1.
+    markUnread(instance, "chat_a", "tok_x");
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(1);
+  });
+
+  test("markUnread counts trailing tool_calls along with the latest assistant turn", () => {
+    const instance = "crs-mark-unread-tools" as Instance;
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "go" });
+    insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_a",
+      text: "on it",
+      streaming: false
+    });
+    insertChatBlock(instance, {
+      kind: "tool_call",
+      sessionId: "chat_a",
+      callId: "call_1",
+      toolName: "echo",
+      displayLabel: "Echo",
+      argsPreview: "{}",
+      argsFull: {},
+      status: "running"
+    });
+    markUnread(instance, "chat_a", "tok_x");
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(2);
+  });
+
+  test("markUnread falls back to clearing the cursor when there is no assistant_text", () => {
+    const instance = "crs-mark-unread-no-assistant" as Instance;
+    const a = insertChatBlock(instance, {
+      kind: "user_text",
+      sessionId: "chat_a",
+      text: "hi"
+    });
+    insertChatBlock(instance, { kind: "user_text", sessionId: "chat_a", text: "hi again" });
+    markRead(instance, "chat_a", "tok_x", a.id);
+    markUnread(instance, "chat_a", "tok_x");
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(2);
+  });
+
+  test("markUnread clears the cursor when assistant_text is the only visible block", () => {
+    const instance = "crs-mark-unread-only-assistant" as Instance;
+    const assistant = insertChatBlock(instance, {
+      kind: "assistant_text",
+      sessionId: "chat_a",
+      text: "hello",
+      streaming: false
+    });
+    markRead(instance, "chat_a", "tok_x", assistant.id);
+    markUnread(instance, "chat_a", "tok_x");
+    expect(getReadState(instance, "chat_a", "tok_x")).toBeNull();
+    expect(unreadCountForDevice(instance, "tok_x")).toBe(1);
   });
 
   test("clearReadState only clears the caller's device", () => {

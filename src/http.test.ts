@@ -3069,7 +3069,7 @@ describe("runtime api", () => {
       expect(badgeB.unread).toBe(1);
     });
 
-    test("DELETE /api/chat/:id/read re-inflates the badge for the caller's device only", async () => {
+    test("DELETE /api/chat/:id/read marks just the latest assistant turn unread", async () => {
       const config = testConfig("chat-unread-swipe");
       const handler = createHandler(config);
       await call(handler, config, "/api/push/devices", {
@@ -3086,32 +3086,40 @@ describe("runtime api", () => {
         method: "POST",
         body: JSON.stringify({ title: "swipe" })
       });
+      // Realistic chat: a few user messages culminating in an assistant
+      // reply. After Mark Unread the badge should show 1 (just the
+      // assistant turn), not 4 (every visible block).
       const { insertChatBlock } = await import("./state");
-      const b = insertChatBlock(config.instance, {
-        kind: "user_text",
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "still hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "ok last one" });
+      const assistant = insertChatBlock(config.instance, {
+        kind: "assistant_text",
         sessionId: session.id,
-        text: "ping"
+        text: "hello back",
+        streaming: false
       });
 
       // Both devices catch up first so the baseline badge is 0.
       await call(handler, config, `/api/chat/${session.id}/read`, {
-        method: "POST", headers: headerA, body: JSON.stringify({ lastReadBlockId: b.id })
+        method: "POST", headers: headerA, body: JSON.stringify({ lastReadBlockId: assistant.id })
       });
       await call(handler, config, `/api/chat/${session.id}/read`, {
-        method: "POST", headers: headerB, body: JSON.stringify({ lastReadBlockId: b.id })
+        method: "POST", headers: headerB, body: JSON.stringify({ lastReadBlockId: assistant.id })
       });
       expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(0);
-      expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
 
-      // iPhone A swipes "Mark unread" — its badge bounces to 1, iPhone B unchanged.
+      // iPhone A swipes "Mark unread". The badge surfaces just the
+      // latest assistant turn (1), not the full session.
       const cleared = await call(handler, config, `/api/chat/${session.id}/read`, {
         method: "DELETE", headers: headerA
       });
       expect(cleared.ok).toBe(true);
       expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+      // iPhone B is unaffected (still caught up).
       expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
 
-      // Idempotent — second call on the already-empty row stays 1.
+      // Idempotent — replaying lands on the same cursor; still 1.
       const second = await call(handler, config, `/api/chat/${session.id}/read`, {
         method: "DELETE", headers: headerA
       });

@@ -7,10 +7,10 @@ import {
   addSseSubscription,
   appendTrace,
   getDevice,
-  clearReadState,
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
+  markUnread,
   mutateState,
   readState,
   unreadCountsByDevice,
@@ -915,11 +915,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
       return json({ ok: true, readState: result });
     }],
-    // Drop the device's read cursor for a session so the badge counts
-    // it as fully unread again. Powers the mobile chat-list swipe
-    // "Mark Unread" action — markRead is monotonic and can't regress
-    // a cursor, so the only honest way to flip a chat back to unread
-    // is to delete the row.
+    // Mark a chat unread for the calling device. Pins the read cursor
+    // to the block before the latest assistant_text so the badge
+    // settles at "just the agent's last turn" (typically 1), matching
+    // iOS Mail / Messages behavior — not "every block since session
+    // start". Sessions with no assistant_text fall back to clearing
+    // the cursor entirely so the action still surfaces them as unread.
     ["DELETE", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
@@ -929,7 +930,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!readState(config.instance).chatSessions.some((s) => s.id === sessionId)) {
         return json({ error: `Chat session not found: ${sessionId}` }, 404);
       }
-      clearReadState(config.instance, sessionId, dev.token);
+      markUnread(config.instance, sessionId, dev.token);
       return json({ ok: true });
     }],
     ["GET", /^\/api\/badge$/, async (request) => {
