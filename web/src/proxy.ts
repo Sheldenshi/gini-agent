@@ -26,11 +26,10 @@ import {
   buildTunnelCookie,
   isTunnelDenied,
   matchSecretPrefix,
-  readLiveTunnelHost,
-  readTunnelConfigFromDisk,
   readTunnelCookie,
   tunnelSecretEquals
 } from "@/lib/tunnel-policy";
+import { readLiveTunnelHost, readTunnelConfigFromDisk } from "@/lib/tunnel-policy.server";
 
 const PROXY_STATUS_TIMEOUT_MS = 1500;
 

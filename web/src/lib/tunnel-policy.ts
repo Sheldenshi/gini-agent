@@ -4,12 +4,14 @@
 // also handles Host classification and the session-cookie mint; this file
 // holds the path-and-method logic both layers share.
 //
+// This module must stay browser-safe — it is imported (transitively) by
+// `"use client"` components via `web/src/lib/queries.ts` and
+// `web/src/lib/useRuntimeStream.ts`. Anything that touches `node:fs` /
+// `node:os` / `node:path` lives in `tunnel-policy.server.ts` instead, so
+// Turbopack never tries to bundle a Node built-in for the browser.
+//
 // See docs/adr/tunnel-and-mobile-access.md "Architecture (summary)" and
 // "Trust radius" + docs/adr/bff-trust-boundary.md.
-
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
 
 export const TUNNEL_MARKER_HEADER = "x-gini-tunnel-vetted";
 export const TUNNEL_MARKER_VALUE = "1";
@@ -99,54 +101,6 @@ export function matchSecretPrefix(canonicalPath: string, secret: string): { matc
     return { match: true, suffix: canonicalPath.slice(`/${secret}`.length) };
   }
   return null;
-}
-
-function instanceStateDir(): string {
-  const instance = process.env.GINI_INSTANCE ?? "default";
-  const stateRoot = process.env.GINI_STATE_ROOT
-    ? resolve(process.env.GINI_STATE_ROOT)
-    : join(process.env.HOME ?? homedir(), ".gini");
-  return join(stateRoot, "instances", instance);
-}
-
-/** Read the live tunnel config from disk on every call. The proxy reads
- *  tunnel.secret + tunnel.enabled uncached on every request so rotate-secret
- *  / disable cycles invalidate cookies on the very next hit without
- *  coordination. See docs/adr/tunnel-and-mobile-access.md
- *  "Architecture (summary)". */
-export function readTunnelConfigFromDisk(): { enabled: boolean; secret: string } {
-  const configFile = join(instanceStateDir(), "config.json");
-  if (!existsSync(configFile)) return { enabled: false, secret: "" };
-  try {
-    const raw = readFileSync(configFile, "utf8");
-    const parsed = JSON.parse(raw) as { tunnel?: { enabled?: unknown; secret?: unknown } };
-    return {
-      enabled: parsed.tunnel?.enabled === true,
-      secret: typeof parsed.tunnel?.secret === "string" ? parsed.tunnel.secret : ""
-    };
-  } catch {
-    return { enabled: false, secret: "" };
-  }
-}
-
-/** Read the live tunnel public URL host from the sibling file the runtime
- *  publishes (`~/.gini/instances/<inst>/tunnel.publicUrl`). The proxy uses
- *  this for an EQUALITY host match (see
- *  docs/adr/tunnel-and-mobile-access.md "Architecture (summary)"),
- *  rather than a permissive `.trycloudflare.com` suffix check. Returns the
- *  empty string when the file is missing (no live tunnel) — the proxy
- *  treats that as "no tunnel branch matches" and rejects at the Host
- *  classifier. */
-export function readLiveTunnelHost(): string {
-  const p = join(instanceStateDir(), "tunnel.publicUrl");
-  if (!existsSync(p)) return "";
-  try {
-    const url = readFileSync(p, "utf8").trim();
-    if (!url) return "";
-    return new URL(url).host.toLowerCase();
-  } catch {
-    return "";
-  }
 }
 
 /** Constant-time byte equality. Avoids early-exit on length mismatch. */

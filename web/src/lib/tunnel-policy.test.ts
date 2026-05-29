@@ -8,12 +8,11 @@ import {
   isTunnelDenied,
   looksLikeSecretSegment,
   matchSecretPrefix,
-  readLiveTunnelHost,
-  readTunnelConfigFromDisk,
   readTunnelCookie,
   tunnelSecretEquals,
   withoutTrailingSlash
 } from "./tunnel-policy";
+import { readLiveTunnelHost, readTunnelConfigFromDisk } from "./tunnel-policy.server";
 
 describe("isTunnelDenied", () => {
   test("denies entire /api/runtime/pairing subtree on every method", () => {
