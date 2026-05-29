@@ -10,14 +10,6 @@
 import { createHash } from "node:crypto";
 import type { ToolFunctionSpec } from "../provider";
 import type { RuntimeState } from "../types";
-import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
-
-// Skill-script-derived tools (Anthropic Agent Skills `scripts/` convention)
-// are appended to the catalog at build time from `state.skills`. We give
-// them their own synthetic toolset name so the always-on filter and the
-// chat-block display layer can pick them out without sniffing each entry's
-// origin separately.
-export const SKILL_SCRIPT_TOOLSET = "skill_script";
 
 // Canonical tool list. Initial set mirrors src/tools/* one-for-one. We keep
 // each entry small and self-documenting so models with weaker tool-calling
@@ -758,6 +750,36 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // signed_upload: PUT a chat-uploaded image/file to a signed URL the
+    // caller already obtained from some API (Linear's prepare_attachment_
+    // upload, GitHub's uploads.github.com, etc.). The body is constrained
+    // to "bytes of a Gini upload"; the model picks the URL and headers
+    // from a prior API response. This is the generic primitive that lets
+    // the model complete signed-PUT upload flows without per-provider
+    // runtime code.
+    //
+    // Pair with mcp_call (or any other API call) on either side: get the
+    // signed URL + headers from the provider's prepare step, run
+    // signed_upload, then call the provider's finalize step. The skill
+    // for each integration documents the specific 3-step sequence.
+    toolset: "mcp",
+    displayLabel: "Upload to signed URL",
+    type: "function",
+    function: {
+      name: "signed_upload",
+      description: "PUT a chat-uploaded file's bytes to a signed URL. Use this for attachment / file-upload flows where an API (Linear, GitHub, S3, etc.) handed you a short-lived signed URL plus headers — you call signed_upload between the prepare step and the finalize step. The uploadId is the id from the 'Attached image uploads' system note in the user's message; url + headers come from the prepare-step response verbatim. Returns { ok, status, error?, bytesSent? }. Only https URLs are accepted.",
+      parameters: {
+        type: "object",
+        properties: {
+          uploadId: { type: "string", description: "Upload id of a chat-attached file (from the 'Attached image uploads' system note in the user message)." },
+          url: { type: "string", description: "Signed PUT URL returned by the API's prepare step. Must be https." },
+          headers: { type: "object", description: "Headers the API said to send verbatim with the PUT (e.g. content-type, x-goog-content-length-range). Pass them through exactly; omitting one usually means a 403 from the storage backend.", additionalProperties: { type: "string" } }
+        },
+        required: ["uploadId", "url"]
+      }
+    }
+  },
+  {
     // Schedule a real cron/job. The job's output is delivered as an
     // assistant message back into the originating chat session when it
     // fires. Low-risk: no approval gate — the user can pause/delete the
@@ -1143,37 +1165,6 @@ export function allTools(): ToolCatalogTool[] {
   return TOOL_DEFS.map((t) => ({ ...t, function: { ...t.function, parameters: { ...t.function.parameters } } }));
 }
 
-// Materialize one ToolCatalogTool per (enabled bundled skill, declared
-// script) pair. We hand-build the toolset / displayLabel fields so the
-// always-on branch and the chat-block label helper recognize them by
-// toolset name rather than by hand-maintained allowlists.
-export function skillScriptCatalogEntries(state: RuntimeState): ToolCatalogTool[] {
-  const seen = new Set<string>();
-  const out: ToolCatalogTool[] = [];
-  // Skill order is stable across boots because we sort by skill name then
-  // by declared file path. Same hash-stability property the rest of the
-  // catalog relies on.
-  const sorted = [...listEnabledSkillScripts(state)].sort((a, b) => {
-    const skillCmp = a.skill.name.localeCompare(b.skill.name);
-    if (skillCmp !== 0) return skillCmp;
-    return a.script.file.localeCompare(b.script.file);
-  });
-  for (const inv of sorted) {
-    const name = inv.script.tool.name;
-    if (seen.has(name)) continue; // first-declaration-wins on duplicate names.
-    seen.add(name);
-    out.push({
-      toolset: SKILL_SCRIPT_TOOLSET,
-      type: "function",
-      function: {
-        name,
-        description: inv.script.tool.description,
-        parameters: inv.script.tool.parameters
-      }
-    });
-  }
-  return out;
-}
 
 // Filter tools by enabled toolsets in state. The web_fetch tool is grouped
 // under "messaging" only because the legacy defaults didn't include a "web"
@@ -1195,11 +1186,7 @@ export function skillScriptCatalogEntries(state: RuntimeState): ToolCatalogTool[
 // hide outbound messaging entirely.
 export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<string>): ToolCatalogTool[] {
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
-  // Append skill-script-derived tools so the rest of the filter chain can
-  // treat them like any other catalog entry. The synthetic toolset name
-  // `SKILL_SCRIPT_TOOLSET` is what the always-on branch above keys on.
-  const base = [...allTools(), ...skillScriptCatalogEntries(state)];
-  return base.filter((tool) => {
+  return allTools().filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
@@ -1230,12 +1217,12 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
-    // Skill-script-derived tools (Anthropic Agent Skills `scripts/`
-    // convention; see src/capabilities/skill-scripts.ts) ride alongside
-    // mcp_call: when an enabled bundled skill ships a script, the model
-    // needs that tool exposed on every fresh instance without a toolset
-    // toggle. The skill's status (`enabled`/`disabled`) is the gate.
-    if (tool.toolset === SKILL_SCRIPT_TOOLSET) return true;
+    // signed_upload rides alongside mcp_call: it's the generic primitive
+    // for "PUT a Gini upload to a URL" that completes signed-PUT flows
+    // (Linear attachments, GitHub uploads, S3, etc.). The model needs it
+    // on every fresh instance without toolset toggling — same always-on
+    // rationale as mcp_call.
+    if (tool.function.name === "signed_upload") return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
     // rationale: a fresh instance with no toolsets toggled still needs
@@ -1437,6 +1424,11 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.server)}.${previewValue(safe.tool)}`
       );
+    case "signed_upload": {
+      let host = "";
+      try { host = new URL(String(safe.url ?? "")).host; } catch { host = "?"; }
+      return truncatePreview(`${previewValue(safe.uploadId)} → ${host}`);
+    }
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
     case "request_messaging_bridge":

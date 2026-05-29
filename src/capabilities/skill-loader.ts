@@ -25,7 +25,7 @@
 
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import type { RuntimeConfig, RuntimeState, SkillRecord, SkillScript, SkillStatus } from "../types";
+import type { RuntimeConfig, RuntimeState, SkillRecord, SkillStatus } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now } from "../state";
 import { projectRoot, skillsDir } from "../paths";
 import { hasProvider } from "../integrations/connectors/registry";
@@ -40,7 +40,6 @@ export interface ParsedSkillFile {
   allowedTools?: string;
   license?: string;
   compatibility?: string;
-  scripts?: SkillScript[];
   validationStatus?: "ok" | "unsupported";
   validationMessage?: string;
   body: string;
@@ -367,46 +366,6 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
     }
   }
 
-  // Parse skill-bundled scripts (Anthropic Agent Skills `scripts/`
-  // convention). Each declared entry registers as a tool the agent can
-  // invoke; the dispatcher spawns the script with connector env injected.
-  // Parameters is a JSON-encoded JSON-Schema string so authors can express
-  // arbitrarily deep argument shapes without fighting the YAML-ish parser.
-  let scripts: SkillScript[] | undefined;
-  if (giniExt && Array.isArray(giniExt.scripts)) {
-    const collected: SkillScript[] = [];
-    for (const entry of giniExt.scripts) {
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      const item = entry as Record<string, unknown>;
-      const file = typeof item.file === "string" ? item.file.trim() : "";
-      const tool = item.tool && typeof item.tool === "object" && !Array.isArray(item.tool)
-        ? item.tool as Record<string, unknown>
-        : null;
-      if (!file || !tool) continue;
-      const toolName = typeof tool.name === "string" ? tool.name.trim() : "";
-      const toolDescription = typeof tool.description === "string" ? tool.description : "";
-      let parameters: Record<string, unknown> | null = null;
-      if (typeof tool.parameters === "string") {
-        try {
-          const parsedSchema = JSON.parse(tool.parameters) as unknown;
-          if (parsedSchema && typeof parsedSchema === "object" && !Array.isArray(parsedSchema)) {
-            parameters = parsedSchema as Record<string, unknown>;
-          }
-        } catch {
-          parameters = null;
-        }
-      } else if (tool.parameters && typeof tool.parameters === "object" && !Array.isArray(tool.parameters)) {
-        parameters = tool.parameters as Record<string, unknown>;
-      }
-      if (!toolName || !parameters) continue;
-      collected.push({
-        file,
-        tool: { name: toolName, description: toolDescription, parameters }
-      });
-    }
-    if (collected.length > 0) scripts = collected;
-  }
-
   return {
     name,
     description,
@@ -417,7 +376,6 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
     allowedTools,
     license,
     compatibility,
-    scripts,
     body: body.trim(),
     frontmatter: fm
   };
@@ -528,7 +486,6 @@ function upsertSkillFromFile(
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
       JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null) ||
-      JSON.stringify(existing.scripts ?? null) !== JSON.stringify(parsed.scripts ?? null) ||
       (existing.manifestVersion ?? null) !== (parsed.version ?? null);
     if (!changed) return { record: existing, kind: "noop" };
     if (changed) {
@@ -551,7 +508,6 @@ function upsertSkillFromFile(
       existing.allowedTools = parsed.allowedTools;
       existing.license = parsed.license;
       existing.compatibility = parsed.compatibility;
-      existing.scripts = parsed.scripts;
       existing.manifestVersion = parsed.version;
       existing.validationStatus = validationStatus;
       existing.validationMessage = validationMessage;
@@ -579,7 +535,6 @@ function upsertSkillFromFile(
     allowedTools: parsed.allowedTools,
     license: parsed.license,
     compatibility: parsed.compatibility,
-    scripts: parsed.scripts,
     manifestVersion: parsed.version,
     validationStatus,
     validationMessage,

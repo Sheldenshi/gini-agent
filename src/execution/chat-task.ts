@@ -509,11 +509,11 @@ function buildUserMessage(config: RuntimeConfig, task: Task): ToolCallingMessage
 function buildVisionContent(
   config: RuntimeConfig,
   text: string,
-  images: ReadonlyArray<{ id: string; mimeType: string }>
+  images: ReadonlyArray<{ id: string; mimeType: string; size: number }>
 ): MessageContentPart[] {
   const parts: MessageContentPart[] = [];
   if (text.length > 0) parts.push({ type: "text", text });
-  const loaded: string[] = [];
+  const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
@@ -521,17 +521,22 @@ function buildVisionContent(
       continue;
     }
     parts.push({ type: "image_url", image_url: { url: dataUrl } });
-    loaded.push(image.id);
+    loaded.push({ id: image.id, mimeType: image.mimeType, size: image.size });
   }
-  // Surface upload ids to the model so non-vision tools (e.g.
-  // linear_attach_image) can reference the same image the user just
-  // showed. The data URL itself carries no id, and we deliberately don't
-  // embed ids in the image_url payload to keep the provider call shape
-  // standard — a short trailing text marker is enough.
+  // Surface upload metadata to the model so non-vision tools (e.g.
+  // signed_upload, MCP attachment uploads) can plug the right values into
+  // their args. Each line carries id + mimeType + size — the model needs
+  // size for `prepare_attachment_upload`-style calls, mimeType for
+  // content-type headers, and the id for any tool that takes an uploadId.
+  // The data URL itself carries none of this; the marker is the canonical
+  // place to read it from.
   if (loaded.length > 0) {
+    const lines = loaded.map(
+      (u) => `- ${u.id} (${u.mimeType}, ${u.size} bytes)`
+    );
     parts.push({
       type: "text",
-      text: `Attached image upload ids (in order): ${loaded.join(", ")}`
+      text: `Attached image uploads (in order):\n${lines.join("\n")}`
     });
   }
   // Provider requires non-empty content. If every image failed to load and

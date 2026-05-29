@@ -53,15 +53,6 @@ and surface the providers the new skill will need.
    - Whether it can write outside its workspace.
    - Whether it makes outbound network calls and to which hosts.
 
-   If the SKILL.md declares `metadata.gini.scripts`, **tell the user
-   they will NOT execute as registered tools** — only bundled (vendored)
-   skills' scripts auto-register with the catalog. User-imported skills
-   are markdown-only; the script files land on disk but the runtime
-   ignores them at dispatch time. If the user wants the scripts to
-   actually run, the path is to PR the skill into the bundled set
-   (`<repo>/skills/`) so a maintainer reviews the code before it joins
-   the trusted set.
-
 4. Resolve the connector requirements declared under
    `metadata.gini.requires.connectors`:
 
