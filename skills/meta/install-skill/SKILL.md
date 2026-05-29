@@ -89,11 +89,10 @@ and surface the providers the new skill will need.
        '{ body: $body }')"
    ```
 
-   The endpoint writes the file under
-   `~/.gini/instances/<instance>/skills/user/<name>/SKILL.md`
-   (or under a category folder when the skill declares
-   `metadata.gini.category`), triggers a loader reload, and returns the
-   new enabled SkillRecord.
+   The endpoint writes the file flat under
+   `~/.gini/instances/<instance>/skills/<name>/SKILL.md`, triggers a
+   loader reload, and returns the new enabled SkillRecord. User-installed
+   skills never nest under a category subfolder.
 
 7. If any required connector is missing or unhealthy, tell the user to
    open the Skills page (`/skills`), find the row for the skill they

@@ -2052,13 +2052,6 @@ async function installSkillTool(
   args: Record<string, unknown>
 ): Promise<string> {
   const body = requireString(args, "body");
-  let category: string | undefined;
-  if (args.category !== undefined && args.category !== null) {
-    if (typeof args.category !== "string" || args.category.length === 0) {
-      throw new Error("Invalid input: category must be a non-empty string.");
-    }
-    category = args.category;
-  }
   let files: Array<{ name: string; content: string }> | undefined;
   if (args.files !== undefined && args.files !== null) {
     if (!Array.isArray(args.files)) {
@@ -2080,7 +2073,7 @@ async function installSkillTool(
     }
     files = cleaned;
   }
-  const installed = await installSkillFromBody(config, { body, category, files });
+  const installed = await installSkillFromBody(config, { body, files });
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(

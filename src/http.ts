@@ -899,8 +899,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // POST /api/skills accepts two payload shapes per ADR connector-provider-spec-compliance.md:
     //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
     //     flow used by the install-skill meta-skill and remote/mobile UIs.
-    //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/
-    //     and reloads.
+    //     Writes the manifest flat to ~/.gini/instances/<instance>/skills/<name>/
+    //     and reloads. User skills never nest under a category subfolder.
     //   - legacy CRUD payload (`name`, `description`, `steps`, …): create
     //     an in-memory SkillRecord without a manifest file.
     ["POST", /^\/api\/skills$/, async (request) => {
@@ -912,7 +912,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           : undefined;
         return json(await installSkillFromBody(config, {
           body: String(payload.body),
-          category: typeof payload.category === "string" ? payload.category : undefined,
           files
         }), 201);
       }
