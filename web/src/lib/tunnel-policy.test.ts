@@ -13,7 +13,12 @@ import {
   withoutTrailingSlash
 } from "./tunnel-policy";
 import { readLiveTunnelHost, readTunnelConfigFromDisk } from "./tunnel-policy.server";
-import { TUNNEL_PUBLIC_URL_FILENAME } from "@runtime/runtime/tunnel/types";
+
+// MUST stay in sync with TUNNEL_PUBLIC_URL_FILENAME in
+// src/runtime/tunnel/types.ts. Inlined because TypeScript's web rootDir
+// rejects relative imports that escape web/, and Turbopack rejects the
+// `@runtime/` alias in middleware. See tunnel-policy.server.ts.
+const TUNNEL_PUBLIC_URL_FILENAME = "tunnel.publicUrl";
 
 describe("isTunnelDenied", () => {
   test("denies entire /api/runtime/pairing subtree on every method", () => {

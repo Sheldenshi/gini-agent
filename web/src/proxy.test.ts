@@ -9,7 +9,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest, type NextResponse } from "next/server";
 import { proxy } from "./proxy";
-import { TUNNEL_PUBLIC_URL_FILENAME } from "@runtime/runtime/tunnel/types";
+
+// MUST stay in sync with TUNNEL_PUBLIC_URL_FILENAME in
+// src/runtime/tunnel/types.ts. Inlined because the web rootDir rejects
+// relative imports that escape web/. See tunnel-policy.server.ts.
+const TUNNEL_PUBLIC_URL_FILENAME = "tunnel.publicUrl";
 
 const STATE_ROOT = mkdtempSync(join(tmpdir(), "gini-proxy-test-"));
 const INSTANCE = "default";

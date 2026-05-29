@@ -11,14 +11,14 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-// Reach into the runtime tree to share the publicUrl filename constant.
-// The runtime is what writes this file; importing the literal from the
-// authoritative source means renaming the file in one place fans out to
-// both trust layers without a silent desynchronization. The runtime
-// tunnel `types` module is type-only plus a pair of bare constants —
-// no node: imports — so this pulls nothing fs- or cloudflared-shaped
-// into the BFF bundle.
-import { TUNNEL_PUBLIC_URL_FILENAME } from "@runtime/runtime/tunnel/types";
+
+// MUST stay in sync with TUNNEL_PUBLIC_URL_FILENAME in
+// src/runtime/tunnel/types.ts. Inlined here because Next.js' Turbopack
+// can't follow a tsconfig path alias across the worktree root in the
+// middleware bundle, and TypeScript's web project rootDir refuses an
+// absolute-style relative import that escapes web/. The runtime is the
+// writer; this is the reader; renaming the file requires updating both.
+const TUNNEL_PUBLIC_URL_FILENAME = "tunnel.publicUrl";
 
 function instanceStateDir(): string {
   const instance = process.env.GINI_INSTANCE ?? "default";
