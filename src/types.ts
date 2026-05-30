@@ -1087,8 +1087,16 @@ export interface SetupRequest {
   action: SetupRequestAction;
   // Trust anchor shown to the user before they complete the request: the
   // destination URL for browser.connect / browser.fill_secret, the provider
-  // id for connector.request, or the bridge kind / id for the messaging.*
-  // actions.
+  // id for connector.request (or the credential `name` for a templateless
+  // typed-credential request, which carries no registered provider), or the
+  // bridge kind / id for the messaging.* actions.
+  //
+  // For connector.request the payload is one of two shapes. Known-provider:
+  // {provider, providerLabel, providerDescription, fields, reason, toolCallId}.
+  // Templateless typed credential (no registered provider): {credentialName,
+  // credentialType ("api-key" | "oauth2"), credentialLabel, mcpUrl?, reason,
+  // toolCallId}. Either shape may also carry {skillId} — when set, completing
+  // the request both stores the credential AND grants it to that skill.
   target: string;
   // Human-language ask shown to the user in the chat card.
   reason: string;

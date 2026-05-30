@@ -2687,17 +2687,88 @@ async function requestConnectorTool(
   args: Record<string, unknown>,
   messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
-  const providerId = requireString(args, "provider");
   const reason = requireString(args, "reason");
-  const provider = getProvider(providerId);
-  if (!provider) {
-    // Synchronous error so the model can recover (it picked a bogus
-    // provider id). Matches how mcp_call surfaces unknown servers.
+  const providerId = optionalString(args, "provider", "");
+  const provider = providerId ? getProvider(providerId) : undefined;
+
+  // The contract: the caller supplies EITHER a registered `provider`
+  // (template path) OR `{name, type}` (templateless typed credential for a
+  // service with no provider module). Templateless is the path when the
+  // model passed `type` and there's no registered provider for `provider`.
+  const credentialType = optionalString(args, "type", "");
+  const templateless = !provider && (credentialType === "api-key" || credentialType === "oauth2");
+
+  if (!provider && !templateless) {
+    // Synchronous error so the model can recover. It either picked a bogus
+    // provider id, or asked for a templateless credential without a valid
+    // `type`. Matches how mcp_call surfaces unknown servers.
     return {
       kind: "sync",
       result: JSON.stringify({
         ok: false,
-        error: `Unknown provider: ${providerId}. The user has no path to connect this.`
+        error: providerId
+          ? `Unknown provider: ${providerId}. For a service with no registered provider, pass {name, type:"api-key"|"oauth2"} instead so the user can connect it.`
+          : `request_connector needs either a registered \`provider\` id, or \`type\` ("api-key" | "oauth2") plus \`name\` for a templateless credential.`
+      })
+    };
+  }
+
+  // Templateless field capture. `name` is the credential name; for api-key it
+  // IS the env var, so validate it synchronously here (createConnector
+  // re-validates server-side) — a recoverable error lets the model fix the
+  // name before any card is minted.
+  const credentialName = templateless ? optionalString(args, "name", "") : "";
+  const credentialLabel = optionalString(args, "label", "");
+  const mcpUrl = optionalString(args, "mcpUrl", "");
+  const skillId = optionalString(args, "skillId", "");
+  if (templateless) {
+    if (!credentialName) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `A templateless request needs a \`name\`. For type 'api-key' it must be an uppercase env-var token (e.g. SOME_SERVICE_API_KEY).`
+        })
+      };
+    }
+    if (credentialType === "api-key" && !/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Invalid api-key credential name: "${credentialName}". The name is used as the environment variable, so it must match ^[A-Z][A-Z0-9_]*$ (e.g. SOME_SERVICE_API_KEY).`
+        })
+      };
+    }
+  }
+
+  // Surface guard — same rationale as requestSkillConnectorGrant /
+  // browser_fill_secrets. The Connect card is React UI rendered only in the
+  // web chat; a task running over a messaging bridge (Telegram/Discord), in a
+  // scheduled/headless job session (origin:"job"), or with no chat session at
+  // all would park in waiting_approval with no way to enter the secret. Fail
+  // synchronously so the agent can verbalize "open the web chat to enter it".
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Connecting a credential needs the secure Connect card, and that card only renders in a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Route this through the web chat or settings page.`
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Connecting a credential needs the secure Connect card, which only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to enter it, then continue once they confirm.`
       })
     };
   }
@@ -2707,17 +2778,23 @@ async function requestConnectorTool(
   // values like project IDs, and passes the finished text here. No runtime
   // templating: `reason` becomes the approval's `reason` verbatim.
 
-  // Fast path: if a healthy + configured connector already exists for
-  // this provider, the model is calling defensively. Tell it to proceed
-  // and skip the round-trip through the approval UI.
-  const state = readState(config.instance);
-  const existing = state.connectors.find(
-    (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
-  );
+  // Fast path: if a healthy + configured connector already exists, the model
+  // is calling defensively. Tell it to proceed and skip the round-trip through
+  // the approval UI. Key on the credential `name` for templateless requests,
+  // else on the provider id.
+  const state = surfaceState;
+  const existing = templateless
+    ? state.connectors.find(
+        (c) => c.name === credentialName && c.status === "configured" && c.health === "healthy"
+      )
+    : state.connectors.find(
+        (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
+      );
   if (existing) {
+    const label = provider?.label ?? (credentialLabel || credentialName);
     return {
       kind: "sync",
-      result: `${provider.label} is already connected. Proceed with the original request.`
+      result: `${label} is already connected. Proceed with the original request.`
     };
   }
 
@@ -2739,7 +2816,7 @@ async function requestConnectorTool(
   // snapshot is only written when a task pauses for approval, so the
   // first time the model calls request_connector inside the same turn
   // it just called read_skill, only messageHistory has the evidence.
-  if (provider.setupSkill) {
+  if (provider?.setupSkill) {
     const task = state.tasks.find((t) => t.id === taskId);
     const persisted = task?.toolCallState?.messages ?? [];
     const inFlight = messageHistory ?? [];
@@ -2776,6 +2853,13 @@ async function requestConnectorTool(
     }
   }
 
+  // Resolve the user-facing target/label. For the known-provider path these
+  // come from the module; for a templateless request they come from the
+  // model's `name`/`label`. The card detects the templateless case by
+  // `credentialType` being present with no registered provider (see
+  // BlockSetupRequested / AddConnectorDialog).
+  const target = provider?.id ?? credentialName;
+  const payloadLabel = provider?.label ?? (credentialLabel || credentialName);
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -2784,14 +2868,24 @@ async function requestConnectorTool(
     const approval = createSetupRequest(mutable, {
       taskId: item.id,
       action: "connector.request",
-      target: provider.id,
+      target,
       reason,
       payload: {
-        provider: provider.id,
-        providerLabel: provider.label,
-        providerDescription: provider.description,
+        // Known-provider fields (undefined for templateless requests).
+        provider: provider?.id,
+        providerLabel: provider?.label,
+        providerDescription: provider?.description,
+        fields: provider?.fields,
+        // Templateless typed-credential fields (undefined for the
+        // known-provider path). credentialType present + no registered
+        // provider is how the card detects templateless.
+        credentialName: templateless ? credentialName : undefined,
+        credentialType: templateless ? credentialType : undefined,
+        credentialLabel: templateless ? payloadLabel : undefined,
+        mcpUrl: templateless && mcpUrl ? mcpUrl : undefined,
+        // Skill to auto-grant on completion (either path).
+        skillId: skillId || undefined,
         reason,
-        fields: provider.fields,
         toolCallId
       }
     });
@@ -2818,7 +2912,7 @@ async function requestConnectorTool(
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",
-      data: { approvalId: approval.id, provider: provider.id, toolCallId }
+      data: { approvalId: approval.id, provider: target, toolCallId }
     });
     return approval.id;
   });

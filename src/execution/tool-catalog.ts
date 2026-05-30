@@ -494,14 +494,19 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "request_connector",
-      description: "Ask the user to connect an external provider (e.g. linear, github). Use this when a skill is available but inactive because the required connector is not configured. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
+      description: "Ask the user to connect a credential the task needs. This is the ONLY way to obtain a credential: it renders a SECURE inline input in the web chat so the value is captured server-side — NEVER ask the user to paste an API key, token, or secret as a normal chat message (the value would land in your context and the transcript). Two ways to call it: (1) pass a registered `provider` id (e.g. 'linear', 'github') for a known service; or (2) for a brand-new service that has no provider module, pass `name` + `type` (and optionally `label`, `mcpUrl`, `skillId`) to request an arbitrary typed credential. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
       parameters: {
         type: "object",
         properties: {
-          provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
+          provider: { type: "string", description: "Registered provider id (e.g. 'linear'). Use this for a known service whose setup is already modeled. Omit it (and pass `name` + `type` instead) for a brand-new service with no provider module." },
+          name: { type: "string", description: "Credential name for a templateless request (no registered provider). For type 'api-key' this IS the environment variable, so it must be an uppercase token like SOME_SERVICE_API_KEY (matches /^[A-Z][A-Z0-9_]*$/). For type 'oauth2' it is a handle. Required when `provider` is omitted." },
+          type: { type: "string", enum: ["api-key", "oauth2"], description: "Credential type for a templateless request. 'api-key' is a single secret token stored in the env var named by `name`; 'oauth2' is a multi-secret handle. Required when `provider` is omitted." },
+          label: { type: "string", description: "Optional human-readable label shown to the user for a templateless request (e.g. 'Some Service'). Defaults to `name`." },
+          mcpUrl: { type: "string", description: "Optional MCP server URL to associate with an api-key credential (templateless requests only)." },
+          skillId: { type: "string", description: "Optional id of the skill that needs this credential. When set, completing the card both stores the credential AND grants it to this skill — no separate consent card." },
           reason: { type: "string", description: "The full user-visible message shown above the inline Connect form. You are responsible for producing the complete text — including any URLs, project IDs, click instructions, or step-by-step guidance the user needs. Substitute any real values (project ids, etc.) directly into the string; do not leave `${...}` placeholders. The skill body (when one applies) shows the exact format to follow; copy it line-for-line, fill in the real values, and pass the result here verbatim." }
         },
-        required: ["provider", "reason"]
+        required: ["reason"]
       }
     }
   },

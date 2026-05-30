@@ -376,6 +376,143 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("templateless: unknown provider with type:'api-key' mints a typed connector.request card", async () => {
+    // No registered provider for "some-service", but the model passed a
+    // valid {name, type} so the request is accepted (templateless path).
+    const instance = `req-connector-templateless-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_tl",
+      JSON.stringify({
+        name: "SOME_SERVICE_API_KEY",
+        type: "api-key",
+        label: "Some Service",
+        mcpUrl: "https://some.test/mcp",
+        skillId: "skill_demo",
+        reason: "Enter your Some Service API key"
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval).toBeDefined();
+      expect(approval!.action).toBe("connector.request");
+      // target is the credential name (no provider id available).
+      expect(approval!.target).toBe("SOME_SERVICE_API_KEY");
+      // No registered provider — known-provider fields stay undefined.
+      expect(approval!.payload.provider).toBeUndefined();
+      // Templateless typed-credential fields are carried for the card.
+      expect(approval!.payload.credentialName).toBe("SOME_SERVICE_API_KEY");
+      expect(approval!.payload.credentialType).toBe("api-key");
+      expect(approval!.payload.credentialLabel).toBe("Some Service");
+      expect(approval!.payload.mcpUrl).toBe("https://some.test/mcp");
+      expect(approval!.payload.skillId).toBe("skill_demo");
+      expect(approval!.payload.toolCallId).toBe("call_tl");
+      expect(approval!.reason).toBe("Enter your Some Service API key");
+    }
+  });
+
+  test("templateless: a bad api-key name is rejected with a recoverable error before any card is minted", async () => {
+    const instance = `req-connector-badname-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_bad",
+      JSON.stringify({ name: "some-service", type: "api-key", reason: "connect" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("api-key credential name");
+    }
+    const state = readState(instance);
+    expect(state.setupRequests.filter((a) => a.taskId === taskId).length).toBe(0);
+  });
+
+  test("templateless: skillId is carried into the payload for a known provider too", async () => {
+    const instance = `req-connector-skillid-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_known_skill",
+      JSON.stringify({ provider: "linear", skillId: "skill_linear", reason: "connect linear" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval!.payload.skillId).toBe("skill_linear");
+      expect(approval!.payload.provider).toBe("linear");
+    }
+  });
+
+  test("surface guard: rejects a job-origin session synchronously", async () => {
+    const instance = `req-connector-job-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    // Build a task bound to a session whose origin is "job" (headless).
+    const task = createTask(config.instance, "job dispatch test");
+    await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "job session");
+      session.origin = "job";
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "request_connector",
+      "call_job",
+      JSON.stringify({ provider: "linear", reason: "connect" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("web chat");
+    }
+    const state = readState(instance);
+    expect(state.setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
+  });
+
+  test("surface guard: rejects a telegram-sourced session synchronously", async () => {
+    const instance = `req-connector-tg-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const task = createTask(config.instance, "telegram dispatch test");
+    await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "telegram session");
+      session.source = { kind: "telegram", bridgeId: "b1", chatId: 1, target: "t" };
+      task.chatSessionId = session.id;
+      upsertTask(state, task);
+    });
+    const result = await dispatchToolCall(
+      config,
+      task.id,
+      "request_connector",
+      "call_tg",
+      JSON.stringify({ provider: "linear", reason: "connect" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("telegram");
+    }
+    const state = readState(instance);
+    expect(state.setupRequests.filter((a) => a.taskId === task.id).length).toBe(0);
+  });
+
   test("request_messaging_bridge: creates a pending messaging.add_bridge approval with kind/suggestedName/reason in payload", async () => {
     // Chat-side affordance for adding a Telegram bridge. The
     // dispatcher mints a pending approval whose payload carries the
