@@ -806,7 +806,7 @@ const BLOCKED_HOSTNAMES = new Set([
   "::1"
 ]);
 
-const SECRET_PATTERNS = [
+export const SECRET_PATTERNS = [
   /sk-[A-Za-z0-9_-]{16,}/,
   /ghp_[A-Za-z0-9]{20,}/,
   /github_pat_[A-Za-z0-9_]{20,}/,
