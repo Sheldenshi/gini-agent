@@ -1245,12 +1245,12 @@ describe("chat-task loop", () => {
 
   test("message 0 is a byte-stable prefix across two turns in the same session", async () => {
     // Headline cache contract: with no identity/skill/job/connector change
-    // between turns and recall isolated (no active agent → recall skipped, so
-    // recalledContext is empty on both turns), the system message (message 0)
-    // must be byte-identical turn-to-turn so automatic provider prefix
-    // caching stays warm. The per-turn-varying content (emitted identity,
-    // recalled memory) now lives in the ephemeral role:"user" tail, not the
-    // prefix. See ADR stable-system-prefix.md.
+    // between turns, the system message (message 0) must be byte-identical
+    // turn-to-turn so automatic provider prefix caching stays warm. Message 0
+    // is stable regardless of whether recall returns anything, because the
+    // per-turn-varying content (emitted identity, recalled memory) now lives
+    // in the ephemeral role:"user" tail rather than in message 0. See ADR
+    // stable-system-prefix.md.
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-stable-prefix");
     const provider = normalizeProvider(config.provider);

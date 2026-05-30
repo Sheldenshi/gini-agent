@@ -419,9 +419,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   return runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent);
 }
 
-// Capture the runtime identity exposed to the model via the system
-// prompt. Pulled from the same data sources gini status reads so the
-// agent's self-report stays consistent with the CLI's view of the
+// Capture the runtime identity exposed to the model via the ephemeral
+// role:"user" tail. Pulled from the same data sources gini status reads
+// so the agent's self-report stays consistent with the CLI's view of the
 // instance. Returns "(none)" placeholders for the optional agent fields
 // when state has no active agent (system-driven flows).
 export function buildAgentIdentity(

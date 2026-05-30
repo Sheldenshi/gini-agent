@@ -268,8 +268,8 @@ export function renderIdentityDelta(prior: AgentIdentity, current: AgentIdentity
 
 // Pure decision: given the current identity, the persisted snapshot from
 // the last turn, and the current turn index, decide what identity content
-// (if any) to emit into the system prompt and what snapshot to persist
-// for the next turn. Three outcomes:
+// (if any) to emit into the ephemeral role:"user" tail and what snapshot
+// to persist for the next turn. Three outcomes:
 //   - first turn or refresh due → full block, snapshot resets lastFullTurn
 //   - delta non-empty           → delta block, snapshot keeps lastFullTurn
 //   - delta empty               → "", no snapshot update
