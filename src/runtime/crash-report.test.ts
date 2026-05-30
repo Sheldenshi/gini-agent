@@ -159,6 +159,100 @@ describe("redactReportText", () => {
   });
 });
 
+describe("buildCrashReport redaction", () => {
+  test("redacts secrets in error.message/stack and logTail, keeps fingerprint stable, drops raw data", () => {
+    // An error whose message + stack embed a fake OpenAI token, a gh token, a
+    // bearer/authorization header, a literal secrets-env value, and a tunnel
+    // secret. None may survive into the built report.
+    const literalSecret = "hunter2-literal-value";
+    const tunnelSecret = "tunnel-secret-zzz999";
+    const err = new Error(
+      `boom sk-abcdefghijklmnop1234 and ${literalSecret} and ${tunnelSecret}`
+    );
+    err.stack = [
+      "Error: boom sk-abcdefghijklmnop1234",
+      "  Authorization: Bearer xyztoken123456",
+      `  token ghp_0123456789abcdefghijklmnopqrstuv leaked ${literalSecret}`,
+      "  at handler (/Users/x/server.ts:1:1)"
+    ].join("\n");
+
+    const report = buildCrashReport({
+      instance: "test-inst",
+      supervisor: "launchd",
+      source: "runtime",
+      error: err,
+      logTail: [
+        {
+          at: "2026-05-29T00:00:00.000Z",
+          message: `log gho_0123456789abcdefghijklmnopqrstuv and ${tunnelSecret}`,
+          data: { secret: "raw payload bytes" }
+        }
+      ],
+      sysInfo: SYS_INFO,
+      clock: () => new Date("2026-05-29T00:00:02.000Z"),
+      secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'\nFOO=bar`,
+      tunnelSecret
+    });
+
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain("sk-abcdefghijklmnop1234");
+    expect(serialized).not.toContain("ghp_0123456789abcdefghijklmnopqrstuv");
+    expect(serialized).not.toContain("gho_0123456789abcdefghijklmnopqrstuv");
+    expect(serialized).not.toContain("Bearer xyztoken123456");
+    expect(serialized).not.toContain("xyztoken123456");
+    expect(serialized).not.toContain(literalSecret);
+    expect(serialized).not.toContain(tunnelSecret);
+    // The raw log `data` payload is dropped entirely.
+    expect(serialized).not.toContain("raw payload bytes");
+    expect(serialized).not.toContain("secret");
+    expect(serialized).toContain("[redacted]");
+    // Fingerprint is computed from the RAW error (sha256) and stays stable —
+    // redaction of the human-readable fields doesn't perturb it.
+    expect(report.fingerprint).toBe(fingerprint(err));
+  });
+
+  test("a built + written pending report carries no secret bytes on disk", () => {
+    const prevStateRoot = process.env.GINI_STATE_ROOT;
+    const stateRoot = `/tmp/gini-crash-redact-tests-${tag()}`;
+    rmSync(stateRoot, { recursive: true, force: true });
+    process.env.GINI_STATE_ROOT = stateRoot;
+    try {
+      const literalSecret = "literal-disk-secret-77";
+      const tunnelSecret = "tunnel-disk-secret-88";
+      const err = new Error(`disk sk-abcdefghijklmnop1234 ${literalSecret}`);
+      err.stack = [
+        "Error: disk",
+        "  Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        `  ghp_0123456789abcdefghijklmnopqrstuv ${tunnelSecret}`
+      ].join("\n");
+      const report = buildCrashReport({
+        instance: "test-inst",
+        supervisor: "launchd",
+        source: "runtime",
+        error: err,
+        logTail: [{ at: "2026-05-29T00:00:00.000Z", message: "evt", data: { x: "raw" } }],
+        sysInfo: SYS_INFO,
+        clock: () => new Date("2026-05-29T00:00:00.000Z"),
+        secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'`,
+        tunnelSecret
+      });
+      const path = writeCrashReportFile(report);
+      const onDisk = readFileSync(path, "utf8");
+      expect(onDisk).not.toContain("sk-abcdefghijklmnop1234");
+      expect(onDisk).not.toContain("ghp_0123456789abcdefghijklmnopqrstuv");
+      expect(onDisk).not.toContain("dXNlcjpwYXNzd29yZA==");
+      expect(onDisk).not.toContain(literalSecret);
+      expect(onDisk).not.toContain(tunnelSecret);
+      expect(onDisk).not.toContain("raw");
+      expect(onDisk).toContain("[redacted]");
+    } finally {
+      if (prevStateRoot === undefined) delete process.env.GINI_STATE_ROOT;
+      else process.env.GINI_STATE_ROOT = prevStateRoot;
+      rmSync(stateRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("buildCrashReport", () => {
   test("drops the data payload from each log line, keeping at + message", () => {
     const report = buildCrashReport({

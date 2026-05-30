@@ -41,8 +41,9 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 const instance = parseInstance();
 const config = loadConfig(instance);
 // Install crash handlers before any runtime work so an uncaughtException or
-// unhandledRejection thrown during boot is still captured + filed. The
-// handler gates issue filing on launchd supervision internally.
+// unhandledRejection thrown during boot is still captured. The handler queues a
+// redacted report; nothing is filed here — the on-restart consent flow
+// (maybeAskAboutCrashes) asks the user before any report is published.
 installCrashHandlers({ instance, source: "runtime" });
 await install(config);
 writePid(config);

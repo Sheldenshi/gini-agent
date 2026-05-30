@@ -17,6 +17,8 @@ import { arch, platform } from "node:os";
 import { join } from "node:path";
 import { logDir } from "../paths";
 import { supervisor } from "../integrations/launchd";
+import { secretsEnvPath } from "../state/secrets-env";
+import { readTunnelConfig } from "./tunnel/config-store";
 import { appendLog } from "../state/trace";
 import {
   buildCrashReport,
@@ -60,6 +62,29 @@ function readRuntimeLogTail(instance: string, maxLines: number): RuntimeLogLine[
   }
 }
 
+// Best-effort literal-redaction inputs for the report. A crash path must never
+// throw while sourcing these, so any read failure yields undefined — the
+// report's pattern-based redaction still runs regardless.
+function readRedactionLiterals(instance: string): {
+  secretsEnvBody?: string;
+  tunnelSecret?: string;
+} {
+  let secretsEnvBody: string | undefined;
+  try {
+    const path = secretsEnvPath();
+    if (existsSync(path)) secretsEnvBody = readFileSync(path, "utf8");
+  } catch {
+    secretsEnvBody = undefined;
+  }
+  let tunnelSecret: string | undefined;
+  try {
+    tunnelSecret = readTunnelConfig(instance)?.secret;
+  } catch {
+    tunnelSecret = undefined;
+  }
+  return { secretsEnvBody, tunnelSecret };
+}
+
 // Module-level guard so a second installCrashHandlers call (e.g. a re-import in
 // tests, or a double wire-up) doesn't register duplicate listeners that would
 // each call exit.
@@ -80,6 +105,7 @@ export function installCrashHandlers(options: InstallCrashHandlersOptions): void
       const err = error instanceof Error ? error : new Error(String(error));
       appendLog(instance, `runtime.${event}`, { message: err.message, stack: err.stack });
 
+      const { secretsEnvBody, tunnelSecret } = readRedactionLiterals(instance);
       const report = buildCrashReport({
         instance,
         supervisor: supervisorImpl(),
@@ -87,7 +113,9 @@ export function installCrashHandlers(options: InstallCrashHandlersOptions): void
         source,
         logTail: readRuntimeLogTail(instance, LOG_TAIL_LINES),
         sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
-        clock
+        clock,
+        secretsEnvBody,
+        tunnelSecret
       });
       // Queue the report. It's filed only if the user consents on the next
       // restart — nothing leaves this process.

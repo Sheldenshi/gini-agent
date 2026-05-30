@@ -12,7 +12,7 @@
 // in chat and the gini-bug-report skill does the actual filing, so the
 // build/fingerprint/redact/queue logic stays pure and testable.
 
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { baseStateRoot } from "../paths";
@@ -59,6 +59,12 @@ export interface BuildCrashReportArgs {
   logTail: RuntimeLogLine[];
   sysInfo: CrashSysInfo;
   clock: () => Date;
+  // Best-effort literal-redaction inputs. Pattern-based redaction always runs;
+  // these scrub the exact secrets-env values + tunnel secret when provided. A
+  // producer that can't read them (e.g. a crash path) passes undefined and
+  // still gets pattern redaction.
+  secretsEnvBody?: string;
+  tunnelSecret?: string;
 }
 
 function errorParts(error: unknown): { name: string; message: string; stack: string } {
@@ -178,15 +184,32 @@ export function redactReportText(text: string, opts: RedactOptions = {}): string
 
 export function buildCrashReport(args: BuildCrashReportArgs): CrashReport {
   const { instance, supervisor, error, source, logTail, sysInfo, clock } = args;
-  const error_ = errorParts(error);
-  // Keep only the event name + timestamp per log line. The `data` payload can
-  // carry user/task content and is dropped entirely.
-  const trimmedTail = logTail.map((line) => ({ at: line.at, message: line.message }));
+  // Fingerprint from the RAW error (a sha256 — safe to keep, and it must stay
+  // stable so recurrences dedupe). Redaction only touches the human-readable
+  // fields that reach the published issue body.
+  const fp = fingerprint(error);
+  const redactOpts: RedactOptions = {
+    secretsEnvBody: args.secretsEnvBody,
+    tunnelSecret: args.tunnelSecret
+  };
+  const raw = errorParts(error);
+  const error_ = {
+    name: raw.name,
+    message: redactReportText(raw.message, redactOpts),
+    stack: redactReportText(raw.stack, redactOpts)
+  };
+  // Keep only the event name + timestamp per log line (the `data` payload can
+  // carry user/task content and is dropped entirely), and redact the message
+  // text that survives.
+  const trimmedTail = logTail.map((line) => ({
+    at: line.at,
+    message: line.message === undefined ? undefined : redactReportText(line.message, redactOpts)
+  }));
   return {
     instance,
     source,
     supervisor,
-    fingerprint: fingerprint(error),
+    fingerprint: fp,
     at: clock().toISOString(),
     error: error_,
     sysInfo,
@@ -216,13 +239,16 @@ export function dismissedCrashReportsDir(): string {
 }
 
 // Synchronous write so a crash handler can persist before exiting. Lands in the
-// pending/ queue as <iso-ts-with-safe-chars>-<fingerprint>.json; nothing is
-// filed until the user consents on the next restart.
+// pending/ queue as <iso-ts-with-safe-chars>-<fingerprint>-<rand>.json; nothing
+// is filed until the user consents on the next restart. The short random suffix
+// keeps two same-millisecond, same-fingerprint reports (a tight crash loop)
+// from clobbering each other.
 export function writeCrashReportFile(report: CrashReport): string {
   const dir = pendingCrashReportsDir();
   mkdirSync(dir, { recursive: true });
   const safeTs = report.at.replace(/[:.]/g, "-");
-  const path = join(dir, `${safeTs}-${report.fingerprint}.json`);
+  const suffix = randomBytes(4).toString("hex");
+  const path = join(dir, `${safeTs}-${report.fingerprint}-${suffix}.json`);
   writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`);
   return path;
 }
