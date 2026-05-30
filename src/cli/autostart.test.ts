@@ -496,6 +496,47 @@ describe("resolveLaunchSpecPair", () => {
     expect(pair.web.environment.GINI_SUPERVISOR).toBe("launchd");
   });
 
+  test("watchdog spec runs `gini watchdog --instance <name>` with the launchd marker", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => "OPENAI_API_KEY=sk-should-not-leak\n"
+    });
+    expect(pair.watchdog.programArguments).toEqual([
+      "/opt/bun/bin/bun",
+      "run",
+      "gini",
+      "watchdog",
+      "--instance",
+      "main"
+    ]);
+    expect(pair.watchdog.environment.GINI_SUPERVISOR).toBe("launchd");
+    expect(pair.watchdog.environment.GINI_INSTANCE).toBe("main");
+    expect(pair.watchdog.workingDirectory).toBe(pair.gateway.workingDirectory);
+  });
+
+  test("watchdog env carries NO provider secrets (it never talks to a provider)", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      // A secret here MUST land in the gateway env but never the watchdog env.
+      readSecretsFile: () => "OPENAI_API_KEY=sk-secret-value\n"
+    });
+    expect(pair.gateway.environment.OPENAI_API_KEY).toBe("sk-secret-value");
+    expect(pair.watchdog.environment.OPENAI_API_KEY).toBeUndefined();
+    // The watchdog also doesn't need the web's Next.js knobs.
+    expect(pair.watchdog.environment.PORT).toBeUndefined();
+    expect(pair.watchdog.environment.GINI_DIST_DIR).toBeUndefined();
+  });
+
   test("rejects suspicious instance names that could break out of the shell shim", async () => {
     const { resolveLaunchSpecPair } = await import("./autostart");
     expect(() => resolveLaunchSpecPair({
@@ -749,5 +790,46 @@ describe("generatePlist", () => {
     expect(xml).toContain("&apos;");
     expect(xml).toContain("&amp; such");
     expect(xml).toContain("&lt;out&gt;");
+  });
+});
+
+describe("generatePlist (watchdog kind: periodic StartInterval)", () => {
+  const baseSpec = {
+    programArguments: ["/opt/bun/bin/bun", "run", "gini", "watchdog", "--instance", "main"],
+    workingDirectory: "/Users/test/.gini/runtime",
+    environment: { PATH: "/usr/bin", GINI_INSTANCE: "main", HOME: "/Users/test", LANG: "en_US.UTF-8" }
+  };
+
+  test("emits StartInterval + RunAtLoad and NO KeepAlive for the watchdog", () => {
+    const xml = generatePlist({
+      instance: "main",
+      kind: "watchdog",
+      spec: baseSpec,
+      stdoutPath: "/tmp/watchdog.log",
+      stderrPath: "/tmp/watchdog.err.log",
+      startIntervalSeconds: 30
+    });
+    expect(xml).toMatch(/<key>StartInterval<\/key>\s*<integer>30<\/integer>/);
+    expect(xml).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
+    // The watchdog is a periodic one-shot that always exits 0 — KeepAlive
+    // would respawn it in a tight loop the instant it finishes.
+    expect(xml).not.toContain("<key>KeepAlive</key>");
+    // ThrottleInterval is a KeepAlive-job knob; the periodic plist drops it.
+    expect(xml).not.toContain("<key>ThrottleInterval</key>");
+    expect(xml).toContain(`<string>${LABEL_PREFIX}.main.watchdog</string>`);
+  });
+
+  test("gateway and web still carry KeepAlive <true/> (StartInterval is watchdog-only)", () => {
+    for (const kind of ["gateway", "web"] as const) {
+      const xml = generatePlist({
+        instance: "main",
+        kind,
+        spec: baseSpec,
+        stdoutPath: "/tmp/out.log",
+        stderrPath: "/tmp/err.log"
+      });
+      expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+      expect(xml).not.toContain("<key>StartInterval</key>");
+    }
   });
 });

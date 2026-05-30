@@ -44,6 +44,7 @@ import { autostart } from "./commands/autostart";
 import { identity } from "./commands/identity";
 import { tunnel } from "./commands/tunnel";
 import { reportCrash } from "./commands/report-crash";
+import { watchdog } from "./commands/watchdog";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -161,6 +162,7 @@ export async function run(): Promise<void> {
     case "identity": await identity(ctx); break;
     case "tunnel": await tunnel(ctx); break;
     case "report-crash": await reportCrash(ctx); break;
+    case "watchdog": await watchdog(ctx); break;
     default: help();
   }
 }

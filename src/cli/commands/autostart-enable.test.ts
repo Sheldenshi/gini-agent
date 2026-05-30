@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { enable } from "./autostart";
-import type { LaunchctlResult } from "../autostart";
+import type { LaunchctlResult, PlistKind } from "../autostart";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -58,12 +58,12 @@ const isDarwin = process.platform === "darwin";
   });
 
   test("happy path: both kinds bootstrap → rollbackState 'clean', no rollbackFailures", async () => {
-    const kickstartCalls: Array<{ inst: string; kind?: "gateway" | "web" }> = [];
+    const kickstartCalls: Array<{ inst: string; kind?: PlistKind }> = [];
     const deps = {
       isLoaded: () => false,
       bootout: () => ok(),
       bootstrap: () => ok(),
-      kickstart: (inst: string, kind?: "gateway" | "web") => {
+      kickstart: (inst: string, kind?: PlistKind) => {
         kickstartCalls.push({ inst, kind });
         return ok();
       }
@@ -137,7 +137,7 @@ const isDarwin = process.platform === "darwin";
     const bootoutStderrSeen: string[] = [];
     const deps = {
       isLoaded: () => false,
-      bootout: (_inst: string, _kind?: "gateway" | "web") => {
+      bootout: (_inst: string, _kind?: PlistKind) => {
         bootoutCalls += 1;
         // Rollback bootout fails — this is the scenario HIGH-B flagged.
         return fail("Bootout failed: 5: Input/output error");

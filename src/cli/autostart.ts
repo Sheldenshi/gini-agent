@@ -114,6 +114,10 @@ export interface LaunchSpec {
 export interface LaunchSpecPair {
   gateway: LaunchSpec;
   web: LaunchSpec;
+  // The periodic health watchdog (StartInterval one-shot). Carries no
+  // provider secrets — it only probes localhost health endpoints and shells
+  // out to launchctl.
+  watchdog: LaunchSpec;
   // Recorded for `status`/diagnostics: which working-directory path
   // resolution picked (installed vs source).
   resolution: "installed" | "source";
@@ -334,7 +338,25 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     environment: webEnv
   };
 
-  return { gateway, web, resolution };
+  // Watchdog plist: a periodic one-shot (StartInterval, see generatePlist)
+  // that runs `gini watchdog --instance <name>`, probes the gateway +
+  // web health endpoints, and kickstarts whichever is dead/hung. It needs
+  // NO provider secrets (it only hits localhost health endpoints and shells
+  // out to launchctl), so the env is the base PATH/HOME/LANG plus the
+  // launchd marker and GINI_INSTANCE — same minimal surface as the web env
+  // minus the Next.js knobs.
+  const watchdogEnv: Record<string, string> = {
+    ...baseEnv,
+    GINI_INSTANCE: options.instance,
+    GINI_SUPERVISOR: GINI_SUPERVISOR_VALUE
+  };
+  const watchdog: LaunchSpec = {
+    programArguments: [bunPath, "run", "gini", "watchdog", "--instance", options.instance],
+    workingDirectory,
+    environment: watchdogEnv
+  };
+
+  return { gateway, web, watchdog, resolution };
 }
 
 // Per-instance descriptor for a supervised LaunchAgent service. Encodes
@@ -357,31 +379,59 @@ export interface SupervisedService {
   // stdout tees.
   stdoutLogFilename: string;
   stderrLogFilename: string;
+  // Set only for the watchdog kind: the periodic one-shot interval (seconds)
+  // that drives the plist's StartInterval. gateway/web leave this undefined
+  // (they are KeepAlive long-lived jobs, not periodic).
+  startIntervalSeconds?: number;
   resolution: "installed" | "source";
 }
 
+// How often the watchdog launchd job re-runs `gini watchdog`. A periodic
+// one-shot (StartInterval), NOT a KeepAlive long-lived job: launchd relaunches
+// it every N seconds. 30s bounds detection latency for a dead/hung web or
+// runtime without spinning the CPU. Overlaps benignly with the gateway/web
+// ThrottleInterval — a kickstart against an already-running job is a no-op.
+export const WATCHDOG_START_INTERVAL_SECONDS = 30;
+
 export interface SupervisedServicesOptions extends ResolveLaunchOptions {
-  // Narrow to a subset of kinds. Defaults to both ["gateway", "web"]. The
-  // `--kind` CLI flag and the setup-api refresh path pass a one-element
-  // array so they don't touch the other service.
+  // Narrow to a subset of kinds. Defaults to all three
+  // ["gateway","web","watchdog"]. The `--kind` CLI flag and the setup-api
+  // refresh path pass a one-element array so they don't touch the others.
   kinds?: PlistKind[];
 }
 
 // Returns the descriptors that drive every per-kind launchctl interaction.
-// The order matches `kinds` (defaults to ["gateway","web"]) so enable's
-// rollback semantics ("kinds bootstrapped earlier in the loop") stay
-// deterministic.
+// The order matches `kinds` (defaults to ["gateway","web","watchdog"]) so
+// enable's rollback semantics ("kinds bootstrapped earlier in the loop")
+// stay deterministic — watchdog is last so a watchdog failure never rolls
+// back the gateway/web that are already up.
 export function supervisedServices(options: SupervisedServicesOptions): SupervisedService[] {
-  const kinds = options.kinds ?? (["gateway", "web"] satisfies PlistKind[]);
+  const kinds = options.kinds ?? (["gateway", "web", "watchdog"] satisfies PlistKind[]);
   const pair = resolveLaunchSpecPair(options);
+  const specForKind: Record<PlistKind, LaunchSpec> = {
+    gateway: pair.gateway,
+    web: pair.web,
+    watchdog: pair.watchdog
+  };
+  const stdoutForKind: Record<PlistKind, string> = {
+    gateway: "runtime-stdout.log",
+    web: "web.log",
+    watchdog: "watchdog.log"
+  };
+  const stderrForKind: Record<PlistKind, string> = {
+    gateway: "runtime-launchd.err.log",
+    web: "web-launchd.err.log",
+    watchdog: "watchdog-launchd.err.log"
+  };
   return kinds.map((kind): SupervisedService => ({
     kind,
     label: labelForKind(options.instance, kind),
     plistPath: plistPathFor(options.instance, kind),
     serviceTarget: serviceTarget(options.instance, kind),
-    spec: kind === "gateway" ? pair.gateway : pair.web,
-    stdoutLogFilename: kind === "gateway" ? "runtime-stdout.log" : "web.log",
-    stderrLogFilename: kind === "gateway" ? "runtime-launchd.err.log" : "web-launchd.err.log",
+    spec: specForKind[kind],
+    stdoutLogFilename: stdoutForKind[kind],
+    stderrLogFilename: stderrForKind[kind],
+    ...(kind === "watchdog" ? { startIntervalSeconds: WATCHDOG_START_INTERVAL_SECONDS } : {}),
     resolution: pair.resolution
   }));
 }
@@ -617,10 +667,16 @@ export interface PlistOptions {
   // service. 10s keeps a crashloop from melting CPU without making clean-stop
   // recovery painfully slow.
   throttleIntervalSeconds?: number;
+  // When set, emit a periodic one-shot plist instead of a long-lived one:
+  // `StartInterval` (launchd relaunches every N seconds) + `RunAtLoad`, and
+  // NO `KeepAlive`. Used for the watchdog. When omitted, the plist is a
+  // KeepAlive long-lived job (gateway/web).
+  startIntervalSeconds?: number;
 }
 
 export function generatePlist(options: PlistOptions): string {
   const throttle = options.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
+  const periodic = options.startIntervalSeconds !== undefined;
   const label = options.kind ? labelForKind(options.instance, options.kind) : labelFor(options.instance);
   const args = options.spec.programArguments.map(escapeXml).map((a) => `        <string>${a}</string>`).join("\n");
   const envEntries = Object.entries(options.spec.environment)
@@ -647,6 +703,25 @@ export function generatePlist(options: PlistOptions): string {
   // The runtime tolerates a network-not-yet-up startup (provider auth
   // retries with backoff), so dropping NetworkState gets us reliable
   // crash respawn.
+  //
+  // Scheduling block differs by job shape:
+  //   - Long-lived (gateway/web): KeepAlive:true + ThrottleInterval. launchd
+  //     always respawns on exit; bootout is the stop.
+  //   - Periodic (watchdog): StartInterval + RunAtLoad and NO KeepAlive. The
+  //     watchdog is a short-lived probe that always exits 0 — KeepAlive would
+  //     respawn it in a tight loop the instant it finishes. StartInterval is
+  //     the right primitive: launchd reruns it every N seconds.
+  const scheduling = periodic
+    ? `    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>${options.startIntervalSeconds}</integer>`
+    : `    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>${throttle}</integer>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -663,12 +738,7 @@ ${args}
     <dict>
 ${envEntries}
     </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>${throttle}</integer>
+${scheduling}
     <key>StandardOutPath</key>
     <string>${escapeXml(options.stdoutPath)}</string>
     <key>StandardErrorPath</key>
@@ -696,6 +766,9 @@ export interface WritePlistOptions {
   stdoutPath: string;
   stderrPath: string;
   throttleIntervalSeconds?: number;
+  // Forwarded to generatePlist: when set, writes a periodic (StartInterval,
+  // no KeepAlive) plist instead of a long-lived one. Set for the watchdog.
+  startIntervalSeconds?: number;
 }
 
 export function writePlist(options: WritePlistOptions): string {

@@ -81,7 +81,7 @@ const isDarwin = process.platform === "darwin";
     rmSync(scratch.logRoot, { recursive: true, force: true });
   });
 
-  test("reports plistExists:false and loaded:false for a fresh instance (both kinds)", () => {
+  test("reports plistExists:false and loaded:false for a fresh instance (all kinds)", () => {
     const result = runCli(
       ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
       {}
@@ -89,7 +89,7 @@ const isDarwin = process.platform === "darwin";
     expect(result.status).toBe(0);
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
     expect(parsed.instance).toBe(uniqueInstance);
-    // round-2: both gateway and web are reported under `services`. The
+    // gateway, web, and watchdog are reported under `services`. The
     // top-level `label` field mirrors the gateway service for back-compat
     // with shell scripts that grep on it.
     expect(parsed.label).toBe(labelForKind(uniqueInstance, "gateway"));
@@ -98,11 +98,13 @@ const isDarwin = process.platform === "darwin";
     expect(parsed.pid).toBe(null);
     const services = parsed.services as Array<Record<string, unknown>>;
     expect(Array.isArray(services)).toBe(true);
-    expect(services.length).toBe(2);
+    expect(services.length).toBe(3);
     expect(services[0]!.kind).toBe("gateway");
     expect(services[1]!.kind).toBe("web");
+    expect(services[2]!.kind).toBe("watchdog");
     expect(services[0]!.label).toBe(labelForKind(uniqueInstance, "gateway"));
     expect(services[1]!.label).toBe(labelForKind(uniqueInstance, "web"));
+    expect(services[2]!.label).toBe(labelForKind(uniqueInstance, "watchdog"));
     for (const svc of services) {
       expect(svc.plistExists).toBe(false);
       expect(svc.loaded).toBe(false);

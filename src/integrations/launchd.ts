@@ -51,7 +51,7 @@ export const LEGACY_LABEL_PREFIXES: readonly string[] = ["ai.lilac.gini"];
 // clean-stop recovery painfully slow.
 export const THROTTLE_INTERVAL_SECONDS = 10;
 
-export type PlistKind = "gateway" | "web";
+export type PlistKind = "gateway" | "web" | "watchdog";
 
 // Returns every legacy label/plist-path pair that may exist on disk for
 // this instance, across all known prior label prefixes and both the
