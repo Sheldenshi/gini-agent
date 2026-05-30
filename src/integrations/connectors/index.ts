@@ -8,13 +8,19 @@ import { getProvider, listProviders } from "./registry";
 export interface CreateConnectorInput {
   name: string;
   provider: string;
+  // Credential type. When supplied, the record is stamped with it so skills
+  // and MCP rows can resolve the credential by name. Optional — presence-only
+  // and un-typed legacy records omit it. The hard "provider must be a
+  // registered module" requirement is relaxed for typed credentials in a
+  // later commit; commit 1 only threads the field through.
+  type?: ConnectorRecord["type"];
   scopes?: string[];
   secrets?: Record<string, string>;
   // Free-form metadata for the `generic` provider. Stored verbatim on the
   // record under `metadata.fields` so the Add Connector dialog can render
   // dynamic non-secret fields (base URLs, account ids) without provider-
-  // specific code.
-  metadata?: Record<string, unknown>;
+  // specific code. Typed credentials also persist `mcp`/`envMap` here.
+  metadata?: ConnectorRecord["metadata"];
 }
 
 // CRUD-created connectors always carry `source: "user"`. The detection
@@ -50,6 +56,7 @@ export async function createConnector(config: RuntimeConfig, input: CreateConnec
       instance: state.instance,
       name,
       provider,
+      ...(input.type ? { type: input.type } : {}),
       status: "configured",
       scopes: Array.isArray(input.scopes) ? input.scopes.map(String) : [],
       secretRefs,

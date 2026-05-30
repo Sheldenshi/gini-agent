@@ -1149,12 +1149,21 @@ export interface SkillRecord {
   // ids (and optionally scopes) the skill needs to function. The runtime
   // gates the skill out of the agent loop's available-skills set until every
   // entry matches a healthy ConnectorRecord. Defaults to [].
+  // Migration source for `requiredCredentials`; kept one release.
   requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
-  // Per-(skill, connector) consent: the provider ids the user has granted this
-  // skill access to. `resolveSkillEnv` injects a credentialed connector's env
-  // only when its provider is granted here (or the skill is `source:"bundled"`,
-  // which is auto-granted by short-circuit). Cleared on disable so re-enabling
-  // re-prompts. See docs/adr/skill-connector-consent.md.
+  // Frontmatter `metadata.gini.requires.credentials` — credential NAMES the
+  // skill needs to function (e.g. ["LINEAR_API_KEY"] or
+  // ["google-workspace-oauth"]). The runtime gates the skill out of the agent
+  // loop's available-skills set until every name matches a configured+healthy
+  // ConnectorRecord with that `name`, and resolveSkillEnv resolves the skill's
+  // prerequisites.env from those named credentials. Defaults to [].
+  requiredCredentials?: string[];
+  // Per-(skill, connector) consent: the credential NAMES the user has granted
+  // this skill access to (the field name is kept for back-compat; the contents
+  // are now names, not provider strings). `resolveSkillEnv` injects a named
+  // credential's env only when that name is granted here (or the skill is
+  // `source:"bundled"`, which is auto-granted by short-circuit). Cleared on
+  // disable so re-enabling re-prompts. See docs/adr/skill-connector-consent.md.
   grantedConnectors?: string[];
   // Spec-compliant top-level `allowed-tools` declaration (space-separated in
   // the source frontmatter, normalized to the original string here). Stored
@@ -1315,6 +1324,19 @@ export interface ConnectorRecord {
   // ("demo", "linear", "claude-code", "codex", "generic", or any module id
   // in the registry). Renamed from `kind` in ADR connector-provider-spec-compliance.md.
   provider: string;
+  // Credential type. Skills and MCP rows reference credentials BY NAME, and
+  // `type` says how the name resolves to env vars:
+  //   - "api-key": a single secret whose env var IS the credential `name`
+  //     (uppercase env-token, e.g. LINEAR_API_KEY). Optional
+  //     `metadata.mcp` powers MCP registration with
+  //     `Authorization: Bearer ${<name>}`.
+  //   - "oauth2": a named handle (may be kebab, e.g. google-workspace-oauth)
+  //     whose fields materialize as env vars via `metadata.envMap`
+  //     (purpose → ENV_NAME).
+  // Optional: presence-only providers (demo/claude-code/codex) carry no env
+  // and stay untyped. Un-migrated records also lack it until the migration
+  // stamps a type; resolution falls back to provider env bindings then.
+  type?: "api-key" | "oauth2";
   status: "configured" | "disabled" | "error";
   scopes: string[];
   secretRefs: ConnectorSecretRef[];
@@ -1327,7 +1349,18 @@ export interface ConnectorRecord {
   // persist non-secret dynamic fields (base URLs, account ids, …) that the
   // user supplies in the Add Connector dialog. Provider-specific keys live
   // under a nested namespace (e.g. `metadata.fields`) by convention.
-  metadata?: Record<string, unknown>;
+  //
+  // Two typed-credential keys live here by convention:
+  //   - `mcp`: present on api-key credentials that back an HTTP MCP server.
+  //     Drives MCP registration (the server row is named by the credential)
+  //     and the header `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
+  //   - `envMap`: present on oauth2 credentials, mapping each secret purpose
+  //     to the ENV_NAME the runtime injects for it (e.g.
+  //     `{ client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID" }`).
+  metadata?: Record<string, unknown> & {
+    mcp?: { url: string; headerName?: string; scheme?: string };
+    envMap?: Record<string, string>;
+  };
   // Origin marker: "auto" for connectors materialized by the startup
   // detection job (claude-code, codex on PATH); "user" for connectors
   // created via the Add Connector dialog or `gini connector add`. Drives
