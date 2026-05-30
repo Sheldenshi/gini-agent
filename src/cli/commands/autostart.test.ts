@@ -11,7 +11,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { labelForKind, plistPathFor } from "../autostart";
+import { labelForKind, plistPathFor, serviceTarget, type LaunchctlResult } from "../autostart";
+import { stopViaBootout } from "./autostart";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -475,4 +476,70 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     expect(afterSvcs[0]!.loaded).toBe(true);
     expect(afterSvcs[1]!.loaded).toBe(true);
   }, 60_000);
+});
+
+// Pure-logic tests for stopViaBootout. We inject a fake bootoutTarget
+// recorder so no real launchctl runs — the function's job is just to boot
+// out the right service targets and fold "Could not find service" into a
+// successful stop.
+describe("stopViaBootout", () => {
+  const ok: LaunchctlResult = { ok: true, stdout: "", stderr: "", status: 0 };
+  // launchctl phrases "not loaded" differently across macOS releases.
+  const notLoadedOldText: LaunchctlResult = {
+    ok: false,
+    stdout: "",
+    stderr: "Could not find service",
+    status: 113
+  };
+  const notLoadedTahoeText: LaunchctlResult = {
+    ok: false,
+    stdout: "",
+    stderr: "Boot-out failed: 3: No such process",
+    status: 3
+  };
+
+  test("boots out gateway, web, and watchdog targets for the instance", () => {
+    const targets: string[] = [];
+    const result = stopViaBootout("stop-test", {
+      bootoutTarget: (target: string) => {
+        targets.push(target);
+        return ok;
+      }
+    });
+    // Gateway + web are the live kinds; watchdog is included for
+    // forward-compatibility with the watchdog service (separate task).
+    expect(targets).toEqual([
+      `${serviceTarget("stop-test")}.gateway`,
+      `${serviceTarget("stop-test")}.web`,
+      `${serviceTarget("stop-test")}.watchdog`
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.results.map((r) => r.kind)).toEqual(["gateway", "web", "watchdog"]);
+    expect(result.results.every((r) => r.bootedOut)).toBe(true);
+  });
+
+  test("treats a not-loaded target as a successful stop (both macOS phrasings)", () => {
+    // A target that was never loaded (e.g. the not-yet-shipped watchdog, or
+    // an instance that was already stopped) must not fail the stop. The
+    // error text differs by macOS release, so accept both.
+    for (const notLoaded of [notLoadedOldText, notLoadedTahoeText]) {
+      const result = stopViaBootout("stop-test", { bootoutTarget: () => notLoaded });
+      expect(result.ok).toBe(true);
+      expect(result.results.every((r) => r.bootedOut)).toBe(true);
+      expect(result.results.every((r) => r.stderr === undefined)).toBe(true);
+    }
+  });
+
+  test("reports ok:false and surfaces stderr on a real bootout failure", () => {
+    const failure: LaunchctlResult = {
+      ok: false,
+      stdout: "",
+      stderr: "Boot-out failed: 5: Input/output error",
+      status: 5
+    };
+    const result = stopViaBootout("stop-test", { bootoutTarget: () => failure });
+    expect(result.ok).toBe(false);
+    expect(result.results.every((r) => r.bootedOut === false)).toBe(true);
+    expect(result.results[0]!.stderr).toContain("Input/output error");
+  });
 });

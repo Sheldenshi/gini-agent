@@ -29,14 +29,83 @@ import {
   loadedPid,
   platformIsSupported,
   plistPathFor,
+  serviceTarget,
   supervisedServices,
   unsupportedPlatformMessage,
   writePlist,
+  type LaunchctlResult,
   type PlistKind,
   type SupervisedService
 } from "../autostart";
 
 const KINDS: PlistKind[] = ["gateway", "web"];
+
+// Service-target suffixes that `gini stop` boots out for a launchd
+// instance. The gateway/web pair are the live PlistKinds; "watchdog" is
+// included ahead of the watchdog service landing (it's a separate task) so
+// stop is forward-compatible — booting out a target that was never loaded
+// is a graceful no-op (launchctl returns "Could not find service").
+const BOOTOUT_KINDS: readonly string[] = ["gateway", "web", "watchdog"];
+
+export interface StopBootoutDeps {
+  // Boot out a fully-qualified service target string (gui/<uid>/<label>).
+  // Injectable so unit tests can record the targets without shelling out
+  // to a real launchctl. Defaults to the real bootoutTarget shellout.
+  bootoutTarget: typeof bootoutTarget;
+}
+
+export interface PerKindStopResult {
+  kind: string;
+  serviceTarget: string;
+  // True when the bootout succeeded OR the service simply wasn't loaded
+  // ("Could not find service" — a deliberate stop on a target that's
+  // already down is still a successful stop).
+  bootedOut: boolean;
+  stderr?: string;
+}
+
+export interface StopBootoutResult {
+  ok: boolean;
+  instance: string;
+  results: PerKindStopResult[];
+}
+
+// A bootout of a target that isn't loaded is, for stop purposes, a
+// success: the service is already down. launchctl phrases "not loaded"
+// differently across macOS releases — "Could not find service" on older
+// systems, "No such process" on macOS 26 (Tahoe) — so we accept both.
+// This matters doubly for the watchdog target, which doesn't exist yet:
+// every stop would otherwise report ok:false on that target alone.
+function isBootoutNotLoaded(stderr: string): boolean {
+  return stderr.includes("Could not find service") || stderr.includes("No such process");
+}
+
+// `gini stop` for a launchd-supervised instance. KeepAlive is `true`, so a
+// plain SIGTERM would just be respawned — the only way to actually stop a
+// supervised service is `launchctl bootout`, which unloads it. We boot out
+// the gateway, web, and (forward-compatible) watchdog targets. A target
+// that isn't loaded is treated as a successful stop (see isBootoutNotLoaded).
+export function stopViaBootout(instance: string, deps: StopBootoutDeps = { bootoutTarget }): StopBootoutResult {
+  const results: PerKindStopResult[] = [];
+  let allOk = true;
+  for (const kind of BOOTOUT_KINDS) {
+    // Build the target string directly (rather than via serviceTarget,
+    // which only accepts the typed PlistKinds) so "watchdog" works before
+    // it becomes a PlistKind. The label shape matches labelForKind:
+    // <prefix>.<instance>.<kind>.
+    const target = `${serviceTarget(instance)}.${kind}`;
+    const out: LaunchctlResult = deps.bootoutTarget(target);
+    const bootedOut = out.ok || isBootoutNotLoaded(out.stderr);
+    if (!bootedOut) allOk = false;
+    results.push({
+      kind,
+      serviceTarget: target,
+      bootedOut,
+      ...(bootedOut ? {} : { stderr: out.stderr.trim() })
+    });
+  }
+  return { ok: allOk, instance, results };
+}
 
 export async function autostart(ctx: CliContext): Promise<void> {
   const sub = ctx.cliArgs[1];

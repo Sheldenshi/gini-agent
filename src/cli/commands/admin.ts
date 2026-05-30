@@ -9,7 +9,7 @@ import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { configPath, loadConfig, parseInstance, writeRuntimeConfig } from "../../paths";
+import { configPath, loadConfig, parseInstance, pidPath, runtimePortPath, webPortPath, writeRuntimeConfig } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -21,7 +21,8 @@ import {
 } from "../process";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
-import { disableForUninstall } from "./autostart";
+import { disableForUninstall, stopViaBootout } from "./autostart";
+import { supervisor } from "../autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
 import { api } from "../api";
 
@@ -125,6 +126,24 @@ export async function start(ctx: CliContext): Promise<boolean> {
 }
 
 export function stop(ctx: CliContext): void {
+  // Under launchd, KeepAlive is `true`, so a SIGTERM to the runtime pid
+  // would just be respawned. The only way to actually stop a supervised
+  // instance is `launchctl bootout`, which unloads the service. The
+  // foreground / `gini run` path (supervisor()===null) keeps the existing
+  // SIGTERM-based stopRuntime behavior.
+  if (supervisor() === "launchd") {
+    const instance = ctx.config.instance;
+    const result = stopViaBootout(instance);
+    // bootout unloads the launchd job; the runtime/web no longer write
+    // their pid/port files on the way out (they were SIGKILLed by
+    // launchctl), so clean them up here the same way stopRuntime does.
+    rmSync(pidPath(instance), { force: true });
+    rmSync(runtimePortPath(instance), { force: true });
+    rmSync(join(ctx.config.stateRoot, "web.pid"), { force: true });
+    rmSync(webPortPath(instance), { force: true });
+    print(result);
+    return;
+  }
   print(stopRuntime(ctx.config));
 }
 
