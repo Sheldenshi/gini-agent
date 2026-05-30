@@ -29,6 +29,16 @@ import { removeMemoryDb } from "../../state/memory-db";
 // Delegating to the real implementation inside the mock keeps the
 // public surface intact for any later importer.
 import { buildWriteNoteScript as realBuildWriteNoteScript } from "./apple-notes";
+// Snapshot the REAL cloudflared-install export VALUES at module-eval
+// time, before any mock rebinds the live namespace. A snapshot taken
+// inside the test body via `await import(...)` is too late: a sibling
+// test file's earlier `mock.module("./cloudflared-install", …)` would
+// make that dynamic import resolve to the leaked mock. Restoring this
+// snapshot in afterEach undoes our ensureCloudflaredBin override so it
+// can't leak into cloudflared-install.test.ts (mock.restore() does not
+// unregister mock.module factories).
+import * as cloudflaredInstall from "./cloudflared-install";
+const realCfInstall = { ...cloudflaredInstall };
 
 const INSTANCE = "manager-clearnotes-recovery-gate-test";
 
@@ -65,6 +75,10 @@ describe("runClearNotes recovery refresh is gated by generation match", () => {
     removeMemoryDb(INSTANCE);
     rmSync(tmp, { recursive: true, force: true });
     mock.restore();
+    // mock.restore() leaves mock.module factories registered, so re-register
+    // the pristine cloudflared-install snapshot to undo our override before
+    // the next test file in this process runs.
+    mock.module("./cloudflared-install", () => ({ ...realCfInstall }));
   });
 
   test("a slow clearNote followed by off→on toggles fires writeNote exactly once per on-state", async () => {
@@ -106,6 +120,14 @@ describe("runClearNotes recovery refresh is gated by generation match", () => {
       isSupervisedWebChild: async () => true
     }));
 
+    // Override only ensureCloudflaredBin to skip real PATH/download
+    // resolution; ...realCfInstall keeps every other export real. The
+    // afterEach restore re-registers the pristine snapshot so this
+    // override can't leak into cloudflared-install.test.ts.
+    mock.module("./cloudflared-install", () => ({
+      ...realCfInstall,
+      ensureCloudflaredBin: async () => "cloudflared"
+    }));
     const { __resetTunnelManagerForTests, tunnelManager } = await import("./manager");
     __resetTunnelManagerForTests();
     const mgr = tunnelManager({

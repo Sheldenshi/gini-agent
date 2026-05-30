@@ -2,6 +2,7 @@ import type { RuntimeConfig } from "../../types";
 import { appendLog, purgeTunnelDevices } from "../../state";
 import { setRedactionPublicUrl, setRedactionSecret, redact } from "./redact";
 import { launchCloudflared, TERMINATE_CAP_MS, type CloudflaredLaunch } from "./cloudflared";
+import { ensureCloudflaredBin, manualInstallHint, CloudflaredUnavailableError } from "./cloudflared-install";
 import { probeNotesAvailable, writeNote, clearNote } from "./apple-notes";
 import { ensureTunnelConfig, patchTunnelConfig, readTunnelConfig } from "./config-store";
 import { atomicWriteFile } from "../../atomic-write";
@@ -164,6 +165,9 @@ class TunnelManager {
       tunnelTransport: inferTunnelTransport(null),
       lastError: null,
       lastErrorCode: null,
+      // Constant for the process lifetime — computed once from this host's
+      // platform/arch. Carried forward by every `...this.snapshot` spread.
+      cloudflaredInstall: manualInstallHint(),
       appleNotes: {
         enabled: persisted.appleNotes.enabled,
         notesAvailable: null,
@@ -412,7 +416,45 @@ class TunnelManager {
     if (this.shuttingDown) {
       return { ok: false, error: "Tunnel manager shutting down" };
     }
-    const launch = launchCloudflared({ port: webPort });
+    // Resolve a usable cloudflared binary, auto-installing it on first use so
+    // a fresh machine with no Homebrew / apt / system cloudflared can still
+    // bring the tunnel up. Only an offline host with no managed binary reaches
+    // the catch, where we stamp actionable, platform-appropriate guidance
+    // instead of the raw spawn-ENOENT blob the UI used to render.
+    let cloudflaredBin: string;
+    try {
+      cloudflaredBin = await ensureCloudflaredBin({
+        log: (event, data) => appendLog(this.config.instance, event, data ?? {})
+      });
+    } catch (err) {
+      const hint = err instanceof CloudflaredUnavailableError ? err.hint : manualInstallHint();
+      const message = err instanceof Error ? err.message : String(err);
+      this.removePublicUrlFile();
+      setRedactionPublicUrl(null);
+      this.snapshot = {
+        ...this.snapshot,
+        publicUrl: null,
+        tunnelTransport: inferTunnelTransport(null),
+        lastError: redact(message),
+        lastErrorCode: "cloudflared_unavailable",
+        cloudflaredInstall: hint
+      };
+      this.stopEdgeProbe();
+      appendLog(this.config.instance, "tunnel.cloudflared.unavailable", { platform: hint.platform });
+      return { ok: false, error: redact(message), code: "cloudflared_unavailable" };
+    }
+    // Re-check shuttingDown one more time after the install await. A first-
+    // use enable can spend a long time inside ensureCloudflaredBin downloading
+    // the binary over the network; SIGTERM may have flipped the flag during
+    // that download. Without this gate a brand-new cloudflared would spawn
+    // and outlive the bounded drain — the post-banner shutdown check below
+    // would still tear it down, but only after the spawn + banner-parse
+    // window. Mirror the pre-spawn shutdown check above and skip the spawn
+    // entirely.
+    if (this.shuttingDown) {
+      return { ok: false, error: "Tunnel manager shutting down" };
+    }
+    const launch = launchCloudflared({ bin: cloudflaredBin, port: webPort });
     this.cloudflared = launch;
     // Install the exit listener BEFORE the await so any same-tick
     // crash during banner parse triggers cleanup. process.once does
@@ -551,6 +593,30 @@ class TunnelManager {
       }
       this.removePublicUrlFile();
       const msg = err instanceof Error ? err.message : String(err);
+      // ensureCloudflaredBin resolved a real binary just above, so the
+      // spawn should never ENOENT — but a resolve→spawn TOCTOU (the
+      // binary deleted/renamed in the gap, PATH mutated) can still reject
+      // here with a raw spawn ENOENT now that cloudflared.ts no longer
+      // rewrites it. Classify that residual ENOENT into the same
+      // actionable `cloudflared_unavailable` shape the ensureCloudflaredBin
+      // catch stamps so the install-guidance UI renders, instead of the
+      // old three-OS blob with lastErrorCode:null. All other spawn / banner
+      // failures keep the generic lastErrorCode:null path unchanged.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        const hint = manualInstallHint();
+        setRedactionPublicUrl(null);
+        this.snapshot = {
+          ...this.snapshot,
+          publicUrl: null,
+          tunnelTransport: inferTunnelTransport(null),
+          lastError: redact(msg),
+          lastErrorCode: "cloudflared_unavailable",
+          cloudflaredInstall: hint
+        };
+        this.stopEdgeProbe();
+        appendLog(this.config.instance, "tunnel.cloudflared.unavailable", { platform: hint.platform });
+        return { ok: false, error: redact(msg), code: "cloudflared_unavailable" };
+      }
       this.snapshot = {
         ...this.snapshot,
         publicUrl: null,

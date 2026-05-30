@@ -77,6 +77,23 @@ export function instanceRoot(instance: Instance): string {
   return join(instancesRoot(), instance);
 }
 
+// Shared, instance-agnostic cache for the gateway-managed `cloudflared`
+// binary. The binary is byte-identical across instances and carries no
+// per-instance state, so it lives under the state root rather than any
+// per-instance dir — re-downloading it for every worktree / named instance
+// would be wasteful. Honors GINI_STATE_ROOT exactly like baseStateRoot() so
+// tests can point it at a temp dir.
+export function cloudflaredCacheDir(): string {
+  return join(baseStateRoot(), "bin");
+}
+
+// Resolved path of the managed cloudflared binary. `.exe` on Windows; bare
+// elsewhere. The auto-installer writes here and the tunnel manager spawns
+// from here when no system cloudflared is on PATH.
+export function cloudflaredBinPath(platform: NodeJS.Platform = process.platform): string {
+  return join(cloudflaredCacheDir(), platform === "win32" ? "cloudflared.exe" : "cloudflared");
+}
+
 // One-time migration of legacy on-disk layouts to ~/.gini/instances/<name>/.
 // We support two predecessor layouts in a single pass so users coming from
 // either era end up in the same place:

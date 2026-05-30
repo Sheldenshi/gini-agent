@@ -15,6 +15,20 @@ export interface AppleNotesState {
   lastError: string | null;
 }
 
+/** Manual-install guidance for `cloudflared` on the gateway's platform.
+ *  Non-secret and constant for the life of the process. Exposed on every
+ *  snapshot so the UI can render a copy-pasteable command + releases link
+ *  when an enable fails with `lastErrorCode: "cloudflared_unavailable"`,
+ *  without the browser needing to know the gateway's OS / arch. The runtime
+ *  auto-installs cloudflared on enable, so this is a fallback for the offline
+ *  case, not the primary path. Defined here (the shared contract) and
+ *  consumed by `cloudflared-install.ts`. */
+export interface CloudflaredInstallHint {
+  platform: "macos" | "linux" | "windows" | "other";
+  command: string;
+  url: string;
+}
+
 export interface TunnelPersistedConfig {
   enabled: boolean;
   // 192-bit base64url-encoded secret. Generated eagerly on first gateway boot
@@ -56,6 +70,10 @@ export interface TunnelSnapshot {
    *  matching the human-readable prose. Reset to `null` whenever
    *  `lastError` clears. */
   lastErrorCode: TunnelTransitionErrorCode | null;
+  /** Constant manual-install guidance for cloudflared on this host (see
+   *  CloudflaredInstallHint). Non-secret; the UI reads it only when
+   *  `lastErrorCode === "cloudflared_unavailable"`. */
+  cloudflaredInstall: CloudflaredInstallHint;
   appleNotes: AppleNotesState;
 }
 
@@ -75,6 +93,8 @@ export interface RedactedTunnelSnapshot {
    *  an enum the client uses to branch on the failure mode without
    *  substring-matching `lastError`. */
   lastErrorCode: TunnelTransitionErrorCode | null;
+  /** Same constant install-hint as the privileged shape. Non-secret. */
+  cloudflaredInstall: CloudflaredInstallHint;
   appleNotes: {
     enabled: boolean;
     notesAvailable: boolean | null;
@@ -88,7 +108,7 @@ export interface RedactedTunnelSnapshot {
  *  message can't silently flip a 409 (operator-actionable: bring the
  *  web child back) into a 500 (gateway-internal). The prose is kept
  *  for client display; the code is the load-bearing contract. */
-export type TunnelTransitionErrorCode = "web_port_unhealthy";
+export type TunnelTransitionErrorCode = "web_port_unhealthy" | "cloudflared_unavailable";
 
 /** Filename for the sibling file the runtime writes inside
  *  `~/.gini/instances/<inst>/` when the tunnel is up. The Next.js proxy

@@ -29,6 +29,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
+    "cloudflared": "^0.7.1",
     "croner": "^10.0.1",
     "playwright-core": "^1.60.0",
     "qrcode": "^1.5.4"

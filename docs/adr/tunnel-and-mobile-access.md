@@ -157,6 +157,65 @@ shipped mobile build that points at a gateway over the tunnel — every
 new path would 404 until the mobile client is rebuilt with the new
 prefix.
 
+### cloudflared binary provisioning
+
+The gateway provisions `cloudflared` itself rather than assuming the
+operator pre-installed it. Enabling the tunnel on a fresh machine with no
+Homebrew / apt / scoop must succeed end-to-end. `ensureCloudflaredBin()`
+(`src/runtime/tunnel/cloudflared-install.ts`) resolves the binary in this
+order, stopping at the first hit:
+
+1. `GINI_CLOUDFLARED_BIN` — an operator-pinned absolute path (also the seam
+   tests use to stay hermetic).
+2. A system `cloudflared` on `PATH` (Homebrew, apt, a hand-placed binary) —
+   preferred so we don't re-download one the operator already manages.
+   `node_modules/.bin` entries are skipped: the `cloudflared` package's
+   launcher there is a Node script (`#!/usr/bin/env node`), and the gateway
+   ships only Bun, so spawning it could fail with `ENOENT` on a Node-less
+   host. The native binary from step 3/4 needs no Node.
+3. The managed binary previously installed under `~/.gini/bin/`
+   (`cloudflaredBinPath()`), shared across instances since the binary is
+   byte-identical and carries no per-instance state.
+4. A fresh download into `~/.gini/bin/` via the `cloudflared` npm package
+   (`install(to)`), which fetches the official latest release for the host's
+   platform/arch (or `CLOUDFLARED_VERSION`) and extracts/`chmod`s it.
+
+`scripts/install.sh` pre-fetches the binary right after dependency install by
+running `gini tunnel install-cloudflared` (best-effort, non-fatal), so a normal
+install has cloudflared ready before the first enable. If that step is skipped
+or fails (e.g. an offline install), the runtime still provisions it lazily on
+the first enable. The download is otherwise lazy — it runs on the first enable
+that needs it, never at `bun install` time (the package's `node`-based
+postinstall is intentionally left unrun; the gateway ships only Bun). The
+trust model for the download is: verify the binary's SHA-256 against the
+official GitHub release asset digest when that digest can be obtained, and fail
+closed on a mismatch; the GitHub releases API exposes an immutable per-asset
+`sha256:` digest and Cloudflare also publishes SHA-256 checksums in the release
+body, so a digest is normally available to anchor against. When a digest cannot
+be obtained for the resolved asset, HTTPS to `github.com` /
+`objects.githubusercontent.com` is the fallback trust anchor — the same origin
+Homebrew and apt ultimately fetch the binary from. On macOS the published asset
+is a `.tgz`, so the package extracts the bare binary after the download. The
+binary is spawned with the same env-whitelist and SIGTERM→SIGKILL lifecycle as
+before; provisioning only changes how its path is obtained.
+
+When every resolution path fails — in practice an offline host on a first
+enable — `ensureCloudflaredBin()` throws `CloudflaredUnavailableError`. The
+manager stamps `lastErrorCode: "cloudflared_unavailable"` plus a constant,
+non-secret `cloudflaredInstall` hint (platform, a copy-pasteable
+manual-install command for the host's platform/arch, and the releases URL)
+onto the snapshot. The web UI renders that as actionable guidance — a
+single platform-appropriate command with a copy button and a releases link.
+The residual spawn path maps to the same shape: `ensureCloudflaredBin()`
+resolves a real binary before spawn, but a resolve→spawn TOCTOU (the binary
+deleted or PATH mutated in the gap) can still surface a spawn `ENOENT`. The
+manager classifies that `ENOENT` into the same
+`lastErrorCode: "cloudflared_unavailable"` guidance rather than letting a raw
+three-OS install string reach the UI, so the actionable hint is the only
+cloudflared-missing surface the operator ever sees. `cloudflaredInstall` is
+computed once at construction and is always present on the snapshot; the UI
+only surfaces it when `lastErrorCode === "cloudflared_unavailable"`.
+
 ## Trust radius
 
 | Holder | Authority | Rotation |
@@ -258,3 +317,9 @@ Per-invariant observable checks, short version:
 - Log files under `~/.gini/instances/<inst>/logs/` contain no occurrence of
   the live secret value (or the prior secret within the rotation window)
   after a request that included the secret in the path.
+- With no `cloudflared` on PATH and an empty `~/.gini/bin/`, enabling the
+  tunnel on an online host auto-installs the binary and the tunnel comes up;
+  on an offline host the snapshot reports `lastErrorCode:
+  "cloudflared_unavailable"` with a populated `cloudflaredInstall` hint, and
+  the UI renders a single platform-appropriate install command (copy button +
+  releases link) rather than a raw `spawn ENOENT` blob.

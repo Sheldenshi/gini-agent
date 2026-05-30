@@ -13,6 +13,19 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeMemoryDb } from "../../state/memory-db";
+// Snapshot the REAL cloudflared-install export VALUES at module-eval
+// time, before any mock can rebind the live namespace. A snapshot taken
+// inside the test body via `await import(...)` is too late: once a
+// sibling test file (which Bun loads in the same process) has registered
+// its own `mock.module("./cloudflared-install", …)`, that dynamic import
+// resolves to the leaked mock, not the original. `mock.restore()` does
+// NOT unregister a `mock.module` factory, so the override has to be
+// undone explicitly in afterEach (see below) to keep the full public
+// surface — CLOUDFLARED_RELEASES_URL, cloudflaredAssetFor,
+// findCloudflaredOnPath, the real ensureCloudflaredBin — intact for
+// cloudflared-install.test.ts.
+import * as cloudflaredInstall from "./cloudflared-install";
+const realCfInstall = { ...cloudflaredInstall };
 
 const INSTANCE = "manager-notes-toggle-race-test";
 
@@ -45,6 +58,12 @@ describe("setAppleNotesEnabled bumps generation to supersede the prior worker", 
     removeMemoryDb(INSTANCE);
     rmSync(tmp, { recursive: true, force: true });
     mock.restore();
+    // mock.restore() leaves mock.module factories registered, so a
+    // ./cloudflared-install override from this file would otherwise
+    // persist into the next test file in the same process (e.g.
+    // cloudflared-install.test.ts). Re-register the pristine snapshot to
+    // hand the real module back.
+    mock.module("./cloudflared-install", () => ({ ...realCfInstall }));
   });
 
   test("an off-toggle bumps generation so a prior in-flight refresh bails before writeNote", async () => {
@@ -99,6 +118,14 @@ describe("setAppleNotesEnabled bumps generation to supersede the prior worker", 
       isSupervisedWebChild: async () => true
     }));
 
+    // Override only ensureCloudflaredBin to skip real PATH/download
+    // resolution; ...realCfInstall keeps every other export real. The
+    // afterEach restore re-registers the pristine snapshot so this
+    // override can't leak into cloudflared-install.test.ts.
+    mock.module("./cloudflared-install", () => ({
+      ...realCfInstall,
+      ensureCloudflaredBin: async () => "cloudflared"
+    }));
     const { __resetTunnelManagerForTests, tunnelManager } = await import("./manager");
     __resetTunnelManagerForTests();
     const mgr = tunnelManager({

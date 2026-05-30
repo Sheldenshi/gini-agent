@@ -137,7 +137,7 @@ gini tunnel qr              # render an ASCII QR for the URL
 gini tunnel disable         # stop cloudflared + clear the URL
 ```
 
-Install `cloudflared` first: `brew install cloudflared` (macOS), `sudo apt install cloudflared` (Linux), or `scoop install cloudflared` (Windows). See [tunnel-and-mobile-access.md](docs/adr/tunnel-and-mobile-access.md) for the trust boundary, secret rotation, and Bearer-auth contract.
+No manual install of `cloudflared` is required: the gateway provisions the binary automatically on first enable. A system `cloudflared` on `PATH` (Homebrew, apt, a hand-placed binary) is used if present; otherwise the runtime downloads the official build into `~/.gini/bin/`. The installer pre-fetches it so a normal install has it ready before the first enable. See [tunnel-and-mobile-access.md](docs/adr/tunnel-and-mobile-access.md) for the trust boundary, secret rotation, and Bearer-auth contract.
 
 ## Messaging channels
 

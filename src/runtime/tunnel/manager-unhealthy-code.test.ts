@@ -9,6 +9,15 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeMemoryDb } from "../../state/memory-db";
+// Snapshot the REAL cloudflared-install export VALUES at module-eval
+// time, before any mock rebinds the live namespace. A snapshot taken
+// inside the test body via `await import(...)` is too late once a
+// sibling test file has registered its own mock.module for this path.
+// Restoring this snapshot in afterEach undoes our ensureCloudflaredBin
+// override so it can't leak into cloudflared-install.test.ts
+// (mock.restore() does not unregister mock.module factories).
+import * as cloudflaredInstall from "./cloudflared-install";
+const realCfInstall = { ...cloudflaredInstall };
 
 const INSTANCE = "manager-unhealthy-code-test";
 
@@ -49,6 +58,10 @@ describe("TunnelManager typed error code on health-probe failure", () => {
     removeMemoryDb(INSTANCE);
     rmSync(tmp, { recursive: true, force: true });
     mock.restore();
+    // mock.restore() leaves mock.module factories registered, so re-register
+    // the pristine cloudflared-install snapshot to undo our override before
+    // the next test file in this process runs.
+    mock.module("./cloudflared-install", () => ({ ...realCfInstall }));
   });
 
   test("enable() surfaces code=web_port_unhealthy when the inline health probe fails", async () => {
@@ -69,6 +82,14 @@ describe("TunnelManager typed error code on health-probe failure", () => {
 
     // Reset the manager singleton AFTER the mocks are installed so the
     // freshly minted instance binds to the mocked health-probe import.
+    // Override only ensureCloudflaredBin to skip real PATH/download
+    // resolution; ...realCfInstall keeps every other export real. The
+    // afterEach restore re-registers the pristine snapshot so this
+    // override can't leak into cloudflared-install.test.ts.
+    mock.module("./cloudflared-install", () => ({
+      ...realCfInstall,
+      ensureCloudflaredBin: async () => "cloudflared"
+    }));
     const { __resetTunnelManagerForTests, tunnelManager } = await import("./manager");
     __resetTunnelManagerForTests();
     const result = await tunnelManager({
@@ -119,6 +140,14 @@ describe("TunnelManager typed error code on health-probe failure", () => {
       })
     }));
 
+    // Override only ensureCloudflaredBin to skip real PATH/download
+    // resolution; ...realCfInstall keeps every other export real. The
+    // afterEach restore re-registers the pristine snapshot so this
+    // override can't leak into cloudflared-install.test.ts.
+    mock.module("./cloudflared-install", () => ({
+      ...realCfInstall,
+      ensureCloudflaredBin: async () => "cloudflared"
+    }));
     const { __resetTunnelManagerForTests, tunnelManager } = await import("./manager");
     __resetTunnelManagerForTests();
     const mgr = tunnelManager({

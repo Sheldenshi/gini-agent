@@ -17,12 +17,9 @@ import {
 } from "@/components/ui/dialog";
 import { api } from "@/lib/api";
 import { shouldShowEphemeralWarning } from "@/lib/tunnel-warning";
+import { CloudflaredInstallHelp } from "@/components/CloudflaredInstallHelp";
+import { cloudflaredGuidance, type CloudflaredInstallHint, type TunnelErrorCode } from "@/lib/cloudflared-install-hint";
 import { EyeOff, Info, Loader2, RefreshCw, RotateCw, ShieldAlert } from "lucide-react";
-
-// Mirrors the runtime's TunnelTransitionErrorCode union. Keep this in
-// sync with src/runtime/tunnel/types.ts — pulling it from @runtime here
-// would couple the BFF bundle to the runtime tree at runtime.
-type TunnelErrorCode = "web_port_unhealthy";
 
 interface TunnelSnapshot {
   enabled: boolean;
@@ -31,6 +28,7 @@ interface TunnelSnapshot {
   secretRevision: string | null;
   lastError: string | null;
   lastErrorCode: TunnelErrorCode | null;
+  cloudflaredInstall: CloudflaredInstallHint;
   appleNotes: {
     enabled: boolean;
     notesAvailable: boolean | null;
@@ -42,7 +40,13 @@ interface TunnelSnapshot {
  *  human-readable `lastError` prose when the snapshot doesn't carry a
  *  code (older runtime, transient errors that don't map to the enum).
  *  Keeping the prose lookup in one place means a future code addition
- *  needs one new branch here rather than scattered substring matches. */
+ *  needs one new branch here rather than scattered substring matches.
+ *
+ *  This only feeds the "degraded" badge title, which renders solely when
+ *  `data.enabled` is true. The `cloudflared_unavailable` path always rolls
+ *  the snapshot back to `enabled: false`, so that code can never reach this
+ *  title — its guidance is rendered separately via `cloudflaredGuidance` →
+ *  `CloudflaredInstallHelp`. Hence no `cloudflared_unavailable` branch here. */
 function describeTunnelError(
   code: TunnelErrorCode | null,
   lastError: string | null
@@ -138,6 +142,7 @@ export function TunnelCard() {
     setIsTunneledView(!isLoopbackHost(window.location.host));
   }, []);
   const tunnelLive = Boolean(data?.enabled && data?.publicUrl);
+  const cfGuidance = cloudflaredGuidance(data?.lastErrorCode, data?.cloudflaredInstall);
 
   const runConfirmed = (kind: Exclude<ConfirmKind, null>) => {
     setConfirm(null);
@@ -257,7 +262,9 @@ export function TunnelCard() {
           </p>
         )}
 
-        {data?.lastError ? (
+        {cfGuidance && data?.cloudflaredInstall ? (
+          <CloudflaredInstallHelp hint={data.cloudflaredInstall} message={cfGuidance} />
+        ) : data?.lastError ? (
           <p className="rounded bg-destructive/10 px-3 py-2 text-sm text-destructive">
             <span className="font-medium">Last error:</span> {data.lastError}
           </p>

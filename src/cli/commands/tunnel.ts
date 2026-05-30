@@ -4,6 +4,7 @@ import { api } from "../api";
 import { print } from "../output";
 import { bootstrapUrl, renderQrAnsi } from "../../runtime/tunnel";
 import type { TunnelSnapshot } from "../../runtime/tunnel/types";
+import { ensureCloudflaredBin, manualInstallHint, CloudflaredUnavailableError } from "../../runtime/tunnel/cloudflared-install";
 
 function asSnapshot(value: unknown): TunnelSnapshot {
   return value as TunnelSnapshot;
@@ -31,8 +32,10 @@ Subcommands:
   rotate-secret            Mint a fresh 192-bit secret atomically and recycle cloudflared.
   sync-notes               Force the iCloud Notes mirror to refresh now.
   apple-notes <on|off>     Toggle the iCloud Notes mirror.
+  install-cloudflared      Download/resolve the cloudflared binary now (no running gateway needed).
 
-Prerequisite: cloudflared must be installed (brew install cloudflared / sudo apt install cloudflared / scoop install cloudflared).
+cloudflared is provisioned automatically on the first \`enable\` (and pre-fetched
+by scripts/install.sh), so no manual package-manager install is required.
 `;
 
 export async function tunnel(ctx: CliContext): Promise<void> {
@@ -45,6 +48,22 @@ export async function tunnel(ctx: CliContext): Promise<void> {
   }
 
   switch (sub) {
+    case "install-cloudflared": {
+      // Local + gateway-independent: resolve (downloading if needed) the
+      // cloudflared binary so a later `enable` is instant. Called best-effort
+      // by scripts/install.sh right after `bun install`. Unlike the other
+      // subcommands this does NOT hit the runtime HTTP API — it runs the same
+      // ensureCloudflaredBin() the manager uses, writing into ~/.gini/bin.
+      try {
+        const bin = await ensureCloudflaredBin();
+        print({ ok: true, cloudflared: bin });
+      } catch (err) {
+        const hint = err instanceof CloudflaredUnavailableError ? err.hint : manualInstallHint();
+        print({ ok: false, error: err instanceof Error ? err.message : String(err), install: hint });
+        process.exitCode = 1;
+      }
+      return;
+    }
     case "status": {
       const snap = asSnapshot(await api(config, "/api/tunnel"));
       print(snap);

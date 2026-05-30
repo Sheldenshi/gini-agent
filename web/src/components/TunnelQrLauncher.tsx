@@ -16,6 +16,8 @@ import {
   DialogTitle
 } from "@/components/ui/dialog";
 import { api } from "@/lib/api";
+import { CloudflaredInstallHelp } from "@/components/CloudflaredInstallHelp";
+import { cloudflaredGuidance, type CloudflaredInstallHint, type TunnelErrorCode } from "@/lib/cloudflared-install-hint";
 
 interface TunnelSnapshot {
   enabled: boolean;
@@ -23,6 +25,8 @@ interface TunnelSnapshot {
   publicUrl: string | null;
   secretRevision: string | null;
   lastError: string | null;
+  lastErrorCode: TunnelErrorCode | null;
+  cloudflaredInstall: CloudflaredInstallHint;
   appleNotes: {
     enabled: boolean;
     notesAvailable: boolean | null;
@@ -104,6 +108,7 @@ export function TunnelQrLauncher() {
 
   const isReady = data.enabled && Boolean(data.publicUrl) && Boolean(data.secret);
   const isStarting = data.enabled && (!data.publicUrl || !data.secret);
+  const guidance = cloudflaredGuidance(data.lastErrorCode, data.cloudflaredInstall);
 
   return (
     <>
@@ -234,7 +239,9 @@ export function TunnelQrLauncher() {
                   Anyone with the URL (or a photo of the QR) can act as you until the secret is
                   rotated or the tunnel is disabled. Keep it to yourself.
                 </p>
-                {data.lastError ? (
+                {guidance ? (
+                  <CloudflaredInstallHelp hint={data.cloudflaredInstall} message={guidance} />
+                ) : data.lastError ? (
                   <p className="break-all rounded bg-destructive/10 px-2 py-1 text-center font-mono text-[10px] text-destructive">
                     Last error: {data.lastError}
                   </p>

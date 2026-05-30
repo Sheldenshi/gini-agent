@@ -105,6 +105,10 @@ function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
     // failure mode without substring-matching the human-readable
     // `lastError`. Mirrors the contract on the privileged endpoint.
     lastErrorCode: snapshot.lastErrorCode,
+    // Constant, non-secret manual-install guidance — mirrors the privileged
+    // shape so the tunneled card can render the same fallback if cloudflared
+    // ever fails to install.
+    cloudflaredInstall: snapshot.cloudflaredInstall,
     appleNotes: {
       enabled: snapshot.appleNotes.enabled,
       notesAvailable: snapshot.appleNotes.notesAvailable,
@@ -180,7 +184,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const mgr = tunnelManager(config);
       if (typeof payload.rotateSecret === "boolean" && payload.rotateSecret) {
         const result = await mgr.rotateSecret();
-        if (!result.ok) return json({ error: result.error }, result.code === "web_port_unhealthy" ? 409 : 500);
+        if (!result.ok) return json({ error: result.error }, result.code ? 409 : 500);
       }
       if (typeof payload.enabled === "boolean") {
         if (payload.enabled) {
@@ -198,13 +202,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           // re-enabling a tunnel the operator just disabled. Calling
           // mgr.enable() synchronously after body parse keeps queue
           // arrival order = request order, so the later disable
-          // wins. The not-healthy 409 is preserved by keying off the
-          // typed `code` field on the manager's error payload — the
-          // human-readable prose is for client display, the discrete
-          // code is what gates the HTTP status mapping.
+          // wins. The HTTP status keys off the typed `code` field on
+          // the manager's error payload: any operator-actionable code
+          // (web_port_unhealthy, cloudflared_unavailable, …) maps to
+          // 409 Conflict, while an absent code is a generic failure and
+          // maps to 500. The human-readable prose is for client
+          // display; the discrete code is what gates the mapping, so a
+          // reword of the message can't flip the status.
           const result = await mgr.enable(port);
           if (!result.ok) {
-            return json({ error: result.error }, result.code === "web_port_unhealthy" ? 409 : 500);
+            return json({ error: result.error }, result.code ? 409 : 500);
           }
         } else {
           const result = await mgr.disable();

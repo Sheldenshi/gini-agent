@@ -81,7 +81,15 @@ export function launchCloudflared(opts: LaunchOptions): CloudflaredLaunch {
   proc.stderr?.on("data", onChunk("stderr"));
   proc.on("error", (err) => {
     clearTimeout(bannerTimer);
-    rejectUrl(translateSpawnError(err));
+    // Reject with the raw spawn error untouched. The manager resolves a
+    // real binary via ensureCloudflaredBin before spawning, so a spawn
+    // ENOENT here is only reachable through a resolve→spawn TOCTOU; the
+    // manager's swapCloudflared catch detects that ENOENT-class failure
+    // and stamps the actionable `cloudflared_unavailable` install
+    // guidance. Preserving the original error object keeps its `.code`
+    // intact for that classification. Other spawn errors (EACCES,
+    // ECHILD, …) propagate unchanged and surface as a generic lastError.
+    rejectUrl(err);
   });
   proc.on("exit", (code) => {
     clearTimeout(bannerTimer);
@@ -106,21 +114,4 @@ export function launchCloudflared(opts: LaunchOptions): CloudflaredLaunch {
   };
 
   return { process: proc, publicUrl, stop };
-}
-
-/** Replace a raw ENOENT from `child_process.spawn` with an operator-readable
- *  error that names the missing dependency and points at the one-liner
- *  install per platform. Other spawn errors (EACCES, ECHILD, signal-driven
- *  exits) propagate unchanged — the ENOENT shape is the only one that
- *  reliably maps to "cloudflared isn't on PATH", and we don't want to
- *  mistranslate a real runtime fault. The wrapped error still propagates up
- *  through `publicUrl`'s reject path so TunnelManager surfaces it as
- *  `lastError` exactly the same way it did before. */
-function translateSpawnError(err: Error): Error {
-  const code = (err as NodeJS.ErrnoException).code;
-  if (code !== "ENOENT") return err;
-  return new Error(
-    "cloudflared not installed or not on PATH — install via 'brew install cloudflared' (macOS), " +
-      "'sudo apt install cloudflared' (Linux), or 'scoop install cloudflared' (Windows)"
-  );
 }
