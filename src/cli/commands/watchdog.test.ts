@@ -174,6 +174,21 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
+  test("a kickstart that throws still results in exit 0 (tick never propagates the throw)", async () => {
+    writePorts();
+    // Runtime is down, so the gateway kickstart fires — and throws. The tick
+    // must still set exitCode 0 (try/finally) and must not reject.
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: () => {
+        throw new Error("launchctl blew up");
+      },
+      supervisorImpl: () => "launchd"
+    });
+    expect(process.exitCode).toBe(0);
+  });
+
   test("web down but not under launchd -> still kicks web, and still queues the report", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
