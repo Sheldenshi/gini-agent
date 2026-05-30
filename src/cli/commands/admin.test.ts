@@ -17,8 +17,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import type { ProviderConfig, RuntimeConfig } from "../../types";
-import { install_, stop } from "./admin";
+import { install_, shouldStopViaBootout, stop } from "./admin";
 import { loadConfig } from "../../paths";
+import type { PlistKind } from "../autostart";
 
 describe("install_ provider env override", () => {
   let scratchHome: string;
@@ -297,6 +298,49 @@ describe("stop dispatch (launchd vs foreground)", () => {
       expect(out.ok).toBe(true);
     }
   );
+});
+
+// `gini stop` decides bootout-vs-SIGTERM on the TARGET instance's launchd
+// state, not the calling process's env. A user running `gini stop` from a
+// terminal has no GINI_SUPERVISOR, so the decision must come from
+// isLoaded()/plist-on-disk — otherwise a launchd instance gets a SIGTERM
+// that KeepAlive immediately respawns. Inject fakes so no real launchctl runs.
+describe("shouldStopViaBootout (target launchd state, not process env)", () => {
+  const noPlist = () => false;
+  const plistFor = (instance: string, kind?: PlistKind) => `/fake/${instance}.${kind}.plist`;
+
+  test("any service loaded -> bootout (even with GINI_SUPERVISOR unset)", () => {
+    const loadedKinds: Array<PlistKind | undefined> = [];
+    const decision = shouldStopViaBootout("inst", {
+      isLoaded: (_inst: string, kind?: PlistKind) => {
+        loadedKinds.push(kind);
+        return kind === "gateway";
+      },
+      plistExists: noPlist,
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(true);
+    // Short-circuits on the first loaded kind (gateway).
+    expect(loadedKinds).toEqual(["gateway"]);
+  });
+
+  test("a plist on disk (registered but stopped) -> bootout", () => {
+    const decision = shouldStopViaBootout("inst", {
+      isLoaded: () => false,
+      plistExists: (path: string) => path.includes("web"),
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(true);
+  });
+
+  test("nothing loaded and no plist (pure foreground) -> SIGTERM path", () => {
+    const decision = shouldStopViaBootout("inst", {
+      isLoaded: () => false,
+      plistExists: noPlist,
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(false);
+  });
 });
 
 function makeStopCtx(instance: string): CliContext {

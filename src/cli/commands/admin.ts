@@ -22,7 +22,7 @@ import {
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
 import { disableForUninstall, stopViaBootout } from "./autostart";
-import { supervisor } from "../autostart";
+import { isLoaded, plistPathFor, supervisor, type PlistKind } from "../autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
 import { api } from "../api";
 
@@ -125,14 +125,45 @@ export async function start(ctx: CliContext): Promise<boolean> {
   return runtimeStarted;
 }
 
+const STOP_KINDS: PlistKind[] = ["gateway", "web", "watchdog"];
+
+export interface ShouldStopViaBootoutDeps {
+  isLoaded: (instance: string, kind?: PlistKind) => boolean;
+  plistExists: (path: string) => boolean;
+  plistPathFor: (instance: string, kind?: PlistKind) => string;
+}
+
+// Decide whether `gini stop` must use `launchctl bootout` instead of a
+// SIGTERM. The decision is based on the TARGET INSTANCE's launchd state, not
+// the calling process's env: a user running `gini stop` from a terminal has
+// no GINI_SUPERVISOR, so supervisor() would say "foreground" and a SIGTERM
+// would just be respawned by KeepAlive. We bootout when any of the instance's
+// services is loaded OR any of its plists exists on disk (a stopped-but-
+// registered launchd instance). Pure + injectable so it's unit-testable
+// without a real launchctl.
+export function shouldStopViaBootout(
+  instance: string,
+  deps: ShouldStopViaBootoutDeps = { isLoaded, plistExists: existsSync, plistPathFor }
+): boolean {
+  for (const kind of STOP_KINDS) {
+    if (deps.isLoaded(instance, kind)) return true;
+    if (deps.plistExists(deps.plistPathFor(instance, kind))) return true;
+  }
+  return false;
+}
+
 export function stop(ctx: CliContext): void {
   // Under launchd, KeepAlive is `true`, so a SIGTERM to the runtime pid
   // would just be respawned. The only way to actually stop a supervised
-  // instance is `launchctl bootout`, which unloads the service. The
-  // foreground / `gini run` path (supervisor()===null) keeps the existing
-  // SIGTERM-based stopRuntime behavior.
-  if (supervisor() === "launchd") {
-    const instance = ctx.config.instance;
+  // instance is `launchctl bootout`, which unloads the service. We decide
+  // on the TARGET INSTANCE's launchd state (services loaded / plist on disk)
+  // rather than the calling process's env — a user-run `gini stop` from a
+  // terminal has no GINI_SUPERVISOR, so an env-only check would miss a
+  // launchd instance and SIGTERM-then-respawn it. `supervisor()==="launchd"`
+  // (the gateway calling stop on itself) is an additional fast path. The
+  // foreground / `gini run` path falls through to SIGTERM-based stopRuntime.
+  const instance = ctx.config.instance;
+  if (supervisor() === "launchd" || shouldStopViaBootout(instance)) {
     const result = stopViaBootout(instance);
     // bootout unloads the launchd job; the runtime/web no longer write
     // their pid/port files on the way out (they were SIGKILLed by
