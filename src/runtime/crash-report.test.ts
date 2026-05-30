@@ -6,15 +6,22 @@
 // touches the real ~/.gini.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import {
   buildCrashReport,
   crashReportsDir,
+  dismissedCrashReportsDir,
+  filedCrashReportsDir,
   fingerprint,
+  listPendingReports,
+  markAsked,
   normalizeForFingerprint,
+  pendingCrashReportsDir,
   readRateLimitState,
   redactReportText,
+  resolvePendingReport,
+  wasAskedRecently,
   writeCrashReportFile,
   writeRateLimitState,
   type CrashSysInfo
@@ -196,36 +203,117 @@ describe("file writes + rate-limit state", () => {
     rmSync(stateRoot, { recursive: true, force: true });
   });
 
-  test("writeCrashReportFile lands under <stateRoot>/crash-reports/", () => {
-    const report = buildCrashReport({
+  function buildReport(error: unknown): ReturnType<typeof buildCrashReport> {
+    return buildCrashReport({
       instance: "test-inst",
       supervisor: "launchd",
       source: "runtime",
-      error: new Error("disk-write"),
+      error,
       logTail: [],
       sysInfo: SYS_INFO,
       clock: () => new Date("2026-05-29T00:00:00.000Z")
     });
+  }
+
+  test("writeCrashReportFile lands under <stateRoot>/crash-reports/pending/", () => {
+    const report = buildReport(new Error("disk-write"));
     const path = writeCrashReportFile(report);
-    expect(path.startsWith(join(stateRoot, "crash-reports"))).toBe(true);
+    expect(path.startsWith(pendingCrashReportsDir())).toBe(true);
+    expect(pendingCrashReportsDir()).toBe(join(stateRoot, "crash-reports", "pending"));
     expect(existsSync(path)).toBe(true);
     const onDisk = JSON.parse(readFileSync(path, "utf8"));
     expect(onDisk.fingerprint).toBe(report.fingerprint);
   });
 
-  test("rate-limit state round-trips and defaults cleanly", () => {
+  test("listPendingReports reads queued reports and skips unparseable files", () => {
+    const a = writeCrashReportFile(buildReport(new Error("alpha")));
+    const b = writeCrashReportFile(buildReport(new Error("beta")));
+    // A corrupt/half-written report and a non-json file must not break the read.
+    writeFileSync(join(pendingCrashReportsDir(), "garbage.json"), "{not json");
+    writeFileSync(join(pendingCrashReportsDir(), "ignore.txt"), "{}");
+    const pending = listPendingReports();
+    expect(pending.map((p) => p.path).sort()).toEqual([a, b].sort());
+    const messages = pending.map((p) => p.report.error.message).sort();
+    expect(messages).toEqual(["alpha", "beta"]);
+  });
+
+  test("listPendingReports returns [] when the queue dir is absent", () => {
+    expect(listPendingReports()).toEqual([]);
+  });
+
+  test("resolvePendingReport moves a report into filed/ or dismissed/", () => {
+    const filed = writeCrashReportFile(buildReport(new Error("file-me")));
+    const dismissed = writeCrashReportFile(buildReport(new Error("drop-me")));
+
+    const filedDest = resolvePendingReport(filed, "filed");
+    expect(filedDest.startsWith(filedCrashReportsDir())).toBe(true);
+    expect(basename(filedDest)).toBe(basename(filed));
+    expect(existsSync(filed)).toBe(false);
+    expect(existsSync(filedDest)).toBe(true);
+
+    const dismissedDest = resolvePendingReport(dismissed, "dismissed");
+    expect(dismissedDest.startsWith(dismissedCrashReportsDir())).toBe(true);
+    expect(existsSync(dismissed)).toBe(false);
+    expect(existsSync(dismissedDest)).toBe(true);
+
+    // Both moves leave the pending queue empty.
+    expect(listPendingReports()).toEqual([]);
+  });
+
+  test("rate-limit state round-trips (incl. lastAskedAt) and defaults cleanly", () => {
     const fp = "deadbeef";
-    expect(readRateLimitState(fp)).toEqual({ lastFiledAt: null, lastCommentAt: null, commentCount: 0 });
+    expect(readRateLimitState(fp)).toEqual({
+      lastFiledAt: null,
+      lastCommentAt: null,
+      commentCount: 0,
+      lastAskedAt: null
+    });
     writeRateLimitState(fp, {
       lastFiledAt: "2026-05-29T00:00:00.000Z",
       lastCommentAt: "2026-05-29T01:00:00.000Z",
-      commentCount: 3
+      commentCount: 3,
+      lastAskedAt: "2026-05-29T02:00:00.000Z"
     });
     expect(readRateLimitState(fp)).toEqual({
       lastFiledAt: "2026-05-29T00:00:00.000Z",
       lastCommentAt: "2026-05-29T01:00:00.000Z",
-      commentCount: 3
+      commentCount: 3,
+      lastAskedAt: "2026-05-29T02:00:00.000Z"
     });
     expect(crashReportsDir()).toBe(join(stateRoot, "crash-reports"));
+  });
+
+  test("markAsked stamps lastAskedAt and wasAskedRecently honors the window", () => {
+    const fp = "feedface";
+    const nowMs = Date.parse("2026-05-29T12:00:00.000Z");
+    const windowMs = 24 * 60 * 60 * 1000;
+    // Never asked -> not recent.
+    expect(wasAskedRecently(fp, nowMs, windowMs)).toBe(false);
+
+    markAsked(fp, "2026-05-29T11:00:00.000Z");
+    expect(readRateLimitState(fp).lastAskedAt).toBe("2026-05-29T11:00:00.000Z");
+    // 1h ago, inside a 24h window -> recent.
+    expect(wasAskedRecently(fp, nowMs, windowMs)).toBe(true);
+    // Same stamp, but 25h later -> outside the window -> not recent.
+    expect(wasAskedRecently(fp, nowMs + 25 * 60 * 60 * 1000, windowMs)).toBe(false);
+  });
+
+  test("markAsked preserves the rest of the rate-limit state", () => {
+    const fp = "cafebabe";
+    writeRateLimitState(fp, {
+      lastFiledAt: "2026-05-29T00:00:00.000Z",
+      lastCommentAt: null,
+      commentCount: 2,
+      lastAskedAt: null,
+      issueNumber: 42
+    });
+    markAsked(fp, "2026-05-29T03:00:00.000Z");
+    expect(readRateLimitState(fp)).toEqual({
+      lastFiledAt: "2026-05-29T00:00:00.000Z",
+      lastCommentAt: null,
+      commentCount: 2,
+      lastAskedAt: "2026-05-29T03:00:00.000Z",
+      issueNumber: 42
+    });
   });
 });

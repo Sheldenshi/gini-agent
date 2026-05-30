@@ -3,16 +3,17 @@
 // A crash handler (src/runtime/crash-handlers.ts) and the watchdog build a
 // structured report here, fingerprint the error so recurrences dedupe to one
 // GitHub issue, redact every secret/token/user-content byte before the text
-// can reach an external issue body, and persist the report + per-fingerprint
-// rate-limit state under <stateRoot>/crash-reports/.
+// can reach an external issue body, and queue the report under
+// <stateRoot>/crash-reports/pending/ plus per-fingerprint ask-rate-limit state.
 //
 // This module deliberately has no gh/launchd/process side effects beyond the
-// synchronous file writes — the filing path lives in
-// src/cli/commands/report-crash.ts so the build/fingerprint/redact logic stays
-// pure and testable without spawning anything.
+// synchronous file writes. The reports it queues are filed only after the user
+// consents — the restart-ask glue (src/runtime/crash-recovery.ts) offers them
+// in chat and the gini-bug-report skill does the actual filing, so the
+// build/fingerprint/redact/queue logic stays pure and testable.
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { baseStateRoot } from "../paths";
 import { SECRET_PATTERNS, redactSecretValuesFromString } from "../tools/browser";
@@ -197,10 +198,28 @@ export function crashReportsDir(): string {
   return join(baseStateRoot(), "crash-reports");
 }
 
-// Synchronous write so a crash handler can persist before exiting. Filename is
-// <iso-ts-with-safe-chars>-<fingerprint>.json under <stateRoot>/crash-reports/.
+// Queued reports awaiting a consent decision. A producer writes here; the
+// restart-ask glue reads here; a "yes" moves the report to filed/, a "no"
+// moves it to dismissed/.
+export function pendingCrashReportsDir(): string {
+  return join(crashReportsDir(), "pending");
+}
+
+// Reports the user consented to file (the skill moves them here once filed).
+export function filedCrashReportsDir(): string {
+  return join(crashReportsDir(), "filed");
+}
+
+// Reports the user declined to file.
+export function dismissedCrashReportsDir(): string {
+  return join(crashReportsDir(), "dismissed");
+}
+
+// Synchronous write so a crash handler can persist before exiting. Lands in the
+// pending/ queue as <iso-ts-with-safe-chars>-<fingerprint>.json; nothing is
+// filed until the user consents on the next restart.
 export function writeCrashReportFile(report: CrashReport): string {
-  const dir = crashReportsDir();
+  const dir = pendingCrashReportsDir();
   mkdirSync(dir, { recursive: true });
   const safeTs = report.at.replace(/[:.]/g, "-");
   const path = join(dir, `${safeTs}-${report.fingerprint}.json`);
@@ -208,10 +227,51 @@ export function writeCrashReportFile(report: CrashReport): string {
   return path;
 }
 
+// Read + parse every report in the pending/ queue. An unparseable file is
+// skipped rather than throwing — a half-written or corrupt report must not
+// wedge the restart-ask path. Returns [] when the queue dir doesn't exist.
+export function listPendingReports(): Array<{ path: string; report: CrashReport }> {
+  const dir = pendingCrashReportsDir();
+  if (!existsSync(dir)) return [];
+  const out: Array<{ path: string; report: CrashReport }> = [];
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const path = join(dir, entry);
+    try {
+      const report = JSON.parse(readFileSync(path, "utf8")) as CrashReport;
+      out.push({ path, report });
+    } catch {
+      // Skip an unparseable report; keep the rest of the queue.
+    }
+  }
+  return out;
+}
+
+// Move a pending report into filed/ or dismissed/ once its consent decision is
+// resolved. renameSync within the same crash-reports tree is atomic; the sibling
+// dir is created first so the move never fails on a missing target.
+export function resolvePendingReport(path: string, outcome: "filed" | "dismissed"): string {
+  const targetDir = outcome === "filed" ? filedCrashReportsDir() : dismissedCrashReportsDir();
+  mkdirSync(targetDir, { recursive: true });
+  const dest = join(targetDir, basename(path));
+  renameSync(path, dest);
+  return dest;
+}
+
 export interface RateLimitState {
   lastFiledAt: string | null;
   lastCommentAt: string | null;
   commentCount: number;
+  // When this fingerprint was last surfaced to the user as a "want me to file
+  // it?" question. Gates the restart-ask so a crash loop (or a respawn) doesn't
+  // re-ask about the same crash on every boot. Null until first asked.
+  lastAskedAt: string | null;
   // The open crash issue this fingerprint was last filed to. Once known, a
   // recurrence comments directly instead of searching — defeating GitHub's
   // search-indexing latency, which could otherwise let a crash loop file a
@@ -226,7 +286,7 @@ function rateLimitStatePath(fingerprint: string): string {
 export function readRateLimitState(fingerprint: string): RateLimitState {
   const path = rateLimitStatePath(fingerprint);
   if (!existsSync(path)) {
-    return { lastFiledAt: null, lastCommentAt: null, commentCount: 0 };
+    return { lastFiledAt: null, lastCommentAt: null, commentCount: 0, lastAskedAt: null };
   }
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<RateLimitState>;
@@ -234,10 +294,11 @@ export function readRateLimitState(fingerprint: string): RateLimitState {
       lastFiledAt: typeof parsed.lastFiledAt === "string" ? parsed.lastFiledAt : null,
       lastCommentAt: typeof parsed.lastCommentAt === "string" ? parsed.lastCommentAt : null,
       commentCount: typeof parsed.commentCount === "number" ? parsed.commentCount : 0,
+      lastAskedAt: typeof parsed.lastAskedAt === "string" ? parsed.lastAskedAt : null,
       ...(typeof parsed.issueNumber === "number" ? { issueNumber: parsed.issueNumber } : {})
     };
   } catch {
-    return { lastFiledAt: null, lastCommentAt: null, commentCount: 0 };
+    return { lastFiledAt: null, lastCommentAt: null, commentCount: 0, lastAskedAt: null };
   }
 }
 
@@ -245,4 +306,23 @@ export function writeRateLimitState(fingerprint: string, state: RateLimitState):
   const dir = crashReportsDir();
   mkdirSync(dir, { recursive: true });
   writeFileSync(rateLimitStatePath(fingerprint), `${JSON.stringify(state)}\n`);
+}
+
+// Stamp lastAskedAt for a fingerprint, preserving the rest of its state. Done
+// BEFORE the ask is created so a crash that respawns the gateway mid-ask can't
+// produce a second question for the same fingerprint.
+export function markAsked(fingerprint: string, atIso: string): void {
+  const state = readRateLimitState(fingerprint);
+  writeRateLimitState(fingerprint, { ...state, lastAskedAt: atIso });
+}
+
+// True when this fingerprint was asked about within `windowMs` of `nowMs`. A
+// fingerprint never asked (lastAskedAt === null) or with an unparseable stamp
+// returns false so it's eligible to ask.
+export function wasAskedRecently(fingerprint: string, nowMs: number, windowMs: number): boolean {
+  const { lastAskedAt } = readRateLimitState(fingerprint);
+  if (!lastAskedAt) return false;
+  const askedMs = new Date(lastAskedAt).getTime();
+  if (!Number.isFinite(askedMs)) return false;
+  return nowMs - askedMs < windowMs;
 }
