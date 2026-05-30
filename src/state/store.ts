@@ -656,7 +656,11 @@ const HISTORICAL_DEFAULT_AGENT_TOOLSETS: ReadonlyArray<ReadonlyArray<string>> = 
   ["file", "terminal", "memory", "session_search", "delegation"],
   // Post-messaging/mcp, pre-browser. This is what backfillDefaultAgentToolsets
   // produces when it fires on the prior-default snapshot.
-  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"]
+  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp"],
+  // Post-browser, pre-web_search. Lets instances created after `browser`
+  // but before `web_search` recognize the default as uncustomized and
+  // union in `web_search`.
+  ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser"]
 ];
 
 function migrateDefaultAgentToolsets(state: RuntimeState, instance: Instance): void {

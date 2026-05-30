@@ -242,6 +242,23 @@ describe("normalizeState toolset/tool backfill", () => {
     expect(userCustom.updatedAt).toBe(originalUpdatedAt);
   });
 
+  test("unions web_search into a default agent persisted at the post-browser snapshot", () => {
+    // An instance created after `browser` joined the defaults but before
+    // `web_search` did carries exactly this 8-entry whitelist. The
+    // migration must recognize it as uncustomized and add web_search —
+    // otherwise the web_search tool stays invisible to the model.
+    const state = createEmptyState("test-instance-web-search-migrate");
+    const agent = state.agents.find((a) => a.id === "agent_default")!;
+    agent.toolsets = ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser"];
+    agent.updatedAt = "2025-01-01T00:00:00.000Z";
+
+    const normalized = normalizeState("test-instance-web-search-migrate", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default")!;
+    expect(after.toolsets).toContain("web_search");
+    expect(after.toolsets).toContain("browser");
+    expect(after.updatedAt).not.toBe("2025-01-01T00:00:00.000Z");
+  });
+
   test("backfilled tool rows for a DISABLED toolset stay disabled", () => {
     const state = createEmptyState("test-instance-6");
     const browser = state.toolsets.find((ts) => ts.name === "browser");
