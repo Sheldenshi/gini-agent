@@ -51,9 +51,9 @@ describe("gini autostart usage and platform gate", () => {
     expect(parsed.ok).toBe(false);
   });
 
-  // HIGH-4: `kick` on a non-existent service must return non-zero exit
-  // code so install.sh's `if … then` shell guard sees the failure. The
-  // JSON had ok:false before round 2 even when the exit code was 0.
+  // `kick` on a non-existent service must return a non-zero exit code (not
+  // just ok:false in the JSON) so install.sh's `if … then` shell guard sees
+  // the failure.
   test("kick on a not-loaded instance returns non-zero exit", () => {
     if (process.platform !== "darwin") return; // platform gate prints macOS-only
     const result = runCli(["autostart", "kick", "--instance", `kick-nonexistent-${tag()}`], {});
@@ -252,13 +252,14 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     rmSync(scratch.logRoot, { recursive: true, force: true });
     for (const path of [
       plistPathFor(uniqueInstance, "gateway"),
-      plistPathFor(uniqueInstance, "web")
+      plistPathFor(uniqueInstance, "web"),
+      plistPathFor(uniqueInstance, "watchdog")
     ]) {
       try { rmSync(path, { force: true }); } catch { /* ignore */ }
     }
   });
 
-  test("enable → status shows both kinds loaded; disable → status shows both gone", () => {
+  test("enable → status shows all three kinds loaded; disable → status shows all gone", () => {
     const enableResult = runCli(
       [
         "autostart", "enable",
@@ -274,7 +275,7 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     expect(enableParsed.ok).toBe(true);
     expect(enableParsed.enabled).toBe(true);
     const results = enableParsed.results as Array<Record<string, unknown>>;
-    expect(results.length).toBe(2);
+    expect(results.length).toBe(3);
     for (const r of results) expect(r.enabled).toBe(true);
 
     // Status should report both kinds plistExists:true and loaded:true.
@@ -298,13 +299,12 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     const disableParsed = JSON.parse(disableResult.stdout) as Record<string, unknown>;
     expect(disableParsed.ok).toBe(true);
     expect(disableParsed.disabled).toBe(true);
-    // Round-5 fix: enable now calls `kickstart` after bootstrap so the
-    // service actually launches immediately on macOS 26 (where RunAtLoad
-    // is best-effort). That means by the time we reach `disable`, the
-    // child process is genuinely running, and launchctl propagation
-    // takes a beat after `bootout` returns before `launchctl print`
-    // stops finding the service. Poll briefly to let that propagate
-    // before asserting "loaded:false" — the bootout itself already
+    // enable `kickstart`s after bootstrap so the service actually launches
+    // immediately on macOS 26 (where RunAtLoad is best-effort). That means by
+    // the time we reach `disable`, the child process is genuinely running, and
+    // launchctl propagation takes a beat after `bootout` returns before
+    // `launchctl print` stops finding the service. Poll briefly to let that
+    // propagate before asserting "loaded:false" — the bootout itself already
     // returned ok above.
     let unloaded = false;
     let statusAgain: ReturnType<typeof runCli> | undefined;

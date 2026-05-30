@@ -43,6 +43,17 @@ import {
 // means a watchdog failure never tears down the gateway/web already up.
 const KINDS: PlistKind[] = ["gateway", "web", "watchdog"];
 
+// The CORE kinds whose failure means the instance can't serve. The watchdog is
+// supplementary (revives a dead/hung core service) — its bootstrap failing is
+// a degraded-but-running state, NOT a reason to bootout the working
+// gateway/web. enable() only rolls the earlier bootstraps back when a CORE
+// kind fails.
+const CORE_KINDS: readonly PlistKind[] = ["gateway", "web"];
+
+function isCoreKind(kind: PlistKind): boolean {
+  return CORE_KINDS.includes(kind);
+}
+
 // Narrow a raw --kind flag value to a PlistKind. Used to validate the flag
 // and to decide single-kind vs all-kinds for enable/kick.
 function isPlistKind(value: string | undefined): value is PlistKind {
@@ -489,6 +500,17 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
         stderr: res.stderr.trim()
       });
       allOk = false;
+      // Only a CORE kind (gateway/web) failure rolls back the earlier
+      // bootstraps — a half-loaded CORE set (gateway up but no web) is worse
+      // than nothing. The watchdog is supplementary: if it fails to bootstrap
+      // (it's last in the sequence, after gateway/web are up), tearing down a
+      // working gateway/web to "clean up" would take the instance offline over
+      // a missing health-prober. Treat that as a surfaced partial failure
+      // (allOk already false, per-kind error recorded above) and leave the
+      // core services loaded.
+      if (!isCoreKind(svc.kind)) {
+        continue;
+      }
       // Roll back any kinds we already bootstrapped in this call so
       // we don't leave a half-loaded service set behind. Skip kinds
       // that were `wasLoaded:true` on entry — those are the user's

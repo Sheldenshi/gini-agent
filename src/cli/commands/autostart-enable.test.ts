@@ -2,7 +2,7 @@
 // injection. The integration-level behavior (real launchctl shellouts)
 // is covered by autostart.test.ts under GINI_AUTOSTART_E2E=1; this file
 // targets the bookkeeping branches that real launchctl can't reach —
-// notably HIGH-B (rollback bootout itself fails) and the corresponding
+// notably the rollback-bootout-itself-fails path and the corresponding
 // EnableResult.rollbackState contract.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -83,15 +83,58 @@ const isDarwin = process.platform === "darwin";
       expect(r.enabled).toBe(true);
       expect(r.kickstartError).toBeUndefined();
     }
-    // Round-5 fix: kickstart must fire once per successful bootstrap so
-    // services actually launch on macOS 26 (where RunAtLoad is
-    // best-effort). Order matches the kinds slice: gateway, then web.
+    // kickstart must fire once per successful bootstrap so services actually
+    // launch on macOS 26 (where RunAtLoad is best-effort). Order matches the
+    // kinds slice: gateway, then web.
     expect(kickstartCalls.length).toBe(2);
     expect(kickstartCalls[0]!.kind).toBe("gateway");
     expect(kickstartCalls[1]!.kind).toBe("web");
   });
 
-  test("Round-5: kickstart failure is surfaced per-kind but does NOT fail the enable", async () => {
+  test("watchdog bootstrap failure does NOT roll back the already-loaded gateway/web", async () => {
+    // The watchdog is supplementary and bootstrapped last. If it fails, the
+    // gateway/web are already up — tearing them down to "clean up" would take
+    // the instance offline over a missing health-prober. Assert no rollback
+    // bootout fires for gateway/web and the partial failure is surfaced.
+    let bootstrapCalls = 0;
+    const bootoutKinds: Array<PlistKind | undefined> = [];
+    const deps = {
+      isLoaded: () => false,
+      bootout: (_inst: string, kind?: PlistKind) => {
+        bootoutKinds.push(kind);
+        return ok();
+      },
+      bootstrap: () => {
+        bootstrapCalls += 1;
+        // gateway (1) + web (2) succeed; watchdog (3) fails permanently.
+        if (bootstrapCalls < 3) return ok();
+        return fail("Bootstrap failed: watchdog plist rejected");
+      },
+      kickstart: () => ok()
+    };
+    const result = await enable({
+      instance,
+      testRoot: { stateRoot: scratch.stateRoot, logRoot: scratch.logRoot },
+      kinds: ["gateway", "web", "watchdog"],
+      launchctl: deps
+    });
+    // Partial failure surfaced, but no rollback of the core services.
+    expect(result.ok).toBe(false);
+    expect(result.rollbackState).toBe("clean");
+    expect(result.rollbackFailures).toBeUndefined();
+    // CRITICAL: no bootout for gateway or web — they stay loaded.
+    expect(bootoutKinds).not.toContain("gateway");
+    expect(bootoutKinds).not.toContain("web");
+    const gateway = result.results.find((r) => r.kind === "gateway")!;
+    const web = result.results.find((r) => r.kind === "web")!;
+    const watchdog = result.results.find((r) => r.kind === "watchdog")!;
+    expect(gateway.enabled).toBe(true);
+    expect(web.enabled).toBe(true);
+    expect(watchdog.enabled).toBe(false);
+    expect(watchdog.error).toBe("launchctl bootstrap failed");
+  });
+
+  test("kickstart failure is surfaced per-kind but does NOT fail the enable", async () => {
     // The bootstrap succeeded (services are registered), but kickstart
     // returned non-zero. We keep enabled:true so install.sh proceeds
     // and surface the soft failure so the user can recover with
@@ -129,7 +172,7 @@ const isDarwin = process.platform === "darwin";
     expect(web.kickstartStderr).toContain("No such process");
   });
 
-  test("HIGH-B: web fails AND rollback bootout fails → rollbackState 'rollback_failed' + stderr surfaced", async () => {
+  test("web fails AND rollback bootout fails → rollbackState 'rollback_failed' + stderr surfaced", async () => {
     // Bookkeeping: track per-call so the test can distinguish web's
     // bootstrap call (fails) from the rollback bootout call (also fails).
     let bootstrapCalls = 0;
@@ -139,7 +182,7 @@ const isDarwin = process.platform === "darwin";
       isLoaded: () => false,
       bootout: (_inst: string, _kind?: PlistKind) => {
         bootoutCalls += 1;
-        // Rollback bootout fails — this is the scenario HIGH-B flagged.
+        // Rollback bootout itself fails — the scenario this test pins.
         return fail("Bootout failed: 5: Input/output error");
       },
       bootstrap: (_inst: string, _path: string) => {
