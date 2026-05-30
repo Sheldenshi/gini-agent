@@ -13,7 +13,8 @@ import { iconForTool } from "./tool-icons";
 // so no chevron / status dot — the new style relies on the icon to
 // indicate what kind of tool ran.
 //
-// On error / denied the row gets a red error string below.
+// On error / denied the row gets an error string below — red by default,
+// muted gray when errorSeverity is "info" (a calm needs-setup notice).
 
 export function BlockToolCall({
   block,
@@ -49,7 +50,10 @@ export function BlockToolCall({
         ) : null}
       </TouchableOpacity>
       {failed && block.errorMessage ? (
-        <Text style={styles.errorMessage} numberOfLines={3}>
+        <Text
+          style={block.errorSeverity === "info" ? styles.infoMessage : styles.errorMessage}
+          numberOfLines={3}
+        >
           {block.errorMessage}
         </Text>
       ) : null}
@@ -105,6 +109,14 @@ const styles = StyleSheet.create({
   },
   errorMessage: {
     color: theme.danger,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 13,
+    paddingLeft: 21
+  },
+  // Muted variant for errorSeverity "info" (e.g. web_search with no
+  // provider): a calm needs-setup notice rather than a red failure.
+  infoMessage: {
+    color: theme.muted,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 13,
     paddingLeft: 21

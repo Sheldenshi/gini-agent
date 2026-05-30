@@ -11,9 +11,10 @@ export function BlockSetupRequested({
 }: {
   block: SetupRequestedBlock;
 }) {
+  const isConnectorRequest = block.action === "connector.request";
   const title = block.action === "browser.connect"
     ? "Connect to agent's browser"
-    : block.action === "connector.request"
+    : isConnectorRequest
       ? "Provider setup"
       : block.action === "browser.fill_secret"
         ? "Fill credentials"
@@ -23,7 +24,9 @@ export function BlockSetupRequested({
       <View style={styles.header}>
         <Text style={styles.action}>{title}</Text>
       </View>
-      <Text style={styles.summary}>{block.summary}</Text>
+      {/* connector.request repeats the model's reason as a separate
+          assistant bubble, so skip the duplicate here. */}
+      {!isConnectorRequest ? <Text style={styles.summary}>{block.summary}</Text> : null}
       <Text style={styles.hint}>Open the chat on the web client to continue.</Text>
     </View>
   );
