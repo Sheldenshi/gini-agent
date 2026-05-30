@@ -497,6 +497,10 @@ function persistTranscriptRow(
   void mutateState(config.instance, (state) => {
     const item = state.tasks.find((t) => t.id === taskId);
     if (item && isTerminalTaskStatus(item.status)) return;
+    // A concurrent deleteChat between two persist points would otherwise let
+    // createChatMessage recreate orphan rows for a session that no longer
+    // exists; no-op when the session has vanished mid-turn.
+    if (!state.chatSessions.some((s) => s.id === sessionId)) return;
     createChatMessage(state, {
       sessionId,
       role: row.role,

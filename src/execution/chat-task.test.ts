@@ -1745,6 +1745,14 @@ describe("chat-task loop", () => {
     const view = getChatSession(config, session.id);
     expect(view.messages.some((m) => m.kind === "tool_transcript")).toBe(false);
 
+    // The full-state runtime views (/api/state, /api/mobile/bootstrap) must
+    // also drop transcript rows — they carry tool-call args and raw tool
+    // results (skill bodies, file contents) that have no place in a public
+    // state poll.
+    const { publicState, mobileBootstrap } = await import("../runtime/views");
+    expect(publicState(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+    expect(mobileBootstrap(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 });
