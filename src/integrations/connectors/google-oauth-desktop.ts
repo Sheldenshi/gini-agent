@@ -23,10 +23,16 @@ export const googleOauthDesktopProvider: ProviderModule = {
     "Client ID and secret for a Desktop OAuth app in your Google Cloud project. Used by gws for Workspace API authentication.",
   fields: [
     {
+      // Marked secret so the request_connector dialog routes it into
+      // `secrets` (→ a secretRef under purpose "client_id") rather than
+      // dropping it as a non-secret metadata field. The OAuth client id is a
+      // credential component the runtime resolves into the gws CLI env, so it
+      // must survive the dialog→/complete seam alongside client_secret. It is
+      // stored encrypted like every other secret.
       name: "client_id",
       label: "Client ID",
       description: "Looks like 1234567890-abcdef.apps.googleusercontent.com",
-      secret: false,
+      secret: true,
       required: true,
       placeholder: "1234567890-abcdef.apps.googleusercontent.com"
     },
@@ -46,6 +52,11 @@ export const googleOauthDesktopProvider: ProviderModule = {
       GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: "client_secret"
     }
   },
+  // Canonical credential handle skills + the migration reference by name. NOT
+  // the module id ("google-oauth-desktop"): the LOCKED name is the workspace
+  // handle so a fresh UI-created credential, the request /complete path, and
+  // the migration output all agree (and match LEGACY_CONNECTOR_CREDENTIAL_NAMES).
+  credentialName: "google-workspace-oauth",
   // The setup flow is non-trivial — install gws, install gcloud, gcloud
   // auth login, project provisioning, APIs enable, THEN capture the
   // OAuth client credentials. The `google-workspace-setup` skill owns

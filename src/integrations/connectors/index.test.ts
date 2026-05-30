@@ -3,7 +3,7 @@ import { rmSync } from "node:fs";
 import { createEmptyState, mutateState, readState } from "../../state";
 import { writeSecret } from "../../state/secrets";
 import type { ConnectorRecord, RuntimeConfig, SkillRecord } from "../../types";
-import { bindingsForCredentials, createConnector, isSkillActive, resolveSkillEnv } from "./index";
+import { bindingsForCredentials, checkConnector, createConnector, isSkillActive, resolveSkillEnv } from "./index";
 
 const ROOT = "/tmp/gini-connectors-unit";
 
@@ -813,5 +813,194 @@ describe("createConnector typed credentials", () => {
     const stored = readState(config.instance).connectors.find((c) => c.id === created.id);
     expect(stored?.name).toBe("ROUNDTRIP_KEY");
     expect(stored?.type).toBe("api-key");
+  });
+
+  test("api-key: more than one secret is rejected", async () => {
+    const config = configFor("create-apikey-two-secrets");
+    await expect(
+      createConnector(config, {
+        provider: "generic",
+        name: "TWO_SECRETS",
+        type: "api-key",
+        secrets: { TWO_SECRETS: "a", EXTRA: "b" }
+      })
+    ).rejects.toThrow(/exactly one secret/);
+  });
+
+  test("oauth2: an envMap purpose with no matching secret is rejected", async () => {
+    const config = configFor("create-oauth2-missing-secret");
+    await expect(
+      createConnector(config, {
+        provider: "generic",
+        name: "my-oauth-missing",
+        type: "oauth2",
+        secrets: { CLIENT_ID: "cid" },
+        metadata: { envMap: { CLIENT_ID: "CLIENT_ID", CLIENT_SECRET: "CLIENT_SECRET" } }
+      })
+    ).rejects.toThrow(/has no secret for it/);
+  });
+
+  test("a duplicate name collides even against a disabled record", async () => {
+    const config = configFor("create-dupe-disabled");
+    const first = await createConnector(config, {
+      provider: "generic",
+      name: "DISABLED_DUPE",
+      type: "api-key",
+      secrets: { DISABLED_DUPE: "value" }
+    });
+    await mutateState(config.instance, (state) => {
+      const c = state.connectors.find((x) => x.id === first.id)!;
+      c.status = "disabled";
+    });
+    await expect(
+      createConnector(config, {
+        provider: "generic",
+        name: "DISABLED_DUPE",
+        type: "api-key",
+        secrets: { DISABLED_DUPE: "value2" }
+      })
+    ).rejects.toThrow(/already exists/);
+  });
+});
+
+// Template-driven create (GROUP 1). Every create path that does NOT pass an
+// explicit `type` but names a template-backed provider (linear,
+// google-oauth-desktop) must yield the SAME typed, name-correct record the
+// migration produces — so connector.request /complete, `gini connector add`,
+// and the dialog all converge on one shape.
+describe("createConnector applies the provider template when no type is passed", () => {
+  function configFor(instance: string): RuntimeConfig {
+    return {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+  }
+
+  test("linear → typed api-key named LINEAR_API_KEY with mcp.name, secret under purpose token", async () => {
+    // Mirrors the connector.request /complete + CLI path: provider="linear",
+    // a label-ish name, secret keyed by the module field "token", no type.
+    const config = configFor("template-linear");
+    const created = await createConnector(config, {
+      provider: "linear",
+      name: "My Linear",
+      secrets: { token: "lin_api_real" }
+    });
+    expect(created.type).toBe("api-key");
+    expect(created.name).toBe("LINEAR_API_KEY");
+    expect(created.metadata?.mcp).toEqual({
+      url: "https://mcp.linear.app/mcp",
+      name: "linear",
+      headerName: "Authorization",
+      scheme: "Bearer"
+    });
+    // Secret stays under purpose "token" so the Linear probe (resolveSecret
+    // "token") keeps working AND bindingsForCredentials reads it as LINEAR_API_KEY.
+    expect(created.secretRefs.map((r) => r.purpose)).toEqual(["token"]);
+  });
+
+  test("google-oauth-desktop → oauth2 named google-workspace-oauth with the canonical envMap", async () => {
+    const config = configFor("template-google");
+    const created = await createConnector(config, {
+      provider: "google-oauth-desktop",
+      name: "My Google",
+      // client_id is now a secret field, so the request dialog routes both
+      // values into `secrets` under their purposes.
+      secrets: { client_id: "cid-value", client_secret: "csec-value" }
+    });
+    expect(created.type).toBe("oauth2");
+    expect(created.name).toBe("google-workspace-oauth");
+    expect(created.metadata?.envMap).toEqual({
+      client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+      client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
+    });
+    expect(created.secretRefs.map((r) => r.purpose).sort()).toEqual(["client_id", "client_secret"]);
+  });
+
+  test("a fresh google credential resolves GOOGLE_WORKSPACE_CLI_CLIENT_ID by name", async () => {
+    // Fresh-create shape == migration shape: GOOGLE_WORKSPACE_CLI_CLIENT_ID
+    // must materialize from the credential's client_id secret.
+    const instance = "template-google-resolves";
+    const config = configFor(instance);
+    const created = await createConnector(config, {
+      provider: "google-oauth-desktop",
+      name: "My Google Resolve",
+      secrets: { client_id: "cid-value", client_secret: "csec-value" }
+    });
+    await mutateState(instance, (state) => {
+      const c = state.connectors.find((x) => x.id === created.id)!;
+      c.health = "healthy";
+    });
+    const skill = newSkill({
+      source: "bundled",
+      requiredCredentials: ["google-workspace-oauth"],
+      prerequisites: { env: ["GOOGLE_WORKSPACE_CLI_CLIENT_ID", "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"] }
+    });
+    const env = await resolveSkillEnv(config, skill);
+    expect(env).toEqual({
+      GOOGLE_WORKSPACE_CLI_CLIENT_ID: "cid-value",
+      GOOGLE_WORKSPACE_CLI_CLIENT_SECRET: "csec-value"
+    });
+  });
+
+  test("presence-only provider (demo) with no template stays untyped", async () => {
+    const config = configFor("template-demo");
+    const created = await createConnector(config, {
+      provider: "demo",
+      name: "Demo"
+    });
+    expect(created.type).toBeUndefined();
+  });
+});
+
+describe("checkConnector presence-health for typed credentials", () => {
+  function configFor(instance: string): RuntimeConfig {
+    return {
+      instance,
+      port: 0,
+      token: "t",
+      provider: { name: "echo" as const, model: "echo" },
+      workspaceRoot: `${ROOT}/${instance}/workspace`,
+      stateRoot: `${ROOT}/${instance}`,
+      logRoot: `${ROOT}/${instance}/logs`
+    };
+  }
+
+  test("a typed api-key whose provider has no module is presence-healthy when configured", async () => {
+    const instance = "check-typed-unknown";
+    const config = configFor(instance);
+    const created = await createConnector(config, {
+      provider: "not-a-registered-module",
+      name: "PLAIN_TYPED_KEY",
+      type: "api-key",
+      secrets: { PLAIN_TYPED_KEY: "value" }
+    });
+    const probed = await checkConnector(config, created.id);
+    expect(probed.health).toBe("healthy");
+  });
+
+  test("an UNTYPED record with an unknown provider stays unhealthy", async () => {
+    // Guard the inverse: only typed credentials get the presence-healthy
+    // treatment; an untyped record referencing a dead provider is still broken.
+    const instance = "check-untyped-unknown";
+    const config = configFor(instance);
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_untyped_unknown",
+        instance,
+        name: "Legacy",
+        provider: "not-a-registered-module",
+        type: undefined,
+        status: "configured",
+        health: "unknown",
+        secretRefs: []
+      }));
+    });
+    const probed = await checkConnector(config, "id_untyped_unknown");
+    expect(probed.health).toBe("unhealthy");
   });
 });

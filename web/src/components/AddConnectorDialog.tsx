@@ -49,10 +49,15 @@ type CredType = "api-key" | "oauth2";
 // One oauth2 field: an env var the runtime materializes and the value to
 // store for it. Every value is persisted encrypted (oauth2 credentials
 // resolve entirely through the secret store via metadata.envMap), so there
-// is no non-secret variant here.
+// is no non-secret variant here. `purpose` is the secret-store key the value
+// is stored under and the envMap purpose it binds to; when a template is
+// applied it carries the provider's purpose (e.g. "client_id") so the created
+// record matches the migration shape — otherwise it equals the env var name
+// (identity map for a custom oauth2 credential).
 interface OAuthRow {
   envVarName: string;
   value: string;
+  purpose?: string;
 }
 
 export interface AddConnectorDialogProps {
@@ -164,8 +169,13 @@ export function AddConnectorDialog({
       setMcpName(tmpl.mcpName ?? "");
     } else {
       setOauthName(tmpl.name);
+      // Seed one row per template envMap entry, KEEPING the provider's purpose
+      // key (e.g. client_id → GOOGLE_WORKSPACE_CLI_CLIENT_ID). Submit stores
+      // each value under its purpose and persists the template's envMap so a
+      // fresh UI-created credential matches the migration / bundled-skill shape
+      // (bindingsForCredentials reads each purpose's secret by env var).
       const envMap = tmpl.envMap ?? {};
-      const rows = Object.values(envMap).map((envVarName) => ({ envVarName, value: "" }));
+      const rows = Object.entries(envMap).map(([purpose, envVarName]) => ({ envVarName, value: "", purpose }));
       setOauthRows(rows.length > 0 ? rows : [{ envVarName: "", value: "" }]);
     }
   }
@@ -246,11 +256,13 @@ export function AddConnectorDialog({
         setError(`Value for ${envName} is required.`);
         return;
       }
-      secrets[envName] = row.value.trim();
-      // Identity purpose → ENV map (generic oauth2). Template-seeded rows
-      // carry the provider's env names directly, so the purpose IS the env
-      // name; bindingsForCredentials reads each purpose's secret by name.
-      envMap[envName] = envName;
+      // The secret-store key (purpose) is the template's provider purpose when
+      // a template was applied (e.g. "client_id"), else the env var name itself
+      // (identity map for a custom oauth2 credential). envMap binds purpose →
+      // ENV; bindingsForCredentials resolves each ENV from its purpose's secret.
+      const purpose = row.purpose?.trim() || envName;
+      secrets[purpose] = row.value.trim();
+      envMap[purpose] = envName;
     }
     onSubmit({
       provider: template || "generic",

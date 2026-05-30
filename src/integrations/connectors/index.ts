@@ -73,7 +73,8 @@ export function credentialTemplateForProvider(module: ProviderModule): Credentia
     const [envName] = entries[0]!;
     return {
       type: "api-key",
-      name: envName,
+      // api-key name IS the env var, unless the module pins a canonical name.
+      name: module.credentialName ?? envName,
       ...(module.mcpServer?.url ? { mcpUrl: module.mcpServer.url } : {}),
       ...(module.mcpServer?.name ? { mcpName: module.mcpServer.name } : {})
     };
@@ -82,7 +83,10 @@ export function credentialTemplateForProvider(module: ProviderModule): Credentia
   for (const [envName, purpose] of entries) {
     envMap[purpose] = envName;
   }
-  return { type: "oauth2", name: module.id, envMap };
+  // oauth2 name is a handle. Use the module's canonical credentialName (e.g.
+  // "google-workspace-oauth") when declared so the dialog / request / CLI /
+  // migration agree; fall back to the module id only when none is set.
+  return { type: "oauth2", name: module.credentialName ?? module.id, envMap };
 }
 
 // An env-var token: uppercase ASCII, digits, and underscores, leading with a
@@ -92,60 +96,123 @@ const ENV_TOKEN = /^[A-Z][A-Z0-9_]*$/;
 
 export async function createConnector(config: RuntimeConfig, input: CreateConnectorInput): Promise<ConnectorRecord> {
   const provider = String(input.provider || "").trim();
-  const name = String(input.name || "").trim();
-  const type = input.type;
   if (!provider) throw new Error("Invalid input: provider is required.");
-  if (!name) throw new Error("Invalid input: name is required.");
+  if (!String(input.name || "").trim()) throw new Error("Invalid input: name is required.");
   const module = getProvider(provider);
-  // The provider module is REQUIRED only for un-typed creates (presence-only
-  // and legacy provider-keyed connectors still resolve through their module).
-  // When a credential `type` is supplied the module is OPTIONAL template
-  // enrichment — a plain api-key needs no registered provider, so an unknown
-  // provider is allowed and the record resolves from its own fields/envMap.
-  if (!module && !type) {
+  // The provider module is REQUIRED only for un-typed creates that ALSO lack a
+  // credential template (presence-only and legacy provider-keyed connectors
+  // still resolve through their module). When a credential `type` is supplied,
+  // OR the registered module carries a `credentialTemplate`, the create yields
+  // a typed record: a plain api-key needs no registered provider (unknown
+  // provider allowed once `type` is set), and a template-backed provider (e.g.
+  // linear, google-oauth-desktop) is stamped typed even when the caller —
+  // connector.request /complete, `gini connector add` — passed no `type`.
+  const template = module ? credentialTemplateForProvider(module) : undefined;
+  if (!module && !input.type) {
     throw new Error(`Unknown provider: ${provider}. Use one of ${listProviders().map((p) => p.id).join(", ")} or "generic".`);
   }
+
+  // Resolve the effective type/name/metadata. An explicit `type` (the
+  // type-driven Add Connector dialog) wins and uses the caller's name +
+  // metadata as-is. Otherwise, when the provider has a template, stamp the
+  // record from it so EVERY create path (dialog, /complete, CLI) lands the
+  // same typed, name-correct shape the migration produces. With no type and
+  // no template, the record stays untyped (presence-only / generic).
+  let type = input.type;
+  let name = String(input.name).trim();
+  let metadata = input.metadata;
+  if (!type && template) {
+    type = template.type;
+    name = template.name;
+    if (template.type === "api-key") {
+      metadata = {
+        ...(input.metadata ?? {}),
+        ...(template.mcpUrl
+          ? {
+              mcp: {
+                url: template.mcpUrl,
+                ...(template.mcpName ? { name: template.mcpName } : {}),
+                headerName: "Authorization",
+                scheme: "Bearer"
+              }
+            }
+          : {})
+      };
+    } else {
+      metadata = { ...(input.metadata ?? {}), envMap: { ...template.envMap } };
+    }
+  }
+
   // Typed-credential name rules (LOCKED decision 3). api-key name IS the env
   // var; oauth2 name is a handle but each envMap target must be a valid env
-  // token. Names are unique instance-wide.
+  // token. Names are unique instance-wide (uniqueness is enforced inside the
+  // mutate lock below so a concurrent create can't slip a duplicate past the
+  // check).
   if (type === "api-key" && !ENV_TOKEN.test(name)) {
     throw new Error(`Invalid api-key credential name: "${name}". The name is used as the environment variable, so it must match ${ENV_TOKEN.source} (e.g. LINEAR_API_KEY).`);
   }
   if (type === "oauth2") {
-    const envMap = (input.metadata?.envMap ?? {}) as Record<string, string>;
+    const envMap = (metadata?.envMap ?? {}) as Record<string, string>;
     for (const envName of Object.values(envMap)) {
       if (!ENV_TOKEN.test(String(envName))) {
         throw new Error(`Invalid env var name in envMap: "${envName}". Each target must match ${ENV_TOKEN.source} (e.g. GOOGLE_WORKSPACE_CLI_CLIENT_ID).`);
       }
     }
   }
-  if (type) {
-    const existing = readState(config.instance).connectors.find((c) => c.name === name && c.status !== "disabled");
-    if (existing) {
-      throw new Error(`A credential named "${name}" already exists. Credential names must be unique.`);
-    }
-  }
+
   const connectorId = id("id");
   const secretRefs: ConnectorSecretRef[] = [];
   for (const [purpose, value] of Object.entries(input.secrets ?? {})) {
     if (typeof value !== "string" || value.length === 0) continue;
     secretRefs.push(writeSecret(config.instance, connectorId, purpose, value));
   }
+
+  // Shape validation (MED #11). A typed record must resolve cleanly: an
+  // api-key has exactly one secret (its env var == name reads `secretRefs[0]`),
+  // and every oauth2 envMap purpose must have a matching secretRef so each
+  // declared env var actually resolves. These run before the mutate so a
+  // malformed record never lands.
+  if (type === "api-key" && secretRefs.length !== 1) {
+    throw new Error(`An api-key credential must carry exactly one secret; "${name}" got ${secretRefs.length}.`);
+  }
+  if (type === "oauth2") {
+    const envMap = (metadata?.envMap ?? {}) as Record<string, string>;
+    const purposes = new Set(secretRefs.map((ref) => ref.purpose));
+    for (const purpose of Object.keys(envMap)) {
+      if (!purposes.has(purpose)) {
+        throw new Error(`oauth2 credential "${name}" maps purpose "${purpose}" to an env var but has no secret for it.`);
+      }
+    }
+  }
+
+  const finalType = type;
+  const finalName = name;
+  const finalMetadata = metadata;
   return mutateState(config.instance, (state) => {
     const at = now();
+    // Uniqueness check INSIDE the lock (LOCKED decision 3). A typed credential
+    // name must be unique instance-wide INCLUDING disabled/tombstoned records —
+    // a disabled credential still owns its name (and its env var), so allowing
+    // a duplicate would make name→credential resolution ambiguous.
+    if (finalType) {
+      const existing = state.connectors.find((c) => c.name === finalName);
+      if (existing) {
+        throw new Error(`A credential named "${finalName}" already exists. Credential names must be unique.`);
+      }
+    }
     const connector: ConnectorRecord = {
       id: connectorId,
       instance: state.instance,
-      name,
+      name: finalName,
       provider,
-      ...(input.type ? { type: input.type } : {}),
+      ...(finalType ? { type: finalType } : {}),
       status: "configured",
       scopes: Array.isArray(input.scopes) ? input.scopes.map(String) : [],
       secretRefs,
       createdAt: at,
       updatedAt: at,
       health: "unknown",
-      metadata: input.metadata,
+      metadata: finalMetadata,
       source: "user"
     };
     state.connectors.unshift(connector);
@@ -196,7 +263,24 @@ export async function updateConnector(
   return mutateState(config.instance, (state) => {
     const connector = state.connectors.find((candidate) => candidate.id === connectorId);
     if (!connector) throw new Error(`Connector not found: ${connectorId}`);
-    if (typeof input.name === "string") connector.name = input.name.trim() || connector.name;
+    if (typeof input.name === "string") {
+      const nextName = input.name.trim() || connector.name;
+      // Renaming a typed credential must keep the LOCKED name rules intact:
+      // an api-key name IS its env var (uppercase env-token), and names stay
+      // unique instance-wide (including disabled records). Skip when the name
+      // is unchanged so an idempotent PATCH doesn't fail its own uniqueness
+      // check.
+      if (connector.type && nextName !== connector.name) {
+        if (connector.type === "api-key" && !ENV_TOKEN.test(nextName)) {
+          throw new Error(`Invalid api-key credential name: "${nextName}". The name is used as the environment variable, so it must match ${ENV_TOKEN.source} (e.g. LINEAR_API_KEY).`);
+        }
+        const collision = state.connectors.find((c) => c.id !== connector.id && c.name === nextName);
+        if (collision) {
+          throw new Error(`A credential named "${nextName}" already exists. Credential names must be unique.`);
+        }
+      }
+      connector.name = nextName;
+    }
     if (Array.isArray(input.scopes)) connector.scopes = input.scopes.map(String);
     if (input.status) connector.status = input.status;
     if (input.metadata) connector.metadata = { ...(connector.metadata ?? {}), ...input.metadata };
@@ -324,9 +408,13 @@ export async function resolveConnectorSecret(
 
 // Per-provider health probe dispatch. Probes are optional per ADR connector-provider-spec-compliance.md: a
 // provider without a `probe` falls back to a configured-status check (no
-// remote system to query). Connector records that reference an unknown
-// provider land at `unhealthy` with a surfaced message so the activation
-// gate sees the failure.
+// remote system to query). A record that references an unknown provider AND
+// carries no credential `type` lands at `unhealthy` with a surfaced message so
+// the activation gate sees the failure — but a typed credential (api-key /
+// oauth2) is self-describing: it resolves from its own fields/envMap and needs
+// no provider module, so a plain typed key whose provider isn't registered is
+// treated presence-healthy (configured → healthy) rather than unhealthy. This
+// keeps "a plain API key needs no module" true end to end.
 export async function checkConnector(config: RuntimeConfig, connectorId: string): Promise<ConnectorRecord> {
   const initial = readState(config.instance).connectors.find((candidate) => candidate.id === connectorId);
   if (!initial) throw new Error(`Connector not found: ${connectorId}`);
@@ -336,7 +424,12 @@ export async function checkConnector(config: RuntimeConfig, connectorId: string)
   let probeHealth: "healthy" | "unhealthy" | "unknown" = initial.health;
   let probed = false;
 
-  if (!module) {
+  if (!module && initial.type) {
+    // Typed credential with no registered module — self-describing, no remote
+    // system to query. Presence-healthy when configured.
+    probeHealth = initial.status === "configured" ? "healthy" : "unhealthy";
+    probeMessage = `Typed ${initial.type} credential "${initial.name}" has no provider module; presence-only.`;
+  } else if (!module) {
     probeHealth = "unhealthy";
     probeMessage = `Unknown provider: ${initial.provider}.`;
     probed = true;
