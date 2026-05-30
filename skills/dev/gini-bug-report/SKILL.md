@@ -117,14 +117,18 @@ question, so on this turn you are acting on their reply:
   report(s) dismissed (step 5).
 
 **File ONLY the fingerprints the consent named.** The consent message in
-this conversation listed the specific crash fingerprint(s) it covers (e.g.
-`The specific crash fingerprint(s) this consent covers: ab12cd34, ...`). A
-new crash can land in `$QUEUE/pending` between the ask and the user's "yes";
-filing it would be unconsented. So when you list the queue in step 1, **match
-each pending file against the fingerprint(s) named in the consent message**
-(the listed values are the first 8 hex chars of each fingerprint — match by
-prefix) and act on those files only. Leave any pending file whose fingerprint
-was not named where it is; a later consent flow will offer it.
+this conversation listed the specific crash fingerprint(s) it covers in full
+(e.g. `The specific crash fingerprint(s) this consent covers (match these
+EXACTLY): <64-hex-fingerprint>, ...`). A new crash can land in
+`$QUEUE/pending` between the ask and the user's "yes"; filing it would be
+unconsented. So when you list the queue in step 1, **match each pending file's
+`.fingerprint` against the fingerprint(s) named in the consent message by
+EXACT, full-string equality** (not by prefix — a short prefix could
+misattribute a later same-prefix crash to this consent). Act on those files
+only. You may display a shortened form to the user as cosmetic sugar, but the
+file/dedup decision must use the exact fingerprint. Leave any pending file
+whose fingerprint was not named where it is; a later consent flow will offer
+it.
 
 The one exception: if the user **explicitly** asks to file *all* pending
 crashes ("file all of them", "report everything in the queue"), then act on
@@ -146,8 +150,8 @@ read_skill name='github-issues'
 ```
 
 Then, **once per distinct fingerprint that the consent named** (skip any
-pending file whose fingerprint was not in the consent message, unless the
-user explicitly asked to file all):
+pending file whose `.fingerprint` does not EXACTLY equal one named in the
+consent message, unless the user explicitly asked to file all):
 
 1. **Dedup first.** Search for an existing open crash issue with the same
    fingerprint (per `github-issues` Listing and Searching). The fingerprint
@@ -267,9 +271,10 @@ declined → `dismissed/`, and gh-not-authed / user-defers → leave it in
    `gini-crash` issues for the fingerprint first; comment on a match rather
    than opening a duplicate.
 7. **File only the fingerprints the consent named.** The consent message
-   lists the exact crash fingerprint(s) it covers; act on those pending files
-   only. A crash that landed after the ask is unconsented — leave it pending.
-   The sole exception is an explicit "file all" from the user.
+   lists the full crash fingerprint(s) it covers; match each pending file's
+   `.fingerprint` by EXACT, full-string equality and act on those files only.
+   A crash that landed after the ask is unconsented — leave it pending. The
+   sole exception is an explicit "file all" from the user.
 5. **Confirm before filing.** Act on the user's consent-flow reply, or — if
    invoked manually — ask first and wait.
 6. Quote issue numbers verbatim (`#N`) in replies so GitHub deeplinks
