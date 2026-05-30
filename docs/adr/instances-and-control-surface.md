@@ -29,20 +29,25 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
 
 ## Implemented Since
 
-- **Per-instance LaunchAgents (macOS).** Each instance now writes two
+- **Per-instance LaunchAgents (macOS).** Each instance now writes three
   user-domain LaunchAgents under `~/Library/LaunchAgents/`:
   `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime, runs
-  `src/server.ts` directly) and `ai.lilaclabs.gini.<instance>.web`
+  `src/server.ts` directly), `ai.lilaclabs.gini.<instance>.web`
   (Next.js dev server, gated on the gateway becoming healthy via a
-  shell shim). Both are supervised with
-  `KeepAlive.SuccessfulExit: false` so `gini stop` (clean exit 0) is
-  honored and crashes are respawned. Provider secrets from
-  `~/.gini/secrets.env` are merged into the gateway plist's
+  shell shim), and `ai.lilaclabs.gini.<instance>.watchdog` (a periodic
+  health probe). The gateway and web are supervised with `KeepAlive`
+  set to `true` (launchd always respawns on *any* exit, including a
+  clean `exit 0` from an auto-update self-restart), so `gini stop`
+  unloads them via `launchctl bootout` rather than relying on a clean
+  exit. The watchdog covers the gaps KeepAlive can't — a
+  wedged-but-alive process and a launchd-deferred respawn. Provider
+  secrets from `~/.gini/secrets.env` are merged into the gateway plist's
   `EnvironmentVariables` only — the web BFF never invokes a provider
   directly, so it gets none. Subcommands `gini autostart
-  enable|disable|status|kick` manage the pair; uninstall tears them
-  down and reports any launchctl failures. See `src/cli/autostart.ts`
-  and `src/cli/commands/autostart.ts`.
+  enable|disable|status|kick` manage the set; uninstall tears them
+  down and reports any launchctl failures. See
+  [Always-Up Supervision](always-up-supervision.md),
+  `src/cli/autostart.ts`, and `src/cli/commands/autostart.ts`.
 
 ## Deferred
 

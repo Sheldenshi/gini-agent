@@ -26,11 +26,12 @@ Order below matches the README preview. The webapp is the primary interface for 
 
 The current flow makes the user type `gini start` after install. The target experience matches what tools like Paperclip do today: install completes, the runtime is already running, and it stays running across reboots and crashes.
 
-- ✅ **LaunchAgent registration at install time.** The installer writes two per-instance plists under `~/Library/LaunchAgents/` — `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime) and `ai.lilaclabs.gini.<instance>.web` (Next.js dev) — and registers both with `launchctl bootstrap gui/$(id -u)`. Uninstall tears both down and surfaces bootout failures.
-- ✅ **Crash recovery.** `KeepAlive` configured as a dict (`SuccessfulExit: false`) on both plists, so `gini stop` (clean exit 0) is honored but unexpected exits respawn within `ThrottleInterval`. The web plist's shell shim execs `bun run dev` to keep the launchd-tracked PID accurate.
+- ✅ **LaunchAgent registration at install time.** The installer writes three per-instance plists under `~/Library/LaunchAgents/` — `ai.lilaclabs.gini.<instance>.gateway` (Bun runtime), `ai.lilaclabs.gini.<instance>.web` (Next.js dev), and `ai.lilaclabs.gini.<instance>.watchdog` (periodic health probe) — and registers them with `launchctl bootstrap gui/$(id -u)`. Uninstall tears them all down and surfaces bootout failures.
+- ✅ **Crash recovery.** `KeepAlive` is `true` on the gateway and web plists, so launchd respawns the service on *any* exit (including a clean `exit 0` from an auto-update self-restart), bounded by `ThrottleInterval`. Because a clean exit no longer keeps a service down, `gini stop` unloads via `launchctl bootout`. The web plist's shell shim execs `bun run dev` to keep the launchd-tracked PID accurate. See [Always-Up Supervision](docs/adr/always-up-supervision.md).
+- ✅ **Health watchdog.** A third `StartInterval` plist (`gini watchdog`, ~30s) probes the gateway `/api/status` and web `/api/runtime/__healthz`, and `kickstart -k`s whatever is dead or hung — covering wedged-but-alive processes and clean exits that launchd defers respawning.
+- ✅ **Crash reporting.** Runtime `uncaughtException`/`unhandledRejection` handlers (and the watchdog for web) capture a redacted crash report and file a deduped, rate-limited GitHub issue via the `gh` CLI, gated to launchd instances. See [Crash Reporting And External Issue Filing](docs/adr/crash-reporting-and-issue-filing.md).
 - ✅ **Opt-out.** `--no-autostart` on the installer for users who want to manage the runtime themselves.
-- ⚠ **macOS 26+ caveat.** launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). RunAtLoad still fires at login; `gini autostart kick` is the manual workaround.
-- ⚪ **Health watchdog.** A secondary `StartInterval` plist or in-process job hits `/api/healthz` and kills wedged Bun processes that launchd can't detect.
+- ⚠ **macOS 26+ caveat.** launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). The watchdog kickstarts a dead/hung service on its next tick; RunAtLoad still fires at login; `gini autostart kick` is the manual workaround.
 - ⚪ **Linux equivalent.** `systemd --user` unit shipped alongside the macOS plist for parity.
 
 ### Browser-based onboarding at install

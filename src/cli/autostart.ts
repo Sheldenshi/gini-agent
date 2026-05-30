@@ -9,17 +9,19 @@
 // ~/Library/LaunchAgents/. System daemons (~/.../Library/LaunchDaemons/)
 // can't reach the user's Keychain, which would break Codex auth.
 //
-// Two plists per instance:
-//   - `<prefix>.<instance>.gateway` — the Bun runtime (src/server.ts)
-//   - `<prefix>.<instance>.web`     — Next.js dev server, gated on the
-//                                     gateway's /api/healthz coming up
+// Three plists per instance:
+//   - `<prefix>.<instance>.gateway`  — the Bun runtime (src/server.ts)
+//   - `<prefix>.<instance>.web`      — Next.js dev server, gated on the
+//                                      gateway's /api/healthz coming up
+//   - `<prefix>.<instance>.watchdog` — periodic health probe (StartInterval)
+//                                      that revives a dead/hung gateway/web
 //
 // Scope notes:
 //   - macOS only in v1. Linux systemd --user parity is a follow-up.
-//   - PID supervision only (launchd's default). A health watchdog that hits
-//     /api/healthz to detect wedged-but-alive Bun is OUT of v1 — `status`
-//     and `--help` surface that limitation so users know what they're
-//     getting.
+//   - KeepAlive only reacts to process exit, so the watchdog covers the gaps
+//     it can't: a wedged-but-alive runtime (hits /api/status and
+//     /api/runtime/__healthz, kickstarts whatever is hung) and a clean exit
+//     that launchd defers respawning. See ADR always-up-supervision.md.
 //   - KeepAlive is `true`: launchd always respawns the service on exit, so
 //     the runtime stays up across crashes AND clean exits (an auto-update
 //     self-SIGTERM respawns with the fresh code). Stopping is done out of

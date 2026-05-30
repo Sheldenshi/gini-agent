@@ -52,6 +52,17 @@ installer-origin guardrails rather than adding a browser-only shortcut.
   accidentally mutating a different installed runtime.
 - Browser-triggered updates schedule a post-response restart helper so the
   HTTP response can flush before the current gateway exits.
+- The scheduled restart is supervisor-aware. On a launchd-supervised
+  instance the runtime self-SIGTERMs (drains, exits 0) and `KeepAlive`
+  respawns it with the freshly checked-out code — no detached stop+start
+  helper that would reparent and orphan the respawn outside supervision —
+  plus a detached `gini autostart kick --kind web` re-execs the web service
+  for any new `web/` dependencies. Foreground / `gini run` instances keep
+  the detached stop+start helper because there is no KeepAlive to respawn
+  them. The always-respawn KeepAlive model, the watchdog, and the
+  bootout-as-stop contract live in
+  [Always-Up Supervision](always-up-supervision.md); this ADR cross-links
+  rather than duplicating them.
 - Update remains scoped to the installer-managed runtime. Repo worktrees
   should still use normal git workflows.
 

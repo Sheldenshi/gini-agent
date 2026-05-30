@@ -759,10 +759,9 @@ function status(instance: string): StatusResult {
     pid: gateway.pid,
     lastExitStatus: gateway.lastExitStatus,
     limitations: [
-      "PID supervision only — a wedged-but-alive runtime is not detected.",
-      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. Use `gini autostart kick` to force respawn.",
+      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. The watchdog kickstarts a dead/hung service every ~30s; `gini autostart kick` forces it on demand.",
       "macOS only in v1.",
-      "Two services per instance: <prefix>.<instance>.gateway and <prefix>.<instance>.web. `gini status` aggregates web/runtime health."
+      "Three services per instance: <prefix>.<instance>.gateway, <prefix>.<instance>.web, and <prefix>.<instance>.watchdog (periodic health probe that revives a wedged-but-alive or cleanly-exited gateway/web). `gini status` aggregates web/runtime health."
     ]
   };
 }
