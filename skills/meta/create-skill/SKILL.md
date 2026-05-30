@@ -144,10 +144,13 @@ Gini extensions (under `metadata.gini`):
      `requires.credentials`.
    - For each, check `GET /api/connectors`. If a healthy credential with
      that name already exists, you are done.
-   - If not, tell the user: "Open `/skills`, find the new skill, and
-     click the inline `[Set up <Credential>]` button next to the missing
-     credential." There is no standalone Connectors page; setup is
-     inline on the Skills page.
+   - If not, prompt the user in chat with `request_connector` (passing the
+     new skill's id as `skillId`) so they can enter it securely — the card
+     stores the credential and grants it to the skill in one step. For a
+     credential with no registered provider, use the templateless
+     `{name, type, skillId}` shape. The `/skills` page (find the new skill,
+     click the inline `[Set up <Credential>]` button) is a fallback when the
+     secure card cannot render. There is no standalone Connectors page.
 
 ## Migration Mode
 

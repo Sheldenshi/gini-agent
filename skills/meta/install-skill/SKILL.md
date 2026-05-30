@@ -68,12 +68,10 @@ and surface the credentials the new skill will need.
      or local integration, remove the credential requirement. Record
      command requirements under `metadata.gini.prerequisites.commands`.
    - If a required credential is NOT yet configured:
-     **Default to forward motion.** Keep the requirement and explain to
-     the user: "This skill needs a `<name>` credential you haven't added
-     yet. I'll install it; you'll provide the value manually in the
-     credential dialog. Probes are presence-only — Gini won't verify the
-     remote system is actually reachable." Do not present an
-     install / hold-off binary choice.
+     **Default to forward motion.** Keep the requirement and install the
+     skill (step 6). You will prompt for the missing credential(s) in chat
+     right after install (step 7) — do not present an install / hold-off
+     binary choice.
 
 5. Surface the `allowed-tools` declaration to the user. Read the
    skill's frontmatter `allowed-tools` value (space-separated) and
@@ -97,13 +95,31 @@ and surface the credentials the new skill will need.
    `metadata.gini.category`), triggers a loader reload, and returns the
    new enabled SkillRecord.
 
-7. If any required credential is missing or unhealthy, tell the user to
-   open the Skills page (`/skills`), find the row for the skill they
-   just installed, and click the inline `[Set up <Credential>]` button
-   next to the missing credential. There is no longer a standalone
-   Connectors page — credential setup happens inline. Alternatively,
-   collect the credential in chat and POST it directly to
-   `/api/connectors`.
+7. For EACH still-missing required credential, prompt the user in chat
+   with `request_connector` so they can enter it securely. The install
+   response (step 6) returns the new SkillRecord — use its `id` as the
+   `skillId`. Call:
+
+   - Registered provider (the credential name maps to a known module, e.g.
+     `LINEAR_API_KEY` → linear): `request_connector` with that
+     `provider` id plus `skillId`.
+   - No registered provider (a brand-new service): `request_connector`
+     with `{name: "<CREDENTIAL_NAME>", type: "<api-key|oauth2>",
+     skillId: "<installed skill id>", reason: "<what the credential is
+     for and where to get it>"}`. Infer `type` from the name: an
+     UPPER_SNAKE env-var token (e.g. `SOME_SERVICE_API_KEY`) is
+     `api-key`; a kebab handle is `oauth2`.
+
+   Completing the card stores the credential as a typed record AND grants
+   it to the installed skill — the skill activates once all its
+   credentials are granted, so there is no separate grant step and no
+   `/skills` trip. The secure card captures the secret server-side; the
+   value never enters the chat transcript.
+
+   The `/skills` page (find the installed skill's row, click the inline
+   `[Set up <Credential>]` button) is a fallback only — use it if the
+   secure card cannot render (e.g. the conversation is not in the web
+   chat).
 
 ## Rules
 
@@ -116,5 +132,10 @@ and surface the credentials the new skill will need.
   requirement for skills that only need local commands or an
   already-authenticated CLI.
 - Never embed the user's secret values in the SKILL.md you write.
+- Never POST a secret to `/api/connectors` (or any endpoint) from a shell
+  command. A secret on a command line lands in your context, the audit
+  trail, and process listings. Always use `request_connector` so the value
+  is captured server-side through the secure card and never enters the
+  transcript.
 - Bundled vendored skills are off-limits to this skill — install only
   user-source records.
