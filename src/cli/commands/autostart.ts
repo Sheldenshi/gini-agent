@@ -3,9 +3,9 @@
 // What this does for the user: after `gini install` (or by hand on an
 // existing instance), enabling autostart writes ~/Library/LaunchAgents/
 // ai.lilac.gini.<instance>.plist, registers it with launchctl, and from
-// then on the runtime is up at login and respawned on crash. `gini stop`
-// (clean exit) is honored — the agent does NOT respawn after a deliberate
-// stop.
+// then on the runtime is up at login and respawned on crash (KeepAlive is
+// `true`, so launchd respawns on any exit). A deliberate `gini stop` runs
+// `launchctl bootout` to unload the service so it stays down.
 //
 // macOS only in v1. Linux systemd --user is a follow-up, but invoking
 // `gini autostart ...` on Linux prints a clear platform message rather
@@ -161,7 +161,7 @@ function usage(): Record<string, unknown> {
       "macOS only in v1 (Linux systemd --user is a follow-up).",
       "Two services per instance: <prefix>.<instance>.gateway (Bun runtime) and <prefix>.<instance>.web (Next.js).",
       "PID supervision only — a wedged-but-alive runtime is not detected here. A health watchdog hitting /api/healthz is a follow-up.",
-      "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn. The web shim execs `bun run dev`, which exits 0 on SIGTERM; the same KeepAlive contract applies.",
+      "`gini stop` runs `launchctl bootout` to unload the service (KeepAlive is `true` — launchd always respawns on exit, so a clean exit alone won't keep it down). The web service is torn down the same way.",
       "macOS 26 (Tahoe): launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). Use `gini autostart kick` to force a respawn when this happens; RunAtLoad still fires at login.",
       "Secrets in ~/.gini/secrets.env are merged into the gateway plist's EnvironmentVariables only (the web plist is the BFF and never talks to providers directly). If you change a key (e.g. `gini provider set`), re-run `autostart enable` to refresh the plist for future respawns.",
       "`--test-root <dir>` is an E2E-test escape hatch: scoped state/log roots are embedded in the plist. Plain GINI_STATE_ROOT in your shell does NOT leak into a permanent plist."

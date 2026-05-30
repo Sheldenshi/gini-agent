@@ -10,13 +10,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  GINI_SUPERVISOR_VALUE,
   LABEL_PREFIX,
   generatePlist,
   guiDomain,
   labelFor,
   plistPathFor,
   resolveLaunchSpec,
-  serviceTarget
+  serviceTarget,
+  supervisor
 } from "./autostart";
 
 function makeTempHome(tag: string): string {
@@ -84,8 +86,8 @@ describe("resolveLaunchSpec", () => {
     });
 
     // Direct exec of bun against the server entry — no wrapper, no CLI
-    // layer. Single-process job so SIGKILL is reliably observed by launchd
-    // and KeepAlive.SuccessfulExit:false respawns it.
+    // layer. Single-process job so the launchd-tracked PID is the runtime
+    // itself and KeepAlive respawns it on any exit.
     expect(spec.programArguments).toEqual([
       "/Users/test/.bun/bin/bun",
       "run",
@@ -477,6 +479,23 @@ describe("resolveLaunchSpecPair", () => {
     expect(pair.gateway.workingDirectory).toBe(pair.web.workingDirectory);
   });
 
+  test("gateway and web env both carry GINI_SUPERVISOR=launchd", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    // The marker is how a launchd-spawned runtime/web recognizes its
+    // supervisor at runtime (supervisor()==="launchd"). Foreground/
+    // `gini start` never set it.
+    expect(pair.gateway.environment.GINI_SUPERVISOR).toBe("launchd");
+    expect(pair.web.environment.GINI_SUPERVISOR).toBe("launchd");
+  });
+
   test("rejects suspicious instance names that could break out of the shell shim", async () => {
     const { resolveLaunchSpecPair } = await import("./autostart");
     expect(() => resolveLaunchSpecPair({
@@ -551,6 +570,34 @@ describe("parseSecretsEnv", () => {
   });
 });
 
+describe("supervisor", () => {
+  let prior: string | undefined;
+
+  beforeEach(() => {
+    prior = process.env.GINI_SUPERVISOR;
+  });
+
+  afterEach(() => {
+    if (prior === undefined) delete process.env.GINI_SUPERVISOR;
+    else process.env.GINI_SUPERVISOR = prior;
+  });
+
+  test('returns "launchd" when GINI_SUPERVISOR matches the marker', () => {
+    process.env.GINI_SUPERVISOR = GINI_SUPERVISOR_VALUE;
+    expect(supervisor()).toBe("launchd");
+  });
+
+  test("returns null when GINI_SUPERVISOR is unset (foreground/`gini run`)", () => {
+    delete process.env.GINI_SUPERVISOR;
+    expect(supervisor()).toBeNull();
+  });
+
+  test("returns null for an unrelated GINI_SUPERVISOR value", () => {
+    process.env.GINI_SUPERVISOR = "systemd";
+    expect(supervisor()).toBeNull();
+  });
+});
+
 describe("generatePlist", () => {
   const baseSpec = {
     programArguments: ["/Users/test/.local/bin/gini", "run", "--instance", "main", "--no-web"],
@@ -589,17 +636,20 @@ describe("generatePlist", () => {
     expect(web).toContain(`<string>${LABEL_PREFIX}.main.web</string>`);
   });
 
-  test("KeepAlive is a dict with SuccessfulExit=false", () => {
+  test("KeepAlive is true (always respawn; bootout is the stop mechanism)", () => {
     const xml = generatePlist({
       instance: "main",
       spec: baseSpec,
       stdoutPath: "/tmp/out.log",
       stderrPath: "/tmp/err.log"
     });
-    // The exact dict shape is load-bearing: changing it to a <true/>
-    // bool would make `gini stop` immediately respawn, which defeats the
-    // whole "user intent honored" contract.
-    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>[\s\S]*?<key>SuccessfulExit<\/key>\s*<false\/>[\s\S]*?<\/dict>/);
+    // KeepAlive:true means launchd respawns on ANY exit — the runtime must
+    // stay up across crashes and clean exits alike. Stopping is done via
+    // `launchctl bootout` (see `gini stop`), never by a clean exit. A
+    // SuccessfulExit dict would let a clean exit keep the service down,
+    // which would re-open the orphan/stay-dead failure mode.
+    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+    expect(xml).not.toContain("<key>SuccessfulExit</key>");
     // NetworkState was deliberately omitted — see the comment in
     // generatePlist for why (pended-spawn semaphore prevents respawn).
     expect(xml).not.toContain("<key>NetworkState</key>");
