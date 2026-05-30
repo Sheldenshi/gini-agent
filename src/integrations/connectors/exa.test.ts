@@ -4,7 +4,7 @@ import { probeExa } from "./exa";
 describe("probeExa", () => {
   test("returns ok=false when the API returns a non-2xx response", async () => {
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response("", { status: 403 })) as typeof fetch;
+    globalThis.fetch = (async () => new Response("", { status: 403 })) as unknown as typeof fetch;
     try {
       const result = await probeExa("bad-key");
       expect(result.ok).toBe(false);
@@ -24,7 +24,7 @@ describe("probeExa", () => {
       receivedHeaders = new Headers(init?.headers ?? {});
       receivedBody = typeof init?.body === "string" ? init.body : undefined;
       return new Response(JSON.stringify({ results: [] }), { status: 200 });
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
     try {
       const result = await probeExa("good-key");
       expect(result.ok).toBe(true);

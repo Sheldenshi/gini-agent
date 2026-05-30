@@ -550,7 +550,7 @@ async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record
   if (!connector || !providerId) {
     const wanted = requested ?? "brave-search or exa";
     throw new Error(
-      `No healthy ${wanted} connector configured. Call request_connector with provider '${requested ?? "brave-search"}' to ask the user for an API key.`
+      `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`
     );
   }
 

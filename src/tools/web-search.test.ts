@@ -15,7 +15,7 @@ describe("braveWebSearch", () => {
           }
         }),
         { status: 200 }
-      )) as typeof fetch;
+      )) as unknown as typeof fetch;
     try {
       const results = await braveWebSearch("k", "brave", 5);
       expect(results).toHaveLength(2);
@@ -31,7 +31,7 @@ describe("braveWebSearch", () => {
 
   test("throws on non-2xx Brave responses", async () => {
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = (async () => new Response("", { status: 429 })) as typeof fetch;
+    globalThis.fetch = (async () => new Response("", { status: 429 })) as unknown as typeof fetch;
     try {
       await expect(braveWebSearch("k", "q", 3)).rejects.toThrow(/HTTP 429/);
     } finally {
@@ -52,7 +52,7 @@ describe("exaWebSearch", () => {
           ]
         }),
         { status: 200 }
-      )) as typeof fetch;
+      )) as unknown as typeof fetch;
     try {
       const results = await exaWebSearch("k", "q", 5);
       expect(results[0]?.snippet).toBe("highlight one … highlight two");
