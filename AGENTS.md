@@ -79,6 +79,10 @@ After a UI-related change or new feature, exercise it end-to-end on every surfac
 
 "It compiles" is not "it works." Native RN behavior in particular often differs from RN Web (e.g. `selectable` on `<Text>` is a no-op on web because browser text is selectable by default), so a web-only check can pass while the native build is still broken.
 
+**A gateway that isn't running is not a blocker — start it yourself.** Never report "I couldn't test end-to-end because the gateway/dev server was down." Bring it up with the Tmux pattern below (`tmux new-session -d -A -s gini-<instance> "bun run gini run --instance <instance>"`), confirm it's listening with `gini status --instance <instance>`, then drive the change through the real surface. It boots in seconds.
+
+For runtime / agent changes (tools, dispatch, providers, memory, skills), "the affected surface" is a **real chat turn**, not a unit test. Start the gateway, create a session, send a message through the chat flow (`gini chat new` → `gini chat send <session> "<prompt>"`, which posts to `/api/chat/<id>/messages` — the same path the web UI uses), wait for the task to complete, and confirm from the task's `recentToolCalls` + summary that the agent selected the right tool and produced the right result. Unit tests verify the mechanism; the chat turn verifies the model actually reaches for it. Test against the worktree's own instance, never `default`.
+
 ## Logs
 
 Spawned child stdio is appended under:
