@@ -153,6 +153,28 @@ describe("resolveMcpHeaders", () => {
     }
   });
 
+  test("resolves ${LINEAR_API_KEY} from a typed api-key credential named LINEAR_API_KEY", async () => {
+    // Name-based path: after migration the credential is `type: "api-key"`
+    // with `name == "LINEAR_API_KEY"` (the env var). The header placeholder
+    // resolves against the credential by name, not via the provider module.
+    const instance = "mcp-resolve-by-name";
+    const config = makeConfig(instance);
+    const ref = writeSecret(instance, "id_named", "token", "lin_api_BY_NAME");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_named",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        secretRefs: [ref]
+      }));
+    });
+    const server = makeServer({ instance });
+    const headers = await resolveMcpHeaders(config, server);
+    expect(headers["Authorization"]).toBe("Bearer lin_api_BY_NAME");
+  });
+
   test("permits process.env fallback for vars no provider claims", async () => {
     // Conversely: a user-supplied passthrough header like
     // `MCP-Foo: ${SOME_GENERIC_VAR}` is fair game for process.env

@@ -31,6 +31,72 @@ function findUsableConnector(connectors: ConnectorRecord[], providerId: string, 
   );
 }
 
+// Same usability guard as `findUsableConnector` but for a single record —
+// used by the credential-driven pass which already has the credential in hand.
+function connectorUsable(c: ConnectorRecord): boolean {
+  if (c.status !== "configured") return false;
+  if (c.health === "healthy") return true;
+  const hasProbe = Boolean(getProvider(c.provider)?.probe);
+  return !hasProbe && c.health === "unknown";
+}
+
+// Register an MCP server for every usable api-key credential that carries
+// `metadata.mcp`. The server row is NAMED BY THE CREDENTIAL (api-key name ==
+// env var), and its single auth header is built from the credential's mcp
+// metadata: `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
+// The `${<name>}` placeholder resolves at invoke-time via `resolveMcpHeaders`
+// against the same credential (name-based), so the token never lands in
+// state.json. Idempotent and keyed by name — never clobbers a user's manual
+// `gini mcp add` config or an already-registered row.
+async function syncCredentialMcpServers(config: RuntimeConfig, created: string[]): Promise<void> {
+  const state = readState(config.instance);
+  for (const credential of state.connectors) {
+    if (credential.type !== "api-key") continue;
+    const mcp = credential.metadata?.mcp;
+    if (!mcp?.url) continue;
+    if (!connectorUsable(credential)) continue;
+    const name = credential.name;
+    if (state.mcpServers.some((s) => s.name === name)) continue;
+    const headerName = mcp.headerName ?? "Authorization";
+    const scheme = mcp.scheme ?? "Bearer";
+    const headers = { [headerName]: `${scheme} \${${name}}` };
+    const inserted = await mutateState(config.instance, (mutating): { id: string; name: string } | undefined => {
+      // Re-check usability and existence inside the lock to lose cleanly to a
+      // concurrent disable/delete or `gini mcp add` for the same name.
+      const still = mutating.connectors.find((c) => c.id === credential.id);
+      if (!still || still.type !== "api-key" || !connectorUsable(still)) return undefined;
+      if (mutating.mcpServers.some((s) => s.name === name)) return undefined;
+      const record = createMcpServerRecord(
+        mutating,
+        {
+          name,
+          command: "",
+          args: [],
+          envKeys: [],
+          exposedTools: [],
+          transport: "http",
+          url: mcp.url,
+          headers
+        },
+        { actor: "runtime" }
+      );
+      addAudit(
+        mutating,
+        {
+          actor: "runtime",
+          action: "mcp.auto_register",
+          target: record.id,
+          risk: "low",
+          evidence: { provider: credential.provider, name, url: mcp.url }
+        },
+        { system: true }
+      );
+      return { id: record.id, name: record.name };
+    });
+    if (inserted) created.push(inserted.name);
+  }
+}
+
 // Idempotently materialize an MCP server record for every provider that
 // declares one and has at least one configured + healthy connector. The
 // registry is keyed by `mcpServer.name`: if a server with that name
@@ -46,8 +112,12 @@ function findUsableConnector(connectors: ConnectorRecord[], providerId: string, 
 // insert actually happened inside the lock (i.e. no concurrent CLI add /
 // connector disable raced ahead between our read and the mutate).
 export async function syncProviderMcpServers(config: RuntimeConfig): Promise<string[]> {
-  const state = readState(config.instance);
   const created: string[] = [];
+  // Name-based pass: typed api-key credentials carrying `metadata.mcp`. The
+  // module-driven pass below stays for un-migrated connectors so Linear's MCP
+  // keeps registering before the migration stamps types onto records.
+  await syncCredentialMcpServers(config, created);
+  const state = readState(config.instance);
   const providerIds = new Set(state.connectors.map((c) => c.provider));
   for (const providerId of providerIds) {
     const module = getProvider(providerId);

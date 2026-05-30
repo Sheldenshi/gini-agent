@@ -243,6 +243,51 @@ describe("syncProviderMcpServers", () => {
     expect(configured?.actor).toBe("runtime");
   });
 
+  test("registers an MCP server named by an api-key credential carrying metadata.mcp", async () => {
+    // Name-based pass: a typed api-key credential (name == env var) with
+    // `metadata.mcp` materializes a server row NAMED BY THE CREDENTIAL whose
+    // single header is `<scheme> ${<name>}`, resolvable by name at invoke time.
+    const config = buildConfig("mcp-sync-credential");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_cred",
+        instance: config.instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        health: "healthy",
+        metadata: { mcp: { url: "https://mcp.linear.app/mcp", headerName: "Authorization", scheme: "Bearer" } }
+      }));
+    });
+    const created = await syncProviderMcpServers(config);
+    expect(created).toContain("LINEAR_API_KEY");
+    const state = readState(config.instance);
+    const server = state.mcpServers.find((s) => s.name === "LINEAR_API_KEY");
+    expect(server).toBeDefined();
+    expect(server?.transport).toBe("http");
+    expect(server?.url).toBe("https://mcp.linear.app/mcp");
+    expect(server?.headers?.Authorization).toBe("Bearer ${LINEAR_API_KEY}");
+  });
+
+  test("credential MCP header honors headerName and scheme overrides", async () => {
+    const config = buildConfig("mcp-sync-credential-override");
+    await mutateState(config.instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_cred2",
+        instance: config.instance,
+        name: "SOME_API_KEY",
+        type: "api-key",
+        provider: "generic",
+        health: "healthy",
+        metadata: { mcp: { url: "https://mcp.example.com/mcp", headerName: "X-Api-Key", scheme: "Token" } }
+      }));
+    });
+    const created = await syncProviderMcpServers(config);
+    expect(created).toContain("SOME_API_KEY");
+    const server = readState(config.instance).mcpServers.find((s) => s.name === "SOME_API_KEY");
+    expect(server?.headers?.["X-Api-Key"]).toBe("Token ${SOME_API_KEY}");
+  });
+
   test("clean sync (no failure) leaves no mcp.auto_register_failed audit", async () => {
     // Negative control for the failure path: a presence-only provider
     // (no mcpServer descriptor) flips healthy and syncProviderMcpServers

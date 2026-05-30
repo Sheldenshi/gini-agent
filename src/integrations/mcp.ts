@@ -1,7 +1,7 @@
 import type { McpServerRecord, RuntimeConfig } from "../types";
 import { addAudit, appendEvent, createMcpServerRecord, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
-import { envBindingsForProviders, resolveConnectorSecret } from "./connectors";
+import { bindingsForCredentials, envBindingsForProviders, resolveConnectorSecret } from "./connectors";
 import { getProvider, listProviders } from "./connectors/registry";
 import { httpMcpCallTool, httpMcpInitialize, httpMcpListTools, resolveHeaderValue } from "./mcp-http";
 
@@ -189,15 +189,37 @@ export async function resolveMcpHeaders(
 ): Promise<Record<string, string>> {
   const raw = server.headers ?? {};
   if (Object.keys(raw).length === 0) return {};
-  // Bindings owned by ANY known provider — used both to populate
-  // credentials from live connectors and to block process.env fallback
-  // for those same variable names.
-  const allBindings = envBindingsForProviders(listProviders().map((p) => p.id));
   const state = readState(config.instance);
+  // Resolve live credential secrets into `env`. Two sources, name-based first:
+  //   1. Typed credentials (api-key/oauth2) resolved by NAME via
+  //      `bindingsForCredentials` — api-key env var == credential name (so
+  //      `${LINEAR_API_KEY}` resolves against the credential named
+  //      LINEAR_API_KEY), oauth2 materializes each metadata.envMap entry.
+  //   2. Transitional provider env bindings (removed by the migration commit)
+  //      for un-migrated connectors that still lack a name/type — fills any
+  //      env var the name-based pass didn't cover so today's linear MCP row
+  //      keeps resolving before migration.
+  const typedNames = state.connectors.filter((c) => c.type).map((c) => c.name);
+  const credentialBindings = bindingsForCredentials(state, typedNames);
+  const providerBindings = envBindingsForProviders(listProviders().map((p) => p.id));
+  // Block-list: every env var ANY provider OR typed credential CLAIMS, whether
+  // or not a connector currently resolves it. These can ONLY be supplied by a
+  // live credential, never by process.env — so deleting/disabling a connector
+  // can't leave an MCP row authenticated from the operator's shell (which
+  // would bypass the connector.secret.use audit). A claimed-but-unresolved var
+  // therefore stays unresolved and surfaces a "missing credential" error.
+  const claimedVars = new Set<string>([
+    ...Object.keys(credentialBindings),
+    ...Object.keys(providerBindings)
+  ]);
   const env: Record<string, string> = {};
-  for (const [envName, binding] of Object.entries(allBindings)) {
-    const providerModule = getProvider(binding.provider);
-    const hasProbe = Boolean(providerModule?.probe);
+  for (const [envName, binding] of Object.entries(credentialBindings)) {
+    const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
+    if (value) env[envName] = value;
+  }
+  for (const [envName, binding] of Object.entries(providerBindings)) {
+    if (envName in env) continue;
+    const hasProbe = Boolean(getProvider(binding.provider)?.probe);
     const match = state.connectors.find(
       (c) =>
         c.provider === binding.provider
@@ -213,12 +235,12 @@ export async function resolveMcpHeaders(
   // process.env so users can wire in non-secret values like
   // `MCP-Protocol-Version` by hand. The fallback never overrides a
   // connector-bound value because the env map shadows process.env for
-  // any name in `allBindings`.
+  // any claimed var.
   const resolved: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
     const referencedVars = Array.from(value.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((m) => m[1] as string);
     let usedEnv: Record<string, string> = env;
-    const fallbackCandidates = referencedVars.filter((name) => !(name in allBindings));
+    const fallbackCandidates = referencedVars.filter((name) => !claimedVars.has(name));
     if (fallbackCandidates.length > 0) {
       const fallback: Record<string, string> = {};
       for (const name of fallbackCandidates) {
