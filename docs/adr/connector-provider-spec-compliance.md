@@ -35,7 +35,7 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - Routes: `/api/identities*` → `/api/connectors*`.
 - CLI: `gini identity ...` → `gini connector ...`.
 - Audit event names: `identity.*` → `connector.*`.
-- Helpers: `isSkillActive`, `resolveSkillEnv`, `resolveActiveSkillsEnv` keep their names — the verb operates on skills.
+- Helpers: `isSkillActive`, `resolveSkillEnv` keep their names — the verb operates on skills.
 - Web: `useIdentities` → `useConnectors`. There is no standalone Connectors page in the sidebar — connector setup happens inline on the Skills page next to the rows that depend on a connector. The `useConnectors` hook stays the canonical client query so the inline rows can read connector state without coupling to page lifecycle.
 - State migration: on load, rename `state.identities` → `state.connectors` and `record.kind` → `record.provider` silently. No back-compat shim is exposed.
 - ADR connector-secret-storage.md title becomes "Connector Secret Storage"; ADR skills-and-connectors.md becomes "Skills and Connectors." Body text updated to match.
