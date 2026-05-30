@@ -110,7 +110,7 @@ const isDarwin = process.platform === "darwin";
       expect(svc.loaded).toBe(false);
     }
     expect(Array.isArray(parsed.limitations)).toBe(true);
-    expect((parsed.limitations as string[]).some((l) => l.includes("PID supervision"))).toBe(true);
+    expect((parsed.limitations as string[]).some((l) => l.includes("watchdog"))).toBe(true);
   });
 });
 
