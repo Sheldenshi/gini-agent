@@ -10,7 +10,7 @@ metadata:
     author: Gini
     category: meta
     requires:
-      connectors: []
+      credentials: []
 ---
 
 # Create Skill
@@ -47,7 +47,13 @@ Gini extensions (under `metadata.gini`):
 
 - `version`, `author`, `platforms`, `category`
 - `prerequisites: { commands, env }`
-- `requires.connectors: [{ provider, scopes? }]`
+- `requires.credentials: [<credential-name>]` — the credential names the
+  skill needs, referenced by name (e.g. `[LINEAR_API_KEY]` for an
+  api-key credential, `[google-workspace-oauth]` for the Google oauth2
+  credential). This is the current, preferred form.
+- `requires.connectors: [{ provider, scopes? }]` — still accepted for
+  backward compatibility during the migration window; prefer
+  `requires.credentials`.
 
 ## Procedure
 
@@ -55,16 +61,21 @@ Gini extensions (under `metadata.gini`):
    posts to Slack", clarify whether the skill should also read messages,
    list channels, etc. — surface the cardinality so the design is right.
 
-2. Decide whether the skill needs a connector. Use
-   `requires.connectors` only when the skill needs a configured account,
-   credential, remote API, or connector-backed local integration. If the
-   skill only needs local commands such as `git`, `gh`, `jq`, or `curl`,
-   record those under `prerequisites.commands` and set
-   `requires.connectors: []`. If a fitting connector exists in
-   `/api/connectors/providers`, use it. If the skill truly needs an
-   unsupported external system, declare `provider: generic` under
-   `requires.connectors`. Do not ask the user to pick between
-   install/skip on unknown providers — default to forward motion.
+2. Decide whether the skill needs a credential. Use
+   `requires.credentials` only when the skill needs a configured account,
+   credential, remote API, or connector-backed local integration. Each
+   entry is a credential NAME — `LINEAR_API_KEY` for an api-key
+   credential, `google-workspace-oauth` for the Google oauth2 credential.
+   Check the configured credentials in `GET /api/connectors` to find the
+   right name. If the skill only needs local commands such as `git`,
+   `gh`, `jq`, or `curl`, record those under `prerequisites.commands` and
+   set `requires.credentials: []`. If the skill truly needs a credential
+   that hasn't been configured yet, name it the way the credential will
+   be stored (the env-var name for an api-key) and tell the user to add
+   it. Do not ask the user to pick between install/skip on unknown
+   credentials — default to forward motion.
+   (`requires.connectors: [{ provider }]` is still accepted for backward
+   compatibility, but `requires.credentials` is preferred.)
 
 3. Draft the frontmatter. Use this template:
 
@@ -84,9 +95,10 @@ Gini extensions (under `metadata.gini`):
          commands: [<cli names>]
          env: [<ENV_VAR_NAMES>]
        requires:
-         # Leave empty for local-command-only skills. If a connector is
-         # needed, use: [{ provider: <id>, scopes: [<optional>] }]
-         connectors: []
+         # Leave empty for local-command-only skills. If a credential is
+         # needed, list it by name, e.g. [LINEAR_API_KEY] or
+         # [google-workspace-oauth].
+         credentials: []
    ---
    ```
 
@@ -105,9 +117,9 @@ Gini extensions (under `metadata.gini`):
    - `name` is uppercase or contains underscores → switch to kebab-case.
    - `description` exceeds 1024 chars → tighten it.
    - parent dir name doesn't match `name` → adjust whichever is wrong.
-   - required provider doesn't exist → if the skill needs a real external
-     system, switch to `generic` or add the provider module first; if it
-     only needs local commands, remove the connector requirement.
+   - required credential name is malformed → an api-key name must be an
+     env token (`[A-Z][A-Z0-9_]*`, e.g. `LINEAR_API_KEY`); if the skill
+     only needs local commands, remove the credential requirement.
 
 6. Install the skill via the API so the runtime picks it up:
 
@@ -126,27 +138,32 @@ Gini extensions (under `metadata.gini`):
    and triggers a loader reload. The response includes the new
    `SkillRecord` with `validation: { ok, issues }`.
 
-7. Walk the connector dependency:
+7. Walk the credential dependency:
 
-   - List the providers the skill declares in `requires.connectors`.
-   - For each, check `GET /api/connectors`. If a healthy connector for
-     that provider already exists, you are done.
+   - List the credential names the skill declares in
+     `requires.credentials`.
+   - For each, check `GET /api/connectors`. If a healthy credential with
+     that name already exists, you are done.
    - If not, tell the user: "Open `/skills`, find the new skill, and
-     click the inline `[Set up <Provider>]` button next to the missing
-     connector." There is no standalone Connectors page; setup is
+     click the inline `[Set up <Credential>]` button next to the missing
+     credential." There is no standalone Connectors page; setup is
      inline on the Skills page.
 
 ## Migration Mode
 
 When converting a legacy SKILL.md, the recipe is:
 
-1. Move `version`, `author`, `platforms`, `prerequisites`, and
-   `requires.connectors` (with `provider:` items) under
-   `metadata.gini.*` — paying attention to the renames introduced by
-   ADR connector-provider-spec-compliance.md:
-   - `requires.identities[].kind` → `requires.connectors[].provider`.
-   The legacy `requires.identities` / `kind:` shape is what older
-   pre-ADR-connector-provider-spec-compliance.md SKILL.md files used; rewrite both keys when migrating.
+1. Move `version`, `author`, `platforms`, `prerequisites`, and the
+   credential requirement under `metadata.gini.*`, landing on the current
+   `requires.credentials: [<name>]` form. Convert legacy connector
+   declarations to credential names:
+   - `requires.identities[].kind` and `requires.connectors[].provider` →
+     `requires.credentials[]` names (e.g. `linear` → `LINEAR_API_KEY`,
+     `google-oauth-desktop` → `google-workspace-oauth`).
+   The legacy `requires.identities` / `kind:` and `requires.connectors` /
+   `provider:` shapes are what older SKILL.md files used;
+   `requires.connectors` is still accepted for backward compatibility, but
+   migrate to `requires.credentials` when rewriting.
 
 2. Move `compatibility` to the top level if you can describe the host
    contract in ≤ 500 chars.
@@ -159,9 +176,9 @@ When converting a legacy SKILL.md, the recipe is:
 ## Rules
 
 - Never write a skill without validating first.
-- Always check `GET /api/connectors/providers` for the providers the new
-  skill will depend on. Prefer existing providers over `generic`, and do
-  not add `generic` for local-command-only skills.
+- Always check `GET /api/connectors` for the credentials the new skill
+  will depend on, and reference them by name in `requires.credentials`.
+  Do not add a credential requirement for local-command-only skills.
 - Bundled skills are immutable from the agent's perspective — if the
   user asks to edit a bundled skill, instead create a user-source copy
   with the same name. The runtime keeps both as separate rows.

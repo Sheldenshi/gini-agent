@@ -10,14 +10,14 @@ metadata:
     author: Gini
     category: meta
     requires:
-      connectors: []
+      credentials: []
 ---
 
 # Install Skill
 
 You install a SKILL.md the user supplied — pasted text, a URL, or a
 file path — into the runtime's user-skills directory. You also review risk
-and surface the providers the new skill will need.
+and surface the credentials the new skill will need.
 
 ## When To Use
 
@@ -43,7 +43,7 @@ and surface the providers the new skill will need.
    - Exit code non-zero → repair the obvious issues (kebab-case the
      name, trim the description, move legacy fields under
      `metadata.gini.*`). If the issues are substantive (referencing a
-     provider that doesn't exist), see step 4.
+     credential that isn't configured), see step 4.
 
 3. Review the scripts and the body for risk. Read every sidecar file
    the user provided. Summarize for the user:
@@ -53,24 +53,26 @@ and surface the providers the new skill will need.
    - Whether it can write outside its workspace.
    - Whether it makes outbound network calls and to which hosts.
 
-4. Resolve the connector requirements declared under
-   `metadata.gini.requires.connectors`:
+4. Resolve the credential requirements declared under
+   `metadata.gini.requires.credentials` (a list of credential names). An
+   incoming skill may instead carry the legacy
+   `metadata.gini.requires.connectors` (with `provider:` items); that form
+   is still accepted, but rewrite it to `requires.credentials` names
+   (e.g. `linear` → `LINEAR_API_KEY`, `google-oauth-desktop` →
+   `google-workspace-oauth`) when you install:
 
-   - For each entry, check `GET /api/connectors/providers`.
-   - If the provider exists, note whether the user already has a healthy
-     connector for it (via `GET /api/connectors`).
+   - For each credential name, check `GET /api/connectors` to see whether
+     the user already has a healthy credential with that name.
    - If the skill only needs local commands or an already-authenticated CLI
-     and does not need a connector-managed account, credential, remote API,
-     or local integration, remove the connector requirement instead of
-     rewriting it to `generic`. Record command requirements under
-     `metadata.gini.prerequisites.commands`.
-   - If the provider does NOT exist in the registry:
-     **Default to forward motion.** Rewrite the requirement as
-     `provider: generic` and explain the tradeoff to the user:
-     "Gini doesn't yet have a `<id>` provider module. I'll install with
-     `generic` instead; you'll provide the credentials manually in the
-     Connections dialog. Probes are presence-only — Gini won't verify
-     the remote system is actually reachable." Do not present an
+     and does not need a credential-managed account, credential, remote API,
+     or local integration, remove the credential requirement. Record
+     command requirements under `metadata.gini.prerequisites.commands`.
+   - If a required credential is NOT yet configured:
+     **Default to forward motion.** Keep the requirement and explain to
+     the user: "This skill needs a `<name>` credential you haven't added
+     yet. I'll install it; you'll provide the value manually in the
+     credential dialog. Probes are presence-only — Gini won't verify the
+     remote system is actually reachable." Do not present an
      install / hold-off binary choice.
 
 5. Surface the `allowed-tools` declaration to the user. Read the
@@ -95,11 +97,11 @@ and surface the providers the new skill will need.
    `metadata.gini.category`), triggers a loader reload, and returns the
    new enabled SkillRecord.
 
-7. If any required connector is missing or unhealthy, tell the user to
+7. If any required credential is missing or unhealthy, tell the user to
    open the Skills page (`/skills`), find the row for the skill they
-   just installed, and click the inline `[Set up <Provider>]` button
-   next to the missing connector. There is no longer a standalone
-   Connectors page — connector setup happens inline. Alternatively,
+   just installed, and click the inline `[Set up <Credential>]` button
+   next to the missing credential. There is no longer a standalone
+   Connectors page — credential setup happens inline. Alternatively,
    collect the credential in chat and POST it directly to
    `/api/connectors`.
 
@@ -109,9 +111,10 @@ and surface the providers the new skill will need.
 - Always review the scripts for risk before installing. If you can't read
   the scripts (binary blobs, opaque URLs), refuse the install and tell the
   user why.
-- Default to `provider: generic` for unknown external providers; do not
-  stop the install flow to ask permission. Do not add `generic` for
-  skills that only need local commands or an already-authenticated CLI.
+- Keep an unconfigured credential requirement and install anyway; do not
+  stop the install flow to ask permission. Do not add a credential
+  requirement for skills that only need local commands or an
+  already-authenticated CLI.
 - Never embed the user's secret values in the SKILL.md you write.
 - Bundled vendored skills are off-limits to this skill — install only
   user-source records.

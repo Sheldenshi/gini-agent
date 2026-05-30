@@ -867,7 +867,7 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          credentialName: "linear",
+          credentialName: "LINEAR_API_KEY",
           credentialLabel: "Linear",
           toolCallId: "call_grant_1"
         }
@@ -885,7 +885,7 @@ describe("runtime api", () => {
     expect(resolved?.status).toBe("completed");
     const updated = state.skills.find((s) => s.id === skill.id);
     expect(updated?.status).toBe("enabled");
-    expect(updated?.grantedConnectors).toEqual(["linear"]);
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
     expect(state.audit.some((a) => a.action === "skill.connector.granted")).toBe(true);
   });
 
@@ -1050,7 +1050,7 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          credentialName: "linear",
+          credentialName: "LINEAR_API_KEY",
           credentialLabel: "Linear",
           toolCallId: "call_grant_final_double"
         }
@@ -1075,7 +1075,7 @@ describe("runtime api", () => {
     const updated = state.skills.find((s) => s.id === skill.id);
     expect(updated?.status).toBe("enabled");
     // Exactly one grant — the loser double-granted nothing.
-    expect(updated?.grantedConnectors).toEqual(["linear"]);
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
     // Exactly ONE skill.enabled audit row (the loser produced no second one).
     expect(state.audit.filter((a) => a.action === "skill.enabled").length).toBe(1);
     // Exactly ONE grant audit row.
@@ -1118,7 +1118,7 @@ describe("runtime api", () => {
         payload: {
           skillId: skill.id,
           skillName: skill.name,
-          credentialName: "linear",
+          credentialName: "LINEAR_API_KEY",
           credentialLabel: "Linear",
           toolCallId: "call_grant_cancel_race"
         }
@@ -1160,7 +1160,7 @@ describe("runtime api", () => {
       expect(resolved?.status).toBe("completed");
       expect(cancelRes.ok).toBe(false);
       expect(updated?.status).toBe("enabled");
-      expect(updated?.grantedConnectors).toEqual(["linear"]);
+      expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
       expect(granted).toBe(true);
       expect(enabled).toBe(true);
     }
