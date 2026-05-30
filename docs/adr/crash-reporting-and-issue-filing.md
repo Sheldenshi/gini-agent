@@ -1,159 +1,204 @@
-# ADR: Crash reporting and external GitHub issue filing
+# ADR: Crash reporting and issue filing
 
 ## Decision
 
-A launchd-supervised Gini instance captures unhandled crashes to disk and
-files a deduped, rate-limited GitHub issue for each distinct failure. The
-issue body is published to an external service, so redaction before publish
-is a hard trust boundary, not a nicety.
+A launchd-supervised `default` Gini instance captures unhandled crashes to a
+local queue, **redacts them at capture**, and **never files anything
+autonomously**. On the next gateway restart — and only for the `default`
+instance — if the queue holds crashes the user hasn't been asked about, Gini
+posts a single normal chat message asking whether to file them as GitHub
+issues. Filing happens only on the user's explicit "yes", and runs through the
+`gini-bug-report` skill, which delegates the actual `gh` work to the
+`github-issues` skill. Nothing leaves the machine without consent.
+
+Crash reports can contain provider API keys, bearer tokens, the tunnel secret,
+and user/task content. Because a GitHub issue *publishes* that content,
+redaction before the report is even offered to the agent or the user is a hard
+trust boundary, not a nicety.
 
 ### Capture
 
-The gateway installs process-level `uncaughtException` and
-`unhandledRejection` handlers (`src/runtime/crash-handlers.ts`, wired in
-`src/server.ts`). On a crash the *dying* process, in order:
+Two producers write redacted reports into a local queue; neither files
+anything:
 
-1. appends a structured event (`runtime.<event>`) to `runtime.jsonl` so the
-   crash is in the log stream even if the steps below fail,
-2. builds a structured crash report — error name/message/stack, system
-   context (platform, arch, node version), and a bounded tail of
-   `runtime.jsonl` — and writes it **synchronously** to
-   `<stateRoot>/crash-reports/<ts>-<fingerprint>.json`,
-3. when under launchd, spawns a **detached, unref'd** `gini report-crash
-   --report <path>` so the filing survives the process's imminent death,
-4. always `exit(1)` (in a `finally`, so a failure in any earlier step still
-   exits) — KeepAlive then respawns the gateway. See
-   [Always-Up Supervision](always-up-supervision.md).
+- **Runtime crashes.** The gateway installs process-level `uncaughtException`
+  and `unhandledRejection` handlers (`src/runtime/crash-handlers.ts`, wired in
+  `src/server.ts`). On a crash the *dying* process, in order: appends a
+  structured `runtime.<event>` line to `runtime.jsonl` (so the crash is in the
+  log stream even if the next step fails); builds a structured, redacted report
+  — error name/message/stack, system context, and a bounded tail of
+  `runtime.jsonl` — and writes it **synchronously** to
+  `<stateRoot>/crash-reports/pending/`; then always `exit(1)` in a `finally`
+  (so a failure in the report write still exits) — KeepAlive respawns the
+  gateway. See [Always-Up Supervision](always-up-supervision.md).
 
-Filing is a separate detached process rather than inline because doing `gh`
-I/O inside a dying process is unreliable, and decoupling lets the capture
-path stay dumb (write + spawn + exit) while the filing path owns all
-policy.
+- **Web crashes (via the watchdog).** The web (Next.js) child has no
+  in-process crash handler; patching Next.js internals to install one was
+  rejected as invasive and fragile. Instead the watchdog (`gini watchdog`, see
+  [Always-Up Supervision](always-up-supervision.md)) detects a dead-or-hung web
+  child by its health probe and, for a *genuine* web failure only — the web
+  port was recorded, the probe failed, **and** the runtime is healthy — builds
+  a `source: "web"` report from the web log tails (synthesizing an `Error` so a
+  web outage with no JS exception still fingerprints and dedupes), writes it
+  into the same `pending/` queue, then kickstarts the web service. A missing
+  port (boot race) or a web failure while the runtime is also down (the BFF
+  can't reach a dead gateway) is not a web crash, so no report is written for
+  it.
 
-### Web crashes are detected by the watchdog, not in-process
+Both producers are write-only: they capture, queue, and move on. The decision
+to publish lives entirely in the consent flow below.
 
-The web (Next.js) child has no in-process crash handler. Patching Next.js
-internals to install one in v1 was rejected as invasive and fragile — it
-would couple Gini to Next.js's process model. Instead the watchdog
-(`gini watchdog`, see [Always-Up Supervision](always-up-supervision.md))
-detects a dead-or-hung web child by its health probe and, before
-kickstarting it, captures the web log tails (`web-launchd.err.log`,
-`web.log`), synthesizes an `Error` (so a web outage with no JS exception
-still fingerprints and dedupes), writes a `source: "web"` report, and fires
-the same detached `gini report-crash`. An in-process web handler remains a
-possible follow-up.
+### Trust boundary: redaction happens at capture
 
-### External publishing trust boundary: redaction before publish
-
-Filing to GitHub *publishes* the report content. Crash reports can contain
-provider API keys, bearer tokens, the tunnel secret, and user/task content.
-So every text field that reaches an issue body is run through
-`redactReportText` (`src/runtime/crash-report.ts`) first, which scrubs:
+The report is **already redacted before it is written to the queue** — before
+it can be read by the agent or shown to the user. `buildCrashReport`
+(`src/runtime/crash-report.ts`) runs every text field through
+`redactReportText`, which scrubs:
 
 - the repo's existing browser secret patterns (`sk-…`, `ghp_…`,
   `github_pat_…`, etc.),
-- GitHub token shapes (`gho_`/`ghu_`/`ghs_`/`ghr_…`) and
-  `Bearer …` / `Authorization: …` header values,
-- every literal value parsed out of `~/.gini/secrets.env`, scrubbed
-  verbatim so a hand-edited or odd-format key is caught even when it
-  doesn't match a pattern,
+- GitHub token shapes (`gho_`/`ghu_`/`ghs_`/`ghr_…`) and `Bearer …` /
+  `Authorization: …` header values (the whole header value to end-of-line, not
+  just the first token),
+- every literal value parsed out of `~/.gini/secrets.env`, unquoted through the
+  repo's `unquoteSecretsValue` and scrubbed verbatim so a hand-edited or
+  odd-format key is caught even when it doesn't match a pattern,
 - the per-instance tunnel secret.
 
-Independently, the `runtime.jsonl` tail carried into a report keeps only
-each line's event name + timestamp; the `data` payload is **dropped at
-build time** because it can contain user message and task content. Pattern
-redaction runs first so a token is removed even when its literal value
-isn't in the provided lists — the design defaults to dropping rather than
-including.
+Independently, the `runtime.jsonl` tail carried into a report keeps only each
+line's event name + timestamp; the `data` payload is **dropped at build time**
+because it can contain user message and task content. Pattern redaction runs
+first, so a token is removed even when its literal value isn't in the provided
+lists — the design defaults to dropping rather than including.
 
-### Scope, dedup, rate-limit, and auth
+Because redaction is complete at capture, the queued JSON *is* the trust
+boundary. The `gini-bug-report` skill files an issue straight from that JSON
+and is instructed never to re-fetch raw `runtime.jsonl`, secrets, or any data
+outside the queue. There is no un-redacted path from the queue to GitHub.
 
-- **Gated to launchd/autostart instances only.** `gini report-crash` exits
-  0 as a no-op unless `supervisor()` is `"launchd"`. The 40+ throwaway
-  conductor/test/foreground instances never file, so they can't spam the
-  tracker.
+### Consent flow: ask on restart, file through skills
 
-- **Dedup by fingerprint.** The fingerprint is a sha256 over the normalized
-  `name: message` plus the top-5 normalized stack frames; normalization
-  strips absolute paths to basenames, line/column numbers, hex addresses,
-  PIDs, UUIDs, and timestamps, so two instances of the same crash collapse
-  to one hash. Each issue body carries a hidden marker
-  (`<!-- gini-crash-fingerprint: <hash> -->`) and the `gini-crash` label.
+On gateway boot, `maybeAskAboutCrashes` (`src/runtime/crash-recovery.ts`, called
+best-effort from `src/server.ts`) decides whether to ask:
 
-- **Crash-loop-safe dedup.** Once an issue is filed, its number is persisted
-  in the per-fingerprint state; a recurrence comments straight on that issue
-  and never searches, which defeats GitHub's asynchronous search-indexing
-  latency (a just-created issue isn't immediately findable). When the number
-  is not yet known, a recurrence searches open `gini-crash` issues for the
-  marker. The lookup distinguishes a confirmed "absent" from a lookup
-  "error": a new issue is opened only on a confirmed "absent" *and* only when
-  no issue was filed within the comment interval — so a tight crash loop
-  hitting search lag (or a transient `gh` failure) can't spray duplicate
-  issues.
+1. **Gate.** It returns immediately unless `config.instance === "default"`
+   **and** `supervisor()` is `"launchd"`. Throwaway, conductor, tmux, and
+   foreground instances capture crashes but never ask.
 
-- **Rate-limited recurrences.** Recurrences become comments on the existing
-  open issue, at least 1h apart, with a hard cap of 20 comments per
-  fingerprint after which recurrences are silently dropped. The
-  per-fingerprint rate-limit state (`<fingerprint>.state.json` under the
-  crash-reports dir) is persisted to disk so it survives the respawns a
-  crash loop produces.
+2. **Filter + dedupe.** It reads the `pending/` queue, keeps only reports
+   belonging to this instance, and collapses them to the set of distinct
+   fingerprints that have **not** been asked about within the last 24h
+   (`lastAskedAt` in the per-fingerprint state). If that set is empty, it
+   returns.
 
-- **Auth via the `gh` CLI only.** Filing shells out to `gh` (the operator's
-  existing authenticated CLI, repo scope). If `gh` is unauthenticated or
-  unreachable, `report-crash` leaves a local breadcrumb in `runtime.jsonl`
-  and exits 0 — it never blocks a respawn or a watchdog tick.
+3. **Stamp, then ask once.** It stamps `lastAskedAt` for each fresh
+   fingerprint **before** creating the ask — so a crash that respawns the
+   gateway mid-ask can't double-ask — then creates one immediate one-shot job
+   bound to a dedicated `origin: "job"` chat session ("Crash report"). The job
+   prompt instructs the agent to post a **single** friendly chat message saying
+   it noticed N crash(es) (already redacted, captured locally) and asking
+   whether to file them, and to take no other action this turn. The job's
+   terminal task syncs the assistant message into the session, which fires the
+   usual "Gini has a new message" push.
+
+When the user replies in that thread, their answer drives a fresh agent turn in
+the same session, and the agent loads the `gini-bug-report` skill to act:
+
+- **Yes** → the skill reads the queued redacted report(s), loads the
+  `github-issues` skill, and files **one** issue per distinct fingerprint
+  (`[gini-crash] <source>: <error.name>`, body assembled only from the queued
+  JSON, label `gini-crash`). An open issue already carrying the fingerprint
+  gets a recurrence comment instead of a duplicate. Filed reports move to
+  `filed/`.
+- **No** → nothing is filed; the report(s) move to `dismissed/`.
+- **gh not authenticated** → `github-issues` asks the user to run
+  `gh auth login` (interactive, and the user is present), then resumes. If the
+  user declines to authenticate, or defers, the report is **left in
+  `pending/`** so the consent flow can offer it again on a later restart.
+
+The crash-loop guard is the combination of **per-fingerprint ask-once**
+(`lastAskedAt`, 24h window) and **batching** every fresh fingerprint into a
+single ask: even if KeepAlive respawns a crash-looping gateway repeatedly, the
+user is asked at most once per fingerprint per day, and never more than one
+message per restart. The model-turn cost is bounded by the same gate plus
+ask-once — only `default`, only when there's something new to ask about.
+
+### Superseded
+
+An earlier design filed crashes autonomously. The autonomous `gini
+report-crash` command, a deterministic `gh`-wrapper module, hidden-marker `gh`
+issue dedup, comment rate-limiting, and a `gh`-auth-at-crash gate are no longer
+part of the design. Filing is now consent-gated and skill-driven: capture
+queues a redacted report, the restart hook asks, and the `gini-bug-report` +
+`github-issues` skills do the `gh` work only after the user says yes. Dedup,
+label management, and `gh` auth all live in those skills, run interactively with
+the user present, rather than in a deterministic filer that publishes without a
+human in the loop.
 
 ## Context
 
-When the incident that motivated this work happened, there was no crash
-capture at all: no `uncaughtException`/`unhandledRejection` handlers, so a
-runtime crash left no stack trace, no non-zero exit, and no report
-anywhere. Diagnosing required reconstructing the timeline from launchd exit
-codes and log timestamps.
+When the incident that motivated this work happened, there was no crash capture
+at all: no `uncaughtException`/`unhandledRejection` handlers, so a runtime crash
+left no stack trace, no non-zero exit, and no report anywhere. Diagnosing
+required reconstructing the timeline from launchd exit codes and log timestamps.
 
-The operator wanted two things on a crash: enough logs to diagnose it, and
-an automatically filed GitHub issue so failures surface without manual
-triage. The risk in auto-filing is twofold — publishing secret/user content
-to a public tracker, and a crash *loop* (which the incident actually
-exhibited) spamming the tracker with duplicate issues. The redaction
-boundary addresses the first; fingerprint dedup + rate-limiting + the
-launchd-only gate address the second.
+The operator wanted two things on a crash: enough logs to diagnose it, and a way
+to surface failures as GitHub issues without manual triage. Autonomous filing
+carried two risks — publishing secret/user content to a tracker, and a crash
+*loop* (which the incident actually exhibited) spamming the tracker. Capture +
+redaction addresses the logging need and the publishing risk; routing the
+*decision* to publish through a consent message keeps a human in the loop and
+makes per-fingerprint ask-once the crash-loop guard, while still surfacing every
+distinct crash for one-click filing.
 
 ## Consequences
 
-- A launchd instance that crashes leaves a structured, redacted report on
-  disk and (when `gh` is authed) one open GitHub issue per distinct
-  failure, with recurrences as rate-limited comments.
-- No crash report or issue body carries a provider key, bearer/tunnel
-  secret, gh token, or user/task content — the redaction pass and the
-  dropped `data` payload are the enforced boundary.
-- Foreground, conductor, tmux, and throwaway instances never file. A crash
-  on one of those is captured to its own log stream but produces no GitHub
-  issue.
-- A crash loop produces at most one issue plus a bounded number of
-  rate-limited comments per fingerprint, even though KeepAlive respawns the
-  process each time — the rate-limit state survives respawns because it's
-  on disk.
-- Web outages are reported through the watchdog's ~30s tick rather than
+- A launchd `default` instance that crashes leaves a structured, redacted
+  report in `crash-reports/pending/` and nothing else — no process is spawned
+  to file it, and nothing is published.
+- On the next restart of `default`, the user is asked **once per distinct
+  fingerprint** (24h window) whether to file the captured crash(es), in a
+  single chat message. A "yes" files one GitHub issue per fingerprint through
+  the skills; a "no" dismisses; declining or deferring `gh` auth leaves the
+  report pending for a later offer.
+- Nothing is published without explicit consent, and `gh` authentication
+  happens interactively with the user present — there is no headless `gh` path.
+- No report or issue body carries a provider key, bearer/tunnel secret, gh
+  token, or user/task content: redaction at capture and the dropped `data`
+  payload are the enforced boundary, and the skill files only from the queued
+  JSON.
+- Non-`default` and non-launchd instances (foreground, conductor, tmux,
+  throwaway) capture crashes to their own queue but **never ask** and never
+  file.
+- A crash loop produces at most one ask per fingerprint per day even though
+  KeepAlive respawns the process each time, because `lastAskedAt` is persisted
+  to disk and stamped before the ask.
+- Web outages are captured through the watchdog's ~30s tick rather than
   instantly, and a web report is a synthesized error rather than a real JS
-  stack. An in-process web crash handler is a possible follow-up.
-- Filing depends on a working, authenticated `gh`. An unauthed or offline
-  `gh` degrades to a local log breadcrumb; it never wedges a respawn.
+  stack. An in-process web crash handler remains a possible follow-up.
 
 ## Acceptance Checks
 
-- The fingerprint is stable across PID/line/timestamp/path noise for the
-  same error and differs for a different message or call site.
+- A runtime crash writes a redacted report into `crash-reports/pending/` and
+  exits 1 even if the report write throws; no filer process is spawned.
+- A genuine web failure (port recorded, probe failed, runtime healthy) writes a
+  `source: "web"` report into `pending/`; a missing port or a web failure while
+  the runtime is down writes none.
 - `redactReportText` removes `sk-…`, `ghp_…`, `github_pat_…`, `gho_…`,
-  `Bearer …`, a literal secrets-env value, and the tunnel secret; the
-  serialized `runtime.jsonl` tail carries no `data` payload.
-- With no matching open issue, `report-crash` creates one carrying the
-  hidden marker and the `gini-crash` label; with one open, it comments
-  (when within the rate-limit budget); rate-limited or capped recurrences
-  do neither.
-- When `supervisor()` is not `"launchd"`, `report-crash` never calls `gh`
-  and exits 0; when `gh` is unauthed, it exits 0 with a local breadcrumb.
-- A crash emitted to the runtime handlers writes a report, spawns a
-  detached `gini report-crash`, and exits 1 even if the report write
-  throws.
+  `Bearer …`, an `Authorization:` header value, a literal secrets-env value,
+  and the tunnel secret; the serialized `runtime.jsonl` tail carries no `data`
+  payload — all before the report reaches the queue.
+- On a `default` launchd restart with fresh pending reports, exactly one ask job
+  is created, its prompt mentions the count and the `gini-bug-report` skill, and
+  `lastAskedAt` is stamped for each fresh fingerprint; a second restart within
+  the window creates no job (ask-once).
+- A non-`default` instance, or a `default` instance not under launchd, creates
+  no ask job; pending reports belonging to a different instance are filtered
+  out.
+- Nothing is published before the user replies "yes": a decline dismisses, an
+  un-authed/deferred `gh` leaves the report pending, and a "yes" files one issue
+  per distinct fingerprint through the `gini-bug-report` + `github-issues`
+  skills.
 - `bun run typecheck`, `bun run test`, and `bun run gini smoke` pass.
+</content>
+</invoke>

@@ -32,9 +32,10 @@ The model rests on four pieces:
   `supervisor()` (`src/integrations/launchd.ts`) reads that env var and
   returns `"launchd"` only when the marker is present. Foreground paths
   never set it and get `null`. Every launchd-native branch (bootout as
-  stop, KeepAlive respawn after self-SIGTERM, crash-issue filing) gates on
-  this value, so the same code runs both supervised and foreground without
-  the foreground path ever triggering launchd-only behavior.
+  stop, KeepAlive respawn after self-SIGTERM, the restart-time crash-report
+  ask) gates on this value, so the same code runs both supervised and
+  foreground without the foreground path ever triggering launchd-only
+  behavior.
 
 - **A dedicated watchdog service.** The third LaunchAgent is a periodic
   one-shot — `StartInterval` (~30s) + `RunAtLoad`, and *no* `KeepAlive`
@@ -110,9 +111,10 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   stop+start update helper. The `GINI_SUPERVISOR` marker is the single
   switch that keeps the two worlds apart.
 - A crash-looping service is bounded by `ThrottleInterval` (10s) rather
-  than respawning as fast as it dies. When a crash carries an error, the
-  runtime crash handler also files a deduped, rate-limited GitHub issue;
-  see [Crash Reporting And External Issue Filing](crash-reporting-and-issue-filing.md).
+  than respawning as fast as it dies. A crash also leaves a redacted report
+  in a local queue, which the user is asked to file as a GitHub issue on the
+  next restart of the `default` instance;
+  see [Crash Reporting And Issue Filing](crash-reporting-and-issue-filing.md).
 
 ## Acceptance Checks
 
@@ -132,5 +134,6 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   detached stop+start helper.
 - A `gini watchdog` tick against a healthy instance takes no action; with
   the gateway down it `kickstart -k`s the gateway; with web down it
-  `kickstart -k`s web (and files a web crash report — see the crash ADR).
+  `kickstart -k`s web (and queues a web crash report for consent-gated
+  filing — see the crash ADR).
 - `bun run typecheck`, `bun run test`, and `bun run gini smoke` pass.
