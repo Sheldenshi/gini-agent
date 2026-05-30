@@ -1600,6 +1600,97 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("two turns reusing the same tool_call_id each replay with their own result", async () => {
+    // The text-backstop path synthesizes call ids from name:args:index, so
+    // the same tool called with the same args on two turns yields an
+    // identical tool_call_id. Pairing must stay local to each assistant row:
+    // turn 1's call gets turn 1's result, turn 2's call gets turn 2's, even
+    // though both rows share the id.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-dupid");
+    const provider = normalizeProvider(config.provider);
+    const fixturePath = join(workspaceRoot, "state.txt");
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Dup-id thread" });
+
+    // Turn 1: read the file (content "FIRST"), reusing the colliding id.
+    writeFileSync(fixturePath, "FIRST");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_dup", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "state.txt" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read FIRST.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const first = await submitChatMessage(config, session.id, { content: "read it once" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: read the same file (now "SECOND") with the SAME tool_call_id.
+    writeFileSync(fixturePath, "SECOND");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_dup", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "state.txt" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read SECOND.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "read it again" });
+    await waitForTerminal(config, second.taskId);
+    await syncChatTaskResult(config, session.id, second.taskId);
+
+    // Turn 3: plain answer — we only inspect the transcript it was handed.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const third = await submitChatMessage(config, session.id, { content: "what changed?" });
+    await waitForTerminal(config, third.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn3 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "what changed?")
+    );
+    expect(turn3).toBeDefined();
+
+    // Both assistant tool_calls rows replay, each immediately followed by its
+    // OWN paired result — turn 1 with "FIRST", turn 2 with "SECOND".
+    const toolResults: string[] = [];
+    for (let i = 0; i < turn3!.length; i++) {
+      const m = turn3![i]!;
+      if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === "call_dup")) {
+        const next = turn3![i + 1];
+        expect(next?.role).toBe("tool");
+        expect(next?.tool_call_id).toBe("call_dup");
+        toolResults.push(String(next?.content ?? ""));
+      }
+    }
+    expect(toolResults.length).toBe(2);
+    expect(toolResults[0]).toContain("FIRST");
+    expect(toolResults[0]).not.toContain("SECOND");
+    expect(toolResults[1]).toContain("SECOND");
+    expect(toolResults[1]).not.toContain("FIRST");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("a read_skill body from a prior turn persists into the next turn's transcript", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-transcript-skill");

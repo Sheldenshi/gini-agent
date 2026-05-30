@@ -565,22 +565,31 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
   // Defensive pairing pass. Providers reject an assistant tool_calls message
   // whose ids aren't each answered by a following role:"tool" message, and
   // reject orphan tool messages. A partially-persisted turn (process died
-  // mid-loop) can leave either. Group each tool row under the assistant that
-  // emitted its id; drop orphan tool rows, and drop any assistant tool_calls
-  // row missing one of its paired results — so replay can never produce a
-  // provider 400.
-  const resultsByCallId = new Map<string, ToolCallingMessage>();
-  for (const msg of mapped) {
-    if (msg.role === "tool" && typeof msg.tool_call_id === "string") {
-      resultsByCallId.set(msg.tool_call_id, msg);
-    }
-  }
+  // mid-loop) can leave either. Tool result rows are persisted immediately
+  // after their assistant row, so we pair each assistant tool_calls row with
+  // the role:"tool" rows in its own local window — the rows that follow it up
+  // to the next assistant/user row — matching the assistant's own ids. A
+  // session-global id map would mispair when two turns reuse the same
+  // tool_call_id (the text-backstop path synthesizes ids from
+  // name:args:index, so the same tool+args on two turns collides). Drop orphan
+  // tool rows, and drop any assistant tool_calls row missing one of its paired
+  // results — so replay can never produce a provider 400.
   const paired: ToolCallingMessage[] = [];
-  for (const msg of mapped) {
+  for (let i = 0; i < mapped.length; i++) {
+    const msg = mapped[i]!;
     if (msg.role === "tool") continue; // emitted alongside its assistant below
     if (msg.role === "assistant" && msg.__toolCallIds) {
       const ids = msg.__toolCallIds;
-      const results = ids.map((id) => resultsByCallId.get(id));
+      // Collect the tool result rows in this assistant row's local window.
+      const resultsInWindow = new Map<string, ToolCallingMessage>();
+      for (let j = i + 1; j < mapped.length; j++) {
+        const next = mapped[j]!;
+        if (next.role !== "tool") break; // window ends at the next non-tool row
+        if (typeof next.tool_call_id === "string") {
+          resultsInWindow.set(next.tool_call_id, next);
+        }
+      }
+      const results = ids.map((id) => resultsInWindow.get(id));
       if (ids.length === 0 || results.some((r) => r === undefined)) continue; // drop unpaired turn
       const { __toolCallIds, ...assistant } = msg;
       paired.push(assistant);
