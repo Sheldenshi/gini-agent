@@ -79,8 +79,17 @@ including.
   PIDs, UUIDs, and timestamps, so two instances of the same crash collapse
   to one hash. Each issue body carries a hidden marker
   (`<!-- gini-crash-fingerprint: <hash> -->`) and the `gini-crash` label.
-  A recurrence searches open `gini-crash` issues for the marker; a match
-  reuses that issue, a miss opens a new one.
+
+- **Crash-loop-safe dedup.** Once an issue is filed, its number is persisted
+  in the per-fingerprint state; a recurrence comments straight on that issue
+  and never searches, which defeats GitHub's asynchronous search-indexing
+  latency (a just-created issue isn't immediately findable). When the number
+  is not yet known, a recurrence searches open `gini-crash` issues for the
+  marker. The lookup distinguishes a confirmed "absent" from a lookup
+  "error": a new issue is opened only on a confirmed "absent" *and* only when
+  no issue was filed within the comment interval — so a tight crash loop
+  hitting search lag (or a transient `gh` failure) can't spray duplicate
+  issues.
 
 - **Rate-limited recurrences.** Recurrences become comments on the existing
   open issue, at least 1h apart, with a hard cap of 20 comments per

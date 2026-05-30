@@ -30,7 +30,8 @@ import {
   readRateLimitState,
   redactReportText,
   writeRateLimitState,
-  type CrashReport
+  type CrashReport,
+  type RateLimitState
 } from "../../runtime/crash-report";
 import { secretsEnvPath } from "../../state/secrets-env";
 import { readTunnelConfig } from "../../runtime/tunnel/config-store";
@@ -47,8 +48,8 @@ export interface ReportCrashDeps {
   supervisorImpl?: () => "launchd" | null;
 }
 
-function shortMessage(message: string): string {
-  const oneLine = message.split("\n")[0] ?? "";
+function truncate(text: string): string {
+  const oneLine = text.split("\n")[0] ?? "";
   return oneLine.length > 120 ? `${oneLine.slice(0, 117)}...` : oneLine;
 }
 
@@ -71,10 +72,12 @@ function readTunnelSecret(instance: string): string | undefined {
   }
 }
 
-// Assemble the redacted issue body: a human-readable summary of the report
-// plus the hidden fingerprint marker. Every text field is run through
-// redactReportText so no secret/token/user-content byte reaches GitHub.
-function buildIssueBody(report: CrashReport, instance: string): string {
+// Assemble the redacted issue title AND body in one pass so both share the
+// same redaction context. The TITLE is built from raw error.name/message, so
+// it MUST be redacted before sending (the body redaction alone would leave a
+// secret/user-content byte leaking via the title). Redact first, then
+// truncate, so we never expose the head of an unredacted secret.
+function buildIssueContent(report: CrashReport, instance: string): { title: string; body: string } {
   const secretsEnvBody = readSecretsEnvBody();
   const tunnelSecret = readTunnelSecret(instance);
   const redact = (text: string): string => redactReportText(text, { secretsEnvBody, tunnelSecret });
@@ -101,7 +104,8 @@ function buildIssueBody(report: CrashReport, instance: string): string {
     "",
     fingerprintMarker(report.fingerprint)
   ];
-  return sections.join("\n");
+  const title = `[crash] ${report.source}: ${truncate(redact(report.error.name))}: ${truncate(redact(report.error.message))}`;
+  return { title, body: sections.join("\n") };
 }
 
 export async function reportCrash(ctx: CliContext, deps: ReportCrashDeps = {}): Promise<void> {
@@ -135,24 +139,80 @@ export async function reportCrash(ctx: CliContext, deps: ReportCrashDeps = {}): 
   const nowIso = clock().toISOString();
 
   ensureCrashLabel(gh);
-  const existing = findOpenIssueByFingerprint(gh, report.fingerprint);
 
-  if (existing === null) {
-    const title = `[crash] ${report.source}: ${report.error.name}: ${shortMessage(report.error.message)}`;
-    const body = buildIssueBody(report, instance);
-    const created = createCrashIssue(gh, { title, body });
-    if (created !== null) {
-      writeRateLimitState(report.fingerprint, {
-        lastFiledAt: nowIso,
-        lastCommentAt: null,
-        commentCount: 0
-      });
-      appendLog(instance, "crash.report.filed", { fingerprint: report.fingerprint, issue: created });
-    }
+  // Crash-loop safety. GitHub's issue search is indexed asynchronously, so a
+  // just-created issue may not be findable on the next crash a second later.
+  // To avoid filing a duplicate during a tight loop we:
+  //   1. If we already know the issue number for this fingerprint, comment
+  //      straight on it (rate-limited) and never search.
+  //   2. Otherwise search, and distinguish "absent" from a lookup "error":
+  //      only create on a confirmed "absent", and only when we haven't just
+  //      filed (lastFiledAt outside the comment interval) — that guards
+  //      against a create-storm while the first issue is still un-indexed. A
+  //      lookup error with a recent filing is skipped rather than risk a dup.
+  if (typeof state.issueNumber === "number") {
+    commentOrSuppress(gh, report, instance, state, state.issueNumber, nowMs, nowIso);
     return;
   }
 
-  // An open issue exists. Comment only if within the rate-limit budget.
+  const found = findOpenIssueByFingerprint(gh, report.fingerprint);
+
+  if (found.status === "found") {
+    commentOrSuppress(gh, report, instance, state, found.number, nowMs, nowIso);
+    return;
+  }
+
+  // Both "absent" and "error" must not create when we filed recently — the
+  // existing issue is likely just not indexed yet. "error" additionally means
+  // we couldn't even confirm absence, so the recent-filing guard is the only
+  // thing keeping a crash loop from spraying duplicates.
+  const filedRecently = state.lastFiledAt
+    ? (() => {
+        const filedMs = new Date(state.lastFiledAt).getTime();
+        return Number.isFinite(filedMs) && nowMs - filedMs < COMMENT_MIN_INTERVAL_MS;
+      })()
+    : false;
+
+  if (filedRecently) {
+    appendLog(instance, "crash.report.suppressed", {
+      reason: found.status === "error" ? "lookup-error-recent-filing" : "create-suppressed-recent-filing",
+      fingerprint: report.fingerprint
+    });
+    return;
+  }
+  if (found.status === "error") {
+    // No recent filing, but we genuinely don't know if an issue exists. Skip
+    // rather than risk a duplicate — a later tick will retry the lookup.
+    appendLog(instance, "crash.report.skipped", { reason: "lookup-error", fingerprint: report.fingerprint });
+    return;
+  }
+
+  // Confirmed absent and no recent filing — create a fresh issue.
+  const { title, body } = buildIssueContent(report, instance);
+  const created = createCrashIssue(gh, { title, body });
+  if (created !== null) {
+    writeRateLimitState(report.fingerprint, {
+      lastFiledAt: nowIso,
+      lastCommentAt: null,
+      commentCount: 0,
+      issueNumber: created
+    });
+    appendLog(instance, "crash.report.filed", { fingerprint: report.fingerprint, issue: created });
+  }
+}
+
+// Comment on a known open issue, honoring the rate-limit budget (hard cap +
+// minimum interval between comments). Persists the issue number so future
+// recurrences skip the search entirely.
+function commentOrSuppress(
+  gh: GhRunner,
+  report: CrashReport,
+  instance: string,
+  state: RateLimitState,
+  issueNumber: number,
+  nowMs: number,
+  nowIso: string
+): void {
   if (state.commentCount >= COMMENT_HARD_CAP) {
     appendLog(instance, "crash.report.suppressed", { reason: "comment-cap", fingerprint: report.fingerprint });
     return;
@@ -165,14 +225,15 @@ export async function reportCrash(ctx: CliContext, deps: ReportCrashDeps = {}): 
     }
   }
 
-  const body = buildIssueBody(report, instance);
-  const commented = commentOnIssue(gh, existing, body);
+  const { body } = buildIssueContent(report, instance);
+  const commented = commentOnIssue(gh, issueNumber, body);
   if (commented) {
     writeRateLimitState(report.fingerprint, {
       lastFiledAt: state.lastFiledAt,
       lastCommentAt: nowIso,
-      commentCount: state.commentCount + 1
+      commentCount: state.commentCount + 1,
+      issueNumber
     });
-    appendLog(instance, "crash.report.commented", { fingerprint: report.fingerprint, issue: existing });
+    appendLog(instance, "crash.report.commented", { fingerprint: report.fingerprint, issue: issueNumber });
   }
 }

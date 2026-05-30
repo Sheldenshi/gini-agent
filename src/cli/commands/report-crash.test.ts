@@ -207,4 +207,77 @@ describe("reportCrash", () => {
     expect(create!.input).not.toContain("sk-abcdefghijklmnop1234");
     expect(create!.input).toContain("[redacted]");
   });
+
+  test("a secret in the error message is redacted out of the issue TITLE", async () => {
+    // The title is built from error.name/message — it must be redacted too,
+    // not just the body. A leaked token in the title would be plainly visible
+    // on the issue list.
+    const err = new Error("auth failed for sk-titleleak0123456789abcd token");
+    const report = makeReport({ error: err });
+    writeReport(report);
+    const { gh, calls } = makeGh({});
+    await reportCrash(ctxFor(), { gh, supervisorImpl: () => "launchd" });
+    const create = calls.find(isIssue("create"));
+    expect(create).toBeDefined();
+    const titleIdx = create!.args.indexOf("--title");
+    expect(titleIdx).toBeGreaterThanOrEqual(0);
+    const title = create!.args[titleIdx + 1]!;
+    expect(title).not.toContain("sk-titleleak0123456789abcd");
+    expect(title).toContain("[redacted]");
+  });
+
+  test("known issueNumber in state -> comments WITHOUT searching", async () => {
+    const report = makeReport();
+    writeReport(report);
+    writeRateLimitState(report.fingerprint, {
+      lastFiledAt: "2026-05-29T09:00:00.000Z",
+      lastCommentAt: null,
+      commentCount: 0,
+      issueNumber: 13
+    });
+    const { gh, calls } = makeGh({});
+    // 10:00 is >1h after the last (null) comment; comment proceeds.
+    await reportCrash(ctxFor(), { gh, supervisorImpl: () => "launchd", clock: () => new Date("2026-05-29T10:00:00.000Z") });
+    // No search and no create — we went straight to the known issue.
+    expect(calls.some(isIssue("list"))).toBe(false);
+    expect(calls.some(isIssue("create"))).toBe(false);
+    const comment = calls.find(isIssue("comment"));
+    expect(comment).toBeDefined();
+    expect(comment!.args).toContain("13");
+    const state = readRateLimitState(report.fingerprint);
+    expect(state.issueNumber).toBe(13);
+    expect(state.commentCount).toBe(1);
+  });
+
+  test("absent + recent lastFiledAt -> suppressed (no duplicate create during a loop)", async () => {
+    const report = makeReport();
+    writeReport(report);
+    // Filed 30 min ago; the just-created issue may not be indexed yet, so the
+    // search returns absent. We must NOT create a second issue.
+    writeRateLimitState(report.fingerprint, {
+      lastFiledAt: "2026-05-29T09:30:00.000Z",
+      lastCommentAt: null,
+      commentCount: 0
+    });
+    const { gh, calls } = makeGh({ listResult: { ok: true, stdout: "[]", stderr: "", status: 0 } });
+    await reportCrash(ctxFor(), { gh, supervisorImpl: () => "launchd", clock: () => new Date("2026-05-29T10:00:00.000Z") });
+    expect(calls.some(isIssue("create"))).toBe(false);
+  });
+
+  test("lookup error during a crash loop does NOT create a second issue", async () => {
+    const report = makeReport();
+    writeReport(report);
+    // We filed an issue moments ago. The next crash's `gh issue list` fails
+    // (rate limit / transient). A failed lookup is not 'absent' — creating
+    // here would spawn a duplicate. Suppress instead.
+    writeRateLimitState(report.fingerprint, {
+      lastFiledAt: "2026-05-29T09:59:30.000Z",
+      lastCommentAt: null,
+      commentCount: 0
+    });
+    const { gh, calls } = makeGh({ listResult: { ok: false, stdout: "", stderr: "API rate limit", status: 1 } });
+    await reportCrash(ctxFor(), { gh, supervisorImpl: () => "launchd", clock: () => new Date("2026-05-29T10:00:00.000Z") });
+    expect(calls.some(isIssue("create"))).toBe(false);
+    expect(calls.some(isIssue("comment"))).toBe(false);
+  });
 });

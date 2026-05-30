@@ -62,11 +62,19 @@ export function fingerprintMarker(fingerprint: string): string {
   return `<!-- gini-crash-fingerprint: ${fingerprint} -->`;
 }
 
+// Outcome of a fingerprint lookup. We MUST distinguish a genuine "no open
+// issue" from a lookup error: collapsing both to null lets a crash loop create
+// a duplicate issue every time `gh issue list` transiently fails. The caller
+// only creates on "absent"; on "error" it suppresses to avoid duplicates.
+export type FindIssueResult =
+  | { status: "found"; number: number }
+  | { status: "absent" }
+  | { status: "error" };
+
 // Find an OPEN crash issue carrying this fingerprint's hidden marker. The
 // search narrows the candidate set; we still confirm the exact marker in each
 // returned body (gh search is fuzzy and could match a marker substring).
-// Returns the issue number, or null when none match.
-export function findOpenIssueByFingerprint(gh: GhRunner, fingerprint: string): number | null {
+export function findOpenIssueByFingerprint(gh: GhRunner, fingerprint: string): FindIssueResult {
   const marker = fingerprintMarker(fingerprint);
   const res = gh.run([
     "issue", "list",
@@ -75,19 +83,21 @@ export function findOpenIssueByFingerprint(gh: GhRunner, fingerprint: string): n
     "--search", marker,
     "--json", "number,body"
   ]);
-  if (!res.ok) return null;
+  // A failed lookup is NOT "absent" — we don't know whether an issue exists,
+  // so the caller must not create one off the back of it.
+  if (!res.ok) return { status: "error" };
   let parsed: Array<{ number?: number; body?: string }>;
   try {
     parsed = JSON.parse(res.stdout) as Array<{ number?: number; body?: string }>;
   } catch {
-    return null;
+    return { status: "error" };
   }
   for (const issue of parsed) {
     if (typeof issue.number === "number" && typeof issue.body === "string" && issue.body.includes(marker)) {
-      return issue.number;
+      return { status: "found", number: issue.number };
     }
   }
-  return null;
+  return { status: "absent" };
 }
 
 // Create a new crash issue. Body is piped via stdin (`--body-file -`) so it
