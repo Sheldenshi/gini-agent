@@ -1,7 +1,7 @@
-// Tests for installCrashHandlers. We inject spawn/exit/write/supervisor so
-// nothing real is spawned, no process exits, and no disk write touches ~/.gini.
-// Handlers are emitted synchronously via process.emit and removed after each
-// test so listeners don't leak into the rest of the suite.
+// Tests for installCrashHandlers. We inject exit/write/supervisor so no process
+// exits and no disk write touches ~/.gini. Handlers are emitted synchronously
+// via process.emit and removed after each test so listeners don't leak into the
+// rest of the suite.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
@@ -9,12 +9,7 @@ import {
   installCrashHandlers,
   __resetCrashHandlersForTest
 } from "./crash-handlers";
-import type { CrashReport } from "./crash-report";
-
-interface SpawnCall {
-  cmd: string;
-  args: string[];
-}
+import { listPendingReports, type CrashReport } from "./crash-report";
 
 function captureListeners() {
   return {
@@ -53,7 +48,6 @@ describe("installCrashHandlers", () => {
 
   function install(overrides: {
     exitCodes: number[];
-    spawnCalls: SpawnCall[];
     supervisorValue?: "launchd" | null;
     writeThrows?: boolean;
     writeImpl?: (r: CrashReport) => string;
@@ -65,65 +59,60 @@ describe("installCrashHandlers", () => {
       source: "runtime",
       supervisorImpl: () => supervisorValue,
       exitImpl: (code) => { overrides.exitCodes.push(code); },
-      spawnImpl: ((cmd: string, args: string[]) => {
-        overrides.spawnCalls.push({ cmd, args });
-        return { unref() {} } as unknown as ReturnType<typeof import("node:child_process").spawn>;
-      }) as unknown as typeof import("node:child_process").spawn,
+      // Default to the real writer so the report lands in the temp pending
+      // queue (GINI_STATE_ROOT points under /tmp). Overrides can intercept it.
       writeImpl: overrides.writeThrows
         ? () => { throw new Error("disk full"); }
-        : (overrides.writeImpl ?? (() => "/tmp/fake-report.json")),
+        : overrides.writeImpl,
       clock: () => new Date("2026-05-29T00:00:00.000Z")
     });
   }
 
-  test("uncaughtException -> writes report, spawns report-crash, exits 1", () => {
+  test("uncaughtException -> writes a pending report, exits 1", () => {
     const exitCodes: number[] = [];
-    const spawnCalls: SpawnCall[] = [];
-    install({ exitCodes, spawnCalls });
+    install({ exitCodes });
     process.emit("uncaughtException", new Error("boom"));
     expect(exitCodes).toEqual([1]);
-    expect(spawnCalls.length).toBe(1);
-    expect(spawnCalls[0]!.args).toContain("report-crash");
-    expect(spawnCalls[0]!.args).toContain("--report");
-    expect(spawnCalls[0]!.args).toContain("/tmp/fake-report.json");
+    const pending = listPendingReports();
+    expect(pending.length).toBe(1);
+    expect(pending[0]!.report.error.message).toBe("boom");
   });
 
-  test("unhandledRejection -> spawns report-crash, exits 1", () => {
+  test("unhandledRejection -> writes a pending report, exits 1", () => {
     const exitCodes: number[] = [];
-    const spawnCalls: SpawnCall[] = [];
-    install({ exitCodes, spawnCalls });
+    install({ exitCodes });
     process.emit("unhandledRejection", new Error("rejected"), Promise.resolve());
     expect(exitCodes).toEqual([1]);
-    expect(spawnCalls.length).toBe(1);
-    expect(spawnCalls[0]!.args).toContain("report-crash");
+    const pending = listPendingReports();
+    expect(pending.length).toBe(1);
+    expect(pending[0]!.report.error.message).toBe("rejected");
   });
 
   test("write throwing still exits 1 (finally)", () => {
     const exitCodes: number[] = [];
-    const spawnCalls: SpawnCall[] = [];
-    install({ exitCodes, spawnCalls, writeThrows: true });
+    install({ exitCodes, writeThrows: true });
     process.emit("uncaughtException", new Error("boom"));
     expect(exitCodes).toEqual([1]);
-    // Spawn never reached because the write threw before it.
-    expect(spawnCalls.length).toBe(0);
+    // The write threw, so nothing was queued — but exit still fired.
+    expect(listPendingReports().length).toBe(0);
   });
 
-  test("not under launchd -> no spawn but still exits 1", () => {
+  test("not under launchd -> still writes a pending report and exits 1", () => {
     const exitCodes: number[] = [];
-    const spawnCalls: SpawnCall[] = [];
-    install({ exitCodes, spawnCalls, supervisorValue: null });
+    install({ exitCodes, supervisorValue: null });
     process.emit("uncaughtException", new Error("boom"));
     expect(exitCodes).toEqual([1]);
-    expect(spawnCalls.length).toBe(0);
+    // Capture is unconditional now; the consent gate lives in crash-recovery.
+    const pending = listPendingReports();
+    expect(pending.length).toBe(1);
+    expect(pending[0]!.report.supervisor).toBeNull();
   });
 
   test("the built report carries the source and instance", () => {
     const exitCodes: number[] = [];
-    const spawnCalls: SpawnCall[] = [];
     let captured: CrashReport | null = null;
     install({
       exitCodes,
-      spawnCalls,
       writeImpl: (r) => { captured = r; return "/tmp/fake-report.json"; }
     });
     process.emit("uncaughtException", new Error("boom"));
@@ -135,13 +124,12 @@ describe("installCrashHandlers", () => {
 
   test("double-registration is guarded (second install is a no-op)", () => {
     const exitCodes: number[] = [];
-    const spawnCalls: SpawnCall[] = [];
-    install({ exitCodes, spawnCalls });
+    install({ exitCodes });
     // Second install without reset must not add a second listener pair.
-    install({ exitCodes, spawnCalls });
+    install({ exitCodes });
     process.emit("uncaughtException", new Error("boom"));
-    // Exactly one handler fired -> one exit, one spawn.
+    // Exactly one handler fired -> one exit, one queued report.
     expect(exitCodes).toEqual([1]);
-    expect(spawnCalls.length).toBe(1);
+    expect(listPendingReports().length).toBe(1);
   });
 });

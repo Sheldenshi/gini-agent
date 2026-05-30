@@ -1,22 +1,22 @@
 // Tests for `gini watchdog`. Every external dependency is injected — no real
-// fetch, no real launchctl, no real spawned process. Port files + the report/
-// log dirs live under a unique GINI_STATE_ROOT in /tmp. The watchdog always
-// exits 0 (process.exitCode === 0) regardless of which services were down.
+// fetch, no real launchctl. Port files + the report/log dirs live under a
+// unique GINI_STATE_ROOT in /tmp. The watchdog always exits 0
+// (process.exitCode === 0) regardless of which services were down.
 //
 // Coverage:
-//   - all healthy -> no kickstart, no report spawned, exit 0
-//   - web down -> web kickstart + a report-crash child spawned with a report
-//     file that actually exists on disk
+//   - all healthy -> no kickstart, no report queued, exit 0
+//   - web down while runtime healthy -> web kickstart + a pending web report
 //   - runtime hung -> gateway kickstart, no web report
-//   - missing port files -> treated as down (kickstart fired), exit 0
+//   - missing port files -> treated as down (kickstart fired), no report, exit 0
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { watchdog, type WatchdogDeps } from "./watchdog";
+import { watchdog } from "./watchdog";
 import type { CliContext } from "../context";
 import type { LaunchctlResult, PlistKind } from "../../integrations/launchd";
 import { runtimePortPath, webPortPath } from "../../paths";
+import { listPendingReports } from "../../runtime/crash-report";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -34,21 +34,6 @@ function ctxFor(): CliContext {
     rawArgs: ["watchdog", "--instance", INSTANCE],
     web: { webPort: 0, webPortPinned: false, noWeb: true, runtimePortPinned: false }
   };
-}
-
-interface SpawnCall {
-  command: string;
-  args: string[];
-}
-
-// A fake spawn that records the call and returns an object with an unref().
-function makeSpawn(): { impl: WatchdogDeps["spawnImpl"]; calls: SpawnCall[] } {
-  const calls: SpawnCall[] = [];
-  const impl = ((command: string, args: string[]) => {
-    calls.push({ command, args });
-    return { unref() {} };
-  }) as unknown as WatchdogDeps["spawnImpl"];
-  return { impl, calls };
 }
 
 const okLaunchctl: LaunchctlResult = { ok: true, stdout: "", stderr: "", status: 0 };
@@ -78,10 +63,9 @@ describe("watchdog", () => {
     writeFileSync(webPortPath(INSTANCE), "7777\n");
   }
 
-  test("all healthy -> no kickstart, no report spawned, exit 0", async () => {
+  test("all healthy -> no kickstart, no report queued, exit 0", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     await watchdog(ctxFor(), {
       probeRuntime: async () => true,
       probeWeb: async () => true,
@@ -89,18 +73,16 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
-      spawnImpl,
       supervisorImpl: () => "launchd"
     });
     expect(kicks.length).toBe(0);
-    expect(spawnCalls.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
     expect(process.exitCode).toBe(0);
   });
 
-  test("web down while runtime healthy (recorded port) -> web kickstart + report-crash spawned with a written report file", async () => {
+  test("web down while runtime healthy (recorded port) -> web kickstart + a pending web report", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     await watchdog(ctxFor(), {
       probeRuntime: async () => true,
       probeWeb: async () => false,
@@ -108,32 +90,22 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
-      spawnImpl,
       supervisorImpl: () => "launchd"
     });
     // Web revived, gateway untouched.
     expect(kicks.map((k) => k.kind)).toEqual(["web"]);
-    // Exactly one report-crash child, carrying --report <path>.
-    expect(spawnCalls.length).toBe(1);
-    const call = spawnCalls[0]!;
-    expect(call.args).toContain("report-crash");
-    expect(call.args).toContain("--instance");
-    expect(call.args).toContain(INSTANCE);
-    const reportIdx = call.args.indexOf("--report");
-    expect(reportIdx).toBeGreaterThanOrEqual(0);
-    const reportPath = call.args[reportIdx + 1]!;
-    // The report file was actually written to disk before the spawn.
-    expect(existsSync(reportPath)).toBe(true);
-    const report = JSON.parse(readFileSync(reportPath, "utf8")) as { source: string; fingerprint: string };
-    expect(report.source).toBe("web");
-    expect(report.fingerprint.length).toBeGreaterThan(0);
+    // Exactly one web report queued in pending/.
+    const pending = listPendingReports();
+    expect(pending.length).toBe(1);
+    expect(pending[0]!.report.source).toBe("web");
+    expect(pending[0]!.report.instance).toBe(INSTANCE);
+    expect(pending[0]!.report.fingerprint.length).toBeGreaterThan(0);
     expect(process.exitCode).toBe(0);
   });
 
   test("runtime hung -> gateway kickstart, no web report", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     await watchdog(ctxFor(), {
       probeRuntime: async () => false,
       probeWeb: async () => true,
@@ -141,22 +113,20 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
-      spawnImpl,
       supervisorImpl: () => "launchd"
     });
     expect(kicks.map((k) => k.kind)).toEqual(["gateway"]);
-    // A hung runtime files via the in-process crash handler, not the
-    // watchdog — no report-crash spawned here.
-    expect(spawnCalls.length).toBe(0);
+    // A hung runtime is captured via the in-process crash handler, not the
+    // watchdog — no web report queued here.
+    expect(listPendingReports().length).toBe(0);
     expect(process.exitCode).toBe(0);
   });
 
   test("missing web port -> kickstart only, NO web crash report (boot race, not a crash)", async () => {
     // No writePorts(): the port files are absent. A missing web port means the
     // service never booted (or was stopped) — that's a boot race, not a web
-    // crash, so we kickstart but must NOT file a false-positive issue.
+    // crash, so we kickstart but must NOT queue a false-positive report.
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     let probedRuntime = false;
     let probedWeb = false;
     await watchdog(ctxFor(), {
@@ -172,7 +142,6 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
-      spawnImpl,
       supervisorImpl: () => "launchd"
     });
     // With no recorded port, there's nothing to probe — both are down and
@@ -181,36 +150,33 @@ describe("watchdog", () => {
     expect(probedWeb).toBe(false);
     expect(kicks.map((k) => k.kind)).toEqual(["gateway", "web"]);
     // No web crash report: the missing port is a boot race, not a crash.
-    expect(spawnCalls.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
     expect(process.exitCode).toBe(0);
   });
 
   test("web down WHILE runtime down -> kickstart web, NO web report (symptom, not web crash)", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     await watchdog(ctxFor(), {
       // Runtime is down too — the web BFF failing is just a symptom of the
-      // dead gateway, not a web-specific crash worth its own issue.
+      // dead gateway, not a web-specific crash worth its own report.
       probeRuntime: async () => false,
       probeWeb: async () => false,
       kickstartImpl: (instance, kind) => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
-      spawnImpl,
       supervisorImpl: () => "launchd"
     });
-    // Both kicked, but no web crash report filed.
+    // Both kicked, but no web crash report queued.
     expect(kicks.map((k) => k.kind)).toEqual(["gateway", "web"]);
-    expect(spawnCalls.length).toBe(0);
+    expect(listPendingReports().length).toBe(0);
     expect(process.exitCode).toBe(0);
   });
 
-  test("web down but not under launchd -> still kicks web, but spawns no filing child", async () => {
+  test("web down but not under launchd -> still kicks web, and still queues the report", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];
-    const { impl: spawnImpl, calls: spawnCalls } = makeSpawn();
     await watchdog(ctxFor(), {
       probeRuntime: async () => true,
       probeWeb: async () => false,
@@ -218,12 +184,14 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
-      spawnImpl,
-      // Not launchd: report-crash would no-op, so we don't spawn it.
+      // Not launchd: capture is unconditional now; the consent gate lives in
+      // crash-recovery. The report carries supervisor: null.
       supervisorImpl: () => null
     });
     expect(kicks.map((k) => k.kind)).toEqual(["web"]);
-    expect(spawnCalls.length).toBe(0);
+    const pending = listPendingReports();
+    expect(pending.length).toBe(1);
+    expect(pending[0]!.report.supervisor).toBeNull();
     expect(process.exitCode).toBe(0);
   });
 });

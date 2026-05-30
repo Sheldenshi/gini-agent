@@ -2,17 +2,16 @@
 //
 // Registers uncaughtException + unhandledRejection handlers that:
 //   1. append a structured event to runtime.jsonl (so the crash is captured
-//      in the log stream even if the report write or filing fails),
-//   2. build + synchronously write a crash report file,
-//   3. when under launchd, spawn a DETACHED, unref'd `gini report-crash` so the
-//      filing survives our imminent death (KeepAlive respawns the gateway),
-//   4. ALWAYS exit(1) via the injected exit impl (try/finally).
+//      in the log stream even if the report write fails),
+//   2. build + synchronously write a redacted crash report into the pending/
+//      queue (writeCrashReportFile),
+//   3. ALWAYS exit(1) via the injected exit impl (try/finally) so KeepAlive
+//      respawns the gateway.
 //
-// The filing is intentionally a separate detached process, not inline: doing
-// gh I/O inside a dying process is unreliable, and `report-crash` itself gates
-// on launchd + rate-limits, so the handler stays dumb.
+// The handler never files anything itself: the queued report is offered to the
+// user on the next restart (src/runtime/crash-recovery.ts) and filed only on
+// consent, so the dying process just captures + queues + exits.
 
-import { spawn as nodeSpawn, type spawn as SpawnType } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { join } from "node:path";
@@ -33,7 +32,6 @@ const LOG_TAIL_LINES = 50;
 export interface InstallCrashHandlersOptions {
   instance: string;
   source: CrashSource;
-  spawnImpl?: typeof SpawnType;
   exitImpl?: (code: number) => void;
   writeImpl?: (report: ReturnType<typeof buildCrashReport>) => string;
   supervisorImpl?: () => "launchd" | null;
@@ -71,7 +69,6 @@ export function installCrashHandlers(options: InstallCrashHandlersOptions): void
   if (installed) return;
   installed = true;
 
-  const spawnImpl = options.spawnImpl ?? nodeSpawn;
   const exitImpl = options.exitImpl ?? ((code: number) => process.exit(code));
   const writeImpl = options.writeImpl ?? writeCrashReportFile;
   const supervisorImpl = options.supervisorImpl ?? supervisor;
@@ -92,22 +89,9 @@ export function installCrashHandlers(options: InstallCrashHandlersOptions): void
         sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
         clock
       });
-      const reportPath = writeImpl(report);
-
-      // Only launchd-supervised instances file. Spawn detached + unref'd so the
-      // filing child outlives our exit (KeepAlive respawns the gateway).
-      if (supervisorImpl() === "launchd") {
-        try {
-          const child = spawnImpl(
-            process.execPath,
-            ["run", "gini", "report-crash", "--instance", instance, "--report", reportPath],
-            { detached: true, stdio: "ignore", env: { ...process.env, GINI_INSTANCE: instance } }
-          );
-          if (typeof child.unref === "function") child.unref();
-        } catch {
-          // Best-effort: a failed spawn must not block the exit below.
-        }
-      }
+      // Queue the report. It's filed only if the user consents on the next
+      // restart — nothing leaves this process.
+      writeImpl(report);
     } catch {
       // Never let the crash handler itself throw — fall through to exit.
     } finally {

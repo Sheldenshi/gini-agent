@@ -12,16 +12,16 @@
 //   3. If the runtime is dead/hung -> `launchctl kickstart -k` the gateway.
 //      KeepAlive should respawn it, but on macOS 26 launchd frequently defers
 //      the auto-respawn indefinitely; the explicit kickstart forces it.
-//   4. If web is dead/hung -> capture the web log tails, build + write a crash
-//      report, spawn a DETACHED `gini report-crash` (which gates on launchd +
-//      dedupes + rate-limits), THEN kickstart -k the web service.
+//   4. If web is dead/hung -> capture the web log tails, build + write a
+//      redacted crash report into the pending/ queue, THEN kickstart -k the web
+//      service. The report is offered to the user on the next restart and filed
+//      only on consent — the watchdog never files anything itself.
 //
 // Always exits 0: it's a periodic probe, and a non-zero exit muddies launchd's
 // StartInterval bookkeeping. Every external dependency (fetch, the launchctl
-// kickstart runner, spawn, the clock) is injectable so tests never bind real
-// ports, call real launchctl, or spawn real processes.
+// kickstart runner, the clock) is injectable so tests never bind real ports or
+// call real launchctl.
 
-import { spawn as nodeSpawn, type spawn as SpawnType } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { arch, platform } from "node:os";
 import { join } from "node:path";
@@ -54,11 +54,8 @@ export interface WatchdogDeps {
   // Force a launchctl `kickstart -k` of the given service kind. Defaults to
   // the real kickstart shellout.
   kickstartImpl?: (instance: string, kind: PlistKind) => LaunchctlResult;
-  // Spawn the detached report-crash child. Defaults to node's spawn.
-  spawnImpl?: typeof SpawnType;
-  // Report whether we're under launchd. Defaults to supervisor(). The actual
-  // filing gate lives in report-crash; this is only used to skip spawning a
-  // no-op child when we already know it won't file.
+  // Report whether we're under launchd. Defaults to supervisor(). Stamped onto
+  // the queued report so the restart-ask can gate on supervision later.
   supervisorImpl?: () => "launchd" | null;
   clock?: () => Date;
 }
@@ -109,7 +106,6 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   const probeRuntime = deps.probeRuntime ?? defaultProbeRuntime;
   const probeWeb = deps.probeWeb ?? isSupervisedWebChild;
   const kickstartImpl = deps.kickstartImpl ?? kickstart;
-  const spawnImpl = deps.spawnImpl ?? nodeSpawn;
   const supervisorImpl = deps.supervisorImpl ?? supervisor;
   const clock = deps.clock ?? (() => new Date());
 
@@ -146,10 +142,11 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   // false-positive issue. We still kickstart web below regardless.
   const shouldReportWebCrash = webPort !== null && webProbeFailed && runtimeOk;
 
-  // Web dead/hung -> build a crash report from the web log tails, write it, fire
-  // a detached report-crash, then kickstart the web service. The web has no
-  // in-process crash handler (decision: web crash coverage is the watchdog), so
-  // this is the only place a web outage gets reported.
+  // Web dead/hung -> build a crash report from the web log tails, queue it into
+  // pending/, then kickstart the web service. The web has no in-process crash
+  // handler (decision: web crash coverage is the watchdog), so this is the only
+  // place a web outage gets captured. The queued report is offered to the user
+  // on the next restart and filed only on consent — nothing is filed here.
   if (!webOk) {
     if (shouldReportWebCrash) {
       try {
@@ -169,23 +166,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
           sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
           clock
         });
-        const reportPath = writeCrashReportFile(report);
-
-        // Only spawn the filing child when we're under launchd — report-crash
-        // itself gates on this, so spawning when not supervised would just exit
-        // 0 as a no-op. Detached + unref'd so it outlives this short tick.
-        if (supervisorImpl() === "launchd") {
-          try {
-            const child = spawnImpl(
-              process.execPath,
-              ["run", "gini", "report-crash", "--instance", instance, "--report", reportPath],
-              { detached: true, stdio: "ignore", env: { ...process.env, GINI_INSTANCE: instance } }
-            );
-            if (typeof child.unref === "function") child.unref();
-          } catch {
-            // Best-effort: a failed spawn must not block the kickstart below.
-          }
-        }
+        writeCrashReportFile(report);
         actions.push("report:web");
       } catch {
         // Building/writing the report must never stop us from reviving web.
