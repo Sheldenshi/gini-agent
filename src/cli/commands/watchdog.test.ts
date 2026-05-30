@@ -189,6 +189,24 @@ describe("watchdog", () => {
     expect(process.exitCode).toBe(0);
   });
 
+  test("a probe that throws/rejects -> watchdog resolves, exit 0, never propagates", async () => {
+    writePorts();
+    // probeRuntime rejects. Without the tick's catch, this rejection would
+    // propagate out of watchdog and the CLI top-level would exit(1). The tick
+    // must instead swallow it, resolve normally, and set exitCode 0.
+    await expect(
+      watchdog(ctxFor(), {
+        probeRuntime: async () => {
+          throw new Error("probe blew up");
+        },
+        probeWeb: async () => true,
+        kickstartImpl: () => okLaunchctl,
+        supervisorImpl: () => "launchd"
+      })
+    ).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(0);
+  });
+
   test("web down but not under launchd -> still kicks web, and still queues the report", async () => {
     writePorts();
     const kicks: Array<{ instance: string; kind: PlistKind }> = [];

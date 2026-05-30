@@ -119,10 +119,13 @@ describe("maybeAskAboutCrashes", () => {
     // 2 distinct fingerprints -> count of 2 in the prompt.
     expect(prompt).toContain("2 crashes");
     expect(prompt).toContain("gini-bug-report skill");
-    // The consent is scoped to the exact batch: the specific fingerprints
-    // (short form) must appear so the skill files only those.
+    // The consent is scoped to the exact batch: the FULL fingerprints must
+    // appear so the skill can match exactly (an 8-char prefix could misattribute
+    // a later same-prefix crash to this consent).
     for (const fp of distinctFingerprints) {
-      expect(prompt).toContain(fp.slice(0, 8));
+      expect(prompt).toContain(fp);
+      // A full sha256 fingerprint is 64 hex chars; pin we're not slicing.
+      expect(fp.length).toBe(64);
     }
 
     // lastAskedAt stamped for each fresh (distinct) fingerprint.

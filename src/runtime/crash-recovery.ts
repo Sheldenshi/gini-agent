@@ -34,20 +34,21 @@ const ASK_WINDOW_MS = 24 * 60 * 60 * 1000;
 // single chat message asking for consent — and explicitly NOT to file or act
 // this turn. When the user replies, the gini-bug-report skill does the work.
 //
-// The SPECIFIC fingerprints being asked about are named so the consent is bound
-// to exactly this batch: a crash that lands between the ask and the user's
-// "yes" must not get filed under this consent. The skill files only the
-// fingerprints listed here.
+// The SPECIFIC fingerprints being asked about are named in FULL so the consent
+// is bound to exactly this batch: a crash that lands between the ask and the
+// user's "yes" must not get filed under this consent. The skill matches each
+// pending report against these full fingerprints EXACTLY — an 8-char prefix
+// could misattribute a later same-prefix crash to this consent.
 export function ASK_PROMPT(fingerprints: string[]): string {
   const count = fingerprints.length;
   const noun = count === 1 ? "crash" : "crashes";
-  // Short, human-glanceable identifiers; the full fingerprints live in the
-  // queued reports the skill reads.
-  const shortList = fingerprints.map((fp) => fp.slice(0, 8)).join(", ");
+  // Full fingerprints so the skill can match exactly; a short form is shown to
+  // the user as cosmetic sugar only, never used for the file/dedup decision.
+  const fullList = fingerprints.join(", ");
   return [
     `Gini detected ${count} ${noun} since it last ran (captured locally and already redacted — no secrets or message content).`,
     "",
-    `The specific crash fingerprint(s) this consent covers: ${shortList}.`,
+    `The specific crash fingerprint(s) this consent covers (match these EXACTLY): ${fullList}.`,
     "",
     "In ONE short, friendly chat message: tell the user you noticed the " +
       `${count} ${noun}, and ASK whether they'd like you to file ${count === 1 ? "it" : "them"} as ` +
@@ -55,7 +56,7 @@ export function ASK_PROMPT(fingerprints: string[]): string {
     "",
     "Do NOT file anything and do NOT take any other action this turn — just ask the question and wait for the user's answer.",
     "When the user replies, use the gini-bug-report skill to act on their answer — and file ONLY the " +
-      `fingerprint(s) named above (${shortList}), not any other crash that may have landed since.`
+      `fingerprint(s) named above (matched EXACTLY: ${fullList}), not any other crash that may have landed since.`
   ].join("\n");
 }
 

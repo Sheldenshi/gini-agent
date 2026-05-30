@@ -225,6 +225,16 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
     } catch {
       // Logging is observability, not control flow — swallow.
     }
+  } catch (err) {
+    // A thrown/rejected probe (probeRuntime/probeWeb) or any other tick failure
+    // must NOT reject out of watchdog — the CLI top-level would then exit(1),
+    // muddying launchd's StartInterval bookkeeping. Swallow it (logged
+    // best-effort) and let the finally below resolve the tick with exitCode 0.
+    try {
+      appendLog(instance, "watchdog.error", { error: String(err) });
+    } catch {
+      // Logging is observability, not control flow — swallow.
+    }
   } finally {
     // Periodic probe: always succeed so launchd's StartInterval bookkeeping
     // stays clean. Recovery actions are recorded above, not signaled via exit.
