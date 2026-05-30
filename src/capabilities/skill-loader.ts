@@ -37,6 +37,11 @@ export interface ParsedSkillFile {
   platforms?: string[];
   prerequisites?: { commands?: string[]; env?: string[] };
   requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  // Frontmatter `metadata.gini.requires.credentials` — credential NAMES the
+  // skill needs (e.g. ["LINEAR_API_KEY"], ["google-workspace-oauth"]). A name
+  // is resolved against a ConnectorRecord with that `name`, not a provider
+  // module, so it need NOT be a registered provider.
+  requiredCredentials?: string[];
   allowedTools?: string;
   license?: string;
   compatibility?: string;
@@ -276,7 +281,7 @@ function parseScalar(value: string): unknown {
 // Gini extension keys (under `metadata.gini`):
 //   version, author, platforms,
 //   prerequisites: { commands, env },
-//   requires: { connectors: [{ provider, scopes? }, ...] },
+//   requires: { credentials: [<name>, ...], connectors: [{ provider, scopes? }, ...] },
 //   category   — used as a UI grouping hint
 //
 // For one release we accept legacy top-level fields (`version`,
@@ -325,9 +330,16 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
   }
 
   let requiredConnectors: ParsedSkillFile["requiredConnectors"];
+  let requiredCredentials: ParsedSkillFile["requiredCredentials"];
   const requiresSource = pickFromGiniOrTop("requires");
   if (requiresSource && typeof requiresSource === "object" && !Array.isArray(requiresSource)) {
     const reqs = requiresSource as Record<string, unknown>;
+    if (Array.isArray(reqs.credentials)) {
+      const names = reqs.credentials
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+        .filter((entry) => entry.length > 0);
+      if (names.length > 0) requiredCredentials = names;
+    }
     const connectorList = Array.isArray(reqs.connectors)
       ? reqs.connectors
       : Array.isArray((reqs as { identities?: unknown }).identities)
@@ -373,6 +385,7 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
     platforms,
     prerequisites,
     requiredConnectors,
+    requiredCredentials,
     allowedTools,
     license,
     compatibility,
@@ -442,6 +455,10 @@ export function validateParsedSkill(
   if (parsed.compatibility && parsed.compatibility.length > 500) {
     issues.push("compatibility exceeds 500-character spec limit.");
   }
+  // Legacy `requires.connectors` providers must still resolve to a registered
+  // module. The name-based `requires.credentials` deliberately skips this gate:
+  // a credential NAME is matched against a ConnectorRecord at runtime, not a
+  // provider module, so a plain api-key (no module) is valid.
   for (const req of parsed.requiredConnectors ?? []) {
     if (!hasProvider(req.provider)) {
       issues.push(`Required provider "${req.provider}" is not in the connector registry; install a connector module or use "generic".`);
@@ -486,6 +503,7 @@ function upsertSkillFromFile(
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
       JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null) ||
+      JSON.stringify(existing.requiredCredentials ?? null) !== JSON.stringify(parsed.requiredCredentials ?? null) ||
       (existing.manifestVersion ?? null) !== (parsed.version ?? null);
     if (!changed) return { record: existing, kind: "noop" };
     if (changed) {
@@ -505,6 +523,7 @@ function upsertSkillFromFile(
       existing.platforms = parsed.platforms;
       existing.prerequisites = parsed.prerequisites;
       existing.requiredConnectors = parsed.requiredConnectors;
+      existing.requiredCredentials = parsed.requiredCredentials;
       existing.allowedTools = parsed.allowedTools;
       existing.license = parsed.license;
       existing.compatibility = parsed.compatibility;
@@ -532,6 +551,7 @@ function upsertSkillFromFile(
     platforms: parsed.platforms,
     prerequisites: parsed.prerequisites,
     requiredConnectors: parsed.requiredConnectors,
+    requiredCredentials: parsed.requiredCredentials,
     allowedTools: parsed.allowedTools,
     license: parsed.license,
     compatibility: parsed.compatibility,

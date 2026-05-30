@@ -9,8 +9,7 @@ metadata:
     author: Gini
     platforms: [macos, linux]
     requires:
-      connectors:
-        - provider: linear
+      credentials: [LINEAR_API_KEY]
 ---
 
 # Linear

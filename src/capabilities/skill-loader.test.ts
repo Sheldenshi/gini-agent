@@ -90,6 +90,25 @@ describe("skill-loader frontmatter parsing", () => {
     expect(parsed.body).toContain("# Body starts here");
     expect(parsed.body).toContain("Some content.");
   });
+
+  test("parseSkillFile reads metadata.gini.requires.credentials as names", () => {
+    const text = [
+      "---",
+      "name: linear",
+      'description: "Linear via MCP."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      credentials: [LINEAR_API_KEY]",
+      "---",
+      "",
+      "# Linear"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.requiredCredentials).toEqual(["LINEAR_API_KEY"]);
+    // A credential-name skill carries no legacy requiredConnectors.
+    expect(parsed.requiredConnectors).toBeUndefined();
+  });
 });
 
 describe("loadSkillsFromDisk", () => {
