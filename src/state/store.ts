@@ -5,6 +5,7 @@ import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
 import { addAudit } from "./audit";
 import { getMemoryDb, memoryDbPath } from "./memory-db";
+import { canonicalCredentialName, getProvider } from "../integrations/connectors/registry";
 
 // Shared terminal-status predicate. Every site that mutates
 // `task.status` should check this before flipping so a cancelled /
@@ -438,25 +439,46 @@ function migrateDropDeadAgentMemoryScopes(state: RuntimeState): void {
 // Marker-gated on `state.migrations.connectorsTypedCredentials` so it runs
 // once per instance, idempotent, with a single summary audit row.
 //
-//   - linear            → type "api-key", name LINEAR_API_KEY, secret purpose
-//                         re-keyed to LINEAR_API_KEY (the secret file stays put;
-//                         only the ref's purpose changes), metadata.mcp drives
-//                         the "linear" MCP row.
+//   - linear            → type "api-key", name LINEAR_API_KEY. The secret
+//                         STAYS under its existing purpose ("token"):
+//                         bindingsForCredentials reads `secretRefs[0].purpose`
+//                         and the Linear probe resolves "token", so re-keying
+//                         would break both. metadata.mcp drives the "linear"
+//                         MCP row.
 //   - google-oauth-desktop → type "oauth2", name google-workspace-oauth,
-//                         metadata.envMap reversing the module's envBindings.
+//                         metadata.envMap built from the secrets actually
+//                         present (reversing the module's envBindings).
 //   - generic           → 1 secret: api-key named by the field purpose; 2+:
 //                         oauth2 with an identity envMap.
 //   - demo/claude-code/codex (presence-only) → left untyped (carry no env).
 //
-// Collision (LOCKED decision 4): if a generic connector already maps to a
-// name a template-typed connector owns (e.g. LINEAR_API_KEY), the
-// template-typed one keeps the canonical name and the generic dup is renamed
-// `<name>_2` with a `connector.migration_collision` audit.
+// Skill requires conversion uses the STATIC canonical table
+// (`canonicalCredentialName`, connectors/registry.ts) for template providers,
+// so a skill requiring a provider with NO connector still converts. For
+// `generic` requires (no canonical name) the converter matches the skill's
+// declared `prerequisites.env` against the generic credential whose fields
+// cover them.
+//
+// Collision (LOCKED decision 4): if a generic connector maps to a name a
+// template-typed connector owns (e.g. LINEAR_API_KEY), the template-typed one
+// keeps the canonical name and the generic dup is renamed to the first free
+// `<name>_N` with a `connector.migration_collision` audit.
 const GENERIC_ENV_TOKEN = /^[A-Z][A-Z0-9_]*$/;
 
+// A typed generic credential plus the env vars it materializes, so skill
+// requires conversion can match `generic` requires by env coverage (#7).
+interface GenericCredential {
+  name: string;
+  envVars: Set<string>;
+}
+
 interface TypedCredentialMigrationResult {
-  // provider string → new credential name, for converting skill requires/grants.
+  // provider string → new credential name, for converting skill GRANTS. Only
+  // populated for the template providers (linear/google) and, as a fallback,
+  // the last generic credential's name keyed under "generic".
   providerToName: Map<string, string>;
+  // Typed generic credentials, for env-coverage matching of `generic` requires.
+  generics: GenericCredential[];
   collisions: Array<{ connectorId: string; from: string; to: string }>;
 }
 
@@ -470,11 +492,24 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
   const at = now();
   const result: TypedCredentialMigrationResult = {
     providerToName: new Map(),
+    generics: [],
     collisions: []
   };
   // Names already claimed by a typed credential, used for collision detection.
   const claimedNames = new Set<string>();
   let typedCount = 0;
+  // Count of google-oauth-desktop records that migrated with an incomplete
+  // envMap (legacy shape missing the client_id secret), surfaced in the
+  // summary audit so operators know to re-enter the Client ID.
+  let partialGoogle = 0;
+
+  // Pick the first `<name>_N` not already claimed (loops past `_2`, `_3`, …) so
+  // two colliding generics can't both land on `<name>_2`.
+  const firstFreeSuffixedName = (base: string): string => {
+    let n = 2;
+    while (claimedNames.has(`${base}_${n}`)) n += 1;
+    return `${base}_${n}`;
+  };
 
   // Pass 1: template-typed providers (linear, google-oauth-desktop) own their
   // canonical names first so a colliding generic loses the tie-break.
@@ -484,10 +519,15 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
       // the marker should prevent re-running). Record its name as claimed.
       claimedNames.add(connector.name);
       result.providerToName.set(connector.provider, connector.name);
+      if (connector.provider === "generic") {
+        result.generics.push({ name: connector.name, envVars: genericEnvVars(connector) });
+      }
       continue;
     }
     if (connector.provider === "linear") {
-      reKeyApiKeyPurpose(connector, "LINEAR_API_KEY");
+      // Do NOT re-key the secret purpose. bindingsForCredentials reads
+      // `secretRefs[0].purpose` and the Linear probe resolves "token" — both
+      // keep working only if the purpose stays put.
       connector.type = "api-key";
       connector.name = "LINEAR_API_KEY";
       connector.metadata = {
@@ -500,13 +540,23 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
     } else if (connector.provider === "google-oauth-desktop") {
       connector.type = "oauth2";
       connector.name = "google-workspace-oauth";
-      connector.metadata = {
-        ...(connector.metadata ?? {}),
-        envMap: {
-          client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
-          client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
-        }
-      };
+      // Build the envMap from the secrets actually present. With client_id now
+      // a secret (Group 1) both purposes are in secretRefs and both map. A
+      // legacy record that pre-dates the client_id-secret flip carries only
+      // client_secret — map just that purpose (the migration emits a note via
+      // the summary audit's `partialGoogle` count rather than crashing).
+      const envBindings = getProvider("google-oauth-desktop")?.secrets?.envBindings ?? {};
+      const purposeToEnv: Record<string, string> = {};
+      for (const [envName, purpose] of Object.entries(envBindings)) {
+        purposeToEnv[purpose] = envName;
+      }
+      const envMap: Record<string, string> = {};
+      for (const ref of connector.secretRefs ?? []) {
+        const envName = purposeToEnv[ref.purpose];
+        if (envName) envMap[ref.purpose] = envName;
+      }
+      connector.metadata = { ...(connector.metadata ?? {}), envMap };
+      if (!envMap.client_id) partialGoogle += 1;
       claimedNames.add("google-workspace-oauth");
       result.providerToName.set("google-oauth-desktop", "google-workspace-oauth");
       typedCount += 1;
@@ -524,9 +574,10 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
     if (refs.length === 1) {
       const purpose = refs[0]!.purpose;
       let name = purpose;
-      // Collision: a template-typed credential already owns this name.
+      // Collision: a credential already owns this name. Loop to the first free
+      // `_N` so a second colliding generic doesn't reuse `_2`.
       if (claimedNames.has(name) && GENERIC_ENV_TOKEN.test(name)) {
-        const renamed = `${name}_2`;
+        const renamed = firstFreeSuffixedName(name);
         result.collisions.push({ connectorId: connector.id, from: name, to: renamed });
         name = renamed;
       }
@@ -535,9 +586,10 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
       claimedNames.add(name);
       // Generic single-credential maps its provider string to this name. When
       // multiple generics exist their providers all say "generic"; the last
-      // write wins, which is acceptable — generic skills declared the matching
-      // env name, not the provider, so requires conversion keys off the env.
+      // write wins for the grant fallback, but requires conversion matches by
+      // env coverage (`result.generics`) so it isn't ambiguous.
       result.providerToName.set("generic", name);
+      result.generics.push({ name, envVars: new Set([name]) });
       typedCount += 1;
     } else if (refs.length >= 2) {
       connector.type = "oauth2";
@@ -550,6 +602,7 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
       connector.metadata = { ...(connector.metadata ?? {}), envMap };
       claimedNames.add(connector.name);
       result.providerToName.set("generic", connector.name);
+      result.generics.push({ name: connector.name, envVars: new Set(Object.values(envMap)) });
       typedCount += 1;
     }
     // 0 secrets: nothing to bind; leave untyped.
@@ -564,16 +617,35 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
     if (Array.isArray(skill.requiredConnectors) && skill.requiredConnectors.length > 0 && !skill.requiredCredentials) {
       const names: string[] = [];
       for (const req of skill.requiredConnectors) {
-        const mapped = result.providerToName.get(req.provider);
-        if (mapped) names.push(mapped);
+        // Template providers map via the STATIC canonical table, so a skill
+        // requiring a provider with NO connector still converts.
+        const canonical = canonicalCredentialName(req.provider);
+        if (canonical) {
+          names.push(canonical);
+          continue;
+        }
+        // `generic` (no canonical name): match the generic credential whose env
+        // vars cover this skill's declared `prerequisites.env`, instead of
+        // blindly taking the last generic.
+        if (req.provider === "generic") {
+          const matched = matchGenericByEnv(skill.prerequisites?.env ?? [], result.generics);
+          if (matched) names.push(matched);
+        }
       }
-      if (names.length > 0) {
-        skill.requiredCredentials = names;
+      // De-dupe while preserving order (a skill could list the same provider
+      // twice, or two providers that map to one name).
+      const unique = names.filter((n, i) => names.indexOf(n) === i);
+      if (unique.length > 0) {
+        skill.requiredCredentials = unique;
         mutated = true;
       }
     }
     if (Array.isArray(skill.grantedConnectors) && skill.grantedConnectors.length > 0) {
-      const converted = skill.grantedConnectors.map((g) => result.providerToName.get(g) ?? g);
+      const converted = skill.grantedConnectors.map((g) => {
+        const canonical = canonicalCredentialName(g);
+        if (canonical) return canonical;
+        return result.providerToName.get(g) ?? g;
+      });
       // Only rewrite when at least one entry actually maps to a new name, so a
       // re-run (or already-name-based grants) is a no-op.
       if (converted.some((name, i) => name !== skill.grantedConnectors![i])) {
@@ -600,7 +672,12 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
         action: "connector.migration.typed_credentials",
         target: "state.connectors",
         risk: "low",
-        evidence: { connectorsTyped: typedCount, skillsConverted, collisions: result.collisions.length }
+        evidence: {
+          connectorsTyped: typedCount,
+          skillsConverted,
+          collisions: result.collisions.length,
+          ...(partialGoogle > 0 ? { partialGoogle } : {})
+        }
       },
       { system: true }
     );
@@ -622,17 +699,35 @@ function migrateConnectorsToTypedCredentials(state: RuntimeState): void {
   dyn.migrations = { ...(dyn.migrations ?? {}), connectorsTypedCredentials: at };
 }
 
-// Re-key an api-key connector's single secret purpose to the credential's new
-// env-var name. The encrypted secret file on disk is keyed by the OLD purpose
-// in its path; we leave the file untouched and only rewrite the ref's
-// `purpose`, keeping `ref.path` pointing at the existing file. resolveConnector-
-// Secret looks the ref up by purpose and reads `ref.path`, so the value stays
-// resolvable under the new purpose with no filesystem I/O in normalizeState.
-function reKeyApiKeyPurpose(connector: ConnectorRecord, newPurpose: string): void {
-  const refs = connector.secretRefs ?? [];
-  if (refs.length === 0) return;
-  // Re-key only the first (single) secret; api-key credentials carry one.
-  refs[0]!.purpose = newPurpose;
+// The env vars an already-typed generic credential materializes — its
+// `metadata.envMap` values (oauth2) or its single name (api-key). Used to
+// match `generic` skill requires by env coverage on a re-entry where the
+// generic was already typed by a prior pass.
+function genericEnvVars(connector: ConnectorRecord): Set<string> {
+  const envMap = connector.metadata?.envMap;
+  if (envMap && Object.keys(envMap).length > 0) return new Set(Object.values(envMap));
+  return new Set([connector.name]);
+}
+
+// Pick the typed generic credential the skill actually consumes: every env var
+// the generic provides must appear in the skill's declared `prerequisites.env`
+// (the generic's env set is a subset of the skill's env). A skill that declares
+// `[LINEAR_API_KEY, MY_API_KEY]` matches the generic providing `{MY_API_KEY}`
+// even though LINEAR_API_KEY comes from the Linear credential. Falls back to the
+// single generic when the skill declares no env (nothing to match on) and
+// exactly one exists, so the common one-generic instance still converts.
+// Returns undefined when no generic matches — the skill drops that requirement.
+function matchGenericByEnv(skillEnv: string[], generics: GenericCredential[]): string | undefined {
+  if (generics.length === 0) return undefined;
+  if (skillEnv.length === 0) {
+    return generics.length === 1 ? generics[0]!.name : undefined;
+  }
+  const declared = new Set(skillEnv);
+  for (const generic of generics) {
+    if (generic.envVars.size === 0) continue;
+    if (Array.from(generic.envVars).every((envVar) => declared.has(envVar))) return generic.name;
+  }
+  return undefined;
 }
 
 // Backfill Task.chatSessionId from the chatMessages join for records that

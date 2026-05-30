@@ -535,8 +535,8 @@ function connectorIsUsable(connector: ConnectorRecord): boolean {
 // Name-based: a required credential NAME is satisfied when a usable connector
 // with that `name` exists. A skill that declares no `requiredCredentials` has
 // no credential gate (the legacy `requires.connectors` form is mapped to
-// credential names at load time — see LEGACY_CONNECTOR_CREDENTIAL_NAMES in
-// skill-loader.ts).
+// credential names at load time — see canonicalCredentialName in
+// connectors/registry.ts, applied by the skill loader).
 export function isSkillActive(state: RuntimeState, skill: SkillRecord): boolean {
   if (skill.validationStatus === "unsupported") return false;
   const credentials = skill.requiredCredentials ?? [];
@@ -659,7 +659,7 @@ export async function resolveSkillEnv(
   // (the credential id ties an env var back to its owning credential name for
   // the gate). A skill with no `requiredCredentials` resolves nothing — the
   // legacy `requires.connectors` form is mapped to credential names at load
-  // time (see LEGACY_CONNECTOR_CREDENTIAL_NAMES in skill-loader.ts), so there
+  // time (see canonicalCredentialName in connectors/registry.ts), so there
   // is no provider-keyed resolution path left here.
   const credentials = skill.requiredCredentials ?? [];
   if (credentials.length === 0) return {};

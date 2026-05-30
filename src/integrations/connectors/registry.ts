@@ -39,3 +39,25 @@ export function listProviders(): ProviderModule[] {
 export function hasProvider(id: string): boolean {
   return REGISTRY.has(id);
 }
+
+// The canonical typed-credential NAME a template-backed provider maps to.
+// Single source of truth shared by the state migration (provider-keyed records
+// + legacy skill requires → credential names) and the skill loader (legacy
+// `requires.connectors` → `requiredCredentials`), so all three of fresh-create
+// (createConnector's template), migration, and loader agree:
+//   - explicit `credentialName` on the module (oauth2 handles, e.g.
+//     google-oauth-desktop → "google-workspace-oauth"), else
+//   - the single env-var binding for an api-key provider (e.g. linear →
+//     "LINEAR_API_KEY").
+// Providers with no secret spec (presence-only) and `generic` have no canonical
+// name and return undefined — those skills must declare `requires.credentials`.
+export function canonicalCredentialName(providerId: string): string | undefined {
+  const module = REGISTRY.get(providerId);
+  if (!module) return undefined;
+  if (module.credentialName) return module.credentialName;
+  const envBindings = module.secrets?.envBindings;
+  if (!envBindings) return undefined;
+  const envVars = Object.keys(envBindings);
+  if (envVars.length === 1) return envVars[0];
+  return undefined;
+}

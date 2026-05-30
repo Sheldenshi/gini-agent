@@ -81,8 +81,9 @@ export interface ProviderModule {
   // env vars — e.g. google-oauth-desktop → "google-workspace-oauth". When set,
   // `credentialTemplateForProvider` uses it as the template name so the Add
   // Connector dialog, connector.request /complete, the CLI, and the state
-  // migration all produce the SAME credential name. Must match the entry in
-  // LEGACY_CONNECTOR_CREDENTIAL_NAMES (skill-loader.ts).
+  // migration all produce the SAME credential name. Surfaced through
+  // `canonicalCredentialName` (connectors/registry.ts), the single source the
+  // migration and skill loader both consult.
   credentialName?: string;
   // Probe is optional per ADR connector-provider-spec-compliance.md. Providers with no remote system to
   // query (apple-notes via TCC, generic by definition) omit it; the
