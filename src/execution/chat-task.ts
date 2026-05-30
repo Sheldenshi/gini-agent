@@ -565,14 +565,19 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
   // Defensive pairing pass. Providers reject an assistant tool_calls message
   // whose ids aren't each answered by a following role:"tool" message, and
   // reject orphan tool messages. A partially-persisted turn (process died
-  // mid-loop) can leave either. Tool result rows are persisted immediately
-  // after their assistant row, so we pair each assistant tool_calls row with
-  // the role:"tool" rows in its own local window — the rows that follow it up
-  // to the next assistant/user row — matching the assistant's own ids. A
-  // session-global id map would mispair when two turns reuse the same
-  // tool_call_id (the text-backstop path synthesizes ids from
-  // name:args:index, so the same tool+args on two turns collides). Drop orphan
-  // tool rows, and drop any assistant tool_calls row missing one of its paired
+  // mid-loop) can leave either. We pair each assistant tool_calls row with the
+  // role:"tool" rows in its own turn window — the rows that follow it up to,
+  // but not including, the next turn boundary (a role:"user" row) or the next
+  // assistant tool_calls row. The window must span the whole turn so it
+  // skips interleaved non-tool rows: a gated tool persists a plain assistant
+  // approval_reason row (and possibly plain assistant text) between its
+  // assistant tool_calls row and its on-resume tool result, so stopping at the
+  // first non-tool row would drop the gated call as unpaired and its result as
+  // an orphan. But the window must NOT cross a user row or the next tool
+  // round, so two turns that reuse the same synthesized tool_call_id (the
+  // text-backstop path derives ids from name:args:index, which resets each
+  // turn) stay isolated and each pairs with its own result. Drop orphan tool
+  // rows, and drop any assistant tool_calls row missing one of its paired
   // results — so replay can never produce a provider 400.
   const paired: ToolCallingMessage[] = [];
   for (let i = 0; i < mapped.length; i++) {
@@ -580,11 +585,13 @@ function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessag
     if (msg.role === "tool") continue; // emitted alongside its assistant below
     if (msg.role === "assistant" && msg.__toolCallIds) {
       const ids = msg.__toolCallIds;
-      // Collect the tool result rows in this assistant row's local window.
+      // Collect the tool result rows in this assistant row's turn window.
       const resultsInWindow = new Map<string, ToolCallingMessage>();
       for (let j = i + 1; j < mapped.length; j++) {
         const next = mapped[j]!;
-        if (next.role !== "tool") break; // window ends at the next non-tool row
+        if (next.role === "user") break; // turn boundary
+        if (next.role === "assistant" && next.__toolCallIds) break; // next tool round
+        if (next.role !== "tool") continue; // skip approval_reason / plain assistant text
         if (typeof next.tool_call_id === "string") {
           resultsInWindow.set(next.tool_call_id, next);
         }

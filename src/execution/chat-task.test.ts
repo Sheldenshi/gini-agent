@@ -16,7 +16,7 @@ import {
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
-import { submitTask, decideApproval } from "../agent";
+import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
 import {
   createChatSession,
   createEmptyState,
@@ -1843,6 +1843,101 @@ describe("chat-task loop", () => {
     const { publicState, mobileBootstrap } = await import("../runtime/views");
     expect(publicState(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
     expect(mobileBootstrap(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a gated tool that persists an approval_reason row still replays its call+result next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-gated-reason");
+    const provider = normalizeProvider(config.provider);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Connector thread" });
+
+    // Turn 1: request_connector (approval-gated) for a provider with no
+    // setupSkill, so it goes straight to a pending setup request. Unlike
+    // file_write, this path persists a plain assistant kind:"approval_reason"
+    // row BETWEEN the assistant tool_calls row and the on-resume tool result,
+    // which is exactly what the turn-window pairing must span.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_conn", type: "function", function: { name: "request_connector", arguments: JSON.stringify({ provider: "linear", reason: "list my open issues" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Connected to Linear.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "connect linear" });
+    const paused = await waitForTerminal(config, first.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    // An approval_reason row was persisted during dispatch — this is the
+    // interleaved non-tool row that the old window logic stopped at.
+    const reasonRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.kind === "approval_reason"
+    );
+    expect(reasonRows.length).toBeGreaterThan(0);
+
+    // Resolve the setup request the way the /complete handler does: the
+    // synthesized toolResult is fed back via resumeChatTask, which persists
+    // the gated tool result row.
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === first.taskId);
+    expect(setup).toBeDefined();
+    await resolveSetupRequest(config, setup!.id, "complete", {
+      actor: "user",
+      toolResult: "Connected to Linear. Proceed with the original request."
+    });
+    const finished = await waitForTerminal(config, first.taskId);
+    expect(finished.status).toBe("completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The gated tool's call+result must survive replay
+    // even though an approval_reason row sits between them in the transcript.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "thanks" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "thanks")
+    );
+    expect(turn2).toBeDefined();
+
+    const assistantIdx = turn2!.findIndex(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((c) => c.id === "call_conn")
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    // The matching tool result must immediately follow its assistant message.
+    const nextMsg = turn2![assistantIdx + 1];
+    expect(nextMsg?.role).toBe("tool");
+    expect(nextMsg?.tool_call_id).toBe("call_conn");
+    expect(String(nextMsg?.content)).toContain("Connected to Linear");
+
+    // No orphan tool results: every role:"tool" message in the replay points
+    // at an assistant tool_call id that appears earlier in the same array.
+    const emittedCallIds = new Set<string>();
+    for (const m of turn2!) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) emittedCallIds.add(c.id);
+      }
+      if (m.role === "tool") {
+        expect(typeof m.tool_call_id).toBe("string");
+        expect(emittedCallIds.has(m.tool_call_id!)).toBe(true);
+      }
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
