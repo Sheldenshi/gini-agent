@@ -53,11 +53,18 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
 
   const connect = useMutation({
     mutationFn: async (body: CreateConnectorBody) => {
+      // The body carries ONLY the secret(s) plus non-secret structure: for a
+      // templateless oauth2 request the envMap (purpose → ENV) rides in
+      // `metadata` so /complete can stamp the typed record (the dispatcher
+      // never mints an envMap — the model doesn't know the service's env vars).
+      // name/type/credential metadata are otherwise derived from the trusted
+      // setup payload server-side; the secret value reaches the gateway only
+      // through this POST and never through the model.
       return api<{ ok: boolean; message?: string; connector?: unknown }>(
         `/setup-requests/${block.setupRequestId}/complete`,
         {
           method: "POST",
-          body: JSON.stringify({ secrets: body.secrets, scopes: body.scopes, name: body.name })
+          body: JSON.stringify({ secrets: body.secrets, scopes: body.scopes, name: body.name, metadata: body.metadata })
         }
       );
     },
@@ -122,6 +129,24 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     ? typeof setup.payload?.providerLabel === "string"
       ? (setup.payload.providerLabel as string)
       : providerId
+    : "";
+  // Templateless connector.request: the payload carries a credentialType and
+  // credentialName with no registered provider. Thread these into the dialog
+  // so it renders the type-driven secure input instead of provider fields.
+  // (Detection mirrors http.ts: credentialType present && no provider.)
+  const credentialType = isConnectorRequest && setup
+    && (setup.payload?.credentialType === "api-key" || setup.payload?.credentialType === "oauth2")
+    && !providerId
+    ? (setup.payload.credentialType as "api-key" | "oauth2")
+    : undefined;
+  const credentialName = isConnectorRequest && setup && typeof setup.payload?.credentialName === "string"
+    ? (setup.payload.credentialName as string)
+    : "";
+  const credentialLabel = isConnectorRequest && setup && typeof setup.payload?.credentialLabel === "string"
+    ? (setup.payload.credentialLabel as string)
+    : credentialName;
+  const credentialMcpUrl = isConnectorRequest && setup && typeof setup.payload?.mcpUrl === "string"
+    ? (setup.payload.mcpUrl as string)
     : "";
   const fillSlots: FillSecretSlot[] = isBrowserFillSecret && setup
     ? parseFillSecretSlots(setup.payload?.slots)
@@ -695,7 +720,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
                 setConnectOpen(true);
               }}
             >
-              Connect {providerLabel || "provider"}
+              Connect {providerLabel || credentialLabel || "credential"}
             </Button>
             <Button
               size="sm"
@@ -836,6 +861,9 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
           defaultProvider={providerId}
           lockProvider
           mode="request"
+          requestCredentialName={credentialName || undefined}
+          requestCredentialType={credentialType}
+          requestMcpUrl={credentialMcpUrl || undefined}
           pending={connect.isPending}
           externalError={connectError}
           onSubmit={(body) => connect.mutate(body)}

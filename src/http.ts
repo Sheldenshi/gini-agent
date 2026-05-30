@@ -419,12 +419,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // payload: an api-key with an mcpUrl gets an mcp binding; oauth2 carries
         // an envMap. Known-provider requests pass no metadata so the module's
         // template fills it.
+        //
+        // The oauth2 envMap (purpose → ENV-var-name) is a NON-secret structural
+        // map the dispatcher does not mint — the model never knows which env
+        // vars a brand-new oauth2 service needs, so the user names them in the
+        // Connect card alongside the secret values. We therefore accept it from
+        // the browser body (`metadata.envMap`) as a fallback to the trusted
+        // payload. This carries no secret: the values stay in `secrets`, keyed
+        // by purpose, exactly as the type-driven Add Connector dialog sends them.
         let metadata: Record<string, unknown> | undefined;
         if (isTemplateless) {
           if (credentialType === "api-key" && typeof setup.payload.mcpUrl === "string" && setup.payload.mcpUrl.length > 0) {
             metadata = { mcp: { url: setup.payload.mcpUrl, headerName: "Authorization", scheme: "Bearer" } };
-          } else if (credentialType === "oauth2" && setup.payload.envMap && typeof setup.payload.envMap === "object") {
-            metadata = { envMap: setup.payload.envMap as Record<string, string> };
+          } else if (credentialType === "oauth2") {
+            const bodyMetadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
+              ? payload.metadata as Record<string, unknown>
+              : undefined;
+            const envMap = setup.payload.envMap && typeof setup.payload.envMap === "object"
+              ? setup.payload.envMap as Record<string, string>
+              : bodyMetadata?.envMap && typeof bodyMetadata.envMap === "object"
+                ? bodyMetadata.envMap as Record<string, string>
+                : undefined;
+            if (envMap) metadata = { envMap };
           }
         }
         // Connector name: the credential name for templateless, else the
