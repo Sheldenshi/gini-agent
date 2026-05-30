@@ -139,7 +139,9 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
           {expanded ? "Hide details" : "Show details"}
         </button>
       </div>
-      <p className="mt-1 text-xs text-muted-foreground">{block.summary}</p>
+      {!isConnectorRequest ? (
+        <p className="mt-1 text-xs text-muted-foreground">{block.summary}</p>
+      ) : null}
       {expanded && setup ? (
         <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
           {JSON.stringify(setup.payload, null, 2)}

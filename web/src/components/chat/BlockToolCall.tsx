@@ -11,8 +11,9 @@ import { iconForTool } from "./tool-icons";
 // the kind of tool at a glance. The whole row is the click target —
 // tapping toggles the matching tool_result preview below.
 //
-// Error/denied calls surface the error string in red below the row;
-// happy path stays quiet (no status badge, no chevron).
+// Error/denied calls surface the error string below the row — red by
+// default, muted gray when errorSeverity is "info" (a calm needs-setup
+// notice); happy path stays quiet (no status badge, no chevron).
 
 export function BlockToolCall({
   block,
@@ -44,7 +45,13 @@ export function BlockToolCall({
         ) : null}
       </button>
       {failed && block.errorMessage ? (
-        <span className="pl-[23px] text-[12px] text-red-400/90">{block.errorMessage}</span>
+        <span
+          className={`pl-[23px] text-[12px] ${
+            block.errorSeverity === "info" ? "text-[#9A9AA0]" : "text-red-400/90"
+          }`}
+        >
+          {block.errorMessage}
+        </span>
       ) : null}
       {expanded && result ? (
         <pre className="ml-[23px] max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-[#2B2B31] p-2.5 font-mono text-[12px] text-[#C8C8D2]">
