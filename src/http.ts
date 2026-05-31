@@ -461,6 +461,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // mirrors the probe-failure handling: persist a failure outcome and
         // safeResume the task with a failure message so the agent can re-issue
         // request_connector.
+        // Track a connector created during THIS attempt so the post-claim
+        // catch can roll it back. Without this, a throw AFTER a successful
+        // create + healthy probe (e.g. an audit/grant/enable failure) would
+        // leave a healthy connector behind; the agent then re-requests, hits
+        // the existing-healthy fast path, and skips the missing skill grant —
+        // the skill stays env-denied. Only set for connectors this attempt
+        // created, so the rollback never touches a pre-existing record.
+        let createdConnectorId: string | undefined;
         try {
         // Create the typed record, then probe.
         const connector = await createConnector(config, {
@@ -471,6 +479,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           secrets,
           ...(metadata ? { metadata } : {})
         });
+        createdConnectorId = connector.id;
         const probed = await checkConnector(config, connector.id);
         if (probed.health !== "healthy") {
           // The secret was wrong/unreachable. The row is already claimed
@@ -566,6 +575,21 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           // failure outcome and resume the task so it never strands at
           // waiting_approval. Mirrors the probe-failure cleanup.
           const message = error instanceof Error ? error.message : String(error);
+          // Roll back a connector created during THIS attempt. The create +
+          // probe may have succeeded and a LATER step (audit, grant, enable)
+          // thrown, leaving a healthy record behind. Drop it so a re-request
+          // starts fresh and creates + grants cleanly instead of short-circuiting
+          // on the existing-healthy fast path (which would skip the skill grant).
+          // Mirrors the probe-fail orphan cleanup; best-effort so a delete throw
+          // never masks the original failure.
+          if (createdConnectorId) {
+            try {
+              await deleteConnector(config, createdConnectorId);
+            } catch {
+              // A leftover record is inert; failing the response over a delete
+              // throw would be worse than leaving it.
+            }
+          }
           await persistConnectOutcome(config, setupId, { ok: false, message });
           if (setup.taskId && toolCallId) {
             await safeResume(
