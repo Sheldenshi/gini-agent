@@ -641,8 +641,14 @@ export async function resolveSkillEnv(
   skill: SkillRecord,
   taskId?: string
 ): Promise<Record<string, string>> {
-  const envNames = skill.prerequisites?.env ?? [];
-  if (envNames.length === 0) return {};
+  // The injectable env set is derived from the skill's GRANTED
+  // `requiredCredentials`, NOT from the legacy `prerequisites.env` list. A
+  // skill that declares only `requires.credentials: [X]` (the modern,
+  // documented way) must get X injected; gating on `prerequisites.env` would
+  // silently drop it. `bindingsForCredentials` already produces the right
+  // NAME→secret bindings (api-key: env var == name; oauth2: envMap entries).
+  const credentials = skill.requiredCredentials ?? [];
+  if (credentials.length === 0) return {};
   const state = readState(config.instance);
   // Per-(skill, credential) consent gate (ADR skill-connector-consent.md). A
   // credential contributes env only when the skill is bundled (first-party,
@@ -661,8 +667,6 @@ export async function resolveSkillEnv(
   // legacy `requires.connectors` form is mapped to credential names at load
   // time (see canonicalCredentialName in connectors/registry.ts), so there
   // is no provider-keyed resolution path left here.
-  const credentials = skill.requiredCredentials ?? [];
-  if (credentials.length === 0) return {};
   const idToName = new Map<string, string>();
   for (const name of credentials) {
     const connector = state.connectors.find(
@@ -674,9 +678,7 @@ export async function resolveSkillEnv(
     bundled || (skill.grantedConnectors?.includes(name) ?? false);
   const bindings = bindingsForCredentials(state, credentials);
   const out: Record<string, string> = {};
-  for (const envName of envNames) {
-    const binding = bindings[envName];
-    if (!binding) continue;
+  for (const [envName, binding] of Object.entries(bindings)) {
     const credentialName = idToName.get(binding.credentialId);
     if (!credentialName || !granted(credentialName)) continue;
     const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);

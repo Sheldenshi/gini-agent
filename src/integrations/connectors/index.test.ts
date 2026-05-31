@@ -258,7 +258,10 @@ describe("resolveSkillEnv", () => {
     expect(env).toEqual({ MY_API_KEY: "generic-real" });
   });
 
-  test("oauth2 env vars NOT in prerequisites.env do not leak into the env", async () => {
+  test("oauth2 credential materializes its full envMap (no prerequisites.env filter)", async () => {
+    // An oauth2 credential's `envMap` IS its contract for which env vars it
+    // produces — resolveSkillEnv injects every mapped var for a granted
+    // credential, independent of `prerequisites.env`.
     const instance = "resolve-generic-extra";
     const config = {
       instance,
@@ -270,7 +273,7 @@ describe("resolveSkillEnv", () => {
       logRoot: `${ROOT}/${instance}/logs`
     };
     const wanted = writeSecret(instance, "id_generic", "MY_API_KEY", "generic-real");
-    const extra = writeSecret(instance, "id_generic", "OTHER_SECRET", "should-not-appear");
+    const extra = writeSecret(instance, "id_generic", "OTHER_SECRET", "other-real");
     await mutateState(instance, (state) => {
       state.connectors.push(newConnector({
         id: "id_generic",
@@ -286,12 +289,10 @@ describe("resolveSkillEnv", () => {
     });
     const skill = newSkill({
       source: "bundled",
-      requiredCredentials: ["my-generic-oauth"],
-      prerequisites: { env: ["MY_API_KEY"] }
+      requiredCredentials: ["my-generic-oauth"]
     });
     const env = await resolveSkillEnv(config, skill);
-    expect(env).toEqual({ MY_API_KEY: "generic-real" });
-    expect(env).not.toHaveProperty("OTHER_SECRET");
+    expect(env).toEqual({ MY_API_KEY: "generic-real", OTHER_SECRET: "other-real" });
   });
 
   test("disabled generic credential does NOT inject its secret", async () => {
@@ -684,6 +685,89 @@ describe("resolveSkillEnv by credential name", () => {
     });
     const env = await resolveSkillEnv(configFor(instance), skill);
     expect(env).toEqual({});
+  });
+
+  // The modern declaration form: a skill that lists ONLY
+  // `requires.credentials` and carries NO `prerequisites.env`. Injection must
+  // derive from the granted credential alone — `prerequisites.env` is legacy
+  // and not required for env to flow.
+
+  test("api-key: requires.credentials-only skill (no prerequisites.env) injects when granted", async () => {
+    const instance = "name-apikey-only-granted";
+    const ref = writeSecret(instance, "id_foo", "token", "foo-secret");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_foo",
+        instance,
+        name: "FOO_API_KEY",
+        type: "api-key",
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      grantedConnectors: ["FOO_API_KEY"],
+      requiredCredentials: ["FOO_API_KEY"]
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({ FOO_API_KEY: "foo-secret" });
+  });
+
+  test("api-key: requires.credentials-only skill ungranted (non-bundled) injects nothing", async () => {
+    const instance = "name-apikey-only-ungranted";
+    const ref = writeSecret(instance, "id_foo", "token", "foo-secret");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_foo",
+        instance,
+        name: "FOO_API_KEY",
+        type: "api-key",
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      requiredCredentials: ["FOO_API_KEY"]
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({});
+  });
+
+  test("oauth2: requires.credentials-only skill (no prerequisites.env) injects mapped env vars", async () => {
+    const instance = "name-oauth-only-granted";
+    const cid = writeSecret(instance, "id_oauth", "client_id", "cid-value");
+    const csec = writeSecret(instance, "id_oauth", "client_secret", "csec-value");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_oauth",
+        instance,
+        name: "some-oauth",
+        type: "oauth2",
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [cid, csec],
+        metadata: {
+          envMap: {
+            client_id: "SOME_CLIENT_ID",
+            client_secret: "SOME_CLIENT_SECRET"
+          }
+        }
+      }));
+    });
+    const skill = newSkill({
+      source: "user",
+      grantedConnectors: ["some-oauth"],
+      requiredCredentials: ["some-oauth"]
+    });
+    const env = await resolveSkillEnv(configFor(instance), skill);
+    expect(env).toEqual({ SOME_CLIENT_ID: "cid-value", SOME_CLIENT_SECRET: "csec-value" });
   });
 });
 
