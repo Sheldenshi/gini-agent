@@ -33,7 +33,13 @@ stores the credential AND grants it to that skill, enabling the skill once it
 has no remaining ungranted credentials — one card, no second consent card. The
 user entering a secret for a named skill IS the consent (ADR
 skill-connector-consent.md): the model cannot forge it because it never sees the
-secret value.
+secret value. The card states which skill receives the grant from the
+**server-resolved** skill identity: the model supplies only `skillId`, the
+dispatcher resolves that id to the skill's name from state and stamps it into
+the setup payload as `credentialSkillName`, and the card renders consent ("Grant
+&lt;credential&gt; to &lt;skill&gt;") from that field — not from the
+model-authored reason or title. So the consent the user acts on names the skill
+the gateway will actually grant, even if the model's prose claimed otherwise.
 
 ## Context
 
@@ -121,6 +127,16 @@ and its secure card — so provisioning becomes "the agent asks via
   (`isSkillActive` + `firstUngrantedCredential`). A multi-credential skill stays
   disabled until the next missing credential is requested separately.
 
+- The card displays consent against the server-resolved skill identity. The
+  dispatcher resolves `skillId` to the skill's name and stamps it into the setup
+  payload as `credentialSkillName`; the web card renders "Grant &lt;credential&gt;
+  to &lt;skill&gt;" from that field and shows a non-spoofable "Grants to skill"
+  band, so what the user consents to is the gateway's grant target, not the
+  model's prose. Because the row is claimed at completion, a completed
+  `connector.request` is terminal: the card renders the resolved connect outcome
+  (a persisted `ok:false` failure resumes the agent to re-request; otherwise
+  "Connected") rather than offering a resubmit that would be Gone.
+
 - The needs-setup system block tells the agent exactly how to request each
   missing credential: a registered provider id, or the templateless
   `{name, type: "api-key", skillId}` shape (grouped by the credential NAME, not
@@ -135,13 +151,16 @@ and its secure card — so provisioning becomes "the agent asks via
 ### Trust boundary
 
 The secret value reaches the gateway only through the card → `/complete` POST
-and is encrypted at rest (ADR connector-secret-storage.md). Name, type, and
-credential metadata are derived from the trusted setup payload the dispatcher
-minted, not from the browser body, so a compromised client cannot retype a
-credential as a different name or provider. The model authors the
-`request_connector` arguments and the user-visible reason, but never sees the
-secret — exactly the secret-never-in-model invariant the `connector.request`
-substrate already enforces.
+and is encrypted at rest (ADR connector-secret-storage.md). Name, type,
+credential metadata, and the displayed skill name (`credentialSkillName`) are
+derived from the trusted setup payload the dispatcher minted, not from the
+browser body, so a compromised client cannot retype a credential as a different
+name or provider, nor can the model misstate which skill the consent is for: the
+card's skill identity is resolved server-side from `skillId`, not from the
+model-authored reason or title. The model authors the `request_connector`
+arguments and the user-visible reason, but never sees the secret — exactly the
+secret-never-in-model invariant the `connector.request` substrate already
+enforces.
 
 ## Related
 
