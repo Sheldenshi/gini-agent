@@ -84,9 +84,15 @@ export async function maybeAskAboutCrashes(
   const wasAskedRecentlyImpl = deps.wasAskedRecentlyImpl ?? wasAskedRecently;
 
   try {
-    // Only the default, launchd-supervised instance asks. Everything else
-    // (conductor/tmux/throwaway) captures but never bothers the user.
-    if (config.instance !== "default" || supervisorImpl() !== "launchd") return;
+    // Only supervised instances on the ask-allowlist bother the user; everything
+    // else (conductor/tmux/throwaway) captures but stays silent. The allowlist is
+    // the canonical primary instance by default; GINI_CRASH_ASK_INSTANCES overrides
+    // it (comma-separated) so a non-default primary — or a test instance — can ask.
+    const askInstances = (process.env.GINI_CRASH_ASK_INSTANCES ?? "default")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!askInstances.includes(config.instance) || supervisorImpl() !== "launchd") return;
 
     // Defensive: only consider reports that belong to this instance.
     const reports = listPendingImpl().filter((r) => r.report.instance === config.instance);

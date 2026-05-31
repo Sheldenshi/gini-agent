@@ -141,6 +141,11 @@ before doing anything in step 3. Either way, confirm before filing.
 
 ## 3. On "yes" — file via github-issues
 
+**Target repository.** A Gini crash is filed against the canonical Gini repo
+— `Lilac-Labs/gini-agent` — NOT whatever git remote the current workspace
+happens to have (the agent's working directory is a sandbox, not a Gini
+checkout). Pass `--repo Lilac-Labs/gini-agent` to every `gh` call below.
+
 Do not duplicate `gh` mechanics here. Load the `github-issues` skill and
 follow its `gh` path — it handles installing `gh`, the interactive
 `gh auth login` degrade, idempotent label creation, and create/search:
@@ -158,7 +163,7 @@ consent message, unless the user explicitly asked to file all):
    is embedded in the body, so search for it:
 
    ```bash
-   gh issue list --state open --label "gini-crash" \
+   gh issue list --repo Lilac-Labs/gini-agent --state open --label "gini-crash" \
      --search "<fingerprint> in:body" --json number,title
    ```
 
@@ -172,8 +177,8 @@ consent message, unless the user explicitly asked to file all):
    it):
 
    ```bash
-   gh label list --search "gini-crash" | grep -q gini-crash \
-     || gh label create "gini-crash" \
+   gh label list --repo Lilac-Labs/gini-agent --search "gini-crash" | grep -q gini-crash \
+     || gh label create "gini-crash" --repo Lilac-Labs/gini-agent \
          --description "Automatically captured Gini crash" --color B60205
    ```
 
@@ -205,7 +210,7 @@ consent message, unless the user explicitly asked to file all):
      "\n```\n"
    ' "$f")
 
-   gh issue create --label "gini-crash" --title "$title" --body "$body"
+   gh issue create --repo Lilac-Labs/gini-agent --label "gini-crash" --title "$title" --body "$body"
    ```
 
    Then resolve the file(s) for this fingerprint (step 5). Quote the new
