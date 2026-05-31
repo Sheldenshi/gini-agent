@@ -272,9 +272,12 @@ export async function cancelTask(
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
-    // captured tool-call snapshot in the same write.
+    // captured tool-call snapshot in the same write. Also drop the loaded
+    // deferred-tool set: a cancelled task is terminal and must not retain
+    // dead state that a future read could mistake for live context.
     cancelPendingTaskApprovals(state, taskId, "task.cancelled");
     task.toolCallState = undefined;
+    task.loadedTools = undefined;
     upsertTask(state, task);
     // Abort any in-flight approved actions for this task. The
     // abort is called INSIDE the `mutateState` callback so
@@ -988,6 +991,9 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       // recordInFlightAborted.
       if (task && !isTerminalTaskStatus(task.status)) {
         task.toolCallState = undefined;
+        // A denied/failed task is terminal — drop the loaded deferred-tool
+        // set alongside the tool-call snapshot so no dead state lingers.
+        task.loadedTools = undefined;
         const message = `Approval denied: ${item.target}`;
         task.status = "failed";
         task.currentStep = "Failed";
@@ -1341,6 +1347,9 @@ export async function resolveSetupRequest(
       const task = state.tasks.find((t) => t.id === item.taskId);
       if (task && !isTerminalTaskStatus(task.status)) {
         task.toolCallState = undefined;
+        // Cancelling setup fails the task (terminal) — drop the loaded
+        // deferred-tool set alongside the tool-call snapshot.
+        task.loadedTools = undefined;
         const message = `Setup cancelled: ${item.target}`;
         task.status = "failed";
         task.currentStep = "Failed";

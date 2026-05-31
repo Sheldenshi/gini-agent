@@ -63,6 +63,7 @@ import {
   deferredToolIndex,
   handleLoadTools,
   hashCatalog,
+  isDeferredToolName,
   toProviderTools,
   type ToolCatalogTool
 } from "./tool-catalog";
@@ -797,8 +798,10 @@ async function runLoop(
 ): Promise<Task> {
   // Build the tool catalog once per loop entry. If the user toggles a
   // toolset mid-pause we'll pick up the change on resume — that's a
-  // feature, not a bug, and the toolsHash check protects against weird
-  // schema drift.
+  // feature, not a bug. `toolsHash` is recorded for trace/telemetry only;
+  // it is NOT enforced on resume (resumeChatTask rebuilds the catalog via
+  // runLoop and never reads the snapshot's toolsHash), so a growing tool
+  // set across a pause is safe.
   const state0 = readState(config.instance);
   const taskRow = state0.tasks.find((t) => t.id === taskId);
   const subagent0 = taskRow ? getSubagentForTask(state0, taskRow) : undefined;
@@ -1161,6 +1164,11 @@ async function runLoop(
     // (assistant_message tool_call → tool result) and the LLM can
     // re-evaluate after the approval resolves.
     let pausedThisTurn = false;
+    // Deferred tools become callable only on the provider call AFTER they were
+    // loaded. Snapshot the loaded set as the provider saw it when it generated
+    // THIS turn's tool calls; a tool loaded by a load_tools call earlier in the
+    // same batch is deliberately NOT yet callable.
+    const loadedAtTurnStart = new Set(loadedToolNames);
     for (const call of result.toolCalls) {
       if (pausedThisTurn) {
         const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
@@ -1250,6 +1258,34 @@ async function runLoop(
         toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: result });
         emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
         emitToolResult(emitCtx, { callId: call.id, result });
+        continue;
+      }
+      // Primary deferred-tool gate. A deferred tool is callable only on the
+      // provider call AFTER its schema was loaded, so we test against the
+      // loaded set as the provider saw it at the START of this turn — NOT the
+      // running set. This blocks two cases the per-tool dispatch case would
+      // otherwise let through: (a) the model emitting a deferred tool it never
+      // loaded, and (b) a deferred tool emitted in the SAME batch as the
+      // load_tools that loads it (the provider generated the call without ever
+      // having the schema). `load_tools` itself is core, not deferred, so the
+      // gate never blocks it; a tool loaded on a prior turn is in
+      // loadedAtTurnStart and passes through to dispatch normally.
+      if (isDeferredToolName(call.function.name) && !loadedAtTurnStart.has(call.function.name)) {
+        const nudge = JSON.stringify({
+          ok: false,
+          error: `Tool '${call.function.name}' is available but not loaded yet. Call load_tools({"names":["${call.function.name}"]}) first, then call it on the next turn.`
+        });
+        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: nudge });
+        emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: "tool not loaded" });
+        emitToolResult(emitCtx, { callId: call.id, result: nudge });
+        await mutateState(config.instance, (state) => {
+          updateRecentToolCall(findTask(state, taskId), call.id, "done");
+        });
+        appendTrace(config.instance, taskId, {
+          type: "tool",
+          message: "Deferred tool call skipped: not loaded yet",
+          data: { toolCallId: call.id, toolName: call.function.name }
+        });
         continue;
       }
       try {

@@ -1618,22 +1618,25 @@ describe("chat-task loop", () => {
   });
 
   // The riskiest invariant: a deferred tool the model loaded must stay live
-  // across an approval pause/resume. We load a deferred mutate self tool
-  // (set_provider), call it (strict → gates), assert the paused task carries
-  // loadedTools, then approve and confirm the loop resumes and completes —
-  // proving runLoop re-seeds loadedToolNames from task.loadedTools on resume.
-  test("loaded deferred tool set persists across an approval pause/resume", async () => {
+  // across an approval pause/resume. We load two deferred self tools
+  // (set_provider + get_self), call set_provider (strict → gates), assert the
+  // paused task carries loadedTools, then approve and — on the RESUMED turn —
+  // call get_self directly. get_self only dispatches successfully if it is
+  // still in providerTools after the resume, which proves runLoop re-seeds
+  // loadedToolNames from task.loadedTools (a merely-completing final-text turn
+  // would not prove the loaded schema survived).
+  test("loaded deferred tool set persists across an approval pause/resume and dispatches after resume", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     // strict so set_provider gates instead of auto-resolving.
     const config = buildConfig(workspaceRoot, "chat-task-deferred-resume");
     const provider = normalizeProvider(config.provider);
 
-    // Turn 1: load set_provider.
+    // Turn 1: load set_provider AND get_self.
     setEchoToolCallingResponse({
       provider,
       text: "",
       toolCalls: [
-        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["set_provider"] }) } }
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["set_provider", "get_self"] }) } }
       ],
       finishReason: "tool_calls"
     });
@@ -1646,7 +1649,18 @@ describe("chat-task loop", () => {
       ],
       finishReason: "tool_calls"
     });
-    // Turn 3 (after approval resumes): final answer.
+    // Turn 3 (the RESUMED turn): call the previously-loaded get_self directly.
+    // It's a query op → resolves sync (no second gate) and writes a self.get
+    // audit row, proving the loaded schema survived the resume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_gs", type: "function", function: { name: "get_self", arguments: "{}" } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 4: final answer.
     setEchoToolCallingResponse({
       provider,
       text: "Provider set.",
@@ -1659,18 +1673,134 @@ describe("chat-task loop", () => {
     expect(paused.status).toBe("waiting_approval");
     // The loaded set survived onto the task across the pause snapshot.
     expect(paused.loadedTools).toContain("set_provider");
+    expect(paused.loadedTools).toContain("get_self");
     expect(paused.toolCallState).toBeDefined();
     expect(paused.toolCallState?.pending[0]?.toolName).toBe("set_provider");
     expect(paused.approvalIds.length).toBe(1);
 
     // Approve → resume. runLoop re-seeds loadedToolNames from task.loadedTools
-    // so set_provider is live again on the resumed iteration.
+    // so get_self is live again on the resumed iteration.
     await decideApproval(config, paused.approvalIds[0]!, "approve");
     const finished = await waitForTerminal(config, task.id, 10000);
     expect(finished.status).toBe("completed");
     expect(finished.summary).toBe("Provider set.");
+    // get_self dispatched on the resumed turn — proving the loaded deferred
+    // tool was in providerTools post-resume (not nudged as unloaded).
+    const state = readState(config.instance);
+    const reads = state.audit.filter((a) => a.action === "self.get" && a.taskId === task.id);
+    expect(reads).toHaveLength(1);
     // Cleared on terminal completion.
     expect(finished.loadedTools).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop gate, never-loaded case: the model emits a deferred tool it never
+  // loaded. The chat-task loop gate (NOT the dispatcher's default-case
+  // backstop, which browser_navigate never reaches — it has its own dispatch
+  // case) must block execution and feed back a "not loaded yet" nudge, and the
+  // loop must continue to a final answer. We assert NO browser.navigate audit
+  // row exists (proving the thunk never ran).
+  test("loop gate blocks a deferred tool the model never loaded and nudges toward load_tools", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-unloaded");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: jump straight to browser_navigate without loading it first.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: model recovers with a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Understood — I'll load the browser tools first next time.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Understood — I'll load the browser tools first next time.");
+
+    const state = readState(config.instance);
+    // The browser thunk never ran: no browser.navigate audit row.
+    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
+    expect(navAudits).toHaveLength(0);
+
+    // The second model turn's history carries the "not loaded yet" nudge as the
+    // tool result for the unloaded browser_navigate call.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const nudge = calls[1]!.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
+    );
+    expect(nudge).toBeDefined();
+    const envelope = JSON.parse(String((nudge as { content: string }).content)) as { ok: boolean; error: string };
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain("browser_navigate");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop gate, same-batch case: the model emits load_tools AND the tool it just
+  // loaded in ONE tool_calls array. The provider generated browser_navigate
+  // without ever having its schema (it wasn't in the tools array that turn), so
+  // the loaded set as it stood at turn start does NOT contain it — the gate
+  // must block browser_navigate this turn while load_tools still succeeds. A
+  // subsequent turn can then call browser_navigate for real (now loadable).
+  test("loop gate blocks a same-batch load+call but lets the tool through on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-samebatch");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load_tools(browser_navigate) AND browser_navigate(...) together.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } },
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: model recovers with a final answer (we stop before a real browser
+    // call to keep the test hermetic; the point is that the same-batch call was
+    // gated while load_tools succeeded).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browser tools loaded; ready to navigate.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const state = readState(config.instance);
+    // browser_navigate was NOT executed this turn — no browser.navigate audit.
+    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
+    expect(navAudits).toHaveLength(0);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const secondTurn = calls[1]!;
+    // load_tools succeeded: its tool result confirms callability.
+    const loadResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
+    );
+    expect(loadResult).toBeDefined();
+    // browser_navigate got the "not loaded yet" nudge this turn.
+    const navResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
+    );
+    expect(navResult).toBeDefined();
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

@@ -260,9 +260,12 @@ export async function dispatchToolCall(
       // `command` field on the payload is what the policy inspects.
       return codeExecDispatch(config, taskId, toolCallId, args);
     default:
-      // A deferred catalog tool whose schema the model never loaded can
-      // surface here as a hallucinated call (the dispatch case exists, but a
-      // name-typo or a not-yet-loaded reference lands in default). Return a
+      // Defensive backstop only. The chat-task loop gate is the PRIMARY guard:
+      // it blocks any deferred tool not loaded at the start of the turn before
+      // dispatch is ever reached, so a known deferred tool with its own case
+      // (browser_*, the self ops) never gets here unloaded. This branch still
+      // catches the residual cases that bypass that gate — a deferred tool with
+      // NO dispatch case, or a name-typo onto a deferred name — returning a
       // recoverable nudge pointing at load_tools instead of the bare
       // "Unknown tool" error so the model self-corrects on the next turn.
       if (isDeferredToolName(toolName)) {
