@@ -72,8 +72,15 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
         setConnectError(null);
         invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       } else {
+        // The backend now claims the setup row BEFORE createConnector, so a
+        // failed connect leaves the row `completed` (with a persisted
+        // ok:false connectOutcome) — retrying the same setup id 410s. Refresh
+        // setup-requests/tasks/chat (like the other resolved cards do) so the
+        // card flips out of the retryable dialog into the resolved-failure
+        // summary instead of stranding the user on a dialog whose resubmit is
+        // Gone. The agent will re-issue request_connector for a fresh card.
         setConnectError(result.message ?? "Could not connect. Please verify the credentials and try again.");
-        invalidate(["connectors"]);
+        invalidate(["setup-requests", "approvals", "tasks", "task", "chat", "events", "audit", "connectors"]);
       }
     },
     onError: (error: Error) => setConnectError(error.message)
@@ -148,6 +155,18 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
   const credentialMcpUrl = isConnectorRequest && setup && typeof setup.payload?.mcpUrl === "string"
     ? (setup.payload.mcpUrl as string)
     : "";
+  // Server-resolved name of the skill this credential is granted to (the model
+  // supplies only the skillId; the dispatcher resolves the name from state).
+  // Present only when the request carried a skillId. Drives the consent copy
+  // on the card and dialog so the user sees which skill receives the grant
+  // from a trusted identity rather than the model-authored reason/title.
+  const credentialSkillName = isConnectorRequest && setup && typeof setup.payload?.credentialSkillName === "string"
+    ? (setup.payload.credentialSkillName as string)
+    : "";
+  // What the user is connecting, for the button + resolved-card copy: the
+  // provider label (known-provider request) or the templateless credential
+  // label/name.
+  const connectorLabel = providerLabel || credentialLabel || credentialName || "credential";
   const fillSlots: FillSecretSlot[] = isBrowserFillSecret && setup
     ? parseFillSecretSlots(setup.payload?.slots)
     : [];
@@ -444,6 +463,15 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
     ? persistedOutcome.ok
     : removeResultOk;
   const effectiveRemoveMessage = persistedOutcome?.message ?? removeError ?? null;
+  // connector.request persists a connectOutcome ONLY on failure (probe failure
+  // or a post-claim throw); a successful create + grant returns ok:true and
+  // leaves the row completed with no outcome. So a completed row with no
+  // failure outcome is the success case. The sticky connectError is the
+  // in-flight fast-path before useSetupRequests() refetches.
+  const effectiveConnectFailed = persistedOutcome
+    ? persistedOutcome.ok === false
+    : Boolean(connectError);
+  const effectiveConnectMessage = persistedOutcome?.message ?? connectError ?? null;
 
   // Past-tense the summary once resolved so "Enter credentials..." doesn't
   // keep reading as an active ask after the user has already submitted (or
@@ -495,7 +523,21 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
             : setup.status === "cancelled"
               ? `Request cancelled. (${block.summary})`
               : block.summary
-          : block.summary;
+          : !isPending && setup && isConnectorRequest
+            ? setup.status === "completed"
+              // The backend claims the row at completion (success OR failure),
+              // so a completed connector.request is terminal — retrying its
+              // setup id 410s. A persisted ok:false outcome marks a failed
+              // connect; otherwise the create + grant succeeded. Surface the
+              // failure message and that the agent will re-request, rather than
+              // leaving "Enter credentials…" reading as still-actionable.
+              ? effectiveConnectFailed
+                ? `Setup failed${effectiveConnectMessage ? `: ${effectiveConnectMessage}` : ""}. The agent will re-request the credential. (${block.summary})`
+                : `Connected ${connectorLabel}${credentialSkillName ? ` for ${credentialSkillName}` : ""}. (${block.summary})`
+              : setup.status === "cancelled"
+                ? `Request cancelled. (${block.summary})`
+                : block.summary
+            : block.summary;
 
   return (
     <div className={cardClass}>
@@ -517,6 +559,16 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
         <pre className="mt-2 max-h-48 overflow-auto rounded-md border border-border bg-background/40 p-2 font-mono text-[10px]">
           {JSON.stringify(setup.payload, null, 2)}
         </pre>
+      ) : null}
+      {isConnectorRequest && isPending && credentialSkillName ? (
+        // Server-resolved consent anchor: the dispatcher resolved the skillId
+        // (model-supplied) to this NAME from state, so it's the trustworthy
+        // statement of which skill the credential is granted to — unlike the
+        // model-authored reason/title in the summary above.
+        <div className="mt-2 rounded-md border border-amber-500/30 bg-background/40 px-2 py-1 text-[11px]">
+          <span className="text-muted-foreground">Grants to skill: </span>
+          <span className="font-mono">{credentialSkillName}</span>
+        </div>
       ) : null}
       {isBrowserFillSecret && fillSlots.length > 0 && isPending ? (
         <div className="mt-2 space-y-2">
@@ -720,7 +772,12 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
                 setConnectOpen(true);
               }}
             >
-              Connect {providerLabel || credentialLabel || "credential"}
+              {/* When a skillId resolved to a name server-side, the consent is
+                  about granting this credential to THAT skill, so name it from
+                  the trusted identity rather than the model's reason/title. */}
+              {credentialSkillName
+                ? `Grant ${connectorLabel} to ${credentialSkillName}`
+                : `Connect ${connectorLabel}`}
             </Button>
             <Button
               size="sm"
@@ -864,6 +921,7 @@ export function BlockSetupRequested({ block }: { block: SetupRequestedBlock }) {
           requestCredentialName={credentialName || undefined}
           requestCredentialType={credentialType}
           requestMcpUrl={credentialMcpUrl || undefined}
+          requestSkillName={credentialSkillName || undefined}
           pending={connect.isPending}
           externalError={connectError}
           onSubmit={(body) => connect.mutate(body)}

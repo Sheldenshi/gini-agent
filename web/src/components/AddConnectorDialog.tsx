@@ -101,6 +101,11 @@ export interface AddConnectorDialogProps {
   requestCredentialName?: string;
   requestCredentialType?: "api-key";
   requestMcpUrl?: string;
+  // Server-resolved name of the skill this credential is granted to (request
+  // mode, when the connector.request carried a skillId). When present, the
+  // dialog titles the action as granting the credential to that named skill so
+  // the consent is accurate about which skill receives the grant.
+  requestSkillName?: string;
 }
 
 export function AddConnectorDialog({
@@ -116,7 +121,8 @@ export function AddConnectorDialog({
   externalError = null,
   requestCredentialName,
   requestCredentialType,
-  requestMcpUrl
+  requestMcpUrl,
+  requestSkillName
 }: AddConnectorDialogProps) {
   // A templateless request carries an api-key credentialType and NO registered
   // provider (the connector.request approval had no `provider`). Detect it
@@ -389,7 +395,12 @@ export function AddConnectorDialog({
             {mode === "rotate"
               ? `Rotate ${defaultName ?? "credential"}`
               : mode === "request"
-                ? `Connect ${selectedProvider?.label ?? requestCredentialName ?? "credential"}`
+                // When the request resolved a skill name server-side, title the
+                // action as granting the credential to THAT skill so the
+                // consent reflects which skill receives the grant.
+                ? requestSkillName
+                  ? `Grant ${selectedProvider?.label ?? requestCredentialName ?? "credential"} to ${requestSkillName}`
+                  : `Connect ${selectedProvider?.label ?? requestCredentialName ?? "credential"}`
                 : "Add connector"}
           </DialogTitle>
           <DialogDescription>
