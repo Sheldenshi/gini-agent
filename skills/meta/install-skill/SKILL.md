@@ -68,10 +68,12 @@ and surface the credentials the new skill will need.
      or local integration, remove the credential requirement. Record
      command requirements under `metadata.gini.prerequisites.commands`.
    - If a required credential is NOT yet configured:
-     **Default to forward motion.** Keep the requirement and install the
-     skill (step 6). You will prompt for the missing credential(s) in chat
-     right after install (step 7) — do not present an install / hold-off
-     binary choice.
+     **Default to forward motion** — but forward motion means "install,
+     then prompt," not "install, then stop." Keep the requirement and
+     install the skill (step 6). You MUST then prompt for the missing
+     credential(s) in chat at step 7 (which is mandatory); do not present
+     an install / hold-off binary choice, and do not treat installation as
+     the finish line.
 
 5. Surface the `allowed-tools` declaration to the user. Read the
    skill's frontmatter `allowed-tools` value (space-separated) and
@@ -95,20 +97,36 @@ and surface the credentials the new skill will need.
    `metadata.gini.category`), triggers a loader reload, and returns the
    new enabled SkillRecord.
 
-7. For EACH still-missing required credential, prompt the user in chat
-   with `request_connector` so they can enter it securely. The install
-   response (step 6) returns the new SkillRecord — use its `id` as the
-   `skillId`. Call:
+7. **MANDATORY — prompt for every missing credential before you report
+   the skill ready. Installing the skill is NOT the end of the task.**
+   The install response (step 6) returns the new SkillRecord — use its
+   `id` as the `skillId`. Then:
 
-   - Registered provider (the credential name maps to a known module, e.g.
-     `LINEAR_API_KEY` → linear): `request_connector` with that
-     `provider` id plus `skillId`.
-   - No registered provider (a brand-new service): `request_connector`
-     with `{name: "<CREDENTIAL_NAME>", type: "<api-key|oauth2>",
-     skillId: "<installed skill id>", reason: "<what the credential is
-     for and where to get it>"}`. Infer `type` from the name: an
-     UPPER_SNAKE env-var token (e.g. `SOME_SERVICE_API_KEY`) is
-     `api-key`; a kebab handle is `oauth2`.
+   1. Re-read the installed skill's `metadata.gini.requires.credentials`
+      list.
+   2. For EACH credential name in that list, check `GET /api/connectors`
+      for an existing healthy credential with that name.
+   3. For EACH credential that is still missing, you MUST call
+      `request_connector` so the user enters it securely. Do this for
+      every missing credential — do not skip any, do not batch them into
+      prose, do not defer to "the next time the skill runs":
+      - Registered provider (the credential name maps to a known module,
+        e.g. `LINEAR_API_KEY` → linear): `request_connector` with that
+        `provider` id plus `skillId`.
+      - No registered provider (a brand-new service): `request_connector`
+        with `{name: "<CREDENTIAL_NAME>", type: "<api-key|oauth2>",
+        skillId: "<installed skill id>", reason: "<what the credential is
+        for and where to get it>"}`. Infer `type` from the name: an
+        UPPER_SNAKE env-var token (e.g. `SOME_SERVICE_API_KEY`) is
+        `api-key`; a kebab handle is `oauth2`.
+
+   **Do not stop after "installed."** A skill with a missing required
+   credential is NOT ready to use — it stays inactive until the credential
+   is granted. You may report the skill as ready ONLY when either every
+   required credential has been provided (each `request_connector` card
+   completed) OR the user has explicitly declined to provide it. If the
+   user has not yet responded to a card, the task is still in progress;
+   wait for it, do not declare completion.
 
    Completing the card stores the credential as a typed record AND grants
    it to the installed skill — the skill activates once all its
@@ -131,6 +149,12 @@ and surface the credentials the new skill will need.
   stop the install flow to ask permission. Do not add a credential
   requirement for skills that only need local commands or an
   already-authenticated CLI.
+- After a successful install, prompting for each missing required
+  credential via `request_connector` (step 7) is MANDATORY, not optional.
+  Never report the skill as installed/ready and then stop while a required
+  credential is still missing — the skill is inactive until it is granted.
+  The post-install prompt must happen in the SAME turn as the install, not
+  deferred to a later on-demand run.
 - Never embed the user's secret values in the SKILL.md you write.
 - Never POST a secret to `/api/connectors` (or any endpoint) from a shell
   command. A secret on a command line lands in your context, the audit
