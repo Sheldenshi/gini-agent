@@ -2877,6 +2877,13 @@ async function requestConnectorTool(
   // BlockSetupRequested / AddConnectorDialog).
   const target = provider?.id ?? credentialName;
   const payloadLabel = provider?.label ?? (credentialLabel || credentialName);
+  // When a skill requested this credential, resolve its NAME from state (the
+  // model supplies only the id) so the card can render "Grant <credential> to
+  // skill <name>" from a server-resolved identity rather than the
+  // model-authored reason/title.
+  const credentialSkillName = skillId
+    ? state.skills.find((s) => s.id === skillId)?.name
+    : undefined;
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -2902,6 +2909,8 @@ async function requestConnectorTool(
         mcpUrl: templateless && mcpUrl ? mcpUrl : undefined,
         // Skill to auto-grant on completion (either path).
         skillId: skillId || undefined,
+        // Server-resolved name of that skill, for the card to display.
+        credentialSkillName,
         reason,
         toolCallId
       }

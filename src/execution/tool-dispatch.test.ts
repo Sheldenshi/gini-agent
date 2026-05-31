@@ -417,6 +417,49 @@ describe("request_connector dispatch", () => {
     }
   });
 
+  test("templateless: payload carries the server-resolved credentialSkillName when skillId matches a skill", async () => {
+    // Fix 5-backend: the card displays "Grant <credential> to skill <name>"
+    // from a server-resolved identity. The model supplies only the id, so the
+    // dispatcher resolves the skill NAME from state and threads it into the
+    // payload.
+    const instance = `req-connector-skillname-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const { createSkill } = await import("../state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-some-service",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["SOME_SERVICE_API_KEY"]
+      })
+    );
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "request_connector",
+      "call_skillname",
+      JSON.stringify({
+        name: "SOME_SERVICE_API_KEY",
+        type: "api-key",
+        skillId: skill.id,
+        reason: "Enter your Some Service API key"
+      })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.setupRequests.find((a) => a.id === result.approvalId);
+      expect(approval!.payload.skillId).toBe(skill.id);
+      expect(approval!.payload.credentialSkillName).toBe("needs-some-service");
+    }
+  });
+
   test("templateless: type:'oauth2' with no registered provider is rejected (api-key only)", async () => {
     // Templateless request_connector supports api-key ONLY — an oauth2
     // credential needs a provider module / setup skill to model its env vars

@@ -1096,7 +1096,9 @@ export interface SetupRequest {
   // Templateless typed credential (no registered provider): {credentialName,
   // credentialType ("api-key" | "oauth2"), credentialLabel, mcpUrl?, reason,
   // toolCallId}. Either shape may also carry {skillId} — when set, completing
-  // the request both stores the credential AND grants it to that skill.
+  // the request both stores the credential AND grants it to that skill — plus
+  // {credentialSkillName}, the server-resolved name of that skill for the card
+  // to display.
   target: string;
   // Human-language ask shown to the user in the chat card.
   reason: string;
