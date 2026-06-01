@@ -16,8 +16,13 @@ import type { SystemNoteBlock } from "@runtime/types";
 export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
   if (block.authError) {
     const { providerLabel, detail, reauthKind, reauthUrl } = block.authError;
+    // Fall back to the Settings form for blocks that predate the routing fields
+    // (or any with them missing) so an older persisted note never renders a
+    // broken CTA.
+    const kind = reauthKind ?? "settings";
+    const url = reauthUrl ?? "/settings";
     const ctaLabel =
-      reauthKind === "docs" ? `Re-authenticate ${providerLabel}` : `Update ${providerLabel} key`;
+      kind === "docs" ? `Re-authenticate ${providerLabel}` : `Update ${providerLabel} key`;
     return (
       <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
         <div className="flex items-center gap-2">
@@ -28,12 +33,12 @@ export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
           <p className="mt-1 text-[11px] italic text-muted-foreground">{detail}</p>
         ) : null}
         <Button asChild size="sm" variant="outline" className="mt-2">
-          {reauthKind === "docs" ? (
-            <a href={reauthUrl} target="_blank" rel="noreferrer">
+          {kind === "docs" ? (
+            <a href={url} target="_blank" rel="noreferrer">
               {ctaLabel}
             </a>
           ) : (
-            <Link href={reauthUrl}>{ctaLabel}</Link>
+            <Link href={url}>{ctaLabel}</Link>
           )}
         </Button>
       </div>
