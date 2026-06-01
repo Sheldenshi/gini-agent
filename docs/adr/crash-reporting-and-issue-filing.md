@@ -81,9 +81,12 @@ outside the queue. There is no un-redacted path from the queue to GitHub.
 On gateway boot, `maybeAskAboutCrashes` (`src/runtime/crash-recovery.ts`, called
 best-effort from `src/server.ts`) decides whether to ask:
 
-1. **Gate.** It returns immediately unless `config.instance === "default"`
-   **and** `supervisor()` is `"launchd"`. Throwaway, conductor, tmux, and
-   foreground instances capture crashes but never ask.
+1. **Gate.** It returns immediately unless the instance is on the ask-allowlist
+   **and** `supervisor()` is `"launchd"`. The allowlist defaults to the primary
+   instance (`default`) and is overridable via `GINI_CRASH_ASK_INSTANCES`
+   (comma-separated) so a differently-named primary — or a test instance — can
+   ask. Throwaway, conductor, tmux, and foreground instances capture crashes but
+   never ask.
 
 2. **Filter + dedupe.** It reads the `pending/` queue, keeps only reports
    belonging to this instance, and collapses them to the set of distinct
@@ -105,11 +108,12 @@ When the user replies in that thread, their answer drives a fresh agent turn in
 the same session, and the agent loads the `gini-bug-report` skill to act:
 
 - **Yes** → the skill reads the queued redacted report(s), loads the
-  `github-issues` skill, and files **one** issue per distinct fingerprint
-  (`[gini-crash] <source>: <error.name>`, body assembled only from the queued
-  JSON, label `gini-crash`). An open issue already carrying the fingerprint
-  gets a recurrence comment instead of a duplicate. Filed reports move to
-  `filed/`.
+  `github-issues` skill, and files **one** issue per distinct fingerprint to the
+  canonical Gini repo (`Lilac-Labs/gini-agent`) — not whatever git remote the
+  agent's sandbox workspace happens to have (`[gini-crash] <source>:
+  <error.name>`, body assembled only from the queued JSON, label `gini-crash`).
+  An open issue already carrying the fingerprint gets a recurrence comment
+  instead of a duplicate. Filed reports move to `filed/`.
 - **No** → nothing is filed; the report(s) move to `dismissed/`.
 - **gh not authenticated** → `github-issues` asks the user to run
   `gh auth login` (interactive, and the user is present), then resumes. If the
@@ -121,19 +125,8 @@ The crash-loop guard is the combination of **per-fingerprint ask-once**
 single ask: even if KeepAlive respawns a crash-looping gateway repeatedly, the
 user is asked at most once per fingerprint per day, and never more than one
 message per restart. The model-turn cost is bounded by the same gate plus
-ask-once — only `default`, only when there's something new to ask about.
-
-### Superseded
-
-An earlier design filed crashes autonomously. The autonomous `gini
-report-crash` command, a deterministic `gh`-wrapper module, hidden-marker `gh`
-issue dedup, comment rate-limiting, and a `gh`-auth-at-crash gate are no longer
-part of the design. Filing is now consent-gated and skill-driven: capture
-queues a redacted report, the restart hook asks, and the `gini-bug-report` +
-`github-issues` skills do the `gh` work only after the user says yes. Dedup,
-label management, and `gh` auth all live in those skills, run interactively with
-the user present, rather than in a deterministic filer that publishes without a
-human in the loop.
+ask-once — only the supervised primary instance, only when there's something new
+to ask about.
 
 ## Context
 
