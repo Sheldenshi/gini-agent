@@ -166,7 +166,7 @@ export function defaultAgent(instance: Instance, at: string): AgentRecord {
   return {
     id: "agent_default",
     instance,
-    name: "default",
+    name: "Gini",
     status: "active",
     providerName: undefined,
     model: undefined,
