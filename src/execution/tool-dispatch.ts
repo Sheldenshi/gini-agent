@@ -2086,13 +2086,6 @@ async function installSkillTool(
   args: Record<string, unknown>
 ): Promise<string> {
   const body = requireString(args, "body");
-  let category: string | undefined;
-  if (args.category !== undefined && args.category !== null) {
-    if (typeof args.category !== "string" || args.category.length === 0) {
-      throw new Error("Invalid input: category must be a non-empty string.");
-    }
-    category = args.category;
-  }
   let files: Array<{ name: string; content: string }> | undefined;
   if (args.files !== undefined && args.files !== null) {
     if (!Array.isArray(args.files)) {
@@ -2114,7 +2107,7 @@ async function installSkillTool(
     }
     files = cleaned;
   }
-  const installed = await installSkillFromBody(config, { body, category, files });
+  const installed = await installSkillFromBody(config, { body, files });
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(
@@ -3457,7 +3450,10 @@ async function waitForMessagingPairTool(
   // long we tie up the chat-task awaiting an external event.
   const timeoutSeconds = Math.max(10, Math.min(1800, Math.round(requestedTimeoutSeconds)));
   const deadlineMs = Date.now() + timeoutSeconds * 1000;
-  const POLL_INTERVAL_MS = 1000;
+  // Server-side env override so tests don't wait full poll ticks. Production
+  // leaves it unset and gets the 1000ms default (Number(undefined)/0/NaN all
+  // fall through the `||`).
+  const POLL_INTERVAL_MS = Number(process.env.GINI_PAIR_POLL_MS) || 1000;
 
   // Validate bridge existence + kind up-front so we don't burn
   // the timeout on a typo'd name. The wait predicate itself

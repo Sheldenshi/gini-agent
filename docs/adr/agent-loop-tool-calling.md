@@ -93,6 +93,32 @@ through the same loop. So the loop comes first.
       pattern id surfaces on the approval row's `reason` field so
       operators see WHY they're being asked.
 
+## Durable tool-calling transcript
+
+The model sees its own prior tool calls and results across turns. Each
+turn's assistant `tool_calls` message and every paired `role:"tool"`
+result are persisted durably as `ChatMessageRecord` rows tagged
+`kind:"tool_transcript"` (the store gains a `"tool"` role plus inline
+`toolCalls` / `toolCallId` / `seq` fields). `priorChatMessages` replays
+the full ordered transcript — user/assistant text interleaved with the
+assistant→tool pairs — sorted by `(createdAt, seq)`, so the model can
+reference a structured result it produced earlier (a created issue's id)
+and so an invoked skill body (`read_skill`) stays in context instead of
+being re-read every turn.
+
+- Replay applies a defensive pairing pass: each `role:"tool"` row is
+  grouped under the assistant `tool_calls` row that emitted its id;
+  orphan tool rows and assistant rows missing any paired result are
+  dropped, so a partially-persisted turn can never produce a provider
+  400 on the ordering invariant.
+- These rows are model-facing replay state, **not** the human-facing
+  transcript. The chat UI renders from the ChatBlock stream (ADR
+  chat-block-protocol.md), and the JSON view-builders in
+  `src/execution/chat.ts` (`getChatSession`, `listChatSessions`) plus
+  `syncChatTaskResult`'s terminal-summary short-circuit all exclude
+  `kind:"tool_transcript"` rows, so they never leak into or corrupt
+  what the user sees.
+
 ## Deferred
 
 - Skill-driven tool exposure. Beyond the deferred-tools mechanism above
@@ -100,12 +126,13 @@ through the same loop. So the loop comes first.
   per-skill so a skill body brings its own tool surface into the catalog.
 - Subagent spawn as a tool. Slice 4 will add `spawn_subagent` to the
   catalog and map it through this same loop.
-- Multi-turn `tool` messages in the prior-message snapshot. Today we
-  drop tool-result messages from prior turns and only re-include
-  `user`/`assistant` text — keeps the context window lean at the cost
-  of losing fine-grained tool history across turns.
 - Codex tool calling (responses API supports it; we'd need a separate
   parser).
+- Transcript compaction. The replayed transcript (see "Durable
+  tool-calling transcript" below) grows unbounded, the same way prior
+  text history already does. A future ADR can introduce
+  summarization-based compaction (e.g. re-attach the most-recent skill
+  body after a summary boundary) to bound the model-facing window.
 
 ## Consequences For Coding Agents
 
@@ -132,4 +159,8 @@ through the same loop. So the loop comes first.
   `waiting_approval`, populates `toolCallState.pending`, and pauses.
 - Approving the approval writes the file, calls `resumeChatTask`, and
   the model's next turn finalizes the assistant message.
+- A tool result from turn 1 (a returned id, a `read_skill` body) appears
+  in turn 2's replayed provider messages as a `role:"tool"` row paired
+  with its assistant `tool_calls` row, while the JSON chat views exclude
+  every `kind:"tool_transcript"` row.
 - `bun run typecheck` and `bun test` are green.

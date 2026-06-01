@@ -963,7 +963,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         type: "object",
         properties: {
           body: { type: "string", description: "Full SKILL.md content (YAML frontmatter + markdown body)." },
-          category: { type: "string", description: "Optional category override. Defaults to metadata.gini.category in the frontmatter, then 'user'." },
           files: {
             type: "array",
             description: "Optional named-file payloads written next to SKILL.md (e.g. scripts/linear.sh). Each entry's name is treated as a relative path under the skill folder and must not escape it.",
@@ -1740,7 +1739,7 @@ export function chatBlockArgsPreviewFor(
     case "disable_skill":
       return truncatePreview(previewValue(safe.name) || previewValue(safe.skillId));
     case "install_skill":
-      return truncatePreview(previewValue(safe.category) || "skill");
+      return truncatePreview("skill");
     case "spawn_subagent":
       return truncatePreview(previewValue(safe.name) || previewValue(safe.prompt));
     case "browser_navigate":

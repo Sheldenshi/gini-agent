@@ -85,7 +85,9 @@ export function listChatSessions(config: RuntimeConfig) {
       ...session,
       lastMessagePreview,
       pendingApprovalCount,
-      messages: state.chatMessages.filter((message) => message.sessionId === session.id),
+      messages: state.chatMessages.filter(
+        (message) => message.sessionId === session.id && message.kind !== "tool_transcript"
+      ),
       runs: state.runs.filter((run) => session.runIds.includes(run.id))
     };
   });
@@ -96,7 +98,9 @@ export function getChatSession(config: RuntimeConfig, id: string) {
   const session = state.chatSessions.find((item) => item.id === id);
   if (!session) throw new Error(`Chat session not found: ${id}`);
 
-  const stored = state.chatMessages.filter((message) => message.sessionId === id);
+  const stored = state.chatMessages.filter(
+    (message) => message.sessionId === id && message.kind !== "tool_transcript"
+  );
   const tasks = state.tasks.filter((task) => session.taskIds.includes(task.id));
 
   // Synthesize transient streaming assistant messages: any in-flight task
@@ -310,14 +314,18 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
     if (!task) throw new Error(`Task not found: ${taskId}`);
     // Tasks can have multiple assistant messages — the durable
     // approval-reason bubble (kind: "approval_reason") emitted from
-    // request_connector lives alongside the eventual terminal summary.
-    // The short-circuit here is only for the *summary*, so it must
-    // ignore approval_reason rows.
+    // request_connector lives alongside the eventual terminal summary,
+    // and a tool-calling turn persists assistant rows tagged
+    // kind:"tool_transcript" (model-facing replay state). The
+    // short-circuit here is only for the *summary*, so it must ignore
+    // both — otherwise the first tool_transcript assistant row would be
+    // mistaken for the terminal summary and suppress the real one.
     const existing = state.chatMessages.find(
       (message) =>
         message.taskId === taskId &&
         message.role === "assistant" &&
-        message.kind !== "approval_reason"
+        message.kind !== "approval_reason" &&
+        message.kind !== "tool_transcript"
     );
     if (existing) return existing;
     // Only sync truly terminal task results into a real ChatMessageRecord.

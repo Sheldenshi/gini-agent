@@ -3,8 +3,12 @@
 // Walks two roots looking for `SKILL.md` files (Hermes-compatible shape):
 //   - bundled: <repo-root>/skills/<category>/<skill>/SKILL.md (vendored,
 //     ships with the runtime — apple-notes, apple-reminders, …)
-//   - user:    ~/.gini/instances/<instance>/skills/<skill>/SKILL.md or
-//              ~/.gini/instances/<instance>/skills/<category>/<skill>/SKILL.md
+//   - user:    ~/.gini/instances/<instance>/skills/<skill>/SKILL.md
+//
+// Installs always write user skills flat (no category subfolder). The
+// walker still tolerates a `<category>/<skill>/` layout under the user
+// root for manually-placed or legacy folders, deriving the category from
+// the parent directory name in either case.
 //
 // Each file has YAML-ish frontmatter (name, description, version,
 // platforms, prerequisites, …) followed by a markdown body that teaches
@@ -268,8 +272,12 @@ function parseScalar(value: string): unknown {
 // Gini extension keys (under `metadata.gini`):
 //   version, author, platforms,
 //   prerequisites: { commands, env },
-//   requires: { connectors: [{ provider, scopes? }, ...] },
-//   category   — used as a UI grouping hint
+//   requires: { connectors: [{ provider, scopes? }, ...] }
+//
+// A skill's category (a UI grouping hint) is NOT read from frontmatter —
+// it's derived from the parent directory name in discoverSkillFiles().
+// Bundled skills ship under `skills/<category>/<skill>/`; user-installed
+// skills land flat under `skills/<skill>/` and so carry no category.
 //
 // For one release we accept legacy top-level fields (`version`,
 // `platforms`, `prerequisites`, `requires.identities` with `kind` keys)

@@ -19,7 +19,7 @@ import { probeMemoryDb } from "../state/memory-db";
 import { legacyMigrationStatus } from "../memory";
 import { embeddingStatus, listBanksWithModelMismatch } from "../memory/embedding";
 import { rerankerStatus } from "../memory/reranker";
-import { defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
+import { configPath, defaultRuntimePort, defaultWebPort, ensureDir, logDir, pidPath, projectRoot, runtimePortPath, webPortPath } from "../paths";
 import { api, auth, url } from "./api";
 
 export interface WebOptions {
@@ -79,6 +79,24 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
   const dir = logDir(instance);
   ensureDir(dir);
   const logPath = join(dir, fileName);
+  // For web.log only: the Next.js child logs inbound request paths verbatim,
+  // and the tunnel bootstrap path is `/<secret>/...`. Run each chunk through
+  // a tunnel-secret redactor before write so the secret doesn't persist on
+  // disk. The redactor reads the live secret from `config.json` (cheap,
+  // cached briefly) so a rotate-secret on a running gateway picks up the
+  // new value within the cache window. See
+  // docs/adr/tunnel-and-mobile-access.md "Architecture (summary)" >
+  // Log redaction.
+  // One redactor per stream. Sharing a single carry buffer across
+  // stdout AND stderr would prepend stdout's held-back tail onto the
+  // next stderr chunk (and vice versa), re-routing bytes across streams
+  // and leaving the close-time flush going to whichever process.stream
+  // was wired in the close handler regardless of where the tail
+  // originated. Two redactors keep each stream's carry isolated; both
+  // still share the same secret/priorSecret values via the file-cache
+  // inside makeWebLogRedactor.
+  const redactStdout = fileName === "web.log" ? makeWebLogRedactor(instance) : null;
+  const redactStderr = fileName === "web.log" ? makeWebLogRedactor(instance) : null;
   if (foreground) {
     // Foreground: open a write stream and tee child.stdout/stderr to both the
     // user's terminal and the log file. Stream is closed when the child's stdio
@@ -97,14 +115,37 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
       stdio: ["inherit", "pipe", "pipe"],
       onSpawned: (child) => {
         child.stdout?.on("data", (chunk: Buffer | string) => {
-          process.stdout.write(chunk);
-          stream.write(chunk);
+          const redacted = redactStdout ? redactStdout(chunk) : chunk;
+          process.stdout.write(redacted);
+          stream.write(redacted);
         });
         child.stderr?.on("data", (chunk: Buffer | string) => {
-          process.stderr.write(chunk);
-          stream.write(chunk);
+          const redacted = redactStderr ? redactStderr(chunk) : chunk;
+          process.stderr.write(redacted);
+          stream.write(redacted);
         });
-        const close = () => { try { stream.end(); } catch { /* ignore */ } };
+        const close = () => {
+          // Flush any held-back redactor carry bytes before ending the
+          // stream — otherwise the tail of the child's output is lost when
+          // the process exits without a trailing newline. Per-stream
+          // flushes write the tail to the matching process.std<x> so
+          // stderr's last bytes never end up on stdout (and vice versa).
+          if (redactStdout) {
+            const tail = redactStdout.flush();
+            if (tail) {
+              try { process.stdout.write(tail); } catch { /* ignore */ }
+              try { stream.write(tail); } catch { /* ignore */ }
+            }
+          }
+          if (redactStderr) {
+            const tail = redactStderr.flush();
+            if (tail) {
+              try { process.stderr.write(tail); } catch { /* ignore */ }
+              try { stream.write(tail); } catch { /* ignore */ }
+            }
+          }
+          try { stream.end(); } catch { /* ignore */ }
+        };
         // `close` (not `exit`) fires after stdio has fully drained. Using `exit`
         // here let late `data` events arrive after the stream had been ended,
         // which truncates the tail.
@@ -114,13 +155,105 @@ export function setupChildLog(instance: string, fileName: string, foreground: bo
     };
   }
   // Daemon: hand the FD directly to the child so writes go straight to the
-  // file from the kernel's perspective. This survives child.unref() and the
-  // parent CLI exiting (a JS-level pipe would not — the parent owns it).
+  // file from the kernel's perspective. This survives `child.unref()` and the
+  // parent CLI exiting (a JS-level pipe would not — the parent owns the pipe
+  // and an active `'data'` listener keeps the parent's event loop alive,
+  // breaking the daemon-exit contract).
+  //
+  // The web.log redactor is foreground-only by design. In daemon mode
+  // `gini start` returns immediately and the operator typically uses
+  // `gini status` / log files; an unredacted secret in daemon-mode web.log
+  // is a documented tradeoff. The runtime-side `redact()` helper covers the
+  // gateway's own log emissions; the leak here is limited to the Next.js
+  // child's stdout, and `rotate-secret` invalidates that secret immediately.
   const fd = openSync(logPath, "a");
   return {
     stdio: ["ignore", fd, fd],
     onSpawned: () => { /* nothing to wire; FDs go to the kernel */ }
   };
+}
+
+// Build a per-instance redactor that scrubs the live tunnel.secret from a
+// log chunk. The secret is read from config.json with a brief cache so a
+// rotate-secret picks up the new value without re-creating the redactor.
+// The previous secret is held one cycle so an in-flight log line written
+// after rotation but referencing the old secret is still scrubbed.
+//
+// Chunk-boundary safety: child stdout `'data'` events flush at arbitrary
+// byte offsets, so a secret straddling two chunks would slip past a naive
+// per-chunk substring replace. The redactor retains up to `secret.length - 1`
+// trailing bytes per call and prepends them to the next chunk before
+// scanning, so any secret that ends inside the current chunk OR straddles
+// the next is caught. On flush (final chunk before stream end) the held
+// suffix is returned verbatim.
+interface WebLogRedactor {
+  /** Scrub the next chunk; may hold back up to 256 bytes as carry. */
+  (chunk: Buffer | string): string;
+  /** Flush any carry buffer at stream end. Returned text has already had the
+   *  final secret scan applied; the caller writes it to the stream before
+   *  closing. */
+  flush(): string;
+}
+
+const REDACTOR_CARRY_CAP = 256;
+
+function makeWebLogRedactor(instance: string): WebLogRedactor {
+  const PLACEHOLDER = "<redacted-secret>";
+  const CACHE_MS = 1_000;
+  let cachedSecret: string | null = null;
+  let cachedAt = 0;
+  let priorSecret: string | null = null;
+  let carry = "";
+  const readSecret = (): string | null => {
+    const now = Date.now();
+    if (cachedSecret !== null && now - cachedAt < CACHE_MS) return cachedSecret;
+    try {
+      // Use configPath() so GINI_STATE_ROOT is honored — without this the
+      // redactor reads a nonexistent file under HOME and emits the secret
+      // unredacted in non-default deployments (tests, alt state-roots).
+      const raw = readFileSync(configPath(instance), "utf8");
+      const parsed = JSON.parse(raw) as { tunnel?: { secret?: unknown } };
+      const next = typeof parsed.tunnel?.secret === "string" ? parsed.tunnel.secret : null;
+      if (next !== cachedSecret && cachedSecret) priorSecret = cachedSecret;
+      cachedSecret = next;
+      cachedAt = now;
+      return next;
+    } catch {
+      cachedAt = now;
+      return cachedSecret;
+    }
+  };
+  const redact = (chunk: Buffer | string): string => {
+    const secret = readSecret();
+    const raw = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    let text = carry + raw;
+    if (secret) text = text.split(secret).join(PLACEHOLDER);
+    if (priorSecret) text = text.split(priorSecret).join(PLACEHOLDER);
+    // Decide how many trailing bytes to retain as carry for the next chunk.
+    // The carry must be big enough to catch a secret that straddles the
+    // next boundary — i.e., `max(secret.length, priorSecret.length) - 1`.
+    // Capped at REDACTOR_CARRY_CAP bytes to bound memory.
+    const longest = Math.max(secret?.length ?? 0, priorSecret?.length ?? 0);
+    const carryLen = longest > 0 ? Math.min(longest - 1, REDACTOR_CARRY_CAP) : 0;
+    if (carryLen > 0 && text.length > carryLen) {
+      carry = text.slice(-carryLen);
+      return text.slice(0, -carryLen);
+    }
+    carry = text;
+    return "";
+  };
+  // Final flush — applied on stream close so the carry tail isn't dropped
+  // when the Next.js child exits without a trailing newline.
+  const flush = (): string => {
+    if (!carry) return "";
+    const secret = readSecret();
+    let text = carry;
+    if (secret) text = text.split(secret).join(PLACEHOLDER);
+    if (priorSecret) text = text.split(priorSecret).join(PLACEHOLDER);
+    carry = "";
+    return text;
+  };
+  return Object.assign(redact, { flush });
 }
 
 function readRecordedPort(path: string): number | null {

@@ -1,34 +1,36 @@
-// Next.js Proxy (renamed from middleware). Runs before each request and
-// gates everything except /setup and the API surface on the provider
-// being configured. If the gateway reports providerConfigured:false the
-// user is bounced to /setup so they can pick a provider before doing
-// anything else.
+// Next.js Proxy. Runs at the network boundary for every request not excluded
+// by the matcher below. Two responsibilities, in order:
 //
-// We hit the runtime directly through the BFF helpers (env override
-// falls back to ~/.gini/instances/<inst>/runtime.port + config.json),
-// the same source of truth the rest of the BFF reads from. Failures
-// (gateway down, network glitch) let the request through — we'd rather
-// show a degraded UI than a redirect loop when the runtime is the
-// problem.
+// 1. Tunnel proxy. Classify Host, gate on the secret-path bootstrap or the
+//    session cookie, stamp the `x-gini-tunnel-vetted: 1` marker on tunnel-
+//    branch forwards, and 404 anything else. Loopback callers (operator's
+//    own Mac) pass through without the marker. See
+//    docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
 //
-// No cache on the status answer. A previous version cached the result
-// for 2s, but that caused a race: when /setup POSTs a successful
-// provider, the page calls router.replace('/') *immediately* —
-// within the cache window. The proxy on `/` would then read stale
-// `providerConfigured:false` and bounce the user back to /setup. The
-// cost of always hitting the gateway is one sub-millisecond local
-// HTTP call per gated request — cheap, because the runtime is on the
-// same machine and the call hits a tiny in-memory check
-// (providerHealth + config). The matcher already excludes
-// /_next/static and /_next/image so static asset loading is unaffected.
+// 2. Setup gate. If no provider is configured the operator is bounced to
+//    /setup so the rest of the app doesn't render in a broken state.
+//
+// The proxy reads `tunnel.secret`, `tunnel.enabled`, and the live tunnel
+// public-URL host from disk on every request (uncached) — a `rotate-secret`
+// causes every outstanding cookie to mismatch on the very next request, a
+// `disable` 404s the next request even with a valid cookie, and a hostname
+// rotation after restart invalidates the host-only session cookie.
 
 import { NextResponse, type NextRequest } from "next/server";
 import { runtimeToken, runtimeUrl } from "@/lib/runtime";
+import { canonicalizePath } from "@/lib/canonicalize";
+import { parseTrustedOriginUrls } from "@/lib/trusted-origins";
+import {
+  TUNNEL_MARKER_HEADER,
+  TUNNEL_MARKER_VALUE,
+  buildTunnelCookie,
+  isTunnelDenied,
+  matchSecretPrefix,
+  readTunnelCookie,
+  tunnelSecretEquals
+} from "@/lib/tunnel-policy";
+import { readLiveTunnelHost, readTunnelConfigFromDisk } from "@/lib/tunnel-policy.server";
 
-// Upper bound on the round-trip to the local gateway's /api/setup/status.
-// The gateway is on 127.0.0.1 and the call hits a tiny in-memory check, so
-// the typical latency is sub-ms. We're guarding against a hung gateway —
-// don't make the user wait long when the runtime is genuinely down.
 const PROXY_STATUS_TIMEOUT_MS = 1500;
 
 async function isProviderConfigured(): Promise<boolean | null> {
@@ -38,43 +40,306 @@ async function isProviderConfigured(): Promise<boolean | null> {
       headers: { authorization: `Bearer ${runtimeToken()}` },
       signal: AbortSignal.timeout(PROXY_STATUS_TIMEOUT_MS)
     });
-    if (!response.ok) {
-      // 401 / 5xx — let the request through so the page can surface
-      // the real error rather than redirecting in a loop.
-      return null;
-    }
-    const data = await response.json() as { providerConfigured?: unknown };
+    if (!response.ok) return null;
+    const data = (await response.json()) as { providerConfigured?: unknown };
     return data.providerConfigured === true;
   } catch {
-    // Network error / gateway down — same logic as 5xx: don't redirect.
     return null;
   }
 }
 
+/** Per-request Host classifier. Three live lanes:
+ *
+ *  - `loopback`: the operator's own machine (`localhost` / `127.0.0.1` /
+ *    `[::1]`). Pass through with the setup gate; the marker is stripped.
+ *  - `tunnel`: the live trycloudflare hostname the runtime writes to the
+ *    `tunnel.publicUrl` sibling file on enable. Gated on the secret-prefix
+ *    bootstrap or the session cookie; the marker is stamped on forwards.
+ *  - `trusted`: a stable hostname the operator listed in
+ *    `GINI_TRUSTED_ORIGINS` (Tailscale, reverse proxy, whatever stable
+ *    front they own). The BFF's CSRF guard handles origin equality on
+ *    this lane; the proxy does NOT apply the tunnel's enabled / secret /
+ *    cookie checks here. Conflating the two would 404 every trusted
+ *    request whenever the tunnel was disabled — a real deployment hazard
+ *    for operators who don't use the cloudflare lane at all.
+ *
+ *  Anything else returns `unknown` and 404s before any secret/cookie
+ *  check — defends against DNS-rebinding to an attacker-controlled
+ *  hostname — see docs/adr/tunnel-and-mobile-access.md
+ *  "Architecture (summary)". */
+function classifyHost(hostHeader: string | null): "loopback" | "tunnel" | "trusted" | "unknown" {
+  if (!hostHeader) return "unknown";
+  const lower = hostHeader.toLowerCase();
+  const hostOnly = lower.includes("]")
+    ? lower.slice(0, lower.lastIndexOf("]") + 1)
+    : lower.includes(":") ? lower.slice(0, lower.indexOf(":")) : lower;
+  if (hostOnly === "localhost" || hostOnly === "127.0.0.1" || hostOnly === "[::1]") {
+    return "loopback";
+  }
+  // Equality match against the live tunnel hostname (NOT a suffix check on
+  // .trycloudflare.com — that would accept any cloudflare-issued host the
+  // attacker could mint). The runtime writes tunnel.publicUrl to a sibling
+  // file on enable; the proxy reads it per-request so a recycle or disable
+  // is visible on the very next hit.
+  const liveHost = readLiveTunnelHost();
+  if (liveHost) {
+    if (hostMatches(lower, liveHost)) return "tunnel";
+  }
+  // Share the env-var parse + validation with the BFF CSRF guard so the
+  // two lanes can't drift apart on what counts as a valid entry (entries
+  // with paths/queries/userinfo are rejected here as well as there, per
+  // the same fail-loud-on-typo posture). The proxy matches the Host
+  // header against `.host` (with default-port equivalence); the BFF
+  // matches the Origin header against `${protocol}//${host}` — same
+  // validated input, different match field.
+  const allowlist = parseTrustedOriginUrls(process.env.GINI_TRUSTED_ORIGINS);
+  if (allowlist) {
+    for (const url of allowlist) {
+      const entryHost = url.host.toLowerCase();
+      if (hostMatches(lower, entryHost)) return "trusted";
+    }
+  }
+  return "unknown";
+}
+
+/** Compare two Host header values applying the default-port equivalence rule
+ *  the BFF trust boundary enforces (see docs/adr/bff-trust-boundary.md):
+ *  `host` and `host:443` (HTTPS) or `host:80` (HTTP) are equivalent when
+ *  one side omits the port. */
+function hostMatches(inbound: string, candidate: string): boolean {
+  if (inbound === candidate) return true;
+  const splitPort = (h: string): { name: string; port: string | null } => {
+    if (h.startsWith("[")) {
+      const close = h.lastIndexOf("]");
+      const name = h.slice(0, close + 1);
+      const rest = h.slice(close + 1);
+      return { name, port: rest.startsWith(":") ? rest.slice(1) : null };
+    }
+    const idx = h.indexOf(":");
+    return idx < 0 ? { name: h, port: null } : { name: h.slice(0, idx), port: h.slice(idx + 1) };
+  };
+  const a = splitPort(inbound);
+  const b = splitPort(candidate);
+  if (a.name !== b.name) return false;
+  const isDefault = (port: string | null) => port === null || port === "443" || port === "80";
+  return isDefault(a.port) && isDefault(b.port);
+}
+
+function notFound(): NextResponse {
+  return new NextResponse("Not found", { status: 404 });
+}
+
+function stampVettedHeaders(headers: Headers): Headers {
+  const cloned = new Headers(headers);
+  cloned.delete(TUNNEL_MARKER_HEADER);
+  cloned.set(TUNNEL_MARKER_HEADER, TUNNEL_MARKER_VALUE);
+  return cloned;
+}
+
+function stripVettedHeaders(headers: Headers): Headers {
+  const cloned = new Headers(headers);
+  cloned.delete(TUNNEL_MARKER_HEADER);
+  return cloned;
+}
+
+function applyResponsePolicy(res: NextResponse): NextResponse {
+  // Outbound clicks send only the origin, never the path with the secret.
+  res.headers.set("referrer-policy", "strict-origin");
+  return res;
+}
+
 export async function proxy(request: NextRequest): Promise<NextResponse> {
-  const { pathname } = request.nextUrl;
-  // Public surfaces that must not be gated:
-  //   - /setup itself (otherwise infinite redirect)
-  //   - All /api/* (BFF must always be reachable for the /setup page to
-  //     hit /api/runtime/setup/status and /api/runtime/setup/provider)
-  //   - Next.js internals (_next/, favicon, etc.) — covered by the matcher
-  if (pathname.startsWith("/setup") || pathname.startsWith("/api/")) {
-    return NextResponse.next();
+  const url = request.nextUrl.clone();
+  const hostHeader = request.headers.get("host");
+  const classification = classifyHost(hostHeader);
+  const tunnel = readTunnelConfigFromDisk();
+  const canon = canonicalizePath(url.pathname);
+
+  // -------- LOOPBACK + TRUSTED BRANCHES --------
+  // Both lanes strip the marker (no upstream classifier proved anything; the
+  // BFF guard makes its own decision via loopback-Host or origin-allowlist).
+  // The tunnel-specific gates (enabled / secret / cookie) only belong on the
+  // tunnel lane — applying them to a trusted-host caller would 404 every
+  // request whenever the tunnel was disabled.
+  if (classification === "loopback" || classification === "trusted") {
+    const headers = stripVettedHeaders(request.headers);
+    const next = NextResponse.next({ request: { headers } });
+    // Setup gate runs ONLY on loopback. A tunneled phone or a Tailscale-front
+    // caller hitting / should not be redirected to /setup since /setup is a
+    // localhost-only experience.
+    if (classification === "loopback") {
+      const { pathname } = url;
+      if (!pathname.startsWith("/setup") && !pathname.startsWith("/api/") && !pathname.startsWith("/connect")) {
+        const configured = await isProviderConfigured();
+        if (configured === false) {
+          const setupUrl = new URL("/setup", request.url);
+          return applyResponsePolicy(NextResponse.redirect(setupUrl));
+        }
+      }
+    }
+    return applyResponsePolicy(next);
   }
-  const configured = await isProviderConfigured();
-  if (configured === false) {
-    const setupUrl = new URL("/setup", request.url);
-    return NextResponse.redirect(setupUrl);
+
+  if (classification === "unknown") {
+    return notFound();
   }
-  return NextResponse.next();
+
+  // -------- TUNNEL BRANCH --------
+  // canon errors land here as a 4xx before any secret/cookie check.
+  if (!canon.ok) {
+    return new NextResponse("Bad request", { status: 400 });
+  }
+  if (!tunnel.enabled) return notFound();
+
+  // Try secret-path bootstrap: /<secret>/<rest>. Use the shared matcher so
+  // the proxy and the policy module stay byte-equivalent.
+  const prefixMatch = matchSecretPrefix(canon.path, tunnel.secret);
+  if (prefixMatch) {
+    const postPrefix = prefixMatch.suffix;
+    if (isTunnelDenied(postPrefix, request.method)) {
+      return notFound();
+    }
+    // Redirect through /connect rather than straight to `/` so the operator's
+    // phone has a chance to hand off to the installed gini-mobile app via the
+    // `gini://connect?...` URL scheme. The /connect interstitial attempts the
+    // scheme handoff and falls back to the mobile web app on a
+    // visibilitychange timeout when the app isn't installed. We still mint
+    // the session cookie here so the web-app fallback is already authed —
+    // the user never has to re-enter the bootstrap URL after the scheme
+    // attempt fails. The mobile app, when it does take the handoff, uses
+    // the Bearer-token path on the proxy (see Bearer branch below) rather
+    // than the cookie.
+    //
+    // The origin must come from the inbound Host header (hostHeader, the
+    // tunnel hostname) rather than `url.host`, which reflects whatever
+    // Next.js sees internally (loopback when cloudflared rewrites). The
+    // tunnel branch only runs once `classifyHost` has confirmed the inbound
+    // Host equals the live tunnel hostname, so we know it's safe to encode
+    // as `https://<hostHeader>`. The /connect interstitial validates the
+    // resulting URL as an http/https URL before handing off; an empty or
+    // malformed Host would simply fail validation there.
+    const tunnelOrigin = `https://${hostHeader ?? ""}`;
+    const target = new URL(request.url);
+    target.pathname = "/connect";
+    target.search =
+      `?api=${encodeURIComponent(tunnelOrigin)}` +
+      `&web=${encodeURIComponent(tunnelOrigin)}` +
+      `&token=${encodeURIComponent(tunnel.secret)}`;
+    const redirect = NextResponse.redirect(target, 302);
+    redirect.headers.set("set-cookie", buildTunnelCookie(tunnel.secret));
+    // The 302 itself carries no-referrer so the brief /<secret>/ URL cannot
+    // leak via Referer on subresource fetches the destination page issues.
+    // See docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
+    redirect.headers.set("referrer-policy", "no-referrer");
+    redirect.headers.set("cache-control", "no-store");
+    return redirect;
+  }
+
+  // Cookie-bearing follow-up requests.
+  const cookieValue = readTunnelCookie(request.headers);
+  if (cookieValue && tunnelSecretEquals(cookieValue, tunnel.secret)) {
+    if (isTunnelDenied(canon.path, request.method)) {
+      return notFound();
+    }
+    const headers = stampVettedHeaders(request.headers);
+    return applyResponsePolicy(forwardTunnelRequest(url, request, headers));
+  }
+
+  // Bearer-token follow-up requests. The installed gini-mobile app receives
+  // the secret via the `gini://connect` deep link and sends it on every API
+  // call as `Authorization: Bearer <secret>` rather than as a cookie — the
+  // mobile RN runtime has no cookie jar that survives across app launches
+  // the way Safari does, so the Bearer path is the durable auth surface for
+  // the installed app. The compare uses the SAME constant-time helper as
+  // the cookie path so neither branch leaks the secret via timing.
+  const bearer = readTunnelBearer(request.headers);
+  if (bearer && tunnelSecretEquals(bearer, tunnel.secret)) {
+    if (isTunnelDenied(canon.path, request.method)) {
+      return notFound();
+    }
+    const headers = stampVettedHeaders(request.headers);
+    return applyResponsePolicy(forwardTunnelRequest(url, request, headers));
+  }
+
+  // A Bearer was supplied but didn't match the live tunnel secret — most
+  // commonly because the operator rotated the secret while the mobile app
+  // held a stale credential. Return a generic 401 so the mobile auth gate
+  // (`isUnauthorized`, which only matches 401) can drop the bearer and
+  // bounce the user to /setup. A 401 challenge does not reveal that this
+  // is a tunneled gateway specifically — any HTTPS endpoint can issue one
+  // — so the opacity property the 404 path defends is preserved on the
+  // unauthenticated surface below.
+  if (bearer) {
+    return new NextResponse("Unauthorized", { status: 401 });
+  }
+
+  // No bootstrap, no cookie, no Bearer — 404 (do NOT reveal the existence of
+  // the gateway via a richer error). A mismatched cookie also lands here:
+  // cookie-bearing requests are browser sessions, and a 401 would not help
+  // a browser that cannot programmatically clear its own cookie jar from
+  // an unauthenticated response, so the opaque 404 stays the right answer
+  // for that path.
+  return notFound();
+}
+
+/** Forward a vetted tunnel request to the BFF. Mobile clients build URLs as
+ *  `${origin}/api${path}` (e.g. `/api/agents`, `/api/chat/<id>/poll`), but
+ *  the BFF only exposes `/api/runtime/[...path]` — calls to bare `/api/*`
+ *  would 404 even after the proxy's auth gate passes. When the inbound
+ *  pathname is a non-`/api/runtime/` `/api/*` request, rewrite it internally
+ *  to `/api/runtime${rest}` so the existing route handler picks it up. The
+ *  vetted-marker headers ride along on the rewrite so the BFF still sees
+ *  the proof-of-classification stamp. Anything not under `/api/` (e.g.
+ *  `/`, `/connect`, app pages, `/_next/...`, `/icon.png`, `/favicon.ico`)
+ *  falls through to `NextResponse.next()` — those paths are handled by
+ *  Next.js's own routing, not by the BFF API tree, so no rewrite is
+ *  needed (and they are excluded from the matcher anyway in the static
+ *  asset cases). Paths already under `/api/runtime/...` are passed
+ *  through untouched to avoid double-prepending. */
+function forwardTunnelRequest(
+  url: URL,
+  request: NextRequest,
+  headers: Headers
+): NextResponse {
+  const pathname = url.pathname;
+  if (pathname.startsWith("/api/") && !pathname.startsWith("/api/runtime/")) {
+    const rewritten = new URL(
+      `/api/runtime${pathname.slice(4)}${url.search}`,
+      request.url
+    );
+    return NextResponse.rewrite(rewritten, { request: { headers } });
+  }
+  return NextResponse.next({ request: { headers } });
+}
+
+/** Extract the Bearer token from an `Authorization: Bearer <value>` header.
+ *  Returns null when the header is missing, malformed, or uses a different
+ *  scheme. The Authorization header itself is case-insensitive per HTTP
+ *  (handled by Headers.get); the scheme prefix is matched case-sensitively
+ *  with exactly one space because Bearer is the only shape gini-mobile
+ *  emits and we want a tight surface rather than a permissive parser. */
+function readTunnelBearer(headers: Headers): string | null {
+  const raw = headers.get("authorization");
+  if (!raw) return null;
+  const match = /^Bearer (.+)$/.exec(raw);
+  if (!match) return null;
+  return match[1];
 }
 
 export const config = {
-  // Exclude API routes (the BFF), Next.js static + image assets, and the
-  // favicon — proxy runs at request time and re-running it for every
-  // _next/static asset would be wasteful. We DO match the bare root path
-  // and any app route so the gating works end-to-end.
-  matcher: [
-    "/((?!api|_next/static|_next/image|favicon.ico).*)"
-  ]
+  // Exclude Next.js static assets and the dev-mode HMR endpoint — the proxy
+  // runs at request time and re-running for every /_next/static asset would
+  // be wasteful. `_next/webpack-hmr` is the dev server's WebSocket upgrade
+  // path; intercepting it as an HTTP request breaks the upgrade handshake,
+  // and the browser logs a steady stream of WS connection failures (one per
+  // reconnect attempt). Excluding it here lets Next.js's HMR WS upgrade run
+  // through to the dev server directly. The path doesn't exist in
+  // production builds. The match intentionally covers `/api/*` so the
+  // tunnel proxy gates BFF calls too.
+  // `icon.png` is the Next.js 16 metadata-route filename for the site
+  // favicon — public logo bytes, no sensitive payload. If the proxy gates
+  // it, a speculative favicon fetch from the bootstrap-redirect window
+  // (no cookie yet) 404s, and the browser caches that 404 across the
+  // session so even after auth lands the favicon stays missing.
+  matcher: ["/((?!_next/static|_next/image|_next/webpack-hmr|favicon.ico|icon.png).*)"]
 };

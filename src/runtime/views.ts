@@ -29,7 +29,7 @@ export function mobileBootstrap(config: RuntimeConfig) {
     events: state.events,
     jobRuns: state.jobRuns,
     chatSessions: state.chatSessions,
-    chatMessages: state.chatMessages,
+    chatMessages: state.chatMessages.filter((m) => m.kind !== "tool_transcript"),
     messagingMessages: state.messagingMessages,
     runs: state.runs,
     planSteps: state.planSteps
@@ -40,6 +40,7 @@ export function publicState(config: RuntimeConfig) {
   const state = readState(config.instance);
   return {
     ...state,
+    chatMessages: state.chatMessages.filter((m) => m.kind !== "tool_transcript"),
     pairingCodes: state.pairingCodes.map((pairing) => ({
       id: pairing.id,
       instance: pairing.instance,

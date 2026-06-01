@@ -32,6 +32,7 @@ import { notification } from "./commands/notifications";
 import { promotion } from "./commands/promotions";
 import { snapshot } from "./commands/snapshots";
 import { provider } from "./commands/provider";
+import { cacheWarmer } from "./commands/cache-warmer";
 import { trace } from "./commands/trace";
 import { audit } from "./commands/audit";
 import { events } from "./commands/events";
@@ -41,6 +42,7 @@ import { doctorCmd, install_, reset, runForeground, start, statusCmd, stop, unin
 import { setup } from "./commands/setup";
 import { autostart } from "./commands/autostart";
 import { identity } from "./commands/identity";
+import { tunnel } from "./commands/tunnel";
 
 export async function run(): Promise<void> {
   const args = Bun.argv.slice(2);
@@ -147,6 +149,8 @@ export async function run(): Promise<void> {
     case "snapshot":
     case "snapshots": snapshot(ctx); break;
     case "provider": await provider(ctx); break;
+    case "cache-warmer":
+    case "warmer": await cacheWarmer(ctx); break;
     case "trace": trace(ctx); break;
     case "audit": audit(ctx); break;
     case "events":
@@ -154,6 +158,7 @@ export async function run(): Promise<void> {
     case "evidence": evidence(ctx); break;
     case "smoke": await smoke(ctx); break;
     case "identity": await identity(ctx); break;
+    case "tunnel": await tunnel(ctx); break;
     default: help();
   }
 }

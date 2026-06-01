@@ -41,7 +41,15 @@ import { id, now } from "./ids";
 // each credential's cursor onto every device registered to that
 // credential. Sessions owned by credentials with no registered
 // devices are dropped (no devices → no badge to bias).
-export const MEMORY_SCHEMA_VERSION = 6;
+//
+// Bumped to 7 for devices.origin: tags each push-device row with the
+// network path it arrived over. New tunneled rows are flagged
+// `origin = 'tunnel'`; rows that came in over loopback (or any pre-v7
+// row backfilled by the ensureColumn helper) stay `origin = 'loopback'`.
+// rotateSecret / disable purge every `origin = 'tunnel'` row so a leaked
+// QR-bootstrap holder loses their APNs subscription as soon as the
+// operator rotates or disables the tunnel.
+export const MEMORY_SCHEMA_VERSION = 7;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -381,10 +389,20 @@ function applyMigrations(db: Database): void {
       platform TEXT NOT NULL CHECK (platform IN ('ios')),
       bundle_id TEXT NOT NULL,
       registered_at TEXT NOT NULL,
-      last_seen_at TEXT NOT NULL
+      last_seen_at TEXT NOT NULL,
+      origin TEXT NOT NULL DEFAULT 'loopback' CHECK (origin IN ('loopback','tunnel'))
     );
     CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
   `);
+  // Pre-v7 installs already have a devices table without the origin
+  // column; the CREATE TABLE IF NOT EXISTS above is a no-op against
+  // them. Add the column with the same default so legacy loopback
+  // registrations retain their identity instead of getting purged on
+  // the next rotate. Index creation is deferred until after the
+  // column exists, otherwise SQLite's parse-time validation would
+  // reject `CREATE INDEX ... ON devices(origin)` on the legacy shape.
+  ensureColumn(db, "devices", "origin", "TEXT NOT NULL DEFAULT 'loopback'");
+  db.exec("CREATE INDEX IF NOT EXISTS devices_by_origin ON devices(origin);");
 
   // Step 6 — chat_read_state table (schema version 6). Tracks the
   // last block id each device has acknowledged seeing on a given chat

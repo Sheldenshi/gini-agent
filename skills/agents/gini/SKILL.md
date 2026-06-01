@@ -149,8 +149,8 @@ persist, where a skill ends up).
 
 - `~/.gini/instances/<inst>/chrome-profile/` — Playwright Chromium
   profile; persistent browser sign-ins land here.
-- `~/.gini/instances/<inst>/skills/<category>/<name>/` — user-installed
-  skills (the agent's own writable skill dir).
+- `~/.gini/instances/<inst>/skills/<name>/` — user-installed skills (the
+  agent's own writable skill dir); these land flat, no category subfolder.
 - `skills/<category>/<name>/` (repo root) — built-in skills shipped with
   Gini.
 - `~/.gini/instances/<inst>/workspace/` — default workspace root for
@@ -485,9 +485,9 @@ Human-operator CLI mirror: `gini memory {retain|recall|reflect|units|banks|migra
 ## Skills
 
 Built-in skills live under the repo at `skills/<category>/<name>/SKILL.md`.
-User-installed skills land at
-`~/.gini/instances/<inst>/skills/<category>/<name>/SKILL.md`. The runtime
-loads both on boot.
+User-installed skills land flat at
+`~/.gini/instances/<inst>/skills/<name>/SKILL.md` (no category subfolder).
+The runtime loads both on boot.
 
 To enumerate skills from chat, `load_tools({ names: ["list_skills"] })`
 then call `list_skills({})` (filter via `{ status, nameContains }`). To

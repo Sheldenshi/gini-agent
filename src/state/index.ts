@@ -102,9 +102,10 @@ export {
   listAllDevices,
   getDevice,
   removeDevice,
-  removeDeviceForCredential
+  removeDeviceForCredential,
+  purgeTunnelDevices
 } from "./devices";
-export type { PushDevice, UpsertDeviceInput } from "./devices";
+export type { PushDevice, UpsertDeviceInput, DeviceOrigin } from "./devices";
 export {
   addSseSubscription,
   isDeviceWatching,
@@ -116,9 +117,12 @@ export {
 } from "./chat-session-events";
 export {
   markRead,
+  markUnread,
+  clearReadState,
   getLastReadByDevice,
   getReadState,
-  unreadCountForDevice
+  unreadCountForDevice,
+  unreadCountsByDevice
 } from "./chat-read-state";
 export type { ChatReadState } from "./chat-read-state";
 export {

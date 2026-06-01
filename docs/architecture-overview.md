@@ -124,9 +124,13 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
+## Off-LAN Access
+
+Cloudflare quick tunnels are the current off-LAN surface — the gateway manages a single `cloudflared` subprocess that bridges the loopback web port to a rotating `*.trycloudflare.com` URL, and the Next.js proxy gates inbound traffic on a per-instance secret (via cookie or `Authorization: Bearer`) before forwarding to the BFF. See [Tunnel And Mobile Access](./adr/tunnel-and-mobile-access.md) for the full trust model, auth paths, and deny list.
+
 ## Not Yet Built
 
-- Production relay for off-LAN access.
+- Production relay on a stable hostname (the current quick tunnel rotates on every gateway restart).
 - Push notification delivery.
 - LaunchAgent-style auto-start.
 

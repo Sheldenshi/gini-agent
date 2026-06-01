@@ -131,10 +131,13 @@ describe("chat session waiting-approval placeholder", () => {
     const paused = await waitForStatus(config, taskId, (t) => t.status === "waiting_approval");
     expect(paused.status).toBe("waiting_approval");
 
-    // No real persisted assistant ChatMessageRecord while waiting_approval.
+    // No real persisted assistant summary ChatMessageRecord while
+    // waiting_approval. The model-facing tool_transcript rows (the assistant
+    // tool_calls row persisted before the pause) are excluded — they are
+    // replay state, not the terminal summary the UI renders.
     let stateNow = readState(config.instance);
     let realAssistant = stateNow.chatMessages.find(
-      (m) => m.taskId === taskId && m.role === "assistant"
+      (m) => m.taskId === taskId && m.role === "assistant" && m.kind !== "tool_transcript"
     );
     expect(realAssistant).toBeUndefined();
 
@@ -160,7 +163,7 @@ describe("chat session waiting-approval placeholder", () => {
 
     stateNow = readState(config.instance);
     realAssistant = stateNow.chatMessages.find(
-      (m) => m.taskId === taskId && m.role === "assistant"
+      (m) => m.taskId === taskId && m.role === "assistant" && m.kind !== "tool_transcript"
     );
     expect(realAssistant).toBeDefined();
     expect(realAssistant?.content).toBe("All done.");

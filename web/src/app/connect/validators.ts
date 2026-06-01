@@ -1,0 +1,123 @@
+// Validators for the /connect deep-link interstitial. Extracted so the
+// security-sensitive parsing rules can be exercised by focused unit tests
+// without pulling in the Next.js page render path.
+
+export const DEFAULT_SCHEME = "gini://connect";
+export const DEFAULT_FALLBACK_MS = 1500;
+
+export function singleParam(value: string | string[] | undefined): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+export function validateHttpUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+// The `web` query param lands on a `redirect()` call when the visitor is
+// not on a mobile UA — so an attacker crafting
+//   https://<gini-host>/connect?api=...&web=https://phishing.example/...
+// could otherwise launder a desktop visitor straight to the phishing site
+// from a URL whose origin matches the operator's tunnel. Restrict the
+// fallback URL to the request origin so the redirect can only land back
+// on the host the user is already talking to. Compare full origins
+// (scheme + host + port) so substring confusion like `gini.example.evil`
+// vs `gini.example` is rejected.
+export function validateSameOriginUrl(
+  value: string | undefined,
+  requestOrigin: string,
+): string | undefined {
+  // `validateHttpUrl` already filters anything `new URL(value)` would
+  // throw on, so the second parse here is unconditionally safe.
+  const normalized = validateHttpUrl(value);
+  if (!normalized) return undefined;
+  const parsed = new URL(normalized);
+  if (parsed.origin !== requestOrigin) return undefined;
+  return normalized;
+}
+
+// The scheme value lands on `window.location.href` inside the
+// ConnectClient component. A `javascript:` URL with a crafted body
+// would execute same-origin JS that can fetch `/api/runtime/*` and
+// pivot through the BFF's bearer injection. Defenses, in order:
+//
+// 1. Reject by length cap so a degenerate-long payload doesn't even
+//    enter validation.
+// 2. Explicit case-insensitive blocklist for known script-execution
+//    schemes — `javascript:`, `data:`, `vbscript:`, `file:`, `blob:`,
+//    `about:`. The blocklist runs BEFORE the regex so a percent-encoded
+//    variant like `javascript%3A...` (which decodes once via Next.js
+//    searchParams to `javascript:...`) is caught before the next step.
+// 3. Structural shape: a real deep-link scheme is `<scheme>://<path>`
+//    with the scheme starting with a lowercase letter and the post-`://`
+//    body limited to alphanumerics + `.-_/+`. `javascript:` URLs cannot
+//    pass this shape because they don't have `://` followed by a
+//    well-formed path (and `javascript://...` is also blocklisted above).
+// 4. The shape disallows `%` so a doubly-encoded payload that only
+//    decodes once can't sneak the body past the regex.
+export const DANGEROUS_SCHEME_PREFIXES = ["javascript:", "data:", "vbscript:", "file:", "blob:", "about:"];
+export function validateScheme(value: string | undefined, fallback: string): string {
+  if (!value) return fallback;
+  if (value.length > 256) return fallback;
+  const lower = value.toLowerCase();
+  for (const bad of DANGEROUS_SCHEME_PREFIXES) {
+    if (lower.startsWith(bad)) return fallback;
+  }
+  if (!/^[a-z][a-z0-9+.\-]*:\/\/[A-Za-z0-9._\-/]+$/.test(value)) return fallback;
+  return value;
+}
+
+// The bearer token rides through to the app as a query param on the deep
+// link. The gateway mints tunnel secrets as 32-character base64url
+// strings via `generateTunnelSecret` in `src/runtime/tunnel/secret.ts`
+// (24 random bytes, base64url-encoded). Constrain the validator to that
+// exact shape — base64url charset (`[A-Za-z0-9_-]`) and the fixed 32-
+// character length — so the value we eventually set on
+// `window.location.href` cannot carry an attacker-controlled byte that
+// the broader printable set (`+/=:.~`) would have permitted. A real
+// token that fails this gate is a programmer bug, not an attacker; the
+// app will route the user to /setup to paste the token by hand instead
+// of silently saving garbage.
+const TUNNEL_SECRET_LENGTH = 32;
+export function validateToken(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  if (value.length !== TUNNEL_SECRET_LENGTH) return undefined;
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return undefined;
+  return value;
+}
+
+export function clampMs(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(250, Math.min(10_000, Math.floor(n)));
+}
+
+// The deep-link interstitial only makes sense on platforms that can route
+// a custom URL scheme (`gini://`) to an installed app. On a desktop
+// browser the scheme handoff is guaranteed to fail and the "Opening
+// Gini…" placeholder is just noise before the timed fallback ships the
+// user to the web app. Server-render a `redirect()` to `webUrl` directly
+// when the User-Agent isn't iOS / iPadOS / Android so the operator never
+// sees the interstitial flicker — the mobile path keeps the existing
+// scheme handoff + fallback machinery.
+//
+// iPadOS Safari (since iPadOS 13) sends a Mac-shaped User-Agent with no
+// `iPad`/`Mobile` token, indistinguishable from macOS Safari. We accept
+// macOS Safari too so iPad users with the native app get the scheme
+// handoff. macOS Safari users without the app see a `DEFAULT_FALLBACK_MS`
+// interstitial flicker before the client-side timed fallback ships them
+// to the web app — acceptable tradeoff. Other Mac browsers (Chrome,
+// Firefox, Edge) are excluded so they don't see the flicker.
+export const MOBILE_UA_PATTERN =
+  /\b(iPhone|iPad|iPod|Android)\b|Macintosh(?!.*Chrome).*Safari\//i;
+export function userAgentLooksMobile(ua: string | null | undefined): boolean {
+  if (!ua) return false;
+  return MOBILE_UA_PATTERN.test(ua);
+}

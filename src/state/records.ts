@@ -343,6 +343,14 @@ export function renameChatSession(state: RuntimeState, id: string, title: string
   return session;
 }
 
+// Monotonic counter stamped onto every chat message as `seq`. Several
+// transcript rows (assistant tool_calls + its paired tool results) can be
+// created within the same millisecond, so createdAt alone can't order them;
+// seq is the stable tiebreaker replay sorts on. It only needs to be monotonic
+// within a process run — across restarts createdAt differs, so a reset counter
+// is harmless.
+let chatMessageSeq = 0;
+
 export function createChatMessage(
   state: RuntimeState,
   message: Omit<ChatMessageRecord, "id" | "instance" | "createdAt">
@@ -351,6 +359,7 @@ export function createChatMessage(
     id: id("msg"),
     instance: state.instance,
     createdAt: now(),
+    seq: chatMessageSeq++,
     ...message
   };
   state.chatMessages.push(item);
@@ -360,7 +369,11 @@ export function createChatMessage(
     if (item.taskId && !session.taskIds.includes(item.taskId)) session.taskIds.push(item.taskId);
     if (item.runId && !session.runIds.includes(item.runId)) session.runIds.push(item.runId);
     session.updatedAt = item.createdAt;
-    if (item.role === "assistant") session.summary = item.content.slice(0, 240);
+    // Tool-transcript rows are model-facing replay state, not human-facing
+    // summaries; only let a real assistant turn drive the session summary.
+    if (item.role === "assistant" && item.kind !== "tool_transcript") {
+      session.summary = item.content.slice(0, 240);
+    }
   }
   return item;
 }
