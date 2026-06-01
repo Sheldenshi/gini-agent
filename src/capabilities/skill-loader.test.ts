@@ -153,6 +153,60 @@ describe("skill-loader frontmatter parsing", () => {
     // generic has no canonical credential name — no derived credentials.
     expect(parsed.requiredCredentials).toBeUndefined();
   });
+
+  // A model-authored near-miss: a TOP-LEVEL `gini:` block (the loader only
+  // reads metadata.gini) AND `requirements` misspelled for `requires`. Both
+  // deviations drop the credential silently; the warnings must name the key,
+  // suggest the fix, flag the placement, and state the credential was dropped.
+  test("parseSkillFile warns on top-level gini block + requirements typo (weather3-style)", () => {
+    const text = [
+      "---",
+      "name: weather3",
+      'description: "Check the weather."',
+      "gini:",
+      "  category: user",
+      "  requirements:",
+      "    credentials:",
+      "      - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.warnings).toBeDefined();
+    const joined = (parsed.warnings ?? []).join(" ");
+    // (a) names `requirements`
+    expect(joined).toContain("requirements");
+    // (b) suggests `requires`
+    expect(joined).toContain("requires");
+    // (c) notes the top-level-gini placement
+    expect(joined).toContain("metadata.gini");
+    expect(joined.toLowerCase()).toContain("not read by the loader");
+    // (d) states no credentials were registered
+    expect(joined).toContain("NO credential requirements");
+    // The credential silently vanished — exactly the failure we catch.
+    expect(parsed.requiredCredentials).toBeUndefined();
+  });
+
+  test("parseSkillFile produces no warnings for a correct metadata.gini.requires.credentials skill", () => {
+    const text = [
+      "---",
+      "name: weather3",
+      'description: "Check the weather."',
+      "metadata:",
+      "  gini:",
+      "    category: user",
+      "    requires:",
+      "      credentials:",
+      "        - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.warnings).toBeUndefined();
+    expect(parsed.requiredCredentials).toEqual(["WEATHER3_API_KEY"]);
+  });
 });
 
 describe("loadSkillsFromDisk", () => {

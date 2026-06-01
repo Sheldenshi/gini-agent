@@ -2145,7 +2145,8 @@ async function installSkillTool(
           skillId: installed.skill.id,
           name: installed.skill.name,
           manifestPath: installed.manifestPath,
-          validationIssues: installed.validation.issues
+          validationIssues: installed.validation.issues,
+          frontmatterWarnings: installed.validation.warnings
         }
       },
       { taskId: item.id }
@@ -2160,7 +2161,13 @@ async function installSkillTool(
   const issuesSuffix = installed.validation.issues.length > 0
     ? ` Warnings: ${installed.validation.issues.join("; ")}.`
     : "";
-  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}`;
+  // Surface advisory frontmatter near-misses prominently so the authoring
+  // model fixes them and re-installs — these flag a silently-dropped
+  // credential/connector declaration the skill is currently missing.
+  const warningsSuffix = installed.validation.warnings.length > 0
+    ? ` ⚠ Frontmatter warnings — fix and re-install: ${installed.validation.warnings.join("; ")}.`
+    : "";
+  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}${warningsSuffix}`;
 }
 
 // Enable / disable a registered skill. Wraps setSkillStatus, which

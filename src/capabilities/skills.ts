@@ -25,7 +25,10 @@ export interface InstallSkillInput {
 export interface InstallSkillResult {
   skill: SkillRecord;
   manifestPath: string;
-  validation: { ok: boolean; issues: string[] };
+  // `warnings` are advisory frontmatter near-misses (see
+  // detectGiniFrontmatterWarnings); they don't block install but flag a
+  // silently-dropped declaration so the caller can re-install corrected.
+  validation: { ok: boolean; issues: string[]; warnings: string[] };
 }
 
 // Persist a SKILL.md (and optional sidecar files) to the user-skills
@@ -91,7 +94,7 @@ export async function installSkillFromBody(
   return {
     skill,
     manifestPath,
-    validation: { ok: issues.length === 0, issues }
+    validation: { ok: issues.length === 0, issues, warnings: parsed.warnings ?? [] }
   };
 }
 

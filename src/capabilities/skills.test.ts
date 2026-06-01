@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { createSkill, mutateState, readState } from "../state";
 import type { RuntimeConfig, SkillRecord } from "../types";
-import { grantConnectorToSkill, revokeConnectorGrant, setSkillStatus, updateSkill } from "./skills";
+import { grantConnectorToSkill, installSkillFromBody, revokeConnectorGrant, setSkillStatus, updateSkill } from "./skills";
 
 const ROOT = "/tmp/gini-skills-capability-unit";
 
@@ -92,6 +92,50 @@ describe("setSkillStatus disable transition", () => {
     const enabled = await setSkillStatus(config(instance), skill.id, "enabled");
     expect(enabled.status).toBe("enabled");
     expect(enabled.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+  });
+});
+
+describe("installSkillFromBody frontmatter warnings", () => {
+  test("returns advisory warnings for a near-miss frontmatter without blocking install", async () => {
+    const instance = "skills-install-warn";
+    const body = [
+      "---",
+      "name: weather3",
+      "description: Check the weather.",
+      "gini:",
+      "  requirements:",
+      "    credentials:",
+      "      - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather3"
+    ].join("\n");
+    const result = await installSkillFromBody(config(instance), { body });
+    expect(result.validation.ok).toBe(true);
+    expect(result.validation.warnings.length).toBeGreaterThan(0);
+    expect(result.validation.warnings.join(" ")).toContain("requires");
+    // The dropped credential is reflected on the installed record.
+    expect(result.skill.requiredCredentials).toBeUndefined();
+  });
+
+  test("returns no warnings for a correct metadata.gini skill", async () => {
+    const instance = "skills-install-clean";
+    const body = [
+      "---",
+      "name: weather3",
+      "description: Check the weather.",
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      credentials:",
+      "        - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather3"
+    ].join("\n");
+    const result = await installSkillFromBody(config(instance), { body });
+    expect(result.validation.warnings).toEqual([]);
+    expect(result.skill.requiredCredentials).toEqual(["WEATHER3_API_KEY"]);
   });
 });
 

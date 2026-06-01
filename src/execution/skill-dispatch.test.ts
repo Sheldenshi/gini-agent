@@ -168,6 +168,50 @@ describe("install_skill dispatch", () => {
       dispatchToolCall(config, taskId, "install_skill", "call_no_body", JSON.stringify({}))
     ).rejects.toThrow(/body/);
   });
+
+  // A near-miss frontmatter (top-level `gini:` block + `requirements` typo)
+  // installs fine but its credential declaration is silently dropped. The
+  // tool result must surface the warning so the authoring model self-corrects.
+  test("surfaces frontmatter warnings in the result for a weather3-style skill", async () => {
+    const config = makeConfig("install-skill-warn");
+    const taskId = await seedTask(config);
+    const body = [
+      "---",
+      "name: weather3",
+      "description: Check the weather.",
+      "gini:",
+      "  category: user",
+      "  requirements:",
+      "    credentials:",
+      "      - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather3",
+      "",
+      "Fetch a forecast."
+    ].join("\n");
+    const result = await dispatchToolCall(config, taskId, "install_skill", "call_warn", JSON.stringify({ body }));
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    expect(result.result).toContain("⚠ Frontmatter warnings");
+    expect(result.result).toContain("requirements");
+    expect(result.result).toContain("requires");
+    // Audit evidence carries the warnings too.
+    const skill = readState(config.instance).skills.find((s) => s.name === "weather3");
+    const audit = readState(config.instance).audit.find(
+      (event) => event.action === "skill.installed" && event.target === skill!.id
+    );
+    expect((audit?.evidence?.frontmatterWarnings as string[] | undefined)?.length).toBeGreaterThan(0);
+  });
+
+  test("omits the frontmatter-warnings suffix for a clean skill", async () => {
+    const config = makeConfig("install-skill-clean");
+    const taskId = await seedTask(config);
+    const result = await dispatchToolCall(config, taskId, "install_skill", "call_clean", JSON.stringify({ body: SKILL_BODY }));
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    expect(result.result).not.toContain("⚠ Frontmatter warnings");
+  });
 });
 
 describe("enable_skill / disable_skill dispatch", () => {
