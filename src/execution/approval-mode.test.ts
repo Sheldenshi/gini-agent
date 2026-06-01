@@ -601,7 +601,7 @@ describe("approvalMode dispatch matrix", () => {
         provider,
         text: "",
         toolCalls: [
-          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "js", code: `Bun.spawn(["sudo", "apt", "update"])` }) } }
+          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "js", code: `Bun.spawn(["sudo", "-n", "true"])` }) } }
         ],
         finishReason: "tool_calls"
       });
@@ -609,9 +609,12 @@ describe("approvalMode dispatch matrix", () => {
 
       const task = await submitTask(config, "spawn sudo yolo", { mode: "chat" });
       const finished = await waitForTerminal(config, task.id);
-      // Yolo auto-approves the policy decision. The actual `sudo apt
-      // update` exec almost certainly fails in CI (no sudo /
-      // network), but the gate behavior is what we're pinning.
+      // Yolo auto-approves the policy decision. The argv still trips the
+      // `sudo` dangerous-source pattern, but `sudo -n true` is
+      // non-interactive (never prompts) and a no-op — it terminates in
+      // milliseconds on any runner regardless of sudo/network, so the
+      // task settles well inside the wait cap. The gate behavior is what
+      // we're pinning, not the exec outcome.
       expect(["completed", "failed"]).toContain(finished.status);
 
       const state = readState(config.instance);
