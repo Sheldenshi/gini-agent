@@ -16,7 +16,7 @@ import {
 } from "../state";
 import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
 import { uploadExists } from "../state/uploads";
-import { generateStructured } from "../provider";
+import { generateStructured, providerAuthFailureText, providerDisplayLabel } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
 
@@ -361,9 +361,14 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
       );
       return null;
     }
+    // A provider auth failure surfaces the same actionable, provider-named
+    // line the chat system note shows the web, so messaging/CLI/text-only
+    // clients aren't left with a bare "token expired" (issue #205).
     const content = task.status === "completed"
       ? task.summary ?? "Task completed."
-      : task.error ?? task.currentStep ?? `Task is ${task.status}.`;
+      : task.authErrorProvider
+        ? providerAuthFailureText(providerDisplayLabel(task.authErrorProvider))
+        : task.error ?? task.currentStep ?? `Task is ${task.status}.`;
     const message = createChatMessage(state, { sessionId, role: "assistant", content, taskId, runId: task.runId });
     if (task.runId) {
       const run = state.runs.find((item) => item.id === task.runId);

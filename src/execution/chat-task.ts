@@ -26,7 +26,9 @@ import {
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
 import {
+  ProviderAuthError,
   generateToolCallingResponse,
+  isAuthExpiredError,
   type ToolCallingMessage,
   type MessageContentPart,
   type ToolCall
@@ -1206,13 +1208,25 @@ async function runLoop(
     // ("Working: <toolName>") emit per dispatch inside the loop below.
     emitPhase(emitCtx, "Thinking");
 
-    const result = await generateToolCallingResponse(
-      config,
-      workingMessages,
-      providerTools,
-      onDelta,
-      effective.providerSource === "agent" ? effective.provider : undefined
-    );
+    let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
+    try {
+      result = await generateToolCallingResponse(
+        config,
+        workingMessages,
+        providerTools,
+        onDelta,
+        effective.providerSource === "agent" ? effective.provider : undefined
+      );
+    } catch (error) {
+      // Tag a provider auth failure with the provider that actually served
+      // this turn, so failTask names the right credential even if the active
+      // agent switched while the call was in flight (issue #205).
+      const message = error instanceof Error ? error.message : String(error);
+      if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+        throw new ProviderAuthError(effective.provider.name, message);
+      }
+      throw error;
+    }
     await flush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
 

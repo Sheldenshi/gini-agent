@@ -14,10 +14,10 @@ import { spawn } from "bun";
 import type {
   Authorization,
   ImageAttachment,
+  ProviderName,
   RuntimeConfig,
   RuntimeState,
   SetupRequest,
-  SystemNoteAuthError,
   Task
 } from "./types";
 import { statePath, traceDir } from "./paths";
@@ -70,7 +70,13 @@ function findApprovalRow(state: RuntimeState, id: string):
   if (setup) return { kind: "setup_request", row: setup };
   return undefined;
 }
-import { generateTaskSummary, isAuthExpiredError, providerDisplayLabel } from "./provider";
+import {
+  ProviderAuthError,
+  generateTaskSummary,
+  isAuthExpiredError,
+  providerAuthFailureText,
+  providerDisplayLabel
+} from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
 import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
@@ -787,25 +793,22 @@ export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
     });
 }
 
-// Shape the expired-credential system note for a failed chat turn: an
-// actionable sentence for text-only clients (CLI) plus structured metadata
-// the web chat renders as a "Re-authenticate <provider>" CTA (issue #205).
-// Resolves the provider the same way the chat loop does (effective context),
-// so the note names whichever provider actually served the turn. Returns
-// undefined defensively if resolution throws — the caller then falls back to
-// the raw provider message.
-function buildAuthErrorNote(
+// Identify the provider whose credential failed for a task failure, or
+// undefined when the failure isn't an auth error (issue #205). A
+// ProviderAuthError carries the exact provider that served the turn (captured
+// at the model-call site, accurate across an active-agent switch mid-call);
+// otherwise we best-effort match the message and resolve the current effective
+// provider. Resolution is defensive — a throw yields undefined and the caller
+// falls back to the raw provider message.
+function authProviderForFailure(
   config: RuntimeConfig,
-  rawMessage: string
-): { text: string; authError: SystemNoteAuthError } | undefined {
+  error: unknown,
+  message: string
+): ProviderName | undefined {
+  if (error instanceof ProviderAuthError) return error.provider;
+  if (!isAuthExpiredError(message)) return undefined;
   try {
-    const effective = resolveEffectiveContext(readState(config.instance), config);
-    const provider = effective.provider.name;
-    const providerLabel = providerDisplayLabel(provider);
-    return {
-      text: `${providerLabel} authentication expired. Re-authenticate ${providerLabel} to continue.`,
-      authError: { provider, providerLabel, detail: rawMessage }
-    };
+    return resolveEffectiveContext(readState(config.instance), config).provider.name;
   } catch {
     return undefined;
   }
@@ -813,6 +816,7 @@ function buildAuthErrorNote(
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
+  const authProvider = authProviderForFailure(config, error, message);
   const task = await mutateState(config.instance, (state) => {
     // The two `runTask(...).catch(failTask(...))` fire-and-forget call
     // sites in createTask/retryTask can race with test cleanup or a
@@ -832,6 +836,10 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     }
     task.status = "failed";
     task.error = message;
+    // Record the failed provider so syncChatTaskResult can render the same
+    // actionable, provider-named message for legacy/text-only clients that the
+    // chat system note shows the web (issue #205).
+    if (authProvider) task.authErrorProvider = authProvider;
     task.currentStep = "Failed";
     task.updatedAt = now();
     addAudit(
@@ -874,15 +882,17 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
         if (inFlight) {
           finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
         }
-        // When the turn died because the provider credential expired, replace
+        // When the turn died because the provider credential failed, replace
         // the raw provider line with an actionable note that names the
         // provider and carries re-auth metadata for the client CTA (issue
         // #205). Every other failure passes the raw message through unchanged.
-        const authNote = isAuthExpiredError(message)
-          ? buildAuthErrorNote(config, message)
-          : undefined;
-        if (authNote) {
-          emitSystemNote(emitCtx, authNote.text, authNote.authError);
+        if (authProvider) {
+          const providerLabel = providerDisplayLabel(authProvider);
+          emitSystemNote(emitCtx, providerAuthFailureText(providerLabel), {
+            provider: authProvider,
+            providerLabel,
+            detail: message
+          });
         } else {
           emitSystemNote(emitCtx, message);
         }

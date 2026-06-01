@@ -175,24 +175,27 @@ export function providerDisplayLabel(name: ProviderName): string {
 }
 
 // Detects provider errors that mean the user's credential must be
-// re-established — an expired/invalid/revoked token, a bare 401/unauthorized,
-// or an explicit "sign in again" / "re-authenticate" instruction.
-// Deliberately broader than CODEX_SESSION_EXPIRED_RE (which gates retries and
-// must avoid retrying generic failures): here a false positive only adds a
-// re-auth hint to a note we were already going to show, so the matcher favors
-// recall. An auth noun and an expiry/invalidity verb must sit within the same
-// sentence ([^.]{0,40}) and in either order, so unrelated failures ("the
-// cached file is invalid") don't trip it. The connector after each noun/verb
-// is `(?:[\s_-]|\b)` rather than a bare `\b` so the snake_case enum forms the
-// backend emits (`token_expired`, `session_expired`) match too — `_` is a word
-// char, so `\b` alone would miss them.
-const AUTH_NOUN = "(?:auth(?:enticat\\w*)?|session|token|credential|api[\\s_-]*key|access[\\s_-]*token)";
-const AUTH_VERB = "(?:expired|invalid|revoked|rejected|missing|failed)";
+// re-established — an expired/invalid/revoked/incorrect token, a bare 401/
+// unauthorized, or an explicit "sign in again" / "log in again" /
+// "re-authenticate" instruction. Deliberately broader than
+// CODEX_SESSION_EXPIRED_RE (which gates retries and must avoid retrying generic
+// failures): here a false positive only adds a re-auth hint to a note we were
+// already going to show, so the matcher favors recall. An auth noun and an
+// expiry/invalidity verb must sit within the same sentence ([^.]{0,40}) and in
+// either order, so unrelated failures ("the cached file is invalid") don't trip
+// it. The noun uses `auth\w*` so both "authentication" and "authorization"
+// match. The connector after each noun/verb is `(?:[\s_-]|\b)` rather than a
+// bare `\b` so the snake_case enum forms the backend emits (`token_expired`,
+// `session_expired`) match too — `_` is a word char, so `\b` alone would miss
+// them.
+const AUTH_NOUN = "(?:auth\\w*|session|token|credential|api[\\s_-]*key|access[\\s_-]*token)";
+const AUTH_VERB = "(?:expired|invalid|revoked|rejected|incorrect|missing|failed)";
 const AUTH_EXPIRED_RE = new RegExp(
   [
     "\\b401\\b",
     "\\bunauthorized\\b",
-    "sign(?:ing)?[\\s-]*in[\\s-]*again",
+    "(?:sign|log)(?:ing|ging)?[\\s-]*in[\\s-]*again",
+    "login[\\s-]*again",
     "re-?authenticate",
     `\\b${AUTH_NOUN}(?:[\\s_-]|\\b)[^.]{0,40}?${AUTH_VERB}\\b`,
     `\\b${AUTH_VERB}(?:[\\s_-]|\\b)[^.]{0,40}?${AUTH_NOUN}\\b`
@@ -203,6 +206,28 @@ const AUTH_EXPIRED_RE = new RegExp(
 export function isAuthExpiredError(message: string | undefined): boolean {
   if (!message) return false;
   return AUTH_EXPIRED_RE.test(message);
+}
+
+// Thrown in place of the raw provider error when a tool-calling / model call
+// fails on an auth error, tagging the provider that actually served the turn.
+// failTask reads `provider` off this so the re-auth note names the right
+// credential even if the active agent changed mid-call (issue #205).
+export class ProviderAuthError extends Error {
+  constructor(
+    readonly provider: ProviderName,
+    message: string
+  ) {
+    super(message);
+    this.name = "ProviderAuthError";
+  }
+}
+
+// Actionable copy for a failed provider credential, shared by the chat system
+// note and the legacy assistant message so every client surface says the same
+// thing. Neutral on the failure mode (the classifier matches expired, invalid,
+// revoked, 401, …), so it reads correctly for all of them.
+export function providerAuthFailureText(providerLabel: string): string {
+  return `${providerLabel} authentication failed. Re-authenticate ${providerLabel} to continue.`;
 }
 
 // OpenAI tool-calling shapes. We mirror the chat-completions API surface

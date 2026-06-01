@@ -584,6 +584,13 @@ export interface Task {
   // text mid-flight instead of waiting for the buffered final response.
   partialSummary?: string;
   error?: string;
+  // Provider whose credential failed when the task died on a provider auth
+  // error (expired/invalid/rejected token, 401). Captured at the model-call
+  // site so every render surface — the chat system note and the legacy
+  // assistant ChatMessageRecord — names the same provider and offers a re-auth
+  // CTA, even if the active agent changed while the call was in flight. See
+  // issue #205. Absent for non-auth failures.
+  authErrorProvider?: ProviderName;
   tracePath: string;
   auditIds: string[];
   approvalIds: string[];

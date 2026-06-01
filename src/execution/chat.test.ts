@@ -20,6 +20,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ProviderAuthError,
   clearEchoStructuredResponses,
   clearEchoToolCallingResponses,
   setEchoStructuredResponse,
@@ -448,7 +449,15 @@ describe("chat session waiting-approval placeholder", () => {
       providerLabel: "Codex",
       detail: "Provided authentication token is expired. Please try signing in again."
     });
-    expect(note.text).toContain("Codex authentication expired");
+    expect(note.text).toBe("Codex authentication failed. Re-authenticate Codex to continue.");
+
+    // The failed provider is recorded on the task so text-only clients
+    // (messaging/CLI) get the same actionable line via syncChatTaskResult,
+    // not the raw "token expired" message.
+    const failedTask = readState(config.instance).tasks.find((t) => t.id === taskId);
+    expect(failedTask?.authErrorProvider).toBe("codex");
+    const synced = await syncChatTaskResult(config, session.id, taskId);
+    expect(synced?.content).toBe("Codex authentication failed. Re-authenticate Codex to continue.");
 
     // A non-auth failure must NOT carry authError — the raw message passes
     // through as before.
@@ -480,6 +489,47 @@ describe("chat session waiting-approval placeholder", () => {
     if (plainNote?.kind !== "system_note") throw new Error("expected a system_note block");
     expect(plainNote.authError).toBeUndefined();
     expect(plainNote.text).toBe("Rate limit exceeded");
+  });
+
+  test("ProviderAuthError names the provider that served the turn, not the active one", async () => {
+    // The model-call site tags the failure with the provider it actually used.
+    // failTask must trust that over re-resolving the (possibly since-changed)
+    // active provider, so the CTA points at the right credential. See #205.
+    const config = {
+      ...buildConfig(workspaceRoot, "chat-fail-auth-provider"),
+      provider: { name: "codex" as const, model: "gpt-5-codex" }
+    };
+    const session = await createChat(config, { title: "auth-provider" });
+    const taskId = "task_authprovider";
+    await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: taskId,
+        title: "chat turn",
+        input: "do it",
+        status: "running",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "Thinking"
+      };
+      state.tasks.push(task);
+      const record = state.chatSessions.find((s) => s.id === session.id);
+      if (record) record.taskIds.push(task.id);
+    });
+
+    // Instance provider is codex, but the turn ran on openai — the tagged
+    // error wins.
+    await failTask(config, taskId, new ProviderAuthError("openai", "401 unauthorized"));
+
+    const note = listChatBlocks(config.instance, session.id).find((b) => b.kind === "system_note");
+    if (note?.kind !== "system_note") throw new Error("expected a system_note block");
+    expect(note.authError?.provider).toBe("openai");
+    expect(note.text).toBe("OpenAI authentication failed. Re-authenticate OpenAI to continue.");
   });
 
   test("auto-renames a default chat with a provider-generated title after two synced turns", async () => {

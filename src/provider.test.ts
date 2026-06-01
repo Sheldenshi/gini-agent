@@ -11,6 +11,7 @@ import {
   generateVisionAnalysis,
   isAuthExpiredError,
   normalizeProvider,
+  providerAuthFailureText,
   providerDisplayLabel,
   providerHealth,
   setEchoToolCallingResponse,
@@ -2967,7 +2968,12 @@ describe("auth-error classification", () => {
       "invalid access token",
       "token_expired",
       "API key is invalid",
-      "Please re-authenticate to continue"
+      "Please re-authenticate to continue",
+      "Authorization failed",
+      "Your authorization has expired",
+      "Incorrect API key provided",
+      "Please log in again",
+      "please login again"
     ];
     for (const message of positives) {
       expect(isAuthExpiredError(message)).toBe(true);
@@ -2996,5 +3002,11 @@ describe("auth-error classification", () => {
     expect(providerDisplayLabel("deepseek")).toBe("DeepSeek");
     expect(providerDisplayLabel("local")).toBe("Local");
     expect(providerDisplayLabel("echo")).toBe("Gini Echo");
+  });
+
+  test("providerAuthFailureText names the provider and the action", () => {
+    expect(providerAuthFailureText("Codex")).toBe(
+      "Codex authentication failed. Re-authenticate Codex to continue."
+    );
   });
 });
