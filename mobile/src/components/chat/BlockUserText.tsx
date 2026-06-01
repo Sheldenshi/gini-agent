@@ -1,7 +1,9 @@
-import { Image, StyleSheet, Text, View } from "react-native";
+import { Image, Pressable, StyleSheet, View } from "react-native";
 import { authHeader, uploadUrl } from "@/src/api";
+import { useImagePreview } from "@/src/components/ImagePreview";
 import { family, theme } from "@/src/theme";
 import type { UserTextBlock } from "@/src/types";
+import { SelectableBlockText } from "./SelectableBlockText";
 
 // Right-aligned dark bubble. The asymmetric corner geometry has a
 // sharper bottom-left so the bubble visually "points" toward the
@@ -18,27 +20,36 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
   // Gateway uploads require the same bearer token the SSE / REST paths
   // use; <Image> on RN supports a headers prop on its source object.
   const headers = authHeader();
+  const { open } = useImagePreview();
   return (
     <View style={styles.row}>
       {images.length > 0 ? (
         <View style={styles.imageGrid}>
-          {images.map((image) => (
-            <View key={image.id} style={styles.imageWrapper}>
-              <Image
-                source={{ uri: uploadUrl(image.id), headers }}
-                style={styles.image}
-                resizeMode="cover"
-                accessibilityLabel="Attached image"
-              />
-            </View>
-          ))}
+          {images.map((image) => {
+            const uri = uploadUrl(image.id);
+            return (
+              <Pressable
+                key={image.id}
+                style={styles.imageWrapper}
+                onPress={() => open({ uri, headers })}
+                accessibilityRole="button"
+                accessibilityLabel="Open image"
+              >
+                <Image
+                  source={{ uri, headers }}
+                  style={styles.image}
+                  resizeMode="cover"
+                />
+              </Pressable>
+            );
+          })}
         </View>
       ) : null}
       {hasText ? (
         <View style={styles.bubble}>
-          <Text style={styles.text} selectable>
+          <SelectableBlockText style={styles.text}>
             {block.text}
-          </Text>
+          </SelectableBlockText>
         </View>
       ) : null}
     </View>

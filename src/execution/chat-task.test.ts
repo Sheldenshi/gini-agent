@@ -16,17 +16,22 @@ import {
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
-import { submitTask, decideApproval } from "../agent";
+import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
 import {
+  bankIdForAgent,
   createChatSession,
   createEmptyState,
   createRun,
   createSubagentRecord,
   deleteChatSession,
+  ensureAgentBank,
+  ensureDefaultBank,
+  insertMemoryUnit,
   mutateState,
   now,
   readState
 } from "../state";
+import { echoEmbed } from "../embeddings";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
@@ -1046,12 +1051,22 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBeGreaterThan(0);
-    const system = calls[0]!.find((m) => m.role === "system");
-    const content = String(system?.content ?? "");
-    expect(content).toContain("Your runtime identity:");
-    expect(content).toContain(`- instance: ${config.instance}`);
-    expect(content).toContain(`- runtime port: ${config.port}`);
-    expect(content).toContain("- provider: echo/");
+    // The emitted identity now rides in the ephemeral role:"user" tail
+    // placed immediately before the real user message — NOT in the
+    // byte-stable system prefix. See ADR stable-system-prefix.md.
+    const turn = calls[0]!;
+    const system = turn.find((m) => m.role === "system");
+    const systemContent = String(system?.content ?? "");
+    expect(systemContent).not.toContain("Your runtime identity:");
+    const userIdx = turn.findIndex((m) => m.role === "user" && m.content === "what's your setup?");
+    expect(userIdx).toBeGreaterThan(0);
+    const tail = turn[userIdx - 1]!;
+    expect(tail.role).toBe("user");
+    const tailContent = String(tail.content ?? "");
+    expect(tailContent).toContain("Your runtime identity:");
+    expect(tailContent).toContain(`- instance: ${config.instance}`);
+    expect(tailContent).toContain(`- runtime port: ${config.port}`);
+    expect(tailContent).toContain("- provider: echo/");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1092,11 +1107,20 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBeGreaterThan(0);
-    const system = calls[0]!.find((m) => m.role === "system");
+    const turn = calls[0]!;
+    const system = turn.find((m) => m.role === "system");
     const content = String(system?.content ?? "");
     expect(content.startsWith(SUBAGENT_PROMPT)).toBe(true);
     expect(content).not.toContain("Your runtime identity:");
     expect(content).not.toContain("Runtime identity changes since last turn:");
+    // Subagents keep their single override prompt + the real user message:
+    // no ephemeral identity/memory tail is injected on the subagent path.
+    expect(turn.filter((m) => m.role === "user").length).toBe(1);
+    for (const m of turn) {
+      const text = String(m.content ?? "");
+      expect(text).not.toContain("Your runtime identity:");
+      expect(text).not.toContain("Runtime identity changes since last turn:");
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1156,11 +1180,18 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(2);
-    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
-    const secondSystem = String(calls[1]!.find((m) => m.role === "system")?.content ?? "");
-    expect(firstSystem).toContain("Your runtime identity:");
-    expect(secondSystem).not.toContain("Your runtime identity:");
-    expect(secondSystem).not.toContain("Runtime identity changes since last turn:");
+    // Identity now rides in the ephemeral role:"user" tail, so check every
+    // message of each turn — not just the (now identity-free) system prefix.
+    const firstTurnText = calls[0]!.map((m) => String(m.content ?? "")).join("\n");
+    const secondTurnText = calls[1]!.map((m) => String(m.content ?? "")).join("\n");
+    // First turn emits the full identity (in the tail); the system prefix
+    // itself never carries it anymore.
+    expect(firstTurnText).toContain("Your runtime identity:");
+    expect(String(calls[0]!.find((m) => m.role === "system")?.content ?? "")).not.toContain("Your runtime identity:");
+    // Quiet follow-up turn: no identity anywhere — neither system nor tail
+    // (and with nothing recalled, no tail message is injected at all).
+    expect(secondTurnText).not.toContain("Your runtime identity:");
+    expect(secondTurnText).not.toContain("Runtime identity changes since last turn:");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1208,6 +1239,215 @@ describe("chat-task loop", () => {
     await waitForTerminal(config, task.id);
 
     expect(readState(config.instance).identitySnapshots?.[sessionId]).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("message 0 is a byte-stable prefix across two turns in the same session", async () => {
+    // Headline cache contract: with no identity/skill/job/connector change
+    // between turns, the system message (message 0) must be byte-identical
+    // turn-to-turn so automatic provider prefix caching stays warm. Message 0
+    // is stable regardless of whether recall returns anything, because the
+    // per-turn-varying content (emitted identity, recalled memory) now lives
+    // in the ephemeral role:"user" tail rather than in message 0. See ADR
+    // stable-system-prefix.md.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-stable-prefix");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Stable prefix");
+      return session.id;
+    });
+
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "One.", toolCalls: [], finishReason: "stop" });
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "Two.", toolCalls: [], finishReason: "stop" });
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    expect(calls[0]![0]!.role).toBe("system");
+    expect(calls[1]![0]!.role).toBe("system");
+    // Byte equality of message 0 across the two turns is the whole point.
+    expect(calls[0]![0]!.content).toBe(calls[1]![0]!.content);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("delivers emitted identity then recalled memory in a role:user tail before the user message", async () => {
+    // Both per-turn blocks must still reach the model: the emitted identity
+    // (turn 1 of a session) and the recalled-memory block, in that order,
+    // inside a single role:"user" message placed immediately before the real
+    // user message. Recall is driven through the real pipeline with the echo
+    // embedder and the reranker pinned to `none` so it returns the seeded
+    // unit deterministically and offline.
+    const prevEmbed = process.env.GINI_EMBEDDING_PROVIDER;
+    const prevReranker = process.env.GINI_RERANKER_PROVIDER;
+    process.env.GINI_EMBEDDING_PROVIDER = "echo";
+    process.env.GINI_RERANKER_PROVIDER = "none";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-tail-delivery");
+    const provider = normalizeProvider(config.provider);
+    const MEMORY_TEXT = "the user keeps bees on a rooftop in Lisbon";
+
+    try {
+      // Active agent so resolveEffectiveContext yields a memory namespace and
+      // recall runs; seed one matching unit into that agent's bank.
+      const agentId = "agent_tail";
+      const sessionId = await mutateState(config.instance, (state) => {
+        state.agents.push({
+          id: agentId,
+          instance: state.instance,
+          name: "tail",
+          providerName: "echo",
+          model: "gini-echo-v0",
+          toolsets: [],
+          messagingTargets: [],
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        });
+        state.activeAgentId = agentId;
+        const session = createChatSession(state, "Tail delivery");
+        return session.id;
+      });
+      ensureDefaultBank(config.instance);
+      ensureAgentBank(config.instance, agentId);
+      insertMemoryUnit(config.instance, {
+        bankId: bankIdForAgent(agentId),
+        agentId,
+        text: MEMORY_TEXT,
+        embedding: echoEmbed(MEMORY_TEXT),
+        embeddingModel: "echo-embed-v0",
+        network: "world"
+      });
+
+      const runId = await mutateState(config.instance, (state) => {
+        const run = createRun(state, {
+          kind: "conversation_turn",
+          title: "Tail turn",
+          input: "intro",
+          conversationId: sessionId
+        });
+        return run.id;
+      });
+
+      setEchoToolCallingResponse({ provider, text: "Noted.", toolCalls: [], finishReason: "stop" });
+      const task = await submitTask(config, MEMORY_TEXT, { mode: "chat", runId });
+      const finished = await waitForTerminal(config, task.id);
+      expect(finished.status).toBe("completed");
+
+      const calls = getEchoToolCallingCalls();
+      expect(calls.length).toBeGreaterThan(0);
+      const turn = calls[0]!;
+      // The stable system prefix carries neither block anymore.
+      const systemContent = String(turn.find((m) => m.role === "system")?.content ?? "");
+      expect(systemContent).not.toContain("Your runtime identity:");
+      expect(systemContent).not.toContain("Long-term memory of prior conversations");
+      // The tail is the role:"user" message immediately before the real input.
+      const userIdx = turn.findIndex((m) => m.role === "user" && m.content === MEMORY_TEXT);
+      expect(userIdx).toBeGreaterThan(0);
+      const tail = turn[userIdx - 1]!;
+      expect(tail.role).toBe("user");
+      const tailContent = String(tail.content ?? "");
+      const identityIdx = tailContent.indexOf("Your runtime identity:");
+      const memoryIdx = tailContent.indexOf("Long-term memory of prior conversations");
+      expect(identityIdx).toBeGreaterThanOrEqual(0);
+      expect(memoryIdx).toBeGreaterThanOrEqual(0);
+      expect(tailContent).toContain(MEMORY_TEXT);
+      // Identity before memory, mirroring the old system-prompt order.
+      expect(identityIdx).toBeLessThan(memoryIdx);
+    } finally {
+      if (prevEmbed === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
+      else process.env.GINI_EMBEDDING_PROVIDER = prevEmbed;
+      if (prevReranker === undefined) delete process.env.GINI_RERANKER_PROVIDER;
+      else process.env.GINI_RERANKER_PROVIDER = prevReranker;
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("does not replay a prior turn's ephemeral tail on the next turn", async () => {
+    // The tail is built live and never persisted, so the next turn's prior
+    // transcript (priorChatMessages reads only durable chatMessages) must not
+    // contain the previous tail's identity/memory text. Turn 1 emits identity
+    // into its tail; turn 2's outgoing messages must carry none of it as
+    // replayed history. Recall is isolated (no active agent), so the only
+    // tail content under test is the turn-1 identity block.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-double-inject");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "No double inject");
+      return session.id;
+    });
+
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "One.", toolCalls: [], finishReason: "stop" });
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "Two.", toolCalls: [], finishReason: "stop" });
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    // Turn 1 emitted identity into its tail.
+    const firstTurnText = calls[0]!.map((m) => String(m.content ?? "")).join("\n");
+    expect(firstTurnText).toContain("Your runtime identity:");
+    // Turn 2's messages, EXCLUDING its own freshly-built tail, must not carry
+    // the prior turn's identity as replayed history. (The quiet second turn
+    // emits no identity of its own, so any occurrence would be a stale replay.)
+    const secondTurn = calls[1]!;
+    const userIdx = secondTurn.findIndex((m) => m.role === "user" && m.content === "second question");
+    const historyAndPrefix = secondTurn.filter((_, i) => i !== userIdx - 1);
+    const historyText = historyAndPrefix.map((m) => String(m.content ?? "")).join("\n");
+    expect(historyText).not.toContain("Your runtime identity:");
+    // Durable transcript rows likewise never include the tail.
+    const stored = readState(config.instance).chatMessages.filter((m) => m.sessionId === sessionId);
+    for (const m of stored) {
+      expect(String(m.content ?? "")).not.toContain("Your runtime identity:");
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1524,6 +1764,420 @@ describe("chat-task loop", () => {
 
     await mutateState(config.instance, (state) => deleteChatSession(state, session.id));
     expect(listChatBlocks(config.instance, session.id)).toHaveLength(0);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Tool-calling transcript persistence + replay (ADR
+  // agent-loop-tool-calling.md). A prior turn's assistant tool_calls and its
+  // paired role:"tool" results are persisted durably (kind:"tool_transcript")
+  // and replayed next turn so the model sees the structured results of its
+  // own earlier actions instead of re-deriving them.
+  test("a structured tool result from a prior turn is replayed on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-id");
+    const provider = normalizeProvider(config.provider);
+    const fixturePath = join(workspaceRoot, "issue.json");
+    // The "create issue" stand-in: a tool the loop dispatches synchronously
+    // whose result carries an id the agent must remember next turn.
+    const issueResult = JSON.stringify({ ok: true, issueId: "ISSUE-4242" });
+    writeFileSync(fixturePath, issueResult);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Issue thread" });
+
+    // Turn 1: read the file (returns the issue id), then a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_issue", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "issue.json" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Created issue ISSUE-4242.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "create an issue" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: the model just answers — we only care about the transcript it
+    // was handed.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Editing ISSUE-4242 as requested.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "now edit that issue" });
+    await waitForTerminal(config, second.taskId);
+
+    // Locate turn 2's provider call: the one whose user message is the
+    // second prompt.
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "now edit that issue")
+    );
+    expect(turn2).toBeDefined();
+
+    // The replayed transcript carries the assistant tool_calls message AND
+    // the paired role:"tool" result with the issue id.
+    const assistantToolCalls = turn2!.find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+    );
+    expect(assistantToolCalls).toBeDefined();
+    expect(assistantToolCalls!.tool_calls![0]!.id).toBe("call_issue");
+
+    const toolResult = turn2!.find((m) => m.role === "tool" && m.tool_call_id === "call_issue");
+    expect(toolResult).toBeDefined();
+    expect(String(toolResult!.content)).toContain("ISSUE-4242");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("two turns reusing the same tool_call_id each replay with their own result", async () => {
+    // The text-backstop path synthesizes call ids from name:args:index, so
+    // the same tool called with the same args on two turns yields an
+    // identical tool_call_id. Pairing must stay local to each assistant row:
+    // turn 1's call gets turn 1's result, turn 2's call gets turn 2's, even
+    // though both rows share the id.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-dupid");
+    const provider = normalizeProvider(config.provider);
+    const fixturePath = join(workspaceRoot, "state.txt");
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Dup-id thread" });
+
+    // Turn 1: read the file (content "FIRST"), reusing the colliding id.
+    writeFileSync(fixturePath, "FIRST");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_dup", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "state.txt" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read FIRST.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const first = await submitChatMessage(config, session.id, { content: "read it once" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: read the same file (now "SECOND") with the SAME tool_call_id.
+    writeFileSync(fixturePath, "SECOND");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_dup", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "state.txt" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read SECOND.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "read it again" });
+    await waitForTerminal(config, second.taskId);
+    await syncChatTaskResult(config, session.id, second.taskId);
+
+    // Turn 3: plain answer — we only inspect the transcript it was handed.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const third = await submitChatMessage(config, session.id, { content: "what changed?" });
+    await waitForTerminal(config, third.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn3 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "what changed?")
+    );
+    expect(turn3).toBeDefined();
+
+    // Both assistant tool_calls rows replay, each immediately followed by its
+    // OWN paired result — turn 1 with "FIRST", turn 2 with "SECOND".
+    const toolResults: string[] = [];
+    for (let i = 0; i < turn3!.length; i++) {
+      const m = turn3![i]!;
+      if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === "call_dup")) {
+        const next = turn3![i + 1];
+        expect(next?.role).toBe("tool");
+        expect(next?.tool_call_id).toBe("call_dup");
+        toolResults.push(String(next?.content ?? ""));
+      }
+    }
+    expect(toolResults.length).toBe(2);
+    expect(toolResults[0]).toContain("FIRST");
+    expect(toolResults[0]).not.toContain("SECOND");
+    expect(toolResults[1]).toContain("SECOND");
+    expect(toolResults[1]).not.toContain("FIRST");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a read_skill body from a prior turn persists into the next turn's transcript", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-skill");
+    const provider = normalizeProvider(config.provider);
+
+    const skill = await createSkillFromInput(config, {
+      name: "apple-notes",
+      description: "Apple Notes via memo CLI."
+    });
+    const skillBody = "# Apple Notes\n\nUse `memo notes -a` to add a note.";
+    await mutateState(config.instance, (state) => {
+      const item = state.skills.find((s) => s.id === skill.id)!;
+      item.body = skillBody;
+    });
+    await setSkillStatus(config, skill.id, "enabled");
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Skill thread" });
+
+    // Turn 1: read the skill, then answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_skill", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "apple-notes" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I now know how to use Apple Notes.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "how do I add an apple note?" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The skill body must be in the replayed transcript
+    // so the model need not re-read it (Claude Code skill behavior).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Adding your note now.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "add a note that says hi" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "add a note that says hi")
+    );
+    expect(turn2).toBeDefined();
+    const skillToolResult = turn2!.find((m) => m.role === "tool" && m.tool_call_id === "call_skill");
+    expect(skillToolResult).toBeDefined();
+    expect(String(skillToolResult!.content)).toContain("memo notes -a");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("the gated approval path persists and replays its tool result, keeping pairing valid", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-gated");
+    const provider = normalizeProvider(config.provider);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Gated thread" });
+
+    // Turn 1: request a file write (approval-gated), then answer after resume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_gated", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "out.txt", content: "from-agent" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Wrote the file as requested.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "create out.txt" });
+    const paused = await waitForTerminal(config, first.taskId);
+    expect(paused.status).toBe("waiting_approval");
+    const approvalId = paused.approvalIds[0]!;
+    await decideApproval(config, approvalId, "approve");
+    const finished = await waitForTerminal(config, first.taskId);
+    expect(finished.status).toBe("completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The gated tool's result must be replayed, and the
+    // assistant tool_calls row must be immediately followed by its paired
+    // role:"tool" result (provider ordering invariant).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "thanks" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "thanks")
+    );
+    expect(turn2).toBeDefined();
+
+    const assistantIdx = turn2!.findIndex(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((c) => c.id === "call_gated")
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    // The matching tool result must immediately follow its assistant message.
+    const nextMsg = turn2![assistantIdx + 1];
+    expect(nextMsg?.role).toBe("tool");
+    expect(nextMsg?.tool_call_id).toBe("call_gated");
+
+    // No orphan tool results: every role:"tool" message in the replay points
+    // at an assistant tool_call id that appears earlier in the same array.
+    const emittedCallIds = new Set<string>();
+    for (const m of turn2!) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) emittedCallIds.add(c.id);
+      }
+      if (m.role === "tool") {
+        expect(typeof m.tool_call_id).toBe("string");
+        expect(emittedCallIds.has(m.tool_call_id!)).toBe(true);
+      }
+    }
+
+    // The durable transcript rows exist in state.chatMessages but are
+    // excluded from the human-facing JSON view.
+    const { getChatSession } = await import("./chat");
+    const stored = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.kind === "tool_transcript"
+    );
+    expect(stored.length).toBeGreaterThan(0);
+    const view = getChatSession(config, session.id);
+    expect(view.messages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
+    // The full-state runtime views (/api/state, /api/mobile/bootstrap) must
+    // also drop transcript rows — they carry tool-call args and raw tool
+    // results (skill bodies, file contents) that have no place in a public
+    // state poll.
+    const { publicState, mobileBootstrap } = await import("../runtime/views");
+    expect(publicState(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+    expect(mobileBootstrap(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a gated tool that persists an approval_reason row still replays its call+result next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-gated-reason");
+    const provider = normalizeProvider(config.provider);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Connector thread" });
+
+    // Turn 1: request_connector (approval-gated) for a provider with no
+    // setupSkill, so it goes straight to a pending setup request. Unlike
+    // file_write, this path persists a plain assistant kind:"approval_reason"
+    // row BETWEEN the assistant tool_calls row and the on-resume tool result,
+    // which is exactly what the turn-window pairing must span.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_conn", type: "function", function: { name: "request_connector", arguments: JSON.stringify({ provider: "linear", reason: "list my open issues" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Connected to Linear.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "connect linear" });
+    const paused = await waitForTerminal(config, first.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    // An approval_reason row was persisted during dispatch — this is the
+    // interleaved non-tool row that the old window logic stopped at.
+    const reasonRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.kind === "approval_reason"
+    );
+    expect(reasonRows.length).toBeGreaterThan(0);
+
+    // Resolve the setup request the way the /complete handler does: the
+    // synthesized toolResult is fed back via resumeChatTask, which persists
+    // the gated tool result row.
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === first.taskId);
+    expect(setup).toBeDefined();
+    await resolveSetupRequest(config, setup!.id, "complete", {
+      actor: "user",
+      toolResult: "Connected to Linear. Proceed with the original request."
+    });
+    const finished = await waitForTerminal(config, first.taskId);
+    expect(finished.status).toBe("completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The gated tool's call+result must survive replay
+    // even though an approval_reason row sits between them in the transcript.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "thanks" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "thanks")
+    );
+    expect(turn2).toBeDefined();
+
+    const assistantIdx = turn2!.findIndex(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((c) => c.id === "call_conn")
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    // The matching tool result must immediately follow its assistant message.
+    const nextMsg = turn2![assistantIdx + 1];
+    expect(nextMsg?.role).toBe("tool");
+    expect(nextMsg?.tool_call_id).toBe("call_conn");
+    expect(String(nextMsg?.content)).toContain("Connected to Linear");
+
+    // No orphan tool results: every role:"tool" message in the replay points
+    // at an assistant tool_call id that appears earlier in the same array.
+    const emittedCallIds = new Set<string>();
+    for (const m of turn2!) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) emittedCallIds.add(c.id);
+      }
+      if (m.role === "tool") {
+        expect(typeof m.tool_call_id).toBe("string");
+        expect(emittedCallIds.has(m.tool_call_id!)).toBe(true);
+      }
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

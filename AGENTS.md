@@ -61,9 +61,13 @@ For code changes, run relevant tests plus broader checks when practical:
 
 ```bash
 bun run typecheck
-bun test
+bun run test
 bun run gini smoke
 ```
+
+`bun run test` runs the suite in parallel across files (`bun test --parallel`); bare `bun test` is serial. Keep the full suite under 6 seconds; profile a slow file with `bun test <file>` or `--reporter=junit`. A 10s per-test cap lives in `bun-test-setup.ts` (via the `bunfig.toml` preload).
+
+Fast-test rules: poll instead of `sleep`; make timeouts/intervals injectable; stub expensive deps (models, network, subprocesses); use unique temp dirs and ephemeral ports.
 
 For docs-only changes, at minimum sweep for stale links and terminology:
 
@@ -71,13 +75,13 @@ For docs-only changes, at minimum sweep for stale links and terminology:
 rg -n "v0|v1|v2|v3|lane|v1-readiness|single HTML|src/state\\.ts|src/api" README.md docs
 ```
 
-After a UI-related change or new feature, exercise it end-to-end on every surface it touches before declaring the task done. Don't stop at typecheck — drive the affected screen and confirm the change actually renders and behaves as intended:
+After a UI-related change or new feature, verify it end-to-end by driving the real running app the way the user would — through the browser — before declaring the task done. You are the user here: open the app, get to the change, and exercise it in context. Depending on the change, that's a **visual inspection** (does it render correctly — take a `screenshot` and look at it), a **flow** check (does the interaction path actually work — click, type, and navigate through it), or both.
 
-- Web changes (`web/`): run the Next.js dev server and drive the screen in a browser (Playwright MCP is fine).
-- Mobile changes (`mobile/`): run it on the iOS simulator (`bun run mobile:ios`) AND in the RN Web target (`cd mobile && bun run web`). The web target lets Playwright MCP drive the actual UI; the iOS simulator is what catches native-only behavior (long-press selection, gesture handling, native text input, etc.).
+- Web changes (`web/`): run the Next.js dev server and drive it in a browser with `agent-browser` (run `agent-browser skills get dogfood` first for the exploratory-QA workflow, or `skills get core` for the command reference). Walk the flow by `@ref` from `snapshot -i`, wait with `--load networkidle`, `screenshot` to eyeball the result, and check `errors`/`console` per page.
+- Mobile changes (`mobile/`): run it on the iOS simulator (`bun run mobile:ios`) AND in the RN Web target (`cd mobile && bun run web`). The web target lets `agent-browser` drive the actual UI (flow and visual check); the iOS simulator is what catches native-only behavior (long-press selection, gesture handling, native text input, etc.).
 - Shared changes that affect both: verify on both.
 
-"It compiles" is not "it works." Native RN behavior in particular often differs from RN Web (e.g. `selectable` on `<Text>` is a no-op on web because browser text is selectable by default), so a web-only check can pass while the native build is still broken.
+Don't stop at typecheck — "it compiles" and "the screen loaded" are not "it works." Native RN behavior in particular often differs from RN Web (e.g. `selectable` on `<Text>` is a no-op on web because browser text is selectable by default), so a web-only check can pass while the native build is still broken.
 
 ## Logs
 

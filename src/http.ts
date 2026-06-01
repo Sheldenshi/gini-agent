@@ -11,9 +11,11 @@ import {
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
+  markUnread,
   mutateState,
   now,
   readState,
+  unreadCountsByDevice,
   readTrace,
   readUpload,
   removeDeviceForCredential,
@@ -72,6 +74,7 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
+import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
 import { resumeChatTask } from "./execution/chat-task";
@@ -80,9 +83,60 @@ import { approvalToolCallId } from "./execution/tool-dispatch";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
-import { projectRoot } from "./paths";
+import { projectRoot, webPortPath } from "./paths";
+import { existsSync, readFileSync } from "node:fs";
+import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
+import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
+
+function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
+  return {
+    enabled: snapshot.enabled,
+    secret: null,
+    publicUrl: null,
+    // The revision is a SHA-256 prefix of the secret — non-reversible and
+    // safe to expose. The browser uses it as a cache-buster for the QR
+    // image. A tunneled browser doesn't actually need it (the launcher is
+    // hidden in tunneled contexts) but exposing it keeps the shape uniform.
+    secretRevision: snapshot.secretRevision,
+    // Transport indicator is non-secret — the client uses it to pick
+    // between SSE and the long-poll fallback for runtime events + chat
+    // streaming. Exposing it on the redacted shape lets the tunneled
+    // browser see the same value the privileged endpoint exposes.
+    tunnelTransport: snapshot.tunnelTransport,
+    lastError: snapshot.lastError,
+    // The typed error code is non-secret — clients use it to branch on
+    // failure mode without substring-matching the human-readable
+    // `lastError`. Mirrors the contract on the privileged endpoint.
+    lastErrorCode: snapshot.lastErrorCode,
+    // Constant, non-secret manual-install guidance — mirrors the privileged
+    // shape so the tunneled card can render the same fallback if cloudflared
+    // ever fails to install.
+    cloudflaredInstall: snapshot.cloudflaredInstall,
+    appleNotes: {
+      enabled: snapshot.appleNotes.enabled,
+      notesAvailable: snapshot.appleNotes.notesAvailable,
+      lastError: snapshot.appleNotes.lastError
+    }
+  };
+}
+
+function readWebPort(instance: string): number | null {
+  const p = webPortPath(instance);
+  if (!existsSync(p)) return null;
+  const raw = readFileSync(p, "utf8").trim();
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// `isSupervisedWebChild` lives in `./runtime/health-probe` and the
+// TunnelManager runs it inside its apply chain (swapCloudflared) as
+// the sole probe per enable transition. The PATCH /api/tunnel
+// handler no longer runs a pre-probe of its own — that would land
+// outside the apply chain and let concurrent enable/disable PATCH
+// requests reorder against the queue, silently overwriting the
+// later-issued operation.
 
 // Per-action audit row for connector.request completion. createConnector
 // and checkConnector emit their own connector.create / connector.health
@@ -129,6 +183,113 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
+    // Tunnel surface. /api/tunnel is the privileged shape (secret + publicUrl);
+    // /api/tunnel/redacted is the browser-safe shape (secret=null, publicUrl=null).
+    // See docs/adr/tunnel-and-mobile-access.md "Trust radius".
+    ["GET", /^\/api\/tunnel$/, () => json(tunnelManager(config).current())],
+    ["GET", /^\/api\/tunnel\/redacted$/, () => json(redactedSnapshot(tunnelManager(config).current()))],
+    ["PATCH", /^\/api\/tunnel$/, async (request) => {
+      const payload = await body(request);
+      const mgr = tunnelManager(config);
+      if (typeof payload.rotateSecret === "boolean" && payload.rotateSecret) {
+        const result = await mgr.rotateSecret();
+        if (!result.ok) return json({ error: result.error }, result.code ? 409 : 500);
+      }
+      if (typeof payload.enabled === "boolean") {
+        if (payload.enabled) {
+          const port = readWebPort(config.instance);
+          if (!port) return json({ error: "Web port unknown; start `gini run` first." }, 409);
+          // Health probe lives INSIDE the manager's apply chain
+          // (swapCloudflared). The previous version probed here before
+          // calling enable(), which created an ordering race: two
+          // PATCH requests issued in close succession (enable then
+          // disable) could land out of order because the enable's
+          // pre-probe await happens BEFORE the manager's queue slot,
+          // while disable's body parse is fast and disable enters the
+          // queue first. The later-issued disable then loses to the
+          // earlier-issued enable's probe-then-queue path, silently
+          // re-enabling a tunnel the operator just disabled. Calling
+          // mgr.enable() synchronously after body parse keeps queue
+          // arrival order = request order, so the later disable
+          // wins. The HTTP status keys off the typed `code` field on
+          // the manager's error payload: any operator-actionable code
+          // (web_port_unhealthy, cloudflared_unavailable, …) maps to
+          // 409 Conflict, while an absent code is a generic failure and
+          // maps to 500. The human-readable prose is for client
+          // display; the discrete code is what gates the mapping, so a
+          // reword of the message can't flip the status.
+          const result = await mgr.enable(port);
+          if (!result.ok) {
+            return json({ error: result.error }, result.code ? 409 : 500);
+          }
+        } else {
+          const result = await mgr.disable();
+          if (!result.ok) return json({ error: result.error }, 500);
+        }
+      }
+      if (payload.appleNotes && typeof payload.appleNotes === "object" && !Array.isArray(payload.appleNotes)) {
+        const desired = (payload.appleNotes as { enabled?: unknown }).enabled;
+        if (typeof desired === "boolean") {
+          const result = await mgr.setAppleNotesEnabled(desired);
+          if (!result.ok) return json({ error: result.error }, 500);
+        }
+      }
+      return json(mgr.current());
+    }],
+    ["POST", /^\/api\/tunnel\/refresh-notes$/, async () => {
+      const result = await tunnelManager(config).refreshNotes();
+      if (!result.ok) return json({ error: result.error }, 500);
+      return json(result.snapshot);
+    }],
+    ["GET", /^\/api\/tunnel\/qr\.svg$/, () => {
+      const mgr = tunnelManager(config);
+      const snap = mgr.current();
+      // Rotate window: the new on-disk secret is bonded to the OLD
+      // publicUrl until the recycle finishes. Handing out that mix
+      // would yield a bootstrap the old tunnel immediately rejects.
+      // Tell the caller to retry shortly; the rotate window is
+      // bounded by the cloudflared banner timeout.
+      if (mgr.isRotating() || !snap.publicUrl) {
+        return new Response(JSON.stringify({ error: "tunnel_rotating", retryAfterSec: 2 }), {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "retry-after": "2",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!snap.secret) {
+        return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+      const svg = renderQrSvg(bootstrapUrl(snap.publicUrl, snap.secret));
+      return new Response(svg, {
+        status: 200,
+        headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
+    ["GET", /^\/api\/tunnel\/qr\.txt$/, () => {
+      const mgr = tunnelManager(config);
+      const snap = mgr.current();
+      if (mgr.isRotating() || !snap.publicUrl) {
+        return new Response(JSON.stringify({ error: "tunnel_rotating", retryAfterSec: 2 }), {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "retry-after": "2",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!snap.secret) {
+        return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+      const ansi = renderQrAnsi(bootstrapUrl(snap.publicUrl, snap.secret));
+      return new Response(ansi, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
     ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
     ["POST", /^\/api\/update$/, () => {
       assertCurrentRuntimeUpdateSupported();
@@ -282,6 +443,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // to them anyway.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
       return chatBlockStream(config, request, params[0], deviceToken);
+    }],
+    // Long-polling fallback for chat-block streaming — used by clients
+    // talking to the gateway via a Cloudflare quick tunnel
+    // (`*.trycloudflare.com`), which drops SSE at the edge. Same event-
+    // emitter source as the SSE endpoint above; semantics documented on
+    // the chatBlockPoll helper. We skip the device-token registration
+    // here because per-device APNs suppression is keyed off live SSE
+    // subscriptions; a polling client doesn't hold the socket the
+    // dispatcher uses to detect "watching now", so its completion
+    // pushes are not suppressed (correct, since the client is on a
+    // tunnel and may not have foreground attention anyway).
+    ["GET", /^\/api\/chat\/([^/]+)\/poll$/, (request, params) => {
+      return chatBlockPoll(config, request, params[0]);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -836,6 +1010,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
+    // Long-polling fallback for runtime events — used by clients hitting
+    // gateway via a Cloudflare quick tunnel (`*.trycloudflare.com`), which
+    // drops SSE at the edge. Same event source as the SSE endpoint;
+    // semantics are documented above the eventsPoll helper.
+    ["GET", /^\/api\/events\/poll$/, (request) => eventsPoll(config, request)],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);
@@ -1019,8 +1198,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // POST /api/skills accepts two payload shapes per ADR connector-provider-spec-compliance.md:
     //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
     //     flow used by the install-skill meta-skill and remote/mobile UIs.
-    //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/
-    //     and reloads.
+    //     Writes the manifest flat to ~/.gini/instances/<instance>/skills/<name>/
+    //     and reloads. User skills never nest under a category subfolder.
     //   - legacy CRUD payload (`name`, `description`, `steps`, …): create
     //     an in-memory SkillRecord without a manifest file.
     ["POST", /^\/api\/skills$/, async (request) => {
@@ -1032,7 +1211,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           : undefined;
         return json(await installSkillFromBody(config, {
           body: String(payload.body),
-          category: typeof payload.category === "string" ? payload.category : undefined,
           files
         }), 201);
       }
@@ -1170,11 +1348,41 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!token) return json({ error: "token is required" }, 400);
       if (platform !== "ios") return json({ error: "platform must be 'ios'" }, 400);
       if (!bundleId) return json({ error: "bundleId is required" }, 400);
+      // The BFF forwards the proxy-stamped `x-gini-tunnel-vetted: 1`
+      // marker on tunneled requests. We tag the resulting row with its
+      // origin so rotateSecret / disable can purge every tunneled
+      // registration without disturbing loopback rows.
+      const vetted = request.headers.get("x-gini-tunnel-vetted") === "1";
+      // Recheck the live tunnel state under the marker so a request that
+      // passed the proxy gate before tunnel.disable runs can't sneak a
+      // new tunnel-origin row in AFTER the purge runs. Mobile retries
+      // the registration once /api/tunnel reports the new state, so a
+      // 503 + Retry-After is the cooperative answer here. The bearer
+      // reaching this handler is the BFF-injected runtime token, not
+      // the proxy's tunnel secret, so the recheck gates on the
+      // enabled/secret-presence state rather than a bearer comparison —
+      // a rotated-secret in-flight request still satisfies
+      // `enabled && secret`, and the new row stays attributable to a
+      // surviving credential.
+      if (vetted) {
+        const live = tunnelManager(config).current();
+        if (!live.enabled || !live.secret) {
+          return new Response(
+            JSON.stringify({ error: "tunnel_state_changed" }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json", "Retry-After": "2" }
+            }
+          );
+        }
+      }
+      const origin = vetted ? "tunnel" : "loopback";
       const device = upsertDevice(config.instance, {
         token,
         credentialId: credential,
         platform: "ios",
-        bundleId
+        bundleId,
+        origin
       });
       return json({ ok: true, device });
     }],
@@ -1228,6 +1436,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
       return json({ ok: true, readState: result });
     }],
+    // Mark a chat unread for the calling device. Pins the read cursor
+    // to the block before the latest assistant_text so the badge
+    // settles at "just the agent's last turn" (typically 1), matching
+    // iOS Mail / Messages behavior — not "every block since session
+    // start". Sessions with no assistant_text fall back to clearing
+    // the cursor entirely so the action still surfaces them as unread.
+    ["DELETE", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const sessionId = params[0];
+      if (!readState(config.instance).chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      markUnread(config.instance, sessionId, dev.token);
+      return json({ ok: true });
+    }],
     ["GET", /^\/api\/badge$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
@@ -1236,6 +1462,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
       const unread = unreadCountForDevice(config.instance, dev.token);
       return json({ unread });
+    }],
+    // Per-session unread counts for the calling device. Powers the
+    // mobile chat list's per-row badge (blue pill + count) — /badge
+    // gives the cross-session total, /unread gives the breakdown so
+    // the list can mark each row independently. Sessions with zero
+    // unread blocks are omitted; callers default to 0.
+    ["GET", /^\/api\/unread$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const counts = unreadCountsByDevice(config.instance, dev.token);
+      return json({ counts: Object.fromEntries(counts) });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
@@ -1311,6 +1550,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const payload = await body(request);
       const providerName = typeof payload.provider === "string" ? payload.provider : "";
       const result = removeSetupProvider(config, providerName);
+      return json(result, result.ok ? 200 : 400);
+    }],
+    // Cache warmer: model-agnostic, single-integer-of-state knob. GET
+    // returns the persisted minutes (0 = disabled), POST validates and
+    // saves. The runtime loop in src/server.ts reads `config.cacheWarmerMinutes`
+    // every tick, so a POST takes effect on the next loop iteration
+    // without needing a restart or any pub/sub plumbing.
+    ["GET", /^\/api\/settings\/cache-warmer$/, () => json(getCacheWarmer(config))],
+    ["POST", /^\/api\/settings\/cache-warmer$/, async (request) => {
+      const payload = await body(request);
+      const result = setCacheWarmer(config, payload);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
@@ -1821,6 +2071,189 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
   return 500;
+}
+
+// Long-polling fallback constants — used by `/api/events/poll` and
+// `/api/chat/:id/poll`, the JSON-over-HTTP mirrors of the SSE endpoints
+// below. Cloudflare quick tunnels (`*.trycloudflare.com`) drop
+// `text/event-stream` at the edge, so any tunneled client (web or
+// mobile) hitting a quick-tunnel host must use these endpoints instead.
+// See `src/runtime/tunnel/transport.ts` for the classifier the clients
+// consult.
+//
+// LONG_POLL_TIMEOUT_MS = 25_000: an idle long-poll resolves with an
+// empty `events` array after this. 25 s sits comfortably under the
+// 30 s timeout most proxies enforce on hung requests so we don't get
+// cut off mid-flight, and is long enough that an idle session doesn't
+// burn through HTTP overhead on every short poll.
+//
+// LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS = 25: once at least one event
+// has arrived, wait 25 ms before resolving so a burst (e.g. a chat
+// task firing multiple chat_block updates in one tick) coalesces into
+// a single response instead of N tiny ones. The coalesce delay is
+// short enough to feel real-time to the user; longer would smear
+// streaming-text deltas perceptibly.
+const LONG_POLL_TIMEOUT_MS = 25_000;
+const LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS = 25;
+
+// Mirrors `eventStream` semantics: returns events whose id is past
+// `since`, with a 25_000 ms idle timeout and a 25 ms post-first-event
+// flush window. The event-source is the same ring buffer the SSE
+// endpoint reads from (`readState(...).events`), polled at the same
+// 1 s cadence — no event emitter to subscribe to for this surface.
+// Resolves with the events accumulated since the cursor plus a fresh
+// cursor (the last event's id, or `since` unchanged on idle). Returns
+// `application/json` so Cloudflare's quick-tunnel proxy treats it as
+// an ordinary HTTP response and doesn't strip it.
+function eventsPoll(config: RuntimeConfig, request: Request): Promise<Response> {
+  const since = new URL(request.url).searchParams.get("since") ?? "";
+  // Promise.withResolvers lets us hand the timer + interval the same
+  // resolver without wrapping a `new Promise((res) => …)` callback.
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let resolved = false;
+  let interval: Timer | undefined;
+  let timeoutTimer: Timer | undefined;
+  let coalesceTimer: Timer | undefined;
+  let accumulated: unknown[] = [];
+
+  const finish = (cursor: string): void => {
+    if (resolved) return;
+    resolved = true;
+    if (interval) clearInterval(interval);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    resolve(Response.json({ events: accumulated, cursor }));
+  };
+
+  // Honor client cancellation. AbortSignal fires on browser navigation
+  // away / fetch abort; unsubscribing immediately keeps the gateway
+  // from accumulating dead timers behind clients that hung up.
+  request.signal.addEventListener("abort", () => {
+    // Match the empty-result shape so a cancelled poll doesn't claim
+    // it received events it never delivered.
+    finish(since);
+  });
+
+  // The poll resolves when EITHER (a) at least one event has been
+  // accumulated AND LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS ms have
+  // elapsed since the first event landed, OR (b) LONG_POLL_TIMEOUT_MS
+  // ms have elapsed total. Walking the ring buffer at 1 s matches the
+  // SSE endpoint's polling cadence; there's no event-emitter to
+  // subscribe to for runtime events.
+  const check = (): void => {
+    if (resolved) return;
+    const events = readState(config.instance).events.slice().reverse();
+    const cutoff = since ? events.findIndex((e) => e.id === since) : -1;
+    // Slice off the events past the cursor. cutoff < 0 means the cursor
+    // rolled out of the 1000-entry ring (or no cursor was given), so we
+    // return everything currently retained.
+    const fresh = cutoff >= 0 ? events.slice(cutoff + 1) : events;
+    if (fresh.length === 0) return;
+    accumulated = fresh;
+    if (!coalesceTimer) {
+      const last = fresh[fresh.length - 1];
+      const cursor = last && typeof last === "object" && "id" in last && typeof last.id === "string"
+        ? last.id
+        : since;
+      coalesceTimer = setTimeout(() => finish(cursor), LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    }
+  };
+
+  check();
+  if (!resolved) {
+    interval = setInterval(check, 1_000);
+    timeoutTimer = setTimeout(() => finish(since), LONG_POLL_TIMEOUT_MS);
+  }
+  return promise;
+}
+
+// Mirrors `chatBlockStream` semantics over long-polling. The
+// subscription source is `subscribeChatBlocks` (the same event-emitter
+// the SSE path uses), which fires AFTER the SQLite commit so we
+// observe durable rows. Cursor is the SSE wire id (`<block_id>:<ts>`)
+// the client received last; if the client has never connected we fall
+// back to the full block list via `listChatBlocksAfter(null)`.
+function chatBlockPoll(config: RuntimeConfig, request: Request, sessionId: string): Promise<Response> {
+  const state = readState(config.instance);
+  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+    return Promise.resolve(json({ error: `Chat session not found: ${sessionId}` }, 404));
+  }
+  const since = new URL(request.url).searchParams.get("since") ?? "";
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let resolved = false;
+  let unsubscribe: (() => void) | undefined;
+  let timeoutTimer: Timer | undefined;
+  let coalesceTimer: Timer | undefined;
+  const accumulated: ChatBlock[] = [];
+
+  // The cursor we return is `<block_id>:<ts>` (matching the SSE id
+  // line) of the last block in the response so the next poll resumes
+  // from the exact same point. listChatBlocksAfter parses the suffix
+  // to detect in-place upserts on the cursor row.
+  const wireId = (block: ChatBlock): string => {
+    const ts =
+      block.kind === "assistant_text" || block.kind === "tool_call"
+        ? block.updatedAt
+        : block.createdAt;
+    return `${block.id}:${ts}`;
+  };
+
+  const finish = (cursor: string): void => {
+    if (resolved) return;
+    resolved = true;
+    if (unsubscribe) unsubscribe();
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    resolve(Response.json({ events: accumulated, cursor }));
+  };
+
+  request.signal.addEventListener("abort", () => {
+    finish(since);
+  });
+
+  // Initial backfill — same as the SSE path's start() handler. If the
+  // cursor is fresh enough to be present in chat_blocks, replay only
+  // missing rows; otherwise replay everything (the gateway caps
+  // listChatBlocksAfter's fallback behavior).
+  const backfill = listChatBlocksAfter(config.instance, sessionId, since || null);
+  for (const block of backfill) {
+    accumulated.push(block);
+  }
+  if (accumulated.length > 0) {
+    // Read the latest entry INSIDE the timer callback rather than
+    // freezing the backfill's last block in this closure. If a newer
+    // block lands on the live subscription within the 25 ms coalesce
+    // window, it pushes onto `accumulated`; the cursor we return must
+    // reflect THAT block, not the backfill's. Otherwise the client's
+    // next poll resumes from the backfill cursor and re-receives the
+    // newer block on top of the one it just got.
+    coalesceTimer = setTimeout(() => {
+      const last = accumulated[accumulated.length - 1]!;
+      finish(wireId(last));
+    }, LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+  }
+
+  // Live subscription for blocks that land after the backfill snapshot.
+  // The dedup gate stays loose: assistant_text streaming deltas reuse
+  // the same block id with growing payloads, so id-dedup would drop
+  // intermediate frames. Instead we accept every emitted block; the
+  // client upserts by id and the last seen `<id>:<ts>` is what we
+  // return as the cursor.
+  unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
+    if (resolved) return;
+    accumulated.push(block);
+    if (!coalesceTimer) {
+      coalesceTimer = setTimeout(() => {
+        const last = accumulated[accumulated.length - 1]!;
+        finish(wireId(last));
+      }, LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    }
+  });
+
+  if (!resolved) {
+    timeoutTimer = setTimeout(() => finish(since), LONG_POLL_TIMEOUT_MS);
+  }
+  return promise;
 }
 
 function eventStream(config: RuntimeConfig, request: Request): Response {

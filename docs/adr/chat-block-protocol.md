@@ -83,7 +83,14 @@ remote previews, screen readers) would need the same translation code.
   `createdAt`, optional `taskId`/`runId`, plus the kind-specific
   fields. `AssistantTextBlock` also carries `updatedAt` and a
   `streaming` flag; `ToolCallBlock` carries `updatedAt` and a `status`
-  in `{ running, ok, error, denied }`.
+  in `{ running, ok, error, denied }`, and an optional `runningHint`
+  string. The hint is advisory context a tool emits while parked in
+  `running` to explain why it's waiting and what (if anything) the
+  user can do to unblock it; clients MAY render a hint-bearing row
+  more prominently than a bare running row. It's reserved for tools
+  that block on an external event the agent cannot drive (today only
+  `wait_for_messaging_pair`, waiting on an inbound Telegram DM up to
+  600s) and is cleared automatically when status leaves `running`.
 
 - Persistence in `src/state/chat-blocks.ts`. SQLite is the source of
   truth, not the JSON `RuntimeState` blob. `ordinal` is allocated as

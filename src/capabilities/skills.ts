@@ -12,10 +12,6 @@ export async function reloadSkills(config: RuntimeConfig): Promise<SkillLoadResu
 export interface InstallSkillInput {
   // Raw SKILL.md contents (frontmatter + body).
   body: string;
-  // Optional category override. When omitted, falls back to
-  // metadata.gini.category or "user". The resulting file lives at
-  // `<instance>/skills/<category>/<name>/SKILL.md`.
-  category?: string;
   // Optional named-file payloads written next to SKILL.md
   // (e.g. `scripts/linear.sh`). Each entry's `name` is treated as a
   // relative path under the skill folder and must not escape it.
@@ -31,11 +27,14 @@ export interface InstallSkillResult {
   validation: { ok: boolean; issues: string[]; warnings: string[] };
 }
 
-// Persist a SKILL.md (and optional sidecar files) to the user-skills
-// directory and trigger a reload so the new skill enters the runtime.
-// This is the API counterpart to dropping a file in
-// `~/.gini/instances/<instance>/skills/<category>/<name>/`; both end up
-// in the same watched directory.
+// Persist a SKILL.md (and optional sidecar files) under the instance
+// skills directory and trigger a reload so the new skill enters the
+// runtime. User-installed skills always land flat at
+// `~/.gini/instances/<instance>/skills/<name>/SKILL.md` — no category
+// subfolder. Category folders are a bundled-skill convention: the loader
+// derives a skill's category from its parent directory, so flat user
+// skills simply carry no category. This is the API counterpart to dropping
+// the file there by hand — both end up in the same watched dir.
 export async function installSkillFromBody(
   config: RuntimeConfig,
   input: InstallSkillInput
@@ -47,14 +46,6 @@ export async function installSkillFromBody(
   if (!parsed.name.trim()) {
     throw new Error("Invalid input: SKILL.md must declare a top-level `name`.");
   }
-  // Derive a category from caller input → metadata.gini.category →
-  // fallback "user". Keep the chosen value sanitized so the resulting path
-  // can't escape the skills root.
-  const meta = (parsed.frontmatter.metadata && typeof parsed.frontmatter.metadata === "object")
-    ? (parsed.frontmatter.metadata as Record<string, unknown>)
-    : {};
-  const gini = (meta.gini && typeof meta.gini === "object") ? (meta.gini as Record<string, unknown>) : {};
-  const category = sanitizeName(input.category ?? (typeof gini.category === "string" ? gini.category : "") ?? "user") || "user";
   const folderName = sanitizeName(parsed.name);
   if (!folderName) throw new Error(`Invalid skill name "${parsed.name}".`);
 
@@ -65,7 +56,7 @@ export async function installSkillFromBody(
   }
 
   const root = skillsDir(config.instance);
-  const dir = join(root, category, folderName);
+  const dir = join(root, folderName);
   mkdirSync(dir, { recursive: true });
   const manifestPath = join(dir, "SKILL.md");
   writeFileSync(manifestPath, input.body.endsWith("\n") ? input.body : `${input.body}\n`);

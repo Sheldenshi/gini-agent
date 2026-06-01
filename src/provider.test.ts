@@ -2628,6 +2628,293 @@ describe("provider", () => {
       restore();
     }
   });
+
+  // prompt_cache_retention contract: every OpenAI-compatible chat/completions
+  // and openai /responses request body must pin "in_memory" so prompts large
+  // enough to qualify for OpenAI's prompt cache land on the default tier
+  // (5-10 min idle, 1h max, Zero Data Retention eligible). The codex
+  // chatgpt.com backend rejects the field with HTTP 400, so every codex
+  // /responses builder must omit it.
+
+  test("openai tool-calling chat-completions pins prompt_cache_retention to in_memory", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_pcr_tool",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        []
+      );
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("openai structured chat-completions pins prompt_cache_retention to in_memory", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_pcr_struct",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: '{"ok":true}' } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("local structured chat-completions pins prompt_cache_retention to in_memory", async () => {
+    // openrouter / local / deepseek accept-but-ignore unknown fields, so the
+    // value is a no-op there — but the runtime still sends it uniformly so a
+    // future migration to a stricter gateway has no surprise.
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_pcr_struct_local",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: '{"ok":true}' } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({
+        name: "local",
+        model: "m",
+        baseUrl: "http://127.0.0.1:8000/v1"
+      });
+      await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("openai /responses summary pins prompt_cache_retention to in_memory", async () => {
+    // generateTaskSummary lands in callOpenAIResponses for the openai
+    // provider (Responses API, non-streaming). The openai branch of the
+    // builder pins prompt_cache_retention; the codex branch deliberately
+    // does not.
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_pcr_oai_resp",
+        output: [
+          { id: "msg_1", type: "message", content: [{ type: "output_text", text: "summary." }] }
+        ]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      const result = await generateTaskSummary(config(provider), "summarize this");
+      expect(result.text).toBe("summary.");
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("openrouter chat-completions summary pins prompt_cache_retention to in_memory", async () => {
+    // generateTaskSummary lands in callChatCompletions for the openrouter
+    // provider (and local, and any other OpenAI-style chat gateway). The
+    // field is sent unconditionally so a stricter gateway would never see
+    // it absent.
+    const original = process.env.OPENROUTER_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENROUTER_API_KEY = "test-or-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_pcr_chat",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "summary." } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openrouter", model: "or-model" });
+      const result = await generateTaskSummary(config(provider), "summarize this");
+      expect(result.text).toBe("summary.");
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENROUTER_API_KEY;
+      else process.env.OPENROUTER_API_KEY = original;
+    }
+  });
+
+  test("openai vision chat-completions pins prompt_cache_retention to in_memory", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_pcr_vision",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "described." } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      const result = await generateVisionAnalysis(config(provider), {
+        prompt: "what is shown?",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
+      expect(result.text).toBe("described.");
+      expect(captured?.url).toContain("/chat/completions");
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
+  test("codex /responses summary omits prompt_cache_retention (chatgpt.com backend rejects it)", async () => {
+    // The chatgpt.com backend returns HTTP 400 if prompt_cache_retention is
+    // present on a /responses payload. Every codex builder must therefore
+    // omit the field. Cover the summary path here — the other codex
+    // builders (tool-calling, structured, vision) share the same omission
+    // contract.
+    const { restore } = installCodexAuth("codex-pcr-omit-summary");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "summary-ok" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r_pcr_codex", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const result = await generateTaskSummary(config(provider), "summarize this");
+      expect(result.text).toBe("summary-ok");
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex tool-calling /responses omits prompt_cache_retention", async () => {
+    const { restore } = installCodexAuth("codex-pcr-omit-tool");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          const ev = { type: "response.completed", response: { id: "r_pcr_codex_tool", output: [] } };
+          controller.enqueue(enc.encode(`event: response.completed\ndata: ${JSON.stringify(ev)}\n\n`));
+          controller.enqueue(enc.encode("data: [DONE]\n\n"));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      const tools: ToolFunctionSpec[] = [{
+        type: "function",
+        function: { name: "noop", description: "", parameters: { type: "object" } }
+      }];
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "user", content: "hi" }],
+        tools
+      );
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
 });
 
 // Install a temporary CODEX_AUTH_JSON pointing at a fake auth.json. Tests

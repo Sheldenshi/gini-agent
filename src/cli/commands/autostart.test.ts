@@ -11,7 +11,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { labelForKind, plistPathFor } from "../autostart";
+import { labelForKind, plistPathFor, serviceTarget, type LaunchctlResult } from "../autostart";
+import { stopViaBootout } from "./autostart";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -50,9 +51,9 @@ describe("gini autostart usage and platform gate", () => {
     expect(parsed.ok).toBe(false);
   });
 
-  // HIGH-4: `kick` on a non-existent service must return non-zero exit
-  // code so install.sh's `if … then` shell guard sees the failure. The
-  // JSON had ok:false before round 2 even when the exit code was 0.
+  // `kick` on a non-existent service must return a non-zero exit code (not
+  // just ok:false in the JSON) so install.sh's `if … then` shell guard sees
+  // the failure.
   test("kick on a not-loaded instance returns non-zero exit", () => {
     if (process.platform !== "darwin") return; // platform gate prints macOS-only
     const result = runCli(["autostart", "kick", "--instance", `kick-nonexistent-${tag()}`], {});
@@ -80,7 +81,7 @@ const isDarwin = process.platform === "darwin";
     rmSync(scratch.logRoot, { recursive: true, force: true });
   });
 
-  test("reports plistExists:false and loaded:false for a fresh instance (both kinds)", () => {
+  test("reports plistExists:false and loaded:false for a fresh instance (all kinds)", () => {
     const result = runCli(
       ["autostart", "status", "--instance", uniqueInstance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
       {}
@@ -88,7 +89,7 @@ const isDarwin = process.platform === "darwin";
     expect(result.status).toBe(0);
     const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
     expect(parsed.instance).toBe(uniqueInstance);
-    // round-2: both gateway and web are reported under `services`. The
+    // gateway, web, and watchdog are reported under `services`. The
     // top-level `label` field mirrors the gateway service for back-compat
     // with shell scripts that grep on it.
     expect(parsed.label).toBe(labelForKind(uniqueInstance, "gateway"));
@@ -97,17 +98,19 @@ const isDarwin = process.platform === "darwin";
     expect(parsed.pid).toBe(null);
     const services = parsed.services as Array<Record<string, unknown>>;
     expect(Array.isArray(services)).toBe(true);
-    expect(services.length).toBe(2);
+    expect(services.length).toBe(3);
     expect(services[0]!.kind).toBe("gateway");
     expect(services[1]!.kind).toBe("web");
+    expect(services[2]!.kind).toBe("watchdog");
     expect(services[0]!.label).toBe(labelForKind(uniqueInstance, "gateway"));
     expect(services[1]!.label).toBe(labelForKind(uniqueInstance, "web"));
+    expect(services[2]!.label).toBe(labelForKind(uniqueInstance, "watchdog"));
     for (const svc of services) {
       expect(svc.plistExists).toBe(false);
       expect(svc.loaded).toBe(false);
     }
     expect(Array.isArray(parsed.limitations)).toBe(true);
-    expect((parsed.limitations as string[]).some((l) => l.includes("PID supervision"))).toBe(true);
+    expect((parsed.limitations as string[]).some((l) => l.includes("watchdog"))).toBe(true);
   });
 });
 
@@ -249,13 +252,14 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     rmSync(scratch.logRoot, { recursive: true, force: true });
     for (const path of [
       plistPathFor(uniqueInstance, "gateway"),
-      plistPathFor(uniqueInstance, "web")
+      plistPathFor(uniqueInstance, "web"),
+      plistPathFor(uniqueInstance, "watchdog")
     ]) {
       try { rmSync(path, { force: true }); } catch { /* ignore */ }
     }
   });
 
-  test("enable → status shows both kinds loaded; disable → status shows both gone", () => {
+  test("enable → status shows all three kinds loaded; disable → status shows all gone", () => {
     const enableResult = runCli(
       [
         "autostart", "enable",
@@ -271,7 +275,7 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     expect(enableParsed.ok).toBe(true);
     expect(enableParsed.enabled).toBe(true);
     const results = enableParsed.results as Array<Record<string, unknown>>;
-    expect(results.length).toBe(2);
+    expect(results.length).toBe(3);
     for (const r of results) expect(r.enabled).toBe(true);
 
     // Status should report both kinds plistExists:true and loaded:true.
@@ -295,13 +299,12 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     const disableParsed = JSON.parse(disableResult.stdout) as Record<string, unknown>;
     expect(disableParsed.ok).toBe(true);
     expect(disableParsed.disabled).toBe(true);
-    // Round-5 fix: enable now calls `kickstart` after bootstrap so the
-    // service actually launches immediately on macOS 26 (where RunAtLoad
-    // is best-effort). That means by the time we reach `disable`, the
-    // child process is genuinely running, and launchctl propagation
-    // takes a beat after `bootout` returns before `launchctl print`
-    // stops finding the service. Poll briefly to let that propagate
-    // before asserting "loaded:false" — the bootout itself already
+    // enable `kickstart`s after bootstrap so the service actually launches
+    // immediately on macOS 26 (where RunAtLoad is best-effort). That means by
+    // the time we reach `disable`, the child process is genuinely running, and
+    // launchctl propagation takes a beat after `bootout` returns before
+    // `launchctl print` stops finding the service. Poll briefly to let that
+    // propagate before asserting "loaded:false" — the bootout itself already
     // returned ok above.
     let unloaded = false;
     let statusAgain: ReturnType<typeof runCli> | undefined;
@@ -475,4 +478,70 @@ const e2eOn = isDarwin && process.env.GINI_AUTOSTART_E2E === "1";
     expect(afterSvcs[0]!.loaded).toBe(true);
     expect(afterSvcs[1]!.loaded).toBe(true);
   }, 60_000);
+});
+
+// Pure-logic tests for stopViaBootout. We inject a fake bootoutTarget
+// recorder so no real launchctl runs — the function's job is just to boot
+// out the right service targets and fold "Could not find service" into a
+// successful stop.
+describe("stopViaBootout", () => {
+  const ok: LaunchctlResult = { ok: true, stdout: "", stderr: "", status: 0 };
+  // launchctl phrases "not loaded" differently across macOS releases.
+  const notLoadedOldText: LaunchctlResult = {
+    ok: false,
+    stdout: "",
+    stderr: "Could not find service",
+    status: 113
+  };
+  const notLoadedTahoeText: LaunchctlResult = {
+    ok: false,
+    stdout: "",
+    stderr: "Boot-out failed: 3: No such process",
+    status: 3
+  };
+
+  test("boots out gateway, web, and watchdog targets for the instance", () => {
+    const targets: string[] = [];
+    const result = stopViaBootout("stop-test", {
+      bootoutTarget: (target: string) => {
+        targets.push(target);
+        return ok;
+      }
+    });
+    // Gateway + web are the live kinds; watchdog is included for
+    // forward-compatibility with the watchdog service (separate task).
+    expect(targets).toEqual([
+      `${serviceTarget("stop-test")}.gateway`,
+      `${serviceTarget("stop-test")}.web`,
+      `${serviceTarget("stop-test")}.watchdog`
+    ]);
+    expect(result.ok).toBe(true);
+    expect(result.results.map((r) => r.kind)).toEqual(["gateway", "web", "watchdog"]);
+    expect(result.results.every((r) => r.bootedOut)).toBe(true);
+  });
+
+  test("treats a not-loaded target as a successful stop (both macOS phrasings)", () => {
+    // A target that was never loaded (e.g. the not-yet-shipped watchdog, or
+    // an instance that was already stopped) must not fail the stop. The
+    // error text differs by macOS release, so accept both.
+    for (const notLoaded of [notLoadedOldText, notLoadedTahoeText]) {
+      const result = stopViaBootout("stop-test", { bootoutTarget: () => notLoaded });
+      expect(result.ok).toBe(true);
+      expect(result.results.every((r) => r.bootedOut)).toBe(true);
+      expect(result.results.every((r) => r.stderr === undefined)).toBe(true);
+    }
+  });
+
+  test("reports ok:false and surfaces stderr on a real bootout failure", () => {
+    const failure: LaunchctlResult = {
+      ok: false,
+      stdout: "",
+      stderr: "Boot-out failed: 5: Input/output error",
+      status: 5
+    };
+    const result = stopViaBootout("stop-test", { bootoutTarget: () => failure });
+    expect(result.ok).toBe(false);
+    expect(result.results.every((r) => r.bootedOut === false)).toBe(true);
+    expect(result.results[0]!.stderr).toContain("Input/output error");
+  });
 });

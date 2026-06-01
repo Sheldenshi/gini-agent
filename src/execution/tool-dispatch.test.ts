@@ -8,7 +8,7 @@
 //   - unknown server name produces a structured error envelope
 //   - missing required args throw before reaching the network
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,6 +19,10 @@ import { dispatchToolCall } from "./tool-dispatch";
 const ROOT = mkdtempSync(join(tmpdir(), "gini-mcp-dispatch-"));
 process.env.GINI_STATE_ROOT = ROOT;
 process.env.GINI_LOG_ROOT = `${ROOT}/logs`;
+// Shrink the wait_for_messaging_pair poll interval so the three pairing tests
+// don't each wait a full production 1000ms tick. Server-side env, deleted in
+// afterAll; production leaves it unset and keeps the 1000ms default.
+process.env.GINI_PAIR_POLL_MS = "10";
 
 const originalFetch = globalThis.fetch;
 
@@ -28,6 +32,10 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+});
+
+afterAll(() => {
+  delete process.env.GINI_PAIR_POLL_MS;
 });
 
 function buildConfig(instance: string): RuntimeConfig {
@@ -1108,8 +1116,12 @@ describe("request_connector dispatch", () => {
       "call_wait_expired",
       JSON.stringify({ bridge: "tg-expired", timeoutSeconds: 10 })
     );
-    // Cancel mid-wait so we don't sit out the full 10s timeout.
-    await Bun.sleep(1200);
+    // The expired row is filtered out on the loop's very first scan
+    // (synchronous, before the first poll sleep), so we only need the
+    // cancel to land before a subsequent tick re-scans. Cancel well
+    // inside the first 1s poll interval so the next tick exits on the
+    // task-terminal check instead of sitting out the full 10s timeout.
+    await Bun.sleep(50);
     await mutateState(instance, (state) => {
       const task = state.tasks.find((t) => t.id === taskId);
       if (task) task.status = "cancelled";
@@ -1121,7 +1133,7 @@ describe("request_connector dispatch", () => {
     expect(
       state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
-  }, 30000);
+  });
 
   test("wait_for_messaging_pair: detects out-of-band enrollment and exits with success", async () => {
     // While the wait loop is running, a parallel operator (settings
@@ -1157,7 +1169,11 @@ describe("request_connector dispatch", () => {
     );
     // Simulate another path enrolling chat 555 while the wait is
     // running (e.g. operator clicked Approve on the settings page).
-    await Bun.sleep(1200);
+    // The loop's first scan runs synchronously on entry (before the
+    // first poll sleep) and sees an empty allowlist; land the
+    // enrollment well inside the first 1s poll interval so the next
+    // tick's snapshot-diff detects the fresh chatId.
+    await Bun.sleep(50);
     await mutateState(instance, (state) => {
       const live = state.messagingBridges.find((b) => b.name === "tg-oob");
       if (live) {
@@ -1178,7 +1194,7 @@ describe("request_connector dispatch", () => {
     expect(
       state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
-  }, 15000);
+  });
 
   test("wait_for_messaging_pair: skips a pending row whose chat is already enrolled, then exits on task cancel", async () => {
     // Pin the second half of the new predicate: a pending row whose
@@ -1220,10 +1236,12 @@ describe("request_connector dispatch", () => {
       "call_wait_enrolled",
       JSON.stringify({ bridge: "tg-enrolled", timeoutSeconds: 10 })
     );
-    // Give the wait tool one full poll tick to scan and decide the
-    // already-enrolled row is unsurfacable, then cancel so the next
-    // tick's task-terminal check exits the loop.
-    await Bun.sleep(1200);
+    // The loop's first scan runs synchronously on entry (before the
+    // first poll sleep) and decides the already-enrolled row is
+    // unsurfacable. Cancel well inside the first 1s poll interval so
+    // the next tick's task-terminal check exits the loop without
+    // sitting out the full 10s timeout.
+    await Bun.sleep(50);
     await mutateState(instance, (state) => {
       const task = state.tasks.find((t) => t.id === taskId);
       if (task) task.status = "cancelled";
@@ -1242,21 +1260,25 @@ describe("request_connector dispatch", () => {
     expect(
       state.setupRequests.filter((a) => a.taskId === taskId && a.action === "messaging.approve_pairing").length
     ).toBe(0);
-  }, 10000);
+  });
 
-  test("wait_for_messaging_pair: emits a system_note guidance block telling the operator how to DM the bot", async () => {
-    // The wait card on its own only renders the bridge name — no
+  test("wait_for_messaging_pair: folds the guidance into the running tool_call's runningHint (not a separate system_note)", async () => {
+    // The wait card on its own only shows the bridge name — no
     // instruction that the user must open Telegram, tap Start, and
-    // send a message before the poller can mint a pairing row. Pin
-    // that the wait tool drops a system_note block into the chat
-    // BEFORE the poll loop runs, with text the chat UI can render
-    // inline between the bridge-add card and the wait card. We seed
-    // a pre-existing pending row so the wait returns "pending" on
-    // the first tick — the guidance emit runs before any polling.
+    // send a message before the poller can mint a pairing row. The
+    // dispatch attaches the guidance to its own tool_call block via
+    // `runningHint`, which the web/mobile chat surface renders as an
+    // amber waiting-card with the guidance folded in. Pin that the
+    // hint lands on the right block (and that we DON'T regress to the
+    // pre-folding system_note layout, which split the wait row and the
+    // guidance into two unrelated blocks). We seed a pre-existing
+    // pending row so the wait returns "pending" on the first tick —
+    // the hint write runs before any polling.
     const instance = `wait-pair-guidance-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
     const taskId = await newTask(config);
     const { listChatBlocks } = await import("../state");
+    const { emitToolCallRunning, resolveEmitContext } = await import("./chat-task-emit");
     await mutateState(instance, (state) => {
       const { createMessagingBridgeRecord } = require("../state") as typeof import("../state");
       const bridge = createMessagingBridgeRecord(state, {
@@ -1278,34 +1300,57 @@ describe("request_connector dispatch", () => {
         ]
       };
     });
+
+    // Mount the running tool_call block the same way the chat-task
+    // loop would — dispatchToolCall doesn't emit it itself, so without
+    // this the runningHint write would no-op against a missing row.
+    const callId = "call_wait_guidance";
+    const emitCtx = resolveEmitContext(config, taskId);
+    expect(emitCtx).toBeDefined();
+    emitToolCallRunning(emitCtx, {
+      toolName: "wait_for_messaging_pair",
+      callId,
+      args: { bridge: "tg-guidance", timeoutSeconds: 10 }
+    });
+
     const result = await dispatchToolCall(
       config,
       taskId,
       "wait_for_messaging_pair",
-      "call_wait_guidance",
+      callId,
       JSON.stringify({ bridge: "tg-guidance", timeoutSeconds: 10 })
     );
     // Pre-existing pending row → pending result, just confirming the
-    // dispatcher reached the poll path past the guidance emit.
+    // dispatcher reached the poll path past the runningHint write.
     expect(result.kind).toBe("pending");
 
-    // Pull the task's chat session and verify a system_note block
-    // landed with the guidance text. botUsername is empty (probe is
-    // gated on a secret ref, which test bridges don't have), so the
-    // text falls back to the bridge name.
     const state = readState(instance);
     const task = state.tasks.find((t) => t.id === taskId);
     expect(task?.chatSessionId).toBeDefined();
     const blocks = listChatBlocks(instance, task!.chatSessionId!);
+
+    // The tool_call block carries the guidance in `runningHint`.
+    // botUsername is empty (probe is gated on a secret ref, which
+    // test bridges don't have), so the text falls back to the bridge
+    // name.
+    const toolCall = blocks.find(
+      (b) => b.kind === "tool_call" && (b as { callId?: string }).callId === callId
+    );
+    expect(toolCall).toBeDefined();
+    expect(toolCall?.kind).toBe("tool_call");
+    if (toolCall?.kind === "tool_call") {
+      expect(toolCall.runningHint).toBeDefined();
+      expect(toolCall.runningHint).toContain("tg-guidance");
+      expect(toolCall.runningHint).toContain("/start");
+    }
+
+    // Regression guard: the guidance must NOT be emitted as a
+    // standalone system_note anymore (would re-introduce the split-card
+    // layout the amber waiting-card was meant to fold together).
     const guidanceNote = blocks.find(
       (b) => b.kind === "system_note" && b.text.includes("Open Telegram and start a chat")
     );
-    expect(guidanceNote).toBeDefined();
-    expect(guidanceNote?.kind).toBe("system_note");
-    if (guidanceNote?.kind === "system_note") {
-      expect(guidanceNote.text).toContain("tg-guidance");
-      expect(guidanceNote.text).toContain("/start");
-    }
+    expect(guidanceNote).toBeUndefined();
   });
 
   test("request_remove_messaging_bridge: mints a pending approval for an existing bridge", async () => {

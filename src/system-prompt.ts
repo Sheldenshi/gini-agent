@@ -78,13 +78,12 @@ export interface AgentSystemContextOptions {
   instructionsOverride?: string;
   // Per-agent persona body sourced from
   // ~/.gini/instances/<inst>/agents/<agentId>/SOUL.md. Sits between
-  // instructions and the identity block.
+  // instructions and the user profile in the stable prefix.
   soul?: string;
   // Instance-scoped user profile body sourced from
-  // ~/.gini/instances/<inst>/USER.md. Sits between the runtime identity
-  // block and recalled long-term memory so the model encounters
-  // "who am I talking to" right before "what do I remember about prior
-  // conversations".
+  // ~/.gini/instances/<inst>/USER.md. Last block of the stable prefix so the
+  // model encounters "who am I talking to" before the per-turn ephemeral
+  // tail (recalled memory) that follows the transcript.
   userProfile?: string;
 }
 
@@ -153,30 +152,24 @@ export function identityBudgetState(
   };
 }
 
-// Assemble the system-area context. The block order encodes a stable
-// "agent → persona → self → user-curated facts → recalled memory"
-// progression so the model encounters its own identity before any
-// user/world facts.
+// Assemble the byte-stable system-area prefix. The block order encodes a
+// stable "agent → persona → user-curated facts" progression so the model
+// encounters its own operating rules and persona before any user facts.
+// Every block here is stable across turns for a fixed instance config, so
+// the system message can serve as a warm prompt-cache prefix. Per-turn
+// content (recalled memory, emitted identity) lives in an ephemeral
+// role:"user" tail instead — see `renderEphemeralContext` and ADR
+// stable-system-prefix.md.
 //
 // Order (each block elided when empty):
 //   1. INSTRUCTIONS — operating rules (file override or default).
 //   2. SOUL.md      — per-agent persona.
-//   3. identity     — runtime identity block (instance/agent/provider/...).
-//   4. USER.md      — instance-scoped user profile.
-//   5. recalled     — Hindsight long-term memory.
+//   3. USER.md      — instance-scoped user profile.
 //
 // The legacy "Pinned memories about this user" block was removed when
 // `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
 // See ADR runtime-identity-files.md.
-//
-// Placing memory in the system channel (rather than the user message)
-// gives it higher-priority placement without talking the model into
-// believing it. See ADR runtime-identity-files.md.
-export function buildAgentSystemContext(
-  recalledContext?: string,
-  identityBlock?: string,
-  options?: AgentSystemContextOptions
-): string {
+export function buildAgentSystemContext(options?: AgentSystemContextOptions): string {
   const instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
     ? options.instructionsOverride
     : getDefaultGiniInstructions();
@@ -193,15 +186,30 @@ export function buildAgentSystemContext(
         : renderSoulBlock(options.soul)
     );
   }
-  if (identityBlock && identityBlock.length > 0) {
-    parts.push(identityBlock);
-  }
   if (options?.userProfile && options.userProfile.trim().length > 0) {
     parts.push(
       options.userProfile.startsWith("[BLOCKED:")
         ? options.userProfile
         : renderUserProfileBlock(options.userProfile)
     );
+  }
+  return parts.join("\n\n");
+}
+
+// Render the ephemeral per-turn context body that rides in a role:"user"
+// message placed after the full prior transcript and immediately before
+// the real user message. It carries the two per-turn-varying blocks that
+// used to break the cacheable system prefix:
+//   1. emitted identity — the tell-once/delta/refresh block, when emitted.
+//   2. recalled memory  — Hindsight long-term memory for this turn's query.
+// Blocks are joined by a blank line in the same order they used to sit in
+// the system prompt (identity before memory); each is elided when empty.
+// Returns "" when both are empty so the caller can skip injecting a tail
+// message entirely. See ADR stable-system-prefix.md.
+export function renderEphemeralContext(emittedIdentity?: string, recalledContext?: string): string {
+  const parts: string[] = [];
+  if (emittedIdentity && emittedIdentity.length > 0) {
+    parts.push(emittedIdentity);
   }
   if (recalledContext && recalledContext.trim().length > 0) {
     parts.push(`Long-term memory of prior conversations with this user (use these facts when answering):\n${recalledContext}`);
@@ -260,8 +268,8 @@ export function renderIdentityDelta(prior: AgentIdentity, current: AgentIdentity
 
 // Pure decision: given the current identity, the persisted snapshot from
 // the last turn, and the current turn index, decide what identity content
-// (if any) to emit into the system prompt and what snapshot to persist
-// for the next turn. Three outcomes:
+// (if any) to emit into the ephemeral role:"user" tail and what snapshot
+// to persist for the next turn. Three outcomes:
 //   - first turn or refresh due → full block, snapshot resets lastFullTurn
 //   - delta non-empty           → delta block, snapshot keeps lastFullTurn
 //   - delta empty               → "", no snapshot update

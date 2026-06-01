@@ -378,7 +378,7 @@ describe("identity-files", () => {
       // The full system prompt for a fresh install (seeded file + no
       // SOUL/USER) matches the pre-scaffold default — the seed is purely
       // surface, not behavioral.
-      const assembled = buildAgentSystemContext(undefined, undefined, {
+      const assembled = buildAgentSystemContext({
         instructionsOverride: loaded ?? undefined
       });
       expect(assembled).toBe(expectedDefaultInstructionsTrimmed);

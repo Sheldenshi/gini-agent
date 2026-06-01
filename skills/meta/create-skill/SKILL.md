@@ -45,7 +45,7 @@ Optional spec keys:
 
 Gini extensions (under `metadata.gini`):
 
-- `version`, `author`, `platforms`, `category`
+- `version`, `author`, `platforms`
 - `prerequisites: { commands, env }`
 - `requires.credentials: [<credential-name>]` — the credential names the
   skill needs, referenced by name (e.g. `[LINEAR_API_KEY]` for an
@@ -129,12 +129,11 @@ Gini extensions (under `metadata.gini`):
      -H "content-type: application/json" \
      -d "$(jq -nc \
        --arg body "$(cat /tmp/draft-skill.md)" \
-       --arg category "<optional category override>" \
-       '{ body: $body, category: $category }')"
+       '{ body: $body }')"
    ```
 
-   The endpoint writes the file under
-   `~/.gini/instances/<instance>/skills/<category>/<name>/SKILL.md`
+   The endpoint writes the file flat under
+   `~/.gini/instances/<instance>/skills/<name>/SKILL.md`
    and triggers a loader reload. The response includes the new
    `SkillRecord` with `validation: { ok, issues }`.
 

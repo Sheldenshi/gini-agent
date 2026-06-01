@@ -12,7 +12,9 @@ import { rmSync } from "node:fs";
 import {
   closeAllMemoryDbs,
   getDevice,
+  listAllDevices,
   listDevicesForCredential,
+  purgeTunnelDevices,
   removeDevice,
   removeDeviceForCredential,
   upsertDevice
@@ -143,5 +145,95 @@ describe("devices registry", () => {
     // Correct credential can.
     expect(removeDeviceForCredential(instance, "t1", "cred_a")).toBe(true);
     expect(getDevice(instance, "t1")).toBeNull();
+  });
+
+  test("upsertDevice defaults origin to loopback when omitted", () => {
+    const instance = "devices-origin-default";
+    const device = upsertDevice(instance, {
+      token: "t-default",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile"
+    });
+    expect(device.origin).toBe("loopback");
+    expect(getDevice(instance, "t-default")?.origin).toBe("loopback");
+  });
+
+  test("upsertDevice persists origin when explicitly passed as tunnel", () => {
+    const instance = "devices-origin-tunnel";
+    const device = upsertDevice(instance, {
+      token: "t-tunnel",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile",
+      origin: "tunnel"
+    });
+    expect(device.origin).toBe("tunnel");
+    expect(getDevice(instance, "t-tunnel")?.origin).toBe("tunnel");
+  });
+
+  test("upsertDevice retags origin when the same token re-registers from a different origin", () => {
+    const instance = "devices-origin-retag";
+    upsertDevice(instance, {
+      token: "tok",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile",
+      origin: "loopback"
+    });
+    upsertDevice(instance, {
+      token: "tok",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile",
+      origin: "tunnel"
+    });
+    expect(getDevice(instance, "tok")?.origin).toBe("tunnel");
+  });
+
+  test("purgeTunnelDevices wipes tunnel rows and leaves loopback rows intact", () => {
+    const instance = "devices-purge";
+    upsertDevice(instance, {
+      token: "loop1",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile",
+      origin: "loopback"
+    });
+    upsertDevice(instance, {
+      token: "tun1",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile",
+      origin: "tunnel"
+    });
+    upsertDevice(instance, {
+      token: "tun2",
+      credentialId: "cred_b",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile",
+      origin: "tunnel"
+    });
+
+    const result = purgeTunnelDevices(instance);
+    expect(result.deleted).toBe(2);
+
+    const remaining = listAllDevices(instance);
+    expect(remaining.map((d) => d.token)).toEqual(["loop1"]);
+    expect(remaining[0]?.origin).toBe("loopback");
+  });
+
+  test("purgeTunnelDevices on an empty/clean instance returns deleted=0", () => {
+    const instance = "devices-purge-empty";
+    expect(purgeTunnelDevices(instance).deleted).toBe(0);
+
+    upsertDevice(instance, {
+      token: "only-loopback",
+      credentialId: "cred_a",
+      platform: "ios",
+      bundleId: "ai.lilaclabs.gini.mobile"
+    });
+    expect(purgeTunnelDevices(instance).deleted).toBe(0);
+    expect(listAllDevices(instance).map((d) => d.token)).toEqual(["only-loopback"]);
   });
 });

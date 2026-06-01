@@ -9,21 +9,23 @@
 // ~/Library/LaunchAgents/. System daemons (~/.../Library/LaunchDaemons/)
 // can't reach the user's Keychain, which would break Codex auth.
 //
-// Two plists per instance:
-//   - `<prefix>.<instance>.gateway` — the Bun runtime (src/server.ts)
-//   - `<prefix>.<instance>.web`     — Next.js dev server, gated on the
-//                                     gateway's /api/healthz coming up
+// Three plists per instance:
+//   - `<prefix>.<instance>.gateway`  — the Bun runtime (src/server.ts)
+//   - `<prefix>.<instance>.web`      — Next.js dev server, gated on the
+//                                      gateway's /api/healthz coming up
+//   - `<prefix>.<instance>.watchdog` — periodic health probe (StartInterval)
+//                                      that revives a dead/hung gateway/web
 //
 // Scope notes:
 //   - macOS only in v1. Linux systemd --user parity is a follow-up.
-//   - PID supervision only (launchd's default). A health watchdog that hits
-//     /api/healthz to detect wedged-but-alive Bun is OUT of v1 — `status`
-//     and `--help` surface that limitation so users know what they're
-//     getting.
-//   - `gini stop` exits with the server SIGTERM handler doing process.exit(0),
-//     which feeds launchd's `KeepAlive.SuccessfulExit: false` semantics:
-//     clean exits are treated as the user's intent and are NOT respawned;
-//     anything else triggers a respawn.
+//   - KeepAlive only reacts to process exit, so the watchdog covers the gaps
+//     it can't: a wedged-but-alive runtime (hits /api/status and
+//     /api/runtime/__healthz, kickstarts whatever is hung) and a clean exit
+//     that launchd defers respawning. See ADR always-up-supervision.md.
+//   - KeepAlive is `true`: launchd always respawns the service on exit, so
+//     the runtime stays up across crashes AND clean exits (an auto-update
+//     self-SIGTERM respawns with the fresh code). Stopping is done out of
+//     band: `gini stop` runs `launchctl bootout` to unload the service.
 //
 // Layering: the label/path/service-target derivation and the thin shellouts
 // to `launchctl` live in src/integrations/launchd.ts so src/runtime/* can
@@ -36,6 +38,7 @@ import { dirname, join, resolve } from "node:path";
 import type { Instance } from "../types";
 import { defaultWebPort, projectRoot } from "../paths";
 import {
+  GINI_SUPERVISOR_VALUE,
   LABEL_PREFIX,
   LEGACY_LABEL_PREFIXES,
   THROTTLE_INTERVAL_SECONDS,
@@ -56,12 +59,14 @@ import { unquoteSecretsValue } from "../state/secrets-env";
 // code should import directly from src/integrations/launchd.ts to avoid
 // pulling in this CLI-flavored surface.
 export {
+  GINI_SUPERVISOR_VALUE,
   LABEL_PREFIX,
   LEGACY_LABEL_PREFIXES,
   THROTTLE_INTERVAL_SECONDS,
   type PlistKind,
   type LegacyHandle,
   type LaunchctlResult,
+  supervisor,
   legacyHandlesFor,
   labelFor,
   labelForKind,
@@ -111,6 +116,10 @@ export interface LaunchSpec {
 export interface LaunchSpecPair {
   gateway: LaunchSpec;
   web: LaunchSpec;
+  // The periodic health watchdog (StartInterval one-shot). Carries no
+  // provider secrets — it only probes localhost health endpoints and shells
+  // out to launchctl.
+  watchdog: LaunchSpec;
   // Recorded for `status`/diagnostics: which working-directory path
   // resolution picked (installed vs source).
   resolution: "installed" | "source";
@@ -159,20 +168,12 @@ export interface ResolveLaunchOptions {
 
 // Build the launchd command line. We exec the Bun-driven runtime *directly*
 // — `bun run src/server.ts --instance <name>` — instead of going through the
-// `~/.local/bin/gini` wrapper or `gini run`. Two reasons:
-//
-//   1. Single-process job. The wrapper/CLI path spawns a chain
-//      (bash → bun → bun → bun-server). When launchd kills the head, child
-//      processes can outlive the head briefly and exit cleanly via their
-//      own SIGTERM handlers; launchd then sees a "successful exit" for the
-//      job and KeepAlive.SuccessfulExit:false suppresses respawn. Direct
-//      exec collapses the tree to one process, so SIGKILL = signal exit
-//      and KeepAlive respawns reliably.
-//
-//   2. Exit code is what we control. The server's SIGTERM handler
-//      (src/server.ts) does process.exit(0), so `launchctl stop` (or
-//      `gini stop` SIGTERM) produces a clean exit; KeepAlive.SuccessfulExit:false
-//      then honors that intent and won't respawn.
+// `~/.local/bin/gini` wrapper or `gini run`. The reason: single-process job.
+// The wrapper/CLI path spawns a chain (bash → bun → bun → bun-server), so the
+// launchd-tracked PID is the bash head, not the runtime. Direct exec
+// collapses the tree to one process, so the launchd-tracked PID IS the
+// runtime — `launchctl bootout` / `kickstart -k` target the right process,
+// and KeepAlive respawns that single process reliably on any exit.
 //
 // Source-flow vs installed-flow decision: if we're invoked from a gini-agent
 // source checkout (cwd has package.json with name "gini-agent"), prefer
@@ -279,7 +280,11 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   const gatewayEnv: Record<string, string> = {
     ...baseEnv,
     ...secretsEnv,
-    GINI_INSTANCE: options.instance
+    GINI_INSTANCE: options.instance,
+    // Marks the launchd-spawned runtime so supervisor() reports "launchd"
+    // at runtime. Drives launchd-native stop/restart behavior (bootout as
+    // stop, KeepAlive respawn after a self-SIGTERM on auto-update).
+    GINI_SUPERVISOR: GINI_SUPERVISOR_VALUE
   };
 
   const gateway: LaunchSpec = {
@@ -302,6 +307,9 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
   const webEnv: Record<string, string> = {
     ...baseEnv,
     GINI_INSTANCE: options.instance,
+    // Same launchd marker as the gateway (see gatewayEnv) so the web shim's
+    // child also reports supervisor()==="launchd".
+    GINI_SUPERVISOR: GINI_SUPERVISOR_VALUE,
     // The `bun run dev` invocation otherwise defaults to Next.js's 3000.
     // For instances other than `main`/`dev`, that would collide with
     // whatever else is using 3000. Pin to the per-instance default that
@@ -332,7 +340,25 @@ export function resolveLaunchSpecPair(options: ResolveLaunchOptions): LaunchSpec
     environment: webEnv
   };
 
-  return { gateway, web, resolution };
+  // Watchdog plist: a periodic one-shot (StartInterval, see generatePlist)
+  // that runs `gini watchdog --instance <name>`, probes the gateway +
+  // web health endpoints, and kickstarts whichever is dead/hung. It needs
+  // NO provider secrets (it only hits localhost health endpoints and shells
+  // out to launchctl), so the env is the base PATH/HOME/LANG plus the
+  // launchd marker and GINI_INSTANCE — same minimal surface as the web env
+  // minus the Next.js knobs.
+  const watchdogEnv: Record<string, string> = {
+    ...baseEnv,
+    GINI_INSTANCE: options.instance,
+    GINI_SUPERVISOR: GINI_SUPERVISOR_VALUE
+  };
+  const watchdog: LaunchSpec = {
+    programArguments: [bunPath, "run", "gini", "watchdog", "--instance", options.instance],
+    workingDirectory,
+    environment: watchdogEnv
+  };
+
+  return { gateway, web, watchdog, resolution };
 }
 
 // Per-instance descriptor for a supervised LaunchAgent service. Encodes
@@ -355,31 +381,59 @@ export interface SupervisedService {
   // stdout tees.
   stdoutLogFilename: string;
   stderrLogFilename: string;
+  // Set only for the watchdog kind: the periodic one-shot interval (seconds)
+  // that drives the plist's StartInterval. gateway/web leave this undefined
+  // (they are KeepAlive long-lived jobs, not periodic).
+  startIntervalSeconds?: number;
   resolution: "installed" | "source";
 }
 
+// How often the watchdog launchd job re-runs `gini watchdog`. A periodic
+// one-shot (StartInterval), NOT a KeepAlive long-lived job: launchd relaunches
+// it every N seconds. 30s bounds detection latency for a dead/hung web or
+// runtime without spinning the CPU. Overlaps benignly with the gateway/web
+// ThrottleInterval — a kickstart against an already-running job is a no-op.
+export const WATCHDOG_START_INTERVAL_SECONDS = 30;
+
 export interface SupervisedServicesOptions extends ResolveLaunchOptions {
-  // Narrow to a subset of kinds. Defaults to both ["gateway", "web"]. The
-  // `--kind` CLI flag and the setup-api refresh path pass a one-element
-  // array so they don't touch the other service.
+  // Narrow to a subset of kinds. Defaults to all three
+  // ["gateway","web","watchdog"]. The `--kind` CLI flag and the setup-api
+  // refresh path pass a one-element array so they don't touch the others.
   kinds?: PlistKind[];
 }
 
 // Returns the descriptors that drive every per-kind launchctl interaction.
-// The order matches `kinds` (defaults to ["gateway","web"]) so enable's
-// rollback semantics ("kinds bootstrapped earlier in the loop") stay
-// deterministic.
+// The order matches `kinds` (defaults to ["gateway","web","watchdog"]) so
+// enable's rollback semantics ("kinds bootstrapped earlier in the loop")
+// stay deterministic — watchdog is last so a watchdog failure never rolls
+// back the gateway/web that are already up.
 export function supervisedServices(options: SupervisedServicesOptions): SupervisedService[] {
-  const kinds = options.kinds ?? (["gateway", "web"] satisfies PlistKind[]);
+  const kinds = options.kinds ?? (["gateway", "web", "watchdog"] satisfies PlistKind[]);
   const pair = resolveLaunchSpecPair(options);
+  const specForKind: Record<PlistKind, LaunchSpec> = {
+    gateway: pair.gateway,
+    web: pair.web,
+    watchdog: pair.watchdog
+  };
+  const stdoutForKind: Record<PlistKind, string> = {
+    gateway: "runtime-stdout.log",
+    web: "web.log",
+    watchdog: "watchdog.log"
+  };
+  const stderrForKind: Record<PlistKind, string> = {
+    gateway: "runtime-launchd.err.log",
+    web: "web-launchd.err.log",
+    watchdog: "watchdog-launchd.err.log"
+  };
   return kinds.map((kind): SupervisedService => ({
     kind,
     label: labelForKind(options.instance, kind),
     plistPath: plistPathFor(options.instance, kind),
     serviceTarget: serviceTarget(options.instance, kind),
-    spec: kind === "gateway" ? pair.gateway : pair.web,
-    stdoutLogFilename: kind === "gateway" ? "runtime-stdout.log" : "web.log",
-    stderrLogFilename: kind === "gateway" ? "runtime-launchd.err.log" : "web-launchd.err.log",
+    spec: specForKind[kind],
+    stdoutLogFilename: stdoutForKind[kind],
+    stderrLogFilename: stderrForKind[kind],
+    ...(kind === "watchdog" ? { startIntervalSeconds: WATCHDOG_START_INTERVAL_SECONDS } : {}),
     resolution: pair.resolution
   }));
 }
@@ -465,8 +519,9 @@ function buildWebShim(instance: Instance, bunPath: string): string {
     // Propagate SIGTERM during the polling phase. Without this, launchctl
     // bootout while the shim is sleeping in the poll loop would interrupt
     // the sleep, walk to the next iteration, and only exit when the
-    // overall loop completes. Trapping → exit 0 makes the polling phase
-    // honor KeepAlive.SuccessfulExit:false the same way the runtime does.
+    // overall loop completes. Trapping → exit 0 makes the shim exit
+    // promptly when bootout (the stop mechanism) signals it, instead of
+    // finishing the whole poll loop first.
     // Once `exec <bunPath> run dev` runs, the shell is gone and bun
     // handles SIGTERM directly. We exec the absolute bunPath (the
     // same one the gateway's programArguments uses) instead of bare
@@ -614,20 +669,32 @@ export interface PlistOptions {
   // service. 10s keeps a crashloop from melting CPU without making clean-stop
   // recovery painfully slow.
   throttleIntervalSeconds?: number;
+  // When set, emit a periodic one-shot plist instead of a long-lived one:
+  // `StartInterval` (launchd relaunches every N seconds) + `RunAtLoad`, and
+  // NO `KeepAlive`. Used for the watchdog. When omitted, the plist is a
+  // KeepAlive long-lived job (gateway/web).
+  startIntervalSeconds?: number;
 }
 
 export function generatePlist(options: PlistOptions): string {
   const throttle = options.throttleIntervalSeconds ?? THROTTLE_INTERVAL_SECONDS;
+  const periodic = options.startIntervalSeconds !== undefined;
   const label = options.kind ? labelForKind(options.instance, options.kind) : labelFor(options.instance);
   const args = options.spec.programArguments.map(escapeXml).map((a) => `        <string>${a}</string>`).join("\n");
   const envEntries = Object.entries(options.spec.environment)
     .map(([key, value]) => `        <key>${escapeXml(key)}</key>\n        <string>${escapeXml(value)}</string>`)
     .join("\n");
 
-  // Per the ADR-style decisions in /tmp/claude-context-gini-autostart.md:
-  //   - KeepAlive is a dict (not bool). SuccessfulExit:false means a clean
-  //     `gini stop` (exit 0) is NOT respawned; anything non-zero IS.
-  //   - ThrottleInterval:10 caps crashloop CPU.
+  // KeepAlive contract:
+  //   - KeepAlive is a plain <true/>: launchd ALWAYS respawns the service
+  //     when it exits, regardless of exit code. The runtime must be "always
+  //     up", so a clean exit (e.g. an auto-update self-SIGTERM) is treated
+  //     as "respawn with the fresh code", not "the user is done".
+  //   - Stopping is therefore an out-of-band action: `gini stop` runs
+  //     `launchctl bootout` to unload the service so KeepAlive no longer
+  //     applies. We never rely on a clean exit to keep the service down.
+  //   - ThrottleInterval:10 caps crashloop CPU — KeepAlive:true means a
+  //     crash loop would otherwise respawn as fast as the process dies.
   //   - RunAtLoad:true means it starts at user login.
   //
   // NetworkState was considered (would gate first-boot launches until the
@@ -636,8 +703,27 @@ export function generatePlist(options: PlistOptions): string {
   // network-state transition, which doesn't fire when the network was
   // already up. Empirically that prevents respawn-after-SIGKILL entirely.
   // The runtime tolerates a network-not-yet-up startup (provider auth
-  // retries with backoff), so dropping NetworkState gets us the contract
-  // that matters — clean `gini stop` honored, crash respawned.
+  // retries with backoff), so dropping NetworkState gets us reliable
+  // crash respawn.
+  //
+  // Scheduling block differs by job shape:
+  //   - Long-lived (gateway/web): KeepAlive:true + ThrottleInterval. launchd
+  //     always respawns on exit; bootout is the stop.
+  //   - Periodic (watchdog): StartInterval + RunAtLoad and NO KeepAlive. The
+  //     watchdog is a short-lived probe that always exits 0 — KeepAlive would
+  //     respawn it in a tight loop the instant it finishes. StartInterval is
+  //     the right primitive: launchd reruns it every N seconds.
+  const scheduling = periodic
+    ? `    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>${options.startIntervalSeconds}</integer>`
+    : `    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>${throttle}</integer>`;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -654,15 +740,7 @@ ${args}
     <dict>
 ${envEntries}
     </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <key>ThrottleInterval</key>
-    <integer>${throttle}</integer>
+${scheduling}
     <key>StandardOutPath</key>
     <string>${escapeXml(options.stdoutPath)}</string>
     <key>StandardErrorPath</key>
@@ -690,6 +768,9 @@ export interface WritePlistOptions {
   stdoutPath: string;
   stderrPath: string;
   throttleIntervalSeconds?: number;
+  // Forwarded to generatePlist: when set, writes a periodic (StartInterval,
+  // no KeepAlive) plist instead of a long-lived one. Set for the watchdog.
+  startIntervalSeconds?: number;
 }
 
 export function writePlist(options: WritePlistOptions): string {

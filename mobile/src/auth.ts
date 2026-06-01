@@ -48,11 +48,68 @@ function broadcast(next: AuthCredentials | null) {
   for (const listener of listeners) listener(next);
 }
 
+// True when `hostname` is a host on the user's own machine or a private
+// network they control. Used to gate plaintext `http://` base URLs:
+// iOS ATS is globally disabled (NSAllowsArbitraryLoads=true) so any
+// http:// destination would otherwise transmit the bearer in cleartext.
+// Recognised:
+//   - loopback: `localhost`, `127.0.0.1`, `::1`
+//   - RFC1918:  10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
+//   - CGNAT:    100.64.0.0/10  (Tailscale's default address pool)
+//   - mDNS:     any `*.local` host
+// Anything else falls through as false — including TEST-NET ranges
+// (e.g. 203.0.113.x) and public hosts.
+export function isLocalGatewayHost(hostname: string): boolean {
+  if (!hostname) return false;
+  // WHATWG URL exposes IPv6 hostnames in bracket form (e.g. "[::1]"), but
+  // the loopback literal in the allowlist below is bracket-less ("::1").
+  // Strip a single surrounding pair so both shapes match.
+  const host = hostname.toLowerCase().replace(/^\[(.+)\]$/, "$1");
+  if (host === "localhost") return true;
+  if (host === "127.0.0.1") return true;
+  if (host === "::1") return true;
+  // `.local` must be the trailing label so `my.local.evil.com` (where
+  // `local` is just a label inside a public DNS name) doesn't match.
+  if (host.endsWith(".local")) return true;
+  const octets = host.split(".");
+  if (octets.length !== 4) return false;
+  const parsed: number[] = [];
+  for (const part of octets) {
+    if (part.length === 0 || part.length > 3) return false;
+    if (!/^[0-9]+$/.test(part)) return false;
+    const num = Number(part);
+    if (!Number.isInteger(num) || num < 0 || num > 255) return false;
+    parsed.push(num);
+  }
+  const [a, b] = parsed as [number, number, number, number];
+  // 10.0.0.0/8
+  if (a === 10) return true;
+  // 172.16.0.0/12  (172.16.x – 172.31.x)
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  // 192.168.0.0/16
+  if (a === 192 && b === 168) return true;
+  // 100.64.0.0/10  (100.64.x – 100.127.x — Tailscale CGNAT range)
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  return false;
+}
+
+// Error surfaced when a plaintext `http://` base URL points at a host
+// outside the local-network allowlist. Exposed so callers (e.g. api.ts'
+// runtime guard) can reuse the exact wording.
+export const PUBLIC_HTTP_REJECTION =
+  "Gateway must use https:// or http:// to a local network host " +
+  "(127.0.0.1, 10.x, 172.16-31.x, 192.168.x, 100.64-127.x, or *.local). " +
+  "Public http:// would expose your bearer in plaintext.";
+
 // Reduce a user-supplied base URL to scheme + host + port. The gateway
 // accepts `?token=...` as an auth fallback, so a pasted URL like
 // `http://host:7421?token=leaked` would otherwise be concatenated into
 // every request and silently authenticate that way. Reject anything
 // that doesn't parse so a malformed value can't be saved.
+//
+// Plaintext `http://` is restricted to the local-network allowlist
+// because iOS ATS is globally disabled — a public http:// URL would
+// ship the bearer in cleartext.
 export function normalizeBaseUrl(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) throw new Error("Base URL is required.");
@@ -64,6 +121,9 @@ export function normalizeBaseUrl(input: string): string {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("Base URL must use http or https.");
+  }
+  if (parsed.protocol === "http:" && !isLocalGatewayHost(parsed.hostname)) {
+    throw new Error(PUBLIC_HTTP_REJECTION);
   }
   return parsed.origin;
 }
@@ -94,7 +154,7 @@ export async function clearCredentials(): Promise<void> {
   broadcast(null);
 }
 
-async function tryDeregisterCachedDevice(): Promise<void> {
+export async function tryDeregisterCachedDevice(): Promise<void> {
   try {
     // Lazy require: keeps the import graph free of an auth → push
     // cycle (push.ts imports api.ts which depends on cached

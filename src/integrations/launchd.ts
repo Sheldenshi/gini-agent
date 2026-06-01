@@ -21,6 +21,22 @@ import type { Instance } from "../types";
 
 export const LABEL_PREFIX = "ai.lilaclabs.gini";
 
+// Value baked into the plist's EnvironmentVariables (GINI_SUPERVISOR) so a
+// launchd-spawned runtime/web/watchdog can recognize at runtime that it is
+// under launchd supervision. The foreground / `gini run` / `gini start`
+// paths never set it.
+export const GINI_SUPERVISOR_VALUE = "launchd";
+
+// Read whether the current process is running under launchd supervision.
+// Returns "launchd" only when the env carries our explicit marker (set in
+// the plist by resolveLaunchSpecPair); foreground/conductor/tmux runs leave
+// it unset and get null. Callers branch on this to choose launchd-native
+// behavior (bootout as stop, KeepAlive respawn after self-SIGTERM) vs the
+// foreground process-tree behavior.
+export function supervisor(): "launchd" | null {
+  return process.env.GINI_SUPERVISOR === GINI_SUPERVISOR_VALUE ? "launchd" : null;
+}
+
 // Older releases shipped under different label prefixes. `enable()` boots
 // out and removes any plists registered under these so an upgrade is clean
 // (no orphan launchd jobs, no plist files left in ~/Library/LaunchAgents/).
@@ -35,7 +51,7 @@ export const LEGACY_LABEL_PREFIXES: readonly string[] = ["ai.lilac.gini"];
 // clean-stop recovery painfully slow.
 export const THROTTLE_INTERVAL_SECONDS = 10;
 
-export type PlistKind = "gateway" | "web";
+export type PlistKind = "gateway" | "web" | "watchdog";
 
 // Returns every legacy label/plist-path pair that may exist on disk for
 // this instance, across all known prior label prefixes and both the

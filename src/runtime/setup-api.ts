@@ -43,7 +43,7 @@
 // child's responsibility.
 
 import { writeFileSync } from "node:fs";
-import { configPath } from "../paths";
+import { configPath, writeRuntimeConfig } from "../paths";
 import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
@@ -191,7 +191,7 @@ export async function setSetupProvider(
     ? payload.model
     : (config.provider?.name === "codex" && config.provider.model ? config.provider.model : codexCatalog?.models[0] ?? "gpt-5.5");
   config.provider = normalizeProvider({ name: "codex", model } as ProviderConfig);
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   // Codex switching DOES require a plist refresh: the gateway's config.json
   // is the source of truth for which provider it boots with, and that's
   // already updated. But the plist still has GINI_INSTANCE etc — no env

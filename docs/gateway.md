@@ -81,13 +81,15 @@ Every BFF request to `/api/runtime/*` carries a CSRF guard before the gateway be
    GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000
    ```
 
-   The guard accepts an `Origin` only if it exactly matches one of the listed entries. This is the required posture for any BFF exposed beyond loopback (tailnet, tunnel, public DNS). If you set the env var but every entry is malformed, the guard fails closed and refuses every privileged POST until you fix the value — a typo bricks privileged routes loudly rather than silently downgrading.
+   The guard accepts an `Origin` only if it exactly matches one of the listed entries. This is the required posture for tailnet and public-DNS exposures, and for any browser session on a tunnel where `Origin` needs allowlisting. If you set the env var but every entry is malformed, the guard fails closed and refuses every privileged POST until you fix the value — a typo bricks privileged routes loudly rather than silently downgrading.
 
 2. **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. The guard accepts requests only when both the request `Host` is loopback (`localhost`, `127.0.0.1`, or `[::1]`) and the `Origin` matches `Host`. Any non-loopback Host is refused without an explicit allowlist, so a BFF run on a tailnet hostname without `GINI_TRUSTED_ORIGINS` will see every privileged POST 403'd — set the env var or bind the BFF to loopback only.
 
 Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
-See [BFF trust boundary ADR](adr/bff-trust-boundary.md) for the decision context, threat model, and alternatives considered.
+For Cloudflare quick tunnels, a parallel trust lane bypasses the `GINI_TRUSTED_ORIGINS` requirement on a per-request basis: the Next.js proxy (`web/src/proxy.ts`) verifies the inbound `Host` against the live tunnel hostname read from the runtime's tunnel state file and stamps `x-gini-tunnel-vetted: 1` after the secret-path / cookie gate passes. The BFF CSRF guard accepts vetted requests on a non-loopback Host without requiring an explicit `GINI_TRUSTED_ORIGINS` entry for the rotating trycloudflare URL. The marker is un-forgeable end-to-end because the proxy strips any inbound `x-gini-tunnel-vetted` header before any branching decision and only stamps it after passing the secret/cookie gate; the strip-then-stamp boundary is the trust enforcer. See [BFF trust boundary ADR](adr/bff-trust-boundary.md) for the full marker contract, threat model, and alternatives considered.
+
+The quick-tunnel hostname is ephemeral — Cloudflare assigns a fresh `*.trycloudflare.com` on every `cloudflared` restart and may revoke it without notice — so enable the Apple Notes mirror on the settings TunnelCard to let the mobile app pick up the rotated URL automatically. See the [Quick-tunnel URL ephemerality](adr/tunnel-and-mobile-access.md#quick-tunnel-url-ephemerality) section of the tunnel ADR for the full operator guidance.
 
 ## Lifecycle Commands
 

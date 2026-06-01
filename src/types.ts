@@ -1,3 +1,5 @@
+import type { TunnelPersistedConfig } from "./runtime/tunnel/types";
+
 // `default` is the production end-user install (set by ~/.local/bin/gini).
 // Anything else is a developer worktree (auto-derived from the repo dir
 // basename) or a named test/smoke instance.
@@ -105,7 +107,7 @@ export type RuntimeEventKind =
 
 export type JobRunStatus = "running" | "completed" | "failed";
 
-export type ChatMessageRole = "user" | "assistant" | "system";
+export type ChatMessageRole = "user" | "assistant" | "system" | "tool";
 
 export type RunStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
@@ -130,7 +132,9 @@ export interface ProviderConfig {
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
   // unconditionally owns: model, messages, stream, tools, tool_choice,
-  // response_format, functions, function_call, store, plus prototype-pollution
+  // response_format, functions, function_call, store, prompt_cache_retention
+  // (pinned to "in_memory" by the runtime — extraBody can't promote a
+  // request to the "24h" extended tier), plus prototype-pollution
   // payloads (__proto__, constructor, prototype) and the JSON.stringify
   // hijack vector (toJSON). Token-budget fields (max_tokens,
   // max_completion_tokens) are allowed in extraBody for
@@ -181,6 +185,14 @@ export interface RuntimeConfig {
   workspaceRoot: string;
   stateRoot: string;
   logRoot: string;
+  // On-disk tunnel block, kept in sync by TunnelManager so the four
+  // whole-config writers (`updateAutoApproveSettings`,
+  // `setSetupProvider`, the boot-time approval-mode migration, …) don't
+  // silently clobber an enable / disable / rotate-secret transition
+  // when they serialize the in-memory config back to disk. The manager
+  // mutates this field after every `patchTunnelConfig` call. Optional
+  // because legacy `config.json` files predate the field.
+  tunnel?: TunnelPersistedConfig;
   // User-curated allowlist of shell-glob patterns that bypass the approval
   // gate for terminal_exec. Patterns match the full command string (e.g.
   // `memo *` matches any command starting with "memo "). Auto-approved
@@ -224,6 +236,12 @@ export interface RuntimeConfig {
     // non-conforming value falls back to the built-in default.
     maxIterations?: number;
   };
+  // Cache warmer interval in minutes. 0 / undefined disables the warmer.
+  // When > 0 the runtime fires a minimal probe against the active
+  // provider every `cacheWarmerMinutes * 0.9` minutes so the prompt
+  // cache stays warm. Bounded to 0..1440 by the setter. See
+  // src/runtime/cache-warmer.ts.
+  cacheWarmerMinutes?: number;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so
@@ -310,6 +328,17 @@ export interface ToolCallBlock extends ChatBlockBase {
   // associate result with call, and by resume paths to flip the
   // matching running block to `ok`/`error` after the approval lands.
   callId: string;
+  // Optional context message a tool emits while parked in `running`,
+  // describing why it's waiting and what (if anything) the user can do
+  // to unblock it. Reserved for tools that block on an external event
+  // the agent cannot drive — currently only `wait_for_messaging_pair`
+  // (waiting on an inbound Telegram DM, up to 600s). Clients MAY render
+  // a running tool_call more prominently when this field is set; the
+  // wire contract is that the hint is advisory, not a separate kind.
+  // The runtime clears it automatically when the tool's status leaves
+  // `running`, so resolution/error/cancellation collapse the block back
+  // to its default render.
+  runningHint?: string;
 }
 
 export interface ToolResultBlock extends ChatBlockBase {
@@ -729,6 +758,21 @@ export interface ChatMessageRecord {
   // from landing. Untagged assistant messages (the default) are the
   // task's terminal summary.
   kind?: string;
+  // Tool-calling transcript fields, set only on rows tagged
+  // kind:"tool_transcript". The assistant row that emits tool calls carries
+  // `toolCalls`; each paired result row uses role:"tool" with `toolCallId`
+  // pointing back at the originating call. Stored in a provider-agnostic
+  // inline shape (not the provider's ToolCall type) so the durable store has
+  // no provider dependency; chat-task maps these back to the provider message
+  // shape when replaying across turns. These rows are excluded from the
+  // human-facing JSON views in chat.ts.
+  toolCalls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
+  toolCallId?: string;
+  // Monotonic per-store sequence stamped at create time. Gives a stable
+  // tiebreaker when several transcript rows share a createdAt timestamp, so
+  // replay can reconstruct exact assistant→tool ordering. Older rows lack it
+  // and fall back to 0.
+  seq?: number;
 }
 
 export interface TraceRecord {

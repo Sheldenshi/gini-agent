@@ -2,11 +2,13 @@
 
 - **Status:** Accepted
 - **Date:** 2026-05-19
-- **See also:** [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md)
+- **See also:** [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Per-Agent Memory Isolation](./agent-memory-isolation.md), [Stable System Prefix](./stable-system-prefix.md)
 
 ## Decision
 
-The chat-task agent loop injects a per-conversation runtime identity block into the system prompt. The block names the instance, runtime port, active agent, provider/model, enabled toolsets, and memory namespace — the same fields `gini status` surfaces. The agent can then answer self-introspection questions (`what model are you?`, `what tools do you have?`, `what instance am I talking to?`) without spending a tool call.
+The chat-task agent loop injects a per-conversation runtime identity block into each turn. The block names the instance, runtime port, active agent, provider/model, enabled toolsets, and memory namespace — the same fields `gini status` surfaces. The agent can then answer self-introspection questions (`what model are you?`, `what tools do you have?`, `what instance am I talking to?`) without spending a tool call.
+
+The emitted block is delivered in an ephemeral `role:"user"` "context" message placed after the full prior transcript and immediately before the real user message — **not** in the system message (message 0). Message 0 is a byte-stable, cacheable prefix; per-turn identity emission lives in the tail so an emit turn never breaks the cache prefix. The tell-once mechanism below is unchanged — only the placement of the emitted string moved. See ADR stable-system-prefix.md.
 
 The block uses a tell-once + delta + periodic refresh policy keyed on the chat session id:
 
@@ -20,7 +22,7 @@ The would-be snapshot is persisted to `RuntimeState.identitySnapshots[conversati
 
 Before this change, the agent had no in-context source for its own runtime identity. Asked "what tools do you have?" or "what's your instance?", it would either guess from prior memory entries or admit it didn't know. Tools that could fetch the info (`gini status` via terminal, the `gini` skill) require explicit tool calls — slow, costly, and the agent doesn't always think to invoke them.
 
-The naive fix — always emit the full identity block — would re-send the same fields on every turn for stable sessions. With `codex/gpt-5.5` and similar provider backends the prompt-cache hit rate on identical prefixes blunts the cost, but the rest of the system prompt already varies per turn (recalled memory is keyed on task input), so the cache breaks downstream of identity anyway. Frequent agent reconfiguration ("I'm constantly switching toolsets and providers") defeats the cache argument entirely.
+The naive fix — always emit the full identity block — would re-send the same fields on every turn for stable sessions, and (in the original design that placed identity in the system message) would change message 0 on every reconfiguration, breaking the cache prefix. The tell-once policy bounds emitted identity tokens; placing the emitted block in the ephemeral `role:"user"` tail (see ADR stable-system-prefix.md) keeps even an emit turn from disturbing the byte-stable system prefix, so frequent agent reconfiguration no longer defeats the cache for the rest of the prompt.
 
 A pure-delta approach (tell once, then only emit changes forever) would minimize tokens but force the model to reconstruct ground-truth identity from a long chain of accumulated deltas in unbounded-length conversations. The periodic full refresh caps that reconstruction depth at `IDENTITY_FULL_REFRESH_INTERVAL` turns and gives the prompt cache a clean resync point on a predictable cadence.
 
@@ -52,7 +54,7 @@ A pure-delta approach (tell once, then only emit changes forever) would minimize
 - **Behavior change:** the agent answers self-introspection questions correctly without a tool call on the first turn of a chat session, and at every `IDENTITY_FULL_REFRESH_INTERVAL`-th turn thereafter. Follow-up turns without identity changes carry no identity tokens.
 - **State growth:** one `IdentitySnapshotRecord` per active chat session. Each record is small (seven identity fields plus an integer). Cleanup follows chat-session deletion, so growth tracks active conversations rather than lifetime turn count.
 - **Prompt token cost:** flat for stable sessions (zero identity tokens after the first turn except at the K-turn refresh). Bounded for high-churn sessions (delta lines are smaller than the full block; the K-turn refresh caps the worst case).
-- **Cache behavior:** the identity block sits directly after the static `INSTRUCTIONS` preamble. When the block is identical to the prior turn (or absent), the prefix-cache prefix extends to the end of `INSTRUCTIONS + identity`. When the block changes, the cache breaks at the identity line — but downstream blocks (recalled memory) already vary per turn, so the practical effect on cache hits is small.
+- **Cache behavior:** the emitted identity block rides in the ephemeral `role:"user"` tail, after the full prior transcript and immediately before the real user message — never in the system message. Message 0 therefore stays byte-stable across turns regardless of whether identity is emitted, so an emit turn (first turn, K-turn refresh, or a reconfiguration delta) never breaks the cache prefix. The tail itself is uncached by construction (it carries the per-turn-varying content), which is the correct place for it. See ADR stable-system-prefix.md.
 
 ## Alternatives Considered
 
@@ -64,11 +66,11 @@ A pure-delta approach (tell once, then only emit changes forever) would minimize
 
 ## Acceptance Checks
 
-- Turn 1 of a fresh chat session: the system prompt contains `Your runtime identity:` and the agent answers self-introspection without tool calls.
-- Turn 2-9 of the same session with no identity changes: the system prompt contains neither `Your runtime identity:` nor `Runtime identity changes since last turn:`.
-- Turn N where toolsets / provider / agent / memory namespace changed: the system prompt contains `Runtime identity changes since last turn:` with only the changed fields annotated `(was X)`.
-- Turn 11 of a session: the system prompt re-emits the full block; `state.identitySnapshots[conversationId].lastFullTurn` advances to 11.
-- Subagent tasks: the system prompt is the subagent's override and contains no identity block.
+- Turn 1 of a fresh chat session: the ephemeral `role:"user"` tail contains `Your runtime identity:`, the system message (message 0) does not, and the agent answers self-introspection without tool calls.
+- Turn 2-9 of the same session with no identity changes: neither the system message nor the tail contains `Your runtime identity:` or `Runtime identity changes since last turn:`.
+- Turn N where toolsets / provider / agent / memory namespace changed: the tail contains `Runtime identity changes since last turn:` with only the changed fields annotated `(was X)`; message 0 stays byte-stable.
+- Turn 11 of a session: the tail re-emits the full block; `state.identitySnapshots[conversationId].lastFullTurn` advances to 11.
+- Subagent tasks: the system prompt is the subagent's override, no identity tail is injected.
 - Deleted chat session: `state.identitySnapshots[id]` is removed.
 - Task cancelled before `runLoop`'s first model call: `state.identitySnapshots[conversationId]` is unchanged from before the task started.
 - `bun run typecheck`, `bun test`, and `bun run gini smoke` are green.
@@ -76,7 +78,7 @@ A pure-delta approach (tell once, then only emit changes forever) would minimize
 ## Critical Files
 
 - `src/types.ts` — `AgentIdentity`, `IdentitySnapshotRecord`, `RuntimeState.identitySnapshots?`.
-- `src/system-prompt.ts` — `IDENTITY_FULL_REFRESH_INTERVAL`, `renderFullIdentity`, `renderIdentityDelta`, `decideIdentityEmission`; extended `buildAgentSystemContext` accepts an optional identity block.
+- `src/system-prompt.ts` — `IDENTITY_FULL_REFRESH_INTERVAL`, `renderFullIdentity`, `renderIdentityDelta`, `decideIdentityEmission`; `renderEphemeralContext` renders the emitted-identity + recalled-memory tail body (`buildAgentSystemContext` builds only the stable prefix). See ADR stable-system-prefix.md.
 - `src/execution/chat-task.ts` — `buildAgentIdentity`, deferred snapshot persistence in `runChatTask` and `runLoop`, subagent-skip branch.
 - `src/state/records.ts` — `deleteChatSession` clears the matching snapshot.
 - `src/system-prompt.test.ts`, `src/execution/chat-task.test.ts`, `src/http.test.ts` — render/decision/lifecycle coverage.

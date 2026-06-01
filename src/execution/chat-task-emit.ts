@@ -226,6 +226,26 @@ export function emitToolCallRunning(
   });
 }
 
+// Attach a `runningHint` to a tool_call block that's already mounted in
+// `running` status. The hint is advisory context a tool emits to explain
+// why it's parked — currently only used by tools that block on an
+// external event the agent can't drive (e.g. wait_for_messaging_pair
+// blocking on an inbound Telegram DM). Clients may render the row more
+// prominently when the hint is set; the wire contract is advisory, not a
+// new block kind. The hint is cleared automatically when the tool's
+// status leaves "running" (see updateToolCallBlock); a no-op when there's
+// no emit context (subagent children with no session) or when the block
+// can't be found.
+export function setToolCallRunningHint(
+  ctx: ChatEmitContext | undefined,
+  callId: string,
+  hint: string
+): ChatBlock | undefined {
+  if (!ctx) return undefined;
+  const updated = updateToolCallBlock(ctx.instance, callId, ctx.sessionId, { runningHint: hint });
+  return updated ?? undefined;
+}
+
 // Flip a tool_call row's status (running → ok | error | denied). The
 // lookup is by (sessionId, callId) so callers don't need to remember
 // the block id — the chat-task loop and the approval-resume path both

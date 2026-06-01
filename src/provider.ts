@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { buildAgentSystemContext } from "./system-prompt";
+import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
@@ -357,7 +357,15 @@ async function callToolCallingChatCompletions(
     ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
-    stream: wantStream
+    stream: wantStream,
+    // Pin the default (non-extended) prompt cache tier on every
+    // OpenAI-compatible chat-completions call. "in_memory" is what the
+    // OpenAI docs document for prompts ≥ 1024 tokens (5–10 min idle, 1
+    // hour max) — explicitly NOT "24h", which is documented as not
+    // Zero Data Retention eligible. openrouter / deepseek / local
+    // accept-but-ignore unknown fields, so the value is a no-op there.
+    // Codex never hits this builder.
+    prompt_cache_retention: "in_memory"
   };
   if (tools.length > 0) {
     body.tools = tools;
@@ -1235,11 +1243,21 @@ export async function generateTaskSummary(
   const instructionsOverride = loadInstructions(config.instance, loadOpts) ?? undefined;
   const soulBlock = loadSoul(config.instance, activeAgentId, loadOpts) ?? undefined;
   const userProfileBlock = loadUserProfile(config.instance, loadOpts) ?? undefined;
-  const systemContext = buildAgentSystemContext(recalledContext, undefined, {
+  // The legacy single-shot path is one system + one user message with no
+  // prior transcript and no cross-turn cache prefix to preserve, so recalled
+  // memory stays appended to its system context (the stable-prefix tail only
+  // applies to the multi-turn chat-task loop). renderEphemeralContext
+  // single-sources the "Long-term memory…" header. See ADR
+  // stable-system-prefix.md.
+  const stablePrefix = buildAgentSystemContext({
     instructionsOverride,
     soul: soulBlock,
     userProfile: userProfileBlock
   });
+  const recalledBlock = renderEphemeralContext(undefined, recalledContext);
+  const systemContext = recalledBlock.length > 0
+    ? `${stablePrefix}\n\n${recalledBlock}`
+    : stablePrefix;
   if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
     return callChatCompletions(provider, input, systemContext);
   }
@@ -1448,7 +1466,8 @@ async function callStructuredChatCompletions<T>(
         { role: "system", content: request.system },
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
-      stream: false
+      stream: false,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -1629,7 +1648,8 @@ async function callOpenAIResponses(
             { type: "input_text", text: input }
           ]
         }
-      ]
+      ],
+      prompt_cache_retention: "in_memory"
     })
   });
 
@@ -1669,7 +1689,8 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "system", content: systemContext },
         { role: "user", content: input }
       ],
-      stream: false
+      stream: false,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -2185,6 +2206,14 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "functions",
   "function_call",
   "store",
+  // Pinned at "in_memory" on every OpenAI-compatible chat-completions
+  // builder. Defense-in-depth: a future refactor that reorders the
+  // body spread so the typed field comes BEFORE sanitizeExtraBody
+  // would silently let extraBody.prompt_cache_retention shadow our
+  // explicit opt-out of the "24h" extended tier (documented as not
+  // Zero Data Retention eligible). Stripping the key here keeps the
+  // protection independent of spread order. See ADR cache-warmer.md.
+  "prompt_cache_retention",
   "__proto__",
   "constructor",
   "prototype",
@@ -2421,7 +2450,8 @@ async function callVisionChatCompletions(
         }
       ],
       stream: false,
-      ...tokenBudgetField
+      ...tokenBudgetField,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();

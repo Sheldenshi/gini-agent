@@ -55,7 +55,8 @@ function buildDevice(overrides?: Partial<PushDevice>): PushDevice {
     platform: "ios",
     bundleId: overrides?.bundleId ?? "ai.lilaclabs.gini.mobile",
     registeredAt: overrides?.registeredAt ?? new Date().toISOString(),
-    lastSeenAt: overrides?.lastSeenAt ?? new Date().toISOString()
+    lastSeenAt: overrides?.lastSeenAt ?? new Date().toISOString(),
+    origin: overrides?.origin ?? "loopback"
   };
 }
 

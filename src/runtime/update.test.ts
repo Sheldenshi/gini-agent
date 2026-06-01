@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import type { ChildProcess } from "node:child_process";
 import { spawnSync } from "node:child_process";
-import { currentVersionInfo, formatInstallFailure } from "./update";
+import { currentVersionInfo, formatInstallFailure, scheduleRuntimeRestart } from "./update";
 
 function scratch(tag: string): string {
   const dir = `/tmp/gini-runtime-update-tests/${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -70,3 +71,110 @@ describe("runtime update install failures", () => {
     expect(message).toBe("gini update: bun install in web/ failed (exit null).");
   });
 });
+
+// Records each scheduleRuntimeRestart spawn call without launching a real
+// subprocess. The returned stub only needs an unref().
+interface SpawnCall {
+  cmd: string;
+  args: string[];
+}
+
+function makeSpawnRecorder(): { calls: SpawnCall[]; spawn: (cmd: string, args?: readonly string[]) => ChildProcess } {
+  const calls: SpawnCall[] = [];
+  const spawn = (cmd: string, args?: readonly string[]): ChildProcess => {
+    calls.push({ cmd, args: [...(args ?? [])] });
+    return { unref() { /* no-op */ } } as unknown as ChildProcess;
+  };
+  return { calls, spawn };
+}
+
+// scheduleRuntimeRestart dispatches its restart strategy on supervisor():
+// under launchd it kicks the web service and self-SIGTERMs so KeepAlive
+// respawns the gateway with fresh code; in the foreground it falls back to
+// the detached stop+start bash helper.
+describe("scheduleRuntimeRestart", () => {
+  let scratch: string;
+  let priorState: string | undefined;
+  let priorLog: string | undefined;
+  let priorSupervisor: string | undefined;
+
+  beforeEach(() => {
+    scratch = `/tmp/gini-restart-tests/${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
+    mkdirSync(scratch, { recursive: true });
+    priorState = process.env.GINI_STATE_ROOT;
+    priorLog = process.env.GINI_LOG_ROOT;
+    priorSupervisor = process.env.GINI_SUPERVISOR;
+    // Route logDir() to the scratch dir so the function's update-restart.log
+    // write doesn't touch real instance state.
+    process.env.GINI_STATE_ROOT = join(scratch, "state");
+    process.env.GINI_LOG_ROOT = join(scratch, "logs");
+  });
+
+  afterEach(() => {
+    restoreEnv("GINI_STATE_ROOT", priorState);
+    restoreEnv("GINI_LOG_ROOT", priorLog);
+    restoreEnv("GINI_SUPERVISOR", priorSupervisor);
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  test("launchd: kicks the web service and self-SIGTERMs (no orphaning stop+start helper)", async () => {
+    process.env.GINI_SUPERVISOR = "launchd";
+    const { calls, spawn } = makeSpawnRecorder();
+    const kills: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+
+    const result = scheduleRuntimeRestart("restart-launchd", {
+      spawnImpl: spawn as never,
+      killImpl: (pid, signal) => { kills.push({ pid, signal }); }
+    });
+    expect(result).toBe(true);
+
+    // Exactly one spawn: `gini autostart kick --kind web`. No bash
+    // stop+start helper (that's the orphaning path we replaced).
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.cmd).not.toBe("bash");
+    expect(call.args).toContain("autostart");
+    expect(call.args).toContain("kick");
+    expect(call.args).toEqual(expect.arrayContaining(["--kind", "web"]));
+    expect(call.args).toEqual(expect.arrayContaining(["--instance", "restart-launchd"]));
+
+    // The self-SIGTERM is dispatched via setImmediate; let it run.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(kills.length).toBe(1);
+    expect(kills[0]!.pid).toBe(process.pid);
+    expect(kills[0]!.signal).toBe("SIGTERM");
+  });
+
+  test("foreground (no supervisor): uses the detached bash stop+start helper", async () => {
+    delete process.env.GINI_SUPERVISOR;
+    const { calls, spawn } = makeSpawnRecorder();
+    const kills: Array<{ pid: number; signal: NodeJS.Signals | number }> = [];
+
+    const result = scheduleRuntimeRestart("restart-fg", {
+      spawnImpl: spawn as never,
+      killImpl: (pid, signal) => { kills.push({ pid, signal }); }
+    });
+    expect(result).toBe(true);
+
+    expect(calls.length).toBe(1);
+    const call = calls[0]!;
+    expect(call.cmd).toBe("bash");
+    // The bash script contains the stop+start CLI invocations.
+    const script = call.args.join("\n");
+    expect(script).toContain("src/cli.ts stop --instance");
+    expect(script).toContain("src/cli.ts start --instance");
+    expect(script).toContain("restart-fg");
+    // It does NOT kick the launchd web service.
+    expect(script).not.toContain("autostart kick");
+
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(kills.length).toBe(1);
+    expect(kills[0]!.pid).toBe(process.pid);
+    expect(kills[0]!.signal).toBe("SIGTERM");
+  });
+});
+
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}

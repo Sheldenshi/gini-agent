@@ -567,4 +567,47 @@ describe("memory-db schema and storage", () => {
     expect(probe.banks).toBe(0);
     expect(probe.schemaVersion).toBe(MEMORY_SCHEMA_VERSION);
   });
+
+  test("backfills devices.origin on a pre-v7 install with the loopback default", () => {
+    // Simulate a v6 install: create the devices table WITHOUT the
+    // origin column, drop a row in, close the connection, and let
+    // getMemoryDb run its migration on next open. The ensureColumn
+    // helper should add origin with the loopback default so the
+    // existing row keeps its identity instead of getting purged on
+    // the first rotate.
+    const instance = "mem-devices-origin-backfill";
+    mkdirSync(instanceRoot(instance), { recursive: true });
+    const path = memoryDbPath(instance);
+    const direct = new Database(path, { create: true });
+    direct.exec(`
+      CREATE TABLE devices (
+        token TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL,
+        platform TEXT NOT NULL CHECK (platform IN ('ios')),
+        bundle_id TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+    `);
+    direct.run(
+      `INSERT INTO devices (token, credential_id, platform, bundle_id, registered_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["legacy-tok", "cred_a", "ios", "ai.lilaclabs.gini.mobile", "now", "now"]
+    );
+    direct.close();
+
+    // Re-open via the cached helper so applyMigrations runs.
+    const db = getMemoryDb(instance);
+    const cols = db
+      .query<{ name: string }, []>("PRAGMA table_info(devices)")
+      .all();
+    expect(cols.some((c) => c.name === "origin")).toBe(true);
+
+    const row = db
+      .query<{ origin: string }, [string]>(
+        "SELECT origin FROM devices WHERE token = ?"
+      )
+      .get("legacy-tok");
+    expect(row?.origin).toBe("loopback");
+  });
 });

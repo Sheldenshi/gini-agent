@@ -4,6 +4,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
+import { sep } from "node:path";
 import { dispatchToolCall } from "./tool-dispatch";
 import { buildToolCatalog } from "./tool-catalog";
 import { createChatSession, createSkill, createTask, mutateState, readState, upsertTask } from "../state";
@@ -153,12 +154,39 @@ describe("install_skill dispatch", () => {
       expect(result.result).toContain(skill!.id);
     }
 
+    // User installs land flat in the instance skills root — no grouping
+    // subfolder (and specifically not a "user" one). Category folders are a
+    // bundled-skill convention, so a flat user skill carries no category.
+    expect(skill!.manifestPath?.endsWith(`${sep}skills${sep}dispatch-test-skill${sep}SKILL.md`)).toBe(true);
+    expect(skill!.manifestPath).not.toContain(`${sep}skills${sep}user${sep}`);
+    expect(skill!.category).toBeUndefined();
+
     const audit = readState(config.instance).audit.find(
       (event) => event.action === "skill.installed" && event.actor === "agent" && event.target === skill!.id
     );
     expect(audit).toBeDefined();
     expect(audit?.evidence?.skillId).toBe(skill!.id);
     expect(audit?.evidence?.name).toBe("dispatch-test-skill");
+  });
+
+  test("stays flat even when a category arg is passed", async () => {
+    const config = makeConfig("install-skill-category");
+    const taskId = await seedTask(config);
+
+    // A stray `category` arg is ignored — user skills never nest.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "install_skill",
+      "call_install_cat",
+      JSON.stringify({ body: SKILL_BODY, category: "team-tools" })
+    );
+    expect(result.kind).toBe("sync");
+    const skill = readState(config.instance).skills.find((s) => s.name === "dispatch-test-skill");
+    expect(skill).toBeDefined();
+    expect(skill!.manifestPath?.endsWith(`${sep}skills${sep}dispatch-test-skill${sep}SKILL.md`)).toBe(true);
+    expect(skill!.manifestPath).not.toContain(`${sep}skills${sep}team-tools${sep}`);
+    expect(skill!.category).toBeUndefined();
   });
 
   test("rejects missing body", async () => {
