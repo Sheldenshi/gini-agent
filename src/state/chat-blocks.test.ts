@@ -592,4 +592,35 @@ describe("chat-blocks persistence", () => {
     expect(row?.task_id).toBe("task_meta");
     expect(row?.run_id).toBe("run_meta");
   });
+
+  test("system_note round-trips authError metadata; plain notes omit it", () => {
+    const instance = "chat-blocks-autherror";
+
+    insertChatBlock(instance, {
+      kind: "system_note",
+      sessionId: "chat_auth",
+      text: "Codex authentication expired. Re-authenticate Codex to continue.",
+      authError: {
+        provider: "codex",
+        providerLabel: "Codex",
+        detail: "Provided authentication token is expired. Please try signing in again."
+      }
+    });
+    insertChatBlock(instance, {
+      kind: "system_note",
+      sessionId: "chat_auth",
+      text: "Cancelled"
+    });
+
+    const [authNote, plainNote] = listChatBlocks(instance, "chat_auth");
+    if (authNote?.kind !== "system_note" || plainNote?.kind !== "system_note") {
+      throw new Error("expected two system_note blocks");
+    }
+    expect(authNote.authError).toEqual({
+      provider: "codex",
+      providerLabel: "Codex",
+      detail: "Provided authentication token is expired. Please try signing in again."
+    });
+    expect(plainNote.authError).toBeUndefined();
+  });
 });

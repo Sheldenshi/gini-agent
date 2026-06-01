@@ -26,8 +26,8 @@ import {
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
-import { decideApproval } from "../agent";
-import { createChatMessage, insertChatBlock, mutateState, readState } from "../state";
+import { decideApproval, failTask } from "../agent";
+import { createChatMessage, insertChatBlock, listChatBlocks, mutateState, readState } from "../state";
 import { createScheduledJob } from "../jobs";
 import {
   getChatSession,
@@ -402,6 +402,84 @@ describe("chat session waiting-approval placeholder", () => {
     expect(message).not.toBeNull();
     expect(message?.role).toBe("assistant");
     expect(message?.content).toContain("Approval denied");
+  });
+
+  test("failTask surfaces a re-auth note when the provider credential expired", async () => {
+    // A turn that dies on an expired/invalid provider token must render an
+    // actionable system note (provider name + re-auth metadata) rather than
+    // passing the raw provider line through verbatim. See issue #205.
+    const config = {
+      ...buildConfig(workspaceRoot, "chat-fail-auth-note"),
+      provider: { name: "codex" as const, model: "gpt-5-codex" }
+    };
+    const session = await createChat(config, { title: "auth-fail" });
+    const taskId = "task_authfail";
+    await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: taskId,
+        title: "chat turn",
+        input: "do it",
+        status: "running",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "Thinking"
+      };
+      state.tasks.push(task);
+      const record = state.chatSessions.find((s) => s.id === session.id);
+      if (record) record.taskIds.push(task.id);
+    });
+
+    await failTask(
+      config,
+      taskId,
+      new Error("Provided authentication token is expired. Please try signing in again.")
+    );
+
+    const note = listChatBlocks(config.instance, session.id).find((b) => b.kind === "system_note");
+    if (note?.kind !== "system_note") throw new Error("expected a system_note block");
+    expect(note.authError).toEqual({
+      provider: "codex",
+      providerLabel: "Codex",
+      detail: "Provided authentication token is expired. Please try signing in again."
+    });
+    expect(note.text).toContain("Codex authentication expired");
+
+    // A non-auth failure must NOT carry authError — the raw message passes
+    // through as before.
+    const plainTaskId = "task_plainfail";
+    await mutateState(config.instance, (state) => {
+      const task: Task = {
+        id: plainTaskId,
+        title: "chat turn",
+        input: "do it",
+        status: "running",
+        instance: state.instance,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        tracePath: "",
+        auditIds: [],
+        approvalIds: [],
+        skillIds: [],
+        chatSessionId: session.id,
+        currentStep: "Thinking"
+      };
+      state.tasks.push(task);
+      const record = state.chatSessions.find((s) => s.id === session.id);
+      if (record) record.taskIds.push(task.id);
+    });
+    await failTask(config, plainTaskId, new Error("Rate limit exceeded"));
+    const plainNote = listChatBlocks(config.instance, session.id)
+      .filter((b) => b.kind === "system_note")
+      .at(-1);
+    if (plainNote?.kind !== "system_note") throw new Error("expected a system_note block");
+    expect(plainNote.authError).toBeUndefined();
+    expect(plainNote.text).toBe("Rate limit exceeded");
   });
 
   test("auto-renames a default chat with a provider-generated title after two synced turns", async () => {

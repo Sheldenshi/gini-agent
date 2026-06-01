@@ -9,7 +9,9 @@ import {
   generateTaskSummary,
   generateToolCallingResponse,
   generateVisionAnalysis,
+  isAuthExpiredError,
   normalizeProvider,
+  providerDisplayLabel,
   providerHealth,
   setEchoToolCallingResponse,
   setEchoVisionResponse,
@@ -2955,3 +2957,44 @@ function config(provider: RuntimeConfig["provider"]): RuntimeConfig {
     logRoot: "/tmp/gini-provider-test-logs"
   };
 }
+
+describe("auth-error classification", () => {
+  test("isAuthExpiredError flags expired/invalid/401/sign-in-again messages", () => {
+    const positives = [
+      "Provided authentication token is expired. Please try signing in again.",
+      "Your ChatGPT session expired before this request finished",
+      "401 Unauthorized",
+      "invalid access token",
+      "token_expired",
+      "API key is invalid",
+      "Please re-authenticate to continue"
+    ];
+    for (const message of positives) {
+      expect(isAuthExpiredError(message)).toBe(true);
+    }
+  });
+
+  test("isAuthExpiredError ignores unrelated failures", () => {
+    const negatives = [
+      "Rate limit exceeded",
+      "The request is invalid",
+      "model returned an empty response",
+      "the cached file is invalid",
+      "Internal server error (500)",
+      "missing required parameter: messages",
+      undefined
+    ];
+    for (const message of negatives) {
+      expect(isAuthExpiredError(message)).toBe(false);
+    }
+  });
+
+  test("providerDisplayLabel returns clean brand labels", () => {
+    expect(providerDisplayLabel("codex")).toBe("Codex");
+    expect(providerDisplayLabel("openai")).toBe("OpenAI");
+    expect(providerDisplayLabel("openrouter")).toBe("OpenRouter");
+    expect(providerDisplayLabel("deepseek")).toBe("DeepSeek");
+    expect(providerDisplayLabel("local")).toBe("Local");
+    expect(providerDisplayLabel("echo")).toBe("Gini Echo");
+  });
+});

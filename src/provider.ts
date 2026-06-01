@@ -180,11 +180,25 @@ export function providerDisplayLabel(name: ProviderName): string {
 // Deliberately broader than CODEX_SESSION_EXPIRED_RE (which gates retries and
 // must avoid retrying generic failures): here a false positive only adds a
 // re-auth hint to a note we were already going to show, so the matcher favors
-// recall. The proximity windows ([^.]{0,40}) keep "expired"/"invalid" tied to
-// an auth noun within the same sentence so unrelated failures ("the cached
-// file is invalid") don't trip it.
-const AUTH_EXPIRED_RE =
-  /\b401\b|\bunauthorized\b|sign(?:ing)?[\s-]*in[\s-]*again|re-?authenticate|\b(?:auth(?:enticat\w*)?|session|token|credential|api[\s_-]*key|access[\s_-]*token)\b[^.]{0,40}\b(?:expired|invalid|revoked|rejected|missing|failed)\b|\b(?:expired|invalid|revoked|missing)\b[^.]{0,40}\b(?:auth(?:enticat\w*)?|session|token|credential|api[\s_-]*key|access[\s_-]*token)\b/i;
+// recall. An auth noun and an expiry/invalidity verb must sit within the same
+// sentence ([^.]{0,40}) and in either order, so unrelated failures ("the
+// cached file is invalid") don't trip it. The connector after each noun/verb
+// is `(?:[\s_-]|\b)` rather than a bare `\b` so the snake_case enum forms the
+// backend emits (`token_expired`, `session_expired`) match too — `_` is a word
+// char, so `\b` alone would miss them.
+const AUTH_NOUN = "(?:auth(?:enticat\\w*)?|session|token|credential|api[\\s_-]*key|access[\\s_-]*token)";
+const AUTH_VERB = "(?:expired|invalid|revoked|rejected|missing|failed)";
+const AUTH_EXPIRED_RE = new RegExp(
+  [
+    "\\b401\\b",
+    "\\bunauthorized\\b",
+    "sign(?:ing)?[\\s-]*in[\\s-]*again",
+    "re-?authenticate",
+    `\\b${AUTH_NOUN}(?:[\\s_-]|\\b)[^.]{0,40}?${AUTH_VERB}\\b`,
+    `\\b${AUTH_VERB}(?:[\\s_-]|\\b)[^.]{0,40}?${AUTH_NOUN}\\b`
+  ].join("|"),
+  "i"
+);
 
 export function isAuthExpiredError(message: string | undefined): boolean {
   if (!message) return false;
