@@ -51,7 +51,8 @@ export type PolicyAction =
   | "terminal.exec"
   | "code.exec"
   | "browser.upload_file"
-  | "messaging.send";
+  | "messaging.send"
+  | "self.config";
 
 export interface TerminalExecPayload {
   command: string;
@@ -107,6 +108,14 @@ export function resolveApprovalPolicy(
 
   // mode === "auto"
   if (action === "file.write" || action === "file.patch" || action === "browser.upload_file") {
+    return { mode: "auto", reason: "approval-mode-auto" };
+  }
+
+  // self.config is a config rewrite (provider/agent switch), not external
+  // egress. In "auto" mode it goes through frictionlessly; "strict" gates
+  // it at the top, so an operator who wants provider switches confirmed
+  // flips to strict. Mirrors file.write's auto-approve stance.
+  if (action === "self.config") {
     return { mode: "auto", reason: "approval-mode-auto" };
   }
 

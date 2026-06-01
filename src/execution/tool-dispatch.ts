@@ -33,6 +33,8 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
+import { findSelfOperation } from "./self-registry";
+import { isDeferredToolName } from "./tool-catalog";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -227,6 +229,21 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    // Self-config / self-introspection direct tools. Each maps to a
+    // SelfOperation; query tools resolve sync, mutate tools route through the
+    // generic self.config approval branch. The tool name IS the op name and
+    // args are top-level, so the approval payload shape is identical to the
+    // legacy facade — executeApprovedAction needs no change.
+    case "get_self":
+    case "list_providers":
+    case "list_agents":
+    case "list_skills":
+    case "list_mcp_servers":
+    case "list_connectors":
+    case "set_provider":
+    case "use_agent":
+    case "create_agent":
+      return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
       // visible browser, signs in, then clicks Connect. There is no
@@ -249,6 +266,23 @@ export async function dispatchToolCall(
       // `command` field on the payload is what the policy inspects.
       return codeExecDispatch(config, taskId, toolCallId, args);
     default:
+      // Defensive backstop only. The chat-task loop gate is the PRIMARY guard:
+      // it blocks any deferred tool not loaded at the start of the turn before
+      // dispatch is ever reached, so a known deferred tool with its own case
+      // (browser_*, the self ops) never gets here unloaded. This branch still
+      // catches the residual cases that bypass that gate — a deferred tool with
+      // NO dispatch case, or a name-typo onto a deferred name — returning a
+      // recoverable nudge pointing at load_tools instead of the bare
+      // "Unknown tool" error so the model self-corrects on the next turn.
+      if (isDeferredToolName(toolName)) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error: `Tool '${toolName}' is available but not loaded. Call load_tools({names:['${toolName}']}) first, then call it.`
+          })
+        };
+      }
       throw new Error(`Unknown tool: ${toolName}`);
   }
 }
@@ -2400,6 +2434,37 @@ async function recordLowRiskAudit(
   });
 }
 
+// ---------------- Self-knowledge / self-config ----------------
+//
+// The operation handlers live in self-registry.ts (the single source of
+// truth). Each self-config capability is now a DIRECT deferred tool whose
+// name IS the op name; this dispatcher routes the 9 tool cases through one
+// helper. Query ops resolve synchronously; mutate ops route through the
+// generic self.config approval branch (auto-approved in `auto`, gated in
+// `strict`), with the actual handler re-run in agent.executeApprovedAction
+// on approval.
+
+async function dispatchSelfOp(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  opName: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // The 9 tool cases are the only callers, and each name is a registered op,
+  // so findSelfOperation always resolves here.
+  const op = findSelfOperation(opName)!;
+  if (op.tag === "query") {
+    return { kind: "sync", result: await op.handler(config, taskId, args) };
+  }
+  // mutate => route through the approval seam. The actual handler run happens
+  // in agent.executeApprovedAction (the "self.config" branch) on approval,
+  // re-reading {opName, args} from the approval payload. The direct tool
+  // passes args at TOP LEVEL, so the payload shape is identical to the legacy
+  // facade and the executeApprovedAction branch needs no change.
+  return pendingOrAuto(config, "self.config", undefined, (reason) => requestSelfInvoke(config, taskId, toolCallId, op.name, args, reason));
+}
+
 // ---------------- Approval-gated tools ----------------
 
 async function requestFileWrite(
@@ -2665,6 +2730,48 @@ async function requestSendMessage(
       type: "approval",
       message: "Approval requested for messaging send (chat-task)",
       data: { approvalId: approval.id, bridgeId: bridge.id, target, textBytes: text.length, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+// Create the approval row for a mutate self-config operation. Mirrors
+// requestSendMessage: the side effect (running the registry handler) does
+// NOT happen here — it runs in agent.executeApprovedAction's "self.config"
+// branch once the approval resolves, re-reading {opName, args} from the
+// payload. In `auto` mode pendingOrAuto auto-resolves this immediately; in
+// `strict` mode the row waits for the operator.
+async function requestSelfInvoke(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  opName: string,
+  opArgs: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "self.config",
+      target: opName,
+      risk: "medium",
+      reason: reasonOverride ?? "Changing Gini's own configuration requires approval.",
+      payload: {
+        opName,
+        args: opArgs,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for self-config change (chat-task)",
+      data: { approvalId: approval.id, opName, toolCallId }
     });
     return approval.id;
   });

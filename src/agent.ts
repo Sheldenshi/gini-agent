@@ -78,6 +78,7 @@ import {
   resolveEmitContext
 } from "./execution/chat-task-emit";
 import { approvalToolCallId } from "./execution/tool-dispatch";
+import { findSelfOperation } from "./execution/self-registry";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
@@ -270,9 +271,12 @@ export async function cancelTask(
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
-    // captured tool-call snapshot in the same write.
+    // captured tool-call snapshot in the same write. Also drop the loaded
+    // deferred-tool set: a cancelled task is terminal and must not retain
+    // dead state that a future read could mistake for live context.
     cancelPendingTaskApprovals(state, taskId, "task.cancelled");
     task.toolCallState = undefined;
+    task.loadedTools = undefined;
     upsertTask(state, task);
     // Abort any in-flight approved actions for this task. The
     // abort is called INSIDE the `mutateState` callback so
@@ -986,6 +990,9 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       // recordInFlightAborted.
       if (task && !isTerminalTaskStatus(task.status)) {
         task.toolCallState = undefined;
+        // A denied/failed task is terminal — drop the loaded deferred-tool
+        // set alongside the tool-call snapshot so no dead state lingers.
+        task.loadedTools = undefined;
         const message = `Approval denied: ${item.target}`;
         task.status = "failed";
         task.currentStep = "Failed";
@@ -1138,6 +1145,9 @@ export function mapApprovalToPolicyAction(
     return action;
   }
   if (action === "messaging.send") {
+    return action;
+  }
+  if (action === "self.config") {
     return action;
   }
   return undefined;
@@ -1336,6 +1346,9 @@ export async function resolveSetupRequest(
       const task = state.tasks.find((t) => t.id === item.taskId);
       if (task && !isTerminalTaskStatus(task.status)) {
         task.toolCallState = undefined;
+        // Cancelling setup fails the task (terminal) — drop the loaded
+        // deferred-tool set alongside the tool-call snapshot.
+        task.loadedTools = undefined;
         const message = `Setup cancelled: ${item.target}`;
         task.status = "failed";
         task.currentStep = "Failed";
@@ -2057,6 +2070,66 @@ async function runApprovedAction(
     if (task) await updateRunFromTask(config, task);
     const resultStr = JSON.stringify(resultPayload);
     if (shouldResumeChat && chatToolCallId && approval.taskId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
+    }
+    return resultStr;
+  }
+
+  if (approval.action === "self.config") {
+    // The side effect is the registry handler itself (set_provider /
+    // use_agent / create_agent). It was deferred to approval time; re-read
+    // {opName, args} from the payload and run it now. The handler writes its
+    // own trace + audit rows, so this branch just runs it and feeds the
+    // result back to the chat-task loop.
+    const opName = String(approval.payload.opName ?? "");
+    const opArgs = (approval.payload.args && typeof approval.payload.args === "object" && !Array.isArray(approval.payload.args))
+      ? approval.payload.args as Record<string, unknown>
+      : {};
+    if (signal.aborted) {
+      const aborted = JSON.stringify({ ok: false, aborted: true, error: "self.config aborted: task was cancelled." });
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "self.config aborted by task cancellation",
+          data: { opName, aborted: true }
+        });
+      }
+      return aborted;
+    }
+    const op = findSelfOperation(opName);
+    if (!op || !approval.taskId) {
+      return JSON.stringify({ ok: false, error: `Unknown self operation: ${opName}.` });
+    }
+    const resultStr = await op.handler(config, approval.taskId, opArgs);
+    // The handler writes its own low-risk operation trace; this row carries
+    // approvalId so the operation outcome is joinable to the approval that
+    // authorized it. Mirrors the messaging.send execute-side audit.
+    let resultOk: boolean | null = null;
+    try {
+      const parsed = JSON.parse(resultStr);
+      if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+        resultOk = parsed.ok;
+      }
+    } catch {
+      // Best-effort: a non-JSON handler result leaves ok null.
+    }
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "self.config",
+          target: opName,
+          risk: "medium",
+          taskId: approval.taskId,
+          runId: state.tasks.find((t) => t.id === approval.taskId)?.runId,
+          approvalId: approval.id,
+          evidence: { ...extraEvidence, opName, ok: resultOk }
+        },
+        approvalAgentContext(approval)
+      );
+    });
+    if (shouldResumeChat && chatToolCallId) {
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
     }
     return resultStr;

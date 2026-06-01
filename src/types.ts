@@ -587,6 +587,11 @@ export interface Task {
   // once the loop finishes (completed/failed) so completed tasks don't retain
   // long-lived conversation snapshots in state.
   toolCallState?: TaskToolCallState;
+  // Names of deferred tools the model has loaded via load_tools during this
+  // task. Persists for the life of the task (NOT in toolCallState, which is
+  // cleared each resume) so resumeChatTask re-applies the loaded set when
+  // runLoop rebuilds providerTools. Cleared only on terminal completion.
+  loadedTools?: string[];
   // Recent tool calls dispatched by the chat-task loop, surfaced to the chat
   // UI as inline rows above the "Working…" indicator. Capped at ~20 entries
   // (oldest dropped). Not persisted as audit truth — these are a display
@@ -1080,7 +1085,8 @@ export type AuthorizationAction =
   | "skill.enable"
   | "connector.enable"
   | "browser.upload_file"
-  | "messaging.send";
+  | "messaging.send"
+  | "self.config";
 
 export interface Authorization {
   id: string;

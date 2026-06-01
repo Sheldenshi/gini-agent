@@ -9,6 +9,8 @@ Each file in this directory captures one architecture decision: the context, the
 - [Browser Fill-Secret Tool](browser-fill-secret.md)
 - [Instances And Control Surface](instances-and-control-surface.md)
 - [Agent Loop With Native Tool Calling](agent-loop-tool-calling.md)
+- [Deferred Tools (Load-On-Demand Catalog)](deferred-tools.md)
+- [Self-Config Registry as Deferred Direct Tools](self-config-registry.md)
 - [Subagent Delegation](subagent-delegation.md)
 - [Agents Replace Profiles And Drive Runtime Behavior](agents-replace-profiles.md)
 - [Approval Mode (three-state policy)](approval-mode.md) — supersedes [dangerouslyAutoApprove](dangerously-auto-approve.md)

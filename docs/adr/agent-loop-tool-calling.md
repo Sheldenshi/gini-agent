@@ -45,7 +45,14 @@ through the same loop. So the loop comes first.
   for tests.
 - `src/execution/tool-catalog.ts` produces OpenAI-shape specs filtered
   by enabled toolsets. The catalog is hashed; the loop captures the hash
-  on pause so a reviewer can see which catalog the resume runs against.
+  on pause so a reader can see which catalog the resume runs against (the
+  hash is telemetry, not enforced on resume).
+- Catalog tools may be marked `deferred`: their schemas are withheld from
+  the live provider `tools` array until the model loads them by name via
+  the core `load_tools` meta-tool, which the loop handles inline and
+  persists on `Task.loadedTools`. This keeps the live full-schema tool
+  count low. See ADR deferred-tools.md for the mechanism, the
+  persistence / resume contract, and which clusters are deferred.
 - `src/execution/tool-dispatch.ts` is the per-tool handler: low-risk
   tools (`file_read`, `file_list`, `file_search`, `web_fetch`) execute
   synchronously and return a string; high-risk tools (`file_write`,
@@ -114,9 +121,9 @@ being re-read every turn.
 
 ## Deferred
 
-- Skill-driven tool exposure. The catalog is currently a static list;
-  Slice 2 will inject skill-aware tools and make the catalog hash
-  reflect skill set membership.
+- Skill-driven tool exposure. Beyond the deferred-tools mechanism above
+  (which loads tool schemas on demand by name), tools could be injected
+  per-skill so a skill body brings its own tool surface into the catalog.
 - Subagent spawn as a tool. Slice 4 will add `spawn_subagent` to the
   catalog and map it through this same loop.
 - Codex tool calling (responses API supports it; we'd need a separate

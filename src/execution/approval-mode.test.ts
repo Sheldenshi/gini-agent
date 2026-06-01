@@ -184,6 +184,17 @@ describe("approvalMode dispatch matrix", () => {
       const config = buildConfig(workspaceRoot, "strict-upload", { approvalMode: "strict" });
       const provider = normalizeProvider(config.provider);
 
+      // browser_upload_file is a deferred tool, so the model must load it
+      // before calling it; calling it directly would (correctly) be nudged by
+      // the loop's deferred-tool gate. Load it on the first turn, then call it.
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_upload_file"] }) } }
+        ],
+        finishReason: "tool_calls"
+      });
       setEchoToolCallingResponse({
         provider,
         text: "",
