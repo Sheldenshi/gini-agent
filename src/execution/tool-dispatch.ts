@@ -240,10 +240,17 @@ export async function dispatchToolCall(
     case "list_skills":
     case "list_mcp_servers":
     case "list_connectors":
+    case "list_toolsets":
     case "set_provider":
     case "use_agent":
     case "create_agent":
     case "set_approval_mode":
+    case "enable_toolset":
+    case "disable_toolset":
+    case "delete_agent":
+    case "remove_provider":
+    case "set_auto_approve_commands":
+    case "set_dangerous_patterns":
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the

@@ -47,8 +47,8 @@ async function newTask(config: RuntimeConfig): Promise<string> {
 }
 
 describe("self operation registry", () => {
-  test("SELF_OPERATIONS carries the 10 expected ops with name, summary, tag, handler", () => {
-    expect(SELF_OPERATIONS.length).toBe(10);
+  test("SELF_OPERATIONS carries the 17 expected ops with name, summary, tag, handler", () => {
+    expect(SELF_OPERATIONS.length).toBe(17);
     for (const op of SELF_OPERATIONS) {
       expect(typeof op.name).toBe("string");
       expect(op.name.length).toBeGreaterThan(0);
@@ -60,13 +60,20 @@ describe("self operation registry", () => {
     const names = SELF_OPERATIONS.map((op) => op.name).sort();
     expect(names).toEqual([
       "create_agent",
+      "delete_agent",
+      "disable_toolset",
+      "enable_toolset",
       "get_self",
       "list_agents",
       "list_connectors",
       "list_mcp_servers",
       "list_providers",
       "list_skills",
+      "list_toolsets",
+      "remove_provider",
       "set_approval_mode",
+      "set_auto_approve_commands",
+      "set_dangerous_patterns",
       "set_provider",
       "use_agent"
     ]);
@@ -81,9 +88,21 @@ describe("self operation registry", () => {
       "list_connectors",
       "list_mcp_servers",
       "list_providers",
-      "list_skills"
+      "list_skills",
+      "list_toolsets"
     ]);
-    expect(mutates).toEqual(["create_agent", "set_approval_mode", "set_provider", "use_agent"]);
+    expect(mutates).toEqual([
+      "create_agent",
+      "delete_agent",
+      "disable_toolset",
+      "enable_toolset",
+      "remove_provider",
+      "set_approval_mode",
+      "set_auto_approve_commands",
+      "set_dangerous_patterns",
+      "set_provider",
+      "use_agent"
+    ]);
   });
 
   test("findSelfOperation resolves known names and rejects unknown ones", () => {
@@ -101,9 +120,31 @@ describe("direct self tools — query", () => {
     const result = await dispatchToolCall(config, taskId, "get_self", "call_1", "{}");
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean; instance: string };
+      const parsed = JSON.parse(result.result) as {
+        ok: boolean;
+        instance: string;
+        approvalSettings: { approvalMode: string; autoApproveCommands: unknown[]; dangerousTerminalPatterns: unknown[] };
+      };
       expect(parsed.ok).toBe(true);
       expect(parsed.instance).toBe(instance);
+      // get_self now exposes the full approval picture so the model can
+      // read the allowlist before a replace via set_auto_approve_commands.
+      expect(parsed.approvalSettings.approvalMode).toBe("auto");
+      expect(Array.isArray(parsed.approvalSettings.autoApproveCommands)).toBe(true);
+      expect(Array.isArray(parsed.approvalSettings.dangerousTerminalPatterns)).toBe(true);
+    }
+  });
+
+  test("list_toolsets resolves synchronously with the instance toolsets", async () => {
+    const instance = `self-toolsets-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(config, taskId, "list_toolsets", "call_1", "{}");
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean; toolsets: unknown[] };
+      expect(parsed.ok).toBe(true);
+      expect(Array.isArray(parsed.toolsets)).toBe(true);
     }
   });
 
@@ -238,5 +279,86 @@ describe("direct self tools — mutate", () => {
     }
     // The bad call left the config's mode untouched.
     expect(config.approvalMode).toBe("auto");
+  });
+
+  test("disable_toolset auto-resolves in auto mode and flips the toolset status", async () => {
+    const instance = `self-toolset-auto-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "disable_toolset",
+      "call_1",
+      JSON.stringify({ toolset: "browser" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean; status?: string };
+      expect(parsed.ok).toBe(true);
+      expect(parsed.status).toBe("disabled");
+    }
+    const state = readState(instance);
+    expect(state.toolsets.find((t) => t.name === "browser")?.status).toBe("disabled");
+  });
+
+  test("disable_toolset gates as pending in strict mode with payload.opName set", async () => {
+    const instance = `self-toolset-strict-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "strict");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "disable_toolset",
+      "call_1",
+      JSON.stringify({ toolset: "browser" })
+    );
+    expect(result.kind).toBe("pending");
+    if (result.kind === "pending") {
+      const state = readState(instance);
+      const approval = state.authorizations.find((a) => a.id === result.approvalId);
+      expect(approval?.action).toBe("self.config");
+      expect(approval?.payload.opName).toBe("disable_toolset");
+    }
+  });
+
+  test("set_auto_approve_commands replaces the allowlist in auto mode", async () => {
+    const instance = `self-allowlist-auto-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_auto_approve_commands",
+      "call_1",
+      JSON.stringify({ patterns: ["git status", "ls"] })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean; autoApproveCommands?: string[] };
+      expect(parsed.ok).toBe(true);
+      expect(parsed.autoApproveCommands).toEqual(["git status", "ls"]);
+    }
+    // updateAutoApproveSettings mutates the live config object in-process.
+    expect(config.autoApproveCommands).toEqual(["git status", "ls"]);
+  });
+
+  test("set_auto_approve_commands rejects a non-array 'patterns' without throwing", async () => {
+    const instance = `self-allowlist-bad-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_auto_approve_commands",
+      "call_1",
+      JSON.stringify({ patterns: "git " })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean };
+      expect(parsed.ok).toBe(false);
+    }
+    expect(config.autoApproveCommands).toBeUndefined();
   });
 });
