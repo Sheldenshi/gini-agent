@@ -268,21 +268,41 @@ function modeFromRecord(record: BrowserConnectionRecord | undefined): Mode {
   return record.mode === "managed" ? "persistent" : "cdp";
 }
 
+// Is a shared/borrowed BrowserContext still backed by a live browser? After
+// an EXTERNAL kill (crash, or — now that the agent launches the user's
+// branded Chrome — the user quitting their everyday Chrome takes the
+// headless instance with it) Playwright's context.pages() still returns []
+// without throwing, so it can't tell a dead context from a live one. The
+// underlying Browser's isConnected() is the signal that actually flips on an
+// external kill (and on an explicit context.close()). We treat a context as
+// dead ONLY when we can positively observe isConnected() === false; when the
+// Browser handle isn't exposed (lightweight test fakes, or a Playwright build
+// that returns null for a persistent context) we assume alive, matching the
+// previous reuse-by-default behavior.
+function isContextConnected(context: BrowserContext): boolean {
+  const ctx = context as BrowserContext & { browser?: () => Browser | null };
+  try {
+    if (typeof ctx.browser === "function") {
+      const browser = ctx.browser();
+      if (browser) return browser.isConnected();
+    }
+  } catch {
+    // browser() unexpectedly threw — fall through to assume-alive.
+  }
+  return true;
+}
+
 // Cheap "is this handle still alive?" probe used to short-circuit
-// ensureShared when the previously-installed handle survives. For cdp we
-// ask the Browser; for persistent we ask the BrowserContext (its
-// underlying Browser may not always be exposed publicly across Playwright
-// versions, but `pages()` throws after close, so a try/catch covers it).
+// ensureShared when the previously-installed handle survives, and to force a
+// relaunch when the underlying Chrome died. cdp asks the Browser directly;
+// persistent asks the context's Browser via isContextConnected.
 function isHandleAlive(handle: SharedHandle): boolean {
   try {
     switch (handle.kind) {
       case "cdp":
         return handle.browser.isConnected();
       case "persistent":
-        // Touch a cheap property — if the context was closed the
-        // underlying Playwright object throws on access.
-        handle.context.pages();
-        return true;
+        return isContextConnected(handle.context);
     }
   } catch {
     return false;
@@ -510,8 +530,17 @@ function startSweeper(): void {
 async function getOrCreate(taskId: string): Promise<Session> {
   const existing = sessions.get(taskId);
   if (existing) {
-    existing.lastActivity = Date.now();
-    return existing;
+    // Reuse the cached session only while its browser is still connected. If
+    // the Chrome died out from under it mid-task (external kill), drop the
+    // session so we re-materialize a fresh page against the relaunched
+    // context below instead of handing back a dead page that throws
+    // "Target page, context or browser has been closed".
+    if (isContextConnected(existing.context)) {
+      existing.lastActivity = Date.now();
+      return existing;
+    }
+    sessions.delete(taskId);
+    clearFilledSecrets(taskId);
   }
   const inflight = pendingSessions.get(taskId);
   if (inflight) return inflight;
@@ -2664,9 +2693,16 @@ export const __test = {
     shared = { kind: "persistent", context: context as BrowserContext, headed: true };
   },
   installFakeHeadlessPersistentContextForTest(
-    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[] }>
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>
   ): void {
     shared = { kind: "persistent", context: context as BrowserContext, headed: false };
+  },
+  // Liveness probe over the currently-installed shared handle. Null when no
+  // handle is installed. Lets tests assert that an externally-killed Chrome
+  // (context.browser().isConnected() === false) is detected as dead so
+  // ensureShared relaunches instead of reusing the stale handle.
+  isSharedHandleAliveForTest(): boolean | null {
+    return shared ? isHandleAlive(shared) : null;
   },
   installFakeCdpBrowserForTest(
     browser: Pick<Browser, "close"> & Partial<{ disconnect: () => Promise<void>; isConnected: () => boolean }>,
