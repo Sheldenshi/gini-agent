@@ -11,6 +11,8 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { extname, join, relative } from "node:path";
+import { isIP } from "node:net";
+import { lookup } from "node:dns/promises";
 import type { RuntimeConfig, RuntimeState, Task } from "../types";
 import {
   addAudit,
@@ -31,6 +33,8 @@ import { MAX_SUBAGENT_DEPTH, spawnSubagent, subagentDepth } from "../capabilitie
 import { matchAutoApprove } from "./auto-approve";
 import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
+import { findSelfOperation } from "./self-registry";
+import { isDeferredToolName } from "./tool-catalog";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -47,13 +51,17 @@ import {
   type IdentityFileStatus
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
+import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
 import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
-import { isSkillActive } from "../integrations/connectors";
+import { credentialTemplateForProvider, firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
 import { resolveConnectorSecret } from "../integrations/connectors";
 import { invokeMcpTool } from "../integrations/mcp";
 import { braveWebSearch, exaWebSearch, formatWebSearchResults } from "../tools/web-search";
+import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
+import { invokeVisionQuery } from "../capabilities/vision-query";
+import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
 import { riskForAction } from "./tool-risk";
 import {
   browserBack,
@@ -163,15 +171,31 @@ export async function dispatchToolCall(
     case "install_skill":
       return { kind: "sync", result: await installSkillTool(config, taskId, args) };
     case "enable_skill":
-      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "enabled") };
+      return await setSkillStatusTool(config, taskId, toolCallId, args, "enabled");
     case "disable_skill":
-      return { kind: "sync", result: await setSkillStatusTool(config, taskId, args, "disabled") };
+      return await setSkillStatusTool(config, taskId, toolCallId, args, "disabled");
     case "mcp_call":
       return { kind: "sync", result: await mcpCallTool(config, taskId, args) };
+    case "skill_run":
+      return { kind: "sync", result: await skillRunTool(config, taskId, args) };
+    case "vision_query":
+      return { kind: "sync", result: await visionQueryTool(config, taskId, args) };
     case "request_connector":
       return await requestConnectorTool(config, taskId, toolCallId, args, messageHistory);
     case "browser_fill_secrets":
       return await browserFillSecretsTool(config, taskId, toolCallId, args);
+    case "request_messaging_bridge":
+      return await requestMessagingBridgeTool(config, taskId, toolCallId, args);
+    case "list_messaging_bridges":
+      return { kind: "sync", result: await listMessagingBridgesTool(config) };
+    case "list_messaging_pairings":
+      return { kind: "sync", result: await listMessagingPairingsTool(config, args) };
+    case "wait_for_messaging_pair":
+      return await waitForMessagingPairTool(config, taskId, toolCallId, args);
+    case "request_messaging_pairing":
+      return await requestMessagingPairingTool(config, taskId, toolCallId, args);
+    case "request_remove_messaging_bridge":
+      return await requestRemoveMessagingBridgeTool(config, taskId, toolCallId, args);
     case "browser_navigate":
       return { kind: "sync", result: await browserDispatch(config, taskId, "browser.navigate", () => browserNavigate(taskId, args), args) };
     case "browser_snapshot":
@@ -226,6 +250,36 @@ export async function dispatchToolCall(
       // explicit, side-effecting, irreversible from the user's
       // perspective. Route through the approval gate like file.write.
       return pendingOrAuto(config, "browser.upload_file", undefined, (reason) => requestBrowserUpload(config, taskId, toolCallId, args, reason));
+    // Self-config / self-introspection direct tools. Each maps to a
+    // SelfOperation; query tools resolve sync, mutate tools route through the
+    // generic self.config approval branch. The tool name IS the op name and
+    // args are top-level, so the approval payload shape is identical to the
+    // legacy facade — executeApprovedAction needs no change.
+    case "get_self":
+    case "list_providers":
+    case "list_agents":
+    case "list_skills":
+    case "list_mcp_servers":
+    case "list_connectors":
+    case "list_toolsets":
+    case "set_provider":
+    case "use_agent":
+    case "create_agent":
+    case "set_approval_mode":
+    case "enable_toolset":
+    case "disable_toolset":
+    case "delete_agent":
+    case "remove_provider":
+    case "set_auto_approve_commands":
+    case "set_dangerous_patterns":
+    case "add_mcp_server":
+    case "remove_mcp_server":
+    case "remove_connector":
+    case "rotate_connector":
+    case "update_self":
+    case "rollback_skill":
+    case "test_skill":
+      return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the
       // visible browser, signs in, then clicks Connect. There is no
@@ -248,6 +302,23 @@ export async function dispatchToolCall(
       // `command` field on the payload is what the policy inspects.
       return codeExecDispatch(config, taskId, toolCallId, args);
     default:
+      // Defensive backstop only. The chat-task loop gate is the PRIMARY guard:
+      // it blocks any deferred tool not loaded at the start of the turn before
+      // dispatch is ever reached, so a known deferred tool with its own case
+      // (browser_*, the self ops) never gets here unloaded. This branch still
+      // catches the residual cases that bypass that gate — a deferred tool with
+      // NO dispatch case, or a name-typo onto a deferred name — returning a
+      // recoverable nudge pointing at load_tools instead of the bare
+      // "Unknown tool" error so the model self-corrects on the next turn.
+      if (isDeferredToolName(toolName)) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error: `Tool '${toolName}' is available but not loaded. Call load_tools({names:['${toolName}']}) first, then call it.`
+          })
+        };
+      }
       throw new Error(`Unknown tool: ${toolName}`);
   }
 }
@@ -508,11 +579,153 @@ async function accumulateBrowserVisionCost(
   });
 }
 
+// Classify a host string as one of: loopback (127/8, ::1, "localhost",
+// "0.0.0.0"), private (RFC1918 IPv4 + ULA IPv6), linkLocal (169.254/16,
+// fe80::/10), public (anything else parsable), or unknown (a hostname
+// we can't classify without DNS resolution).
+function classifyHost(host: string): "loopback" | "private" | "linkLocal" | "public" | "unknown" {
+  const stripped = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const lower = stripped.toLowerCase();
+  // Literal hostnames that always mean loopback regardless of /etc/hosts
+  // mapping. "*.localhost" is RFC 6761 — DNS clients SHOULD treat it as
+  // local even if a public DNS server returns something else, so we
+  // refuse it pre-resolution.
+  if (lower === "localhost" || lower.endsWith(".localhost")) return "loopback";
+  const ipVersion = isIP(stripped);
+  if (ipVersion === 4) {
+    const parts = stripped.split(".").map(Number);
+    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return "unknown";
+    if (parts[0] === 127) return "loopback";
+    if (parts[0] === 0) return "loopback";
+    if (parts[0] === 10) return "private";
+    if (parts[0] === 172 && (parts[1] ?? 0) >= 16 && (parts[1] ?? 0) <= 31) return "private";
+    if (parts[0] === 192 && parts[1] === 168) return "private";
+    if (parts[0] === 169 && parts[1] === 254) return "linkLocal";
+    // RFC 6598 carrier-grade NAT space: 100.64.0.0/10. Not RFC1918
+    // but treated equivalently — these are not globally routable and
+    // can be used to reach a CGN-internal service that proxies the
+    // SSRF target. Span: 100.64 through 100.127.
+    if (parts[0] === 100 && (parts[1] ?? 0) >= 64 && (parts[1] ?? 0) <= 127) return "private";
+    // RFC 2544 benchmark/test space: 198.18.0.0/15. Often routed to
+    // internal lab gear; treat as private for the same reason.
+    if (parts[0] === 198 && (parts[1] === 18 || parts[1] === 19)) return "private";
+    return "public";
+  }
+  if (ipVersion === 6) {
+    if (lower === "::1" || lower === "::" || lower === "::0") return "loopback";
+    // Unique local addresses (fc00::/7) and link-local (fe80::/10). The
+    // prefix check is loose but errs on the side of refusing more than
+    // strictly necessary, which is the right direction for an SSRF
+    // guard.
+    if (lower.startsWith("fc") || lower.startsWith("fd")) return "private";
+    // IPv6 link-local is fe80::/10 — first 10 bits 1111111010, so
+    // the leading hex byte is fe80–febf. A prefix check on "fe80"
+    // misses fe81..febf; widen to the full /10 range.
+    if (/^fe[89ab]/.test(lower)) return "linkLocal";
+    // IPv4-mapped IPv6 forms. Three shapes are all valid IPv6
+    // literals for the same underlying IPv4 address; each must be
+    // reclassified on the embedded IPv4 or the guard is bypassable:
+    //   a. mixed dot-quad: "::ffff:127.0.0.1"
+    //   b. pure hex IPv4-mapped: "::ffff:7f00:1"
+    //   c. deprecated IPv4-compatible: "::7f00:1" (no ffff). Node's
+    //      URL parser normalizes "[::127.0.0.1]" to this form, so
+    //      it shows up unprompted even when the agent passed a
+    //      dot-quad-looking URL.
+    const mappedDotQuad = lower.match(/^::ffff:([\d.]+)$/);
+    if (mappedDotQuad) return classifyHost(mappedDotQuad[1] ?? "");
+    const mappedHex = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    const compatHex = lower.match(/^::([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+    const hex = mappedHex ?? compatHex;
+    if (hex) {
+      const hi = parseInt(hex[1] ?? "0", 16);
+      const lo = parseInt(hex[2] ?? "0", 16);
+      if (Number.isFinite(hi) && Number.isFinite(lo)) {
+        const ipv4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+        return classifyHost(ipv4);
+      }
+    }
+    return "public";
+  }
+  return "unknown";
+}
+
+// SSRF guard for the agent's web_fetch tool. The agent might be
+// prompt-injected into fetching the local BFF
+// (http://127.0.0.1:<bff>/api/runtime/approvals) which would inject
+// the runtime bearer and return state including secrets. Refuse
+// loopback / RFC1918 / link-local destinations both at the URL
+// literal AND post-DNS so a hostname that resolves to a private
+// address can't sneak through. Doesn't defeat full DNS rebinding
+// (TTL=0 swap between resolve and fetch) — that's a separate
+// hardening layer that would require dialing the resolved IP
+// directly.
+async function assertPublicWebFetchTarget(parsed: URL): Promise<void> {
+  const literalKind = classifyHost(parsed.hostname);
+  if (literalKind === "loopback" || literalKind === "private" || literalKind === "linkLocal") {
+    throw new Error(
+      `web_fetch refuses ${literalKind} destination ${parsed.hostname}: agent tools may not reach loopback, RFC1918, or link-local addresses.`
+    );
+  }
+  if (literalKind === "unknown") {
+    // It's a hostname we couldn't classify pre-DNS. Resolve and
+    // re-classify the address.
+    try {
+      const { address } = await lookup(parsed.hostname);
+      const resolvedKind = classifyHost(address);
+      if (resolvedKind === "loopback" || resolvedKind === "private" || resolvedKind === "linkLocal") {
+        throw new Error(
+          `web_fetch refuses ${parsed.hostname} (resolves to ${resolvedKind} address ${address}).`
+        );
+      }
+    } catch (err) {
+      // DNS failure: let the subsequent fetch surface the failure
+      // organically; don't swallow our own refusal.
+      if (err instanceof Error && err.message.startsWith("web_fetch refuses")) throw err;
+    }
+  }
+}
+
+// Cap on automatic redirect hops. Five is consistent with the
+// default browser limit and prevents a server that 302s in a loop
+// from holding the agent's tool slot.
+const WEB_FETCH_MAX_REDIRECTS = 5;
+
 async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
   const rawUrl = requireString(args, "url");
-  const parsed = new URL(rawUrl);
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("web_fetch requires an http(s) URL.");
-  const response = await fetch(parsed);
+  let current = new URL(rawUrl);
+  if (current.protocol !== "https:" && current.protocol !== "http:") throw new Error("web_fetch requires an http(s) URL.");
+  await assertPublicWebFetchTarget(current);
+
+  // Manual redirect handling: default fetch() follows redirects, which
+  // would let a public URL 302 into loopback / RFC1918 and bypass the
+  // pre-fetch guard. Loop with redirect:"manual" and re-validate the
+  // Location target on every hop. The fetch DNS resolution still
+  // happens inside fetch() so a full DNS-rebinding attacker (TTL=0
+  // swap between assertPublicWebFetchTarget's lookup and the actual
+  // dial) can still slip through — closing that requires dialing the
+  // resolved IP directly with hostname-in-Host-header + SNI overrides,
+  // which Bun doesn't expose cleanly today. The redirect-bypass leg
+  // is the bigger blast radius and is closed here.
+  let response: Response;
+  let hops = 0;
+  for (;;) {
+    response = await fetch(current, { redirect: "manual" });
+    if (response.status < 300 || response.status >= 400) break;
+    const location = response.headers.get("location");
+    if (!location) break;
+    if (hops >= WEB_FETCH_MAX_REDIRECTS) {
+      throw new Error(`web_fetch refused after ${WEB_FETCH_MAX_REDIRECTS} redirects from ${parsed_origin(current)} (loop or chain too long).`);
+    }
+    // Resolve relative redirects against the previous URL so we
+    // validate the actual destination, not a partial path.
+    const next = new URL(location, current);
+    if (next.protocol !== "https:" && next.protocol !== "http:") {
+      throw new Error(`web_fetch refuses redirect to non-http(s) URL: ${next.protocol}`);
+    }
+    await assertPublicWebFetchTarget(next);
+    current = next;
+    hops += 1;
+  }
   const text = (await response.text())
     .replace(/<script[\s\S]*?<\/script>/gi, "")
     .replace(/<style[\s\S]*?<\/style>/gi, "")
@@ -520,13 +733,30 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 12_000);
+  // Log only the origin (protocol + host) in trace + audit. The
+  // path can carry tokens (signed-URL signatures, OAuth-via-path
+  // styles, the occasional poorly-designed "personal key in URL"
+  // pattern) and any server-controlled redirect can add more, so
+  // including pathname risks leaking credentials into the trace.
+  // Operators who need the exact endpoint can read the original
+  // tool_call args from the conversation transcript; the audit
+  // row's job is to attest "the agent reached this host" without
+  // revealing what it asked for.
+  const sanitizedUrl = `${current.protocol}//${current.host}`;
   appendTrace(config.instance, taskId, {
     type: "tool",
     message: "Web page fetched (chat-task)",
-    data: { url: parsed.toString(), status: response.status, bytes: text.length }
+    data: { url: sanitizedUrl, status: response.status, bytes: text.length, redirects: hops }
   });
-  await recordLowRiskAudit(config, taskId, "web.fetch", parsed.toString(), { status: response.status, bytes: text.length });
-  return text || `Fetched ${parsed.toString()} with HTTP ${response.status}.`;
+  await recordLowRiskAudit(config, taskId, "web.fetch", sanitizedUrl, { status: response.status, bytes: text.length, redirects: hops });
+  return text || `Fetched ${sanitizedUrl} with HTTP ${response.status}.`;
+}
+
+// Tiny helper kept inline because it's only used by the redirect-cap
+// error message — avoids leaking query strings / fragments into the
+// exception while still naming the origin of the redirect chain.
+function parsed_origin(url: URL): string {
+  return `${url.protocol}//${url.host}`;
 }
 
 // Web search via Brave or Exa. Pick a healthy connector by provider id
@@ -623,7 +853,7 @@ async function readSkillTool(config: RuntimeConfig, taskId: string, args: Record
   }
   if (!isSkillActive(state, skill)) {
     const missing = (skill.requiredConnectors ?? []).map((entry) => entry.provider).join(", ");
-    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to set up the missing connector — they can click [Set up <Provider>] next to the affected skill on the /skills page, or paste the credential and you'll wire it up.`);
+    throw new Error(`Skill ${name} is inactive: required connectors not healthy (${missing || "unknown"}). Ask the user to set up the missing connector — they can click [Set up <Provider>] next to the affected skill on the /skills page, or call request_connector so they can enter it securely.`);
   }
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -694,6 +924,49 @@ async function mcpCallTool(
 function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   return `${text.slice(0, max)}\n... (truncated)`;
+}
+
+// skill_run dispatch: looks up the requested skill+script and spawns the
+// script with stdin = JSON args. Returns the script's JSON stdout
+// verbatim, or a clear { ok: false, error } envelope on script failure
+// / missing script / malformed output. See src/capabilities/skill-
+// scripts.ts for the spawn + env-injection details.
+async function skillRunTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const skillName = requireString(args, "skill");
+  const scriptName = requireString(args, "script");
+  const scriptArgs = args.args && typeof args.args === "object" && !Array.isArray(args.args)
+    ? args.args as Record<string, unknown>
+    : {};
+  const handle = findSkillScript(readState(config.instance), skillName, scriptName);
+  if (!handle) {
+    return JSON.stringify({
+      ok: false,
+      error: `Skill script not found: ${skillName}/${scriptName}. The skill must be enabled and ship a top-level file named ${scriptName}.<ext> under scripts/.`
+    });
+  }
+  const result = await invokeSkillScript(config, handle, scriptArgs, { taskId });
+  if (result.parsed !== null && result.parsed !== undefined) {
+    return typeof result.parsed === "string" ? result.parsed : JSON.stringify(result.parsed);
+  }
+  return JSON.stringify({ ok: result.ok, error: result.error ?? "Skill script returned no output." });
+}
+
+// vision_query dispatch: runs the configured vision model against an
+// arbitrary Gini upload.
+async function visionQueryTool(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const uploadId = requireString(args, "uploadId");
+  const question = requireString(args, "question");
+  const maxTokens = typeof args.maxTokens === "number" ? args.maxTokens : undefined;
+  const result = await invokeVisionQuery(config, { uploadId, question, maxTokens }, { taskId });
+  return JSON.stringify(result);
 }
 
 // Spawn a constrained subagent and wait for its terminal state. The model
@@ -1970,13 +2243,6 @@ async function installSkillTool(
   args: Record<string, unknown>
 ): Promise<string> {
   const body = requireString(args, "body");
-  let category: string | undefined;
-  if (args.category !== undefined && args.category !== null) {
-    if (typeof args.category !== "string" || args.category.length === 0) {
-      throw new Error("Invalid input: category must be a non-empty string.");
-    }
-    category = args.category;
-  }
   let files: Array<{ name: string; content: string }> | undefined;
   if (args.files !== undefined && args.files !== null) {
     if (!Array.isArray(args.files)) {
@@ -1998,7 +2264,7 @@ async function installSkillTool(
     }
     files = cleaned;
   }
-  const installed = await installSkillFromBody(config, { body, category, files });
+  const installed = await installSkillFromBody(config, { body, files });
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(
@@ -2014,7 +2280,8 @@ async function installSkillTool(
           skillId: installed.skill.id,
           name: installed.skill.name,
           manifestPath: installed.manifestPath,
-          validationIssues: installed.validation.issues
+          validationIssues: installed.validation.issues,
+          frontmatterWarnings: installed.validation.warnings
         }
       },
       { taskId: item.id }
@@ -2029,18 +2296,54 @@ async function installSkillTool(
   const issuesSuffix = installed.validation.issues.length > 0
     ? ` Warnings: ${installed.validation.issues.join("; ")}.`
     : "";
-  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}`;
+  // Surface advisory frontmatter near-misses prominently so the authoring
+  // model fixes them and re-installs — these flag a silently-dropped
+  // credential/connector declaration the skill is currently missing.
+  const warningsSuffix = installed.validation.warnings.length > 0
+    ? ` ⚠ Frontmatter warnings — fix and re-install: ${installed.validation.warnings.join("; ")}.`
+    : "";
+  return `Installed skill ${installed.skill.id} ("${installed.skill.name}") at ${installed.manifestPath}.${issuesSuffix}${warningsSuffix}`;
 }
 
 // Enable / disable a registered skill. Wraps setSkillStatus, which
 // writes the matching skill.enabled / skill.disabled audit row.
+//
+// Enabling a NON-bundled skill that requires a credentialed connector is
+// gated by a per-(skill, connector) consent grant (ADR
+// skill-connector-consent.md): the tool mints a `skill.grant_connector`
+// SetupRequest and returns `{ kind: "pending" }` instead of enabling, so the
+// user approves the grant via the chat card before the connector's env can
+// reach the skill's scripts. One SetupRequest per ungranted provider — the
+// user grants one, the loop resumes, re-enters here, and either enables (no
+// more ungranted providers) or mints the next grant. Bundled skills are
+// auto-granted in resolveSkillEnv and skip the gate entirely.
 async function setSkillStatusTool(
   config: RuntimeConfig,
   taskId: string,
+  toolCallId: string,
   args: Record<string, unknown>,
   status: "enabled" | "disabled"
-): Promise<string> {
+): Promise<DispatchResult> {
   const skillId = requireString(args, "skillId");
+
+  if (status === "enabled") {
+    const state = readState(config.instance);
+    const skill = state.skills.find((s) => s.id === skillId || s.name === skillId);
+    if (!skill) throw new Error(`Skill not found: ${skillId}`);
+    const bundled = (skill.source ?? "user") === "bundled";
+    if (!bundled) {
+      // The first required credential that carries a secret and isn't yet
+      // granted. A credential "carries a secret" when its connector has a
+      // `type` (api-key/oauth2). Presence-only connectors (no type, no env)
+      // leak nothing and need no consent. Name-based: skills declare
+      // `requiredCredentials`, resolved against the named connector record.
+      const ungranted = firstUngrantedCredential(state, skill);
+      if (ungranted) {
+        return await requestSkillConnectorGrant(config, taskId, toolCallId, skill.id, skill.name, ungranted.name, ungranted.label);
+      }
+    }
+  }
+
   const skill = await setSkillStatus(config, skillId, status);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -2052,7 +2355,115 @@ async function setSkillStatusTool(
     name: skill.name,
     status
   });
-  return `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").`;
+  return { kind: "sync", result: `${status === "enabled" ? "Enabled" : "Disabled"} skill ${skill.id} ("${skill.name}").` };
+}
+
+// Mint a `skill.grant_connector` SetupRequest for one (skill, credential) pair.
+// Mirrors requestConnectorTool: the chat-task loop's pending handler emits a
+// setup_requested block, the user grants via the chat card, and the
+// /complete handler (src/http.ts) appends the credential name to
+// grantedConnectors, enables the skill, and resumes this task. Surface-guarded
+// like browser_fill_secrets — the amber card only renders in the web chat.
+async function requestSkillConnectorGrant(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  skillId: string,
+  skillName: string,
+  credentialName: string,
+  credentialLabel: string
+): Promise<DispatchResult> {
+  const providerLabel = credentialLabel;
+
+  // Surface guard — same rationale as browser_fill_secrets. The consent card
+  // is React UI rendered only in the web chat; a task running over a
+  // messaging bridge (Telegram/Discord), in a scheduled/headless job session
+  // (origin:"job"), or with no chat session at all would park in
+  // waiting_approval with no way to grant. Fail synchronously so the agent can
+  // verbalize "open the web chat to grant" back to the user.
+  // NOTE: sibling request_* guards in this file share the same shape but DON'T
+  // yet check origin:"job"; that blind spot is tracked separately — do not
+  // assume it's handled there.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and that consent card only renders in a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Route this through the web chat or settings page.`
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Enabling skill "${skillName}" needs a one-time grant of your ${providerLabel} credential, and the consent card only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to grant access, then continue once they confirm.`
+      })
+    };
+  }
+
+  // Idempotent re-enter: if a pending grant SetupRequest already exists for
+  // this (skill, provider) ON THIS TASK — e.g. the model re-called
+  // enable_skill while the user hadn't yet acted on the card — reference it
+  // instead of minting a duplicate. The dedupe is scoped to the SAME task:
+  // each task that enables the skill needs its own resumable approval, since
+  // completing the card resumes only its owning `setup.taskId`. Reusing
+  // another task's pending request would park this task on a request that
+  // resumes someone else, stranding it forever.
+  const existing = surfaceState.setupRequests.find(
+    (s) =>
+      s.status === "pending" &&
+      s.action === "skill.grant_connector" &&
+      s.taskId === taskId &&
+      s.payload.skillId === skillId &&
+      s.payload.credentialName === credentialName
+  );
+  if (existing) {
+    return { kind: "pending", approvalId: existing.id };
+  }
+
+  const reason = `Skill "${skillName}" requests access to your ${providerLabel} credential. Granting lets its scripts use ${providerLabel}; you can revoke by disabling the skill.`;
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "skill.grant_connector",
+      target: providerLabel,
+      reason,
+      payload: { skillId, skillName, credentialName, credentialLabel, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Persist the reason as a durable assistant bubble so it survives past
+    // approval resolution — same pattern as requestConnectorTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for skill connector grant",
+      data: { approvalId: approval.id, skillId, credentialName, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
 }
 
 // Poll the subagent record until its child task reaches a terminal state,
@@ -2129,6 +2540,37 @@ async function recordLowRiskAudit(
     );
     item.updatedAt = now();
   });
+}
+
+// ---------------- Self-knowledge / self-config ----------------
+//
+// The operation handlers live in self-registry.ts (the single source of
+// truth). Each self-config capability is now a DIRECT deferred tool whose
+// name IS the op name; this dispatcher routes the self tool cases through one
+// helper. Query ops resolve synchronously; mutate ops route through the
+// generic self.config approval branch (auto-approved in `auto`, gated in
+// `strict`), with the actual handler re-run in agent.executeApprovedAction
+// on approval.
+
+async function dispatchSelfOp(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  opName: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // The self tool cases are the only callers, and each name is a registered
+  // op, so findSelfOperation always resolves here.
+  const op = findSelfOperation(opName)!;
+  if (op.tag === "query") {
+    return { kind: "sync", result: await op.handler(config, taskId, args) };
+  }
+  // mutate => route through the approval seam. The actual handler run happens
+  // in agent.executeApprovedAction (the "self.config" branch) on approval,
+  // re-reading {opName, args} from the approval payload. The direct tool
+  // passes args at TOP LEVEL, so the payload shape is identical to the legacy
+  // facade and the executeApprovedAction branch needs no change.
+  return pendingOrAuto(config, "self.config", undefined, (reason) => requestSelfInvoke(config, taskId, toolCallId, op.name, args, reason));
 }
 
 // ---------------- Approval-gated tools ----------------
@@ -2401,6 +2843,48 @@ async function requestSendMessage(
   });
 }
 
+// Create the approval row for a mutate self-config operation. Mirrors
+// requestSendMessage: the side effect (running the registry handler) does
+// NOT happen here — it runs in agent.executeApprovedAction's "self.config"
+// branch once the approval resolves, re-reading {opName, args} from the
+// payload. In `auto` mode pendingOrAuto auto-resolves this immediately; in
+// `strict` mode the row waits for the operator.
+async function requestSelfInvoke(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  opName: string,
+  opArgs: Record<string, unknown>,
+  reasonOverride?: string
+): Promise<string> {
+  return mutateState(config.instance, (state: RuntimeState) => {
+    const item = findTask(state, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createAuthorization(state, {
+      taskId: item.id,
+      action: "self.config",
+      target: opName,
+      risk: "medium",
+      reason: reasonOverride ?? "Changing Gini's own configuration requires approval.",
+      payload: {
+        opName,
+        args: opArgs,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for self-config change (chat-task)",
+      data: { approvalId: approval.id, opName, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
 // Request that the user connect an external provider. Routed through the
 // setup-request state machine so the chat-task loop pauses naturally — the
 // task moves to waiting_approval, the chat UI renders a Connect card
@@ -2418,17 +2902,105 @@ async function requestConnectorTool(
   args: Record<string, unknown>,
   messageHistory?: readonly unknown[]
 ): Promise<DispatchResult> {
-  const providerId = requireString(args, "provider");
   const reason = requireString(args, "reason");
-  const provider = getProvider(providerId);
-  if (!provider) {
-    // Synchronous error so the model can recover (it picked a bogus
-    // provider id). Matches how mcp_call surfaces unknown servers.
+  const providerId = optionalString(args, "provider", "");
+  const provider = providerId ? getProvider(providerId) : undefined;
+
+  // The contract: the caller supplies EITHER a registered `provider`
+  // (template path) OR `{name, type:"api-key"}` (templateless typed credential
+  // for a service with no provider module). Templateless is the path when the
+  // model passed `type` and there's no registered provider for `provider`.
+  // Templateless supports api-key ONLY — an oauth2 credential needs a provider
+  // module / setup skill to model its env vars and OAuth flow, so the model
+  // can't request one without a registered provider (see
+  // docs/adr/chat-credential-provisioning.md).
+  const credentialType = optionalString(args, "type", "");
+  const templateless = !provider && credentialType === "api-key";
+
+  if (!provider && credentialType === "oauth2") {
+    // Recoverable: an oauth2 credential can't be requested templatelessly.
+    // The model must go through a provider module / setup skill that knows the
+    // service's env vars and OAuth flow.
     return {
       kind: "sync",
       result: JSON.stringify({
         ok: false,
-        error: `Unknown provider: ${providerId}. The user has no path to connect this.`
+        error: `Templateless request_connector supports type "api-key" only. An oauth2 credential requires a registered provider module (pass its \`provider\` id) or a setup skill that owns the OAuth flow — request_connector cannot mint one for a service with no provider module.`
+      })
+    };
+  }
+
+  if (!provider && !templateless) {
+    // Synchronous error so the model can recover. It either picked a bogus
+    // provider id, or asked for a templateless credential without a valid
+    // `type`. Matches how mcp_call surfaces unknown servers.
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: providerId
+          ? `Unknown provider: ${providerId}. For a service with no registered provider, pass {name, type:"api-key"} instead so the user can connect it.`
+          : `request_connector needs either a registered \`provider\` id, or \`type:"api-key"\` plus \`name\` for a templateless credential.`
+      })
+    };
+  }
+
+  // Templateless field capture. `name` is the credential name; it IS the env
+  // var (templateless is api-key only), so validate it synchronously here
+  // (createConnector re-validates server-side) — a recoverable error lets the
+  // model fix the name before any card is minted.
+  const credentialName = templateless ? optionalString(args, "name", "") : "";
+  const credentialLabel = optionalString(args, "label", "");
+  const mcpUrl = optionalString(args, "mcpUrl", "");
+  const skillId = optionalString(args, "skillId", "");
+  if (templateless) {
+    if (!credentialName) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `A templateless request needs a \`name\`. It is used as the environment variable, so it must be an uppercase env-var token (e.g. SOME_SERVICE_API_KEY).`
+        })
+      };
+    }
+    if (!/^[A-Z][A-Z0-9_]*$/.test(credentialName)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Invalid api-key credential name: "${credentialName}". The name is used as the environment variable, so it must match ^[A-Z][A-Z0-9_]*$ (e.g. SOME_SERVICE_API_KEY).`
+        })
+      };
+    }
+  }
+
+  // Surface guard — same rationale as requestSkillConnectorGrant /
+  // browser_fill_secrets. The Connect card is React UI rendered only in the
+  // web chat; a task running over a messaging bridge (Telegram/Discord), in a
+  // scheduled/headless job session (origin:"job"), or with no chat session at
+  // all would park in waiting_approval with no way to enter the secret. Fail
+  // synchronously so the agent can verbalize "open the web chat to enter it".
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  if (!surfaceSession || surfaceSession.origin === "job") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Connecting a credential needs the secure Connect card, and that card only renders in a web chat session — this task isn't attached to one (subagent child, scheduled job, or other headless run). Route this through the web chat or settings page.`
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Connecting a credential needs the secure Connect card, which only works in the web chat (this conversation is over ${surfaceKind}). Reply asking the user to open the web chat to enter it, then continue once they confirm.`
       })
     };
   }
@@ -2438,17 +3010,23 @@ async function requestConnectorTool(
   // values like project IDs, and passes the finished text here. No runtime
   // templating: `reason` becomes the approval's `reason` verbatim.
 
-  // Fast path: if a healthy + configured connector already exists for
-  // this provider, the model is calling defensively. Tell it to proceed
-  // and skip the round-trip through the approval UI.
-  const state = readState(config.instance);
-  const existing = state.connectors.find(
-    (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
-  );
+  // Fast path: if a healthy + configured connector already exists, the model
+  // is calling defensively. Tell it to proceed and skip the round-trip through
+  // the approval UI. Key on the credential `name` for templateless requests,
+  // else on the provider id.
+  const state = surfaceState;
+  const existing = templateless
+    ? state.connectors.find(
+        (c) => c.name === credentialName && c.status === "configured" && c.health === "healthy"
+      )
+    : state.connectors.find(
+        (c) => c.provider === providerId && c.status === "configured" && c.health === "healthy"
+      );
   if (existing) {
+    const label = provider?.label ?? (credentialLabel || credentialName);
     return {
       kind: "sync",
-      result: `${provider.label} is already connected. Proceed with the original request.`
+      result: `${label} is already connected. Proceed with the original request.`
     };
   }
 
@@ -2470,7 +3048,7 @@ async function requestConnectorTool(
   // snapshot is only written when a task pauses for approval, so the
   // first time the model calls request_connector inside the same turn
   // it just called read_skill, only messageHistory has the evidence.
-  if (provider.setupSkill) {
+  if (provider?.setupSkill) {
     const task = state.tasks.find((t) => t.id === taskId);
     const persisted = task?.toolCallState?.messages ?? [];
     const inFlight = messageHistory ?? [];
@@ -2507,6 +3085,33 @@ async function requestConnectorTool(
     }
   }
 
+  // Resolve the user-facing target/label. For the known-provider path these
+  // come from the module; for a templateless request they come from the
+  // model's `name`/`label`. The card detects the templateless case by
+  // `credentialType` being present with no registered provider (see
+  // BlockSetupRequested / AddConnectorDialog).
+  const target = provider?.id ?? credentialName;
+  const payloadLabel = provider?.label ?? (credentialLabel || credentialName);
+  // When a skill requested this credential, resolve its NAME from state (the
+  // model supplies only the id) so the card can render "Grant <credential> to
+  // skill <name>" from a server-resolved identity rather than the
+  // model-authored reason/title. GUARD: only carry the skillId through when the
+  // named skill actually DECLARES the credential this request will mint. The
+  // model supplies skillId, so without this check the card could promise "Grant
+  // X to skill Y" for a grant /complete will then refuse (Y doesn't declare X) —
+  // the consent copy must never advertise a grant that won't happen. When the
+  // skill doesn't declare it, drop skillId + credentialSkillName: the credential
+  // is still created on completion, just not auto-granted. The /complete
+  // declares-credential check remains the authoritative backstop.
+  const requestedName = templateless
+    ? credentialName
+    : (provider ? credentialTemplateForProvider(provider)?.name : undefined);
+  const grantSkill = skillId ? state.skills.find((s) => s.id === skillId) : undefined;
+  const skillDeclaresCredential = Boolean(
+    grantSkill && requestedName && (grantSkill.requiredCredentials ?? []).includes(requestedName)
+  );
+  const effectiveSkillId = skillDeclaresCredential ? skillId : "";
+  const credentialSkillName = skillDeclaresCredential ? grantSkill?.name : undefined;
   const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
     const item = findTask(mutable, taskId);
     if (isTerminalTaskStatus(item.status)) {
@@ -2515,14 +3120,28 @@ async function requestConnectorTool(
     const approval = createSetupRequest(mutable, {
       taskId: item.id,
       action: "connector.request",
-      target: provider.id,
+      target,
       reason,
       payload: {
-        provider: provider.id,
-        providerLabel: provider.label,
-        providerDescription: provider.description,
+        // Known-provider fields (undefined for templateless requests).
+        provider: provider?.id,
+        providerLabel: provider?.label,
+        providerDescription: provider?.description,
+        fields: provider?.fields,
+        // Templateless typed-credential fields (undefined for the
+        // known-provider path). credentialType present + no registered
+        // provider is how the card detects templateless.
+        credentialName: templateless ? credentialName : undefined,
+        credentialType: templateless ? credentialType : undefined,
+        credentialLabel: templateless ? payloadLabel : undefined,
+        mcpUrl: templateless && mcpUrl ? mcpUrl : undefined,
+        // Skill to auto-grant on completion (either path). Only stamped when
+        // the named skill declares this credential (see guard above), so a
+        // promised grant always matches what /complete will perform.
+        skillId: effectiveSkillId || undefined,
+        // Server-resolved name of that skill, for the card to display.
+        credentialSkillName,
         reason,
-        fields: provider.fields,
         toolCallId
       }
     });
@@ -2549,7 +3168,7 @@ async function requestConnectorTool(
     appendTrace(config.instance, item.id, {
       type: "approval",
       message: "Approval requested for connector connect (chat-task)",
-      data: { approvalId: approval.id, provider: provider.id, toolCallId }
+      data: { approvalId: approval.id, provider: target, toolCallId }
     });
     return approval.id;
   });
@@ -2600,6 +3219,26 @@ async function browserFillSecretsTool(
   // the eventual reply back through outboundMirror to Telegram).
   // Mirror finalize.ts:161's `outboundMirror ?? source` precedent.
   const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
   if (surfaceKind === "telegram" || surfaceKind === "discord") {
     return {
       kind: "sync",
@@ -2728,6 +3367,860 @@ async function browserFillSecretsTool(
       type: "approval",
       message: "Approval requested for browser.fill_secret",
       data: { approvalId: approval.id, slotCount: slots.length, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// Messaging-bridge add affordance. Mints a `messaging.add_bridge`
+// approval whose card surfaces a name input and a password-masked
+// bot-token input inside the chat — the same inline-card pattern
+// `browser_fill_secrets` and `request_connector` use. On Submit, the
+// BFF forwards values to POST /api/approvals/<id>/connect, which
+// routes into addMessagingBridge (the same code path the CLI and the
+// settings page already call). The bot token never enters the model
+// context, audit evidence, or the chat transcript — same hygiene as
+// browser.fill_secret.
+async function requestMessagingBridgeTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard — same rationale as browser_fill_secrets. The amber
+  // card renders only in the web chat; a task running over Telegram
+  // or Discord that minted this approval would park in
+  // awaiting_approval forever with no submission path. Refuse early
+  // so the agent can verbalize "open the web chat to add the bridge"
+  // back to the user.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_bridge only works in the web chat (this conversation is over ${surfaceKind}). Reply to the user in text asking them to open the web chat to add the bridge there.`
+      })
+    };
+  }
+
+  const rawKind = typeof args.kind === "string" ? args.kind.trim().toLowerCase() : "";
+  // The chat card collects only name + bot token; Discord bridges
+  // need a deliveryTargets channel-ID list that the card doesn't
+  // surface, so an "add a discord bridge from chat" approval would
+  // be unactionable (settings dialog + CLI are the only paths that
+  // collect channel IDs). The catalog enum restricts kind to
+  // "telegram", but the model can violate the schema; refuse here
+  // with a clear message that points the user at the right surface
+  // so the agent can fall back to plain text instead of minting a
+  // dead-end approval card.
+  if (rawKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "request_messaging_bridge cannot add a Discord bridge from chat: the card does not collect the required channel-IDs list. Tell the user to open the settings page and click \"Add Discord\" there."
+      })
+    };
+  }
+  if (rawKind !== "telegram") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_bridge requires kind: "telegram" (got ${JSON.stringify(args.kind)}).`
+      })
+    };
+  }
+  const kind = "telegram" as const;
+  const kindLabel = "Telegram";
+  const suggestedName = typeof args.suggestedName === "string" && args.suggestedName.trim().length > 0
+    ? args.suggestedName.trim()
+    : `my-${kind}-bot`;
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `Add a ${kindLabel} bridge so this agent can talk to you on ${kindLabel}.`;
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "messaging.add_bridge",
+      target: kind,
+      reason,
+      // Structural payload fields the /connect handler reads:
+      //   - kind: telegram | discord, drives the addMessagingBridge
+      //     branch + the per-kind help text under the form.
+      //   - suggestedName: prefilled value for the name input; the
+      //     user can change it before submitting.
+      //   - toolCallId: links the resume tool result back to the
+      //     originating tool_call in the chat-task loop.
+      payload: { kind, suggestedName, reason, toolCallId }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    // Mirror the reason into the chat session so it survives past
+    // approval resolution — same pattern as requestConnectorTool /
+    // browserFillSecretsTool.
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.add_bridge",
+      data: { approvalId: approval.id, kind, toolCallId }
+    });
+    return approval.id;
+  });
+  return { kind: "pending", approvalId };
+}
+
+// Read-only inventory of configured messaging bridges. Returns the
+// minimum every caller needs (id, name, kind, status, bot username
+// from metadata) so the agent can answer "what bridges do I have?"
+// or pick the right id for a follow-up request_remove_messaging_bridge
+// without leaking the encrypted secret refs / per-chat allowlists.
+async function listMessagingBridgesTool(config: RuntimeConfig): Promise<string> {
+  const state = readState(config.instance);
+  const bridges = state.messagingBridges.map((bridge) => {
+    const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
+    const botUsername = typeof meta.botUsername === "string" ? meta.botUsername : undefined;
+    return {
+      id: bridge.id,
+      name: bridge.name,
+      kind: bridge.kind,
+      status: bridge.status,
+      message: bridge.message ?? null,
+      botUsername: botUsername ?? null,
+      createdAt: bridge.createdAt,
+      updatedAt: bridge.updatedAt
+    };
+  });
+  return JSON.stringify({ ok: true, bridges });
+}
+
+// Read-only view of a Telegram bridge's pending pairing requests +
+// current allowlist. Mirrors the data MessagingCard's
+// TelegramPendingRequests component polls so the agent sees what
+// the operator would see in settings. Returns ok:false (string
+// envelope, not throw) on unknown bridges or non-telegram kinds so
+// the model gets a recoverable tool result instead of a hard error.
+async function listMessagingPairingsTool(
+  config: RuntimeConfig,
+  args: Record<string, unknown>
+): Promise<string> {
+  const bridge = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridge) {
+    return JSON.stringify({ ok: false, error: "list_messaging_pairings requires a 'bridge' (id or name)." });
+  }
+  try {
+    const view = listAllowedChats(config, bridge);
+    // Redact verificationCode + verificationCodeExpiresAt from the
+    // tool envelope. The code is a security-critical token whose
+    // entire purpose is preventing TOFU enrollment race attacks
+    // (see messaging.ts `DeniedChatAttempt`); a prompt-injected
+    // agent that could read it would be able to scrape live codes
+    // and race the legitimate user. The model doesn't need the
+    // code to pair: request_messaging_pairing's dispatcher reads
+    // the same listAllowedChats view server-side when minting the
+    // approval, and the operator confirms the code by eye against
+    // what the bot DM'd them. The settings UI still gets the full
+    // view via its own /api/messaging/* path; only the model-
+    // facing tool envelope is redacted.
+    const safeRecentDeniedChats = view.recentDeniedChats.map((entry) => ({
+      chatId: entry.chatId,
+      chatType: entry.chatType,
+      sender: entry.sender,
+      lastAttemptAt: entry.lastAttemptAt
+    }));
+    return JSON.stringify({
+      ok: true,
+      bridge,
+      allowedChatIds: view.allowedChatIds,
+      ownerChatId: view.ownerChatId,
+      recentDeniedChats: safeRecentDeniedChats
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+// Pairing-approval affordance. Mints a messaging.approve_pairing
+// approval whose payload carries everything the chat card needs to
+// render the confirmation (bridge id+name+botUsername, chat id+type,
+// sender, verification code + expiry). Approve / Reject both flow
+// through /api/approvals/<id>/connect (Reject just sends
+// `{ reject: true }`); /approve refuses this action.
+//
+// The dispatcher reads the pending row up-front and refuses if the
+// chat is already enrolled, no longer pending, or the code has
+// expired — gives the agent a recoverable tool_result instead of
+// minting a card the operator can't act on.
+
+// Shape of a pending recentDeniedChats entry that both
+// requestMessagingPairingTool and waitForMessagingPairTool consume
+// when minting a messaging.approve_pairing approval. Fields match
+// what BlockApprovalRequested.tsx pulls off the payload.
+interface PendingPairForApproval {
+  chatId: number;
+  chatType?: string;
+  sender?: string;
+  verificationCode?: string;
+  verificationCodeExpiresAt?: string;
+}
+
+// Single source of truth for messaging.approve_pairing approval
+// minting. Both the explicit-request tool (requestMessagingPairingTool)
+// and the wait-loop tool (waitForMessagingPairTool) build the same
+// approval shape, including the chat-task plumbing (approvalIds.push,
+// approval_reason chat message, appendTrace). Centralizing it keeps
+// the two call sites from drifting when the card grows a new payload
+// field — adding the field here propagates to both.
+async function mintPairingApproval(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  bridge: { id: string; name: string; metadata?: Record<string, unknown> },
+  pending: PendingPairForApproval,
+  reasonOverride?: string
+): Promise<string> {
+  const reason = reasonOverride
+    ?? `Confirm the verification code below matches what you received on Telegram before approving chat ${pending.chatId}.`;
+  const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
+  const botUsername = typeof meta.botUsername === "string" ? meta.botUsername : undefined;
+  return mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "messaging.approve_pairing",
+      target: `${bridge.id}:${pending.chatId}`,
+      reason,
+      payload: {
+        bridgeId: bridge.id,
+        bridgeName: bridge.name,
+        botUsername: botUsername ?? null,
+        chatId: pending.chatId,
+        chatType: pending.chatType ?? "private",
+        sender: pending.sender ?? null,
+        verificationCode: pending.verificationCode ?? null,
+        verificationCodeExpiresAt: pending.verificationCodeExpiresAt ?? null,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.approve_pairing",
+      data: { approvalId: approval.id, bridgeId: bridge.id, chatId: pending.chatId, toolCallId }
+    });
+    return approval.id;
+  });
+}
+
+async function requestMessagingPairingTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard — same rationale as requestMessagingBridgeTool /
+  // browserFillSecretsTool. The approval card renders only in the
+  // web chat; a task spawned from a Telegram (or Discord) bridge
+  // that minted this approval would park in awaiting_approval
+  // forever, and the telegram-poller would skip relay via
+  // reply_skip_non_terminal. Refuse early so the agent can fall
+  // back to plain text ("open the web chat to approve the pairing").
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_messaging_pairing only works in the web chat (this conversation is over ${surfaceKind}). Tell the user to open the web chat to approve the pairing.`
+      })
+    };
+  }
+
+  const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridgeIdOrName) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "request_messaging_pairing requires a 'bridge' (id or name)." })
+    };
+  }
+  const chatIdRaw = args.chatId;
+  const chatId = typeof chatIdRaw === "number" ? chatIdRaw : Number(chatIdRaw);
+  if (!Number.isFinite(chatId)) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `request_messaging_pairing requires a numeric 'chatId' (got ${JSON.stringify(args.chatId)}).` })
+    };
+  }
+  const state = readState(config.instance);
+  const bridge = state.messagingBridges.find((b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName);
+  if (!bridge) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Messaging bridge not found: ${bridgeIdOrName}.` })
+    };
+  }
+  if (bridge.kind !== "telegram") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Pairing approvals only apply to telegram bridges (got '${bridge.kind}').` })
+    };
+  }
+  const view = listAllowedChats(config, bridge.id);
+  if (view.allowedChatIds.includes(chatId)) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Chat ${chatId} is already enrolled on bridge '${bridge.name}'. No pairing card needed.`
+      })
+    };
+  }
+  const pending = view.recentDeniedChats.find((entry) => entry.chatId === chatId);
+  if (!pending) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `No pending pairing request for chat ${chatId} on bridge '${bridge.name}'. Have the user DM the bot to mint a fresh request.`
+      })
+    };
+  }
+  if (pending.verificationCodeExpiresAt) {
+    const expiresAt = Date.parse(pending.verificationCodeExpiresAt);
+    if (Number.isFinite(expiresAt) && expiresAt <= Date.now()) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Verification code for chat ${chatId} expired. Tell the user to DM the bot again to mint a fresh code.`
+        })
+      };
+    }
+  }
+  // Group chats deliberately have no verification code (the bot can't
+  // DM a per-user code through a group), and the chat-card approve
+  // path requires one for the verification handshake. messaging-
+  // pairing-connect.ts refuses code-less approves, so without this
+  // up-front check the agent would mint a card whose Approve button
+  // bounces — only Reject would work and the card would sit there
+  // until the operator gave up. Refuse the mint instead so the
+  // agent surfaces the right next step to the user (settings page
+  // or `gini messaging allow`).
+  if (!pending.verificationCode) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `Chat ${chatId} on bridge '${bridge.name}' has no verification code (likely a group chat). Group enrollments don't go through the chat-card handshake — tell the user to open the settings page (or run \`gini messaging allow ${bridge.name} ${chatId}\`) to approve.`
+      })
+    };
+  }
+
+  const reasonOverride = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : undefined;
+  const approvalId = await mintPairingApproval(
+    config,
+    taskId,
+    toolCallId,
+    bridge,
+    { ...pending, chatId },
+    reasonOverride
+  );
+  return { kind: "pending", approvalId };
+}
+
+// Server-side blocking tool the agent calls right after a
+// successful request_messaging_bridge. Polls the bridge's
+// recentDeniedChats every second for up to `timeoutSeconds`; the
+// moment a fresh pending row shows up, mints a
+// messaging.approve_pairing approval bound to the agent's task and
+// returns {kind:"pending", approvalId} so the chat-task loop pauses
+// on the approval card. Lets the agent stay engaged with the user
+// through the bridge-add → user-DMs-bot → operator-approves dance
+// without returning control and asking the user to come back.
+//
+// Exit paths:
+//   - Pending row arrives → mint approval → pending DispatchResult
+//   - Task cancelled mid-wait → sync ok:false with "cancelled"
+//   - Timeout → sync ok:false with "timeout" so the agent can
+//     surface the option to keep waiting or skip
+//
+// Reuses the same surface guard as the other request_ tools: a
+// Telegram/Discord-sourced chat can't surface an approval the
+// remote user can't act on.
+async function waitForMessagingPairTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `wait_for_messaging_pair only works in the web chat (this conversation is over ${surfaceKind}).`
+      })
+    };
+  }
+
+  const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridgeIdOrName) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "wait_for_messaging_pair requires a 'bridge' (id or name)." })
+    };
+  }
+  const requestedTimeoutSeconds = typeof args.timeoutSeconds === "number" && Number.isFinite(args.timeoutSeconds)
+    ? args.timeoutSeconds
+    : 600;
+  // Clamp to a sane window. The lower bound keeps a too-short
+  // call from racing the poll interval; the upper bound caps how
+  // long we tie up the chat-task awaiting an external event.
+  const timeoutSeconds = Math.max(10, Math.min(1800, Math.round(requestedTimeoutSeconds)));
+  const deadlineMs = Date.now() + timeoutSeconds * 1000;
+  // Server-side env override so tests don't wait full poll ticks. Production
+  // leaves it unset and gets the 1000ms default (Number(undefined)/0/NaN all
+  // fall through the `||`).
+  const POLL_INTERVAL_MS = Number(process.env.GINI_PAIR_POLL_MS) || 1000;
+
+  // Validate bridge existence + kind up-front so we don't burn
+  // the timeout on a typo'd name. The wait predicate itself
+  // re-reads state every tick, so no snapshot is held here:
+  // surfacing a pending row that arrived BEFORE the wait started
+  // is still legitimate (the operator hasn't acted on it yet),
+  // and approved rows are removed from recentDeniedChats so they
+  // can't loop back. The previous snapshot-diff predicate raced
+  // with the natural "user DMs the bot between bridge create and
+  // wait_for_messaging_pair start" window — pre-existing rows
+  // were filtered out as not-new even though they represented the
+  // exact unresolved pair the agent was waiting for.
+  const initialBridge = readState(config.instance).messagingBridges.find(
+    (b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName
+  );
+  if (!initialBridge) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Messaging bridge not found: ${bridgeIdOrName}.` })
+    };
+  }
+  if (initialBridge.kind !== "telegram") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `wait_for_messaging_pair only applies to telegram bridges (got '${initialBridge.kind}').` })
+    };
+  }
+  // Snapshot the allowlist at wait start so we can detect a chat
+  // getting enrolled out-of-band (settings page click, CLI
+  // `gini messaging allow`, or another agent's parallel
+  // request_messaging_pairing) WHILE this wait is running. allowChat
+  // both removes the pending row AND adds chatId to allowedChatIds,
+  // so the pending-row predicate alone can't tell us "someone else
+  // approved it" from "no one has DM'd yet" — both look like
+  // "nothing to surface." Without this snapshot, the agent would
+  // time out and tell the user "DM the bot again" even though they
+  // were already enrolled.
+  const initialAllowedSnapshot = new Set<number>(
+    Array.isArray((initialBridge.metadata ?? {} as Record<string, unknown>).allowedChatIds)
+      ? ((initialBridge.metadata ?? {}).allowedChatIds as unknown[]).map((v) => Number(v)).filter((n) => Number.isFinite(n))
+      : []
+  );
+
+  // Set a runningHint on this tool_call block so the chat UI upgrades
+  // the row from the 14px inline spinner to an amber waiting-card —
+  // a long, externally-gated wait (up to 600s waiting on an inbound
+  // Telegram DM) needs visual weight proportional to its duration and a
+  // cancel affordance co-located with the state. The hint folds the
+  // bot's @username into the card body so the operator doesn't have to
+  // scan a separate system_note for context.
+  //
+  // Resolve the bot's @username. addMessagingBridge skips getMe —
+  // botUsername is populated by checkMessagingBridge — so a freshly-
+  // added bridge has empty metadata here. Run the probe once when
+  // missing; the merged write benefits later consumers (pairing card,
+  // operator UI) too. Best-effort: a failed probe falls back to the
+  // bridge name, which still uniquely identifies the bot the user
+  // just configured.
+  const readBotUsername = (bridge: typeof initialBridge): string | undefined => {
+    const meta = (bridge.metadata ?? {}) as { botUsername?: unknown };
+    return typeof meta.botUsername === "string" ? meta.botUsername : undefined;
+  };
+  let botUsernameForGuidance = readBotUsername(initialBridge);
+  // Only probe when the bridge has an attached secret ref — without
+  // a token, checkMessagingBridge flips status to "error" with a
+  // "token missing" message, which the in-loop guard at "liveBridge.status
+  // !== 'configured'" treats as a bridge that can't receive messages.
+  // Production bridges always have a token because addMessagingBridge
+  // requires one for telegram; tests that construct bridges via
+  // createMessagingBridgeRecord directly skip this check by leaving
+  // secretRefs empty.
+  const hasSecret = (initialBridge.secretRefs ?? []).length > 0;
+  if (!botUsernameForGuidance && initialBridge.kind === "telegram" && hasSecret) {
+    try {
+      const refreshed = await checkMessagingBridge(config, initialBridge.id);
+      botUsernameForGuidance = readBotUsername(refreshed);
+    } catch {
+      // Probe failed; fall through to bridge-name fallback.
+    }
+  }
+  const guidanceText = botUsernameForGuidance
+    ? `Open Telegram and start a chat with @${botUsernameForGuidance}: tap Start (or send /start), then send any message. The approval card will appear here as soon as your DM lands.`
+    : `Open Telegram and start a chat with the bot '${initialBridge.name}': tap Start (or send /start), then send any message. The approval card will appear here as soon as your DM lands.`;
+  const guidanceCtx = resolveEmitContext(config, taskId);
+  if (guidanceCtx) setToolCallRunningHint(guidanceCtx, toolCallId, guidanceText);
+
+  const reasonText = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : undefined;
+
+  // Poll loop. readState is in-process cached, so this is cheap.
+  while (Date.now() < deadlineMs) {
+    const liveState = readState(config.instance);
+
+    // Abort if the task itself was cancelled mid-wait.
+    const liveTask = liveState.tasks.find((t) => t.id === taskId);
+    if (liveTask && isTerminalTaskStatus(liveTask.status)) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: "wait_for_messaging_pair aborted: task was cancelled."
+        })
+      };
+    }
+
+    const liveBridge = liveState.messagingBridges.find(
+      (b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName
+    );
+    if (!liveBridge) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({ ok: false, error: `Messaging bridge no longer exists: ${bridgeIdOrName}.` })
+      };
+    }
+    // Bridge can flip to "disabled" or "error" while the wait is
+    // polling — operator clicked Disable in settings, the bot
+    // token rotated and the health check failed, etc. Without this
+    // exit the wait would tell the user to DM a bot that won't
+    // receive their message, and time out 10 minutes later. Return
+    // a sync failure so the agent can tell the user what actually
+    // changed.
+    if (liveBridge.status !== "configured") {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: false,
+          error: `Messaging bridge '${liveBridge.name}' is no longer in 'configured' status (now '${liveBridge.status}')${liveBridge.message ? `: ${liveBridge.message}` : ""}. Stop telling the user to DM the bot — the bridge can't receive messages until it's re-enabled.`
+        })
+      };
+    }
+    const liveMeta = (liveBridge.metadata ?? {}) as {
+      allowedChatIds?: unknown;
+      recentDeniedChats?: Array<{
+        chatId: number;
+        chatType?: string;
+        sender?: string;
+        verificationCode?: string;
+        verificationCodeExpiresAt?: string;
+      }>;
+    };
+    const livePending = liveMeta.recentDeniedChats ?? [];
+    const allowedSet = new Set<number>(
+      Array.isArray(liveMeta.allowedChatIds)
+        ? liveMeta.allowedChatIds.map((v) => Number(v)).filter((n) => Number.isFinite(n))
+        : []
+    );
+
+    // Out-of-band enrollment detection: any chat in the current
+    // allowlist that wasn't there at wait start is a fresh
+    // approval landed via settings / CLI / a parallel agent flow.
+    // Return success so the agent can tell the user "the chat is
+    // enrolled, you can DM the bot now" instead of timing out.
+    const freshlyEnrolled: number[] = [];
+    for (const chatId of allowedSet) {
+      if (!initialAllowedSnapshot.has(chatId)) freshlyEnrolled.push(chatId);
+    }
+    if (freshlyEnrolled.length > 0) {
+      return {
+        kind: "sync",
+        result: JSON.stringify({
+          ok: true,
+          outOfBand: true,
+          enrolledChatIds: freshlyEnrolled,
+          message: `Chat ${freshlyEnrolled.join(", ")} got enrolled on bridge '${liveBridge.name}' out-of-band (settings page, CLI, or a parallel agent flow) while waiting. The user can DM the bot now.`
+        })
+      };
+    }
+
+    // Surface the first pending row that the operator can act on:
+    // (a) has a verification code (groups never mint a code and
+    // are not approvable via the chat-card handshake — they go
+    // through the settings page / CLI), (b) isn't already enrolled
+    // on the bridge's allowlist (defensive; allowChat clears
+    // recentDeniedChats on enroll), and (c) the code hasn't
+    // expired. Without (c), an operator who left the chat tab
+    // open across the 10-minute code TTL would be presented an
+    // approval card whose Approve action would fail at allowChat's
+    // expired-code throw. Mirrors the expiry guard inside
+    // requestMessagingPairingTool.
+    const nowMs = Date.now();
+    const newOrRotated = livePending.find((entry) => {
+      if (!entry.verificationCode) return false;
+      if (allowedSet.has(entry.chatId)) return false;
+      if (entry.verificationCodeExpiresAt) {
+        const expiresAt = Date.parse(entry.verificationCodeExpiresAt);
+        if (Number.isFinite(expiresAt) && expiresAt <= nowMs) return false;
+      }
+      return true;
+    });
+
+    if (newOrRotated && newOrRotated.verificationCode) {
+      // Delegate to the shared mintPairingApproval helper so the
+      // payload shape stays in lockstep with requestMessagingPairingTool.
+      // The helper writes its own "Approval requested" trace; add a
+      // wait-variant trace afterward so an operator inspecting the
+      // task log can tell the card came from the polling loop instead
+      // of an explicit request_messaging_pairing call.
+      const approvalId = await mintPairingApproval(
+        config,
+        taskId,
+        toolCallId,
+        liveBridge,
+        newOrRotated,
+        reasonText
+      );
+      appendTrace(config.instance, taskId, {
+        type: "approval",
+        message: "Approval requested for messaging.approve_pairing (wait_for_messaging_pair)",
+        data: { approvalId, bridgeId: liveBridge.id, chatId: newOrRotated.chatId, toolCallId }
+      });
+      return { kind: "pending", approvalId };
+    }
+
+    await new Promise<void>((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+  }
+
+  return {
+    kind: "sync",
+    result: JSON.stringify({
+      ok: false,
+      error: `wait_for_messaging_pair timed out after ${timeoutSeconds}s with no inbound pair on bridge '${initialBridge.name}'. The user can DM the bot again — call wait_for_messaging_pair to retry, or move on if they're not pairing right now.`
+    })
+  };
+}
+
+// Bridge-removal affordance. Mints a messaging.remove_bridge
+// approval whose card asks the operator to confirm tearing down a
+// configured bridge from chat. Approve POSTs `{}` to /connect; the
+// runtime calls removeMessagingBridge (same path as the CLI / the
+// settings page's Remove button). Tasks see the resume tool result
+// once removal completes.
+async function requestRemoveMessagingBridgeTool(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  args: Record<string, unknown>
+): Promise<DispatchResult> {
+  // Surface guard — same rationale as the other request_ tools.
+  // The destructive confirmation card renders only in the web chat;
+  // a task spawned from a Telegram (or Discord) bridge that minted
+  // this approval would park in awaiting_approval forever.
+  const surfaceState = readState(config.instance);
+  const surfaceTask = findTask(surfaceState, taskId);
+  const surfaceSession = surfaceTask.chatSessionId
+    ? surfaceState.chatSessions.find((s) => s.id === surfaceTask.chatSessionId)
+    : undefined;
+  const surfaceKind = surfaceSession?.source?.kind ?? surfaceSession?.outboundMirror?.kind;
+  // Chat-card tools also need a live chat session to surface the
+  // card. A subagent spawned with mode:"chat" (or any other caller
+  // that dispatches tools without binding a chat session) would
+  // otherwise mint an approval that emitApprovalRequested then
+  // silently skips because resolveEmitContext returns undefined
+  // for sessionless tasks (chat-task-emit.ts). Same orphaning
+  // happens when chatSessionId is set but the referenced session
+  // was deleted — surfaceSession resolves to undefined either way.
+  // End result: row in state.approvals + task parked, but no UI
+  // card to act on. Refuse up-front on either shape so the model
+  // can surface a recoverable tool_result.
+  if (!surfaceSession) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: "Approval-card tools require a web chat session, and this task isn't attached to one (subagent child, scheduled job, or other headless run). Tell the caller to route this through the parent web chat or settings page."
+      })
+    };
+  }
+  if (surfaceKind === "telegram" || surfaceKind === "discord") {
+    return {
+      kind: "sync",
+      result: JSON.stringify({
+        ok: false,
+        error: `request_remove_messaging_bridge only works in the web chat (this conversation is over ${surfaceKind}). Tell the user to open the web chat to confirm bridge removal.`
+      })
+    };
+  }
+
+  const bridgeIdOrName = typeof args.bridge === "string" ? args.bridge.trim() : "";
+  if (!bridgeIdOrName) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: "request_remove_messaging_bridge requires a 'bridge' (id or name)." })
+    };
+  }
+  const state = readState(config.instance);
+  const bridge = state.messagingBridges.find((b) => b.id === bridgeIdOrName || b.name === bridgeIdOrName);
+  if (!bridge) {
+    return {
+      kind: "sync",
+      result: JSON.stringify({ ok: false, error: `Messaging bridge not found: ${bridgeIdOrName}.` })
+    };
+  }
+  const reason = typeof args.reason === "string" && args.reason.trim().length > 0
+    ? args.reason.trim()
+    : `Remove the ${bridge.kind} bridge '${bridge.name}'? This deletes its bot token; past messages stay in history.`;
+
+  const approvalId = await mutateState(config.instance, (mutable: RuntimeState) => {
+    const item = findTask(mutable, taskId);
+    if (isTerminalTaskStatus(item.status)) {
+      throw new TaskAlreadyTerminalError(taskId, item.status);
+    }
+    const approval = createSetupRequest(mutable, {
+      taskId: item.id,
+      action: "messaging.remove_bridge",
+      target: bridge.id,
+      reason,
+      payload: {
+        bridgeId: bridge.id,
+        bridgeName: bridge.name,
+        kind: bridge.kind,
+        toolCallId
+      }
+    });
+    item.approvalIds.push(approval.id);
+    item.updatedAt = now();
+    if (item.chatSessionId) {
+      createChatMessage(mutable, {
+        sessionId: item.chatSessionId,
+        role: "assistant",
+        content: reason,
+        taskId: item.id,
+        runId: item.runId,
+        kind: "approval_reason"
+      });
+    }
+    appendTrace(config.instance, item.id, {
+      type: "approval",
+      message: "Approval requested for messaging.remove_bridge",
+      data: { approvalId: approval.id, bridgeId: bridge.id, toolCallId }
     });
     return approval.id;
   });
@@ -2911,7 +4404,7 @@ export function approvalToolCallId(payload: Record<string, unknown>): string | u
 async function pendingOrAuto(
   config: RuntimeConfig,
   action: PolicyAction,
-  payload: { command: string; source?: string; language?: string } | undefined,
+  payload: { command: string; source?: string; language?: string; skill?: string } | undefined,
   request: (reasonOverride?: string) => Promise<string>
 ): Promise<DispatchResult> {
   // Compute the policy decision BEFORE creating the approval so the

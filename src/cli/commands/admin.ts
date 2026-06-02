@@ -9,7 +9,7 @@ import type { RuntimeConfig } from "../../types";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
 import { install, resetInstance, uninstallAll, uninstallInstance } from "../../runtime";
-import { configPath, loadConfig, parseInstance } from "../../paths";
+import { configPath, loadConfig, parseInstance, pidPath, runtimePortPath, webPortPath, writeRuntimeConfig } from "../../paths";
 import {
   awaitForegroundLogFlush,
   doctor,
@@ -21,9 +21,24 @@ import {
 } from "../process";
 import { print, printStartBanner } from "../output";
 import { COLOR, header, footer, step, info, warn, tildify } from "../styling";
-import { disableForUninstall } from "./autostart";
+import { disableForUninstall, stopViaBootout } from "./autostart";
+import { isLoaded, plistPathFor, supervisor, type PlistKind } from "../autostart";
 import { installedRuntimeDir, updateRuntime } from "../../runtime/update";
 import { api } from "../api";
+
+// How long the foreground parent waits for a runtime child to exit on its own
+// after forwarding SIGTERM, before escalating to SIGKILL. This MUST exceed the
+// child's own shutdown budget: src/server.ts drains in-flight work bounded by
+// SCHEDULER_DRAIN_TIMEOUT_MS (5000ms) and writes its "shutting down (SIGTERM)"
+// marker to runtime-stdout.log only AFTER that drain completes. A grace equal
+// to the child's 5000ms drain leaves no room for the marker write+flush, so
+// under parallel-CI CPU starvation the parent can SIGKILL the child mid-drain
+// and drop the marker entirely. The 2500ms of headroom here lets a cleanly
+// draining child reach its own exit first. Kept below the 8000ms teardown
+// budget the run command honors on terminal close / Ctrl-C (7500ms grace plus
+// the 50ms post-SIGKILL reap wait = 7550ms, under 8000ms), so the SIGKILL
+// stays a failsafe rather than a routine wait.
+const RUNTIME_CHILD_SIGKILL_GRACE_MS = 7500;
 
 export async function install_(ctx: CliContext): Promise<void> {
   // Provider configuration is optional at install time. The piped-curl
@@ -89,7 +104,7 @@ export async function install_(ctx: CliContext): Promise<void> {
       model,
       apiKeyEnv: envProvider === "openai" ? "OPENAI_API_KEY" : undefined
     };
-    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
   } else if (envModel !== undefined && config.provider) {
     // Asymmetry fix: fresh configs honor GINI_MODEL alone via
     // defaultConfig(), but the existing-config branch above only fires
@@ -98,7 +113,7 @@ export async function install_(ctx: CliContext): Promise<void> {
     // current provider name and apiKeyEnv untouched so a stale
     // OPENAI_API_KEY value (or absence) survives the rewrite.
     config.provider = { ...config.provider, model: envModel };
-    writeFileSync(configPath(instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
   }
   await install(config);
   print({ installed: true, instance: config.instance, stateRoot: config.stateRoot, port: config.port });
@@ -110,7 +125,56 @@ export async function start(ctx: CliContext): Promise<boolean> {
   return runtimeStarted;
 }
 
+const STOP_KINDS: PlistKind[] = ["gateway", "web", "watchdog"];
+
+export interface ShouldStopViaBootoutDeps {
+  isLoaded: (instance: string, kind?: PlistKind) => boolean;
+  plistExists: (path: string) => boolean;
+  plistPathFor: (instance: string, kind?: PlistKind) => string;
+}
+
+// Decide whether `gini stop` must use `launchctl bootout` instead of a
+// SIGTERM. The decision is based on the TARGET INSTANCE's launchd state, not
+// the calling process's env: a user running `gini stop` from a terminal has
+// no GINI_SUPERVISOR, so supervisor() would say "foreground" and a SIGTERM
+// would just be respawned by KeepAlive. We bootout when any of the instance's
+// services is loaded OR any of its plists exists on disk (a stopped-but-
+// registered launchd instance). Pure + injectable so it's unit-testable
+// without a real launchctl.
+export function shouldStopViaBootout(
+  instance: string,
+  deps: ShouldStopViaBootoutDeps = { isLoaded, plistExists: existsSync, plistPathFor }
+): boolean {
+  for (const kind of STOP_KINDS) {
+    if (deps.isLoaded(instance, kind)) return true;
+    if (deps.plistExists(deps.plistPathFor(instance, kind))) return true;
+  }
+  return false;
+}
+
 export function stop(ctx: CliContext): void {
+  // Under launchd, KeepAlive is `true`, so a SIGTERM to the runtime pid
+  // would just be respawned. The only way to actually stop a supervised
+  // instance is `launchctl bootout`, which unloads the service. We decide
+  // on the TARGET INSTANCE's launchd state (services loaded / plist on disk)
+  // rather than the calling process's env — a user-run `gini stop` from a
+  // terminal has no GINI_SUPERVISOR, so an env-only check would miss a
+  // launchd instance and SIGTERM-then-respawn it. `supervisor()==="launchd"`
+  // (the gateway calling stop on itself) is an additional fast path. The
+  // foreground / `gini run` path falls through to SIGTERM-based stopRuntime.
+  const instance = ctx.config.instance;
+  if (supervisor() === "launchd" || shouldStopViaBootout(instance)) {
+    const result = stopViaBootout(instance);
+    // bootout unloads the launchd job; the runtime/web no longer write
+    // their pid/port files on the way out (they were SIGKILLed by
+    // launchctl), so clean them up here the same way stopRuntime does.
+    rmSync(pidPath(instance), { force: true });
+    rmSync(runtimePortPath(instance), { force: true });
+    rmSync(join(ctx.config.stateRoot, "web.pid"), { force: true });
+    rmSync(webPortPath(instance), { force: true });
+    print(result);
+    return;
+  }
   print(stopRuntime(ctx.config));
 }
 
@@ -522,8 +586,10 @@ export async function runForeground(ctx: CliContext): Promise<void> {
     for (const child of children) {
       try { child.kill("SIGTERM"); } catch { /* already gone */ }
     }
-    // Escalate to SIGKILL after 5s so we don't hang on a stuck child.
-    const deadline = Date.now() + 5000;
+    // Escalate to SIGKILL only after the child's own bounded drain has had room
+    // to finish (see RUNTIME_CHILD_SIGKILL_GRACE_MS), so a cleanly draining
+    // runtime can write its shutdown marker before we force-kill it.
+    const deadline = Date.now() + RUNTIME_CHILD_SIGKILL_GRACE_MS;
     while (aliveChildren().length > 0 && Date.now() < deadline) {
       await Bun.sleep(100);
     }

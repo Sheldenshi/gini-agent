@@ -1,6 +1,13 @@
 # ADR: Skills As Packages, Connectors As Credentials
 
 > Renamed from "Skills As Packages, Identities As Credentials" per ADR connector-provider-spec-compliance.md. The decision is unchanged; only the vocabulary updated.
+>
+> The package/credential split below still holds. The *binding* between them
+> moved from provider-keyed to name-based: skills now reference credentials by
+> NAME (`metadata.gini.requires.credentials`) and connectors carry an explicit
+> `type`. See ADR typed-named-credentials.md for the current model; treat the
+> `requires.connectors: [{ provider }]` form referenced here as the legacy
+> binding kept for one release.
 
 ## Decision
 

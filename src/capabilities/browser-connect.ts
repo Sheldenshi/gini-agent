@@ -132,14 +132,18 @@ function profileDirFor(config: RuntimeConfig): string {
 // build info and the webSocketDebuggerUrl we'll later hand to Playwright.
 // Returns the parsed body on success or null if the host did not respond
 // with a JSON payload before the deadline.
-async function probeCdp(httpUrl: string, deadlineMs: number): Promise<CdpVersionInfo | null> {
+async function probeCdp(
+  httpUrl: string,
+  deadlineMs: number,
+  intervalMs: number = PROBE_INTERVAL_MS
+): Promise<CdpVersionInfo | null> {
   const start = Date.now();
   while (Date.now() < start + deadlineMs) {
     try {
       const response = await fetch(`${httpUrl.replace(/\/$/, "")}/json/version`, {
         // AbortSignal.timeout keeps a single hung connection from eating
         // the entire poll budget.
-        signal: AbortSignal.timeout(PROBE_INTERVAL_MS * 2)
+        signal: AbortSignal.timeout(intervalMs * 2)
       });
       if (response.ok) {
         const body = (await response.json()) as CdpVersionInfo;
@@ -149,7 +153,7 @@ async function probeCdp(httpUrl: string, deadlineMs: number): Promise<CdpVersion
       // Connection refused / network errors are expected during the
       // startup window — keep polling.
     }
-    await new Promise((resolve) => setTimeout(resolve, PROBE_INTERVAL_MS));
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   return null;
 }
@@ -221,6 +225,15 @@ export interface ConnectInput {
 // duplicate, reasonless row.
 interface InternalConnectOptions {
   skipAudit?: boolean;
+  // Test-only override for the CDP probe deadline / poll interval. NEVER
+  // plumbed from network input (this whole arg is in-process-only — the HTTP
+  // route omits it), so an authenticated client cannot shorten the probe to
+  // race the capability. Defaults to the production PROBE_TIMEOUT_MS /
+  // PROBE_INTERVAL_MS, so every non-test caller behaves byte-for-byte as
+  // before. Used by the unit tests to exercise the unreachable-endpoint
+  // failure path without burning the full 15s real-world deadline.
+  probeTimeoutMs?: number;
+  probeIntervalMs?: number;
 }
 
 // Serializes concurrent /api/browser/connect calls. The browser-connect
@@ -277,10 +290,30 @@ async function connectBrowserInner(
     const validated = validateCdpUrl(input.cdpUrl);
     if (!validated.ok) throw new Error(validated.error);
     const httpForm = cdpHttpForm(validated.url);
-    const blocked = safetyCheck(httpForm);
+    // CDP endpoints are always loopback (127.0.0.1:9222 / localhost
+    // typically) — that's the whole point of CDP. Pass allowLoopback
+    // so the navigation-SSRF block on loopback doesn't refuse a
+    // legitimate CDP attach. SSRF concerns for the controlled-browser
+    // navigation surface still apply via the default safetyCheck()
+    // path that browserNavigate hits.
+    const blocked = safetyCheck(httpForm, { allowLoopback: true });
     if (blocked) throw new Error(`Invalid cdpUrl: ${blocked}`);
     validatedCallerCdp = validated.url;
   }
+
+  // Probe tuning resolves from the in-process `internal` arg first, then a
+  // server-side env override, then the module constants. Neither source is
+  // reachable from `input` (the network POST body), so an authenticated HTTP
+  // client still cannot shorten the probe to race the capability — only the
+  // operator (process env) or the in-process tool-dispatch caller can.
+  // Production callers set neither, so the effective values are the module
+  // constants and behavior is unchanged at the real deadline.
+  const envInterval = Number(process.env.GINI_CDP_PROBE_INTERVAL_MS);
+  const envTimeout = Number(process.env.GINI_CDP_PROBE_TIMEOUT_MS);
+  const probeIntervalMs =
+    internal.probeIntervalMs ?? (Number.isFinite(envInterval) && envInterval > 0 ? envInterval : PROBE_INTERVAL_MS);
+  const probeTimeoutMs =
+    internal.probeTimeoutMs ?? (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : PROBE_TIMEOUT_MS);
 
   const wantHeadless = input.headless === true;
   const existing = readState(config.instance).browser ?? null;
@@ -320,7 +353,11 @@ async function connectBrowserInner(
         return { connected: true, record: existing };
       }
       const httpForm = cdpHttpForm(existing.cdpUrl);
-      const probe = await probeCdp(httpForm, PROBE_INTERVAL_MS * 2);
+      // Existing-record liveness re-probe: a single poll window (interval * 2)
+      // is enough — we're checking whether the recorded endpoint is still up,
+      // not waiting out a cold start. Production keeps the 1s budget
+      // (PROBE_INTERVAL_MS * 2); tests shrink it via the effective interval.
+      const probe = await probeCdp(httpForm, probeIntervalMs * 2, probeIntervalMs);
       if (probe) {
         // Chrome may have restarted on the same port with a fresh UUID
         // suffix on its webSocketDebuggerUrl — refresh the stored value so
@@ -371,7 +408,11 @@ async function connectBrowserInner(
   // audit row.
   const skipAudit = internal.skipAudit === true;
   if (validatedCallerCdp) {
-    const result = await connectExisting(config, validatedCallerCdp, { skipAudit });
+    const result = await connectExisting(config, validatedCallerCdp, {
+      skipAudit,
+      probeTimeoutMs,
+      probeIntervalMs
+    });
     await disconnectSharedBrowser();
     return result;
   }
@@ -446,10 +487,17 @@ function targetsExistingRecord(
 async function connectExisting(
   config: RuntimeConfig,
   validatedUrl: string,
-  opts: { skipAudit?: boolean } = {}
+  opts: { skipAudit?: boolean; probeTimeoutMs?: number; probeIntervalMs?: number } = {}
 ): Promise<Status> {
   const httpForm = cdpHttpForm(validatedUrl);
-  const probe = await probeCdp(httpForm, PROBE_TIMEOUT_MS);
+  // Defaults preserve the production 15s deadline / 500ms interval; the
+  // connectBrowserInner caller forwards its already-resolved effective
+  // values, and any other (hypothetical) caller falls back to the constants.
+  const probe = await probeCdp(
+    httpForm,
+    opts.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
+    opts.probeIntervalMs ?? PROBE_INTERVAL_MS
+  );
   if (!probe) {
     throw new Error(`Could not reach CDP endpoint at ${redactUrlCredentials(validatedUrl)}`);
   }

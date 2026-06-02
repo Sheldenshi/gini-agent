@@ -39,6 +39,21 @@ function pickFreePort(): Promise<number> {
 const PROJECT_ROOT = resolve(import.meta.dir, "..", "..");
 const CLI_PATH = join(PROJECT_ROOT, "src", "cli.ts");
 
+// The runtime child (src/server.ts) runs background reconcile/reprobe loops
+// that `await Bun.sleep(interval)` between iterations. On SIGTERM the shutdown
+// handler waits for those loops to break, bounded by SCHEDULER_DRAIN_TIMEOUT_MS
+// (src/server.ts:31 = 5000ms). With the production default reconcile interval
+// (src/server.ts:225-227 = 5000ms) the in-flight sleep keeps the loop alive for
+// the whole drain window: a teardown measured 5016ms of idle wait between the
+// start banner and process exit. These tests assert the signal/teardown
+// *contract*, not the polling cadence, so we compress the loop intervals via
+// the env knobs the server already reads (src/server.ts:198,225-227). Production
+// callers (`gini start`, autostart) never set these, so their defaults stand.
+const FAST_LOOP_ENV = {
+  GINI_MESSAGING_RECONCILE_MS: "25",
+  GINI_REPROBE_TICK_MS: "25"
+} as const;
+
 function uniqueInstance(tag: string): string {
   return `run-test-${tag}-${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
 }
@@ -83,7 +98,8 @@ async function spawnRun(h: RunHarness): Promise<{
     h.logRoot
   ], {
     cwd: PROJECT_ROOT,
-    stdio: ["ignore", "pipe", "pipe"]
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, ...FAST_LOOP_ENV }
   });
   const chunks: Buffer[] = [];
   child.stdout?.on("data", (chunk) => { chunks.push(Buffer.from(chunk)); });
@@ -113,8 +129,23 @@ async function pidAlive(pid: number): Promise<boolean> {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+// Poll a log file until it contains `marker` (or the deadline passes). Replaces
+// a fixed sleep that guessed how long the runtime child needs to flush its
+// startup line: the parent's start banner (`Instance  <name>`, which `stdout`
+// resolves on) is printed by the CLI before the spawned server child has
+// necessarily written "Gini runtime listening" into runtime-stdout.log, so
+// tearing down the moment the banner appears can race the log write. Waiting on
+// the actual condition is both faster and more robust than a fixed delay.
+async function waitForLogMarker(logPath: string, marker: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(logPath) && readFileSync(logPath, "utf8").includes(marker)) return;
+    await Bun.sleep(20);
+  }
+}
+
 describe("gini run", () => {
-  test("SIGTERM tears down the runtime child cleanly", async () => {
+  test.concurrent("SIGTERM tears down the runtime child cleanly", async () => {
     const h = makeHarness("sigterm");
     const { child, stdout, exit } = await spawnRun(h);
     const banner = await stdout;
@@ -136,7 +167,7 @@ describe("gini run", () => {
     expect(existsSync(join(h.stateRoot, "runtime.pid"))).toBe(false);
   }, 30_000);
 
-  test("SIGHUP (terminal close) tears children down within 5s", async () => {
+  test.concurrent("SIGHUP (terminal close) tears children down within 5s", async () => {
     const h = makeHarness("sighup");
     const { child, stdout, exit } = await spawnRun(h);
     await stdout;
@@ -153,18 +184,19 @@ describe("gini run", () => {
     expect(await pidAlive(directChildPid)).toBe(false);
   }, 30_000);
 
-  test("captures runtime child stdout to runtime-stdout.log", async () => {
+  test.concurrent("captures runtime child stdout to runtime-stdout.log", async () => {
     const h = makeHarness("logfile");
     const { child, stdout, exit } = await spawnRun(h);
     await stdout;
-    // Give the runtime a beat to print its startup banner before we tear down
-    // the parent — the tee stream is closed on child exit.
-    await Bun.sleep(500);
-    child.kill("SIGTERM");
-    await exit;
     // With GINI_LOG_ROOT set (via --log-root), logDir(instance) resolves to
     // <override>/<instance> (no extra /logs/ segment). See src/paths.ts:logDir.
     const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
+    // Wait for the runtime child to actually flush its startup line before we
+    // tear down the parent — the tee stream is closed on child exit, so killing
+    // before the write lands would lose the marker we assert on below.
+    await waitForLogMarker(logPath, "Gini runtime listening");
+    child.kill("SIGTERM");
+    await exit;
     expect(existsSync(logPath)).toBe(true);
     const contents = readFileSync(logPath, "utf8");
     // src/server.ts logs "Gini runtime listening on ..." at boot, so this is
@@ -173,7 +205,7 @@ describe("gini run", () => {
     expect(contents).toContain(`instance=${h.instance}`);
   }, 30_000);
 
-  test("captures runtime shutdown output to runtime-stdout.log on SIGTERM", async () => {
+  test.concurrent("captures runtime shutdown output to runtime-stdout.log on SIGTERM", async () => {
     // End-to-end guard for the shutdown contract that
     // `awaitForegroundLogFlush()` in admin.ts:runForeground exists to support:
     // output emitted by the runtime as it tears down (server.ts SIGTERM
@@ -183,9 +215,18 @@ describe("gini run", () => {
     const h = makeHarness("shutdown-flush");
     const { child, stdout, exit } = await spawnRun(h);
     await stdout;
+    const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
+    // Wait for the runtime child to finish booting (its "listening" line lands
+    // in the log) before tearing down. The parent banner (`await stdout`)
+    // only proves the child was spawned, not that it reached steady state.
+    // Sending SIGTERM mid-boot lets the parent forward the signal before the
+    // child's scheduler loops have settled into their short steady-state
+    // sleeps; under parallel load the resulting drain can run long enough to
+    // race the parent's SIGKILL deadline, killing the child before it writes
+    // the shutdown marker this test asserts on.
+    await waitForLogMarker(logPath, "Gini runtime listening");
     child.kill("SIGTERM");
     await exit;
-    const logPath = join(h.logRoot, h.instance, "runtime-stdout.log");
     expect(existsSync(logPath)).toBe(true);
     const contents = readFileSync(logPath, "utf8");
     // Marker comes from src/server.ts SIGTERM handler. The instance suffix
@@ -194,7 +235,7 @@ describe("gini run", () => {
     expect(contents).toContain(`instance=${h.instance}`);
   }, 30_000);
 
-  test("refuses to run when the instance is already up", async () => {
+  test.concurrent("refuses to run when the instance is already up", async () => {
     const h = makeHarness("conflict");
     const first = await spawnRun(h);
     await first.stdout;
@@ -220,7 +261,7 @@ describe("gini run", () => {
         h.stateRoot,
         "--log-root",
         h.logRoot
-      ], { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "pipe"] });
+      ], { cwd: PROJECT_ROOT, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...FAST_LOOP_ENV } });
       let stderr = "";
       blocked.stderr?.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
       const code = await new Promise<number | null>((resolveCode) => {

@@ -1,5 +1,10 @@
 import { writeFileSync } from "node:fs";
 import { createHandler, writePid } from "./http";
+import { tunnelManager } from "./runtime/tunnel";
+import { readTunnelConfig } from "./runtime/tunnel/config-store";
+import { isSupervisedWebChild } from "./runtime/health-probe";
+import { webPortPath } from "./paths";
+import { existsSync as fileExists, readFileSync as readFileSyncFs } from "node:fs";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -10,10 +15,13 @@ import { loadConfig, parseInstance, runtimePortPath } from "./paths";
 import { appendLog, mutateState, readState } from "./state";
 import { loadSkillsFromDisk } from "./capabilities/skill-loader";
 import { consumeAutostartRefresh } from "./runtime/autostart-refresh";
+import { installCrashHandlers } from "./runtime/crash-handlers";
+import { maybeAskAboutCrashes } from "./runtime/crash-recovery";
 import { closeAll as closeBrowserSessions, setBrowserInstance } from "./tools/browser";
 import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
+import { fireCacheWarmerProbe } from "./runtime/cache-warmer";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -32,8 +40,97 @@ const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
 const config = loadConfig(instance);
+// Install crash handlers before any runtime work so an uncaughtException or
+// unhandledRejection thrown during boot is still captured. The handler queues a
+// redacted report; nothing is filed here — the on-restart consent flow
+// (maybeAskAboutCrashes) asks the user before any report is published.
+installCrashHandlers({ instance, source: "runtime" });
 await install(config);
 writePid(config);
+
+// Eagerly construct the tunnel manager so the 192-bit secret is generated on
+// first boot (whether or not tunnel.enabled is true) and the redaction set
+// is populated before any request lands. See
+// docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
+tunnelManager(config);
+
+// Process-wide shutdown sentinel. Set by the SIGTERM handler at the bottom
+// of this file; the boot-reconcile poll polls this between awaits so it
+// never spawns a fresh cloudflared after `stopForShutdown()` has run.
+let bootReconcileAbort = false;
+
+// Boot-time reconciliation: if config.json persists `tunnel.enabled: true`,
+// the operator's expectation is that the tunnel comes back up after a restart
+// (with a new rotating hostname). The web port isn't known yet — the CLI
+// writes it once Next.js reports healthy — so we poll the sibling
+// `web.port` file. The persisted flag is re-read inside the loop so a
+// `gini tunnel disable` issued before web.port appears does NOT re-enable
+// when the port lands. A `__healthz` probe runs before the cloudflared
+// spawn so we never expose a stale or squatted port to the public URL.
+// The poll also checks `bootReconcileAbort` after every await so a SIGTERM
+// landing during a probe / sleep cancels the reconcile cleanly.
+// Bounded by a 60_000 ms ceiling on web-port discovery — see
+// docs/adr/tunnel-and-mobile-access.md "Architecture (summary)".
+{
+  const initial = readTunnelConfig(config.instance);
+  if (initial.enabled) {
+    const deadline = Date.now() + 60_000;
+    const poll = async () => {
+      while (Date.now() < deadline) {
+        if (bootReconcileAbort) {
+          appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
+          return;
+        }
+        // Re-read the persisted state on every tick. If the operator runs
+        // `gini tunnel disable` while we're polling, the next check
+        // observes enabled=false and aborts the reconcile.
+        const persisted = readTunnelConfig(config.instance);
+        if (!persisted.enabled) {
+          appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "disabled-during-poll" });
+          return;
+        }
+        const portFile = webPortPath(config.instance);
+        if (fileExists(portFile)) {
+          const portRaw = readFileSyncFs(portFile, "utf8").trim();
+          const port = Number(portRaw);
+          if (Number.isFinite(port) && port > 0) {
+            // Verify the port is actually our supervised Next.js child by
+            // probing the BFF-side healthz endpoint. A 200 with the
+            // expected JSON shape proves the port isn't a stale-file or
+            // port-squat scenario.
+            const healthy = await isSupervisedWebChild(config.instance, port).catch(() => false);
+            if (bootReconcileAbort) {
+              appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
+              return;
+            }
+            if (!healthy) {
+              await Bun.sleep(500);
+              continue;
+            }
+            // Re-check the persisted state AFTER the probe — the 1500ms
+            // probe window is long enough that a disable can race in
+            // between the prior check and the actual enable() call.
+            const stillEnabled = readTunnelConfig(config.instance).enabled;
+            if (!stillEnabled) {
+              appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "disabled-after-probe" });
+              return;
+            }
+            if (bootReconcileAbort) {
+              appendLog(config.instance, "tunnel.boot-reconcile.aborted", { reason: "shutdown" });
+              return;
+            }
+            const result = await tunnelManager(config).enable(port, { reconcileOnly: true });
+            appendLog(config.instance, "tunnel.boot-reconcile", { ok: result.ok });
+            return;
+          }
+        }
+        await Bun.sleep(500);
+      }
+      appendLog(config.instance, "tunnel.boot-reconcile.timeout", {});
+    };
+    void poll();
+  }
+}
 
 // Inform the browser session manager which instance to consult for the
 // optional CDP connection record. Without this the manager falls back to
@@ -161,6 +258,12 @@ writeFileSync(runtimePortPath(config.instance), String(server.port));
 appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
 
+// If crashes were captured while we were down, offer (default + launchd only)
+// to file them — best-effort, never blocks or crashes boot.
+maybeAskAboutCrashes(config).catch((err) =>
+  appendLog(config.instance, "crash.recovery.error", { error: String(err) })
+);
+
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
 // scheduling the next tick so a slow tick (e.g. spawning N script jobs
 // inline) can never overlap with itself. Cadence is the 1000ms gap
@@ -266,6 +369,36 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
   }
 })();
 
+// Cache warmer loop. Reads config.cacheWarmerMinutes on every iteration
+// so a POST /api/settings/cache-warmer takes effect without restart or
+// pub/sub. When the value is 0 (or undefined) the loop polls every 30s
+// to pick up future enables. When > 0 it sleeps for minutes × 54_000 ms
+// (= minutes × 0.9 × 60 × 1000) and then fires one probe via the
+// existing provider dispatch path. Errors are logged and the next tick
+// retries; we never swallow them silently because that would mask real
+// provider auth/transport failures.
+const CACHE_WARMER_IDLE_TICK_MS = 30_000;
+let cacheWarmerStopped = false;
+const cacheWarmerDone: Promise<void> = (async function cacheWarmerLoop(): Promise<void> {
+  while (!cacheWarmerStopped) {
+    const minutes = config.cacheWarmerMinutes ?? 0;
+    if (minutes > 0) {
+      await Bun.sleep(minutes * 54_000);
+      if (cacheWarmerStopped) break;
+      try {
+        await fireCacheWarmerProbe(config);
+        appendLog(config.instance, "cache_warmer.probe.ok", { minutes });
+      } catch (error) {
+        appendLog(config.instance, "cache_warmer.probe.error", {
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    } else {
+      await Bun.sleep(CACHE_WARMER_IDLE_TICK_MS);
+    }
+  }
+})();
+
 // Guard against concurrent SIGTERMs. launchctl bootout, `kill`, and our
 // own self-signal from src/runtime/autostart-refresh.ts can all arrive
 // in quick succession; we only want to drain + consume the refresh
@@ -278,11 +411,17 @@ let shutdownStarted = false;
 process.on("SIGTERM", async () => {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  // Tell the boot-reconcile poll to bail out before its next enqueue/await
+  // wakes up. Without this the poll can call `tunnelManager.enable(port)`
+  // AFTER `stopForShutdown()` has cleaned up, spawning an orphan
+  // cloudflared the drain never awaits.
+  bootReconcileAbort = true;
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
+  cacheWarmerStopped = true;
   // Tear down the chat-blocks subscription so the dispatcher stops
   // emitting pushes during drain. The APNs HTTP/2 client owns its own
   // session and will close lazily when garbage-collected.
@@ -339,11 +478,19 @@ process.on("SIGTERM", async () => {
       telegramSupervisor.stopAll().catch(() => {}),
       discordDone.catch(() => {}),
       discordSupervisor.stopAll().catch(() => {}),
+      cacheWarmerDone.catch(() => {}),
       // Close any live headless browser contexts so Chromium child
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
       // close shouldn't block runtime shutdown.
-      closeBrowserSessions().catch(() => {})
+      closeBrowserSessions().catch(() => {}),
+      // Tunnel: stop cloudflared so the public URL stops accepting traffic
+      // within the SIGKILL hard-cap. Configured to swallow errors — a stuck
+      // cloudflared shouldn't keep the runtime alive forever.
+      (async () => {
+        const { tunnelManager } = await import("./runtime/tunnel");
+        await tunnelManager(config).stopForShutdown();
+      })().catch(() => {})
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);

@@ -8,7 +8,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import * as readline from "node:readline/promises";
 import type { CliContext } from "../context";
 import { hasFlag } from "../args";
-import { configPath } from "../../paths";
+import { configPath, writeRuntimeConfig } from "../../paths";
 import { hasUsableCodexCredentials, normalizeProvider } from "../../provider";
 import {
   ensureSecretsEnvPerms,
@@ -288,7 +288,7 @@ async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<vo
       ? config.provider.model
       : codexProvider.defaultModel;
     config.provider = normalizeProvider({ name: "codex", model });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
     io.success(`Auto-configured: codex (${model}), credentials from ${codexStatus.source === "env" ? "CODEX_AUTH_JSON env" : "~/.codex/auth.json"}`);
     return;
   }
@@ -302,7 +302,7 @@ async function runNonInteractive(config: RuntimeConfig, io: SetupIO): Promise<vo
       ? config.provider.model
       : openaiProvider.defaultModel;
     config.provider = normalizeProvider({ name: "openai", model });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
     io.success(`Auto-configured: openai (${model}), key from ${status.source === "env" ? "env" : "secrets.env"}`);
     return;
   }
@@ -349,7 +349,7 @@ async function runConfiguredFlow(config: RuntimeConfig, io: SetupIO, current: Pr
   const newModel = await selectModelForProvider(io, current, currentModel ?? null, true);
   if (newModel === null) return;
   config.provider = normalizeProvider({ name: current.id, model: newModel });
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   io.success(`Provider set to ${current.id} (${newModel}).`);
 }
 
@@ -378,7 +378,7 @@ async function runFreshFlow(config: RuntimeConfig, io: SetupIO): Promise<void> {
   const model = await selectModelForProvider(io, provider, null, false);
   const chosenModel = model ?? provider.defaultModel;
   config.provider = normalizeProvider({ name: provider.id, model: chosenModel });
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   io.success(`Provider set to ${provider.id} (${chosenModel}).`);
 }
 

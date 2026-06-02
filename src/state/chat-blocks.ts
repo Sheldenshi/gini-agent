@@ -19,12 +19,15 @@
 import { EventEmitter } from "node:events";
 import type {
   AssistantTextBlock,
+  AudioAttachment,
   AuthorizationAction,
   ChatBlock,
   ChatBlockKind,
   Instance,
+  ProviderName,
   RiskLevel,
   SetupRequestAction,
+  SystemNoteAuthError,
   ToolCallBlock,
   ToolCallStatus
 } from "../types";
@@ -85,6 +88,23 @@ interface ChatBlockRow {
   updated_at: string;
 }
 
+// Parse the optional voice attachment off a user_text payload, guarding
+// types the same way the inline-image parse does (a hand-edited or
+// truncated row must not yield a half-formed attachment).
+function parseAudioPayload(raw: unknown): AudioAttachment | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const item = raw as Record<string, unknown>;
+  const id = String(item.id ?? "");
+  if (id.length === 0) return undefined;
+  const durationMs = typeof item.durationMs === "number" ? item.durationMs : undefined;
+  return {
+    id,
+    mimeType: String(item.mimeType ?? ""),
+    size: Number(item.size ?? 0),
+    ...(durationMs !== undefined ? { durationMs } : {})
+  };
+}
+
 function rowToBlock(row: ChatBlockRow): ChatBlock {
   // The payload column carries the typed kind-specific fields
   // (text/label/toolName/etc.). Bookkeeping fields are denormalized
@@ -117,11 +137,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
             }))
             .filter((image) => image.id.length > 0)
         : undefined;
+      const audio = parseAudioPayload(payload.audio);
       return {
         ...base,
         kind: "user_text",
         text: String(payload.text ?? ""),
-        ...(images && images.length > 0 ? { images } : {})
+        ...(images && images.length > 0 ? { images } : {}),
+        ...(audio ? { audio } : {})
       };
     }
     case "assistant_text":
@@ -146,7 +168,8 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         status: (payload.status as ToolCallStatus) ?? "running",
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
         errorSeverity: payload.errorSeverity === "info" || payload.errorSeverity === "error" ? payload.errorSeverity : undefined,
-        callId: String(payload.callId ?? "")
+        callId: String(payload.callId ?? ""),
+        runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined
       };
     case "tool_result":
       return {
@@ -198,8 +221,30 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         action: String(payload.action ?? "") as SetupRequestAction,
         summary: String(payload.summary ?? "")
       };
-    case "system_note":
-      return { ...base, kind: "system_note", text: String(payload.text ?? "") };
+    case "system_note": {
+      const raw =
+        payload.authError && typeof payload.authError === "object"
+          ? (payload.authError as Partial<SystemNoteAuthError>)
+          : undefined;
+      // Backfill the routing fields for rows written before they existed so
+      // every returned block satisfies SystemNoteAuthError (the renderer never
+      // sees a half-populated authError).
+      const authError: SystemNoteAuthError | undefined = raw
+        ? {
+            provider: raw.provider as ProviderName,
+            providerLabel: String(raw.providerLabel ?? raw.provider ?? ""),
+            detail: String(raw.detail ?? ""),
+            reauthKind: raw.reauthKind === "docs" ? "docs" : "settings",
+            reauthUrl: typeof raw.reauthUrl === "string" ? raw.reauthUrl : "/settings"
+          }
+        : undefined;
+      return {
+        ...base,
+        kind: "system_note",
+        text: String(payload.text ?? ""),
+        ...(authError ? { authError } : {})
+      };
+    }
     default: {
       // Exhaustiveness guard. CHECK constraint on the kind column makes
       // this unreachable for rows we wrote, but a hand-edited DB might
@@ -218,7 +263,8 @@ function payloadFor(block: ChatBlock): string {
     case "user_text":
       return JSON.stringify({
         text: block.text,
-        ...(block.images && block.images.length > 0 ? { images: block.images } : {})
+        ...(block.images && block.images.length > 0 ? { images: block.images } : {}),
+        ...(block.audio ? { audio: block.audio } : {})
       });
     case "assistant_text":
       return JSON.stringify({ text: block.text, streaming: block.streaming });
@@ -231,7 +277,8 @@ function payloadFor(block: ChatBlock): string {
         status: block.status,
         errorMessage: block.errorMessage,
         errorSeverity: block.errorSeverity,
-        callId: block.callId
+        callId: block.callId,
+        runningHint: block.runningHint
       });
     case "tool_result":
       return JSON.stringify({
@@ -255,7 +302,10 @@ function payloadFor(block: ChatBlock): string {
         summary: block.summary
       });
     case "system_note":
-      return JSON.stringify({ text: block.text });
+      return JSON.stringify({
+        text: block.text,
+        ...(block.authError ? { authError: block.authError } : {})
+      });
   }
 }
 
@@ -307,7 +357,8 @@ export function insertChatBlock(
             ...base,
             kind: "user_text",
             text: input.text,
-            ...(input.images && input.images.length > 0 ? { images: input.images } : {})
+            ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+            ...(input.audio ? { audio: input.audio } : {})
           };
         case "assistant_text":
           return {
@@ -329,7 +380,8 @@ export function insertChatBlock(
             status: input.status,
             errorMessage: input.errorMessage,
             errorSeverity: input.errorSeverity,
-            callId: input.callId
+            callId: input.callId,
+            runningHint: input.runningHint
           };
         case "tool_result":
           return {
@@ -359,7 +411,12 @@ export function insertChatBlock(
             summary: input.summary
           };
         case "system_note":
-          return { ...base, kind: "system_note", text: input.text };
+          return {
+            ...base,
+            kind: "system_note",
+            text: input.text,
+            ...(input.authError ? { authError: input.authError } : {})
+          };
       }
     })();
 
@@ -518,9 +575,10 @@ export function updateToolCallBlock(
   callId: string,
   sessionId: string,
   patch: {
-    status: "running" | "ok" | "error" | "denied";
+    status?: "running" | "ok" | "error" | "denied";
     errorMessage?: string;
     errorSeverity?: "info" | "error";
+    runningHint?: string;
   }
 ): ChatBlock | null {
   const db = getMemoryDb(instance);
@@ -541,9 +599,13 @@ export function updateToolCallBlock(
   } catch {
     payload = {};
   }
-  payload.status = patch.status;
+  if (patch.status !== undefined) payload.status = patch.status;
   if (patch.errorMessage !== undefined) payload.errorMessage = patch.errorMessage;
   if (patch.errorSeverity !== undefined) payload.errorSeverity = patch.errorSeverity;
+  // Clear the running hint when the tool leaves the running state — the
+  // amber waiting-card is only meaningful while we're still waiting.
+  if (patch.runningHint !== undefined) payload.runningHint = patch.runningHint;
+  if (patch.status !== undefined && patch.status !== "running") delete payload.runningHint;
   db.run(
     `UPDATE chat_blocks
        SET payload_json = ?, updated_at = ?

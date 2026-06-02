@@ -3,8 +3,12 @@
 // Walks two roots looking for `SKILL.md` files (Hermes-compatible shape):
 //   - bundled: <repo-root>/skills/<category>/<skill>/SKILL.md (vendored,
 //     ships with the runtime — apple-notes, apple-reminders, …)
-//   - user:    ~/.gini/instances/<instance>/skills/<skill>/SKILL.md or
-//              ~/.gini/instances/<instance>/skills/<category>/<skill>/SKILL.md
+//   - user:    ~/.gini/instances/<instance>/skills/<skill>/SKILL.md
+//
+// Installs always write user skills flat (no category subfolder). The
+// walker still tolerates a `<category>/<skill>/` layout under the user
+// root for manually-placed or legacy folders, deriving the category from
+// the parent directory name in either case.
 //
 // Each file has YAML-ish frontmatter (name, description, version,
 // platforms, prerequisites, …) followed by a markdown body that teaches
@@ -28,7 +32,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import type { RuntimeConfig, RuntimeState, SkillRecord, SkillStatus } from "../types";
 import { addAudit, appendEvent, createSkill, mutateState, now } from "../state";
 import { projectRoot, skillsDir } from "../paths";
-import { hasProvider } from "../integrations/connectors/registry";
+import { canonicalCredentialName, hasProvider } from "../integrations/connectors/registry";
 
 export interface ParsedSkillFile {
   name: string;
@@ -37,11 +41,22 @@ export interface ParsedSkillFile {
   platforms?: string[];
   prerequisites?: { commands?: string[]; env?: string[] };
   requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  // Frontmatter `metadata.gini.requires.credentials` — credential NAMES the
+  // skill needs (e.g. ["LINEAR_API_KEY"], ["google-workspace-oauth"]). A name
+  // is resolved against a ConnectorRecord with that `name`, not a provider
+  // module, so it need NOT be a registered provider.
+  requiredCredentials?: string[];
   allowedTools?: string;
   license?: string;
   compatibility?: string;
   validationStatus?: "ok" | "unsupported";
   validationMessage?: string;
+  // Advisory frontmatter near-miss warnings (e.g. a top-level `gini:` block,
+  // or `requires` misspelled as `requirements`). Distinct from hard
+  // validation issues: warnings don't block install, but the credential /
+  // connector declaration they flag was silently dropped, so we surface them
+  // to the authoring model so it self-corrects.
+  warnings?: string[];
   body: string;
   // Original frontmatter for traceability. Loader doesn't read these
   // beyond the keys above, but we keep the whole map so future passes can
@@ -163,6 +178,14 @@ export function parseFrontmatter(text: string): Record<string, unknown> {
     const top = stack[stack.length - 1]!;
 
     // List item: `- value` (scalar) or `- key: value` (start of a map).
+    //
+    // Frame indent for a list-item map is `indent + 1`, NOT `indent + 2`.
+    // The pushed frame's `indent` is the "pop threshold" — the next line
+    // pops it when `lineIndent <= frame.indent`. Sibling keys inside the
+    // same list-item map land at indent + 2 (one indent past the `-`),
+    // and they must NOT pop the frame. Using `indent + 1` keeps siblings
+    // at `indent + 2` inside the frame while still popping when the next
+    // `- ` or higher-level key appears at `indent` or above.
     if (line.startsWith("- ") || line === "-") {
       const arr = top.container as unknown[];
       if (!Array.isArray(arr)) continue;
@@ -170,7 +193,7 @@ export function parseFrontmatter(text: string): Record<string, unknown> {
       if (!rest) {
         const child: Record<string, unknown> = {};
         arr.push(child);
-        stack.push({ indent: indent + 2, container: child });
+        stack.push({ indent: indent + 1, container: child });
         continue;
       }
       const colonIdx = rest.indexOf(":");
@@ -184,7 +207,7 @@ export function parseFrontmatter(text: string): Record<string, unknown> {
       const subRest = rest.slice(colonIdx + 1).trim();
       if (subRest) child[subKey] = parseScalarOrInlineArray(subRest);
       arr.push(child);
-      stack.push({ indent: indent + 2, container: child });
+      stack.push({ indent: indent + 1, container: child });
       continue;
     }
 
@@ -257,6 +280,119 @@ function parseScalar(value: string): unknown {
   return value;
 }
 
+// Gini extension keys the loader actually consumes under `metadata.gini`.
+// A frontmatter key inside the gini namespace that isn't here is a near-miss
+// (typo / wrong shape) whose declaration the loader silently ignored.
+const KNOWN_GINI_KEYS = ["version", "author", "platforms", "prerequisites", "requires", "category", "name", "description"];
+
+// Small Levenshtein distance, capped — used only to suggest the nearest known
+// gini key for an unrecognized one (e.g. `requirements` → `requires`).
+function editDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  const row = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i += 1) {
+    let prev = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= n; j += 1) {
+      const temp = row[j]!;
+      row[j] = a[i - 1] === b[j - 1] ? prev : Math.min(prev, row[j]!, row[j - 1]!) + 1;
+      prev = temp;
+    }
+  }
+  return row[n]!;
+}
+
+function sharedPrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i += 1;
+  return i;
+}
+
+function nearestKnownGiniKey(key: string): string | undefined {
+  const lower = key.toLowerCase();
+  // A known key the unrecognized one is clearly an elaboration of — shares a
+  // long stem (e.g. `requirements` vs `requires` share `require`). Caught
+  // first because such word-form variants exceed a small edit-distance budget.
+  let stemMatch: string | undefined;
+  let stemLen = 0;
+  for (const known of KNOWN_GINI_KEYS) {
+    const shared = sharedPrefixLength(lower, known);
+    // Require at least 5 shared leading chars and most of the known key, so
+    // `requirements`→`requires` matches but unrelated keys don't.
+    if (shared >= 5 && shared >= known.length - 2 && shared > stemLen) {
+      stemLen = shared;
+      stemMatch = known;
+    }
+  }
+  if (stemMatch) return stemMatch;
+  // Otherwise the nearest key within edit distance ≤ 2 (transpositions, typos).
+  let best: string | undefined;
+  let bestDistance = 3;
+  for (const known of KNOWN_GINI_KEYS) {
+    const distance = editDistance(lower, known);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = known;
+    }
+  }
+  return best;
+}
+
+// True when a dropped key's value is an object that carries a `credentials` or
+// `connectors` array — i.e. the near-miss silently swallowed a real
+// credential/connector declaration, which is the worst-case failure.
+function dropsCredentialOrConnector(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const obj = value as Record<string, unknown>;
+  return Array.isArray(obj.credentials) || Array.isArray(obj.connectors);
+}
+
+// Detect frontmatter near-misses in the Gini extension namespace and return
+// advisory warnings naming the offending key, the suggested fix, and the
+// consequence (declaration ignored). Two near-misses are caught:
+//   1. A TOP-LEVEL `gini:` block — the loader only reads `metadata.gini`, so
+//      a top-level block is never consumed.
+//   2. An unrecognized key inside the gini namespace (e.g. `requirements`
+//      misspelled for `requires`), with a near-miss suggestion when within
+//      edit distance ≤ 2 of a known key.
+// Warnings are advisory: they never block install.
+export function detectGiniFrontmatterWarnings(
+  fm: Record<string, unknown>,
+  giniExt: Record<string, unknown> | null
+): string[] {
+  const warnings: string[] = [];
+
+  // Identify the "gini-ish" object. metadata.gini is canonical; a top-level
+  // `gini:` key is a misplacement the loader doesn't read.
+  const topLevelGini = fm.gini && typeof fm.gini === "object" && !Array.isArray(fm.gini)
+    ? fm.gini as Record<string, unknown>
+    : null;
+
+  let giniObject: Record<string, unknown> | null = giniExt;
+  if (!giniExt && topLevelGini) {
+    giniObject = topLevelGini;
+    warnings.push("Top-level `gini:` block is not read by the loader — Gini fields belong under `metadata.gini`. Move this block to `metadata.gini` so its declarations take effect.");
+  }
+
+  if (!giniObject) return warnings;
+
+  for (const key of Object.keys(giniObject)) {
+    if (KNOWN_GINI_KEYS.includes(key)) continue;
+    const suggestion = nearestKnownGiniKey(key);
+    let message = `Unrecognized \`metadata.gini.${key}\` key was ignored`;
+    if (suggestion) message += ` — did you mean \`${suggestion}\`?`;
+    else message += ".";
+    if (dropsCredentialOrConnector(giniObject[key])) {
+      message += ` Its \`credentials\`/\`connectors\` declaration was NOT registered; the skill currently has NO credential requirements as written.`;
+    }
+    warnings.push(message);
+  }
+
+  return warnings;
+}
+
 // Parse a SKILL.md file per the Anthropic Agent Skills spec
 // (https://agentskills.io/specification). Gini-specific extensions live
 // under `metadata.gini.*`.
@@ -268,8 +404,12 @@ function parseScalar(value: string): unknown {
 // Gini extension keys (under `metadata.gini`):
 //   version, author, platforms,
 //   prerequisites: { commands, env },
-//   requires: { connectors: [{ provider, scopes? }, ...] },
-//   category   — used as a UI grouping hint
+//   requires: { credentials: [<name>, ...], connectors: [{ provider, scopes? }, ...] }
+//
+// A skill's category (a UI grouping hint) is NOT read from frontmatter —
+// it's derived from the parent directory name in discoverSkillFiles().
+// Bundled skills ship under `skills/<category>/<skill>/`; user-installed
+// skills land flat under `skills/<skill>/` and so carry no category.
 //
 // For one release we accept legacy top-level fields (`version`,
 // `platforms`, `prerequisites`, `requires.identities` with `kind` keys)
@@ -292,6 +432,11 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
   const giniExt = metadata.gini && typeof metadata.gini === "object" && !Array.isArray(metadata.gini)
     ? metadata.gini as Record<string, unknown>
     : null;
+
+  // Detect frontmatter near-misses (top-level `gini:` block, misspelled keys
+  // like `requirements` for `requires`) so the authoring model self-corrects
+  // instead of silently dropping a credential/connector declaration.
+  const warnings = detectGiniFrontmatterWarnings(fm, giniExt);
 
   // Source for version, platforms, prerequisites, requires.
   // Prefer metadata.gini.*; fall back to top-level for one release.
@@ -317,9 +462,16 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
   }
 
   let requiredConnectors: ParsedSkillFile["requiredConnectors"];
+  let requiredCredentials: ParsedSkillFile["requiredCredentials"];
   const requiresSource = pickFromGiniOrTop("requires");
   if (requiresSource && typeof requiresSource === "object" && !Array.isArray(requiresSource)) {
     const reqs = requiresSource as Record<string, unknown>;
+    if (Array.isArray(reqs.credentials)) {
+      const names = reqs.credentials
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+        .filter((entry) => entry.length > 0);
+      if (names.length > 0) requiredCredentials = names;
+    }
     const connectorList = Array.isArray(reqs.connectors)
       ? reqs.connectors
       : Array.isArray((reqs as { identities?: unknown }).identities)
@@ -349,6 +501,18 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
     }
   }
 
+  // Backward-compat: a skill that still declares only the legacy
+  // `requires.connectors` form gets its `requiredCredentials` derived from the
+  // provider→canonical-name mapping so runtime resolution (purely name-based)
+  // keeps working for one release. Only template providers map; `generic`/
+  // unknown providers carry no canonical name and are dropped from the list.
+  if (!requiredCredentials && requiredConnectors && requiredConnectors.length > 0) {
+    const derived = requiredConnectors
+      .map((req) => canonicalCredentialName(req.provider))
+      .filter((name): name is string => Boolean(name));
+    if (derived.length > 0) requiredCredentials = derived;
+  }
+
   // One-shot deprecation warnings for the legacy top-level Gini fields.
   if (!giniExt) {
     const legacyFields = ["version", "author", "platforms", "prerequisites", "requires"].filter((k) => k in fm);
@@ -365,9 +529,11 @@ export function parseSkillFile(text: string, sourcePath?: string): ParsedSkillFi
     platforms,
     prerequisites,
     requiredConnectors,
+    requiredCredentials,
     allowedTools,
     license,
     compatibility,
+    warnings: warnings.length > 0 ? warnings : undefined,
     body: body.trim(),
     frontmatter: fm
   };
@@ -434,6 +600,10 @@ export function validateParsedSkill(
   if (parsed.compatibility && parsed.compatibility.length > 500) {
     issues.push("compatibility exceeds 500-character spec limit.");
   }
+  // Legacy `requires.connectors` providers must still resolve to a registered
+  // module. The name-based `requires.credentials` deliberately skips this gate:
+  // a credential NAME is matched against a ConnectorRecord at runtime, not a
+  // provider module, so a plain api-key (no module) is valid.
   for (const req of parsed.requiredConnectors ?? []) {
     if (!hasProvider(req.provider)) {
       issues.push(`Required provider "${req.provider}" is not in the connector registry; install a connector module or use "generic".`);
@@ -462,7 +632,15 @@ function upsertSkillFromFile(
   const parentDirName = basename(dirname(origin.manifestPath));
   const issues = validateParsedSkill(parsed, { manifestPath: origin.manifestPath, parentDirName });
   const validationStatus: "ok" | "unsupported" = issues.length === 0 ? "ok" : "unsupported";
-  const validationMessage = issues.length === 0 ? undefined : issues.join(" ");
+  // Advisory frontmatter warnings are surfaced in validationMessage too, but
+  // never escalate validationStatus to "unsupported" — they don't block the
+  // skill. console.warn so the near-miss is visible at boot/reload.
+  const warnings = parsed.warnings ?? [];
+  for (const warning of warnings) {
+    console.warn(`[skill-loader] WARNING (${origin.manifestPath}): ${warning}`);
+  }
+  const messageParts = [...issues, ...warnings];
+  const validationMessage = messageParts.length === 0 ? undefined : messageParts.join(" ");
 
   if (existing) {
     const changed =
@@ -478,6 +656,7 @@ function upsertSkillFromFile(
       JSON.stringify(existing.platforms ?? null) !== JSON.stringify(parsed.platforms ?? null) ||
       JSON.stringify(existing.prerequisites ?? null) !== JSON.stringify(parsed.prerequisites ?? null) ||
       JSON.stringify(existing.requiredConnectors ?? null) !== JSON.stringify(parsed.requiredConnectors ?? null) ||
+      JSON.stringify(existing.requiredCredentials ?? null) !== JSON.stringify(parsed.requiredCredentials ?? null) ||
       (existing.manifestVersion ?? null) !== (parsed.version ?? null);
     if (!changed) return { record: existing, kind: "noop" };
     if (changed) {
@@ -497,6 +676,7 @@ function upsertSkillFromFile(
       existing.platforms = parsed.platforms;
       existing.prerequisites = parsed.prerequisites;
       existing.requiredConnectors = parsed.requiredConnectors;
+      existing.requiredCredentials = parsed.requiredCredentials;
       existing.allowedTools = parsed.allowedTools;
       existing.license = parsed.license;
       existing.compatibility = parsed.compatibility;
@@ -524,6 +704,7 @@ function upsertSkillFromFile(
     platforms: parsed.platforms,
     prerequisites: parsed.prerequisites,
     requiredConnectors: parsed.requiredConnectors,
+    requiredCredentials: parsed.requiredCredentials,
     allowedTools: parsed.allowedTools,
     license: parsed.license,
     compatibility: parsed.compatibility,

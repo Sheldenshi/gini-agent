@@ -169,7 +169,14 @@ async function dispatchJobReplyToBridge(
   // session keyed to this task; pick it up from chatMessages so we
   // never accidentally re-dispatch an older turn.
   const assistantMessage = state.chatMessages
-    .filter((m) => m.sessionId === chatSessionId && m.taskId === task.id && m.role === "assistant")
+    .filter(
+      (m) =>
+        m.sessionId === chatSessionId &&
+        m.taskId === task.id &&
+        m.role === "assistant" &&
+        m.kind !== "tool_transcript" &&
+        m.kind !== "approval_reason"
+    )
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))[0];
   const replyText = assistantMessage?.content?.trim();
   // `[SILENT]` summaries explicitly suppress the bridge mirror. The

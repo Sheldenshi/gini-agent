@@ -1,6 +1,6 @@
 # Gini Agent
 
-Gini Agent is a local-first personal agent runtime for people who want an agent they can install, operate, inspect, approve, and debug.
+Gini Agent is a personal agent that remembers, improves, and runs without forcing you to read a log line.
 
 Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an interaction surface. The runtime is the system of record for conversations, runs, tasks, approvals, memory, skills, jobs, tools, traces, audit events, and runtime health.
 
@@ -24,7 +24,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Architecture In One Sentence
 
-Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract. The one documented exception is `gini import apply openclaw`, which requires the gateway stopped and mutates state in-process; see [Architecture Overview](docs/architecture-overview.md) and [Openclaw Migration](docs/adr/openclaw-migration.md).
+Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract. See [Architecture Overview](docs/architecture-overview.md) for the design.
 
 ```text
                  GATEWAY (Bun runtime, one per instance)
@@ -43,7 +43,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
 - Persistent chat, runs, tasks, approvals, traces, audit events, jobs, memories, and skills
 - Approval-gated file, terminal, and code tools
 - Provider support: Codex OAuth, OpenAI API key, OpenRouter, and any OpenAI-compatible local server
-- Local embeddings and reranking by default
+- Local embeddings, reranking, and voice-message speech-to-text by default
 - Parallel instances with isolated state, ports, and logs
 
 See the [Whitepaper](docs/whitepaper.md) and [Architecture Overview](docs/architecture-overview.md) for the design.
@@ -114,7 +114,7 @@ gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
 ```
 
-The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract.
+The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
 
 ## Parallel Instances
 
@@ -127,11 +127,38 @@ gini smoke                  # ephemeral instance under /tmp
 
 Multiple agents can run smoke tests concurrently without colliding.
 
+## Mobile tunnel
+
+Expose the running gateway over a Cloudflare quick tunnel so your phone can reach it:
+
+```bash
+gini tunnel enable          # spawn cloudflared + mint a bootstrap URL
+gini tunnel qr              # render an ASCII QR for the URL
+gini tunnel disable         # stop cloudflared + clear the URL
+```
+
+No manual install of `cloudflared` is required: the gateway provisions the binary automatically on first enable. A system `cloudflared` on `PATH` (Homebrew, apt, a hand-placed binary) is used if present; otherwise the runtime downloads the official build into `~/.gini/bin/`. The installer pre-fetches it so a normal install has it ready before the first enable. See [tunnel-and-mobile-access.md](docs/adr/tunnel-and-mobile-access.md) for the trust boundary, secret rotation, and Bearer-auth contract.
+
+## Messaging channels
+
+Gini can bridge to messaging channels such as Telegram and Discord. These bridges were added to exercise the gateway's messaging contract and are **not** being actively worked on. We highly recommend interacting with Gini through the native web app and iOS app. Those are the primary, actively developed surfaces. See [telegram-bridge.md](docs/adr/telegram-bridge.md) and [discord-bridge.md](docs/adr/discord-bridge.md) for the bridge contracts.
+
+## Migrating from openclaw
+
+Already running [openclaw](https://github.com/openclaw/openclaw)? Import your agents, chat history, memory, skills, workspace files, and messaging bridges into a gini instance. The import is two steps — `plan` prints a redacted summary, `apply` writes the state:
+
+```bash
+gini import plan openclaw    # dry-run: summarize what would be imported
+gini import apply openclaw   # import the openclaw state into gini
+```
+
+`apply` mutates state in-process, so stop the target instance first (`gini stop --instance <name>`), apply, then start it again. Every applied import first archives your full openclaw state to `<instance>/imports/openclaw-<timestamp>.zip`, so nothing is lost. See [Migrating from openclaw](docs/migration-from-openclaw.md) for the field-by-field mapping, idempotency rules, and verification steps.
+
 ## Local State
 
 ```text
 ~/.gini/instances/<instance>/   # config, state.json, memory.db, traces, snapshots, workspace, logs
-~/.gini/models/                 # shared embedding/reranker model cache
+~/.gini/models/                 # shared embedding/reranker/speech-to-text model cache
 ```
 
 Use `gini uninstall` to remove an instance or the whole install. See [Operations](docs/operations.md) for diagnostics and cleanup.

@@ -41,7 +41,15 @@ import { id, now } from "./ids";
 // each credential's cursor onto every device registered to that
 // credential. Sessions owned by credentials with no registered
 // devices are dropped (no devices → no badge to bias).
-export const MEMORY_SCHEMA_VERSION = 6;
+//
+// Bumped to 7 for devices.origin: tags each push-device row with the
+// network path it arrived over. New tunneled rows are flagged
+// `origin = 'tunnel'`; rows that came in over loopback (or any pre-v7
+// row backfilled by the ensureColumn helper) stay `origin = 'loopback'`.
+// rotateSecret / disable purge every `origin = 'tunnel'` row so a leaked
+// QR-bootstrap holder loses their APNs subscription as soon as the
+// operator rotates or disables the tunnel.
+export const MEMORY_SCHEMA_VERSION = 7;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -357,6 +365,14 @@ function applyMigrations(db: Database): void {
     CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
   `);
 
+  // Recreate chat_blocks if its CHECK constraint predates the
+  // authorization_requested / setup_requested kinds. The old single
+  // approval_requested block was split into those two; the CREATE TABLE
+  // IF NOT EXISTS above is a no-op on an existing table, so a db created
+  // before the split keeps the stale constraint and rejects every new
+  // setup_requested / authorization_requested insert at runtime.
+  ensureChatBlocksKindConstraint(db);
+
   // Step 5 — devices table (schema version 4). Stores APNs push tokens
   // per credential so the runtime can fan an `approval_requested` block
   // out to every iOS install that belongs to the same paired credential.
@@ -373,10 +389,20 @@ function applyMigrations(db: Database): void {
       platform TEXT NOT NULL CHECK (platform IN ('ios')),
       bundle_id TEXT NOT NULL,
       registered_at TEXT NOT NULL,
-      last_seen_at TEXT NOT NULL
+      last_seen_at TEXT NOT NULL,
+      origin TEXT NOT NULL DEFAULT 'loopback' CHECK (origin IN ('loopback','tunnel'))
     );
     CREATE INDEX IF NOT EXISTS devices_by_credential ON devices(credential_id);
   `);
+  // Pre-v7 installs already have a devices table without the origin
+  // column; the CREATE TABLE IF NOT EXISTS above is a no-op against
+  // them. Add the column with the same default so legacy loopback
+  // registrations retain their identity instead of getting purged on
+  // the next rotate. Index creation is deferred until after the
+  // column exists, otherwise SQLite's parse-time validation would
+  // reject `CREATE INDEX ... ON devices(origin)` on the legacy shape.
+  ensureColumn(db, "devices", "origin", "TEXT NOT NULL DEFAULT 'loopback'");
+  db.exec("CREATE INDEX IF NOT EXISTS devices_by_origin ON devices(origin);");
 
   // Step 6 — chat_read_state table (schema version 6). Tracks the
   // last block id each device has acknowledged seeing on a given chat
@@ -485,6 +511,52 @@ export function ensureChatReadStateDeviceTokenSchema(db: Database): void {
       CREATE INDEX chat_read_state_by_device ON chat_read_state(device_token);
     `);
   }
+}
+
+// Recreate chat_blocks when its CHECK constraint predates the
+// authorization_requested / setup_requested kinds. SQLite can't ALTER a
+// CHECK constraint in place, so the fix is the standard staging-table
+// copy-forward + drop + rename. Detection reads the table's stored DDL
+// from sqlite_master: a pre-split table's CHECK omits "setup_requested",
+// so its presence in the SQL is the upgrade marker. Existing rows only
+// carry kinds already in the new allow-set (the old set is a strict
+// subset), so the row copy can't violate the new constraint.
+export function ensureChatBlocksKindConstraint(db: Database): void {
+  const row = db
+    .query<{ sql: string }, []>(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='chat_blocks'"
+    )
+    .get();
+  if (!row || row.sql.includes("setup_requested")) return;
+  db.exec(`
+    CREATE TABLE chat_blocks_v3 (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      agent_id TEXT,
+      ordinal INTEGER NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN (
+        'user_text','assistant_text','tool_call','tool_result',
+        'phase','approval_requested','authorization_requested',
+        'setup_requested','system_note'
+      )),
+      payload_json TEXT NOT NULL,
+      task_id TEXT,
+      run_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (session_id, ordinal)
+    );
+    INSERT INTO chat_blocks_v3
+      (id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, created_at, updated_at)
+      SELECT id, session_id, instance, agent_id, ordinal, kind, payload_json, task_id, run_id, created_at, updated_at
+      FROM chat_blocks;
+    DROP TABLE chat_blocks;
+    ALTER TABLE chat_blocks_v3 RENAME TO chat_blocks;
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_session ON chat_blocks(session_id, ordinal);
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_task ON chat_blocks(task_id) WHERE task_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_chat_blocks_agent ON chat_blocks(agent_id);
+  `);
 }
 
 // Float32Array <-> Buffer round-trip.

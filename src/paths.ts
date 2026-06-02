@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, writeFileSync } from "node:fs";
 import type { Instance, RuntimeConfig } from "./types";
+import { atomicWriteFile } from "./atomic-write";
 
 // Per-instance default ports. The installed end-user instance (`default`,
 // set by the ~/.local/bin/gini wrapper) is pinned to fixed memorable ports so
@@ -74,6 +75,23 @@ export function instancesRoot(): string {
 
 export function instanceRoot(instance: Instance): string {
   return join(instancesRoot(), instance);
+}
+
+// Shared, instance-agnostic cache for the gateway-managed `cloudflared`
+// binary. The binary is byte-identical across instances and carries no
+// per-instance state, so it lives under the state root rather than any
+// per-instance dir — re-downloading it for every worktree / named instance
+// would be wasteful. Honors GINI_STATE_ROOT exactly like baseStateRoot() so
+// tests can point it at a temp dir.
+export function cloudflaredCacheDir(): string {
+  return join(baseStateRoot(), "bin");
+}
+
+// Resolved path of the managed cloudflared binary. `.exe` on Windows; bare
+// elsewhere. The auto-installer writes here and the tunnel manager spawns
+// from here when no system cloudflared is on PATH.
+export function cloudflaredBinPath(platform: NodeJS.Platform = process.platform): string {
+  return join(cloudflaredCacheDir(), platform === "win32" ? "cloudflared.exe" : "cloudflared");
 }
 
 // One-time migration of legacy on-disk layouts to ~/.gini/instances/<name>/.
@@ -259,11 +277,15 @@ export function defaultConfig(instance: Instance): RuntimeConfig {
     workspaceRoot: workspaceDir(instance),
     stateRoot: instanceRoot(instance),
     logRoot: logDir(instance),
-    // New instances default to "auto": auto-approve safe actions, gate
-    // dangerous terminal patterns. See ADR approval-mode.md. Legacy
-    // configs with `dangerouslyAutoApprove: true` are aliased to "yolo"
-    // at load time by `runtime/index.ts`.
-    approvalMode: "auto"
+    // Fresh installs default to "yolo": full bypass of every approval
+    // gate. This is the install template only. Existing on-disk configs
+    // that predate an explicit `approvalMode` are NOT escalated to yolo
+    // — `loadConfig` backfills "auto" for them so the default flip never
+    // silently removes approval gates from an instance the operator
+    // already created. See ADR approval-mode.md. Legacy configs with
+    // `dangerouslyAutoApprove: true` are aliased to "yolo" at load time
+    // by `runtime/index.ts`.
+    approvalMode: "yolo"
   };
 }
 
@@ -284,18 +306,26 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   }
 
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
-  // Don't let the `defaultConfig` spread below stamp `approvalMode:
-  // "auto"` onto a legacy config that carries `dangerouslyAutoApprove:
-  // true` without an explicit `approvalMode`. Leaving the field
-  // undefined here is what lets the install-time migration shim
-  // detect "this is a pre-flip config" and alias it to "yolo".
-  // Synthesizing a `defaultConfig` without `approvalMode` for the
-  // legacy case keeps the legacy detection working without changing
-  // any other default.
+  // `defaultConfig` is both the fresh-install template (which stamps
+  // "yolo") AND the merge base for existing files below. An existing
+  // on-disk config that predates an explicit `approvalMode` must NOT
+  // inherit the "yolo" install default — that would silently strip
+  // every approval gate from an instance the operator never opted into.
+  // So for an existing file without `approvalMode`, override the merge
+  // base instead of letting "yolo" through:
+  //   - `dangerouslyAutoApprove: true` → drop `approvalMode` so the
+  //     install-time migration shim aliases it to "yolo" (legacy
+  //     behavior, audited as `from: "dangerouslyAutoApprove: true"`).
+  //   - otherwise → backfill "auto" so pre-flip / explicit-false files
+  //     keep their documented effective mode and the pre-flip migration
+  //     records `to: "auto"`.
   const defaults = defaultConfig(instance);
-  const isLegacyDangerousFile = parsed.approvalMode === undefined && parsed.dangerouslyAutoApprove === true;
-  if (isLegacyDangerousFile) {
-    delete (defaults as { approvalMode?: unknown }).approvalMode;
+  if (parsed.approvalMode === undefined) {
+    if (parsed.dangerouslyAutoApprove === true) {
+      delete (defaults as { approvalMode?: unknown }).approvalMode;
+    } else {
+      defaults.approvalMode = "auto";
+    }
   }
   // Pre-flip existing instance: on-disk config has neither
   // `approvalMode` nor `dangerouslyAutoApprove`. Pre-flip, this
@@ -352,4 +382,16 @@ export const PRE_FLIP_MIGRATION_MARKER = Symbol.for("gini.preFlipApprovalMigrati
 
 export function hasPreFlipMigrationMarker(config: RuntimeConfig): boolean {
   return (config as unknown as Record<symbol, unknown>)[PRE_FLIP_MIGRATION_MARKER] === true;
+}
+
+/** Atomic write of the runtime config. Replaces every
+ *  `writeFileSync(configPath(...), JSON.stringify(config, null, 2) + "\n")`
+ *  call site in the codebase so a `config.json` reader (the proxy reads
+ *  `tunnel.enabled` + `tunnel.secret` on every request via per-request
+ *  disk reads in `tunnel-policy.ts`) can never observe a torn JSON
+ *  document. Uses the same tempfile + fsync + rename pattern as
+ *  `patchTunnelConfig` — readers either see the OLD complete file or
+ *  the NEW complete file, never a partial. */
+export function writeRuntimeConfig(config: RuntimeConfig): void {
+  atomicWriteFile(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 }

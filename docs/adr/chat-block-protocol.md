@@ -83,13 +83,21 @@ remote previews, screen readers) would need the same translation code.
   `createdAt`, optional `taskId`/`runId`, plus the kind-specific
   fields. `AssistantTextBlock` also carries `updatedAt` and a
   `streaming` flag; `ToolCallBlock` carries `updatedAt`, a `status`
-  in `{ running, ok, error, denied }`, and an optional `errorSeverity`
-  in `{ info, error }`. `errorSeverity` lets a failed call render as a
-  muted "needs setup" notice instead of a red error — e.g. `web_search`
-  with no connector keeps the verbose steering as the model-facing tool
-  result and shows the user a short `"info"` line. The runtime derives
-  it from a `ToolDisplayError` thrown by the tool; clients default to
+  in `{ running, ok, error, denied }`, an optional `errorSeverity`
+  in `{ info, error }`, and an optional `runningHint` string.
+  `errorSeverity` lets a failed call render as a muted "needs setup"
+  notice instead of a red error — e.g. `web_search` with no connector
+  keeps the verbose steering as the model-facing tool result and shows
+  the user a short `"info"` line; the runtime derives it from a
+  `ToolDisplayError` thrown by the tool and clients default to
   `"error"` when it is absent (see ADR web-search-connectors.md).
+  `runningHint` is advisory context a tool emits while parked in
+  `running` to explain why it's waiting and what (if anything) the
+  user can do to unblock it; clients MAY render a hint-bearing row
+  more prominently than a bare running row. It's reserved for tools
+  that block on an external event the agent cannot drive (today only
+  `wait_for_messaging_pair`, waiting on an inbound Telegram DM up to
+  600s) and is cleared automatically when status leaves `running`.
 
 - Persistence in `src/state/chat-blocks.ts`. SQLite is the source of
   truth, not the JSON `RuntimeState` blob. `ordinal` is allocated as
@@ -122,7 +130,7 @@ remote previews, screen readers) would need the same translation code.
     posting to `/api/authorizations/<id>/{approve,deny}`. Carries
     `risk` and `summary` so the bubble renders without a follow-up
     fetch.
-  - `SetupRequestedBlock` — user-actor card. Three layouts keyed off
+  - `SetupRequestedBlock` — user-actor card. Layouts keyed off
     `action`:
     - `connector.request` — render the Connect dialog. Submit posts
       `{ secrets, scopes, name }` to
@@ -142,14 +150,44 @@ remote previews, screen readers) would need the same translation code.
     - `browser.connect` — Connect button posts to
       `/api/setup-requests/<id>/open-browser`; the follow-up "I've
       signed in" posts to `/api/setup-requests/<id>/complete`.
-    Cancel always posts to `/api/setup-requests/<id>/cancel`.
+    - `messaging.add_bridge` — render an inline form with a name
+      input (pre-seeded from `setupRequest.payload.suggestedName`)
+      and a password-masked bot-token input. Submit posts
+      `{ secrets: { name, botToken } }` to
+      `/api/setup-requests/<id>/complete`, which runs the
+      `addMessagingBridge` side effect. The card reads
+      `setupRequest.payload.kind` (currently `"telegram"`;
+      `"discord"` is reserved but the chat card does not collect
+      channel IDs, so the dispatcher tool only advertises Telegram
+      from chat — see [telegram-bridge.md](telegram-bridge.md)).
+    - `messaging.approve_pairing` — render a confirmation card
+      showing the pending sender, chat id, chat type, verification
+      code, and expiry from `setupRequest.payload`. Two buttons:
+      Approve posts `{}` to `/complete`; Reject posts
+      `{ reject: true }` to `/complete`. Server calls `allowChat`
+      (with the `verificationCode` from the payload as
+      `expectedCode`) or `rejectPendingChat`.
+    - `messaging.remove_bridge` — render a destructive confirmation
+      card showing `setupRequest.payload.bridgeName` +
+      `payload.kind` and the irreversibility warning. Submit posts
+      `{}` to `/complete`, which routes into `removeMessagingBridge`.
+    Cancel always posts to `/api/setup-requests/<id>/cancel`. The
+    three `messaging.*` setups are SetupRequests, not Authorizations,
+    so they never appear under `/api/authorizations`; the home page
+    and /permissions list render a "resolve in chat" hint rather than
+    an inline Approve/Reject control for them.
 
 - Tool catalog labels live with the catalog. `displayLabel` on each
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`
   helpers in `src/execution/tool-catalog.ts` keep the per-tool
   vocabulary in one place. `argsPreview` is capped at 80 chars (single
-  bubble line on a phone); `argsFull` is the verbatim parsed JSON for
-  "show full args" affordances.
+  bubble line on a phone); `argsFull` is the parsed JSON for
+  "show full args" affordances, with credential-bearing keys
+  (`apiKey`, `token`, `headers`, …) replaced by `[redacted]` via
+  `redactSensitiveToolArgs` (`src/execution/tool-args-redact.ts`). The
+  same helper scrubs the resolved `self.config` approval payload, so a
+  tool's secret args never persist to a client-rendered surface (the
+  real values still reach the handler for execution).
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
   `src/http.ts`), not a reuse of the existing global `eventStream`.
@@ -194,7 +232,12 @@ remote previews, screen readers) would need the same translation code.
 
 - **Write paths:**
   - `submitChatMessage` inserts the `user_text` block alongside the
-    legacy ChatMessageRecord.
+    legacy ChatMessageRecord. The block carries optional `images` and
+    `audio` upload refs (`{ id, mimeType, size }`); clients fetch the
+    bytes via `GET /api/uploads/:id`. A voice message's `audio` is
+    render-only — it is transcribed on the gateway and only the
+    transcript becomes the block text and model input (see
+    [voice-messages-and-local-stt.md](voice-messages-and-local-stt.md)).
   - `runChatTask` emits `phase("Thinking")` before each model call,
     `assistant_text` on streaming deltas (full text on every frame),
     `phase("Working: <tool>")` + `tool_call(running)` before each

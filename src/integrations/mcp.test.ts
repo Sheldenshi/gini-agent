@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { mutateState } from "../state";
+import { mutateState, readState } from "../state";
 import { writeSecret } from "../state/secrets";
 import type { ConnectorRecord, McpServerRecord, RuntimeConfig } from "../types";
 import { resolveMcpHeaders } from "./mcp";
@@ -151,6 +151,104 @@ describe("resolveMcpHeaders", () => {
       if (saved !== undefined) process.env.LINEAR_API_KEY = saved;
       else delete process.env.LINEAR_API_KEY;
     }
+  });
+
+  test("resolves ${LINEAR_API_KEY} from a typed api-key credential named LINEAR_API_KEY", async () => {
+    // Name-based path: after migration the credential is `type: "api-key"`
+    // with `name == "LINEAR_API_KEY"` (the env var). The header placeholder
+    // resolves against the credential by name, not via the provider module.
+    const instance = "mcp-resolve-by-name";
+    const config = makeConfig(instance);
+    const ref = writeSecret(instance, "id_named", "token", "lin_api_BY_NAME");
+    await mutateState(instance, (state) => {
+      state.connectors.push(newConnector({
+        id: "id_named",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        secretRefs: [ref]
+      }));
+    });
+    const server = makeServer({ instance });
+    const headers = await resolveMcpHeaders(config, server);
+    expect(headers["Authorization"]).toBe("Bearer lin_api_BY_NAME");
+  });
+
+  test("a DISABLED typed credential's var does NOT fall back to process.env", async () => {
+    // #9: a credential-bound placeholder must never silently resolve from the
+    // operator's shell when the credential is disabled/tombstoned. The
+    // block-list includes ALL typed credential names regardless of status, so
+    // even though the disabled credential supplies no binding, LINEAR_API_KEY
+    // stays claimed and the resolve fails rather than reading process.env.
+    const instance = "mcp-resolve-disabled-no-fallback";
+    const config = makeConfig(instance);
+    const ref = writeSecret(instance, "id_linear_disabled", "token", "lin_api_disabled");
+    await mutateState(instance, (state) => {
+      state.connectors = [];
+      state.connectors.push(newConnector({
+        id: "id_linear_disabled",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        status: "disabled",
+        health: "healthy",
+        secretRefs: [ref]
+      }));
+    });
+    const server = makeServer({ instance });
+    const saved = process.env.LINEAR_API_KEY;
+    process.env.LINEAR_API_KEY = "lin_api_FROM_SHELL_SHOULD_BE_IGNORED";
+    try {
+      await expect(resolveMcpHeaders(config, server)).rejects.toThrow(/Missing credential/);
+    } finally {
+      if (saved !== undefined) process.env.LINEAR_API_KEY = saved;
+      else delete process.env.LINEAR_API_KEY;
+    }
+  });
+
+  test("only resolves placeholders the headers reference — unrelated credentials are untouched", async () => {
+    // #10: resolveMcpHeaders must NOT resolve every typed credential's secret.
+    // A second, unrelated typed credential (here an UNHEALTHY one that would
+    // throw/contribute nothing) must not break a Linear header that doesn't
+    // reference it, and no `connector.secret.use` audit should fire for it.
+    const instance = "mcp-resolve-only-referenced";
+    const config = makeConfig(instance);
+    const linearRef = writeSecret(instance, "id_linear_ref", "token", "lin_api_referenced");
+    const otherRef = writeSecret(instance, "id_other", "OTHER_KEY", "other-secret");
+    await mutateState(instance, (state) => {
+      state.connectors = [];
+      state.connectors.push(newConnector({
+        id: "id_linear_ref",
+        instance,
+        name: "LINEAR_API_KEY",
+        type: "api-key",
+        provider: "linear",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [linearRef]
+      }));
+      // Unrelated typed api-key, never referenced by the Linear server header.
+      state.connectors.push(newConnector({
+        id: "id_other",
+        instance,
+        name: "OTHER_KEY",
+        type: "api-key",
+        provider: "generic",
+        status: "configured",
+        health: "healthy",
+        secretRefs: [otherRef]
+      }));
+    });
+    const server = makeServer({ instance });
+    const headers = await resolveMcpHeaders(config, server);
+    expect(headers["Authorization"]).toBe("Bearer lin_api_referenced");
+    // The unrelated credential's secret was NOT resolved → no audit for it.
+    const audits = readState(instance).audit.filter(
+      (a) => a.action === "connector.secret.use" && a.target === "id_other"
+    );
+    expect(audits.length).toBe(0);
   });
 
   test("permits process.env fallback for vars no provider claims", async () => {

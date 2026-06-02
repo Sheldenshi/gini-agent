@@ -7,6 +7,7 @@ import {
   countByNetwork,
   countMemoryUnits,
   deserializeEmbedding,
+  ensureChatBlocksKindConstraint,
   ensureChatReadStateDeviceTokenSchema,
   ensureDefaultBank,
   getMemoryDb,
@@ -458,6 +459,97 @@ describe("memory-db schema and storage", () => {
     db.close();
   });
 
+  test("ensureChatBlocksKindConstraint recreates a pre-split table and preserves rows", () => {
+    const db = new Database(":memory:");
+    // Pre-split schema: CHECK omits authorization_requested / setup_requested.
+    db.exec(`
+      CREATE TABLE chat_blocks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        instance TEXT NOT NULL,
+        agent_id TEXT,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN (
+          'user_text','assistant_text','tool_call','tool_result',
+          'phase','approval_requested','system_note'
+        )),
+        payload_json TEXT NOT NULL,
+        task_id TEXT,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (session_id, ordinal)
+      );
+    `);
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_1','chat_1','inst',NULL,0,'approval_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    // Pre-migration the new kind is rejected by the stale constraint.
+    expect(() =>
+      db.run(
+        "INSERT INTO chat_blocks VALUES ('blk_x','chat_1','inst',NULL,1,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+      )
+    ).toThrow();
+
+    ensureChatBlocksKindConstraint(db);
+
+    // The legacy row survived the table recreation.
+    const kept = db
+      .query<{ kind: string }, []>("SELECT kind FROM chat_blocks WHERE id = 'blk_1'")
+      .get();
+    expect(kept?.kind).toBe("approval_requested");
+    // The recreated table now accepts the new kinds.
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_2','chat_1','inst',NULL,2,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_3','chat_1','inst',NULL,3,'authorization_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    const count = db.query<{ c: number }, []>("SELECT COUNT(*) AS c FROM chat_blocks").get();
+    expect(count?.c).toBe(3);
+    db.close();
+  });
+
+  test("ensureChatBlocksKindConstraint is a no-op when the table already allows setup_requested", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE chat_blocks (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        instance TEXT NOT NULL,
+        agent_id TEXT,
+        ordinal INTEGER NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN (
+          'user_text','assistant_text','tool_call','tool_result',
+          'phase','approval_requested','authorization_requested',
+          'setup_requested','system_note'
+        )),
+        payload_json TEXT NOT NULL,
+        task_id TEXT,
+        run_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE (session_id, ordinal)
+      );
+    `);
+    db.run(
+      "INSERT INTO chat_blocks VALUES ('blk_1','chat_1','inst',NULL,0,'setup_requested','{}',NULL,NULL,'2024-01-01','2024-01-01')"
+    );
+    ensureChatBlocksKindConstraint(db);
+    const row = db
+      .query<{ kind: string }, []>("SELECT kind FROM chat_blocks WHERE id = 'blk_1'")
+      .get();
+    expect(row?.kind).toBe("setup_requested");
+    db.close();
+  });
+
+  test("ensureChatBlocksKindConstraint is a no-op when the table is absent", () => {
+    const db = new Database(":memory:");
+    // No chat_blocks table at all — nothing to recreate, must not throw.
+    expect(() => ensureChatBlocksKindConstraint(db)).not.toThrow();
+    db.close();
+  });
+
   test("resetInstance clears the memory DB and probe reports zero units", async () => {
     const instance = "mem-reset";
     const config = { ...defaultConfig(instance), stateRoot: instanceRoot(instance) };
@@ -474,5 +566,48 @@ describe("memory-db schema and storage", () => {
     expect(probe.memoryUnits).toBe(0);
     expect(probe.banks).toBe(0);
     expect(probe.schemaVersion).toBe(MEMORY_SCHEMA_VERSION);
+  });
+
+  test("backfills devices.origin on a pre-v7 install with the loopback default", () => {
+    // Simulate a v6 install: create the devices table WITHOUT the
+    // origin column, drop a row in, close the connection, and let
+    // getMemoryDb run its migration on next open. The ensureColumn
+    // helper should add origin with the loopback default so the
+    // existing row keeps its identity instead of getting purged on
+    // the first rotate.
+    const instance = "mem-devices-origin-backfill";
+    mkdirSync(instanceRoot(instance), { recursive: true });
+    const path = memoryDbPath(instance);
+    const direct = new Database(path, { create: true });
+    direct.exec(`
+      CREATE TABLE devices (
+        token TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL,
+        platform TEXT NOT NULL CHECK (platform IN ('ios')),
+        bundle_id TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+    `);
+    direct.run(
+      `INSERT INTO devices (token, credential_id, platform, bundle_id, registered_at, last_seen_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      ["legacy-tok", "cred_a", "ios", "ai.lilaclabs.gini.mobile", "now", "now"]
+    );
+    direct.close();
+
+    // Re-open via the cached helper so applyMigrations runs.
+    const db = getMemoryDb(instance);
+    const cols = db
+      .query<{ name: string }, []>("PRAGMA table_info(devices)")
+      .all();
+    expect(cols.some((c) => c.name === "origin")).toBe(true);
+
+    const row = db
+      .query<{ origin: string }, [string]>(
+        "SELECT origin FROM devices WHERE token = ?"
+      )
+      .get("legacy-tok");
+    expect(row?.origin).toBe("loopback");
   });
 });

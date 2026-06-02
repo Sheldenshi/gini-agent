@@ -14,8 +14,7 @@ metadata:
         - GOOGLE_WORKSPACE_CLI_CLIENT_ID
         - GOOGLE_WORKSPACE_CLI_CLIENT_SECRET
     requires:
-      connectors:
-        - provider: google-oauth-desktop
+      credentials: [google-workspace-oauth]
 ---
 
 # Google Gmail

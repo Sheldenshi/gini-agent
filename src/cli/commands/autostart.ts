@@ -3,9 +3,9 @@
 // What this does for the user: after `gini install` (or by hand on an
 // existing instance), enabling autostart writes ~/Library/LaunchAgents/
 // ai.lilac.gini.<instance>.plist, registers it with launchctl, and from
-// then on the runtime is up at login and respawned on crash. `gini stop`
-// (clean exit) is honored — the agent does NOT respawn after a deliberate
-// stop.
+// then on the runtime is up at login and respawned on crash (KeepAlive is
+// `true`, so launchd respawns on any exit). A deliberate `gini stop` runs
+// `launchctl bootout` to unload the service so it stays down.
 //
 // macOS only in v1. Linux systemd --user is a follow-up, but invoking
 // `gini autostart ...` on Linux prints a clear platform message rather
@@ -29,14 +29,93 @@ import {
   loadedPid,
   platformIsSupported,
   plistPathFor,
+  serviceTarget,
   supervisedServices,
   unsupportedPlatformMessage,
   writePlist,
+  type LaunchctlResult,
   type PlistKind,
   type SupervisedService
 } from "../autostart";
 
-const KINDS: PlistKind[] = ["gateway", "web"];
+// All three supervised kinds, in deterministic order. enable/disable/status/
+// kick iterate this; rollback bootouts out earlier kinds, so watchdog last
+// means a watchdog failure never tears down the gateway/web already up.
+const KINDS: PlistKind[] = ["gateway", "web", "watchdog"];
+
+// The CORE kinds whose failure means the instance can't serve. The watchdog is
+// supplementary (revives a dead/hung core service) — its bootstrap failing is
+// a degraded-but-running state, NOT a reason to bootout the working
+// gateway/web. enable() only rolls the earlier bootstraps back when a CORE
+// kind fails.
+const CORE_KINDS: readonly PlistKind[] = ["gateway", "web"];
+
+function isCoreKind(kind: PlistKind): boolean {
+  return CORE_KINDS.includes(kind);
+}
+
+// Narrow a raw --kind flag value to a PlistKind. Used to validate the flag
+// and to decide single-kind vs all-kinds for enable/kick.
+function isPlistKind(value: string | undefined): value is PlistKind {
+  return value === "gateway" || value === "web" || value === "watchdog";
+}
+
+export interface StopBootoutDeps {
+  // Boot out a fully-qualified service target string (gui/<uid>/<label>).
+  // Injectable so unit tests can record the targets without shelling out
+  // to a real launchctl. Defaults to the real bootoutTarget shellout.
+  bootoutTarget: typeof bootoutTarget;
+}
+
+export interface PerKindStopResult {
+  kind: string;
+  serviceTarget: string;
+  // True when the bootout succeeded OR the service simply wasn't loaded
+  // ("Could not find service" — a deliberate stop on a target that's
+  // already down is still a successful stop).
+  bootedOut: boolean;
+  stderr?: string;
+}
+
+export interface StopBootoutResult {
+  ok: boolean;
+  instance: string;
+  results: PerKindStopResult[];
+}
+
+// A bootout of a target that isn't loaded is, for stop purposes, a
+// success: the service is already down. launchctl phrases "not loaded"
+// differently across macOS releases — "Could not find service" on older
+// systems, "No such process" on macOS 26 (Tahoe) — so we accept both.
+// This matters for any instance that was already stopped (or where the
+// watchdog was never enabled): every stop would otherwise report ok:false
+// on that target alone.
+function isBootoutNotLoaded(stderr: string): boolean {
+  return stderr.includes("Could not find service") || stderr.includes("No such process");
+}
+
+// `gini stop` for a launchd-supervised instance. KeepAlive is `true`, so a
+// plain SIGTERM would just be respawned — the only way to actually stop a
+// supervised service is `launchctl bootout`, which unloads it. We boot out
+// the gateway, web, and watchdog targets. A target that isn't loaded is
+// treated as a successful stop (see isBootoutNotLoaded).
+export function stopViaBootout(instance: string, deps: StopBootoutDeps = { bootoutTarget }): StopBootoutResult {
+  const results: PerKindStopResult[] = [];
+  let allOk = true;
+  for (const kind of KINDS) {
+    const target = serviceTarget(instance, kind);
+    const out: LaunchctlResult = deps.bootoutTarget(target);
+    const bootedOut = out.ok || isBootoutNotLoaded(out.stderr);
+    if (!bootedOut) allOk = false;
+    results.push({
+      kind,
+      serviceTarget: target,
+      bootedOut,
+      ...(bootedOut ? {} : { stderr: out.stderr.trim() })
+    });
+  }
+  return { ok: allOk, instance, results };
+}
 
 export async function autostart(ctx: CliContext): Promise<void> {
   const sub = ctx.cliArgs[1];
@@ -77,18 +156,18 @@ export async function autostart(ctx: CliContext): Promise<void> {
   if (sub === "enable") {
     const kindFlag = flagValue(ctx.rawArgs, "--kind");
     // Validate --kind explicitly. Without this, a typo like
-    // `--kind gatway` silently falls through to "both kinds", which is
+    // `--kind gatway` silently falls through to "all kinds", which is
     // surprising and hides intent. A bad value is a clear non-zero
     // exit with a descriptive error instead.
-    if (kindFlag !== undefined && kindFlag !== "gateway" && kindFlag !== "web") {
+    if (kindFlag !== undefined && !isPlistKind(kindFlag)) {
       print({
         ok: false,
-        error: `Invalid --kind value '${kindFlag}'. Allowed: gateway, web (or omit for both).`
+        error: `Invalid --kind value '${kindFlag}'. Allowed: gateway, web, watchdog (or omit for all).`
       });
       process.exitCode = 1;
       return;
     }
-    const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
+    const kinds: PlistKind[] = isPlistKind(kindFlag) ? [kindFlag] : KINDS;
     const result = await enable({ instance, testRoot, kinds });
     print(result);
     // When rollback itself failed, emit a clear stderr warning so the
@@ -126,12 +205,12 @@ export async function autostart(ctx: CliContext): Promise<void> {
   if (sub === "kick") {
     // Validate --kind the same way `enable` does — a typo like
     // `--kind gatway` would otherwise silently fall through to
-    // "both kinds", hiding the operator's intent.
+    // "all kinds", hiding the operator's intent.
     const kindFlag = flagValue(ctx.rawArgs, "--kind");
-    if (kindFlag !== undefined && kindFlag !== "gateway" && kindFlag !== "web") {
+    if (kindFlag !== undefined && !isPlistKind(kindFlag)) {
       print({
         ok: false,
-        error: `Invalid --kind value '${kindFlag}'. Allowed: gateway, web (or omit for both).`
+        error: `Invalid --kind value '${kindFlag}'. Allowed: gateway, web, watchdog (or omit for all).`
       });
       process.exitCode = 1;
       return;
@@ -155,13 +234,13 @@ function usage(): Record<string, unknown> {
       "gini autostart enable  [--instance <name>] [--test-root <dir>]",
       "gini autostart disable [--instance <name>]",
       "gini autostart status  [--instance <name>]",
-      "gini autostart kick    [--instance <name>] [--kind gateway|web]  # force respawn (see notes)"
+      "gini autostart kick    [--instance <name>] [--kind gateway|web|watchdog]  # force respawn (see notes)"
     ],
     notes: [
       "macOS only in v1 (Linux systemd --user is a follow-up).",
-      "Two services per instance: <prefix>.<instance>.gateway (Bun runtime) and <prefix>.<instance>.web (Next.js).",
-      "PID supervision only — a wedged-but-alive runtime is not detected here. A health watchdog hitting /api/healthz is a follow-up.",
-      "`gini stop` is honored: SuccessfulExit:false means clean exits do NOT respawn. The web shim execs `bun run dev`, which exits 0 on SIGTERM; the same KeepAlive contract applies.",
+      "Three services per instance: <prefix>.<instance>.gateway (Bun runtime), <prefix>.<instance>.web (Next.js), and <prefix>.<instance>.watchdog (periodic health probe that revives a dead/hung gateway or web).",
+      "The watchdog runs every 30s (StartInterval, not KeepAlive): it probes the gateway /api/status and web /api/runtime/__healthz, kickstarts whichever is down, and files a deduped crash report when web is down.",
+      "`gini stop` runs `launchctl bootout` to unload the service (KeepAlive is `true` — launchd always respawns on exit, so a clean exit alone won't keep it down). The web service is torn down the same way.",
       "macOS 26 (Tahoe): launchd often defers auto-respawn after SIGKILL indefinitely (`pended nondemand spawn = inefficient`). Use `gini autostart kick` to force a respawn when this happens; RunAtLoad still fires at login.",
       "Secrets in ~/.gini/secrets.env are merged into the gateway plist's EnvironmentVariables only (the web plist is the BFF and never talks to providers directly). If you change a key (e.g. `gini provider set`), re-run `autostart enable` to refresh the plist for future respawns.",
       "`--test-root <dir>` is an E2E-test escape hatch: scoped state/log roots are embedded in the plist. Plain GINI_STATE_ROOT in your shell does NOT leak into a permanent plist."
@@ -365,7 +444,16 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
     // separate so an autostart-only crash log doesn't get tangled with the
     // user-driven `gini run` stdout tee.
     const stderrPath = join(logRoot, svc.stderrLogFilename);
-    const path = writePlist({ instance, kind: svc.kind, spec: svc.spec, stdoutPath, stderrPath });
+    const path = writePlist({
+      instance,
+      kind: svc.kind,
+      spec: svc.spec,
+      stdoutPath,
+      stderrPath,
+      // Only the watchdog descriptor carries this; gateway/web leave it
+      // undefined and get the KeepAlive long-lived plist shape.
+      ...(svc.startIntervalSeconds !== undefined ? { startIntervalSeconds: svc.startIntervalSeconds } : {})
+    });
     const wasLoaded = deps.isLoaded(instance, svc.kind);
 
     if (wasLoaded) {
@@ -412,6 +500,17 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
         stderr: res.stderr.trim()
       });
       allOk = false;
+      // Only a CORE kind (gateway/web) failure rolls back the earlier
+      // bootstraps — a half-loaded CORE set (gateway up but no web) is worse
+      // than nothing. The watchdog is supplementary: if it fails to bootstrap
+      // (it's last in the sequence, after gateway/web are up), tearing down a
+      // working gateway/web to "clean up" would take the instance offline over
+      // a missing health-prober. Treat that as a surfaced partial failure
+      // (allOk already false, per-kind error recorded above) and leave the
+      // core services loaded.
+      if (!isCoreKind(svc.kind)) {
+        continue;
+      }
       // Roll back any kinds we already bootstrapped in this call so
       // we don't leave a half-loaded service set behind. Skip kinds
       // that were `wasLoaded:true` on entry — those are the user's
@@ -682,10 +781,9 @@ function status(instance: string): StatusResult {
     pid: gateway.pid,
     lastExitStatus: gateway.lastExitStatus,
     limitations: [
-      "PID supervision only — a wedged-but-alive runtime is not detected.",
-      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. Use `gini autostart kick` to force respawn.",
+      "macOS 26+: launchd auto-respawn after SIGKILL is unreliable. The watchdog kickstarts a dead/hung service every ~30s; `gini autostart kick` forces it on demand.",
       "macOS only in v1.",
-      "Two services per instance: <prefix>.<instance>.gateway and <prefix>.<instance>.web. `gini status` aggregates web/runtime health."
+      "Three services per instance: <prefix>.<instance>.gateway, <prefix>.<instance>.web, and <prefix>.<instance>.watchdog (periodic health probe that revives a wedged-but-alive or cleanly-exited gateway/web). `gini status` aggregates web/runtime health."
     ]
   };
 }
@@ -715,7 +813,7 @@ interface KickResult {
 // runtime and runs `gini autostart kick --kind gateway`.
 function kick(instance: string, rawArgs: string[]): KickResult {
   const kindFlag = flagValue(rawArgs, "--kind");
-  const kinds: PlistKind[] = kindFlag === "gateway" || kindFlag === "web" ? [kindFlag] : KINDS;
+  const kinds: PlistKind[] = isPlistKind(kindFlag) ? [kindFlag] : KINDS;
   const results: PerKindKickResult[] = [];
   let allOk = true;
   for (const svc of supervisedServices({ instance, kinds })) {

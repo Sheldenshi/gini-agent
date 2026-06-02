@@ -12,8 +12,8 @@
     "gini": "bun run src/cli.ts",
     "server": "bun run src/server.ts",
     "smoke": "bun run src/cli.ts smoke",
-    "test": "bun test",
-    "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit",
+    "test": "bun test --parallel ./src ./web ./mobile/src ./mobile/plugins",
+    "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit && cd ../mobile && bunx tsc --noEmit",
     "web:dev": "cd web && bun run dev",
     "web:build": "cd web && bun run build",
     "web:start": "cd web && bun run start",
@@ -23,12 +23,16 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/qrcode": "^1.5.6",
+    "jsqr": "^1.4.0",
     "typescript": "latest"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
+    "cloudflared": "^0.7.1",
     "croner": "^10.0.1",
-    "playwright-core": "^1.60.0"
+    "playwright-core": "^1.60.0",
+    "qrcode": "^1.5.4"
   },
   "trustedDependencies": [
     "onnxruntime-node",

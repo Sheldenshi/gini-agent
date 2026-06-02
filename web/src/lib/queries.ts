@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type UseQueryOptions } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { inferTunnelTransport } from "@/lib/transport";
+import { isQuickTunnelOrigin } from "@/lib/tunnel-policy";
 import type {
   Authorization,
   BrowserConnectionRecord,
@@ -183,7 +185,21 @@ export interface ProviderDescriptor {
   secrets?: { purposes: string[]; envBindings: Record<string, string> };
   hasProbe: boolean;
   hasDetect: boolean;
+  // Whether the provider declares a chat-driven setup skill (e.g.
+  // google-workspace-setup). Skills page routes these to "Set up via chat".
+  hasSetupSkill?: boolean;
   probeIntervalMs?: number;
+  // Defaults the Add Connector dialog prefills when this provider is picked
+  // as a credential template. Present only for providers whose module
+  // declares secret bindings (linear → api-key LINEAR_API_KEY + MCP URL,
+  // google-oauth-desktop → oauth2 + envMap). Plain api keys carry none.
+  credentialTemplate?: {
+    type: "api-key" | "oauth2";
+    name: string;
+    mcpUrl?: string;
+    mcpName?: string;
+    envMap?: Record<string, string>;
+  };
 }
 
 export function useProviders() {
@@ -287,9 +303,46 @@ export function useDeleteChatSession() {
 //     a stable id, so the same upsert path covers them.
 //   - All other kinds are append-only, but the merge logic is uniform.
 //
+// Backoff schedule for the chat-block long-poll fallback. Doubles up to
+// 8 s, then stays at 8 s — matching the runtime-events fallback so the
+// two transports feel similar.
+const CHAT_POLL_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000] as const;
+
+// True when this browser is loaded over a Cloudflare quick-tunnel
+// hostname — quick tunnels strip `text/event-stream` at the edge so
+// SSE silently dies before any frame reaches the page. The pageIsOn
+// check answers "is THIS browser stuck on the SSE-incapable hop?"; the
+// tunnel snapshot's `tunnelTransport` is the operator-side answer for
+// other clients.
+function pageIsOnQuickTunnel(): boolean {
+  if (typeof window === "undefined") return false;
+  return isQuickTunnelOrigin(window.location.origin);
+}
+
+// Merge the REST seed snapshot with whatever's already in state. A live
+// SSE/poll frame can arrive BEFORE the seed promise resolves; a naive
+// setBlocks(seed) would wipe it. For id collisions, prev (live) wins
+// because the live frame is fresher than the REST snapshot — assistant
+// streaming deltas in particular keep updating the same block id, and
+// the seed's older copy would visibly clobber the running total.
+// Exported for unit testing the merge-vs-replace behavior.
+export function mergeSeedWithLive(seed: ChatBlock[], prev: ChatBlock[]): ChatBlock[] {
+  const merged = new Map<string, ChatBlock>();
+  for (const b of seed) merged.set(b.id, b);
+  for (const b of prev) merged.set(b.id, b);
+  // Sort defensively — the server returns ordinal-asc, but a future
+  // server-side change shouldn't silently re-order the UI, and the
+  // merge can interleave seed+live arbitrarily.
+  return [...merged.values()].sort((a, b) => a.ordinal - b.ordinal);
+}
+
 // The SSE stream auto-attaches Last-Event-ID on browser-driven reconnects.
 // On open we still issue a fresh GET /blocks so a tab waking from sleep or
 // a fresh navigation gets the durable list before any live frames land.
+// When the page is loaded over a quick-tunnel hostname we instead enter
+// a long-polling loop against /chat/:id/poll — Cloudflare quick tunnels
+// do not support SSE at the edge, so EventSource would silently never
+// deliver frames.
 export function useChatBlocks(sessionId: string | null) {
   const [blocks, setBlocks] = useState<ChatBlock[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(Boolean(sessionId));
@@ -303,37 +356,25 @@ export function useChatBlocks(sessionId: string | null) {
   activeSessionRef.current = sessionId;
 
   useEffect(() => {
+    // Reset on EVERY sessionId change, not just null transitions. Caller
+    // (chat/page.tsx) re-runs the hook with a new id on chat switch but
+    // does not remount the component, so the useState slot above persists
+    // the previous chat's blocks. Without this reset, the seed fetch for
+    // the new session merges its initial list with the prior session's
+    // blocks (mergeSeedWithLive de-dupes by id only, no session check),
+    // leaking blocks from chat A into chat B's transcript. Resetting here
+    // also clears the loading/error slot so the new session starts from
+    // a clean slate; the seed fetch below flips loading off on resolve.
+    setBlocks([]);
+    setError(null);
+
     if (!sessionId) {
-      setBlocks([]);
       setIsLoading(false);
-      setError(null);
       return;
     }
 
     let cancelled = false;
-    const source = new EventSource(`/api/runtime/chat/${sessionId}/stream`);
-
     setIsLoading(true);
-    setError(null);
-
-    // Reset to the durable list on session change. The SSE stream's
-    // initial backfill will replay missing blocks, but we want the
-    // bubble for the current session to start from a known-good
-    // snapshot rather than the previous session's residue.
-    api<ChatBlock[]>(`/chat/${sessionId}/blocks`)
-      .then((initial) => {
-        if (cancelled || activeSessionRef.current !== sessionId) return;
-        // Sort defensively — the server already returns ordinal-asc, but
-        // a future server-side change shouldn't silently re-order the UI.
-        const sorted = [...initial].sort((a, b) => a.ordinal - b.ordinal);
-        setBlocks(sorted);
-        setIsLoading(false);
-      })
-      .catch((err: Error) => {
-        if (cancelled || activeSessionRef.current !== sessionId) return;
-        setError(err);
-        setIsLoading(false);
-      });
 
     const merge = (incoming: ChatBlock) => {
       if (cancelled || activeSessionRef.current !== sessionId) return;
@@ -355,25 +396,89 @@ export function useChatBlocks(sessionId: string | null) {
       });
     };
 
-    source.addEventListener("chat_block", (event) => {
-      const messageEvent = event as MessageEvent;
-      try {
-        const block = JSON.parse(messageEvent.data) as ChatBlock;
-        merge(block);
-      } catch {
-        // A malformed frame shouldn't kill the stream — ignore and
-        // wait for the next one. The SSE browser implementation
-        // handles reconnect with Last-Event-ID on transport errors.
+    // Always seed with the durable list first so the first paint
+    // contains the chat's known history regardless of transport.
+    api<ChatBlock[]>(`/chat/${sessionId}/blocks`)
+      .then((initial) => {
+        if (cancelled || activeSessionRef.current !== sessionId) return;
+        // Merge with whatever's already in state — a live SSE/poll
+        // block can arrive BEFORE the seed promise resolves, and a
+        // plain setBlocks(sorted) would silently drop it.
+        setBlocks((prev) => mergeSeedWithLive(initial, prev));
+        setIsLoading(false);
+      })
+      .catch((err: Error) => {
+        if (cancelled || activeSessionRef.current !== sessionId) return;
+        setError(err);
+        setIsLoading(false);
+      });
+
+    const useLongPoll = pageIsOnQuickTunnel();
+
+    if (!useLongPoll) {
+      const source = new EventSource(`/api/runtime/chat/${sessionId}/stream`);
+      source.addEventListener("chat_block", (event) => {
+        const messageEvent = event as MessageEvent;
+        try {
+          const block = JSON.parse(messageEvent.data) as ChatBlock;
+          merge(block);
+        } catch {
+          // A malformed frame shouldn't kill the stream — ignore and
+          // wait for the next one. The SSE browser implementation
+          // handles reconnect with Last-Event-ID on transport errors.
+        }
+      });
+      // EventSource has built-in reconnect with backoff; don't close on
+      // error or transient hiccups turn into permanent disconnects.
+      source.onerror = () => {};
+      return () => {
+        cancelled = true;
+        source.close();
+      };
+    }
+
+    // Long-polling fallback for tunneled pages. Cursor is the SSE wire
+    // id (`<block_id>:<ts>`) returned by the previous poll. Errors
+    // back off through CHAT_POLL_BACKOFF_MS before retrying.
+    const controller = new AbortController();
+    let cursor = "";
+    let consecutiveErrors = 0;
+    const loop = async (): Promise<void> => {
+      while (!controller.signal.aborted) {
+        if (activeSessionRef.current !== sessionId) return;
+        try {
+          const res = await fetch(
+            `/api/runtime/chat/${sessionId}/poll?since=${encodeURIComponent(cursor)}`,
+            { signal: controller.signal, credentials: "same-origin" }
+          );
+          if (!res.ok) throw new Error(`chat poll failed (${res.status})`);
+          const payload = (await res.json()) as { events: ChatBlock[]; cursor: string };
+          consecutiveErrors = 0;
+          cursor = payload.cursor ?? cursor;
+          for (const block of payload.events) merge(block);
+        } catch (err) {
+          if (controller.signal.aborted) return;
+          const idx = Math.min(consecutiveErrors, CHAT_POLL_BACKOFF_MS.length - 1);
+          const delay = CHAT_POLL_BACKOFF_MS[idx]!;
+          consecutiveErrors += 1;
+          const { promise: wait, resolve: settle } = Promise.withResolvers<void>();
+          const timer = setTimeout(settle, delay);
+          // `{ once: true }` lets the browser auto-remove the listener
+          // after firing — without it, every retry attaches a fresh
+          // listener for the lifetime of `controller.signal`, growing
+          // unbounded across consecutive errors.
+          controller.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            settle();
+          }, { once: true });
+          await wait;
+        }
       }
-    });
-
-    // EventSource has built-in reconnect with backoff; don't close on
-    // error or transient hiccups turn into permanent disconnects.
-    source.onerror = () => {};
-
+    };
+    void loop();
     return () => {
       cancelled = true;
-      source.close();
+      controller.abort();
     };
   }, [sessionId]);
 

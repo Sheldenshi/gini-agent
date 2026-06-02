@@ -7,7 +7,7 @@
 //   - resume after approval → task completes
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -16,20 +16,25 @@ import {
   setEchoToolCallingResponse,
   normalizeProvider
 } from "../provider";
-import { submitTask, decideApproval } from "../agent";
+import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
 import {
+  bankIdForAgent,
   createChatSession,
   createEmptyState,
   createRun,
   createSubagentRecord,
   deleteChatSession,
+  ensureAgentBank,
+  ensureDefaultBank,
+  insertMemoryUnit,
   mutateState,
   now,
   readState
 } from "../state";
+import { echoEmbed } from "../embeddings";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildInactiveSkillsBlock } from "./chat-task";
+import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -1046,12 +1051,22 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBeGreaterThan(0);
-    const system = calls[0]!.find((m) => m.role === "system");
-    const content = String(system?.content ?? "");
-    expect(content).toContain("Your runtime identity:");
-    expect(content).toContain(`- instance: ${config.instance}`);
-    expect(content).toContain(`- runtime port: ${config.port}`);
-    expect(content).toContain("- provider: echo/");
+    // The emitted identity now rides in the ephemeral role:"user" tail
+    // placed immediately before the real user message — NOT in the
+    // byte-stable system prefix. See ADR stable-system-prefix.md.
+    const turn = calls[0]!;
+    const system = turn.find((m) => m.role === "system");
+    const systemContent = String(system?.content ?? "");
+    expect(systemContent).not.toContain("Your runtime identity:");
+    const userIdx = turn.findIndex((m) => m.role === "user" && m.content === "what's your setup?");
+    expect(userIdx).toBeGreaterThan(0);
+    const tail = turn[userIdx - 1]!;
+    expect(tail.role).toBe("user");
+    const tailContent = String(tail.content ?? "");
+    expect(tailContent).toContain("Your runtime identity:");
+    expect(tailContent).toContain(`- instance: ${config.instance}`);
+    expect(tailContent).toContain(`- runtime port: ${config.port}`);
+    expect(tailContent).toContain("- provider: echo/");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1092,11 +1107,20 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBeGreaterThan(0);
-    const system = calls[0]!.find((m) => m.role === "system");
+    const turn = calls[0]!;
+    const system = turn.find((m) => m.role === "system");
     const content = String(system?.content ?? "");
     expect(content.startsWith(SUBAGENT_PROMPT)).toBe(true);
     expect(content).not.toContain("Your runtime identity:");
     expect(content).not.toContain("Runtime identity changes since last turn:");
+    // Subagents keep their single override prompt + the real user message:
+    // no ephemeral identity/memory tail is injected on the subagent path.
+    expect(turn.filter((m) => m.role === "user").length).toBe(1);
+    for (const m of turn) {
+      const text = String(m.content ?? "");
+      expect(text).not.toContain("Your runtime identity:");
+      expect(text).not.toContain("Runtime identity changes since last turn:");
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1156,11 +1180,18 @@ describe("chat-task loop", () => {
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(2);
-    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
-    const secondSystem = String(calls[1]!.find((m) => m.role === "system")?.content ?? "");
-    expect(firstSystem).toContain("Your runtime identity:");
-    expect(secondSystem).not.toContain("Your runtime identity:");
-    expect(secondSystem).not.toContain("Runtime identity changes since last turn:");
+    // Identity now rides in the ephemeral role:"user" tail, so check every
+    // message of each turn — not just the (now identity-free) system prefix.
+    const firstTurnText = calls[0]!.map((m) => String(m.content ?? "")).join("\n");
+    const secondTurnText = calls[1]!.map((m) => String(m.content ?? "")).join("\n");
+    // First turn emits the full identity (in the tail); the system prefix
+    // itself never carries it anymore.
+    expect(firstTurnText).toContain("Your runtime identity:");
+    expect(String(calls[0]!.find((m) => m.role === "system")?.content ?? "")).not.toContain("Your runtime identity:");
+    // Quiet follow-up turn: no identity anywhere — neither system nor tail
+    // (and with nothing recalled, no tail message is injected at all).
+    expect(secondTurnText).not.toContain("Your runtime identity:");
+    expect(secondTurnText).not.toContain("Runtime identity changes since last turn:");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1208,6 +1239,215 @@ describe("chat-task loop", () => {
     await waitForTerminal(config, task.id);
 
     expect(readState(config.instance).identitySnapshots?.[sessionId]).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("message 0 is a byte-stable prefix across two turns in the same session", async () => {
+    // Headline cache contract: with no identity/skill/job/connector change
+    // between turns, the system message (message 0) must be byte-identical
+    // turn-to-turn so automatic provider prefix caching stays warm. Message 0
+    // is stable regardless of whether recall returns anything, because the
+    // per-turn-varying content (emitted identity, recalled memory) now lives
+    // in the ephemeral role:"user" tail rather than in message 0. See ADR
+    // stable-system-prefix.md.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-stable-prefix");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Stable prefix");
+      return session.id;
+    });
+
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "One.", toolCalls: [], finishReason: "stop" });
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "Two.", toolCalls: [], finishReason: "stop" });
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    expect(calls[0]![0]!.role).toBe("system");
+    expect(calls[1]![0]!.role).toBe("system");
+    // Byte equality of message 0 across the two turns is the whole point.
+    expect(calls[0]![0]!.content).toBe(calls[1]![0]!.content);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("delivers emitted identity then recalled memory in a role:user tail before the user message", async () => {
+    // Both per-turn blocks must still reach the model: the emitted identity
+    // (turn 1 of a session) and the recalled-memory block, in that order,
+    // inside a single role:"user" message placed immediately before the real
+    // user message. Recall is driven through the real pipeline with the echo
+    // embedder and the reranker pinned to `none` so it returns the seeded
+    // unit deterministically and offline.
+    const prevEmbed = process.env.GINI_EMBEDDING_PROVIDER;
+    const prevReranker = process.env.GINI_RERANKER_PROVIDER;
+    process.env.GINI_EMBEDDING_PROVIDER = "echo";
+    process.env.GINI_RERANKER_PROVIDER = "none";
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-tail-delivery");
+    const provider = normalizeProvider(config.provider);
+    const MEMORY_TEXT = "the user keeps bees on a rooftop in Lisbon";
+
+    try {
+      // Active agent so resolveEffectiveContext yields a memory namespace and
+      // recall runs; seed one matching unit into that agent's bank.
+      const agentId = "agent_tail";
+      const sessionId = await mutateState(config.instance, (state) => {
+        state.agents.push({
+          id: agentId,
+          instance: state.instance,
+          name: "tail",
+          providerName: "echo",
+          model: "gini-echo-v0",
+          toolsets: [],
+          messagingTargets: [],
+          status: "active",
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        });
+        state.activeAgentId = agentId;
+        const session = createChatSession(state, "Tail delivery");
+        return session.id;
+      });
+      ensureDefaultBank(config.instance);
+      ensureAgentBank(config.instance, agentId);
+      insertMemoryUnit(config.instance, {
+        bankId: bankIdForAgent(agentId),
+        agentId,
+        text: MEMORY_TEXT,
+        embedding: echoEmbed(MEMORY_TEXT),
+        embeddingModel: "echo-embed-v0",
+        network: "world"
+      });
+
+      const runId = await mutateState(config.instance, (state) => {
+        const run = createRun(state, {
+          kind: "conversation_turn",
+          title: "Tail turn",
+          input: "intro",
+          conversationId: sessionId
+        });
+        return run.id;
+      });
+
+      setEchoToolCallingResponse({ provider, text: "Noted.", toolCalls: [], finishReason: "stop" });
+      const task = await submitTask(config, MEMORY_TEXT, { mode: "chat", runId });
+      const finished = await waitForTerminal(config, task.id);
+      expect(finished.status).toBe("completed");
+
+      const calls = getEchoToolCallingCalls();
+      expect(calls.length).toBeGreaterThan(0);
+      const turn = calls[0]!;
+      // The stable system prefix carries neither block anymore.
+      const systemContent = String(turn.find((m) => m.role === "system")?.content ?? "");
+      expect(systemContent).not.toContain("Your runtime identity:");
+      expect(systemContent).not.toContain("Long-term memory of prior conversations");
+      // The tail is the role:"user" message immediately before the real input.
+      const userIdx = turn.findIndex((m) => m.role === "user" && m.content === MEMORY_TEXT);
+      expect(userIdx).toBeGreaterThan(0);
+      const tail = turn[userIdx - 1]!;
+      expect(tail.role).toBe("user");
+      const tailContent = String(tail.content ?? "");
+      const identityIdx = tailContent.indexOf("Your runtime identity:");
+      const memoryIdx = tailContent.indexOf("Long-term memory of prior conversations");
+      expect(identityIdx).toBeGreaterThanOrEqual(0);
+      expect(memoryIdx).toBeGreaterThanOrEqual(0);
+      expect(tailContent).toContain(MEMORY_TEXT);
+      // Identity before memory, mirroring the old system-prompt order.
+      expect(identityIdx).toBeLessThan(memoryIdx);
+    } finally {
+      if (prevEmbed === undefined) delete process.env.GINI_EMBEDDING_PROVIDER;
+      else process.env.GINI_EMBEDDING_PROVIDER = prevEmbed;
+      if (prevReranker === undefined) delete process.env.GINI_RERANKER_PROVIDER;
+      else process.env.GINI_RERANKER_PROVIDER = prevReranker;
+      rmSync(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("does not replay a prior turn's ephemeral tail on the next turn", async () => {
+    // The tail is built live and never persisted, so the next turn's prior
+    // transcript (priorChatMessages reads only durable chatMessages) must not
+    // contain the previous tail's identity/memory text. Turn 1 emits identity
+    // into its tail; turn 2's outgoing messages must carry none of it as
+    // replayed history. Recall is isolated (no active agent), so the only
+    // tail content under test is the turn-1 identity block.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-no-double-inject");
+    const provider = normalizeProvider(config.provider);
+
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "No double inject");
+      return session.id;
+    });
+
+    const firstRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 1",
+        input: "first",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "One.", toolCalls: [], finishReason: "stop" });
+    const firstTask = await submitTask(config, "first question", { mode: "chat", runId: firstRunId });
+    await waitForTerminal(config, firstTask.id);
+
+    const secondRunId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Turn 2",
+        input: "second",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+    setEchoToolCallingResponse({ provider, text: "Two.", toolCalls: [], finishReason: "stop" });
+    const secondTask = await submitTask(config, "second question", { mode: "chat", runId: secondRunId });
+    await waitForTerminal(config, secondTask.id);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    // Turn 1 emitted identity into its tail.
+    const firstTurnText = calls[0]!.map((m) => String(m.content ?? "")).join("\n");
+    expect(firstTurnText).toContain("Your runtime identity:");
+    // Turn 2's messages, EXCLUDING its own freshly-built tail, must not carry
+    // the prior turn's identity as replayed history. (The quiet second turn
+    // emits no identity of its own, so any occurrence would be a stale replay.)
+    const secondTurn = calls[1]!;
+    const userIdx = secondTurn.findIndex((m) => m.role === "user" && m.content === "second question");
+    const historyAndPrefix = secondTurn.filter((_, i) => i !== userIdx - 1);
+    const historyText = historyAndPrefix.map((m) => String(m.content ?? "")).join("\n");
+    expect(historyText).not.toContain("Your runtime identity:");
+    // Durable transcript rows likewise never include the tail.
+    const stored = readState(config.instance).chatMessages.filter((m) => m.sessionId === sessionId);
+    for (const m of stored) {
+      expect(String(m.content ?? "")).not.toContain("Your runtime identity:");
+    }
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -1571,6 +1811,751 @@ describe("chat-task loop", () => {
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
+
+  // Tool-calling transcript persistence + replay (ADR
+  // agent-loop-tool-calling.md). A prior turn's assistant tool_calls and its
+  // paired role:"tool" results are persisted durably (kind:"tool_transcript")
+  // and replayed next turn so the model sees the structured results of its
+  // own earlier actions instead of re-deriving them.
+  test("a structured tool result from a prior turn is replayed on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-id");
+    const provider = normalizeProvider(config.provider);
+    const fixturePath = join(workspaceRoot, "issue.json");
+    // The "create issue" stand-in: a tool the loop dispatches synchronously
+    // whose result carries an id the agent must remember next turn.
+    const issueResult = JSON.stringify({ ok: true, issueId: "ISSUE-4242" });
+    writeFileSync(fixturePath, issueResult);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Issue thread" });
+
+    // Turn 1: read the file (returns the issue id), then a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_issue", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "issue.json" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Created issue ISSUE-4242.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "create an issue" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: the model just answers — we only care about the transcript it
+    // was handed.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Editing ISSUE-4242 as requested.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "now edit that issue" });
+    await waitForTerminal(config, second.taskId);
+
+    // Locate turn 2's provider call: the one whose user message is the
+    // second prompt.
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "now edit that issue")
+    );
+    expect(turn2).toBeDefined();
+
+    // The replayed transcript carries the assistant tool_calls message AND
+    // the paired role:"tool" result with the issue id.
+    const assistantToolCalls = turn2!.find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+    );
+    expect(assistantToolCalls).toBeDefined();
+    expect(assistantToolCalls!.tool_calls![0]!.id).toBe("call_issue");
+
+    const toolResult = turn2!.find((m) => m.role === "tool" && m.tool_call_id === "call_issue");
+    expect(toolResult).toBeDefined();
+    expect(String(toolResult!.content)).toContain("ISSUE-4242");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("two turns reusing the same tool_call_id each replay with their own result", async () => {
+    // The text-backstop path synthesizes call ids from name:args:index, so
+    // the same tool called with the same args on two turns yields an
+    // identical tool_call_id. Pairing must stay local to each assistant row:
+    // turn 1's call gets turn 1's result, turn 2's call gets turn 2's, even
+    // though both rows share the id.
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-dupid");
+    const provider = normalizeProvider(config.provider);
+    const fixturePath = join(workspaceRoot, "state.txt");
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Dup-id thread" });
+
+    // Turn 1: read the file (content "FIRST"), reusing the colliding id.
+    writeFileSync(fixturePath, "FIRST");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_dup", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "state.txt" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read FIRST.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const first = await submitChatMessage(config, session.id, { content: "read it once" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: read the same file (now "SECOND") with the SAME tool_call_id.
+    writeFileSync(fixturePath, "SECOND");
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_dup", type: "function", function: { name: "file_read", arguments: JSON.stringify({ path: "state.txt" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Read SECOND.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "read it again" });
+    await waitForTerminal(config, second.taskId);
+    await syncChatTaskResult(config, session.id, second.taskId);
+
+    // Turn 3: plain answer — we only inspect the transcript it was handed.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const third = await submitChatMessage(config, session.id, { content: "what changed?" });
+    await waitForTerminal(config, third.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn3 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "what changed?")
+    );
+    expect(turn3).toBeDefined();
+
+    // Both assistant tool_calls rows replay, each immediately followed by its
+    // OWN paired result — turn 1 with "FIRST", turn 2 with "SECOND".
+    const toolResults: string[] = [];
+    for (let i = 0; i < turn3!.length; i++) {
+      const m = turn3![i]!;
+      if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.some((c) => c.id === "call_dup")) {
+        const next = turn3![i + 1];
+        expect(next?.role).toBe("tool");
+        expect(next?.tool_call_id).toBe("call_dup");
+        toolResults.push(String(next?.content ?? ""));
+      }
+    }
+    expect(toolResults.length).toBe(2);
+    expect(toolResults[0]).toContain("FIRST");
+    expect(toolResults[0]).not.toContain("SECOND");
+    expect(toolResults[1]).toContain("SECOND");
+    expect(toolResults[1]).not.toContain("FIRST");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a read_skill body from a prior turn persists into the next turn's transcript", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-skill");
+    const provider = normalizeProvider(config.provider);
+
+    const skill = await createSkillFromInput(config, {
+      name: "apple-notes",
+      description: "Apple Notes via memo CLI."
+    });
+    const skillBody = "# Apple Notes\n\nUse `memo notes -a` to add a note.";
+    await mutateState(config.instance, (state) => {
+      const item = state.skills.find((s) => s.id === skill.id)!;
+      item.body = skillBody;
+    });
+    await setSkillStatus(config, skill.id, "enabled");
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Skill thread" });
+
+    // Turn 1: read the skill, then answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_skill", type: "function", function: { name: "read_skill", arguments: JSON.stringify({ name: "apple-notes" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "I now know how to use Apple Notes.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "how do I add an apple note?" });
+    await waitForTerminal(config, first.taskId);
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The skill body must be in the replayed transcript
+    // so the model need not re-read it (Claude Code skill behavior).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Adding your note now.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "add a note that says hi" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "add a note that says hi")
+    );
+    expect(turn2).toBeDefined();
+    const skillToolResult = turn2!.find((m) => m.role === "tool" && m.tool_call_id === "call_skill");
+    expect(skillToolResult).toBeDefined();
+    expect(String(skillToolResult!.content)).toContain("memo notes -a");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("the gated approval path persists and replays its tool result, keeping pairing valid", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-gated");
+    const provider = normalizeProvider(config.provider);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Gated thread" });
+
+    // Turn 1: request a file write (approval-gated), then answer after resume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_gated", type: "function", function: { name: "file_write", arguments: JSON.stringify({ path: "out.txt", content: "from-agent" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Wrote the file as requested.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "create out.txt" });
+    const paused = await waitForTerminal(config, first.taskId);
+    expect(paused.status).toBe("waiting_approval");
+    const approvalId = paused.approvalIds[0]!;
+    await decideApproval(config, approvalId, "approve");
+    const finished = await waitForTerminal(config, first.taskId);
+    expect(finished.status).toBe("completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The gated tool's result must be replayed, and the
+    // assistant tool_calls row must be immediately followed by its paired
+    // role:"tool" result (provider ordering invariant).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "thanks" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "thanks")
+    );
+    expect(turn2).toBeDefined();
+
+    const assistantIdx = turn2!.findIndex(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((c) => c.id === "call_gated")
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    // The matching tool result must immediately follow its assistant message.
+    const nextMsg = turn2![assistantIdx + 1];
+    expect(nextMsg?.role).toBe("tool");
+    expect(nextMsg?.tool_call_id).toBe("call_gated");
+
+    // No orphan tool results: every role:"tool" message in the replay points
+    // at an assistant tool_call id that appears earlier in the same array.
+    const emittedCallIds = new Set<string>();
+    for (const m of turn2!) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) emittedCallIds.add(c.id);
+      }
+      if (m.role === "tool") {
+        expect(typeof m.tool_call_id).toBe("string");
+        expect(emittedCallIds.has(m.tool_call_id!)).toBe(true);
+      }
+    }
+
+    // The durable transcript rows exist in state.chatMessages but are
+    // excluded from the human-facing JSON view.
+    const { getChatSession } = await import("./chat");
+    const stored = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.kind === "tool_transcript"
+    );
+    expect(stored.length).toBeGreaterThan(0);
+    const view = getChatSession(config, session.id);
+    expect(view.messages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
+    // The full-state runtime views (/api/state, /api/mobile/bootstrap) must
+    // also drop transcript rows — they carry tool-call args and raw tool
+    // results (skill bodies, file contents) that have no place in a public
+    // state poll.
+    const { publicState, mobileBootstrap } = await import("../runtime/views");
+    expect(publicState(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+    expect(mobileBootstrap(config).chatMessages.some((m) => m.kind === "tool_transcript")).toBe(false);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("a gated tool that persists an approval_reason row still replays its call+result next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-transcript-gated-reason");
+    const provider = normalizeProvider(config.provider);
+
+    const { createChat, submitChatMessage, syncChatTaskResult } = await import("./chat");
+    const session = await createChat(config, { title: "Connector thread" });
+
+    // Turn 1: request_connector (approval-gated) for a provider with no
+    // setupSkill, so it goes straight to a pending setup request. Unlike
+    // file_write, this path persists a plain assistant kind:"approval_reason"
+    // row BETWEEN the assistant tool_calls row and the on-resume tool result,
+    // which is exactly what the turn-window pairing must span.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_conn", type: "function", function: { name: "request_connector", arguments: JSON.stringify({ provider: "linear", reason: "list my open issues" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    setEchoToolCallingResponse({
+      provider,
+      text: "Connected to Linear.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const first = await submitChatMessage(config, session.id, { content: "connect linear" });
+    const paused = await waitForTerminal(config, first.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    // An approval_reason row was persisted during dispatch — this is the
+    // interleaved non-tool row that the old window logic stopped at.
+    const reasonRows = readState(config.instance).chatMessages.filter(
+      (m) => m.sessionId === session.id && m.kind === "approval_reason"
+    );
+    expect(reasonRows.length).toBeGreaterThan(0);
+
+    // Resolve the setup request the way the /complete handler does: the
+    // synthesized toolResult is fed back via resumeChatTask, which persists
+    // the gated tool result row.
+    const setup = readState(config.instance).setupRequests.find((s) => s.taskId === first.taskId);
+    expect(setup).toBeDefined();
+    await resolveSetupRequest(config, setup!.id, "complete", {
+      actor: "user",
+      toolResult: "Connected to Linear. Proceed with the original request."
+    });
+    const finished = await waitForTerminal(config, first.taskId);
+    expect(finished.status).toBe("completed");
+    await syncChatTaskResult(config, session.id, first.taskId);
+
+    // Turn 2: a follow-up. The gated tool's call+result must survive replay
+    // even though an approval_reason row sits between them in the transcript.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Done.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+    const second = await submitChatMessage(config, session.id, { content: "thanks" });
+    await waitForTerminal(config, second.taskId);
+
+    const calls = getEchoToolCallingCalls();
+    const turn2 = calls.find((messages) =>
+      messages.some((m) => m.role === "user" && m.content === "thanks")
+    );
+    expect(turn2).toBeDefined();
+
+    const assistantIdx = turn2!.findIndex(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls!.some((c) => c.id === "call_conn")
+    );
+    expect(assistantIdx).toBeGreaterThan(-1);
+    // The matching tool result must immediately follow its assistant message.
+    const nextMsg = turn2![assistantIdx + 1];
+    expect(nextMsg?.role).toBe("tool");
+    expect(nextMsg?.tool_call_id).toBe("call_conn");
+    expect(String(nextMsg?.content)).toContain("Connected to Linear");
+
+    // No orphan tool results: every role:"tool" message in the replay points
+    // at an assistant tool_call id that appears earlier in the same array.
+    const emittedCallIds = new Set<string>();
+    for (const m of turn2!) {
+      if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+        for (const c of m.tool_calls) emittedCallIds.add(c.id);
+      }
+      if (m.role === "tool") {
+        expect(typeof m.tool_call_id).toBe("string");
+        expect(emittedCallIds.has(m.tool_call_id!)).toBe(true);
+      }
+    }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("advertises deferred tools on demand and loads one via load_tools, feeding back a callable confirmation", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-load");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load the browser_navigate schema via load_tools. (We stop at the
+    // load round-trip rather than driving a real browser — the load branch is
+    // what this test pins; the browser dispatch itself is exercised live.)
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: final answer (no browser call, to keep the test hermetic).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browser tools are ready.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "get ready to browse", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Browser tools are ready.");
+    // loadedTools is cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    // First model call: system prompt advertises the on-demand index with
+    // browser_navigate by name.
+    const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
+    expect(firstSystem).toContain("Tools available on demand");
+    expect(firstSystem).toContain("browser_navigate");
+
+    // After the load, the second model call's message history carries the
+    // load_tools tool result confirming the tool is now callable.
+    const secondTurn = calls[1]!;
+    const loadResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
+    );
+    expect(loadResult).toBeDefined();
+    const envelope = JSON.parse(String((loadResult as { content: string }).content)) as {
+      ok: boolean;
+      loaded: string[];
+    };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.loaded).toContain("browser_navigate");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("the dispatcher's deferred guard nudges toward load_tools and does not over-trigger", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-nudge");
+
+    const { dispatchToolCall } = await import("./tool-dispatch");
+    const { isDeferredToolName } = await import("./tool-catalog");
+    const { createTask, upsertTask } = await import("../state");
+    const taskRow = createTask(config.instance, "nudge probe");
+    await mutateState(config.instance, (state) => upsertTask(state, taskRow));
+
+    // A genuinely unknown (non-deferred) tool still throws Unknown tool —
+    // the guard is scoped to deferred names and does not over-trigger.
+    expect(isDeferredToolName("totally_made_up_tool")).toBe(false);
+    let threw = false;
+    try {
+      await dispatchToolCall(config, taskRow.id, "totally_made_up_tool", "call_x", "{}");
+    } catch {
+      threw = true;
+    }
+    expect(threw).toBe(true);
+
+    // browser_navigate is a known deferred tool. The guard helper classifies
+    // it as deferred so a not-yet-loaded reference reaching the dispatcher's
+    // default case would return the recoverable load_tools nudge rather than
+    // throwing Unknown tool.
+    expect(isDeferredToolName("browser_navigate")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // The riskiest invariant: a deferred tool the model loaded must stay live
+  // across an approval pause/resume. We load two deferred self tools
+  // (set_provider + get_self), call set_provider (strict → gates), assert the
+  // paused task carries loadedTools, then approve and — on the RESUMED turn —
+  // call get_self directly. get_self only dispatches successfully if it is
+  // still in providerTools after the resume, which proves runLoop re-seeds
+  // loadedToolNames from task.loadedTools (a merely-completing final-text turn
+  // would not prove the loaded schema survived).
+  test("loaded deferred tool set persists across an approval pause/resume and dispatches after resume", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    // strict so set_provider gates instead of auto-resolving.
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-resume");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load set_provider AND get_self.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["set_provider", "get_self"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: call set_provider directly (top-level args). Strict → pauses.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_sp", type: "function", function: { name: "set_provider", arguments: JSON.stringify({ provider: "echo" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3 (the RESUMED turn): call the previously-loaded get_self directly.
+    // It's a query op → resolves sync (no second gate) and writes a self.get
+    // audit row, proving the loaded schema survived the resume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_gs", type: "function", function: { name: "get_self", arguments: "{}" } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 4: final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Provider set.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "switch to echo", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+    // The loaded set survived onto the task across the pause snapshot.
+    expect(paused.loadedTools).toContain("set_provider");
+    expect(paused.loadedTools).toContain("get_self");
+    expect(paused.toolCallState).toBeDefined();
+    expect(paused.toolCallState?.pending[0]?.toolName).toBe("set_provider");
+    expect(paused.approvalIds.length).toBe(1);
+
+    // Approve → resume. runLoop re-seeds loadedToolNames from task.loadedTools
+    // so get_self is live again on the resumed iteration.
+    await decideApproval(config, paused.approvalIds[0]!, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Provider set.");
+    // get_self dispatched on the resumed turn — proving the loaded deferred
+    // tool was in providerTools post-resume (not nudged as unloaded).
+    const state = readState(config.instance);
+    const reads = state.audit.filter((a) => a.action === "self.get" && a.taskId === task.id);
+    expect(reads).toHaveLength(1);
+    // Cleared on terminal completion.
+    expect(finished.loadedTools).toBeUndefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop gate, never-loaded case: the model emits a deferred tool it never
+  // loaded. The chat-task loop gate (NOT the dispatcher's default-case
+  // backstop, which browser_navigate never reaches — it has its own dispatch
+  // case) must block execution and feed back a "not loaded yet" nudge, and the
+  // loop must continue to a final answer. We assert NO browser.navigate audit
+  // row exists (proving the thunk never ran).
+  test("loop gate blocks a deferred tool the model never loaded and nudges toward load_tools", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-unloaded");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: jump straight to browser_navigate without loading it first.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: model recovers with a final answer.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Understood — I'll load the browser tools first next time.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Understood — I'll load the browser tools first next time.");
+
+    const state = readState(config.instance);
+    // The browser thunk never ran: no browser.navigate audit row.
+    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
+    expect(navAudits).toHaveLength(0);
+
+    // The second model turn's history carries the "not loaded yet" nudge as the
+    // tool result for the unloaded browser_navigate call.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const nudge = calls[1]!.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
+    );
+    expect(nudge).toBeDefined();
+    const envelope = JSON.parse(String((nudge as { content: string }).content)) as { ok: boolean; error: string };
+    expect(envelope.ok).toBe(false);
+    expect(envelope.error).toContain("browser_navigate");
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop gate, same-batch case: the model emits load_tools AND the tool it just
+  // loaded in ONE tool_calls array. The provider generated browser_navigate
+  // without ever having its schema (it wasn't in the tools array that turn), so
+  // the loaded set as it stood at turn start does NOT contain it — the gate
+  // must block browser_navigate this turn while load_tools still succeeds. A
+  // subsequent turn can then call browser_navigate for real (now loadable).
+  test("loop gate blocks a same-batch load+call but lets the tool through on the next turn", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-deferred-samebatch");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load_tools(browser_navigate) AND browser_navigate(...) together.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } },
+        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: model recovers with a final answer (we stop before a real browser
+    // call to keep the test hermetic; the point is that the same-batch call was
+    // gated while load_tools succeeded).
+    setEchoToolCallingResponse({
+      provider,
+      text: "Browser tools loaded; ready to navigate.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+
+    const state = readState(config.instance);
+    // browser_navigate was NOT executed this turn — no browser.navigate audit.
+    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
+    expect(navAudits).toHaveLength(0);
+
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(2);
+    const secondTurn = calls[1]!;
+    // load_tools succeeded: its tool result confirms callability.
+    const loadResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
+    );
+    expect(loadResult).toBeDefined();
+    // browser_navigate got the "not loaded yet" nudge this turn.
+    const navResult = secondTurn.find(
+      (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
+    );
+    expect(navResult).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // create_agent approve/resume regression: the direct self tool routes
+  // through the unchanged self.config approval branch. Approving the gate
+  // must run the create_agent handler (agent row lands) and resume the loop.
+  test("create_agent direct tool gates, then approval lands the agent and resumes", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-create-agent-resume");
+    const provider = normalizeProvider(config.provider);
+
+    // Turn 1: load create_agent.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["create_agent"] }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 2: call create_agent directly. Strict → gates.
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_ca", type: "function", function: { name: "create_agent", arguments: JSON.stringify({ name: "E2E2" }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+    // Turn 3: final answer after approval.
+    setEchoToolCallingResponse({
+      provider,
+      text: "Agent created.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "create an agent called E2E2", { mode: "chat" });
+    const paused = await waitForTerminal(config, task.id, 10000);
+    expect(paused.status).toBe("waiting_approval");
+
+    const stateBefore = readState(config.instance);
+    const approval = stateBefore.authorizations.find((a) => a.id === paused.approvalIds[0]!)!;
+    expect(approval.action).toBe("self.config");
+    expect(approval.payload.opName).toBe("create_agent");
+    // No agent yet — the side effect is deferred to approval time.
+    expect(stateBefore.agents.some((a) => a.name === "E2E2")).toBe(false);
+
+    await decideApproval(config, approval.id, "approve");
+    const finished = await waitForTerminal(config, task.id, 10000);
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Agent created.");
+
+    // The handler ran on approval — the agent row now exists.
+    const stateAfter = readState(config.instance);
+    expect(stateAfter.agents.some((a) => a.name === "E2E2")).toBe(true);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
 });
 
 describe("buildAgentIdentity", () => {
@@ -1697,12 +2682,14 @@ describe("buildAgentIdentity", () => {
 
 describe("buildInactiveSkillsBlock", () => {
   // Minimal SkillRecord factory. Only the fields the block builder
-  // reads (name, description, status, requiredConnectors, source) carry
-  // meaningful values; the rest are stubbed so the type checks.
+  // reads (name, description, status, requiredCredentials, source) carry
+  // meaningful values; the rest are stubbed so the type checks. Skills now
+  // declare credentials BY NAME; the block maps each name to its provider
+  // (LINEAR_API_KEY → linear, google-workspace-oauth → google-oauth-desktop).
   function makeSkill(opts: {
     name: string;
     description?: string;
-    requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+    requiredCredentials?: string[];
     status?: SkillRecord["status"];
     source?: SkillRecord["source"];
   }): SkillRecord {
@@ -1725,18 +2712,19 @@ describe("buildInactiveSkillsBlock", () => {
       failureCount: 0,
       previousVersions: [],
       body: "",
-      requiredConnectors: opts.requiredConnectors,
+      requiredCredentials: opts.requiredCredentials,
       source: opts.source
     };
   }
 
   test("routes setup-skill providers to the setup skill instead of request_connector", () => {
-    // google-oauth-desktop declares setupSkill: "google-workspace-setup".
-    // The block must point the model at that skill, NOT at request_connector.
+    // google-workspace-oauth maps to google-oauth-desktop, which declares
+    // setupSkill: "google-workspace-setup". The block must point the model at
+    // that skill, NOT at request_connector.
     const skill = makeSkill({
       name: "google-calendar",
       description: "Google Calendar",
-      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+      requiredCredentials: ["google-workspace-oauth"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("google-oauth-desktop");
@@ -1746,13 +2734,13 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toContain("call `request_connector` with provider id `google-oauth-desktop`");
   });
 
-  test("collapses multiple skills sharing one setup-skill provider into a single line", () => {
-    // All six Google Workspace product skills share one connector — the
-    // block should emit ONE provider line, not six per-skill lines.
+  test("collapses multiple skills sharing one credential into a single line", () => {
+    // All Google Workspace product skills share one credential — the block
+    // should emit ONE provider line, not one per skill.
     const skills = [
-      makeSkill({ name: "google-calendar", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
-      makeSkill({ name: "google-gmail", requiredConnectors: [{ provider: "google-oauth-desktop" }] }),
-      makeSkill({ name: "google-drive", requiredConnectors: [{ provider: "google-oauth-desktop" }] })
+      makeSkill({ name: "google-calendar", requiredCredentials: ["google-workspace-oauth"] }),
+      makeSkill({ name: "google-gmail", requiredCredentials: ["google-workspace-oauth"] }),
+      makeSkill({ name: "google-drive", requiredCredentials: ["google-workspace-oauth"] })
     ];
     const block = buildInactiveSkillsBlock(skills);
     const providerLines = block.split("\n").filter((line) => line.includes("google-oauth-desktop"));
@@ -1764,12 +2752,12 @@ describe("buildInactiveSkillsBlock", () => {
   });
 
   test("falls back to request_connector guidance for providers without a setup skill", () => {
-    // The linear provider does not declare setupSkill, so the block must
-    // emit the default request_connector instruction.
+    // LINEAR_API_KEY → linear, which does not declare setupSkill, so the
+    // block must emit the default request_connector instruction.
     const skill = makeSkill({
       name: "needs-linear",
       description: "Test skill that needs Linear.",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("linear");
@@ -1778,23 +2766,101 @@ describe("buildInactiveSkillsBlock", () => {
     expect(block).not.toMatch(/read_skill/);
   });
 
-  test("returns an empty string when no inactive-with-connector skills are present", () => {
+  test("instructs a templateless request_connector for a credential with no registered provider", () => {
+    // SOME_SERVICE_API_KEY maps to no provider module, so providerForCredential
+    // falls back to the name itself. The block must NOT emit the bare
+    // provider-id shortcut (there is no provider to connect) — it must tell the
+    // model to call request_connector with the {name, type, skillId} shape so
+    // the user can enter the secret in chat. The name is UPPER_SNAKE so the
+    // inferred type is api-key.
+    const skill = makeSkill({
+      name: "needs-some-service",
+      description: "Test skill that needs an unmapped credential.",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const block = buildInactiveSkillsBlock([skill]);
+    expect(block).toContain("SOME_SERVICE_API_KEY");
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    expect(block).toContain(`skillId: "${skill.id}"`);
+    // No provider-id shortcut and no read_skill dead-end for a name with no
+    // registered provider.
+    expect(block).not.toContain("call `request_connector` with provider id `SOME_SERVICE_API_KEY`");
+    expect(block).not.toMatch(/read_skill/);
+    expect(block).not.toContain("will be rejected");
+  });
+
+  // Minimal RuntimeState carrying only the connectors the block reads.
+  function stateWithConnectors(connectors: RuntimeState["connectors"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors, improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: [], messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  test("a disabled generic connector sharing the credential name still yields the api-key templateless line by NAME", () => {
+    // Regression: a disabled/unhealthy "generic" connector row sharing the
+    // credential name must NOT masquerade as the owning provider. The earlier
+    // code returned the row's provider ("generic"), grouped under that key, and
+    // emitted a bogus `{name:"generic", type:"oauth2"}` line. The line must name
+    // the actual credential and be api-key (templateless is api-key only).
+    const skill = makeSkill({
+      name: "needs-some-service",
+      requiredCredentials: ["SOME_SERVICE_API_KEY"]
+    });
+    const state = stateWithConnectors([
+      {
+        id: "id_generic_row",
+        instance: "test",
+        name: "SOME_SERVICE_API_KEY",
+        provider: "generic",
+        status: "disabled",
+        scopes: [],
+        secretRefs: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        health: "unknown",
+        source: "user"
+      }
+    ]);
+    const block = buildInactiveSkillsBlock([skill], state);
+    expect(block).toContain('name: "SOME_SERVICE_API_KEY"');
+    expect(block).toContain('type: "api-key"');
+    // Never the bogus generic/oauth2 line.
+    expect(block).not.toContain('name: "generic"');
+    expect(block).not.toContain('type: "oauth2"');
+  });
+
+  test("returns an empty string when no inactive-with-credential skills are present", () => {
     expect(buildInactiveSkillsBlock([])).toBe("");
-    // Skills with no requiredConnectors are filtered out before the
+    // Skills with no requiredCredentials are filtered out before the
     // grouping step.
-    const skill = makeSkill({ name: "no-conn", requiredConnectors: [] });
+    const skill = makeSkill({ name: "no-cred", requiredCredentials: [] });
     expect(buildInactiveSkillsBlock([skill])).toBe("");
   });
 
   test("opens with the dual-path intro so the model knows both routing options", () => {
     const skill = makeSkill({
       name: "needs-linear",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toMatch(/^Skills below need an external connector\./);
-    expect(block).toContain("setup skill");
+    // Both request_connector routing options are advertised: a registered
+    // provider id, and the templateless api-key {name, type:"api-key", skillId}
+    // shape for a credential with no registered provider.
     expect(block).toContain("request_connector");
+    expect(block).toContain("provider id");
+    expect(block).toContain('{name, type:"api-key", skillId}');
   });
 
   test("appends a no-browser-shortcut directive when a setup-skill provider is present", () => {
@@ -1805,7 +2871,7 @@ describe("buildInactiveSkillsBlock", () => {
     // only sanctioned route.
     const skill = makeSkill({
       name: "google-calendar",
-      requiredConnectors: [{ provider: "google-oauth-desktop" }]
+      requiredCredentials: ["google-workspace-oauth"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).toContain("ONLY correct path");
@@ -1827,10 +2893,182 @@ describe("buildInactiveSkillsBlock", () => {
     // declared, so the browser-shortcut directive is unnecessary noise.
     const skill = makeSkill({
       name: "needs-linear",
-      requiredConnectors: [{ provider: "linear" }]
+      requiredCredentials: ["LINEAR_API_KEY"]
     });
     const block = buildInactiveSkillsBlock([skill]);
     expect(block).not.toContain("ONLY correct path");
     expect(block).not.toContain("browser_navigate");
+  });
+});
+
+describe("buildMcpServersBlock", () => {
+  function stateWith(servers: RuntimeState["mcpServers"]): RuntimeState {
+    return {
+      version: 1,
+      instance: "test",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tasks: [], authorizations: [], setupRequests: [], audit: [], skills: [], jobs: [],
+      connectors: [], improvements: [], pairingCodes: [], devices: [],
+      promotions: [], snapshots: [], tools: [], toolsets: [], subagents: [],
+      mcpServers: servers, messagingBridges: [], importReports: [], agents: [],
+      activeAgentId: undefined, relays: [], notifications: [], events: [],
+      jobRuns: [], chatSessions: [], chatMessages: [], messagingMessages: [],
+      runs: [], planSteps: []
+    };
+  }
+
+  function server(name: string, tools: Array<{ name: string }>): RuntimeState["mcpServers"][number] {
+    return {
+      id: `mcp_${name}`,
+      instance: "test",
+      name,
+      command: "",
+      args: [],
+      envKeys: [],
+      status: "configured",
+      exposedTools: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      transport: "http",
+      url: "https://example.test/mcp",
+      tools
+    };
+  }
+
+  test("returns empty string when no servers are configured", () => {
+    expect(buildMcpServersBlock(stateWith([]))).toBe("");
+  });
+
+  test("lists tool names per server so the model has the full inventory", () => {
+    // The inventory line is what lets the model reach for a tool the skill
+    // never documented. Skills should not have to be re-edited every time
+    // an MCP server adds a tool.
+    const state = stateWith([
+      server("linear", [
+        { name: "list_issues" },
+        { name: "save_issue" },
+        { name: "list_initiatives" },
+        { name: "extract_images" }
+      ])
+    ]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear (4 tools)");
+    expect(block).toContain("tools: extract_images, list_initiatives, list_issues, save_issue");
+  });
+
+  test("includes the default-yes posture instruction", () => {
+    // Without this, the model treats the skill's documented tools as
+    // exhaustive and refuses tasks for tools that actually exist on the
+    // server's inventory list.
+    const state = stateWith([server("linear", [{ name: "list_issues" }])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("Do not refuse");
+    expect(block).toContain("validation error on bad args");
+  });
+
+  test("omits the per-server inventory line when a server has no cached tools yet", () => {
+    // Health probe hasn't populated tools yet — show the server but skip
+    // the inventory line so we don't lie about emptiness. (The default-yes
+    // posture sentence below still mentions the word `tools:`, so we
+    // assert on the indented inventory line specifically.)
+    const state = stateWith([server("linear", [])]);
+    const block = buildMcpServersBlock(state);
+    expect(block).toContain("- linear");
+    expect(block).not.toMatch(/^ {2}tools:/m);
+  });
+
+  test("alphabetizes both servers and their tool name lists for determinism", () => {
+    // Toolset hashes and prompt-cache stability depend on stable ordering
+    // across boots even when the order tools were registered varies.
+    const state = stateWith([
+      server("zenith", [{ name: "z_one" }, { name: "a_two" }]),
+      server("acme", [{ name: "c_one" }, { name: "a_two" }])
+    ]);
+    const block = buildMcpServersBlock(state);
+    const acmeIdx = block.indexOf("- acme");
+    const zenithIdx = block.indexOf("- zenith");
+    expect(acmeIdx).toBeGreaterThanOrEqual(0);
+    expect(zenithIdx).toBeGreaterThan(acmeIdx);
+    expect(block).toContain("tools: a_two, c_one");
+    expect(block).toContain("tools: a_two, z_one");
+  });
+});
+
+describe("buildSkillScriptsBlock", () => {
+  // listEnabledSkillScripts statSyncs the real scripts/ dir under each
+  // skill's manifestPath, so the seeded skills need real files on disk.
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "gini-skill-scripts-block-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function seedSkill(
+    state: RuntimeState,
+    name: string,
+    scripts: string[],
+    opts: { status?: SkillRecord["status"] } = {}
+  ): void {
+    const skillDir = join(dir, name);
+    const scriptsDir = join(skillDir, "scripts");
+    mkdirSync(scriptsDir, { recursive: true });
+    for (const script of scripts) {
+      writeFileSync(join(scriptsDir, script), "console.log('{}')");
+    }
+    state.skills.push({
+      id: `skill_${name}`,
+      instance: state.instance,
+      name,
+      description: "",
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status: opts.status ?? "enabled",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      source: "bundled",
+      manifestPath: join(skillDir, "SKILL.md")
+    });
+  }
+
+  test("returns empty string when no visible skill ships scripts", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "no-scripts", []);
+    expect(buildSkillScriptsBlock(state, new Set(["no-scripts"]))).toBe("");
+  });
+
+  test("lists each visible skill's scripts, alphabetized by skill and script", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "bbb", ["alpha.sh"]);
+    seedSkill(state, "aaa", ["two.ts", "one.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["aaa", "bbb"]));
+    expect(block).toBe(
+      [
+        "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+        "- aaa: one, two",
+        "- bbb: alpha"
+      ].join("\n")
+    );
+  });
+
+  test("omits skills that are enabled but not visible (inactive connector)", () => {
+    const state = createEmptyState("test");
+    seedSkill(state, "visible", ["go.ts"]);
+    seedSkill(state, "hidden", ["go.ts"]);
+    const block = buildSkillScriptsBlock(state, new Set(["visible"]));
+    expect(block).toContain("- visible: go");
+    expect(block).not.toContain("hidden");
   });
 });

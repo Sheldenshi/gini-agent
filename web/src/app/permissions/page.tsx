@@ -215,6 +215,7 @@ function SetupRequestCard({
   const isBrowserConnect = setup.action === "browser.connect";
   const isConnectorRequest = setup.action === "connector.request";
   const isBrowserFillSecret = setup.action === "browser.fill_secret";
+  const isSkillGrant = setup.action === "skill.grant_connector";
   const reasonText =
     (typeof setup.payload?.reason === "string" && setup.payload.reason.length > 0
       ? setup.payload.reason
@@ -225,7 +226,9 @@ function SetupRequestCard({
       ? "Provider setup"
       : isBrowserFillSecret
         ? "Fill credentials"
-        : setup.action;
+        : isSkillGrant
+          ? "Grant skill access"
+          : setup.action;
   return (
     <Card>
       <CardHeader>

@@ -1,6 +1,6 @@
 import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ApprovalMode, Instance, RuntimeConfig } from "../types";
-import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot } from "../paths";
+import { configPath, ensureDir, hasPreFlipMigrationMarker, instanceRoot, instancesRoot, writeRuntimeConfig } from "../paths";
 import { mutateState, readState, seedDefaultAgentFromRuntimeConfig, taskCounts } from "../state";
 import { addAudit } from "../state/audit";
 import { appendLog } from "../state/trace";
@@ -112,7 +112,7 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // `config.migrated` event so the trail captures the silent
   // behavior change from "gate everything" to "auto-approve safe
   // actions" for this instance.
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   // One-shot migration: drain `state.memories` (legacy pinned memories) into
   // the instance-scoped USER.md and clear the array. Idempotent via a state
   // marker; best-effort — a failure audits via appendLog and lets the runtime
@@ -270,7 +270,7 @@ export function updateAutoApproveSettings(
   // that pre-dated the scaffold logic). Idempotent — does nothing if the
   // files already exist.
   scaffoldInstanceIdentityFiles(config.instance);
-  writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+  writeRuntimeConfig(config);
   const effectiveMode: ApprovalMode = config.approvalMode ?? (config.dangerouslyAutoApprove ? "yolo" : "auto");
   return {
     patterns: config.autoApproveCommands ?? [],

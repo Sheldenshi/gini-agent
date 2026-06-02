@@ -21,7 +21,17 @@ import type { RuntimeState } from "../types";
 // across web / mobile / CLI bridges (see ADR chat-block-protocol.md).
 // When omitted on a TOOL_DEFS entry, `chatBlockLabelFor` falls back to a
 // humanized version of the tool name.
-const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string }> = [
+//
+// `deferred` marks a tool whose full schema is NOT shipped to the provider
+// until the model loads it via the `load_tools` meta-tool. A deferred tool's
+// NAME + `indexSummary` still surface in the system-prompt "available on
+// demand" index so the model knows the capability exists; the schema only
+// joins the provider `tools` array once loaded. This keeps the live
+// full-schema tool count low (weak local providers degrade past ~30-50 live
+// tools) while preserving access to the whole catalog. `indexSummary` is the
+// one-line description used in that index (falls back to the description's
+// first sentence when omitted).
+const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: string; deferred?: boolean; indexSummary?: string }> = [
   {
     toolset: "file",
     displayLabel: "Read file",
@@ -154,7 +164,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "terminal_exec",
-      description: "Run a shell command in the workspace. Approval-gated; user must approve. Returns stdout/stderr and exit code. Set timeoutMs explicitly for slow commands (Apple/AppleScript-backed CLIs like memo or remindctl can take 30+ seconds; brew installs can take minutes). Set pty=true for interactive CLI tools (vim, memo, claude-code, codex, python repl) — without pty they hang or exit immediately because stdin is not a TTY. To drive vim non-interactively, pre-feed keystrokes via stdin like: `printf 'i<title>\\n<body>\\x1b:wq\\n' | <command>`.",
+      description: "Run a shell command in the workspace. Approval-gated; user must approve. Returns stdout/stderr and exit code. Set timeoutMs explicitly for slow commands (Apple/AppleScript-backed CLIs like memo or remindctl can take 30+ seconds; brew installs can take minutes). Set pty=true for interactive CLI tools (vim, memo, claude-code, codex, python repl) — without pty they hang or exit immediately because stdin is not a TTY. Commands always run with a clean env: no connector secrets are ever injected, so a Linear-token leak can't ride alongside a curl invocation. A command that genuinely needs a connector credential must ship as a skill script and be invoked via `skill_run` — that is the only path connector secrets enter a process.",
       parameters: {
         type: "object",
         properties: {
@@ -231,8 +241,38 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // The deferred-tools meta-tool. CORE (always-on, never deferred): it is
+    // the only way the model can pull a deferred tool's schema into the live
+    // provider `tools` array. The system prompt lists deferred tools by name
+    // + one-line summary under an "available on demand" index; the model
+    // calls load_tools with the exact names, and from the NEXT turn on it
+    // calls those tools directly by name. Handled INLINE in the chat-task
+    // loop (not via the dispatch switch) so it can mutate the loaded set and
+    // persist it onto the task.
+    toolset: "core",
+    displayLabel: "Load tools",
+    type: "function",
+    function: {
+      name: "load_tools",
+      description: "Load the full schemas for one or more tools listed in the 'Tools available on demand' section of your system prompt so you can call them. Pass their EXACT names. After this returns, call each loaded tool directly by name on a later turn — do NOT pass its arguments to load_tools. Example: load_tools({\"names\":[\"browser_navigate\"]}).",
+      parameters: {
+        type: "object",
+        properties: {
+          names: {
+            type: "array",
+            items: { type: "string" },
+            description: "Exact names of the on-demand tools to load (e.g. ['browser_navigate', 'browser_snapshot'])."
+          }
+        },
+        required: ["names"]
+      }
+    }
+  },
+  {
     toolset: "browser",
     displayLabel: "Open page",
+    deferred: true,
+    indexSummary: "Open a URL in a headless browser and get an accessibility snapshot to click/type into. Load this first when starting any browser task.",
     type: "function",
     function: {
       name: "browser_navigate",
@@ -249,6 +289,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Snapshot page",
+    deferred: true,
+    indexSummary: "Re-snapshot the current browser page to get fresh @eN element refs.",
     type: "function",
     function: {
       name: "browser_snapshot",
@@ -264,6 +306,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Click element",
+    deferred: true,
+    indexSummary: "Click an element on the current page by its @eN ref.",
     type: "function",
     function: {
       name: "browser_click",
@@ -280,6 +324,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Type text",
+    deferred: true,
+    indexSummary: "Type text into an input element on the current page by its @eN ref.",
     type: "function",
     function: {
       name: "browser_type",
@@ -297,6 +343,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Press key",
+    deferred: true,
+    indexSummary: "Press a keyboard key on the current page (Enter, Tab, ArrowDown, …).",
     type: "function",
     function: {
       name: "browser_press",
@@ -313,6 +361,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Scroll page",
+    deferred: true,
+    indexSummary: "Scroll the current page up or down by one viewport.",
     type: "function",
     function: {
       name: "browser_scroll",
@@ -329,6 +379,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Go back",
+    deferred: true,
+    indexSummary: "Navigate back one entry in the browser history.",
     type: "function",
     function: {
       name: "browser_back",
@@ -339,6 +391,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Read console",
+    deferred: true,
+    indexSummary: "Read recent console messages, or evaluate a JavaScript expression on the page.",
     type: "function",
     function: {
       name: "browser_console",
@@ -355,6 +409,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Close browser",
+    deferred: true,
+    indexSummary: "Close the browser session for the current task.",
     type: "function",
     function: {
       name: "browser_close",
@@ -365,6 +421,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Hover element",
+    deferred: true,
+    indexSummary: "Hover over an element by its @eN ref to reveal tooltips or hover menus.",
     type: "function",
     function: {
       name: "browser_hover",
@@ -381,6 +439,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Drag element",
+    deferred: true,
+    indexSummary: "Drag from one element to another by their @eN refs.",
     type: "function",
     function: {
       name: "browser_drag",
@@ -398,6 +458,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Select option",
+    deferred: true,
+    indexSummary: "Select an option in a <select> element by its @eN ref.",
     type: "function",
     function: {
       name: "browser_select_option",
@@ -416,6 +478,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Wait for element",
+    deferred: true,
+    indexSummary: "Wait for an element (by @eN ref) to reach a state, or for text to appear on the page.",
     type: "function",
     function: {
       name: "browser_wait_for",
@@ -438,6 +502,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Manage tabs",
+    deferred: true,
+    indexSummary: "List, open, switch, or close browser tabs.",
     type: "function",
     function: {
       name: "browser_tabs",
@@ -460,6 +526,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Upload file",
+    deferred: true,
+    indexSummary: "Upload a workspace file via a file input on the current page.",
     type: "function",
     function: {
       name: "browser_upload_file",
@@ -494,6 +562,8 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
+    deferred: true,
+    indexSummary: "Screenshot the current page and ask a vision model about what's visible (charts, images, layout).",
     type: "function",
     function: {
       name: "browser_vision",
@@ -521,14 +591,19 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "request_connector",
-      description: "Ask the user to connect an external provider (e.g. linear, github). Use this when a skill is available but inactive because the required connector is not configured. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
+      description: "Ask the user to connect a credential the task needs. This is the ONLY way to obtain a credential: it renders a SECURE inline input in the web chat so the value is captured server-side — NEVER ask the user to paste an API key, token, or secret as a normal chat message (the value would land in your context and the transcript). Two ways to call it: (1) pass a registered `provider` id (e.g. 'linear', 'github') for a known service; or (2) for a brand-new service that has no provider module, pass `name` + `type:\"api-key\"` (and optionally `label`, `mcpUrl`, `skillId`) to request an arbitrary api-key credential. Templateless requests support api-key ONLY — an oauth2 credential requires a registered provider or setup skill. The user sees a Connect button in the chat; the task pauses until they finish the setup, then resumes automatically.",
       parameters: {
         type: "object",
         properties: {
-          provider: { type: "string", description: "Provider id (e.g. 'linear'). Must match a registered provider module." },
+          provider: { type: "string", description: "Registered provider id (e.g. 'linear'). Use this for a known service whose setup is already modeled. Omit it (and pass `name` + `type:\"api-key\"` instead) for a brand-new service with no provider module." },
+          name: { type: "string", description: "Credential name for a templateless request (no registered provider). It IS the environment variable, so it must be an uppercase token like SOME_SERVICE_API_KEY (matches /^[A-Z][A-Z0-9_]*$/). Required when `provider` is omitted." },
+          type: { type: "string", enum: ["api-key"], description: "Credential type for a templateless request. Only 'api-key' (a single secret token stored in the env var named by `name`) is supported templatelessly; an oauth2 credential needs a registered provider or setup skill. Required when `provider` is omitted." },
+          label: { type: "string", description: "Optional human-readable label shown to the user for a templateless request (e.g. 'Some Service'). Defaults to `name`." },
+          mcpUrl: { type: "string", description: "Optional MCP server URL to associate with an api-key credential (templateless requests only)." },
+          skillId: { type: "string", description: "Optional id of the skill that needs this credential. When set, completing the card both stores the credential AND grants it to this skill — no separate consent card." },
           reason: { type: "string", description: "The full user-visible message shown above the inline Connect form. You are responsible for producing the complete text — including any URLs, project IDs, click instructions, or step-by-step guidance the user needs. Substitute any real values (project ids, etc.) directly into the string; do not leave `${...}` placeholders. The skill body (when one applies) shows the exact format to follow; copy it line-for-line, fill in the real values, and pass the result here verbatim." }
         },
-        required: ["provider", "reason"]
+        required: ["reason"]
       }
     }
   },
@@ -572,6 +647,185 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Messaging-bridge-request affordance. Surfaces the same inline form
+    // card used by `request_connector` / `browser_fill_secrets`, but for
+    // adding a Telegram bridge. The agent calls this when the user asks
+    // something like "add a telegram bot" or "wire up telegram"; the
+    // user sees a card with a name input and a bot-token input
+    // (password-masked) inside the chat. On Submit, the gateway
+    // forwards the values to addMessagingBridge — same code path the
+    // CLI (`gini messaging add`) and the settings page already go
+    // through. Bot token never enters the model context, the audit row
+    // evidence, or the chat transcript.
+    //
+    // Discord is deliberately NOT advertised in the kind enum: a
+    // Discord bridge requires a list of channel IDs (deliveryTargets)
+    // that the current chat card doesn't collect, so the create would
+    // always fail at the /connect handler's deliveryTargets check.
+    // Discord still flows through the CLI and the settings dialog,
+    // both of which surface the channel-ID input. When the chat card
+    // grows a channel-IDs textarea, widen the enum here.
+    toolset: "messaging",
+    displayLabel: "Add messaging bridge",
+    type: "function",
+    function: {
+      name: "request_messaging_bridge",
+      description: "Ask the user to wire up a Telegram messaging bridge by entering a bot token. Use this when the user says something like 'add a telegram bot', 'connect telegram', or any other Telegram onboarding ask. The user sees an inline card in chat with a name input and a password-masked bot-token input; once they submit, the bridge is created on the runtime — same path as the CLI's `gini messaging add` and the settings page's Add Telegram dialog. The task pauses on this approval and resumes automatically after the user submits. AFTER the bridge resolves successfully, the agent SHOULD typically chain `wait_for_messaging_pair` next so the user gets walked through the DM-the-bot → approve-the-pair handshake without context-switching — only skip the wait if the user explicitly asked to just provision the bridge without pairing right now. For Discord, point the user at the settings page (Add Discord button) because Discord bridges need a channel-ID list that this chat card does not collect.",
+      parameters: {
+        type: "object",
+        properties: {
+          kind: {
+            type: "string",
+            enum: ["telegram"],
+            description: "Which bridge kind to add. Only 'telegram' is supported from chat today; for Discord, direct the user to the settings page."
+          },
+          suggestedName: {
+            type: "string",
+            description: "Optional default name for the bridge (e.g. 'my-telegram-bot'). The user can edit this in the card before submitting. Defaults to a kind-derived placeholder when omitted."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the form explaining what the bridge will do (e.g. 'Add a Telegram bot so I can DM you updates.'). One line."
+          }
+        },
+        required: ["kind"]
+      }
+    }
+  },
+  {
+    // Read-only inventory of messaging bridges. Always-on so the agent
+    // can answer "what bridges do I have?" or "is the telegram bot
+    // configured?" without needing the messaging toolset enabled. Same
+    // always-on rationale as request_messaging_bridge: meta-tools that
+    // surface UI / read state are always available; the
+    // surface-gateway send_message tool stays gated.
+    toolset: "messaging",
+    displayLabel: "List messaging bridges",
+    type: "function",
+    function: {
+      name: "list_messaging_bridges",
+      description: "List the messaging bridges configured on this Gini instance. Returns each bridge's id, name, kind (telegram | discord | demo), status (configured | error | disabled), and bot username when present. Useful before suggesting bridge changes ('do you already have telegram?'), before calling request_remove_messaging_bridge or request_messaging_pairing (so you can target the right bridge id), or whenever the user asks 'what bots are connected?'. Read-only and cheap — call it whenever you need fresh state.",
+      parameters: {
+        type: "object",
+        properties: {}
+      }
+    }
+  },
+  {
+    // Read-only inventory of a Telegram bridge's pending pairing
+    // requests + allowlist. Always-on for the same reason as
+    // list_messaging_bridges. Cheap; call before
+    // request_messaging_pairing so the operator card shows the
+    // current row.
+    toolset: "messaging",
+    displayLabel: "List messaging pairings",
+    type: "function",
+    function: {
+      name: "list_messaging_pairings",
+      description: "List the pending Telegram pairing requests AND the currently-allowed chats for a bridge. Returns an object with `allowedChatIds` (the chats already enrolled) and `recentDeniedChats` (each pending row's chatId, sender, chatType, lastAttemptAt). Call this when the user says 'any pending bots?' / 'who DM'd the bot?' / 'show pairings'; the result tells you whether to immediately call request_messaging_pairing to surface an approve card. Verification codes are NOT returned by this tool — the operator confirms them out-of-band against the bot's DM reply, and request_messaging_pairing reads the code server-side when minting the approval. Only telegram bridges have an allowlist; calling on a discord/demo bridge returns an error envelope.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id (e.g. 'bridge_abc123') or human name (e.g. 'my-telegram-bot') of the bridge to query. Get it from list_messaging_bridges first if you're not sure."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
+    // Approval-gated affordance for confirming or rejecting an
+    // inbound Telegram pairing request from chat. The agent calls
+    // this after list_messaging_pairings shows there's a pending
+    // entry the user has likely just DM'd the bot from; the chat
+    // card displays the sender + verification code + expiry so the
+    // operator can verify the code matches what the user reports
+    // before approving. Approve / Reject both go through /connect
+    // (the agent doesn't run the side effect directly).
+    toolset: "messaging",
+    displayLabel: "Wait for messaging pair",
+    type: "function",
+    function: {
+      name: "wait_for_messaging_pair",
+      description: "Block server-side until an inbound Telegram pairing request arrives on the named bridge, then automatically surface the messaging.approve_pairing confirmation card so the user can Approve / Reject inline. Use this RIGHT AFTER request_messaging_bridge succeeds: the agent should stay engaged with the user through the bridge add → user DMs bot → approve dance instead of returning control and asking the user to come back. The tool blocks for up to `timeoutSeconds` (default 600) checking for a fresh pending row every second; the moment one appears it mints the approval card and pauses the task on it. On Approve/Reject the chat-task loop resumes with the outcome string and the agent continues. On timeout, returns `{ok: false, error: 'timeout'}` so the agent can ask the user whether to keep waiting.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id or name to watch for inbound pairings. Same shape as list_messaging_pairings."
+          },
+          timeoutSeconds: {
+            type: "number",
+            description: "Max seconds to block waiting for an inbound pair. Default 600 (10 min — matches the verification code's TTL so a slow user can still complete pairing on the same code). The runtime clamps to [10, 1800]."
+          },
+          reason: {
+            type: "string",
+            description: "Optional user-visible text shown above the eventual approval card (e.g. 'Confirm the code I'm seeing matches what your bot replied with.'). One line."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
+    toolset: "messaging",
+    displayLabel: "Approve pairing request",
+    type: "function",
+    function: {
+      name: "request_messaging_pairing",
+      description: "Surface an Approve / Reject card in chat for a single pending Telegram pairing request. Use this when list_messaging_pairings reveals a pending row that the user is asking about (e.g. they just DM'd the bot from their phone and want to be enrolled). The card shows the sender, chat id, verification code, and expiry — the user clicks Approve only after confirming the code matches what their Telegram client received. Approve enrolls the chat on the allowlist and the bot greets the user; Reject clears the pending row without enrolling. Don't call this for pairing requests with expired codes — tell the user to DM the bot again to mint a fresh code.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id or name. Same shape list_messaging_pairings accepts."
+          },
+          chatId: {
+            type: "number",
+            description: "Telegram chat id from the pending row. Negative ids are valid (groups/supergroups), positive ids are direct DMs."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the card (e.g. 'Confirm this is you on Telegram before I enroll your chat.'). One line."
+          }
+        },
+        required: ["bridge", "chatId"]
+      }
+    }
+  },
+  {
+    // Approval-gated destructive affordance for tearing down a
+    // configured bridge from chat. Same passthrough-card pattern as
+    // the other request_ tools; the card surfaces a Remove
+    // confirmation with the bridge name. On Submit the runtime calls
+    // removeMessagingBridge — same path the CLI / settings page use.
+    toolset: "messaging",
+    displayLabel: "Remove messaging bridge",
+    type: "function",
+    function: {
+      name: "request_remove_messaging_bridge",
+      description: "Ask the user to confirm tearing down a messaging bridge from chat. The card shows the bridge's name + kind + an irreversibility warning ('deletes the bridge and its bot token; past messages stay in history'). Use this when the user says 'remove my telegram bot', 'delete the discord bridge', etc. List with list_messaging_bridges first if you don't already know the bridge id. The card requires explicit Remove confirmation; the user can Cancel to back out.",
+      parameters: {
+        type: "object",
+        properties: {
+          bridge: {
+            type: "string",
+            description: "Bridge id (e.g. 'bridge_abc123') or human name (e.g. 'my-telegram-bot'). Resolves to the same record list_messaging_bridges returns."
+          },
+          reason: {
+            type: "string",
+            description: "Short user-visible text shown above the confirmation (e.g. 'Confirm you want to delete the my-telegram-bot bridge and its bot token.'). One line."
+          }
+        },
+        required: ["bridge"]
+      }
+    }
+  },
+  {
     // Generic MCP tool invocation. The agent loop sees this as a single
     // tool entry; the dispatcher routes (server, tool, arguments) to the
     // matching McpServerRecord via src/integrations/mcp.ts. Each
@@ -594,6 +848,61 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           arguments: { type: "object", description: "Arguments object the MCP tool expects. Shape varies per tool — read the skill for details.", additionalProperties: true }
         },
         required: ["server", "tool"]
+      }
+    }
+  },
+  {
+    // skill_run: invoke a script that ships with an enabled skill. The
+    // skill's SKILL.md documents what scripts it offers and what args
+    // each takes; the runtime spawns the script with stdin = JSON args,
+    // env = connector secrets + GINI_* context, and returns stdout
+    // parsed as JSON. This is the dispatch surface for recipe-shaped
+    // procedures that live in skills (signed-URL upload flows, multi-
+    // step orchestrations, format conversions) — distinct from `mcp_call`
+    // (which hits external MCP servers) and from the primitive tools in
+    // the catalog (which expose raw runtime capabilities).
+    //
+    // Read the skill's body via read_skill first to know which scripts
+    // exist and what args they take.
+    toolset: "mcp",
+    displayLabel: "Run skill script",
+    type: "function",
+    function: {
+      name: "skill_run",
+      description: "Invoke a script that ships with an enabled skill. Use this for skill-bundled procedures (e.g. `skill_run({skill:'attachments', script:'signed-upload', args:{uploadId, url, headers}})` for signed-PUT upload flows). The skill's SKILL.md is the reference for which scripts it offers and what args each takes — read_skill it first. Returns the script's JSON result verbatim, or `{ok:false, error}` on script failure / non-JSON output.",
+      parameters: {
+        type: "object",
+        properties: {
+          skill: { type: "string", description: "Name of the enabled skill that owns the script (e.g. 'attachments')." },
+          script: { type: "string", description: "Script basename (no extension) inside the skill's scripts/ folder (e.g. 'signed-upload')." },
+          args: { type: "object", description: "Args object passed to the script as JSON on stdin. Shape is per-script; the skill's SKILL.md documents it.", additionalProperties: true }
+        },
+        required: ["skill", "script"]
+      }
+    }
+  },
+  {
+    // vision_query: ask the configured vision model a question about a
+    // Gini upload. Like browser_vision but for arbitrary uploads — pairs
+    // with skill-managed downloads/uploads and chat-attached images so
+    // the model can "see" content it didn't start with as a data URL.
+    // Stays in core (not a skill script) because it's a thin wrapper
+    // over the model's internal multimodal capability — same shape as
+    // browser_vision and web_fetch.
+    toolset: "mcp",
+    displayLabel: "Vision query",
+    type: "function",
+    function: {
+      name: "vision_query",
+      description: "Ask the configured vision model a question about an existing Gini upload (image/png or image/jpeg). Use this for chat-attached screenshots when you need to inspect details beyond what's already in vision context, or after skill scripts (e.g. attachments/signed-download) landed an image and you want the model to describe / extract from it. Returns { ok, answer, usage?, error? }. Costs a vision-model call.",
+      parameters: {
+        type: "object",
+        properties: {
+          uploadId: { type: "string", description: "Id of the image upload to query (from the chat marker, or from a skill script that landed an upload)." },
+          question: { type: "string", description: "What to ask about the image." },
+          maxTokens: { type: "number", description: "Optional cap on the response length. Default 512." }
+        },
+        required: ["uploadId", "question"]
       }
     }
   },
@@ -634,7 +943,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           approvalMode: {
             type: "string",
             enum: ["strict", "auto", "yolo"],
-            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" (instance default) auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
+            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
           },
           dangerousTerminalPatterns: {
             type: "array",
@@ -741,7 +1050,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         type: "object",
         properties: {
           body: { type: "string", description: "Full SKILL.md content (YAML frontmatter + markdown body)." },
-          category: { type: "string", description: "Optional category override. Defaults to metadata.gini.category in the frontmatter, then 'user'." },
           files: {
             type: "array",
             description: "Optional named-file payloads written next to SKILL.md (e.g. scripts/linear.sh). Each entry's name is treated as a relative path under the skill folder and must not escape it.",
@@ -769,7 +1077,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "enable_skill",
-      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Trivial; no approval gate.",
+      description: "Enable a registered skill so it appears in the advertised-skills block and the agent can read its body. Use after the user asks to turn a skill on (or after install_skill if the manifest didn't auto-enable). Bundled (first-party) skills enable immediately. Enabling a non-bundled skill that requires a credentialed connector first prompts the user for a one-time consent grant (a setup card per connector) before the skill can use that credential — expect the call to come back pending; the loop resumes once the user grants.",
       parameters: {
         type: "object",
         properties: {
@@ -969,12 +1277,445 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: []
       }
     }
+  },
+  // Self-config / self-introspection direct tools. Each maps 1:1 to a
+  // SelfOperation in self-registry.ts (the handler home). All are DEFERRED:
+  // their names + one-line summaries surface in the on-demand index, and the
+  // model loads the ones it needs via load_tools. Query tools resolve
+  // synchronously; the mutate tools route through the generic self.config
+  // approval branch in the dispatcher (auto-approved in `auto`, gated in
+  // `strict`). Args are passed at TOP LEVEL — no `{name, args}` envelope.
+  {
+    toolset: "self",
+    displayLabel: "Get self",
+    deferred: true,
+    indexSummary: "Compact snapshot of Gini's runtime: instance, port, version, active provider/model, active agent, approval mode, resource counts. Load this to answer 'what model are you using' / 'what's your setup'.",
+    type: "function",
+    function: {
+      name: "get_self",
+      description: "Compact snapshot of Gini's own runtime — instance, port, version, active provider/model, active agent, approval mode, and resource counts. Use this to answer questions about Gini's current configuration ('what model are you using?', 'what's your setup?'). Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List providers",
+    deferred: true,
+    indexSummary: "LLM provider catalog with which is active and which have credentials configured.",
+    type: "function",
+    function: {
+      name: "list_providers",
+      description: "List the LLM provider catalog — which provider is active and which have credentials configured. Read-only. Call this before set_provider to confirm the target is configured.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List agents",
+    deferred: true,
+    indexSummary: "Agents on this instance with per-agent provider/model overrides, toolset whitelists, and which is active.",
+    type: "function",
+    function: {
+      name: "list_agents",
+      description: "List the agents on this instance with their per-agent provider/model overrides, toolset whitelists, and which one is active. Read-only. Call before use_agent to get the right agent id.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List skills",
+    deferred: true,
+    indexSummary: "Installed skills with id, name, category, status, and trigger phrase. Filter by status or nameContains.",
+    type: "function",
+    function: {
+      name: "list_skills",
+      description: "List installed skills with id, name, category, status, and trigger phrase. Read-only. Filter by `status` or `nameContains`.",
+      parameters: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["enabled", "disabled", "archived", "all"],
+            description: "Filter by status. Defaults to 'all'.",
+            default: "all"
+          },
+          nameContains: { type: "string", description: "Optional case-insensitive substring filter on the skill name." }
+        }
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List MCP servers",
+    deferred: true,
+    indexSummary: "Registered MCP servers with transport, status, and exposed tool count.",
+    type: "function",
+    function: {
+      name: "list_mcp_servers",
+      description: "List the registered MCP servers with transport, status, and exposed tool count. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List connectors",
+    deferred: true,
+    indexSummary: "Registered connectors (claude-code, codex, linear, …) with provider, status, and health.",
+    type: "function",
+    function: {
+      name: "list_connectors",
+      description: "List the registered connectors (claude-code, codex, linear, …) with provider, status, and health. Read-only.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set provider",
+    deferred: true,
+    indexSummary: "Switch the active LLM provider and/or model. Confirm the target is configured via list_providers first.",
+    type: "function",
+    function: {
+      name: "set_provider",
+      description: "Switch the active LLM provider and/or model (e.g. 'switch to deepseek'). Confirm the target is configured via list_providers first. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: {
+            type: "string",
+            description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+          },
+          model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
+          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+          apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
+        },
+        required: []
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Use agent",
+    deferred: true,
+    indexSummary: "Switch the active agent. Its provider/model override, SOUL.md, toolset filter, and memory namespace take effect next turn.",
+    type: "function",
+    function: {
+      name: "use_agent",
+      description: "Switch the active agent. Its provider/model override, SOUL.md, toolset filter, and memory namespace take effect next turn. Call list_agents first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name (e.g. 'agent_abc123' or 'athena')." }
+        },
+        required: ["agentId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Create agent",
+    deferred: true,
+    indexSummary: "Create a new agent row (NOT activated — follow up with use_agent). Inherits provider/toolsets from the default agent unless overridden.",
+    type: "function",
+    function: {
+      name: "create_agent",
+      description: "Create a new agent row. It is NOT activated — follow up with use_agent to switch. Inherits provider/toolsets from the default agent unless overridden. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Human-readable name (e.g. 'Athena')." },
+          providerName: { type: "string", description: "Optional provider override (e.g. 'deepseek'). Defaults to the default agent's provider." },
+          model: { type: "string", description: "Optional model override (e.g. 'deepseek-v4-pro'). Defaults to the default agent's model." },
+          toolsets: {
+            type: "array",
+            description: "Optional list of toolset names this agent is allowed to use. Defaults to the default agent's toolset set.",
+            items: { type: "string" }
+          }
+        },
+        required: ["name"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set approval mode",
+    deferred: true,
+    indexSummary: "Set the runtime approval mode (strict / auto / yolo).",
+    type: "function",
+    function: {
+      name: "set_approval_mode",
+      description: "Set the runtime approval mode: strict (gate every high-risk action), auto (auto-approve safe actions, gate dangerous shell), or yolo (skip the per-action gate). Use when the user says 'set permissions to yolo' or 'stop asking me to approve'. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["strict", "auto", "yolo"], description: "strict | auto | yolo." }
+        },
+        required: ["mode"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List toolsets",
+    deferred: true,
+    indexSummary: "Instance toolsets with status (enabled/disabled), description, and the tools each gates.",
+    type: "function",
+    function: {
+      name: "list_toolsets",
+      description: "List the instance toolsets with id, name, status (enabled/disabled), description, and the tool names each gates. Read-only. Call before enable_toolset/disable_toolset.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Enable toolset",
+    deferred: true,
+    indexSummary: "Enable a toolset so its tools become available. Reversible via disable_toolset.",
+    type: "function",
+    function: {
+      name: "enable_toolset",
+      description: "Enable a toolset so its tools become available to agents on this instance. Call list_toolsets first for the name. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+        },
+        required: ["toolset"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Disable toolset",
+    deferred: true,
+    indexSummary: "Disable a toolset so its tools stop being offered. Self-config tools bypass gating, so this can't lock the agent out. Reversible via enable_toolset.",
+    type: "function",
+    function: {
+      name: "disable_toolset",
+      description: "Disable a toolset so its tools stop being offered to agents. Self-config tools bypass toolset gating, so this can't lock the agent out of its own config surface; reversible via enable_toolset. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+        },
+        required: ["toolset"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Delete agent",
+    deferred: true,
+    indexSummary: "Hard-delete an agent and its memory bank. Refuses the default and the active agent (switch first).",
+    type: "function",
+    function: {
+      name: "delete_agent",
+      description: "Hard-delete an agent and its per-agent memory bank. Refuses the default agent and the currently-active agent (switch via use_agent first). Call list_agents for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name to delete (e.g. 'agent_abc123' or 'athena')." }
+        },
+        required: ["agentId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove provider",
+    deferred: true,
+    indexSummary: "Disconnect an env-keyed LLM provider: scrub its API key. Falls back to codex/echo if it was active.",
+    type: "function",
+    function: {
+      name: "remove_provider",
+      description: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex and local cannot be removed this way. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek')." }
+        },
+        required: ["provider"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set auto-approve commands",
+    deferred: true,
+    indexSummary: "REPLACE the auto-approve command allowlist. Include existing entries (from get_self.approvalSettings) to keep them.",
+    type: "function",
+    function: {
+      name: "set_auto_approve_commands",
+      description: "REPLACE the auto-approve command allowlist (shell prefixes auto-approved without gating). This REPLACES the existing list — read get_self.approvalSettings.autoApproveCommands first and include any entries you want to keep. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          patterns: {
+            type: "array",
+            description: "The FULL allowlist of command prefixes to auto-approve. This REPLACES the existing list — include existing entries (visible via get_self.approvalSettings.autoApproveCommands) to keep them.",
+            items: { type: "string" }
+          }
+        },
+        required: ["patterns"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set dangerous patterns",
+    deferred: true,
+    indexSummary: "REPLACE the dangerous-terminal-pattern list. Include existing entries (from get_self.approvalSettings) to keep them.",
+    type: "function",
+    function: {
+      name: "set_dangerous_patterns",
+      description: "REPLACE the dangerous-terminal-pattern list (substrings that always force a gate even in auto). This REPLACES the existing list — read get_self.approvalSettings.dangerousTerminalPatterns first and include any entries you want to keep. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          patterns: {
+            type: "array",
+            description: "The FULL list of dangerous command substrings that always require approval. This REPLACES the existing list — include existing entries (visible via get_self.approvalSettings.dangerousTerminalPatterns) to keep them.",
+            items: { type: "string" }
+          }
+        },
+        required: ["patterns"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Add MCP server",
+    deferred: true,
+    indexSummary: "Register a new MCP server (stdio command or http url) so its tools become available.",
+    type: "function",
+    function: {
+      name: "add_mcp_server",
+      description: "Register a new MCP server so its tools become available. http transport needs a url; stdio needs a command. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Server name (e.g. 'linear')." },
+          transport: { type: "string", enum: ["stdio", "http"], description: "Transport. Defaults to 'stdio', or 'http' when a url is given." },
+          command: { type: "string", description: "Executable for a stdio server (e.g. 'npx'). Required for stdio." },
+          args: { type: "array", description: "Argument list for the stdio command.", items: { type: "string" } },
+          url: { type: "string", description: "Streamable-HTTP endpoint for an http server (e.g. 'https://mcp.linear.app/mcp'). Required for http." },
+          headers: { type: "object", description: "Static or ${ENV}-placeholder header map for an http server." },
+          exposedTools: { type: "array", description: "Optional whitelist of tool names to expose from this server.", items: { type: "string" } }
+        },
+        required: ["name"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove MCP server",
+    deferred: true,
+    indexSummary: "Disable a registered MCP server so its tools stop being offered.",
+    type: "function",
+    function: {
+      name: "remove_mcp_server",
+      description: "Disable a registered MCP server so its tools stop being offered. Call list_mcp_servers first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server id or name." }
+        },
+        required: ["server"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove connector",
+    deferred: true,
+    indexSummary: "Disconnect a connector: wipe its secrets (user) or tombstone it (auto-detected).",
+    type: "function",
+    function: {
+      name: "remove_connector",
+      description: "Disconnect a connector: wipe its encrypted secrets (user connectors) or tombstone it (auto-detected ones). Call list_connectors first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          connector: { type: "string", description: "Connector id to remove." }
+        },
+        required: ["connector"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Rotate connector",
+    deferred: true,
+    indexSummary: "Rotate a connector's credential — write a new token into one of its secret slots.",
+    type: "function",
+    function: {
+      name: "rotate_connector",
+      description: "Rotate a connector's credential — write a new token into one of its secret slots. Pass 'purpose' when the connector has more than one slot. Call list_connectors first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          connector: { type: "string", description: "Connector id to rotate." },
+          token: { type: "string", description: "The new secret value to store." },
+          purpose: { type: "string", description: "Which secret slot to write (e.g. 'token'). Optional when the connector has exactly one slot; required when it has several." }
+        },
+        required: ["connector", "token"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Update runtime",
+    deferred: true,
+    indexSummary: "Update the runtime to the latest commit and RESTART the gateway to run the new code.",
+    type: "function",
+    function: {
+      name: "update_self",
+      description: "Update the runtime to the latest commit (git fetch + reset + bun install) and RESTART the gateway so the new code takes effect. Only works from the installer-managed runtime. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Roll back skill",
+    deferred: true,
+    indexSummary: "Roll a skill back to its previous saved version. Fails if it has no rollback history.",
+    type: "function",
+    function: {
+      name: "rollback_skill",
+      description: "Roll a skill back to its previous saved version. Fails if the skill has no rollback history. Call list_skills first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name to roll back." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Test skill",
+    deferred: true,
+    indexSummary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail.",
+    type: "function",
+    function: {
+      name: "test_skill",
+      description: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Records the test outcome on the skill, so it is approval-gated: auto-approved in `auto` mode, gated in `strict`. Call list_skills first for the id.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name to test." }
+        },
+        required: ["skillId"]
+      }
+    }
   }
 ];
 
 export type ToolCatalogTool = ToolFunctionSpec & {
   toolset: string;
   displayLabel?: string;
+  deferred?: boolean;
+  indexSummary?: string;
 };
 
 // Public read-only copy. Returned ordering is stable so the toolsHash is
@@ -982,6 +1723,7 @@ export type ToolCatalogTool = ToolFunctionSpec & {
 export function allTools(): ToolCatalogTool[] {
   return TOOL_DEFS.map((t) => ({ ...t, function: { ...t.function, parameters: { ...t.function.parameters } } }));
 }
+
 
 // Filter tools by enabled toolsets in state. The web_fetch tool is grouped
 // under "messaging" only because the legacy defaults didn't include a "web"
@@ -1005,6 +1747,11 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
   const enabled = new Set(state.toolsets.filter((t) => t.status === "enabled").map((t) => t.name));
   return allTools().filter((tool) => {
     if (tool.function.name === "web_fetch") return true;
+    // load_tools is the deferred-tools meta-tool. Always-on and on no legacy
+    // toolset (`core`); the model needs it to pull any deferred schema into
+    // the live tools array. Deferral itself is applied later by
+    // applyDeferralFilter, not by this gate — load_tools is never deferred.
+    if (tool.function.name === "load_tools") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh
@@ -1034,6 +1781,17 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // fresh instances even when a user has configured a server, so it
     // mirrors read_skill / spawn_subagent's always-on stance.
     if (tool.function.name === "mcp_call") return true;
+    // skill_run is the generic dispatch surface for skill-bundled
+    // procedures (recipe-shaped operations that live in skills, not in
+    // core). Always-on alongside mcp_call so a fresh instance can invoke
+    // any skill script without toolset toggling — the skill's `enabled`
+    // status is the gate.
+    if (tool.function.name === "skill_run") return true;
+    // vision_query is the base primitive that exposes the model's
+    // multimodal capability against arbitrary uploads — like
+    // browser_vision but not tied to the browser session. Always-on
+    // alongside mcp_call for the same reasons.
+    if (tool.function.name === "vision_query") return true;
     // request_connector is the in-chat affordance that lets the agent
     // ask the user to wire up a missing connector. Same always-on
     // rationale: a fresh instance with no toolsets toggled still needs
@@ -1051,6 +1809,32 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // visible so the agent can always escalate to the user instead
     // of guessing a credential.
     if (tool.function.name === "browser_fill_secrets") return true;
+    // request_messaging_bridge is the in-chat affordance for adding a
+    // Telegram / Discord bridge — peer of request_connector but for
+    // outbound messaging plumbing. Always-on for the same reason: the
+    // user should be able to ask "add a telegram bot" on a fresh
+    // instance without first toggling a toolset. The owning toolset is
+    // "messaging" (same as `send_message`), but unlike send_message
+    // this is a meta-tool that surfaces a credential form card; it
+    // doesn't egress data on its own. Always exposed so the onboarding
+    // path stays reachable even when the messaging toolset is disabled
+    // by operators who don't want the agent autonomously sending DMs.
+    if (tool.function.name === "request_messaging_bridge") return true;
+    // The rest of the chat-side messaging lifecycle: read-only
+    // inventory (list_messaging_bridges, list_messaging_pairings) so
+    // the agent can answer state questions, and approval-gated
+    // request_messaging_pairing / request_remove_messaging_bridge so
+    // the agent can drive pair-approval and removal from chat without
+    // the user needing to context-switch to the settings page. Same
+    // always-on rationale as request_messaging_bridge: meta-tools that
+    // surface UI cards or read state ride alongside it; the
+    // surface-gateway send_message tool stays gated by the messaging
+    // toolset kill switch.
+    if (tool.function.name === "list_messaging_bridges") return true;
+    if (tool.function.name === "list_messaging_pairings") return true;
+    if (tool.function.name === "wait_for_messaging_pair") return true;
+    if (tool.function.name === "request_messaging_pairing") return true;
+    if (tool.function.name === "request_remove_messaging_bridge") return true;
     // Always expose the core agent-capability meta-tools whose owning
     // toolsets aren't in the legacy defaults (`skills`, `subagents`).
     // Gating these on a toolset toggle would mean a fresh instance
@@ -1077,6 +1861,17 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // prompt regardless of toolset state, so always-on here is safe.
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
+    // Self-knowledge surface. The self-config / introspection tools
+    // (get_self, the list_* readers, and the mutate ops like set_provider /
+    // use_agent / set_approval_mode) are direct deferred tools on the "self"
+    // toolset, which is not a legacy default;
+    // gating on enable would mean a fresh instance couldn't answer "what
+    // model are you using" or "switch to deepseek" — the exact asks the
+    // surface exists for. They pass gating here; deferral (applied later by
+    // applyDeferralFilter) is what keeps them out of the live tools array
+    // until the model loads them. Query tools are read-only; the mutate
+    // tools gate via the self.config approval branch in dispatch.
+    if (tool.toolset === "self") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
     return true;
@@ -1092,11 +1887,151 @@ export function hashCatalog(tools: ToolCatalogTool[]): string {
   return createHash("sha1").update(summary).digest("hex").slice(0, 16);
 }
 
-// Return the OpenAI tool spec without the `toolset` / `displayLabel`
-// annotations we use for filtering and chat rendering. The provider
-// only knows the `type/function` shape.
+// Return the OpenAI tool spec without the `toolset` / `displayLabel` /
+// `deferred` / `indexSummary` annotations we use for filtering, chat
+// rendering, and the deferred-tools index. The provider only knows the
+// `type/function` shape.
 export function toProviderTools(tools: ToolCatalogTool[]): ToolFunctionSpec[] {
-  return tools.map(({ toolset: _toolset, displayLabel: _displayLabel, ...rest }) => rest);
+  return tools.map(
+    ({ toolset: _toolset, displayLabel: _displayLabel, deferred: _deferred, indexSummary: _indexSummary, ...rest }) => rest
+  );
+}
+
+// ---------------- Deferred tools ----------------
+//
+// A deferred tool's full schema is withheld from the provider until the
+// model loads it via load_tools. The functions below are the pure surface
+// the chat-task loop drives: build the system-prompt index, filter the
+// provider catalog by the loaded set, resolve names, and run a load_tools
+// call. None of them touch state — the loop owns persistence.
+
+// First sentence of a (possibly multi-paragraph) tool description, capped so
+// the on-demand index stays compact. Splits on the first sentence-ending
+// punctuation followed by whitespace; falls back to a hard char cap.
+export function firstSentence(text: string, cap = 140): string {
+  const trimmed = text.trim();
+  const match = trimmed.match(/^.*?[.!?](?=\s|$)/);
+  const sentence = match ? match[0] : trimmed;
+  if (sentence.length <= cap) return sentence;
+  return sentence.slice(0, cap - 1).trimEnd() + "…";
+}
+
+// The system-prompt "available on demand" index: every deferred tool in the
+// (already-gated) catalog that the model has NOT yet loaded, as {name,
+// summary}. summary prefers the curated `indexSummary`, falling back to the
+// description's first sentence.
+export function deferredToolIndex(
+  catalog: ToolCatalogTool[],
+  loaded: ReadonlySet<string>
+): Array<{ name: string; summary: string }> {
+  return catalog
+    .filter((tool) => tool.deferred && !loaded.has(tool.function.name))
+    .map((tool) => ({
+      name: tool.function.name,
+      summary: tool.indexSummary ?? firstSentence(tool.function.description ?? "")
+    }));
+}
+
+// The provider-facing catalog: drop deferred tools the model hasn't loaded
+// yet. Core tools always pass; a deferred tool passes only once its name is
+// in `loaded`. The hot no-load path (loaded === ∅) returns exactly the core
+// tools, byte-identical to a catalog with no deferred entries.
+export function applyDeferralFilter(
+  catalog: ToolCatalogTool[],
+  loaded: ReadonlySet<string>
+): ToolCatalogTool[] {
+  return catalog.filter((tool) => !tool.deferred || loaded.has(tool.function.name));
+}
+
+// Partition the requested names against the (already-gated) catalog. Only a
+// deferred tool that is present in the catalog counts as loadable — a core
+// tool (already live) or a name the catalog doesn't carry lands in `unknown`
+// so the model gets a clear signal instead of silently no-op-ing.
+export function resolveLoadableTools(
+  catalog: ToolCatalogTool[],
+  names: string[]
+): { loaded: string[]; unknown: string[] } {
+  const deferredNames = new Set(
+    catalog.filter((tool) => tool.deferred).map((tool) => tool.function.name)
+  );
+  const loaded: string[] = [];
+  const unknown: string[] = [];
+  for (const name of names) {
+    if (deferredNames.has(name)) loaded.push(name);
+    else unknown.push(name);
+  }
+  return { loaded, unknown };
+}
+
+// Closest deferred-tool names for an unknown load request, so the model gets
+// a "did you mean" nudge instead of a bare miss. A candidate is "close" when
+// one name contains the other or they share a leading token.
+function suggestDeferredTools(catalog: ToolCatalogTool[], name: string): string[] {
+  const lower = name.toLowerCase();
+  const head = lower.split(/[_\s]/)[0] ?? lower;
+  return catalog
+    .filter((tool) => tool.deferred)
+    .map((tool) => tool.function.name)
+    .filter((candidate) => {
+      const c = candidate.toLowerCase();
+      return c.includes(lower) || lower.includes(c) || (head.length > 0 && c.startsWith(head));
+    })
+    .slice(0, 5);
+}
+
+// Run a load_tools call against the catalog + current loaded set. Lenient
+// parse (a malformed arg blob yields an empty names list rather than
+// throwing — the model gets a recoverable envelope). Returns the JSON
+// tool-result string plus the names that became NEWLY loaded this call, so
+// the loop can union them into the loaded set and persist.
+export function handleLoadTools(
+  rawArgs: string,
+  catalog: ToolCatalogTool[],
+  loaded: ReadonlySet<string>
+): { result: string; newlyLoaded: string[] } {
+  let names: string[] = [];
+  try {
+    const parsed = rawArgs && rawArgs.trim() ? (JSON.parse(rawArgs) as unknown) : {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const raw = (parsed as Record<string, unknown>).names;
+      if (Array.isArray(raw)) {
+        names = raw.filter((n): n is string => typeof n === "string" && n.trim().length > 0).map((n) => n.trim());
+      } else if (typeof raw === "string" && raw.trim().length > 0) {
+        // Tolerate a single name passed as a bare string.
+        names = [raw.trim()];
+      }
+    }
+  } catch {
+    names = [];
+  }
+  const { loaded: loadable, unknown } = resolveLoadableTools(catalog, names);
+  const newlyLoaded = loadable.filter((name) => !loaded.has(name));
+  const alreadyLoaded = loadable.filter((name) => loaded.has(name));
+  const envelope: Record<string, unknown> = {
+    ok: true,
+    loaded: newlyLoaded,
+    alreadyLoaded,
+    unknown,
+    note: "These tools are now callable directly. Call them by name on your next turn — do not pass their arguments to load_tools."
+  };
+  if (unknown.length > 0) {
+    const didYouMean: Record<string, string[]> = {};
+    for (const name of unknown) {
+      const suggestions = suggestDeferredTools(catalog, name);
+      if (suggestions.length > 0) didYouMean[name] = suggestions;
+    }
+    if (Object.keys(didYouMean).length > 0) envelope.didYouMean = didYouMean;
+  }
+  return { result: JSON.stringify(envelope), newlyLoaded };
+}
+
+// Whether a tool NAME is a deferred catalog tool. Used by the dispatcher's
+// pre-switch guard: a deferred tool the model calls before loading it isn't
+// in the dispatch switch's reachable set yet (it ships no schema), so the
+// guard returns a recoverable "load it first" nudge instead of throwing
+// "Unknown tool".
+export function isDeferredToolName(toolName: string): boolean {
+  return TOOL_DEFS.some((tool) => tool.deferred && tool.function.name === toolName);
 }
 
 // Display-label lookup for ChatBlock rendering. Returns the catalog
@@ -1168,6 +2103,8 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.url));
     case "web_search":
       return truncatePreview(previewValue(safe.query));
+    case "load_tools":
+      return truncatePreview(Array.isArray(safe.names) ? safe.names.join(", ") : previewValue(safe.names));
     case "terminal_exec":
       return truncatePreview(previewValue(safe.command));
     case "code_exec":
@@ -1177,7 +2114,7 @@ export function chatBlockArgsPreviewFor(
     case "disable_skill":
       return truncatePreview(previewValue(safe.name) || previewValue(safe.skillId));
     case "install_skill":
-      return truncatePreview(previewValue(safe.category) || "skill");
+      return truncatePreview("skill");
     case "spawn_subagent":
       return truncatePreview(previewValue(safe.name) || previewValue(safe.prompt));
     case "browser_navigate":
@@ -1211,8 +2148,24 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(
         `${previewValue(safe.server)}.${previewValue(safe.tool)}`
       );
+    case "skill_run":
+      return truncatePreview(`${previewValue(safe.skill)}/${previewValue(safe.script)}`);
+    case "vision_query":
+      return truncatePreview(`${previewValue(safe.uploadId)}: ${previewValue(safe.question)}`);
     case "request_connector":
       return truncatePreview(previewValue(safe.provider));
+    case "request_messaging_bridge":
+      return truncatePreview(previewValue(safe.kind));
+    case "list_messaging_bridges":
+      return "";
+    case "list_messaging_pairings":
+      return truncatePreview(previewValue(safe.bridge));
+    case "wait_for_messaging_pair":
+      return truncatePreview(previewValue(safe.bridge));
+    case "request_messaging_pairing":
+      return truncatePreview(`${previewValue(safe.bridge)} chat ${previewValue(safe.chatId)}`);
+    case "request_remove_messaging_bridge":
+      return truncatePreview(previewValue(safe.bridge));
     case "create_job":
     case "run_job":
     case "delete_job":
@@ -1232,6 +2185,44 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.content));
     case "update_memory":
       return truncatePreview(previewValue(safe.memoryId));
+    case "get_self":
+    case "list_providers":
+    case "list_agents":
+    case "list_mcp_servers":
+    case "list_connectors":
+    case "list_toolsets":
+    case "update_self":
+      return "";
+    case "list_skills":
+      return truncatePreview(previewValue(safe.nameContains) || previewValue(safe.status) || "");
+    case "set_provider":
+      return truncatePreview(previewValue(safe.provider) || previewValue(safe.model) || "");
+    case "use_agent":
+      return truncatePreview(previewValue(safe.agentId));
+    case "create_agent":
+      return truncatePreview(previewValue(safe.name));
+    case "set_approval_mode":
+      return truncatePreview(previewValue(safe.mode));
+    case "enable_toolset":
+    case "disable_toolset":
+      return truncatePreview(previewValue(safe.toolset));
+    case "delete_agent":
+      return truncatePreview(previewValue(safe.agentId));
+    case "remove_provider":
+      return truncatePreview(previewValue(safe.provider));
+    case "set_auto_approve_commands":
+    case "set_dangerous_patterns":
+      return truncatePreview(Array.isArray(safe.patterns) ? `${safe.patterns.length} patterns` : "");
+    case "add_mcp_server":
+      return truncatePreview(previewValue(safe.name));
+    case "remove_mcp_server":
+      return truncatePreview(previewValue(safe.server));
+    case "remove_connector":
+    case "rotate_connector":
+      return truncatePreview(previewValue(safe.connector));
+    case "rollback_skill":
+    case "test_skill":
+      return truncatePreview(previewValue(safe.skillId));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
       // Keeps unmapped or future tools from emitting an empty preview.

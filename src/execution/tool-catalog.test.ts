@@ -6,16 +6,49 @@
 // tightly scoped agents can still reach the core agent capability surface:
 // web_fetch, read_skill, spawn_subagent, the scheduled-job tools
 // (create_job, list_jobs, update_job, delete_job, run_job), mcp_call,
-// request_connector, and the agent-capability meta-tools whose toolsets
-// aren't in the defaults (cancel_task, install_skill, enable_skill,
-// disable_skill). The surface-gateway tool `send_message` (toolset
-// `messaging`) is deliberately NOT always-on so the operator's toolset
-// enable/disable kill switch keeps working.
+// request_connector, browser_fill_secrets, request_messaging_bridge,
+// and the agent-capability meta-tools whose toolsets aren't in the
+// defaults (cancel_task, install_skill, enable_skill, disable_skill,
+// edit_soul, edit_user_profile). The surface-gateway tool `send_message`
+// (toolset `messaging`) is deliberately NOT always-on so the operator's
+// toolset enable/disable kill switch keeps working; the sibling
+// `request_messaging_bridge` IS always-on because it's a meta-tool
+// (renders an onboarding card; doesn't egress data) and the chat
+// onboarding path needs to be reachable on fresh instances.
 
 import { describe, expect, test } from "bun:test";
-import { buildToolCatalog } from "./tool-catalog";
+import {
+  applyDeferralFilter,
+  buildToolCatalog,
+  deferredToolIndex,
+  firstSentence,
+  handleLoadTools,
+  resolveLoadableTools,
+  toProviderTools
+} from "./tool-catalog";
 import { defaultToolsets } from "../state/defaults";
 import type { RuntimeState, ToolsetRecord } from "../types";
+
+// The 16 browser tools that are deferred (the cluster minus the two always-on
+// escalation/onboarding meta-tools browser_fill_secrets and browser_connect).
+const DEFERRED_BROWSER = [
+  "browser_navigate",
+  "browser_snapshot",
+  "browser_click",
+  "browser_type",
+  "browser_press",
+  "browser_scroll",
+  "browser_back",
+  "browser_console",
+  "browser_close",
+  "browser_hover",
+  "browser_drag",
+  "browser_select_option",
+  "browser_wait_for",
+  "browser_tabs",
+  "browser_upload_file",
+  "browser_vision"
+];
 
 function ts(name: string, status: ToolsetRecord["status"] = "enabled"): ToolsetRecord {
   return {
@@ -49,6 +82,9 @@ function stateWithToolsets(toolsets: ToolsetRecord[]): RuntimeState {
 
 const ALWAYS_ON = new Set([
   "web_fetch",
+  // The deferred-tools loader. Toolset "core" (not in defaults); always-on
+  // so the model can pull any deferred schema live. Never deferred itself.
+  "load_tools",
   "read_skill",
   "spawn_subagent",
   "create_job",
@@ -57,6 +93,13 @@ const ALWAYS_ON = new Set([
   "delete_job",
   "run_job",
   "mcp_call",
+  // skill_run is the generic dispatch surface for skill-bundled
+  // procedures (signed-URL uploads/downloads, format conversions,
+  // multi-step orchestrations). vision_query is the base primitive that
+  // exposes the model's multimodal capability on arbitrary uploads.
+  // Both always-on alongside mcp_call.
+  "skill_run",
+  "vision_query",
   "request_connector",
   // browser_fill_secrets is the meta-tool path for asking the user
   // to type a value into a DOM field on the agent's browser tab. It
@@ -65,6 +108,19 @@ const ALWAYS_ON = new Set([
   // logic as request_connector being outside the "connectors"
   // toolset.
   "browser_fill_secrets",
+  // The chat-side messaging lifecycle meta-tools. Same always-on
+  // rationale as request_connector / browser_fill_secrets — they
+  // surface UI cards or read state, never egress data on their own.
+  // The surface-gateway send_message tool stays GATED by the
+  // messaging toolset (operators flip the toolset to disable
+  // outbound DM autonomy without losing the onboarding / inventory
+  // / pairing / removal affordances).
+  "request_messaging_bridge",
+  "list_messaging_bridges",
+  "list_messaging_pairings",
+  "wait_for_messaging_pair",
+  "request_messaging_pairing",
+  "request_remove_messaging_bridge",
   "cancel_task",
   "install_skill",
   "enable_skill",
@@ -74,19 +130,63 @@ const ALWAYS_ON = new Set([
   // USER.md edits. The propose-vs-approve file split is the gate.
   "edit_soul",
   "edit_user_profile"
+  // The self-config tools (get_self, list_*, set_provider, …) live under
+  // the "self" toolset (not in defaults) and pass gating, but they are
+  // DEFERRED — they only join the live tools array once the model loads
+  // them. They are asserted separately (see "deferred tools" below), not
+  // in ALWAYS_ON, because ALWAYS_ON is the set that surfaces in the live
+  // (post-deferral) catalog with no toolsets enabled.
 ]);
 
+// The self-config / introspection tools, now direct deferred tools.
+const SELF_TOOLS = [
+  "get_self",
+  "list_providers",
+  "list_agents",
+  "list_skills",
+  "list_mcp_servers",
+  "list_connectors",
+  "set_provider",
+  "use_agent",
+  "create_agent",
+  "set_approval_mode",
+  "list_toolsets",
+  "enable_toolset",
+  "disable_toolset",
+  "delete_agent",
+  "remove_provider",
+  "set_auto_approve_commands",
+  "set_dangerous_patterns",
+  "add_mcp_server",
+  "remove_mcp_server",
+  "remove_connector",
+  "rotate_connector",
+  "update_self",
+  "rollback_skill",
+  "test_skill"
+];
+
 describe("buildToolCatalog", () => {
-  test("includes only always-on tools when no toolsets are enabled", () => {
+  test("includes only always-on (and ungated self) tools when no toolsets are enabled", () => {
     const state = stateWithToolsets([]);
     const catalog = buildToolCatalog(state);
+    // buildToolCatalog returns the gated catalog INCLUDING deferred tools;
+    // the self tools bypass toolset gating (deferral, applied later, is what
+    // hides them from the live array). So every tool here is either always-on
+    // or one of the self tools.
     for (const tool of catalog) {
-      expect(ALWAYS_ON.has(tool.function.name)).toBe(true);
+      expect(ALWAYS_ON.has(tool.function.name) || tool.toolset === "self").toBe(true);
     }
     // Sanity: every always-on tool surfaces.
     const names = new Set(catalog.map((t) => t.function.name));
     for (const expected of ALWAYS_ON) {
       expect(names.has(expected)).toBe(true);
+    }
+    // The self tools surface (ungated) and are marked deferred.
+    for (const name of SELF_TOOLS) {
+      const tool = catalog.find((t) => t.function.name === name);
+      expect(tool).toBeDefined();
+      expect(tool?.deferred).toBe(true);
     }
   });
 
@@ -151,7 +251,9 @@ describe("buildToolCatalog", () => {
     const catalog = buildToolCatalog(state, new Set(["file"]));
     for (const tool of catalog) {
       if (ALWAYS_ON.has(tool.function.name)) continue;
-      // Only file.* tools should survive.
+      // The self tools bypass the agent toolset filter (ungated). Everything
+      // else surviving must be a file.* tool.
+      if (tool.toolset === "self") continue;
       expect(tool.toolset).toBe("file");
     }
     // file_read should be present, terminal_exec should not.
@@ -173,11 +275,36 @@ describe("buildToolCatalog", () => {
     expect(tool?.function.parameters.required).toEqual(["jobId"]);
   });
 
+  test("skill_run is always-on with the expected required args", () => {
+    // skill_run is the generic dispatch surface for skill-bundled
+    // procedures (signed-URL upload flows, format conversions, multi-
+    // step orchestrations) — always-on alongside mcp_call so a fresh
+    // instance can invoke any enabled skill's scripts.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "skill_run");
+    expect(tool).toBeDefined();
+    expect(tool?.function.parameters.required).toEqual(["skill", "script"]);
+  });
+
+  test("vision_query is always-on (stays a base primitive in core)", () => {
+    // vision_query exposes the model's internal multimodal capability —
+    // same shape as browser_vision / web_fetch. Stays in core; not a
+    // skill script.
+    const state = stateWithToolsets([]);
+    const catalog = buildToolCatalog(state);
+    const tool = catalog.find((t) => t.function.name === "vision_query");
+    expect(tool).toBeDefined();
+    expect(tool?.function.parameters.required).toEqual(["uploadId", "question"]);
+  });
+
   test("agent filter for a globally-disabled toolset still produces an empty (non-always-on) catalog", () => {
     const state = stateWithToolsets([ts("file", "disabled")]);
     const catalog = buildToolCatalog(state, new Set(["file"]));
     for (const tool of catalog) {
-      expect(ALWAYS_ON.has(tool.function.name)).toBe(true);
+      // Only always-on tools and the ungated self tools survive when the one
+      // requested toolset is globally disabled.
+      expect(ALWAYS_ON.has(tool.function.name) || tool.toolset === "self").toBe(true);
     }
   });
 
@@ -235,5 +362,175 @@ describe("buildToolCatalog", () => {
       expect(desc).toContain("persona");
       expect(desc).toContain("You are");
     });
+  });
+});
+
+describe("deferred tools", () => {
+  // Every shipped toolset enabled, so the browser toolset is gated-in and its
+  // deferred tools ride the catalog (subject to deferral, not the toolset
+  // kill switch).
+  const fullState = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
+
+  test("the 16 browser tools are deferred; load_tools, browser_connect, browser_fill_secrets are core", () => {
+    const catalog = buildToolCatalog(fullState);
+    for (const name of DEFERRED_BROWSER) {
+      const tool = catalog.find((t) => t.function.name === name);
+      expect(tool).toBeDefined();
+      expect(tool?.deferred).toBe(true);
+    }
+    // The escalation/onboarding meta-tools and the loader stay core.
+    for (const name of ["load_tools", "browser_connect", "browser_fill_secrets"]) {
+      const tool = catalog.find((t) => t.function.name === name);
+      expect(tool).toBeDefined();
+      expect(tool?.deferred).not.toBe(true);
+    }
+  });
+
+  test("applyDeferralFilter(catalog, ∅) drops every deferred tool but keeps core", () => {
+    const catalog = buildToolCatalog(fullState);
+    const filtered = applyDeferralFilter(catalog, new Set());
+    const names = new Set(filtered.map((t) => t.function.name));
+    for (const name of DEFERRED_BROWSER) {
+      expect(names.has(name)).toBe(false);
+    }
+    // Core tools survive an empty loaded set.
+    for (const name of ["load_tools", "browser_connect", "browser_fill_secrets", "file_read"]) {
+      expect(names.has(name)).toBe(true);
+    }
+    // No deferred tool leaks into the empty-loaded provider array.
+    expect(filtered.every((t) => !t.deferred)).toBe(true);
+  });
+
+  test("the self-config tools are deferred and absent from applyDeferralFilter(catalog, ∅)", () => {
+    const catalog = buildToolCatalog(fullState);
+    for (const name of SELF_TOOLS) {
+      const tool = catalog.find((t) => t.function.name === name);
+      expect(tool).toBeDefined();
+      expect(tool?.toolset).toBe("self");
+      expect(tool?.deferred).toBe(true);
+    }
+    const live = new Set(applyDeferralFilter(catalog, new Set()).map((t) => t.function.name));
+    for (const name of SELF_TOOLS) {
+      expect(live.has(name)).toBe(false);
+    }
+    // self_discover / self_invoke are gone.
+    const allNames = new Set(catalog.map((t) => t.function.name));
+    expect(allNames.has("self_discover")).toBe(false);
+    expect(allNames.has("self_invoke")).toBe(false);
+  });
+
+  test("applyDeferralFilter includes a deferred tool once it is loaded", () => {
+    const catalog = buildToolCatalog(fullState);
+    const filtered = applyDeferralFilter(catalog, new Set(["browser_navigate"]));
+    const names = new Set(filtered.map((t) => t.function.name));
+    expect(names.has("browser_navigate")).toBe(true);
+    // Sibling deferred tools that weren't loaded stay hidden.
+    expect(names.has("browser_click")).toBe(false);
+  });
+
+  test("toProviderTools strips deferred/indexSummary annotations", () => {
+    const catalog = buildToolCatalog(fullState);
+    const navigate = catalog.find((t) => t.function.name === "browser_navigate")!;
+    expect(navigate.deferred).toBe(true);
+    expect(navigate.indexSummary).toBeDefined();
+    const provider = toProviderTools([navigate]);
+    const spec = provider[0] as unknown as Record<string, unknown>;
+    expect("deferred" in spec).toBe(false);
+    expect("indexSummary" in spec).toBe(false);
+    expect("toolset" in spec).toBe(false);
+    expect("displayLabel" in spec).toBe(false);
+  });
+
+  test("deferredToolIndex lists unloaded deferred tools by name + summary, dropping loaded ones", () => {
+    const catalog = buildToolCatalog(fullState);
+    const indexEmpty = deferredToolIndex(catalog, new Set());
+    const indexNames = new Set(indexEmpty.map((e) => e.name));
+    for (const name of DEFERRED_BROWSER) {
+      expect(indexNames.has(name)).toBe(true);
+    }
+    // Core tools never appear in the on-demand index.
+    expect(indexNames.has("load_tools")).toBe(false);
+    expect(indexNames.has("browser_connect")).toBe(false);
+    // Every entry carries a non-empty summary.
+    for (const entry of indexEmpty) {
+      expect(entry.summary.length).toBeGreaterThan(0);
+    }
+    // A loaded tool drops out of the index.
+    const indexAfter = deferredToolIndex(catalog, new Set(["browser_navigate"]));
+    expect(indexAfter.some((e) => e.name === "browser_navigate")).toBe(false);
+  });
+
+  test("resolveLoadableTools partitions deferred (loadable) from unknown/core names", () => {
+    const catalog = buildToolCatalog(fullState);
+    const { loaded, unknown } = resolveLoadableTools(catalog, [
+      "browser_navigate",
+      "file_read", // core → not loadable
+      "nonsense_tool" // not in catalog
+    ]);
+    expect(loaded).toEqual(["browser_navigate"]);
+    expect(unknown.sort()).toEqual(["file_read", "nonsense_tool"].sort());
+  });
+
+  test("handleLoadTools loads deferred tools and reports newlyLoaded + alreadyLoaded + unknown", () => {
+    const catalog = buildToolCatalog(fullState);
+    const first = handleLoadTools(
+      JSON.stringify({ names: ["browser_navigate", "browser_snapshot"] }),
+      catalog,
+      new Set()
+    );
+    expect(first.newlyLoaded.sort()).toEqual(["browser_navigate", "browser_snapshot"].sort());
+    const firstEnvelope = JSON.parse(first.result) as {
+      ok: boolean;
+      loaded: string[];
+      alreadyLoaded: string[];
+      unknown: string[];
+      note: string;
+    };
+    expect(firstEnvelope.ok).toBe(true);
+    expect(firstEnvelope.loaded.sort()).toEqual(["browser_navigate", "browser_snapshot"].sort());
+    expect(firstEnvelope.alreadyLoaded).toEqual([]);
+    expect(firstEnvelope.note).toContain("callable directly");
+
+    // Re-loading an already-loaded tool: it lands in alreadyLoaded, not
+    // newlyLoaded.
+    const second = handleLoadTools(
+      JSON.stringify({ names: ["browser_navigate"] }),
+      catalog,
+      new Set(["browser_navigate"])
+    );
+    expect(second.newlyLoaded).toEqual([]);
+    const secondEnvelope = JSON.parse(second.result) as { alreadyLoaded: string[] };
+    expect(secondEnvelope.alreadyLoaded).toEqual(["browser_navigate"]);
+  });
+
+  test("handleLoadTools surfaces unknown names with didYouMean suggestions", () => {
+    const catalog = buildToolCatalog(fullState);
+    const { result, newlyLoaded } = handleLoadTools(
+      JSON.stringify({ names: ["browser_navigat"] }), // typo
+      catalog,
+      new Set()
+    );
+    expect(newlyLoaded).toEqual([]);
+    const envelope = JSON.parse(result) as {
+      unknown: string[];
+      didYouMean?: Record<string, string[]>;
+    };
+    expect(envelope.unknown).toEqual(["browser_navigat"]);
+    expect(envelope.didYouMean?.["browser_navigat"]).toContain("browser_navigate");
+  });
+
+  test("handleLoadTools tolerates malformed args without throwing", () => {
+    const catalog = buildToolCatalog(fullState);
+    const { result, newlyLoaded } = handleLoadTools("not json{", catalog, new Set());
+    expect(newlyLoaded).toEqual([]);
+    const envelope = JSON.parse(result) as { ok: boolean; loaded: string[] };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.loaded).toEqual([]);
+  });
+
+  test("firstSentence trims to the first sentence and caps length", () => {
+    expect(firstSentence("Open a page. Then do more.")).toBe("Open a page.");
+    const long = "a".repeat(200);
+    expect(firstSentence(long, 50).length).toBeLessThanOrEqual(50);
   });
 });

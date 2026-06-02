@@ -1,11 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { buildAgentSystemContext } from "./system-prompt";
+import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderResult, RuntimeConfig } from "./types";
+import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -151,6 +151,147 @@ export function providerCatalog(): ProviderCatalogItem[] {
       costHint: "unknown"
     }
   ];
+}
+
+// Short brand label for a provider, used in user-facing copy (e.g. the
+// re-authenticate note surfaced when a credential expires). Mirrors the web
+// settings labels: drops the catalog's "Compatible"/"OAuth" suffixes so the
+// brand reads cleanly on its own.
+export function providerDisplayLabel(name: ProviderName): string {
+  switch (name) {
+    case "codex":
+      return "Codex";
+    case "openai":
+      return "OpenAI";
+    case "openrouter":
+      return "OpenRouter";
+    case "deepseek":
+      return "DeepSeek";
+    case "local":
+      return "Local";
+    case "echo":
+      return "Gini Echo";
+  }
+}
+
+// Detects provider errors that mean the user's credential must be
+// re-established — an expired/invalid/revoked/incorrect token, a bare 401/
+// unauthorized, or an explicit "sign in again" / "log in again" /
+// "re-authenticate" instruction. Deliberately broader than
+// CODEX_SESSION_EXPIRED_RE (which gates retries and must avoid retrying generic
+// failures): here a false positive only adds a re-auth hint to a note we were
+// already going to show, so the matcher favors recall. An auth noun and an
+// expiry/invalidity verb must sit within the same sentence ([^.]{0,40}) and in
+// either order, so unrelated failures ("the cached file is invalid") don't trip
+// it. The noun uses `auth\w*` so both "authentication" and "authorization"
+// match. The connector after each noun/verb is `(?:[\s_-]|\b)` rather than a
+// bare `\b` so the snake_case enum forms the backend emits (`token_expired`,
+// `session_expired`) match too — `_` is a word char, so `\b` alone would miss
+// them.
+const AUTH_NOUN = "(?:auth\\w*|session|token|credential|api[\\s_-]*key|access[\\s_-]*token)";
+const AUTH_VERB =
+  "(?:expired|invalid|revoked|rejected|incorrect|missing|failed|disabled|deactivated|suspended)";
+const AUTH_EXPIRED_RE = new RegExp(
+  [
+    "\\b40[13]\\b",
+    "\\b(?:unauthorized|forbidden)\\b",
+    "not[\\s_-]+authori[sz]ed",
+    "(?:sign|log)(?:ing|ging)?[\\s-]*in[\\s-]*again",
+    "login[\\s-]*again",
+    "re-?authenticate",
+    `\\b${AUTH_NOUN}(?:[\\s_-]|\\b)[^.]{0,40}?${AUTH_VERB}\\b`,
+    `\\b${AUTH_VERB}(?:[\\s_-]|\\b)[^.]{0,40}?${AUTH_NOUN}\\b`
+  ].join("|"),
+  "i"
+);
+
+// Classifies provider auth failures. Called ONLY at provider-call sites (the
+// chat-task model call and the iteration-cap summary call), where a match
+// definitively means the credential failed — so a tool/browser/terminal error
+// that merely mentions "401" can never be misread as a provider re-auth. The
+// matcher therefore favors recall: expired/invalid/revoked/disabled tokens,
+// 401/403, "not authorized", and "sign/log in again".
+export function isAuthExpiredError(message: string | undefined): boolean {
+  if (!message) return false;
+  return AUTH_EXPIRED_RE.test(message);
+}
+
+// Mask credential-shaped substrings before a provider's raw error is stored or
+// rendered — some providers echo a partial key in their auth error. Conservative
+// on purpose: only well-known key/token shapes, so ordinary prose is untouched.
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-***")
+    .replace(/\bBearer\s+[A-Za-z0-9._-]{6,}/gi, "Bearer ***")
+    .replace(/\b(api[_-]?key|token|secret|password)(["'\s:=]+)[A-Za-z0-9._-]{6,}/gi, "$1$2***");
+}
+
+// Thrown in place of the raw provider error when a tool-calling / model call
+// fails on an auth error, tagging the provider that actually served the turn.
+// failTask reads `provider` off this so the re-auth note names the right
+// credential even if the active agent changed mid-call (issue #205).
+export class ProviderAuthError extends Error {
+  constructor(
+    readonly provider: ProviderName,
+    message: string
+  ) {
+    super(message);
+    this.name = "ProviderAuthError";
+  }
+}
+
+export type ProviderReauth = { kind: "docs" | "settings"; url: string };
+
+// Hosted documentation root. Re-auth step-throughs for OAuth/CLI providers live
+// here so the instructions have a single source and never drift from code.
+const DOCS_BASE_URL = "https://gini.lilaclabs.ai/docs";
+
+// Where to send the user to re-establish a failed provider credential. OAuth/
+// CLI providers (codex) have no in-app form and a non-obvious terminal flow, so
+// they link to the hosted step-through docs. API-key providers link straight to
+// the Settings → Providers key form — the specific cause is already in the
+// provider's own 401/403 message (surfaced as the note's detail), so no doc is
+// needed. The OAuth-vs-API-key split is read from the catalog's `auth` field,
+// not re-encoded here. See ADR provider-reauth-guidance.md.
+export function providerReauth(name: ProviderName): ProviderReauth {
+  const entry = providerCatalog().find((item) => item.name === name);
+  if (entry?.auth === "codex-oauth") {
+    // `#re-authentication` is the natural GitHub/standard-renderer slug for the
+    // "## Re-authentication" heading in docs/providers/<id>.md, so the anchor
+    // resolves both in-repo and on the hosted docs site.
+    return { kind: "docs", url: `${DOCS_BASE_URL}/providers/${name}#re-authentication` };
+  }
+  return { kind: "settings", url: "/settings" };
+}
+
+// Build the chat system-note payload for a provider auth failure — the
+// provider-named line plus the structured metadata the web renders as a CTA.
+// Shared by failTask and the iteration-cap summary path so both surface
+// identical notes. `detail` should already be redacted by the caller.
+export function providerAuthNote(
+  provider: ProviderName,
+  detail: string
+): { text: string; authError: SystemNoteAuthError } {
+  const providerLabel = providerDisplayLabel(provider);
+  const reauth = providerReauth(provider);
+  return {
+    text: providerAuthFailureText(providerLabel),
+    authError: { provider, providerLabel, detail, reauthKind: reauth.kind, reauthUrl: reauth.url }
+  };
+}
+
+// Actionable copy for a failed provider credential, shared by the chat system
+// note and the legacy assistant message so every client surface says the same
+// thing. Neutral on the failure mode (the classifier matches expired, invalid,
+// revoked, 401, …). Pass `reauth` for text-only clients (CLI/messaging) that
+// can't render a CTA button — the actionable target is appended inline; omit it
+// for the web note, which renders the CTA separately.
+export function providerAuthFailureText(providerLabel: string, reauth?: ProviderReauth): string {
+  const base = `${providerLabel} authentication failed.`;
+  if (!reauth) return `${base} Re-authenticate ${providerLabel} to continue.`;
+  return reauth.kind === "docs"
+    ? `${base} Re-authenticate ${providerLabel} to continue: ${reauth.url}`
+    : `${base} Update your ${providerLabel} API key in Settings → Providers.`;
 }
 
 // OpenAI tool-calling shapes. We mirror the chat-completions API surface
@@ -357,7 +498,15 @@ async function callToolCallingChatCompletions(
     ...sanitizeExtraBody(provider.extraBody),
     model: provider.model,
     messages: messages.map(serializeChatMessage),
-    stream: wantStream
+    stream: wantStream,
+    // Pin the default (non-extended) prompt cache tier on every
+    // OpenAI-compatible chat-completions call. "in_memory" is what the
+    // OpenAI docs document for prompts ≥ 1024 tokens (5–10 min idle, 1
+    // hour max) — explicitly NOT "24h", which is documented as not
+    // Zero Data Retention eligible. openrouter / deepseek / local
+    // accept-but-ignore unknown fields, so the value is a no-op there.
+    // Codex never hits this builder.
+    prompt_cache_retention: "in_memory"
   };
   if (tools.length > 0) {
     body.tools = tools;
@@ -1235,11 +1384,21 @@ export async function generateTaskSummary(
   const instructionsOverride = loadInstructions(config.instance, loadOpts) ?? undefined;
   const soulBlock = loadSoul(config.instance, activeAgentId, loadOpts) ?? undefined;
   const userProfileBlock = loadUserProfile(config.instance, loadOpts) ?? undefined;
-  const systemContext = buildAgentSystemContext(recalledContext, undefined, {
+  // The legacy single-shot path is one system + one user message with no
+  // prior transcript and no cross-turn cache prefix to preserve, so recalled
+  // memory stays appended to its system context (the stable-prefix tail only
+  // applies to the multi-turn chat-task loop). renderEphemeralContext
+  // single-sources the "Long-term memory…" header. See ADR
+  // stable-system-prefix.md.
+  const stablePrefix = buildAgentSystemContext({
     instructionsOverride,
     soul: soulBlock,
     userProfile: userProfileBlock
   });
+  const recalledBlock = renderEphemeralContext(undefined, recalledContext);
+  const systemContext = recalledBlock.length > 0
+    ? `${stablePrefix}\n\n${recalledBlock}`
+    : stablePrefix;
   if (provider.name === "openrouter" || provider.name === "local" || provider.name === "deepseek") {
     return callChatCompletions(provider, input, systemContext);
   }
@@ -1448,7 +1607,8 @@ async function callStructuredChatCompletions<T>(
         { role: "system", content: request.system },
         { role: "user", content: `${request.user}\n\nReturn ONLY valid JSON matching the ${request.schemaName} schema.` }
       ],
-      stream: false
+      stream: false,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -1629,7 +1789,8 @@ async function callOpenAIResponses(
             { type: "input_text", text: input }
           ]
         }
-      ]
+      ],
+      prompt_cache_retention: "in_memory"
     })
   });
 
@@ -1669,7 +1830,8 @@ async function callChatCompletions(provider: ProviderConfig, input: string, syst
         { role: "system", content: systemContext },
         { role: "user", content: input }
       ],
-      stream: false
+      stream: false,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();
@@ -2185,6 +2347,14 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "functions",
   "function_call",
   "store",
+  // Pinned at "in_memory" on every OpenAI-compatible chat-completions
+  // builder. Defense-in-depth: a future refactor that reorders the
+  // body spread so the typed field comes BEFORE sanitizeExtraBody
+  // would silently let extraBody.prompt_cache_retention shadow our
+  // explicit opt-out of the "24h" extended tier (documented as not
+  // Zero Data Retention eligible). Stripping the key here keeps the
+  // protection independent of spread order. See ADR cache-warmer.md.
+  "prompt_cache_retention",
   "__proto__",
   "constructor",
   "prototype",
@@ -2421,7 +2591,8 @@ async function callVisionChatCompletions(
         }
       ],
       stream: false,
-      ...tokenBudgetField
+      ...tokenBudgetField,
+      prompt_cache_retention: "in_memory"
     })
   });
   const rawPayload = await response.text();

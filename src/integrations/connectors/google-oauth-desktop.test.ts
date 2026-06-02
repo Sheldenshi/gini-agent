@@ -10,11 +10,15 @@ describe("googleOauthDesktopProvider", () => {
     expect(googleOauthDesktopProvider.description.length).toBeGreaterThan(0);
   });
 
-  test("declares client_id as a required non-secret field", () => {
+  test("declares client_id as a required secret field", () => {
+    // client_id is a credential component (resolved into the gws CLI env), so
+    // it is marked secret to route through the request dialog's `secrets` map
+    // and persist under purpose "client_id" rather than being dropped as
+    // non-secret metadata.
     const field = googleOauthDesktopProvider.fields.find((f) => f.name === "client_id");
     expect(field).toBeDefined();
     expect(field!.label).toBe("Client ID");
-    expect(field!.secret).toBe(false);
+    expect(field!.secret).toBe(true);
     expect(field!.required).toBe(true);
     expect(field!.placeholder).toMatch(/apps\.googleusercontent\.com/);
   });

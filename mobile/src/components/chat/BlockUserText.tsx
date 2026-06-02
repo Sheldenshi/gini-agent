@@ -1,7 +1,11 @@
-import { Image, StyleSheet, Text, View } from "react-native";
+import { Feather } from "@expo/vector-icons";
+import { useAudioPlayer, useAudioPlayerStatus } from "expo-audio";
+import { Image, Pressable, StyleSheet, Text, View } from "react-native";
 import { authHeader, uploadUrl } from "@/src/api";
+import { useImagePreview } from "@/src/components/ImagePreview";
 import { family, theme } from "@/src/theme";
-import type { UserTextBlock } from "@/src/types";
+import type { AudioAttachment, UserTextBlock } from "@/src/types";
+import { SelectableBlockText } from "./SelectableBlockText";
 
 // Right-aligned dark bubble. The asymmetric corner geometry has a
 // sharper bottom-left so the bubble visually "points" toward the
@@ -18,31 +22,99 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
   // Gateway uploads require the same bearer token the SSE / REST paths
   // use; <Image> on RN supports a headers prop on its source object.
   const headers = authHeader();
+  const { open } = useImagePreview();
   return (
     <View style={styles.row}>
       {images.length > 0 ? (
         <View style={styles.imageGrid}>
-          {images.map((image) => (
-            <View key={image.id} style={styles.imageWrapper}>
-              <Image
-                source={{ uri: uploadUrl(image.id), headers }}
-                style={styles.image}
-                resizeMode="cover"
-                accessibilityLabel="Attached image"
-              />
-            </View>
-          ))}
+          {images.map((image) => {
+            const uri = uploadUrl(image.id);
+            return (
+              <Pressable
+                key={image.id}
+                style={styles.imageWrapper}
+                onPress={() => open({ uri, headers })}
+                accessibilityRole="button"
+                accessibilityLabel="Open image"
+              >
+                <Image
+                  source={{ uri, headers }}
+                  style={styles.image}
+                  resizeMode="cover"
+                />
+              </Pressable>
+            );
+          })}
         </View>
       ) : null}
+      {block.audio ? <VoiceBubble audio={block.audio} /> : null}
       {hasText ? (
         <View style={styles.bubble}>
-          <Text style={styles.text} selectable>
+          <SelectableBlockText style={styles.text}>
             {block.text}
-          </Text>
+          </SelectableBlockText>
         </View>
       ) : null}
     </View>
   );
+}
+
+// Telegram-style playable voice bubble. The recording is streamed from
+// the gateway, which requires the same bearer header the <Image> path
+// uses — expo-audio's remote AudioSource accepts a `headers` map. The
+// track fills as playback advances; tapping play after the clip finishes
+// restarts it from the beginning.
+function VoiceBubble({ audio }: { audio: AudioAttachment }) {
+  const player = useAudioPlayer({ uri: uploadUrl(audio.id), headers: authHeader() });
+  const status = useAudioPlayerStatus(player);
+
+  // Prefer the decoded duration once it's known; fall back to the
+  // client-measured length so the m:ss reads correctly before load.
+  const durationMs =
+    status.duration > 0 ? status.duration * 1000 : (audio.durationMs ?? 0);
+  const positionMs = status.currentTime * 1000;
+  const progress = durationMs > 0 ? Math.min(1, positionMs / durationMs) : 0;
+  const remainingMs = status.playing ? Math.max(0, durationMs - positionMs) : durationMs;
+
+  const toggle = (): void => {
+    if (status.playing) {
+      player.pause();
+    } else {
+      if (status.didJustFinish || status.currentTime >= status.duration) {
+        void player.seekTo(0);
+      }
+      player.play();
+    }
+  };
+
+  return (
+    <View style={styles.voiceBubble}>
+      <Pressable
+        onPress={toggle}
+        hitSlop={8}
+        style={styles.voicePlay}
+        accessibilityRole="button"
+        accessibilityLabel={status.playing ? "Pause voice message" : "Play voice message"}
+      >
+        <Feather
+          name={status.playing ? "pause" : "play"}
+          size={16}
+          color={theme.userBubbleText}
+        />
+      </Pressable>
+      <View style={styles.voiceTrack}>
+        <View style={[styles.voiceProgress, { width: `${progress * 100}%` }]} />
+      </View>
+      <Text style={styles.voiceDuration}>{formatDuration(remainingMs)}</Text>
+    </View>
+  );
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.round(Math.max(0, ms) / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, "0")}`;
 }
 
 const styles = StyleSheet.create({
@@ -69,6 +141,48 @@ const styles = StyleSheet.create({
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 16,
     lineHeight: 22
+  },
+  // Voice control reuses the user-bubble color + corner geometry so it
+  // reads as part of the same right-aligned message.
+  voiceBubble: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    minWidth: 200,
+    backgroundColor: theme.userBubble,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 4,
+    borderBottomLeftRadius: 18
+  },
+  voicePlay: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: "rgba(255,255,255,0.18)",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  voiceTrack: {
+    flex: 1,
+    height: 3,
+    borderRadius: 1.5,
+    backgroundColor: "rgba(255,255,255,0.3)",
+    overflow: "hidden"
+  },
+  voiceProgress: {
+    height: 3,
+    borderRadius: 1.5,
+    backgroundColor: theme.userBubbleText
+  },
+  voiceDuration: {
+    color: theme.userBubbleText,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 13,
+    minWidth: 34,
+    textAlign: "right"
   },
   imageGrid: {
     flexDirection: "row",

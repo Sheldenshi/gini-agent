@@ -90,6 +90,123 @@ describe("skill-loader frontmatter parsing", () => {
     expect(parsed.body).toContain("# Body starts here");
     expect(parsed.body).toContain("Some content.");
   });
+
+  test("parseSkillFile reads metadata.gini.requires.credentials as names", () => {
+    const text = [
+      "---",
+      "name: linear",
+      'description: "Linear via MCP."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      credentials: [LINEAR_API_KEY]",
+      "---",
+      "",
+      "# Linear"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.requiredCredentials).toEqual(["LINEAR_API_KEY"]);
+    // A credential-name skill carries no legacy requiredConnectors.
+    expect(parsed.requiredConnectors).toBeUndefined();
+  });
+
+  test("parseSkillFile derives requiredCredentials from legacy requires.connectors (template providers)", () => {
+    const text = [
+      "---",
+      "name: legacy-linear",
+      'description: "Legacy connector form."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      connectors:",
+      "        - provider: linear",
+      "        - provider: google-oauth-desktop",
+      "---",
+      "",
+      "# Legacy"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    // The legacy connectors are still parsed (kept one release)...
+    expect(parsed.requiredConnectors).toEqual([
+      { provider: "linear" },
+      { provider: "google-oauth-desktop" }
+    ]);
+    // ...and mapped to credential names so runtime resolution stays name-based.
+    expect(parsed.requiredCredentials).toEqual(["LINEAR_API_KEY", "google-workspace-oauth"]);
+  });
+
+  test("parseSkillFile drops un-mappable providers (generic) from derived requiredCredentials", () => {
+    const text = [
+      "---",
+      "name: legacy-generic",
+      'description: "Legacy generic connector."',
+      "metadata:",
+      "  gini:",
+      "    requires:",
+      "      connectors:",
+      "        - provider: generic",
+      "---",
+      "",
+      "# Legacy"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    // generic has no canonical credential name — no derived credentials.
+    expect(parsed.requiredCredentials).toBeUndefined();
+  });
+
+  // A model-authored near-miss: a TOP-LEVEL `gini:` block (the loader only
+  // reads metadata.gini) AND `requirements` misspelled for `requires`. Both
+  // deviations drop the credential silently; the warnings must name the key,
+  // suggest the fix, flag the placement, and state the credential was dropped.
+  test("parseSkillFile warns on top-level gini block + requirements typo (weather3-style)", () => {
+    const text = [
+      "---",
+      "name: weather3",
+      'description: "Check the weather."',
+      "gini:",
+      "  category: user",
+      "  requirements:",
+      "    credentials:",
+      "      - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.warnings).toBeDefined();
+    const joined = (parsed.warnings ?? []).join(" ");
+    // (a) names `requirements`
+    expect(joined).toContain("requirements");
+    // (b) suggests `requires`
+    expect(joined).toContain("requires");
+    // (c) notes the top-level-gini placement
+    expect(joined).toContain("metadata.gini");
+    expect(joined.toLowerCase()).toContain("not read by the loader");
+    // (d) states no credentials were registered
+    expect(joined).toContain("NO credential requirements");
+    // The credential silently vanished — exactly the failure we catch.
+    expect(parsed.requiredCredentials).toBeUndefined();
+  });
+
+  test("parseSkillFile produces no warnings for a correct metadata.gini.requires.credentials skill", () => {
+    const text = [
+      "---",
+      "name: weather3",
+      'description: "Check the weather."',
+      "metadata:",
+      "  gini:",
+      "    category: user",
+      "    requires:",
+      "      credentials:",
+      "        - WEATHER3_API_KEY",
+      "---",
+      "",
+      "# Weather"
+    ].join("\n");
+    const parsed = parseSkillFile(text);
+    expect(parsed.warnings).toBeUndefined();
+    expect(parsed.requiredCredentials).toEqual(["WEATHER3_API_KEY"]);
+  });
 });
 
 describe("loadSkillsFromDisk", () => {

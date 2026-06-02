@@ -184,6 +184,17 @@ describe("approvalMode dispatch matrix", () => {
       const config = buildConfig(workspaceRoot, "strict-upload", { approvalMode: "strict" });
       const provider = normalizeProvider(config.provider);
 
+      // browser_upload_file is a deferred tool, so the model must load it
+      // before calling it; calling it directly would (correctly) be nudged by
+      // the loop's deferred-tool gate. Load it on the first turn, then call it.
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_upload_file"] }) } }
+        ],
+        finishReason: "tool_calls"
+      });
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -332,11 +343,14 @@ describe("approvalMode dispatch matrix", () => {
 
     test("autoApproveCommands allowlist short-circuits the dangerous-pattern blocklist", async () => {
       const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
-      // Operator explicitly allows `sudo apt update` — the allowlist
-      // must win over the built-in `sudo ` block.
+      // Operator explicitly allows a `sudo` command — the allowlist must
+      // win over the built-in `sudo ` block. The command is a
+      // non-interactive no-op (`sudo -n true`) rather than a real package
+      // command so the auto-approved exec runs instantly and offline; the
+      // gate-vs-allowlist decision is identical regardless of the payload.
       const config = buildConfig(workspaceRoot, "auto-allowlist-wins", {
         approvalMode: "auto",
-        autoApproveCommands: ["sudo apt update"]
+        autoApproveCommands: ["sudo -n true"]
       });
       const provider = normalizeProvider(config.provider);
 
@@ -344,7 +358,7 @@ describe("approvalMode dispatch matrix", () => {
         provider,
         text: "",
         toolCalls: [
-          { id: "call_t", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "sudo apt update" }) } }
+          { id: "call_t", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "sudo -n true" }) } }
         ],
         finishReason: "tool_calls"
       });
@@ -358,7 +372,7 @@ describe("approvalMode dispatch matrix", () => {
       // Allowlist fast-path bypasses approval-row creation entirely.
       expect(state.authorizations.filter((a) => a.taskId === task.id)).toHaveLength(0);
       const execAudits = state.audit.filter((a) => a.action === "terminal.exec" && a.taskId === task.id);
-      expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("sudo apt update");
+      expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("sudo -n true");
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });
@@ -590,7 +604,7 @@ describe("approvalMode dispatch matrix", () => {
         provider,
         text: "",
         toolCalls: [
-          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "js", code: `Bun.spawn(["sudo", "apt", "update"])` }) } }
+          { id: "call_c", type: "function", function: { name: "code_exec", arguments: JSON.stringify({ language: "js", code: `Bun.spawn(["sudo", "-n", "true"])` }) } }
         ],
         finishReason: "tool_calls"
       });
@@ -598,9 +612,12 @@ describe("approvalMode dispatch matrix", () => {
 
       const task = await submitTask(config, "spawn sudo yolo", { mode: "chat" });
       const finished = await waitForTerminal(config, task.id);
-      // Yolo auto-approves the policy decision. The actual `sudo apt
-      // update` exec almost certainly fails in CI (no sudo /
-      // network), but the gate behavior is what we're pinning.
+      // Yolo auto-approves the policy decision. The argv still trips the
+      // `sudo` dangerous-source pattern, but `sudo -n true` is
+      // non-interactive (never prompts) and a no-op — it terminates in
+      // milliseconds on any runner regardless of sudo/network, so the
+      // task settles well inside the wait cap. The gate behavior is what
+      // we're pinning, not the exec outcome.
       expect(["completed", "failed"]).toContain(finished.status);
 
       const state = readState(config.instance);

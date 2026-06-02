@@ -16,6 +16,7 @@ import {
   appendLog,
   appendTaskPartial,
   appendTrace,
+  createChatMessage,
   isTerminalTaskStatus,
   mutateState,
   now,
@@ -25,7 +26,11 @@ import {
 import { ApprovedActionFailedError, findTask, scheduleAutoRetain } from "../agent";
 import { recall } from "../memory";
 import {
+  ProviderAuthError,
   generateToolCallingResponse,
+  isAuthExpiredError,
+  providerAuthNote,
+  redactSecrets,
   type ToolCallingMessage,
   type MessageContentPart,
   type ToolCall
@@ -38,6 +43,7 @@ import {
   buildBoundJobsBlock,
   decideIdentityEmission,
   identityBudgetState,
+  renderEphemeralContext,
   renderFullIdentity
 } from "../system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity-files";
@@ -57,7 +63,16 @@ import type {
 } from "../types";
 import type { EffectiveContext } from "./effective-context";
 import { updateRunFromTask } from "./runs";
-import { buildToolCatalog, hashCatalog, toProviderTools } from "./tool-catalog";
+import {
+  applyDeferralFilter,
+  buildToolCatalog,
+  deferredToolIndex,
+  handleLoadTools,
+  hashCatalog,
+  isDeferredToolName,
+  toProviderTools,
+  type ToolCatalogTool
+} from "./tool-catalog";
 import {
   emitAuthorizationRequested,
   emitSetupRequested,
@@ -74,10 +89,11 @@ import {
 } from "./chat-task-emit";
 import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
+import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
 import { finalizeJobRunFromTask } from "../jobs/finalize";
 import { isSkillActive } from "../integrations/connectors";
-import { getProvider } from "../integrations/connectors/registry";
+import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
 
 // Default safety cap on chat-task loop iterations. Each iteration is one
@@ -352,7 +368,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   }
   const baseSystem = subagent && subagent.systemPrompt
     ? subagent.systemPrompt
-    : buildAgentSystemContext(recalledContext, identityBlock, {
+    : buildAgentSystemContext({
         instructionsOverride,
         soul: soulBlock,
         userProfile: userProfileBlock
@@ -367,7 +383,7 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const inactiveSkills = filteredSkills.filter(
     (skill) => skill.status === "enabled" && !isSkillActive(state, skill)
   );
-  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills);
+  const inactiveSkillsBlock = buildInactiveSkillsBlock(inactiveSkills, state);
   // Bound-jobs block: if this chat session has one or more JobRecords whose
   // chatSessionId matches, surface them in the system prompt so the model
   // can act on "this job" / "the reminder" without first calling list_jobs.
@@ -380,19 +396,51 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // invoking. Only "configured" status surfaces; disabled/error servers
   // stay hidden the same way disabled skills do.
   const mcpServersBlock = buildMcpServersBlock(state);
+  // Scripts shipped by the visible (active) skills, so the model reaches
+  // for skill_run rather than re-implementing the work in terminal_exec.
+  const skillScriptsBlock = buildSkillScriptsBlock(
+    state,
+    new Set(visibleSkills.map((skill) => skill.name))
+  );
+  // Deferred-tools index. Build the same gated + subagent-filtered catalog
+  // runLoop builds, seed a subagent's deferred tools (those are already live,
+  // so they must NOT appear in the on-demand list), then advertise whatever
+  // deferred tools remain unloaded by name + one-line summary. The full
+  // schemas join the provider tools array only after load_tools fires.
+  const deferredCatalog = filterToolsForSubagent(
+    buildToolCatalog(state, effectiveForAgent.toolsetFilter),
+    subagent
+  );
+  const alreadyLoaded = new Set<string>(task.loadedTools ?? []);
+  if (subagent) seedSubagentDeferred(deferredCatalog, subagent, alreadyLoaded);
+  const deferredBlock = buildDeferredToolsBlock(deferredToolIndex(deferredCatalog, alreadyLoaded));
   const sections = [baseSystem];
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);
+  if (skillScriptsBlock) sections.push(skillScriptsBlock);
+  if (deferredBlock) sections.push(deferredBlock);
   if (boundJobsBlock) sections.push(boundJobsBlock);
   const systemContext = sections.join("\n\n");
 
   // Conversation history: include prior turns from the same chat session so
   // the model has multi-turn context (the legacy single-shot path didn't).
   const prior = priorChatMessages(config, task);
+  // Ephemeral per-turn context: the emitted identity block and recalled
+  // memory ride in a role:"user" message placed after the full prior
+  // transcript and immediately before the real user message — so the
+  // byte-stable system prefix stays cacheable across turns. It's built live
+  // and never persisted (priorChatMessages reads only durable chatMessages),
+  // so the next turn rebuilds it fresh rather than replaying a stale tail.
+  // Only the non-subagent path injects it; subagents keep their single
+  // override prompt. role:"user" (not system) because codex hoists every
+  // system message into its top-level instructions, which would re-merge
+  // this content back into the cached prefix. See ADR stable-system-prefix.md.
+  const ephemeralContext = subagent ? "" : renderEphemeralContext(identityBlock, recalledContext);
   const messages: ToolCallingMessage[] = [
     { role: "system", content: systemContext },
     ...prior,
+    ...(ephemeralContext.length > 0 ? [{ role: "user" as const, content: ephemeralContext }] : []),
     buildUserMessage(config, task)
   ];
 
@@ -405,9 +453,9 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   return runLoop(config, taskId, messages, 0, pendingIdentitySnapshot, effectiveForAgent);
 }
 
-// Capture the runtime identity exposed to the model via the system
-// prompt. Pulled from the same data sources gini status reads so the
-// agent's self-report stays consistent with the CLI's view of the
+// Capture the runtime identity exposed to the model via the ephemeral
+// role:"user" tail. Pulled from the same data sources gini status reads
+// so the agent's self-report stays consistent with the CLI's view of the
 // instance. Returns "(none)" placeholders for the optional agent fields
 // when state has no active agent (system-driven flows).
 export function buildAgentIdentity(
@@ -465,31 +513,146 @@ function findBoundJobsForTask(state: RuntimeState, task: Task): JobRecord[] {
   return state.jobs.filter((job) => job.chatSessionId === sessionId);
 }
 
-// Pull prior chat messages for multi-turn context. We synthesize an
-// assistant message for any prior task that completed in the same chat
-// session; we skip the in-flight task itself. Tool calls / tool results
-// from prior turns are dropped — only finalized text feeds back in. This
-// keeps the conversation clean without a tool-result transcript ballooning.
-function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessage[] {
-  if (!task.runId) return [];
-  const state = readState(config.instance);
+// Resolve the chat session id behind a task via its run's conversationId.
+// Returns undefined for tasks with no chat session (subagent children,
+// imperative CLI runs) — those paths skip transcript persistence.
+function resolveChatSessionId(state: RuntimeState, task: Task): string | undefined {
+  if (!task.runId) return undefined;
   const run = state.runs.find((r) => r.id === task.runId);
-  if (!run?.conversationId) return [];
-  const sessionId = run.conversationId;
+  return run?.conversationId ?? undefined;
+}
+
+// Persist one tool-calling transcript row so the model can replay its own
+// prior tool calls + results on the next turn (see ADR
+// agent-loop-tool-calling.md). Rows are tagged kind:"tool_transcript" and
+// stay out of the human-facing JSON views (chat.ts). No-op when the task
+// has no chat session (sessionId undefined) or has already reached a
+// terminal status — a transcript row written after cancel/fail would
+// outlive the turn it belongs to.
+function persistTranscriptRow(
+  config: RuntimeConfig,
+  taskId: string,
+  sessionId: string | undefined,
+  row: {
+    role: "assistant" | "tool";
+    content: string;
+    toolCalls?: ToolCall[];
+    toolCallId?: string;
+  }
+): void {
+  if (!sessionId) return;
+  void mutateState(config.instance, (state) => {
+    const item = state.tasks.find((t) => t.id === taskId);
+    if (item && isTerminalTaskStatus(item.status)) return;
+    // A concurrent deleteChat between two persist points would otherwise let
+    // createChatMessage recreate orphan rows for a session that no longer
+    // exists; no-op when the session has vanished mid-turn.
+    if (!state.chatSessions.some((s) => s.id === sessionId)) return;
+    createChatMessage(state, {
+      sessionId,
+      role: row.role,
+      content: row.content,
+      taskId,
+      runId: item?.runId,
+      kind: "tool_transcript",
+      ...(row.toolCalls ? { toolCalls: row.toolCalls } : {}),
+      ...(row.toolCallId ? { toolCallId: row.toolCallId } : {})
+    });
+  });
+}
+
+// Pull prior chat messages for multi-turn context. We replay the full
+// ordered transcript of every prior turn in the same chat session —
+// user/assistant text plus the assistant tool_calls and role:"tool" results
+// persisted as kind:"tool_transcript" rows — so the model sees the structured
+// results of its own earlier actions (a created issue's id, a read_skill
+// body) instead of re-deriving them. The in-flight task is excluded (its own
+// turn is built live in workingMessages).
+function priorChatMessages(config: RuntimeConfig, task: Task): ToolCallingMessage[] {
+  const state = readState(config.instance);
+  const sessionId = resolveChatSessionId(state, task);
+  if (!sessionId) return [];
   const stored = state.chatMessages
     .filter((m) => m.sessionId === sessionId && m.taskId !== task.id)
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  return stored
-    .filter((m) => m.role === "user" || m.role === "assistant")
-    .map((m) => {
-      if (m.role === "user" && m.images && m.images.length > 0) {
-        return {
-          role: "user" as const,
-          content: buildVisionContent(config, m.content, m.images)
-        };
-      }
-      return { role: m.role as "user" | "assistant", content: m.content };
+    .sort((a, b) => {
+      const byTime = a.createdAt.localeCompare(b.createdAt);
+      if (byTime !== 0) return byTime;
+      return (a.seq ?? 0) - (b.seq ?? 0);
     });
+
+  // Map durable rows to provider messages. Assistant rows carrying toolCalls
+  // and role:"tool" result rows become tool-calling messages; plain
+  // user/assistant text rows keep their legacy shape (vision content for
+  // user images).
+  const mapped: (ToolCallingMessage & { __toolCallIds?: string[] })[] = [];
+  for (const m of stored) {
+    if (m.role === "tool" && m.kind === "tool_transcript") {
+      mapped.push({ role: "tool", content: m.content, tool_call_id: m.toolCallId });
+      continue;
+    }
+    if (m.role === "assistant" && m.kind === "tool_transcript") {
+      const toolCalls = m.toolCalls ?? [];
+      mapped.push({
+        role: "assistant",
+        content: m.content.length > 0 ? m.content : null,
+        tool_calls: toolCalls as ToolCall[],
+        __toolCallIds: toolCalls.map((c) => c.id)
+      });
+      continue;
+    }
+    if (m.role === "user" || m.role === "assistant") {
+      if (m.role === "user" && m.images && m.images.length > 0) {
+        mapped.push({ role: "user", content: buildVisionContent(config, m.content, m.images) });
+      } else {
+        mapped.push({ role: m.role, content: m.content });
+      }
+    }
+  }
+
+  // Defensive pairing pass. Providers reject an assistant tool_calls message
+  // whose ids aren't each answered by a following role:"tool" message, and
+  // reject orphan tool messages. A partially-persisted turn (process died
+  // mid-loop) can leave either. We pair each assistant tool_calls row with the
+  // role:"tool" rows in its own turn window — the rows that follow it up to,
+  // but not including, the next turn boundary (a role:"user" row) or the next
+  // assistant tool_calls row. The window must span the whole turn so it
+  // skips interleaved non-tool rows: a gated tool persists a plain assistant
+  // approval_reason row (and possibly plain assistant text) between its
+  // assistant tool_calls row and its on-resume tool result, so stopping at the
+  // first non-tool row would drop the gated call as unpaired and its result as
+  // an orphan. But the window must NOT cross a user row or the next tool
+  // round, so two turns that reuse the same synthesized tool_call_id (the
+  // text-backstop path derives ids from name:args:index, which resets each
+  // turn) stay isolated and each pairs with its own result. Drop orphan tool
+  // rows, and drop any assistant tool_calls row missing one of its paired
+  // results — so replay can never produce a provider 400.
+  const paired: ToolCallingMessage[] = [];
+  for (let i = 0; i < mapped.length; i++) {
+    const msg = mapped[i]!;
+    if (msg.role === "tool") continue; // emitted alongside its assistant below
+    if (msg.role === "assistant" && msg.__toolCallIds) {
+      const ids = msg.__toolCallIds;
+      // Collect the tool result rows in this assistant row's turn window.
+      const resultsInWindow = new Map<string, ToolCallingMessage>();
+      for (let j = i + 1; j < mapped.length; j++) {
+        const next = mapped[j]!;
+        if (next.role === "user") break; // turn boundary
+        if (next.role === "assistant" && next.__toolCallIds) break; // next tool round
+        if (next.role !== "tool") continue; // skip approval_reason / plain assistant text
+        if (typeof next.tool_call_id === "string") {
+          resultsInWindow.set(next.tool_call_id, next);
+        }
+      }
+      const results = ids.map((id) => resultsInWindow.get(id));
+      if (ids.length === 0 || results.some((r) => r === undefined)) continue; // drop unpaired turn
+      const { __toolCallIds, ...assistant } = msg;
+      paired.push(assistant);
+      for (const result of results) paired.push(result as ToolCallingMessage);
+      continue;
+    }
+    paired.push(msg);
+  }
+  return paired;
 }
 
 // Build the latest user-turn message. When the task carries image refs the
@@ -509,10 +672,11 @@ function buildUserMessage(config: RuntimeConfig, task: Task): ToolCallingMessage
 function buildVisionContent(
   config: RuntimeConfig,
   text: string,
-  images: ReadonlyArray<{ id: string; mimeType: string }>
+  images: ReadonlyArray<{ id: string; mimeType: string; size: number }>
 ): MessageContentPart[] {
   const parts: MessageContentPart[] = [];
   if (text.length > 0) parts.push({ type: "text", text });
+  const loaded: Array<{ id: string; mimeType: string; size: number }> = [];
   for (const image of images) {
     const dataUrl = uploadDataUrl(config.instance, image.id);
     if (!dataUrl) {
@@ -520,6 +684,23 @@ function buildVisionContent(
       continue;
     }
     parts.push({ type: "image_url", image_url: { url: dataUrl } });
+    loaded.push({ id: image.id, mimeType: image.mimeType, size: image.size });
+  }
+  // Surface upload metadata to the model so non-vision tools (e.g.
+  // signed_upload, MCP attachment uploads) can plug the right values into
+  // their args. Each line carries id + mimeType + size — the model needs
+  // size for `prepare_attachment_upload`-style calls, mimeType for
+  // content-type headers, and the id for any tool that takes an uploadId.
+  // The data URL itself carries none of this; the marker is the canonical
+  // place to read it from.
+  if (loaded.length > 0) {
+    const lines = loaded.map(
+      (u) => `- ${u.id} (${u.mimeType}, ${u.size} bytes)`
+    );
+    parts.push({
+      type: "text",
+      text: `Attached image uploads (in order):\n${lines.join("\n")}`
+    });
   }
   // Provider requires non-empty content. If every image failed to load and
   // there was no text, fall through to an empty text part so we never send
@@ -544,6 +725,26 @@ function filterToolsForSubagent<T extends { toolset: string; function: { name: s
     if (tool.function.name === "web_fetch") return true;
     return allowed.has(tool.toolset);
   });
+}
+
+// Seed a subagent's deferred tools into the loaded set at runLoop entry.
+// When a subagent's whitelisted toolsets own deferred tools (e.g. a subagent
+// scoped to `["browser"]`), those tools are made live immediately rather than
+// forcing the child through a load_tools round-trip — the child task is
+// short-lived and its tool world is already narrowed by the whitelist.
+// Mutates `loaded` in place. No-op when the subagent has no toolset whitelist
+// (it inherits the parent's world, where deferred tools follow the normal
+// load-on-demand flow).
+function seedSubagentDeferred(
+  catalog: ToolCatalogTool[],
+  subagent: SubagentRecord,
+  loaded: Set<string>
+): void {
+  if (!subagent.toolsetIds || subagent.toolsetIds.length === 0) return;
+  const allowed = new Set(subagent.toolsetIds);
+  for (const tool of catalog) {
+    if (tool.deferred && allowed.has(tool.toolset)) loaded.add(tool.function.name);
+  }
 }
 
 // Filter the enabled-skill list down to a subagent's whitelist. When the
@@ -596,24 +797,27 @@ function buildEnabledSkillsBlock(skills: SkillRecord[]): string {
 }
 
 // Inactive-but-enabled skills block. Distinct from buildEnabledSkillsBlock:
-// these skills are turned on but unusable because a required connector is
+// these skills are turned on but unusable because a required credential is
 // missing. We tell the model exactly which provider needs connecting so it
 // can either invoke the provider's setup skill (when the provider declares
 // one) or call `request_connector` directly to ask the user to connect.
 //
-// Skills with `requiredConnectors` undefined / empty are skipped: those are
+// Skills with `requiredCredentials` undefined / empty are skipped: those are
 // inactive for some other reason (validation status, etc.) and there's no
 // connector affordance to offer.
 //
-// We group by provider — multiple product skills often share the same
-// connector (e.g. all Google Workspace skills share google-oauth-desktop),
-// and emitting one line per provider keeps the block compact and points
-// the model at a single setup path per connector.
+// Skills declare credentials BY NAME; we map each required credential name to
+// the provider that owns its setup flow — an existing connector record with
+// that name, else the canonical provider for the name (so a never-connected
+// credential still routes to its setup skill / request_connector). We group by
+// that provider so multiple product skills sharing one connector (e.g. all
+// Google Workspace skills → google-workspace-oauth → google-oauth-desktop)
+// collapse to a single line.
 //
 // Exported for unit testing; production callers use it via runChatTask.
-export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
+export function buildInactiveSkillsBlock(skills: SkillRecord[], state?: RuntimeState): string {
   const candidates = skills.filter(
-    (skill) => skill.status === "enabled" && (skill.requiredConnectors?.length ?? 0) > 0
+    (skill) => skill.status === "enabled" && (skill.requiredCredentials?.length ?? 0) > 0
   );
   if (candidates.length === 0) return "";
   // Same dedupe rule as buildEnabledSkillsBlock so the same skill name
@@ -631,28 +835,62 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
       byName.set(skill.name, skill);
     }
   }
-  // Group dedup'd skills by provider id. setupSkill is captured per
-  // provider — if any skill's required provider declares one, the
-  // provider-level line directs the model to invoke that skill instead
-  // of calling request_connector directly.
-  const grouped = new Map<string, { skills: string[]; setupSkill?: string }>();
+  // Resolve a required credential NAME to the REGISTERED provider module that
+  // owns its setup flow, or `undefined` when none does. The "generic" provider
+  // is the catch-all placeholder — it models nothing real (no fields, probe, or
+  // setup skill), so a credential on a generic row is templateless and must NOT
+  // resolve to a provider. A connector row's provider only counts when it's a
+  // real (non-generic) registered module — a disabled or unhealthy "generic"
+  // row sharing the credential name must NOT masquerade as the owning provider
+  // (that produced a bogus `{name:"generic", type:"oauth2"}` templateless line).
+  // When nothing registered owns the name, the credential is templateless and
+  // is grouped / requested by its own NAME.
+  const providerForCredential = (name: string): string | undefined => {
+    const connector = state?.connectors.find((c) => c.name === name);
+    if (connector?.provider && connector.provider !== "generic" && getProvider(connector.provider)) {
+      return connector.provider;
+    }
+    return providerForCredentialName(name);
+  };
+  // Group dedup'd skills by the provider their required credential maps to.
+  // setupSkill is captured per provider — if the provider declares one, the
+  // provider-level line directs the model to invoke that skill instead of
+  // calling request_connector directly. `templateless` flags a group whose key
+  // is a bare credential NAME with no registered provider module: those are
+  // requested with request_connector's {name, type:"api-key", skillId} shape
+  // instead of a provider id. `skillId` carries one requesting skill's id so
+  // the templateless call can auto-grant on completion.
+  const grouped = new Map<string, { skills: string[]; setupSkill?: string; templateless: boolean; skillId?: string }>();
   for (const skill of byName.values()) {
-    for (const req of skill.requiredConnectors ?? []) {
-      const entry = grouped.get(req.provider) ?? { skills: [] };
+    for (const credentialName of skill.requiredCredentials ?? []) {
+      const provider = providerForCredential(credentialName);
+      const module = provider ? getProvider(provider) : undefined;
+      // No registered module owns this name — it's a templateless credential.
+      // Group it by the credential NAME itself (never by a "generic" row), so
+      // the request_connector line names the real credential.
+      const templateless = !module;
+      const key = module ? provider! : credentialName;
+      const entry = grouped.get(key) ?? { skills: [], templateless };
       entry.skills.push(skill.name);
-      const module = getProvider(req.provider);
       if (module?.setupSkill) entry.setupSkill = module.setupSkill;
-      grouped.set(req.provider, entry);
+      if (templateless && !entry.skillId) entry.skillId = skill.id;
+      grouped.set(key, entry);
     }
   }
   const lines = Array.from(grouped.entries())
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([provider, entry]) => {
+    .map(([key, entry]) => {
       const skillList = Array.from(new Set(entry.skills)).sort().join(", ");
       if (entry.setupSkill) {
-        return `- ${provider} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
+        return `- ${key} (used by: ${skillList}) — run \`read_skill\` with \`${entry.setupSkill}\` first; request_connector will be rejected until you do.`;
       }
-      return `- ${provider} (used by: ${skillList}) — call \`request_connector\` with provider id \`${provider}\` to ask the user to connect.`;
+      if (entry.templateless) {
+        // No registered provider: request the api-key credential by its actual
+        // NAME (the name IS its env var). Templateless requests are api-key
+        // only — oauth2 credentials require a provider module / setup skill.
+        return `- ${key} (used by: ${skillList}) — no registered provider; call \`request_connector\` with \`{name: "${key}", type: "api-key", skillId: "${entry.skillId ?? ""}"}\` so the user can enter it securely in chat.`;
+      }
+      return `- ${key} (used by: ${skillList}) — call \`request_connector\` with provider id \`${key}\` to ask the user to connect.`;
     });
   // The setup skill is the ONLY correct path for the listed providers.
   // Without this directive, the model has shortcutted to browser_navigate
@@ -662,8 +900,8 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
   // the connector handshake.
   const hasSetupSkill = Array.from(grouped.values()).some((entry) => entry.setupSkill);
   const intro = hasSetupSkill
-    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For providers WITHOUT a setup skill, call `request_connector` with the provider id directly."
-    : "Skills below need an external connector. For providers with a setup skill listed, invoke that skill first (it walks through any install / OAuth / project provisioning, then captures credentials). Otherwise, call `request_connector` with the provider id directly.";
+    ? "Skills below need an external connector. The runtime gates `request_connector` for providers that declare a setup skill — call `read_skill` with the setup skill first (it owns the full prerequisite flow and will invoke request_connector itself). For a registered provider WITHOUT a setup skill, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type:\"api-key\", skillId}` as the line indicates. Each line tells you exactly how to call it."
+    : "Skills below need an external connector. For a registered provider, call `request_connector` with the provider id; for a credential with no registered provider, call `request_connector` with `{name, type:\"api-key\", skillId}` as the line indicates. Each line tells you exactly how to call it. Never ask the user to paste a key as a chat message — request_connector captures it securely.";
   const sections: string[] = [
     intro,
     ...lines
@@ -682,22 +920,66 @@ export function buildInactiveSkillsBlock(skills: SkillRecord[]): string {
 // servers are intentionally omitted — the v0 stdio path is a stub and
 // surfacing it would invite the model to call something that can't
 // actually serve MCP traffic.
-function buildMcpServersBlock(state: RuntimeState): string {
+//
+// We also surface each server's cached tool NAMES (from the last
+// tools/list probe). The model uses this as the authoritative inventory
+// for what's reachable via mcp_call — skills then become "wrapper shape +
+// local glue + taste", not a hand-maintained tool catalog that drifts
+// when the upstream server adds tools. Schemas are intentionally not
+// inlined here (cost) — when the model needs argument shape, it either
+// reads the skill or calls the tool and reads the validation error.
+export function buildMcpServersBlock(state: RuntimeState): string {
   const servers = state.mcpServers.filter(
     (s) => s.status === "configured" && s.transport === "http"
   );
   if (servers.length === 0) return "";
-  const lines = servers
-    .slice()
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((s) => {
-      const count = s.tools?.length ?? 0;
-      const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
-      return `- ${s.name}${suffix} — call read_skill name='${s.name}' for the curated tool reference.`;
-    });
+  const lines: string[] = [];
+  for (const s of [...servers].sort((a, b) => a.name.localeCompare(b.name))) {
+    const tools = s.tools ?? [];
+    const count = tools.length;
+    const suffix = count > 0 ? ` (${count} tool${count === 1 ? "" : "s"})` : "";
+    lines.push(`- ${s.name}${suffix} — call read_skill name='${s.name}' for usage notes.`);
+    if (count > 0) {
+      const names = tools.map((t) => t.name).sort();
+      lines.push(`  tools: ${names.join(", ")}`);
+    }
+  }
   return [
     "Configured MCP servers (use the `mcp_call` tool to invoke):",
-    ...lines
+    ...lines,
+    // Explicit default-yes posture. Without this, the model treats the
+    // skill's documented tools as exhaustive and tells the user "I can't"
+    // even when a matching tool sits on the server's tools list above.
+    "If the user asks for something not covered in a server's skill but a plausible-looking tool exists in that server's `tools:` list, try `mcp_call` with it — the server returns a validation error on bad args, which is recoverable. Do not refuse based on the skill's documented subset alone."
+  ].join("\n");
+}
+
+// Advertise the scripts each visible skill ships so the model reliably
+// reaches for `skill_run` instead of re-implementing the work in
+// `terminal_exec` (which never carries connector env). Filtered to
+// `visibleSkillNames` (active + visible) so we don't point the model at a
+// script whose connector isn't healthy.
+export function buildSkillScriptsBlock(state: RuntimeState, visibleSkillNames: Set<string>): string {
+  const entries = listEnabledSkillScripts(state).filter((e) => visibleSkillNames.has(e.skill));
+  if (entries.length === 0) return "";
+  return [
+    "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+    ...entries.map((e) => `- ${e.skill}: ${e.scripts.join(", ")}`)
+  ].join("\n");
+}
+
+// Build the "Tools available on demand" system-prompt block from the
+// deferred-tool index. These are real tools whose full schemas aren't shipped
+// to the provider yet (to keep the live tool count low). The model loads one
+// by calling load_tools with its exact name; from the next turn on it calls
+// the tool directly by name. Returns "" when nothing is deferred (or
+// everything deferred has already been loaded), so the section drops out of
+// the prompt entirely on the hot path.
+function buildDeferredToolsBlock(index: Array<{ name: string; summary: string }>): string {
+  if (index.length === 0) return "";
+  return [
+    "Tools available on demand (NOT yet loaded). These are real tools you can use, but their definitions aren't loaded yet. To use one, FIRST call load_tools with its exact name(s) (e.g. load_tools({\"names\":[\"browser_navigate\"]})); from the next turn on you call the tool directly by name. Don't guess a tool's arguments before loading it.",
+    ...index.map((t) => `- ${t.name} — ${t.summary}`)
   ].join("\n");
 }
 
@@ -741,11 +1023,17 @@ async function runLoop(
 ): Promise<Task> {
   // Build the tool catalog once per loop entry. If the user toggles a
   // toolset mid-pause we'll pick up the change on resume — that's a
-  // feature, not a bug, and the toolsHash check protects against weird
-  // schema drift.
+  // feature, not a bug. `toolsHash` is recorded for trace/telemetry only;
+  // it is NOT enforced on resume (resumeChatTask rebuilds the catalog via
+  // runLoop and never reads the snapshot's toolsHash), so a growing tool
+  // set across a pause is safe.
   const state0 = readState(config.instance);
   const taskRow = state0.tasks.find((t) => t.id === taskId);
   const subagent0 = taskRow ? getSubagentForTask(state0, taskRow) : undefined;
+  // Resolve the chat session id once per loop entry so each persist point
+  // below can stamp a tool_transcript row. Undefined for subagent/imperative
+  // tasks (no chat session), in which case persistTranscriptRow is a no-op.
+  const transcriptSessionId = taskRow ? resolveChatSessionId(state0, taskRow) : undefined;
   // Resolve the active-agent overrides (provider, toolset filter, etc.).
   // Provider override flows into generateToolCallingResponse below; the
   // toolset filter narrows buildToolCatalog before the subagent filter
@@ -753,9 +1041,29 @@ async function runLoop(
   // entry runChatTask hands us the already-resolved EffectiveContext;
   // resumeChatTask omits it so the resume picks up any agent change.
   const effective = inheritedEffective ?? resolveEffectiveContext(state0, config);
-  const tools = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
-  const providerTools = toProviderTools(tools);
-  const toolsHash = hashCatalog(tools);
+  // Full (gated) catalog, including deferred tools. `loadedToolNames` is the
+  // set of deferred tools the model has pulled live via load_tools; it is
+  // seeded from the task row so it survives the runLoop rebuild on every
+  // resume. `applyDeferralFilter` drops deferred tools the model hasn't
+  // loaded yet — so the provider only ever sees core ∪ loaded(deferred).
+  // `providerTools`/`toolsHash`/`tools` are recomputed by `recompute()`
+  // after a load_tools call so the next provider call sees the new schemas;
+  // the hot no-load path never calls recompute and stays byte-identical to
+  // the prior frozen-catalog behavior.
+  const fullCatalog = filterToolsForSubagent(buildToolCatalog(state0, effective.toolsetFilter), subagent0);
+  const loadedToolNames = new Set<string>(taskRow?.loadedTools ?? []);
+  // Subagent seeding: a subagent whose whitelisted toolsets own deferred
+  // tools gets those tools live at entry (no load_tools round-trip), so a
+  // narrowly-scoped browser subagent can act immediately.
+  if (subagent0) seedSubagentDeferred(fullCatalog, subagent0, loadedToolNames);
+  let tools = applyDeferralFilter(fullCatalog, loadedToolNames);
+  let providerTools = toProviderTools(tools);
+  let toolsHash = hashCatalog(tools);
+  const recompute = (): void => {
+    tools = applyDeferralFilter(fullCatalog, loadedToolNames);
+    providerTools = toProviderTools(tools);
+    toolsHash = hashCatalog(tools);
+  };
 
   const { cap, warnReason } = resolveIterationCap(config);
   if (warnReason) {
@@ -902,13 +1210,25 @@ async function runLoop(
     // ("Working: <toolName>") emit per dispatch inside the loop below.
     emitPhase(emitCtx, "Thinking");
 
-    const result = await generateToolCallingResponse(
-      config,
-      workingMessages,
-      providerTools,
-      onDelta,
-      effective.providerSource === "agent" ? effective.provider : undefined
-    );
+    let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
+    try {
+      result = await generateToolCallingResponse(
+        config,
+        workingMessages,
+        providerTools,
+        onDelta,
+        effective.providerSource === "agent" ? effective.provider : undefined
+      );
+    } catch (error) {
+      // Tag a provider auth failure with the provider that actually served
+      // this turn, so failTask names the right credential even if the active
+      // agent switched while the call was in flight (issue #205).
+      const message = error instanceof Error ? error.message : String(error);
+      if (!(error instanceof ProviderAuthError) && isAuthExpiredError(message)) {
+        throw new ProviderAuthError(effective.provider.name, message);
+      }
+      throw error;
+    }
     await flush();
     accumulatedCost = addCost(accumulatedCost, result.cost);
 
@@ -969,6 +1289,10 @@ async function runLoop(
         // the chat UI uses the synced summary instead.
         item.partialSummary = undefined;
         item.toolCallState = undefined;
+        // The loaded-deferred-tool set is per-task and only meaningful while
+        // the loop runs. Clear it on terminal completion so a finished task
+        // doesn't retain it (the next task seeds an empty set).
+        item.loadedTools = undefined;
         item.updatedAt = now();
         return item;
       });
@@ -1050,6 +1374,14 @@ async function runLoop(
       tool_calls: result.toolCalls
     };
     workingMessages.push(assistantMessage);
+    // Persist the assistant tool_calls row so next turn replays it. Its
+    // paired tool results are persisted per call below (sync / skip /
+    // dispatch-error) or in resumeChatTask (gated path).
+    persistTranscriptRow(config, taskId, transcriptSessionId, {
+      role: "assistant",
+      content: result.text ?? "",
+      toolCalls: result.toolCalls
+    });
 
     const pendingApprovals: PendingToolCall[] = [];
     const toolResultMessages: ToolCallingMessage[] = [];
@@ -1081,13 +1413,24 @@ async function runLoop(
     // (assistant_message tool_call → tool result) and the LLM can
     // re-evaluate after the approval resolves.
     let pausedThisTurn = false;
+    // Deferred tools become callable only on the provider call AFTER they were
+    // loaded. Snapshot the loaded set as the provider saw it when it generated
+    // THIS turn's tool calls; a tool loaded by a load_tools call earlier in the
+    // same batch is deliberately NOT yet callable.
+    const loadedAtTurnStart = new Set(loadedToolNames);
     for (const call of result.toolCalls) {
       if (pausedThisTurn) {
         const skipMessage = "Skipped: a prior tool call in this turn requires approval. Will re-evaluate after that approval resolves.";
+        const skipContent = JSON.stringify({ ok: false, skipped: true, reason: skipMessage });
         toolResultMessages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: JSON.stringify({ ok: false, skipped: true, reason: skipMessage })
+          content: skipContent
+        });
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
+          content: skipContent
         });
         emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: skipMessage });
         emitToolResult(emitCtx, { callId: call.id, result: skipMessage });
@@ -1148,6 +1491,58 @@ async function runLoop(
         callId: call.id,
         args: parsedArgs
       });
+      // load_tools is handled INLINE (not via dispatchToolCall): it mutates
+      // the loaded set, recomputes providerTools so the NEXT iteration ships
+      // the new schemas, and persists `task.loadedTools` so an approval
+      // pause/resume keeps the loaded tools live. It is never approval-gated
+      // and produces no side effect beyond the in-loop state.
+      if (call.function.name === "load_tools") {
+        const { result, newlyLoaded } = handleLoadTools(call.function.arguments, fullCatalog, loadedToolNames);
+        for (const name of newlyLoaded) loadedToolNames.add(name);
+        recompute();
+        await mutateState(config.instance, (state) => {
+          const item = findTask(state, taskId);
+          // Belt-and-suspenders: a cancel that raced the dispatch lock could
+          // have flipped the task terminal — don't re-stamp loadedTools onto
+          // an already-finished task.
+          if (isTerminalTaskStatus(item.status)) return;
+          item.loadedTools = [...loadedToolNames];
+          updateRecentToolCall(item, call.id, "done");
+          item.updatedAt = now();
+        });
+        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: result });
+        emitToolCallStatus(emitCtx, { callId: call.id, status: "ok" });
+        emitToolResult(emitCtx, { callId: call.id, result });
+        continue;
+      }
+      // Primary deferred-tool gate. A deferred tool is callable only on the
+      // provider call AFTER its schema was loaded, so we test against the
+      // loaded set as the provider saw it at the START of this turn — NOT the
+      // running set. This blocks two cases the per-tool dispatch case would
+      // otherwise let through: (a) the model emitting a deferred tool it never
+      // loaded, and (b) a deferred tool emitted in the SAME batch as the
+      // load_tools that loads it (the provider generated the call without ever
+      // having the schema). `load_tools` itself is core, not deferred, so the
+      // gate never blocks it; a tool loaded on a prior turn is in
+      // loadedAtTurnStart and passes through to dispatch normally.
+      if (isDeferredToolName(call.function.name) && !loadedAtTurnStart.has(call.function.name)) {
+        const nudge = JSON.stringify({
+          ok: false,
+          error: `Tool '${call.function.name}' is available but not loaded yet. Call load_tools({"names":["${call.function.name}"]}) first, then call it on the next turn.`
+        });
+        toolResultMessages.push({ role: "tool", tool_call_id: call.id, content: nudge });
+        emitToolCallStatus(emitCtx, { callId: call.id, status: "error", errorMessage: "tool not loaded" });
+        emitToolResult(emitCtx, { callId: call.id, result: nudge });
+        await mutateState(config.instance, (state) => {
+          updateRecentToolCall(findTask(state, taskId), call.id, "done");
+        });
+        appendTrace(config.instance, taskId, {
+          type: "tool",
+          message: "Deferred tool call skipped: not loaded yet",
+          data: { toolCallId: call.id, toolName: call.function.name }
+        });
+        continue;
+      }
       try {
         const dispatch = await dispatchToolCall(
           config,
@@ -1161,6 +1556,11 @@ async function runLoop(
           toolResultMessages.push({
             role: "tool",
             tool_call_id: call.id,
+            content: dispatch.result
+          });
+          persistTranscriptRow(config, taskId, transcriptSessionId, {
+            role: "tool",
+            toolCallId: call.id,
             content: dispatch.result
           });
           // Flip the tool_call row to `ok` and append a tool_result
@@ -1260,6 +1660,11 @@ async function runLoop(
           tool_call_id: call.id,
           content: `Error: ${message}`
         });
+        persistTranscriptRow(config, taskId, transcriptSessionId, {
+          role: "tool",
+          toolCallId: call.id,
+          content: `Error: ${message}`
+        });
         emitToolCallStatus(emitCtx, {
           callId: call.id,
           status: "error",
@@ -1331,7 +1736,25 @@ async function runLoop(
     { role: "user", content: summaryInstruction }
   ];
   try {
-    const summaryResult = await generateToolCallingResponse(config, summaryMessages, []);
+    let summaryResult: Awaited<ReturnType<typeof generateToolCallingResponse>>;
+    try {
+      summaryResult = await generateToolCallingResponse(
+        config,
+        summaryMessages,
+        [],
+        undefined,
+        effective.providerSource === "agent" ? effective.provider : undefined
+      );
+    } catch (error) {
+      // Same provider-auth tagging as the main loop call, so an expired token
+      // on the final summary turn surfaces a named re-auth note instead of a
+      // raw failure (issue #205).
+      const summaryMessage = error instanceof Error ? error.message : String(error);
+      if (!(error instanceof ProviderAuthError) && isAuthExpiredError(summaryMessage)) {
+        throw new ProviderAuthError(effective.provider.name, summaryMessage);
+      }
+      throw error;
+    }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {
@@ -1344,6 +1767,7 @@ async function runLoop(
       item.cost = accumulatedCost;
       item.partialSummary = undefined;
       item.toolCallState = undefined;
+      item.loadedTools = undefined;
       item.updatedAt = now();
       return item;
     });
@@ -1389,18 +1813,25 @@ async function runLoop(
     }
     return exhausted;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    // An expired credential on the summary call gets the same named re-auth
+    // note as the main loop (issue #205); the raw detail is redacted in case
+    // the provider echoed a partial key.
+    const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
+    const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "failed";
       item.currentStep = "Failed";
-      item.error = `Chat task exceeded ${cap} model iterations.`;
+      item.error = authProvider ? message : `Chat task exceeded ${cap} model iterations.`;
+      if (authProvider) item.authErrorProvider = authProvider;
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
       item.cost = accumulatedCost;
       item.toolCallState = undefined;
+      item.loadedTools = undefined;
       item.updatedAt = now();
       return item;
     });
@@ -1408,7 +1839,12 @@ async function runLoop(
     // an explicit marker rather than just trailing off after the last
     // assistant_text. Phase blocks track currentStep; the system_note
     // captures the error condition.
-    emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+    if (authProvider) {
+      const note = providerAuthNote(authProvider, message);
+      emitSystemNote(emitCtx, note.text, note.authError);
+    } else {
+      emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+    }
     emitPhase(emitCtx, "Failed");
     appendTrace(config.instance, taskId, {
       type: "error",
@@ -1420,6 +1856,55 @@ async function runLoop(
     if (exhausted.jobId) await finalizeJobRunFromTask(config, exhausted);
     return exhausted;
   }
+}
+
+// Helper for resumeChatTask's stage-1 mutateState. Extracted so the
+// race-window poll-and-retry can re-stage from a single point.
+// Returns one of four shapes:
+//   - terminal: task in completed/failed/cancelled — bail
+//   - notYetWaiting: task in "running" still racing the loop's
+//     persist to "waiting_approval" — caller should retry briefly
+//   - hasState:false — task is waiting but its toolCallState was
+//     cleared (failure-path artifact); caller logs and exits
+//   - ready (true/false) — normal flow, ready means all pending
+//     resolved and the loop should re-enter
+async function stageResume(
+  config: RuntimeConfig,
+  taskId: string,
+  toolCallId: string,
+  toolResult: string
+): Promise<{
+  task: Task;
+  ready: boolean;
+  hasState: boolean;
+  terminal: boolean;
+  notYetWaiting: boolean;
+}> {
+  return mutateState(config.instance, (state) => {
+    const item = findTask(state, taskId);
+    if (item.status !== "waiting_approval") {
+      // Distinguish actually-terminal (legitimate bail) from
+      // not-yet-waiting (race-window — caller should retry).
+      const truly = isTerminalTaskStatus(item.status);
+      return {
+        task: item,
+        ready: false,
+        hasState: false,
+        terminal: truly,
+        notYetWaiting: !truly
+      };
+    }
+    if (!item.toolCallState) {
+      // Nothing to resume against — most likely the snapshot was cleared by
+      // a prior failure path. Caller can decide to fail the task.
+      return { task: item, ready: false, hasState: false, terminal: false, notYetWaiting: false };
+    }
+    const pending = item.toolCallState.pending;
+    const target = pending.find((p) => p.toolCallId === toolCallId);
+    if (target) target.result = toolResult;
+    const allResolved = pending.every((p) => typeof p.result === "string");
+    return { task: item, ready: allResolved, hasState: true, terminal: false, notYetWaiting: false };
+  });
 }
 
 // Resume a paused chat task after one of its tool approvals resolved.
@@ -1442,22 +1927,35 @@ export async function resumeChatTask(
   // task back to running. If the task has already failed (e.g. a sibling
   // approval was denied), been cancelled, or completed, just no-op so we
   // don't restart a terminal task's loop.
-  const stage = await mutateState(config.instance, (state) => {
-    const item = findTask(state, taskId);
-    if (item.status !== "waiting_approval") {
-      return { task: item, ready: false as const, hasState: false as const, terminal: true as const };
-    }
-    if (!item.toolCallState) {
-      // Nothing to resume against — most likely the snapshot was cleared by
-      // a prior failure path. Caller can decide to fail the task.
-      return { task: item, ready: false as const, hasState: false as const, terminal: false as const };
-    }
-    const pending = item.toolCallState.pending;
-    const target = pending.find((p) => p.toolCallId === toolCallId);
-    if (target) target.result = toolResult;
-    const allResolved = pending.every((p) => typeof p.result === "string");
-    return { task: item, ready: allResolved, hasState: true as const, terminal: false as const };
-  });
+  //
+  // Race-window fix: a fast /connect can land BEFORE the chat-task
+  // loop has persisted waiting_approval (the approval block is
+  // emitted to the SSE stream earlier than the post-loop mutateState
+  // that flips the status). In that window status is still
+  // "running" — NOT terminal — but the original code's
+  // `status !== "waiting_approval"` short-circuit lumped it in with
+  // terminal and silently orphaned the task. Distinguish the two:
+  // a truly-terminal status bails as before; a still-running task
+  // gets a brief poll-and-retry budget so the resume catches the
+  // loop's flip to waiting_approval (~one mutateState boundary
+  // away). 1000ms total budget over 10x 100ms ticks is generous
+  // for the manual-click case and bounded enough for automated
+  // /connect callers (CLI scripts, test harnesses, the messaging
+  // pollers) that race the loop more aggressively.
+  // The budget/tick are overridable via env so in-process test harnesses
+  // (which resolve the race within a couple of mutateState boundaries, or
+  // never enter the loop because their task never reaches waiting_approval)
+  // don't pay the full 1s wall on every resume. Production keeps the
+  // 1000/100 defaults — the `|| DEFAULT` fallback fires for unset/zero/NaN
+  // env, so the operational budget is unchanged unless an operator opts in.
+  const RESUME_WAIT_FOR_WAITING_BUDGET_MS = Number(process.env.GINI_RESUME_WAIT_BUDGET_MS) || 1000;
+  const RESUME_WAIT_FOR_WAITING_TICK_MS = Number(process.env.GINI_RESUME_WAIT_TICK_MS) || 100;
+  const resumeDeadline = Date.now() + RESUME_WAIT_FOR_WAITING_BUDGET_MS;
+  let stage = await stageResume(config, taskId, toolCallId, toolResult);
+  while (stage.notYetWaiting && Date.now() < resumeDeadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, RESUME_WAIT_FOR_WAITING_TICK_MS));
+    stage = await stageResume(config, taskId, toolCallId, toolResult);
+  }
 
   if (stage.terminal) {
     appendTrace(config.instance, taskId, {
@@ -1488,11 +1986,21 @@ export async function resumeChatTask(
   // without a chat session (subagent children) skip emission, matching
   // the loop-entry behavior in runLoop.
   const resumeEmitCtx = resolveEmitContext(config, taskId);
+  // Resolve the chat session once so each gated tool result lands as a
+  // tool_transcript row paired with the assistant tool_calls row that
+  // runLoop persisted before the pause.
+  const resumeSessionId = resolveChatSessionId(readState(config.instance), stage.task);
   for (const entry of snapshot.pending) {
+    const resumeResult = entry.result ?? "(no result)";
     messages.push({
       role: "tool",
       tool_call_id: entry.toolCallId,
-      content: entry.result ?? "(no result)"
+      content: resumeResult
+    });
+    persistTranscriptRow(config, taskId, resumeSessionId, {
+      role: "tool",
+      toolCallId: entry.toolCallId,
+      content: resumeResult
     });
     // Pair the resumed tool_result message with a chat-block update so
     // clients see the previously-running tool_call flip to `ok` and a

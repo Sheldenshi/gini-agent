@@ -1,5 +1,31 @@
 import * as FileSystem from "expo-file-system/legacy";
-import { readCachedCredentials, type AuthCredentials } from "./auth";
+import {
+  isLocalGatewayHost,
+  PUBLIC_HTTP_REJECTION,
+  readCachedCredentials,
+  type AuthCredentials
+} from "./auth";
+import { inferTunnelTransport } from "./transport";
+
+// Defense-in-depth runtime gate against credentials persisted by an
+// older build that didn't enforce the local-only http allowlist (or
+// a future regression). Throws so the bearer never leaves the device
+// in cleartext via a public http:// URL.
+function assertTransportAllowed(baseUrl: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new ApiError(0, "Stored base URL is invalid.");
+  }
+  if (parsed.protocol === "http:" && !isLocalGatewayHost(parsed.hostname)) {
+    throw new ApiError(0, PUBLIC_HTTP_REJECTION);
+  }
+  return parsed;
+}
 
 // Mirrors web/src/lib/api.ts in shape (`api<T>(path, init)`), but talks
 // to the runtime gateway directly with a bearer token instead of routing
@@ -38,6 +64,13 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
   if (!creds) throw new ApiError(401, "No credentials configured");
 
   const { auth: _auth, ...rest } = init;
+
+  // Defensively re-derive the origin so a malformed value in storage
+  // (e.g. one written by an older build that didn't normalize) can't
+  // leak query strings into the request URL. Also blocks public-http
+  // base URLs before the Authorization header is attached.
+  const parsed = assertTransportAllowed(creds.baseUrl);
+
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${creds.token}`,
@@ -50,16 +83,7 @@ export async function api<T = unknown>(path: string, init: ApiOptions = {}): Pro
     ...(init.headers ?? {})
   };
 
-  // Defensively re-derive the origin so a malformed value in storage
-  // (e.g. one written by an older build that didn't normalize) can't
-  // leak query strings into the request URL.
-  let origin: string;
-  try {
-    origin = new URL(creds.baseUrl).origin;
-  } catch {
-    throw new ApiError(0, "Stored base URL is invalid.");
-  }
-  const url = `${origin}/api${path}`;
+  const url = `${parsed.origin}/api${path}`;
   const response = await fetch(url, { ...rest, headers });
 
   // 204 No Content (or any empty body) — return null cast as T so callers
@@ -102,20 +126,17 @@ export interface UploadRef {
 // FormDataPart implementation"). FileSystem.uploadAsync streams the
 // file from disk through native URLSession, sidestepping the polyfill
 // and avoiding loading the bytes into JS memory at all.
-export async function uploadImage(file: {
+async function uploadFile(file: {
   uri: string;
   name: string;
   mimeType: string;
 }): Promise<UploadRef> {
   const creds = readCachedCredentials();
   if (!creds) throw new ApiError(401, "No credentials configured");
-  let origin: string;
-  try {
-    origin = new URL(creds.baseUrl).origin;
-  } catch {
-    throw new ApiError(0, "Stored base URL is invalid.");
-  }
-  const response = await FileSystem.uploadAsync(`${origin}/api/uploads`, file.uri, {
+  // Same transport guard as api(): block public-http origins before the
+  // bearer ever leaves the device, even on the multipart upload path.
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  const response = await FileSystem.uploadAsync(`${parsed.origin}/api/uploads`, file.uri, {
     httpMethod: "POST",
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     fieldName: "file",
@@ -133,14 +154,33 @@ export async function uploadImage(file: {
   return value as UploadRef;
 }
 
+export function uploadImage(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  return uploadFile(file);
+}
+
+// Voice-message upload. The gateway's /api/uploads gate accepts audio/*
+// alongside image/*; the recorder hands us a 16 kHz mono WAV with an
+// explicit `audio/wav` mimeType so it passes the prefix check.
+export function uploadAudio(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  return uploadFile(file);
+}
+
 // Absolute URL for a stored upload. The gateway serves the bytes with
 // long-lived immutable cache headers; the request still needs the bearer
 // token, so callers must pass it via an Image source's `headers` prop.
 export function uploadUrl(id: string): string {
   const creds = readCachedCredentials();
   if (!creds) throw new ApiError(401, "No credentials configured");
-  const origin = new URL(creds.baseUrl).origin;
-  return `${origin}/api/uploads/${encodeURIComponent(id)}`;
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  return `${parsed.origin}/api/uploads/${encodeURIComponent(id)}`;
 }
 
 export function authHeader(): Record<string, string> {
@@ -162,14 +202,11 @@ export function resolveStreamEndpoint(path: string): {
 } {
   const creds = readCachedCredentials();
   if (!creds) throw new ApiError(401, "No credentials configured");
-  let origin: string;
-  try {
-    origin = new URL(creds.baseUrl).origin;
-  } catch {
-    throw new ApiError(0, "Stored base URL is invalid.");
-  }
+  // Same transport guard as api(): if a stored URL is public-http,
+  // refuse to open the stream rather than leak the bearer.
+  const parsed = assertTransportAllowed(creds.baseUrl);
   return {
-    url: `${origin}/api${path}`,
+    url: `${parsed.origin}/api${path}`,
     headers: {
       authorization: `Bearer ${creds.token}`,
       // SSE endpoint resolver also injects X-Device-Token so the
@@ -178,6 +215,22 @@ export function resolveStreamEndpoint(path: string): {
       ...resolveDeviceTokenHeader()
     }
   };
+}
+
+/** True when the cached gateway base URL points at a Cloudflare quick
+ *  tunnel hostname (`*.trycloudflare.com`, case-insensitive). Quick
+ *  tunnels drop `text/event-stream` at the edge, so chat streaming has
+ *  to fall back to long-polling — `react-native-sse` would otherwise
+ *  open an XHR that never receives frames. Returns false on missing /
+ *  malformed credentials so the SSE path (which handles its own 401)
+ *  stays the default.
+ *
+ *  Delegates host classification to the shared `inferTunnelTransport`
+ *  helper so the mobile, web, and runtime copies stay in lockstep —
+ *  parity is pinned in src/runtime/tunnel/transport.parity.test.ts. */
+export function gatewayUsesQuickTunnel(): boolean {
+  const creds = readCachedCredentials();
+  return inferTunnelTransport(creds?.baseUrl ?? null) === "poll";
 }
 
 // Pull the cached APNs token from push.ts on every call. We avoid a

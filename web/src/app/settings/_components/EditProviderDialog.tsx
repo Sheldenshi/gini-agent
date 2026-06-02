@@ -81,7 +81,9 @@ export function EditProviderDialog({
   // for an env-already-set edit; model is required and defaults to the
   // current selection, so toggling it back to the same value still lets
   // the user dismiss via Cancel without nagging.
-  const dirty = apiKey.trim().length > 0 || (model !== "" && model !== (currentModel ?? row.models[0] ?? ""));
+  const dirty =
+    apiKey.trim().length > 0 ||
+    (model !== "" && model !== (currentModel ?? row.models[0] ?? ""));
   const canSubmit = dirty && !save.isPending;
 
   return (

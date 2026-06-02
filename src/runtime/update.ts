@@ -1,8 +1,9 @@
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { logDir, projectRoot } from "../paths";
+import { supervisor } from "../integrations/launchd";
 import type { Instance } from "../types";
 
 const EXPECTED_ORIGIN = "https://github.com/Lilac-Labs/gini-agent";
@@ -114,13 +115,25 @@ export function updateRuntime(runtimeDir = installedRuntimeDir(), options: { std
   };
 }
 
-export function scheduleRuntimeRestart(instance: Instance): boolean {
+// Test seams for scheduleRuntimeRestart. Production callers (http.ts POST
+// /api/update) pass nothing and get the real child_process.spawn and
+// process.kill — tests inject recorders so they neither spawn a real
+// subprocess nor SIGTERM the test runner. Mirrors the spawnImpl seam in
+// src/runtime/autostart-refresh.ts.
+export interface ScheduleRestartOptions {
+  spawnImpl?: typeof spawn;
+  killImpl?: (pid: number, signal: NodeJS.Signals | number) => void;
+}
+
+export function scheduleRuntimeRestart(instance: Instance, options: ScheduleRestartOptions = {}): boolean {
   const root = projectRoot();
   const oldPid = process.pid;
   const logFile = join(logDir(instance), "update-restart.log");
+  const spawnFn = options.spawnImpl ?? spawn;
+  const killFn = options.killImpl ?? ((pid: number, signal: NodeJS.Signals | number) => { process.kill(pid, signal); });
   try {
     mkdirSync(dirname(logFile), { recursive: true });
-    appendFileSync(logFile, `[${new Date().toISOString()}] restart requested cwd=${root}\n`);
+    appendFileSync(logFile, `[${new Date().toISOString()}] restart requested cwd=${root} supervisor=${supervisor() ?? "none"}\n`);
   } catch {
     // Logging is best-effort; restart should still be attempted.
   }
@@ -134,6 +147,56 @@ export function scheduleRuntimeRestart(instance: Instance): boolean {
     // Fall back to ignored stdio.
   }
 
+  // Under launchd, the runtime is a KeepAlive:true job. updateRuntime has
+  // already run `git reset --hard` + `bun install` synchronously by the
+  // time we get here, so the working tree is the fresh code with no
+  // install/respawn race. We:
+  //   1. Spawn a detached, unref'd `gini autostart kick --kind web` so the
+  //      web service re-execs with any new web/ deps. It must survive our
+  //      own exit, so it's detached and we self-SIGTERM after.
+  //   2. Self-SIGTERM. The server's SIGTERM handler drains and exits 0;
+  //      KeepAlive:true respawns the gateway with the fresh code.
+  // This keeps the gateway under launchd supervision (no detached
+  // stop+start helper that would reparent the respawn to PID 1 and orphan
+  // it outside KeepAlive).
+  if (supervisor() === "launchd") {
+    try {
+      const child = spawnFn(process.execPath, [
+        "run", "gini", "autostart", "kick",
+        "--instance", instance,
+        "--kind", "web"
+      ], {
+        cwd: root,
+        detached: true,
+        stdio: ["ignore", outFd, errFd],
+        env: { ...process.env, GINI_INSTANCE: instance }
+      });
+      if (typeof child.unref === "function") child.unref();
+    } catch (error) {
+      try {
+        appendFileSync(logFile, `[${new Date().toISOString()}] kick spawn failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      } catch { /* swallowed */ }
+    } finally {
+      // Parent's FD copies aren't needed after spawn — the child got
+      // dup'd copies. Close them so the test runner (which reuses the
+      // process) doesn't leak FDs.
+      if (typeof outFd === "number") { try { closeSync(outFd); } catch { /* ignore */ } }
+      if (typeof errFd === "number") { try { closeSync(errFd); } catch { /* ignore */ } }
+    }
+    setImmediate(() => {
+      try {
+        killFn(oldPid, "SIGTERM");
+      } catch {
+        // If self-signaling fails, KeepAlive won't respawn until the next
+        // crash/login; the kick child has already been dispatched.
+      }
+    });
+    return true;
+  }
+
+  // Foreground / `gini run` (supervisor()===null): no launchd KeepAlive to
+  // respawn us, so keep the detached bash helper that waits for our exit
+  // then stop+starts the instance itself.
   const script = `
 cd ${shellQuote(root)}
 old_pid=${oldPid}
@@ -151,7 +214,7 @@ fi
 bun run src/cli.ts start --instance ${shellQuote(instance)}
 `;
 
-  const child = spawn("bash", ["-lc", script], {
+  const child = spawnFn("bash", ["-lc", script], {
     cwd: root,
     detached: true,
     stdio: ["ignore", outFd, errFd]
@@ -160,7 +223,7 @@ bun run src/cli.ts start --instance ${shellQuote(instance)}
 
   setImmediate(() => {
     try {
-      process.kill(process.pid, "SIGTERM");
+      killFn(oldPid, "SIGTERM");
     } catch {
       // If self-signaling fails, the helper still tries to stop/start.
     }

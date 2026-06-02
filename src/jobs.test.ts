@@ -17,7 +17,7 @@ import { rmSync } from "node:fs";
 import { createHandler } from "./http";
 import { runDueJobs, runJobNow } from "./jobs";
 import { advanceCronNextRunAt, updateJob } from "./jobs/index";
-import { createTask, mutateState, readState, upsertTask } from "./state";
+import { createChatMessage, createTask, mutateState, readState, upsertTask } from "./state";
 import { dispatchToolCall } from "./execution/tool-dispatch";
 import { syncChatTaskResult } from "./execution/chat";
 import type { RuntimeConfig } from "./types";
@@ -2018,6 +2018,106 @@ describe("cron lifecycle", () => {
       });
       const taskBObj = readState(config.instance).tasks.find((t) => t.id === taskB)!;
       await finalizeJobRunFromTask(config, taskBObj);
+      expect(sendCalls.length).toBe(0);
+    } finally {
+      resetMessagingDeps();
+    }
+  });
+
+  test("dispatchJobReplyToBridge ignores tool_transcript rows so a [SILENT] tool-using job stays suppressed", async () => {
+    // A tool-using turn persists assistant rows tagged kind:"tool_transcript"
+    // (model-facing replay narration) before the terminal summary. The bridge
+    // dispatch picks the newest assistant row for the task; if it considered
+    // the transcript row it would mirror that narration to Telegram/Discord
+    // even though the terminal summary is "[SILENT]" — bypassing suppression.
+    const config = testConfig("jobs-silent-tool-transcript");
+    const { addMessagingBridge, setMessagingDeps, resetMessagingDeps } = await import("./integrations/messaging");
+    const { findOrCreateDiscordChatSession } = await import("./state");
+    const { finalizeJobRunFromTask } = await import("./jobs/finalize");
+    const sendCalls: Array<{ channelId: string; content: string }> = [];
+    setMessagingDeps({
+      discordClientFactory: () => ({
+        async getMe() {
+          return { id: "100", username: "Gini", discriminator: "0000", bot: true };
+        },
+        async sendMessage(channelId, content) {
+          sendCalls.push({ channelId, content });
+          return { id: "reply", channel_id: channelId, content, timestamp: "", author: { id: "100", username: "Gini", bot: true } };
+        },
+        async triggerTypingIndicator() {
+          return true as const;
+        },
+        async fetchChannelMessages() {
+          return [];
+        }
+      })
+    });
+
+    try {
+      const bridge = await addMessagingBridge(config, {
+        name: "disc",
+        kind: "discord",
+        deliveryTargets: ["chan-1"],
+        botToken: "TOK"
+      });
+      const sessionId = await mutateState(config.instance, (state) => {
+        const session = findOrCreateDiscordChatSession(state, bridge.id, "chan-1");
+        return session.id;
+      });
+
+      const taskId = await mutateState(config.instance, (state) => {
+        const t = createTask(state.instance, "scheduled-tool", undefined, undefined, undefined, undefined);
+        t.status = "completed";
+        t.summary = "[SILENT]";
+        t.jobId = "job_tool";
+        upsertTask(state, t);
+        const session = state.chatSessions.find((s) => s.id === sessionId)!;
+        session.taskIds.push(t.id);
+        // Seed a model-facing transcript assistant row with non-empty
+        // narration for the same task — this must never be mirrored.
+        createChatMessage(state, {
+          sessionId,
+          role: "assistant",
+          content: "Let me check the calendar before replying.",
+          taskId: t.id,
+          runId: t.runId,
+          kind: "tool_transcript"
+        });
+        state.jobs.push({
+          id: "job_tool",
+          instance: state.instance,
+          name: "x",
+          status: "active",
+          prompt: "p",
+          deliveryTargets: [],
+          context: [],
+          retryLimit: 0,
+          timeoutSeconds: 600,
+          chatSessionId: sessionId,
+          runIds: [],
+          taskIds: [],
+          runCount: 0,
+          missedRuns: 0,
+          nextRunAt: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        state.jobRuns.push({
+          id: "run_tool",
+          instance: state.instance,
+          jobId: "job_tool",
+          status: "running",
+          taskId: t.id,
+          attempt: 1,
+          trigger: "schedule",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        });
+        return t.id;
+      });
+
+      const taskObj = readState(config.instance).tasks.find((t) => t.id === taskId)!;
+      await finalizeJobRunFromTask(config, taskObj);
       expect(sendCalls.length).toBe(0);
     } finally {
       resetMessagingDeps();

@@ -42,10 +42,12 @@ import type {
   RiskLevel,
   RuntimeConfig,
   SetupRequestAction,
+  SystemNoteAuthError,
   Task,
   ToolCallStatus
 } from "../types";
 import { chatBlockArgsPreviewFor, chatBlockLabelFor } from "./tool-catalog";
+import { redactSensitiveToolArgs } from "./tool-args-redact";
 
 // Resolved chat-task emission context. Callers pass this through every
 // per-iteration emission so we don't re-read state on each row.
@@ -118,15 +120,18 @@ export function emitPhase(
 // Emit a system_note block. Used for terminal-bail-out markers
 // (cancellation, iteration-cap exhaustion, dispatch error before any
 // tool ran) — anything that's runtime-level rather than user- or
-// assistant-authored.
+// assistant-authored. Pass `authError` for a provider-credential failure
+// so the client can name the provider and offer a re-auth CTA (issue #205).
 export function emitSystemNote(
   ctx: ChatEmitContext | undefined,
-  text: string
+  text: string,
+  authError?: SystemNoteAuthError
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
   return insertChatBlock(ctx.instance, {
     kind: "system_note",
     text,
+    ...(authError ? { authError } : {}),
     ...bookkeepingFor(ctx)
   });
 }
@@ -201,10 +206,13 @@ export function finalizeAssistantText(
 }
 
 // Insert a tool_call block in `running` status right before dispatch.
-// `argsFull` carries the verbatim parsed JSON args (clients expand to
-// it for the "show full args" affordance); `argsPreview` is the inline
+// `argsFull` carries the parsed JSON args with credential-bearing values
+// scrubbed via redactSensitiveToolArgs (clients expand to it for the
+// "show full args" affordance, so a secret arg — apiKey / token /
+// Authorization header — must not land here); `argsPreview` is the inline
 // headline (file path / URL / command), capped to 80 chars by
-// chatBlockArgsPreviewFor.
+// chatBlockArgsPreviewFor. argsFull is DISPLAY-only — dispatch parses the
+// raw tool args independently, so redacting here does not affect execution.
 export function emitToolCallRunning(
   ctx: ChatEmitContext | undefined,
   params: {
@@ -219,11 +227,31 @@ export function emitToolCallRunning(
     toolName: params.toolName,
     displayLabel: chatBlockLabelFor(params.toolName),
     argsPreview: chatBlockArgsPreviewFor(params.toolName, params.args),
-    argsFull: params.args,
+    argsFull: redactSensitiveToolArgs(params.args),
     status: "running",
     callId: params.callId,
     ...bookkeepingFor(ctx)
   });
+}
+
+// Attach a `runningHint` to a tool_call block that's already mounted in
+// `running` status. The hint is advisory context a tool emits to explain
+// why it's parked — currently only used by tools that block on an
+// external event the agent can't drive (e.g. wait_for_messaging_pair
+// blocking on an inbound Telegram DM). Clients may render the row more
+// prominently when the hint is set; the wire contract is advisory, not a
+// new block kind. The hint is cleared automatically when the tool's
+// status leaves "running" (see updateToolCallBlock); a no-op when there's
+// no emit context (subagent children with no session) or when the block
+// can't be found.
+export function setToolCallRunningHint(
+  ctx: ChatEmitContext | undefined,
+  callId: string,
+  hint: string
+): ChatBlock | undefined {
+  if (!ctx) return undefined;
+  const updated = updateToolCallBlock(ctx.instance, callId, ctx.sessionId, { runningHint: hint });
+  return updated ?? undefined;
 }
 
 // Flip a tool_call row's status (running → ok | error | denied). The

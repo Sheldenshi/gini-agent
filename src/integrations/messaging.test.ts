@@ -481,6 +481,51 @@ describe("messaging telegram wiring", () => {
     expect(listAllowedChats(config, bridge.id).ownerChatId).toBe(4242);
   });
 
+  test("allowChat pre-creates the Telegram chat session at enrollment time so it appears in the sidebar immediately", async () => {
+    // Without this pre-create, the chat session was only minted lazily
+    // on the first inbound message AFTER enrollment (the receive path
+    // calls findOrCreateTelegramChatSession). That meant the operator
+    // approved a chat, didn't see any sidebar entry, and had to wait
+    // for the user to DM the bot again before any visible confirmation
+    // that the pairing worked. Pin the eager creation so the session
+    // shows up at the moment enrollment commits.
+    const config = testConfig("telegram-allow-creates-session");
+    setMessagingDeps({ telegramClientFactory: () => stubClient().client });
+    const { allowChat, recordDeniedChatAttempt } = await import("./messaging");
+    const { readState: readStateLocal } = await import("../state");
+
+    const bridge = await addMessagingBridge(config, {
+      name: "tg",
+      kind: "telegram",
+      deliveryTargets: [],
+      botToken: "TOK"
+    });
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 5555, chatType: "private", sender: "@earlyenroll" });
+
+    // No sessions yet.
+    expect(readStateLocal(config.instance).chatSessions.length).toBe(0);
+
+    await allowChat(config, bridge.id, 5555);
+
+    // Exactly one session, tied to this bridge + chatId.
+    const sessions = readStateLocal(config.instance).chatSessions;
+    expect(sessions.length).toBe(1);
+    const session = sessions[0]!;
+    expect(session.source?.kind).toBe("telegram");
+    if (session.source?.kind === "telegram") {
+      expect(session.source.bridgeId).toBe(bridge.id);
+      expect(session.source.chatId).toBe(5555);
+    }
+
+    // A second enroll for a different chat creates a second session;
+    // re-enrolling the same chat is idempotent (no duplicate session).
+    await recordDeniedChatAttempt(config, bridge.id, { chatId: 6666, chatType: "private", sender: "@second" });
+    await allowChat(config, bridge.id, 6666);
+    await allowChat(config, bridge.id, 5555);
+    const afterSecond = readStateLocal(config.instance).chatSessions;
+    expect(afterSecond.length).toBe(2);
+  });
+
   test("allowChat is idempotent for an already-allowlisted chatId: no duplicate audit, no duplicate greeting", async () => {
     // A double-clicked Approve (or any caller invoking allowChat twice
     // on a chat that's already enrolled) would otherwise write a second

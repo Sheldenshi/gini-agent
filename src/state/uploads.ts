@@ -18,7 +18,21 @@ interface UploadManifest {
   createdAt: string;
 }
 
-const SUPPORTED_PREFIX = "image/";
+// Uploads were image-only when the only ingestion path was the chat
+// drop-zone. Now `signed_download` and `promote_file` route any byte
+// stream into the same upload space (PDFs, build logs, transcripts,
+// CSVs), so we accept any non-empty mime that looks structurally valid.
+// Vision-only callers (provider vision context) still gate at
+// `buildVisionContent` based on the stored mimeType; non-image uploads
+// won't accidentally land in a vision call.
+function isPlausibleMime(mimeType: string): boolean {
+  if (!mimeType) return false;
+  const slash = mimeType.indexOf("/");
+  if (slash <= 0 || slash === mimeType.length - 1) return false;
+  // Reject whitespace; valid RFC 6838 mime grammar has none.
+  return !/\s/.test(mimeType);
+}
+
 
 function ensureUploadsDir(instance: Instance): string {
   const dir = uploadsDir(instance);
@@ -48,7 +62,7 @@ export function storeUpload(
   mimeType: string,
   filename?: string
 ): ImageAttachment {
-  if (!mimeType.startsWith(SUPPORTED_PREFIX)) {
+  if (!isPlausibleMime(mimeType)) {
     throw new Error(`Unsupported upload mime type: ${mimeType}`);
   }
   if (bytes.length === 0) throw new Error("Upload is empty.");
@@ -67,7 +81,7 @@ export function storeUpload(
   return { id, mimeType, size: bytes.length };
 }
 
-export function readUpload(instance: Instance, id: string): { bytes: Uint8Array; mimeType: string } | null {
+export function readUpload(instance: Instance, id: string): { bytes: Uint8Array; mimeType: string; filename?: string } | null {
   const dir = uploadsDir(instance);
   const manifestPath = join(dir, `${id}.json`);
   if (!existsSync(manifestPath)) return null;
@@ -81,7 +95,7 @@ export function readUpload(instance: Instance, id: string): { bytes: Uint8Array;
   const blobPath = join(dir, `${id}.${ext}`);
   if (!existsSync(blobPath)) return null;
   const bytes = readFileSync(blobPath);
-  return { bytes: new Uint8Array(bytes), mimeType: manifest.mimeType };
+  return { bytes: new Uint8Array(bytes), mimeType: manifest.mimeType, filename: manifest.filename };
 }
 
 export function uploadDataUrl(instance: Instance, id: string): string | null {

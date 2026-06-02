@@ -36,13 +36,13 @@ Gini exposes three markdown files at the runtime root that the agent loop loads 
 
 The three files are a curated layer over the Hindsight memory pipeline. USER.md (instance), SOUL.md (per-agent), and Hindsight (per-agent bank) are the three memory surfaces (see the Memory surfaces section above).
 
-System-prompt assembly order in `buildAgentSystemContext`:
+Byte-stable system-prefix assembly order in `buildAgentSystemContext`:
 
 1. `INSTRUCTIONS.md` content (falls back to the bundled `src/runtime/defaults/INSTRUCTIONS.md` when the per-instance file is absent)
 2. `SOUL.md` content (per active agent, when present)
-3. Runtime identity block (unchanged, see ADR runtime-identity-injection.md)
-4. `USER.md` content (when present)
-5. Long-term recalled memory (Hindsight, unchanged)
+3. `USER.md` content (when present)
+
+The runtime identity block and long-term recalled memory are no longer part of the system prefix — they vary per turn, so they ride in the ephemeral `role:"user"` tail rendered by `renderEphemeralContext` (identity then memory), placed after the full prior transcript and immediately before the real user message. This keeps message 0 byte-stable for prompt caching. See ADR stable-system-prefix.md.
 
 All three files are passed through a prompt-injection scanner before they reach the prompt. Files that match a threat pattern are replaced inline with a `[BLOCKED: ... ]` notice and a warning is recorded in the runtime trace; the gateway does not crash on a malicious file.
 
@@ -66,7 +66,7 @@ The three new files are additive to that stack — a slow-moving, human-curated 
 ## Required Now
 
 - `src/runtime/defaults/INSTRUCTIONS.md` is the single source of truth for the default operating rules. Every byte of this file is spliced verbatim into the system prompt when no per-instance `INSTRUCTIONS.md` exists, and the scaffolder copies the same bytes into freshly-installed instances. There is no in-code constant; the prior `DEFAULT_GINI_INSTRUCTIONS` string has been replaced.
-- `src/system-prompt.ts` exports `getDefaultGiniInstructions()` (memoized per-process, reads and trims the bundled file) and `DEFAULT_INSTRUCTIONS_PATH` (the resolved path other modules import). A missing bundle file is unrecoverable — both the runtime fallback and the scaffolder throw with `"default INSTRUCTIONS.md missing from bundle"` rather than silently falling back to an empty string. `buildAgentSystemContext` takes new optional parameters `instructionsOverride`, `soul`, and `userProfile`; the call assembles them in the order above.
+- `src/system-prompt.ts` exports `getDefaultGiniInstructions()` (memoized per-process, reads and trims the bundled file) and `DEFAULT_INSTRUCTIONS_PATH` (the resolved path other modules import). A missing bundle file is unrecoverable — both the runtime fallback and the scaffolder throw with `"default INSTRUCTIONS.md missing from bundle"` rather than silently falling back to an empty string. `buildAgentSystemContext` takes an options object with `instructionsOverride`, `soul`, and `userProfile`; the call assembles them into the byte-stable prefix in the order above. (Per-turn identity + recalled memory render through `renderEphemeralContext` into the role:"user" tail — see ADR stable-system-prefix.md.)
 - `src/runtime/identity-files.ts` owns file I/O and the injection scan:
   - `loadInstructions(instance)`, `loadSoul(instance, agentId)`, `loadUserProfile(instance)` return either the scanned content, a `[BLOCKED: ...]` notice, or `null` when the file is absent.
   - `writeSoul(instance, agentId, content, status)` and `writeUserProfile(instance, content, status)` write `<file>` for approved content and `<file>.proposed` for proposed content. The gateway only reads the approved file into the prompt; proposals require approval via the API.

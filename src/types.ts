@@ -1,3 +1,5 @@
+import type { TunnelPersistedConfig } from "./runtime/tunnel/types";
+
 // `default` is the production end-user install (set by ~/.local/bin/gini).
 // Anything else is a developer worktree (auto-derived from the repo dir
 // basename) or a named test/smoke instance.
@@ -105,7 +107,7 @@ export type RuntimeEventKind =
 
 export type JobRunStatus = "running" | "completed" | "failed";
 
-export type ChatMessageRole = "user" | "assistant" | "system";
+export type ChatMessageRole = "user" | "assistant" | "system" | "tool";
 
 export type RunStatus = "queued" | "running" | "waiting_approval" | "completed" | "failed" | "cancelled";
 
@@ -130,7 +132,9 @@ export interface ProviderConfig {
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
   // unconditionally owns: model, messages, stream, tools, tool_choice,
-  // response_format, functions, function_call, store, plus prototype-pollution
+  // response_format, functions, function_call, store, prompt_cache_retention
+  // (pinned to "in_memory" by the runtime — extraBody can't promote a
+  // request to the "24h" extended tier), plus prototype-pollution
   // payloads (__proto__, constructor, prototype) and the JSON.stringify
   // hijack vector (toJSON). Token-budget fields (max_tokens,
   // max_completion_tokens) are allowed in extraBody for
@@ -153,8 +157,9 @@ export interface ProviderConfig {
 // - "strict" — every approval-eligible action creates a pending approval
 //   row and pauses the task for a human decision. Matches the legacy
 //   pre-flip default.
-// - "auto" — the new default. Auto-approve `file.write`, `file.patch`,
-//   and `browser.upload_file` unconditionally. For `terminal.exec` and
+// - "auto" — a safe-middle mode (no longer the default; operators can
+//   switch to it). Auto-approve `file.write`, `file.patch`, and
+//   `browser.upload_file` unconditionally. For `terminal.exec` and
 //   `code_exec`, auto-approve unless the command (or, for `code_exec`,
 //   either the shell wrapper OR the raw source — see
 //   `matchDangerousSource`) matches a dangerous-pattern entry (see
@@ -181,6 +186,14 @@ export interface RuntimeConfig {
   workspaceRoot: string;
   stateRoot: string;
   logRoot: string;
+  // On-disk tunnel block, kept in sync by TunnelManager so the four
+  // whole-config writers (`updateAutoApproveSettings`,
+  // `setSetupProvider`, the boot-time approval-mode migration, …) don't
+  // silently clobber an enable / disable / rotate-secret transition
+  // when they serialize the in-memory config back to disk. The manager
+  // mutates this field after every `patchTunnelConfig` call. Optional
+  // because legacy `config.json` files predate the field.
+  tunnel?: TunnelPersistedConfig;
   // User-curated allowlist of shell-glob patterns that bypass the approval
   // gate for terminal_exec. Patterns match the full command string (e.g.
   // `memo *` matches any command starting with "memo "). Auto-approved
@@ -191,10 +204,12 @@ export interface RuntimeConfig {
   // blocklist below — explicit operator opt-in wins over the heuristic.
   autoApproveCommands?: string[];
   // Approval-policy mode. Drives `resolveApprovalPolicy`. Fresh instances
-  // default to "auto" via `defaultConfig`. Legacy config files that carry
-  // `dangerouslyAutoApprove: true` without an `approvalMode` set are
-  // migrated to "yolo" at load time and emit a one-time `config.migrated`
-  // audit row. See ADR approval-mode.md.
+  // default to "yolo" via `defaultConfig`; existing configs that predate
+  // an explicit `approvalMode` backfill "auto" in `loadConfig` so the
+  // default flip never silently escalates an already-created instance.
+  // Legacy config files that carry `dangerouslyAutoApprove: true` without
+  // an `approvalMode` set are migrated to "yolo" at load time and emit a
+  // one-time `config.migrated` audit row. See ADR approval-mode.md.
   approvalMode?: ApprovalMode;
   // Optional operator-supplied list of substring patterns that should
   // GATE a `terminal.exec` call even under `approvalMode: "auto"`. Each
@@ -224,6 +239,12 @@ export interface RuntimeConfig {
     // non-conforming value falls back to the built-in default.
     maxIterations?: number;
   };
+  // Cache warmer interval in minutes. 0 / undefined disables the warmer.
+  // When > 0 the runtime fires a minimal probe against the active
+  // provider every `cacheWarmerMinutes * 0.9` minutes so the prompt
+  // cache stays warm. Bounded to 0..1440 by the setter. See
+  // src/runtime/cache-warmer.ts.
+  cacheWarmerMinutes?: number;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so
@@ -272,10 +293,24 @@ export interface ImageAttachment {
   size: number;
 }
 
+// Voice recording attached to a user message. Render-only: audio NEVER goes
+// to the model/provider — it is transcribed to text at submit time and only
+// the transcript reaches the agent. The bytes live on disk like images
+// (upload id is the canonical reference; clients fetch via GET
+// /api/uploads/:id for playback). `durationMs` is the client-measured clip
+// length so the bubble can render m:ss without decoding the file.
+export interface AudioAttachment {
+  id: string;
+  mimeType: string;
+  size: number;
+  durationMs?: number;
+}
+
 export interface UserTextBlock extends ChatBlockBase {
   kind: "user_text";
   text: string;
   images?: ImageAttachment[];
+  audio?: AudioAttachment;
 }
 
 export interface AssistantTextBlock extends ChatBlockBase {
@@ -315,6 +350,17 @@ export interface ToolCallBlock extends ChatBlockBase {
   // associate result with call, and by resume paths to flip the
   // matching running block to `ok`/`error` after the approval lands.
   callId: string;
+  // Optional context message a tool emits while parked in `running`,
+  // describing why it's waiting and what (if anything) the user can do
+  // to unblock it. Reserved for tools that block on an external event
+  // the agent cannot drive — currently only `wait_for_messaging_pair`
+  // (waiting on an inbound Telegram DM, up to 600s). Clients MAY render
+  // a running tool_call more prominently when this field is set; the
+  // wire contract is that the hint is advisory, not a separate kind.
+  // The runtime clears it automatically when the tool's status leaves
+  // `running`, so resolution/error/cancellation collapse the block back
+  // to its default render.
+  runningHint?: string;
 }
 
 export interface ToolResultBlock extends ChatBlockBase {
@@ -358,6 +404,21 @@ export interface AuthorizationRequestedBlock extends ChatBlockBase {
 //   - `browser.fill_secret` → inline credential inputs with destination URL
 //     prominent. Submit POSTs `{ secrets: { <slot>: <value> } }` to
 //     /api/setup-requests/<id>/complete.
+//   - `messaging.add_bridge` → inline form with name + password-masked
+//     bot-token inputs (kind is pinned in payload). Submit POSTs
+//     `{ secrets: { name, botToken } }` to /api/setup-requests/<id>/complete,
+//     which routes into addMessagingBridge. Other surfaces (home page,
+//     /permissions list) render a "resolve in chat" hint because they can't
+//     display the form. See docs/adr/telegram-bridge.md and
+//     chat-block-protocol.md.
+//   - `messaging.approve_pairing` → confirmation card showing the pending
+//     sender, chat type, verification code, expiry. Two buttons: Approve
+//     (POSTs `{}` to /complete → server calls allowChat with expectedCode);
+//     Reject (POSTs `{ reject: true }` to /complete → server calls
+//     rejectPendingChat).
+//   - `messaging.remove_bridge` → destructive confirmation card showing
+//     bridge name + irreversibility warning. Submit POSTs `{}` to /complete
+//     → server calls removeMessagingBridge.
 // Cancel always POSTs to /api/setup-requests/<id>/cancel.
 export interface SetupRequestedBlock extends ChatBlockBase {
   kind: "setup_requested";
@@ -366,9 +427,35 @@ export interface SetupRequestedBlock extends ChatBlockBase {
   summary: string;
 }
 
+// Provider-credential failure metadata attached to a terminal-failure
+// system note when a chat turn dies because the provider's auth token
+// expired / was rejected. Lets clients name which provider failed and
+// render a "Re-authenticate <provider>" CTA instead of passing the raw
+// provider line through verbatim. See issue #205.
+export interface SystemNoteAuthError {
+  // Provider whose credential failed (e.g. "codex").
+  provider: ProviderName;
+  // Short human label for the provider (e.g. "Codex").
+  providerLabel: string;
+  // The raw provider error message, preserved as secondary detail. For
+  // API-key providers this carries the specific cause (the provider's own
+  // 401/403 text — "incorrect key", "quota exceeded", "key disabled").
+  detail: string;
+  // Where the CTA sends the user to re-establish the credential. "docs" → the
+  // hosted step-through (OAuth/CLI providers like codex, whose re-auth is a
+  // non-obvious terminal flow); "settings" → the in-app Settings → Providers
+  // key form (API-key providers). See ADR provider-reauth-guidance.md.
+  reauthKind: "docs" | "settings";
+  reauthUrl: string;
+}
+
 export interface SystemNoteBlock extends ChatBlockBase {
   kind: "system_note";
   text: string;
+  // Present only when this note marks a provider authentication failure
+  // (see SystemNoteAuthError). Absent for ordinary notes (cancellation,
+  // iteration-cap, approval-denied).
+  authError?: SystemNoteAuthError;
 }
 
 export type ChatBlock =
@@ -524,6 +611,13 @@ export interface Task {
   // text mid-flight instead of waiting for the buffered final response.
   partialSummary?: string;
   error?: string;
+  // Provider whose credential failed when the task died on a provider auth
+  // error (expired/invalid/rejected token, 401). Captured at the model-call
+  // site so every render surface — the chat system note and the legacy
+  // assistant ChatMessageRecord — names the same provider and offers a re-auth
+  // CTA, even if the active agent changed while the call was in flight. See
+  // issue #205. Absent for non-auth failures.
+  authErrorProvider?: ProviderName;
   tracePath: string;
   auditIds: string[];
   approvalIds: string[];
@@ -548,6 +642,11 @@ export interface Task {
   // once the loop finishes (completed/failed) so completed tasks don't retain
   // long-lived conversation snapshots in state.
   toolCallState?: TaskToolCallState;
+  // Names of deferred tools the model has loaded via load_tools during this
+  // task. Persists for the life of the task (NOT in toolCallState, which is
+  // cleared each resume) so resumeChatTask re-applies the loaded set when
+  // runLoop rebuilds providerTools. Cleared only on terminal completion.
+  loadedTools?: string[];
   // Recent tool calls dispatched by the chat-task loop, surfaced to the chat
   // UI as inline rows above the "Working…" indicator. Capped at ~20 entries
   // (oldest dropped). Not persisted as audit truth — these are a display
@@ -709,6 +808,10 @@ export interface ChatMessageRecord {
   // ~/.gini/instances/<inst>/uploads/. Mirrored on the user_text ChatBlock so
   // either persistence path can drive transcript rendering.
   images?: ImageAttachment[];
+  // User-role messages may carry a voice recording. Render-only — the audio
+  // is transcribed into `content` at submit time and never sent to the
+  // provider. Mirrored on the user_text ChatBlock for playback rendering.
+  audio?: AudioAttachment;
   // Optional tag used to distinguish multiple assistant messages emitted by
   // the same task. Today only "approval_reason" is set — when an approval
   // (e.g. connector.request) is created, the runtime persists its `reason`
@@ -719,6 +822,21 @@ export interface ChatMessageRecord {
   // from landing. Untagged assistant messages (the default) are the
   // task's terminal summary.
   kind?: string;
+  // Tool-calling transcript fields, set only on rows tagged
+  // kind:"tool_transcript". The assistant row that emits tool calls carries
+  // `toolCalls`; each paired result row uses role:"tool" with `toolCallId`
+  // pointing back at the originating call. Stored in a provider-agnostic
+  // inline shape (not the provider's ToolCall type) so the durable store has
+  // no provider dependency; chat-task maps these back to the provider message
+  // shape when replaying across turns. These rows are excluded from the
+  // human-facing JSON views in chat.ts.
+  toolCalls?: { id: string; type: "function"; function: { name: string; arguments: string } }[];
+  toolCallId?: string;
+  // Monotonic per-store sequence stamped at create time. Gives a stable
+  // tiebreaker when several transcript rows share a createdAt timestamp, so
+  // replay can reconstruct exact assistant→tool ordering. Older rows lack it
+  // and fall back to 0.
+  seq?: number;
 }
 
 export interface TraceRecord {
@@ -1026,7 +1144,8 @@ export type AuthorizationAction =
   | "skill.enable"
   | "connector.enable"
   | "browser.upload_file"
-  | "messaging.send";
+  | "messaging.send"
+  | "self.config";
 
 export interface Authorization {
   id: string;
@@ -1046,12 +1165,23 @@ export interface Authorization {
 }
 
 // User-actor gate: the user performs a setup step (sign in via browser,
-// enter credentials, fill a form). The runtime resumes after the user
-// signals completion via the /setup-requests/:id/complete endpoint.
+// enter credentials, fill a form, or confirm a messaging side effect). The
+// runtime resumes after the user signals completion via the
+// /setup-requests/:id/complete endpoint.
+//
+// The messaging.* actions (add_bridge, approve_pairing, remove_bridge) are
+// connect-only: like browser.connect / connector.request, their side effect
+// (addMessagingBridge / allowChat / removeMessagingBridge) runs inside the
+// /complete handler before the request is marked completed. They carry no
+// approve/deny semantics, so they live here rather than on AuthorizationAction.
 export type SetupRequestAction =
   | "browser.connect"
   | "connector.request"
-  | "browser.fill_secret";
+  | "browser.fill_secret"
+  | "skill.grant_connector"
+  | "messaging.add_bridge"
+  | "messaging.approve_pairing"
+  | "messaging.remove_bridge";
 
 export interface SetupRequest {
   id: string;
@@ -1065,12 +1195,40 @@ export interface SetupRequest {
   taskId?: string;
   action: SetupRequestAction;
   // Trust anchor shown to the user before they complete the request: the
-  // destination URL for browser.connect / browser.fill_secret, or the
-  // provider id for connector.request.
+  // destination URL for browser.connect / browser.fill_secret, the provider
+  // id for connector.request (or the credential `name` for a templateless
+  // typed-credential request, which carries no registered provider), or the
+  // bridge kind / id for the messaging.* actions.
+  //
+  // For connector.request the payload is one of two shapes. Known-provider:
+  // {provider, providerLabel, providerDescription, fields, reason, toolCallId}.
+  // Templateless typed credential (no registered provider): {credentialName,
+  // credentialType ("api-key" only — templateless oauth2 is rejected because it
+  // needs a provider module / setup skill), credentialLabel, mcpUrl?, reason,
+  // toolCallId}. Either shape may also carry {skillId} — when set, completing
+  // the request both stores the credential AND grants it to that skill — plus
+  // {credentialSkillName}, the server-resolved name of that skill for the card
+  // to display.
   target: string;
   // Human-language ask shown to the user in the chat card.
   reason: string;
   payload: Record<string, unknown>;
+  // Set by the messaging.* /complete handlers (add_bridge, approve_pairing,
+  // remove_bridge) after the post-completion side effect runs, AND by the
+  // connector.request /complete handler on a terminal failure (probe failure
+  // or a post-claim throw). `ok: true` means the side effect succeeded (bridge
+  // created, pairing approved, etc.); `ok: false` plus `message` carries the
+  // sanitized failure reason. connector.request persists this ONLY on failure
+  // — a successful create + grant leaves the completed row with no outcome, so
+  // a completed connector.request row with no outcome IS the success case.
+  // The chat card reads this as the source of truth for the past-tense
+  // summary after reload — React-component-local sticky state is cleared on
+  // reload, so without a persisted outcome a failed side effect on a
+  // status="completed" row would fall back to rendering as success.
+  // browser.fill_secret could adopt the same field; today it only tracks
+  // success via the request status because its failure modes bounce the
+  // request pending state instead of completing + failing.
+  connectOutcome?: { ok: boolean; message?: string };
 }
 
 export interface SkillRecord {
@@ -1115,7 +1273,22 @@ export interface SkillRecord {
   // ids (and optionally scopes) the skill needs to function. The runtime
   // gates the skill out of the agent loop's available-skills set until every
   // entry matches a healthy ConnectorRecord. Defaults to [].
+  // Migration source for `requiredCredentials`; kept one release.
   requiredConnectors?: Array<{ provider: string; scopes?: string[] }>;
+  // Frontmatter `metadata.gini.requires.credentials` — credential NAMES the
+  // skill needs to function (e.g. ["LINEAR_API_KEY"] or
+  // ["google-workspace-oauth"]). The runtime gates the skill out of the agent
+  // loop's available-skills set until every name matches a configured+healthy
+  // ConnectorRecord with that `name`, and resolveSkillEnv resolves the skill's
+  // prerequisites.env from those named credentials. Defaults to [].
+  requiredCredentials?: string[];
+  // Per-(skill, connector) consent: the credential NAMES the user has granted
+  // this skill access to (the field name is kept for back-compat; the contents
+  // are now names, not provider strings). `resolveSkillEnv` injects a named
+  // credential's env only when that name is granted here (or the skill is
+  // `source:"bundled"`, which is auto-granted by short-circuit). Cleared on
+  // disable so re-enabling re-prompts. See docs/adr/skill-connector-consent.md.
+  grantedConnectors?: string[];
   // Spec-compliant top-level `allowed-tools` declaration (space-separated in
   // the source frontmatter, normalized to the original string here). Stored
   // so the UI and install-skill flow can surface it; not enforced yet.
@@ -1275,6 +1448,19 @@ export interface ConnectorRecord {
   // ("demo", "linear", "claude-code", "codex", "generic", or any module id
   // in the registry). Renamed from `kind` in ADR connector-provider-spec-compliance.md.
   provider: string;
+  // Credential type. Skills and MCP rows reference credentials BY NAME, and
+  // `type` says how the name resolves to env vars:
+  //   - "api-key": a single secret whose env var IS the credential `name`
+  //     (uppercase env-token, e.g. LINEAR_API_KEY). Optional
+  //     `metadata.mcp` powers MCP registration with
+  //     `Authorization: Bearer ${<name>}`.
+  //   - "oauth2": a named handle (may be kebab, e.g. google-workspace-oauth)
+  //     whose fields materialize as env vars via `metadata.envMap`
+  //     (purpose → ENV_NAME).
+  // Optional: presence-only providers (demo/claude-code/codex) carry no env
+  // and stay untyped. The state migration stamps a type on every legacy
+  // provider-keyed record at boot, so all credentialed records are typed.
+  type?: "api-key" | "oauth2";
   status: "configured" | "disabled" | "error";
   scopes: string[];
   secretRefs: ConnectorSecretRef[];
@@ -1287,7 +1473,22 @@ export interface ConnectorRecord {
   // persist non-secret dynamic fields (base URLs, account ids, …) that the
   // user supplies in the Add Connector dialog. Provider-specific keys live
   // under a nested namespace (e.g. `metadata.fields`) by convention.
-  metadata?: Record<string, unknown>;
+  //
+  // Two typed-credential keys live here by convention:
+  //   - `mcp`: present on api-key credentials that back an HTTP MCP server.
+  //     Drives MCP registration and the header
+  //     `{[headerName ?? "Authorization"]: "<scheme ?? Bearer> ${<name>}"}`.
+  //     The server row is named by `mcp.name` when set, else the credential
+  //     name. `mcp.name` lets a credential own a differently-named row — e.g.
+  //     the LINEAR_API_KEY credential drives the "linear" MCP server that
+  //     skills reference as `server: "linear"`.
+  //   - `envMap`: present on oauth2 credentials, mapping each secret purpose
+  //     to the ENV_NAME the runtime injects for it (e.g.
+  //     `{ client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID" }`).
+  metadata?: Record<string, unknown> & {
+    mcp?: { url: string; name?: string; headerName?: string; scheme?: string };
+    envMap?: Record<string, string>;
+  };
   // Origin marker: "auto" for connectors materialized by the startup
   // detection job (claude-code, codex on PATH); "user" for connectors
   // created via the Add Connector dialog or `gini connector add`. Drives

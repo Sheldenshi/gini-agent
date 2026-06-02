@@ -1,0 +1,6 @@
+# bun has no `[test] timeout` key (verified against the bunfig reference), so
+# the strict 10s per-test ceiling is enforced by a preloaded setup that calls
+# jest.setTimeout(10000). The preload runs in every worker, including under
+# `bun test --parallel`.
+[test]
+preload = ["./bun-test-setup.ts"]

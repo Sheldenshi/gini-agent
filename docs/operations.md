@@ -163,7 +163,9 @@ restart `gini run` (stop the tmux session and re-issue the command).
 Controls live behind a single endpoint (`/api/settings/auto-approve`):
 
 - **`approvalMode`** — `"strict" | "auto" | "yolo"`. New instances
-  default to `"auto"`. `strict` gates every approval-eligible action
+  default to `"yolo"`; existing instances are not auto-escalated (a
+  config that predates an explicit `approvalMode` keeps resolving to
+  `"auto"`). `strict` gates every approval-eligible action
   (`file_write`, `file_patch`, `terminal_exec`, `code_exec`,
   `browser_upload_file`, `send_message`) for a human decision. `auto`
   auto-approves the safe set (including `send_message`) and gates

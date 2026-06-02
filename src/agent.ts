@@ -11,7 +11,14 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn } from "bun";
-import type { Authorization, ImageAttachment, RuntimeConfig, RuntimeState, SetupRequest, Task } from "./types";
+import type {
+  Authorization,
+  ImageAttachment,
+  RuntimeConfig,
+  RuntimeState,
+  SetupRequest,
+  Task
+} from "./types";
 import { statePath, traceDir } from "./paths";
 import {
   addAudit,
@@ -62,7 +69,12 @@ function findApprovalRow(state: RuntimeState, id: string):
   if (setup) return { kind: "setup_request", row: setup };
   return undefined;
 }
-import { generateTaskSummary } from "./provider";
+import {
+  ProviderAuthError,
+  generateTaskSummary,
+  providerAuthNote,
+  redactSecrets
+} from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
 import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
@@ -78,6 +90,8 @@ import {
   resolveEmitContext
 } from "./execution/chat-task-emit";
 import { approvalToolCallId } from "./execution/tool-dispatch";
+import { findSelfOperation } from "./execution/self-registry";
+import { redactSensitiveToolArgs } from "./execution/tool-args-redact";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
@@ -89,7 +103,6 @@ import {
   releaseApproval
 } from "./execution/approval-execution";
 import { syncSubagentFromTask } from "./capabilities/subagents";
-import { resolveActiveSkillsEnv } from "./integrations/connectors";
 import { sendMessagingOutput } from "./integrations/messaging";
 // Imported from a leaf module (not src/jobs/index.ts) so we don't close
 // the cycle that runs through submitTask. The finalizer flips the linked
@@ -271,9 +284,12 @@ export async function cancelTask(
     // Halt-siblings fix: cancelling a task that's waiting on multiple
     // pending approvals must also tear down those approvals so a later
     // approve doesn't run a tool against a cancelled task. Clear the
-    // captured tool-call snapshot in the same write.
+    // captured tool-call snapshot in the same write. Also drop the loaded
+    // deferred-tool set: a cancelled task is terminal and must not retain
+    // dead state that a future read could mistake for live context.
     cancelPendingTaskApprovals(state, taskId, "task.cancelled");
     task.toolCallState = undefined;
+    task.loadedTools = undefined;
     upsertTask(state, task);
     // Abort any in-flight approved actions for this task. The
     // abort is called INSIDE the `mutateState` callback so
@@ -777,7 +793,16 @@ export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
 }
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
+  // Enrich provider auth failures with a named provider + re-auth CTA (issue
+  // #205) ONLY when the error is a ProviderAuthError — i.e. it originated at a
+  // provider call (tagged with the provider that served the turn), not a
+  // tool/browser/terminal failure whose message merely mentions "401".
+  const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  // Redact credential-shaped substrings from provider auth errors before they
+  // are stored (task.error, audit) or rendered (the note's detail) — some
+  // providers echo a partial key in the error text.
+  const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
   const task = await mutateState(config.instance, (state) => {
     // The two `runTask(...).catch(failTask(...))` fire-and-forget call
     // sites in createTask/retryTask can race with test cleanup or a
@@ -797,6 +822,10 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     }
     task.status = "failed";
     task.error = message;
+    // Record the failed provider so syncChatTaskResult can render the same
+    // actionable, provider-named message for legacy/text-only clients that the
+    // chat system note shows the web (issue #205).
+    if (authProvider) task.authErrorProvider = authProvider;
     task.currentStep = "Failed";
     task.updatedAt = now();
     addAudit(
@@ -839,7 +868,16 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
         if (inFlight) {
           finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
         }
-        emitSystemNote(emitCtx, message);
+        // When the turn died because the provider credential failed, replace
+        // the raw provider line with an actionable note that names the
+        // provider and carries re-auth metadata for the client CTA (issue
+        // #205). Every other failure passes the raw message through unchanged.
+        if (authProvider) {
+          const note = providerAuthNote(authProvider, message);
+          emitSystemNote(emitCtx, note.text, note.authError);
+        } else {
+          emitSystemNote(emitCtx, message);
+        }
         emitPhase(emitCtx, "Failed");
       }
     } catch (error) {
@@ -987,6 +1025,9 @@ export async function decideApproval(config: RuntimeConfig, approvalId: string, 
       // recordInFlightAborted.
       if (task && !isTerminalTaskStatus(task.status)) {
         task.toolCallState = undefined;
+        // A denied/failed task is terminal — drop the loaded deferred-tool
+        // set alongside the tool-call snapshot so no dead state lingers.
+        task.loadedTools = undefined;
         const message = `Approval denied: ${item.target}`;
         task.status = "failed";
         task.currentStep = "Failed";
@@ -1139,6 +1180,9 @@ export function mapApprovalToPolicyAction(
     return action;
   }
   if (action === "messaging.send") {
+    return action;
+  }
+  if (action === "self.config") {
     return action;
   }
   return undefined;
@@ -1337,6 +1381,9 @@ export async function resolveSetupRequest(
       const task = state.tasks.find((t) => t.id === item.taskId);
       if (task && !isTerminalTaskStatus(task.status)) {
         task.toolCallState = undefined;
+        // Cancelling setup fails the task (terminal) — drop the loaded
+        // deferred-tool set alongside the tool-call snapshot.
+        task.loadedTools = undefined;
         const message = `Setup cancelled: ${item.target}`;
         task.status = "failed";
         task.currentStep = "Failed";
@@ -1537,9 +1584,12 @@ async function runApprovedAction(
   const { shouldResumeChat, extraEvidence, chatToolCallId } = ctx;
 
   // SetupRequest actions (browser.connect, connector.request,
-  // browser.fill_secret) no longer reach this executor — their side
-  // effects run inside the /api/setup-requests/:id/complete endpoint,
-  // not through Authorization side-effect dispatch. See
+  // browser.fill_secret, and the messaging.* connect actions —
+  // add_bridge, approve_pairing, remove_bridge) no longer reach this
+  // executor — their side effects run inside the
+  // /api/setup-requests/:id/complete endpoint (delegating to the bounded
+  // runMessaging*Connect / runFillSecretConnect modules), not through
+  // Authorization side-effect dispatch. See
   // docs/adr/authorization-vs-setup-request.md.
 
   if (approval.action === "file.write") {
@@ -1686,12 +1736,11 @@ async function runApprovedAction(
     if (signal.aborted) {
       return await emitTerminalAborted(config, approval, extraEvidence, { command, usePty, signal });
     }
-    const skillEnv = await resolveActiveSkillsEnv(config, approval.taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, ...skillEnv }
+      env: { ...process.env }
     });
     const timeoutMs = Number(approval.payload.timeoutMs ?? 10_000);
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
@@ -2076,6 +2125,77 @@ async function runApprovedAction(
     return resultStr;
   }
 
+  if (approval.action === "self.config") {
+    // The side effect is the registry handler itself (set_provider /
+    // use_agent / create_agent). It was deferred to approval time; re-read
+    // {opName, args} from the payload and run it now. The handler writes its
+    // own trace + audit rows, so this branch just runs it and feeds the
+    // result back to the chat-task loop.
+    const opName = String(approval.payload.opName ?? "");
+    const opArgs = (approval.payload.args && typeof approval.payload.args === "object" && !Array.isArray(approval.payload.args))
+      ? approval.payload.args as Record<string, unknown>
+      : {};
+    if (signal.aborted) {
+      const aborted = JSON.stringify({ ok: false, aborted: true, error: "self.config aborted: task was cancelled." });
+      if (approval.taskId) {
+        appendTrace(config.instance, approval.taskId, {
+          type: "tool",
+          message: "self.config aborted by task cancellation",
+          data: { opName, aborted: true }
+        });
+      }
+      return aborted;
+    }
+    const op = findSelfOperation(opName);
+    if (!op || !approval.taskId) {
+      return JSON.stringify({ ok: false, error: `Unknown self operation: ${opName}.` });
+    }
+    const resultStr = await op.handler(config, approval.taskId, opArgs);
+    // The handler writes its own low-risk operation trace; this row carries
+    // approvalId so the operation outcome is joinable to the approval that
+    // authorized it. Mirrors the messaging.send execute-side audit.
+    let resultOk: boolean | null = null;
+    try {
+      const parsed = JSON.parse(resultStr);
+      if (parsed && typeof parsed === "object" && typeof parsed.ok === "boolean") {
+        resultOk = parsed.ok;
+      }
+    } catch {
+      // Best-effort: a non-JSON handler result leaves ok null.
+    }
+    await mutateState(config.instance, (state) => {
+      addAudit(
+        state,
+        {
+          actor: "agent",
+          action: "self.config",
+          target: opName,
+          risk: "medium",
+          taskId: approval.taskId,
+          runId: state.tasks.find((t) => t.id === approval.taskId)?.runId,
+          approvalId: approval.id,
+          evidence: { ...extraEvidence, opName, ok: resultOk }
+        },
+        approvalAgentContext(approval)
+      );
+      // Scrub any secret args (set_provider.apiKey, rotate_connector.token,
+      // add_mcp_server.headers) from the now-resolved approval payload. The
+      // approvals list serves the payload to clients, so the historical row
+      // must not retain credentials. The handler already ran above, so the
+      // real args are no longer needed. The brief pending window (strict
+      // mode, before approval) keeps the real args so the action can execute
+      // on approval — only the approving user sees that, which is acceptable.
+      const row = state.authorizations.find((a) => a.id === approval.id);
+      if (row && row.payload.args && typeof row.payload.args === "object" && !Array.isArray(row.payload.args)) {
+        row.payload.args = redactSensitiveToolArgs(row.payload.args as Record<string, unknown>);
+      }
+    });
+    if (shouldResumeChat && chatToolCallId) {
+      await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);
+    }
+    return resultStr;
+  }
+
   return undefined;
 }
 
@@ -2347,12 +2467,11 @@ async function runTerminalCommandClaimed(
     winner = "aborted";
     abortReason = readSignalReason(signal);
   } else {
-    const skillEnv = await resolveActiveSkillsEnv(config, taskId);
     const proc = spawn(spawnArgs, {
       cwd: config.workspaceRoot,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, ...skillEnv }
+      env: { ...process.env }
     });
     const timeout = setTimeout(() => proc.kill(), timeoutMs);
     const procExitedSentinel = proc.exited.then(() => "exited" as const);

@@ -1,8 +1,50 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
+import { __resetTunnelManagerForTests, tunnelManager } from "./runtime/tunnel";
+import { webPortPath } from "./paths";
+import { listAllDevices } from "./state/devices";
+import { removeMemoryDb } from "./state/memory-db";
+import { listProviders } from "./integrations/connectors/registry";
 import type { RuntimeConfig } from "./types";
+
+// Stub a provider's host-environment `detect()` so the connector-detection
+// endpoint test stays deterministic AND fast regardless of what's installed
+// on the developer's PATH. The production `detect()` for claude-code / codex
+// shells out via spawnSync (`which`, `claude auth status`), which on a machine
+// with those CLIs installed dominates this test's wall time (the unstubbed
+// detect endpoint test measured 1.524641s). Mirrors the same in-place
+// swap-and-restore helper used by src/jobs/connector-detection.test.ts. The
+// registry is a process-wide singleton, so the returned restore fn MUST run in
+// a finally to avoid leaking the stub into sibling tests.
+function stubProviderDetect(
+  providerId: string,
+  value: { detected: boolean; suggestedName?: string; message?: string }
+): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.detect;
+  provider.detect = async () => value;
+  return () => {
+    provider.detect = previous;
+  };
+}
+
+// Companion to stubProviderDetect. After connector auto-detection creates a
+// record for a provider that exposes a `probe()`, runConnectorDetection runs
+// an initial checkConnector → provider.probe, which for claude-code shells out
+// to `claude auth status` again. Stub the probe so the detection endpoint
+// test never touches a real subprocess. Same swap-and-restore discipline.
+function stubProviderProbe(providerId: string, value: { ok: boolean; message: string }): () => void {
+  const provider = listProviders().find((p) => p.id === providerId);
+  if (!provider) throw new Error(`Provider not registered: ${providerId}`);
+  const previous = provider.probe;
+  provider.probe = async () => value;
+  return () => {
+    provider.probe = previous;
+  };
+}
 
 describe("runtime api", () => {
   test("applies approved improvement proposals and audits the decision", async () => {
@@ -391,10 +433,13 @@ describe("runtime api", () => {
     // chunk is "".
     const reader = response.body?.getReader();
     // Race the read against a short timeout; the heartbeat doesn't fire for
-    // 1s, so an immediate read should observe an empty buffer.
+    // 1s, so an immediate read should observe an empty buffer. The timeout
+    // value only needs to lose to a real event (there are none queued) and
+    // win against the 1s heartbeat — 30ms is as conclusive as 200ms here and
+    // doesn't burn the wall when the suite runs the whole describe block.
     const winner = await Promise.race([
       reader?.read(),
-      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 200))
+      new Promise((resolve) => setTimeout(() => resolve({ value: undefined, done: false }), 30))
     ]) as { value?: Uint8Array; done?: boolean };
     await reader?.cancel();
     const text = winner?.value ? new TextDecoder().decode(winner.value) : "";
@@ -741,14 +786,35 @@ describe("runtime api", () => {
   test("POST /api/connectors/detect runs the detection job and is idempotent", async () => {
     const config = testConfig("connector-detect-endpoint");
     const handler = createHandler(config);
-    const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
-    expect(first).toHaveProperty("considered");
-    expect(first).toHaveProperty("created");
-    // The second call should not create any new records — the detection
-    // logic is idempotent at the registry+state level.
-    const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
-    const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
-    expect(createdProviders).toEqual([]);
+    // Stub the only two providers with a host-shelling detect() so the run
+    // is deterministic and never spawns `which` / `claude auth status`.
+    // claude-code detects positive → the first endpoint call creates an
+    // auto-source connector; codex detects negative. The second call must
+    // then skip claude-code with reason "exists", exercising the full
+    // create-then-skip idempotency contract through the HTTP route.
+    const restoreClaude = stubProviderDetect("claude-code", {
+      detected: true,
+      suggestedName: "Claude Code",
+      message: "stub"
+    });
+    const restoreClaudeProbe = stubProviderProbe("claude-code", { ok: true, message: "stub" });
+    const restoreCodex = stubProviderDetect("codex", { detected: false });
+    try {
+      const first = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+      expect(first).toHaveProperty("considered");
+      expect(first).toHaveProperty("created");
+      expect((first.created as Array<{ provider: string }>).map((c) => c.provider)).toContain("claude-code");
+      // The second call should not create any new records — the detection
+      // logic is idempotent at the registry+state level.
+      const second = await call(handler, config, "/api/connectors/detect", { method: "POST" });
+      const createdProviders = (second.created as Array<{ provider: string }>).map((c) => c.provider);
+      expect(createdProviders).toEqual([]);
+      expect((second.skipped as Array<{ provider: string; reason: string }>).find((s) => s.provider === "claude-code")?.reason).toBe("exists");
+    } finally {
+      restoreClaude();
+      restoreClaudeProbe();
+      restoreCodex();
+    }
   });
 
   test("GET /api/connectors/providers returns the registry", async () => {
@@ -762,6 +828,47 @@ describe("runtime api", () => {
     expect(ids).toContain("generic");
     expect(ids).toContain("claude-code");
     expect(ids).toContain("codex");
+    // Credential templates: linear (single env binding) → api-key prefill
+    // with the MCP URL + server name; google-oauth-desktop (two bindings) →
+    // oauth2 envMap.
+    const linear = providers.find((p: { id: string }) => p.id === "linear");
+    expect(linear.credentialTemplate).toEqual({
+      type: "api-key",
+      name: "LINEAR_API_KEY",
+      mcpUrl: "https://mcp.linear.app/mcp",
+      mcpName: "linear"
+    });
+    const gws = providers.find((p: { id: string }) => p.id === "google-oauth-desktop");
+    expect(gws.credentialTemplate.type).toBe("oauth2");
+    expect(gws.credentialTemplate.envMap).toEqual({
+      client_id: "GOOGLE_WORKSPACE_CLI_CLIENT_ID",
+      client_secret: "GOOGLE_WORKSPACE_CLI_CLIENT_SECRET"
+    });
+    // Presence-only providers (no secret spec) carry no template.
+    const demo = providers.find((p: { id: string }) => p.id === "demo");
+    expect(demo.credentialTemplate).toBeUndefined();
+  });
+
+  test("POST /api/connectors threads a typed api-key credential through createConnector", async () => {
+    const config = testConfig("connector-typed-create");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/connectors", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: "generic",
+        name: "MY_SERVICE_KEY",
+        type: "api-key",
+        secrets: { MY_SERVICE_KEY: "lin_secret_typed" },
+        metadata: { mcp: { url: "https://mcp.example.com/mcp", headerName: "Authorization", scheme: "Bearer" } }
+      })
+    });
+    expect(created.type).toBe("api-key");
+    expect(created.name).toBe("MY_SERVICE_KEY");
+    expect(created.metadata.mcp.url).toBe("https://mcp.example.com/mcp");
+    expect(created.secretRefs).toHaveLength(1);
+    expect(created.secretRefs[0].purpose).toBe("MY_SERVICE_KEY");
+    const raw = readFileSync(`${config.stateRoot}/state.json`, "utf8");
+    expect(raw).not.toContain("lin_secret_typed");
   });
 
   test("POST /api/setup-requests/<id>/complete creates a connector and resolves the setup request on probe success", async () => {
@@ -801,7 +908,627 @@ describe("runtime api", () => {
     expect(state.connectors.some((c) => c.provider === "demo" && c.health === "healthy")).toBe(true);
   });
 
-  test("POST /api/setup-requests/<id>/complete returns ok:false and leaves the request pending on probe failure", async () => {
+  test("POST /api/setup-requests/<id>/complete grants the connector and enables the skill for skill.grant_connector", async () => {
+    const config = testConfig("setup-complete-skill-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-linear requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          credentialName: "LINEAR_API_KEY",
+          credentialLabel: "Linear",
+          toolCallId: "call_grant_1"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.status).toBe("enabled");
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+    expect(state.audit.some((a) => a.action === "skill.connector.granted")).toBe(true);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a templateless connector.request creates a typed api-key, grants + enables the skill, and records no secret", async () => {
+    const config = testConfig("setup-complete-templateless");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-some-service",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["SOME_SERVICE_API_KEY"]
+      })
+    );
+    // Templateless payload: no `provider`, carries credentialType/Name/Label +
+    // skillId (exactly what requestConnectorTool mints).
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "SOME_SERVICE_API_KEY",
+        reason: "Enter your Some Service API key",
+        payload: {
+          credentialName: "SOME_SERVICE_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Some Service",
+          skillId: skill.id,
+          reason: "Enter your Some Service API key",
+          toolCallId: "call_tl_complete"
+        }
+      })
+    );
+
+    const secretValue = "sk-some-service-super-secret";
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { SOME_SERVICE_API_KEY: secretValue } })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.connector.health).toBe("healthy");
+
+    const state = readState(config.instance);
+    // A TYPED api-key record landed under the requested name.
+    const connector = state.connectors.find((c) => c.name === "SOME_SERVICE_API_KEY");
+    expect(connector).toBeDefined();
+    expect(connector?.type).toBe("api-key");
+    // The requesting skill was granted the credential and enabled (its only
+    // required credential is now granted).
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["SOME_SERVICE_API_KEY"]);
+    expect(updated?.status).toBe("enabled");
+    // The setup request resolved.
+    expect(state.setupRequests.find((a) => a.id === approval.id)?.status).toBe("completed");
+    // The audit row for connector.request carries the credential name but NO
+    // secret value — the secret stays server-side.
+    const requestAudit = state.audit.find((a) => a.action === "connector.request");
+    expect(requestAudit).toBeDefined();
+    expect((requestAudit?.evidence as Record<string, unknown>)?.credentialName).toBe("SOME_SERVICE_API_KEY");
+    expect(JSON.stringify(state.audit)).not.toContain(secretValue);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a known-provider connector.request with skillId grants + enables the skill", async () => {
+    const config = testConfig("setup-complete-known-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    // demo provider has no probe (presence-only healthy) and no credential
+    // template, so its record stays untyped — to exercise the grant we point
+    // the skill's requiredCredentials at the connector name the demo create
+    // lands ("Demo") and assert the grant is recorded. firstUngrantedCredential
+    // only blocks on TYPED credentials, so an untyped demo connector enables.
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-demo",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["Demo"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "demo",
+        reason: "connect demo",
+        payload: {
+          provider: "demo",
+          providerLabel: "Demo",
+          providerDescription: "Demo provider",
+          fields: [],
+          skillId: skill.id,
+          reason: "connect demo",
+          toolCallId: "call_known_complete"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: {}, scopes: [] })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.connector.provider).toBe("demo");
+
+    const state = readState(config.instance);
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["Demo"]);
+    expect(updated?.status).toBe("enabled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a known-provider (linear) connector.request creates a TYPED LINEAR_API_KEY, grants + enables the requesting skill", async () => {
+    // Real template-path regression: a connector.request for {provider:"linear",
+    // skillId} must land a TYPED LINEAR_API_KEY record (stamped from the
+    // module's credentialTemplate), and because the requesting skill declares
+    // LINEAR_API_KEY, completing the card grants it and enables the skill — no
+    // second consent card. The demo provider can't prove this (it's untyped /
+    // presence-only); linear has both a credentialTemplate and a live probe, so
+    // we stub a healthy viewer query.
+    const config = testConfig("setup-complete-linear-typed-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear-typed",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["LINEAR_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "linear",
+        reason: "connect linear",
+        payload: {
+          provider: "linear",
+          providerLabel: "Linear",
+          providerDescription: "Linear",
+          fields: [],
+          skillId: skill.id,
+          reason: "connect linear",
+          toolCallId: "call_linear_typed"
+        }
+      })
+    );
+
+    // Stub the Linear GraphQL probe with a healthy viewer so checkConnector
+    // flips the typed record to healthy without a live network call.
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: { viewer: { id: "u1", name: "Tester", email: "t@e.co" } } }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })) as unknown as typeof fetch;
+    let response: { ok: boolean; connector?: { provider?: string } };
+    try {
+      response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { token: "lin_api_realish" } })
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    // The Linear template stamps a TYPED api-key record named LINEAR_API_KEY.
+    const connector = state.connectors.find((c) => c.provider === "linear");
+    expect(connector?.type).toBe("api-key");
+    expect(connector?.name).toBe("LINEAR_API_KEY");
+    expect(connector?.health).toBe("healthy");
+    // The requesting skill (declares LINEAR_API_KEY) was granted + enabled.
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+    expect(updated?.status).toBe("enabled");
+    // No secret value leaked into the audit log.
+    expect(JSON.stringify(state.audit)).not.toContain("lin_api_realish");
+  });
+
+  test("POST /api/setup-requests/<id>/complete: skillId for a skill that does NOT declare the credential creates the connector but does NOT grant or enable", async () => {
+    // Auto-grant trust guard: the model supplies skillId, so /complete must
+    // verify the named skill actually declares connector.name before granting.
+    // A skill that does not declare the credential gets the connector created
+    // (so the credential exists) but is neither granted the credential nor
+    // enabled — "a skill only gets credentials it declared + the user granted".
+    const config = testConfig("setup-complete-undeclared-no-grant");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "wants-other-cred",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        // Declares a DIFFERENT credential than the one being requested.
+        requiredCredentials: ["OTHER_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "SOME_SERVICE_API_KEY",
+        reason: "Enter your Some Service API key",
+        payload: {
+          credentialName: "SOME_SERVICE_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Some Service",
+          skillId: skill.id,
+          reason: "Enter your Some Service API key",
+          toolCallId: "call_undeclared"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { SOME_SERVICE_API_KEY: "sk-secret" } })
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    // The connector was created (the credential now exists).
+    expect(state.connectors.some((c) => c.name === "SOME_SERVICE_API_KEY")).toBe(true);
+    // But the skill — which never declared SOME_SERVICE_API_KEY — was NOT
+    // granted it and stays disabled.
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors ?? []).not.toContain("SOME_SERVICE_API_KEY");
+    expect(updated?.status).toBe("disabled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a multi-credential skill grants the requested credential but stays DISABLED while another required credential has no connector", async () => {
+    // Enable-when-fully-satisfied: a skill that requires two credentials and
+    // only just got the first must NOT be enabled while the second has no
+    // connector row at all. firstUngrantedCredential alone misses this (it
+    // skips required creds with no connector); isSkillActive catches it.
+    const config = testConfig("setup-complete-partial-multi-disabled");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-two-creds",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        // SECOND_API_KEY has no connector yet — it'll be requested separately.
+        requiredCredentials: ["FIRST_API_KEY", "SECOND_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "FIRST_API_KEY",
+        reason: "Enter your first API key",
+        payload: {
+          credentialName: "FIRST_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "First",
+          skillId: skill.id,
+          reason: "Enter your first API key",
+          toolCallId: "call_first"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { FIRST_API_KEY: "sk-first" } })
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    const updated = state.skills.find((s) => s.id === skill.id);
+    // The requested credential was granted (the human entered it for this skill).
+    expect(updated?.grantedConnectors).toEqual(["FIRST_API_KEY"]);
+    // But the skill stays disabled — SECOND_API_KEY still has no connector.
+    expect(updated?.status).toBe("disabled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete on a multi-provider skill grants one provider, stays disabled, and mints the next grant card", async () => {
+    const config = testConfig("setup-complete-skill-grant-multi");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    await seedTypedCredential(config, "LINEAR_API_KEY", "linear");
+    await seedTypedCredential(config, "GENERIC_KEY", "generic");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-two",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["LINEAR_API_KEY", "GENERIC_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-two requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          credentialName: "LINEAR_API_KEY",
+          credentialLabel: "Linear",
+          toolCallId: "call_grant_multi"
+        }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    const updated = state.skills.find((s) => s.id === skill.id);
+    // Only the first credential is granted; the skill stays disabled until the
+    // remaining credential is granted too.
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+    expect(updated?.status).toBe("disabled");
+    // A new pending grant card was minted for the remaining credential.
+    const next = state.setupRequests.find(
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "GENERIC_KEY"
+    );
+    expect(next).toBeDefined();
+    expect(next?.payload.skillId).toBe(skill.id);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a double-complete of one grant request resolves once and mints exactly one next card", async () => {
+    const config = testConfig("setup-complete-skill-grant-double");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    await seedTypedCredential(config, "LINEAR_API_KEY", "linear");
+    await seedTypedCredential(config, "GENERIC_KEY", "generic");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-two-double",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["LINEAR_API_KEY", "GENERIC_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-two-double requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          credentialName: "LINEAR_API_KEY",
+          credentialLabel: "Linear",
+          toolCallId: "call_grant_double"
+        }
+      })
+    );
+
+    // Fire two completes of the SAME request. The mutateState lock serializes
+    // the atomic claim, so exactly one wins; the loser hits the already-
+    // resolved guard and mints nothing. No extra pending grant row.
+    const [a, b] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token)
+    ]);
+    const oks = [a.ok, b.ok];
+    expect(oks.filter(Boolean).length).toBe(1);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    // Exactly one next card for the remaining credential — no duplicate from
+    // the losing racer.
+    const next = state.setupRequests.filter(
+      (s) => s.status === "pending" && s.action === "skill.grant_connector" && s.payload.credentialName === "GENERIC_KEY"
+    );
+    expect(next.length).toBe(1);
+    // No stray pending grant rows beyond that single next card.
+    const pendingGrants = state.setupRequests.filter(
+      (s) => s.status === "pending" && s.action === "skill.grant_connector"
+    );
+    expect(pendingGrants.length).toBe(1);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a double-complete of the FINAL grant request enables once and writes exactly one skill.enabled audit and one grant", async () => {
+    const config = testConfig("setup-complete-skill-grant-final-double");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill, createTask, upsertTask } = await import("./state");
+    // A single-provider skill so completing the one grant card is the FINAL
+    // step (no next card): the winner records the grant, enables the skill,
+    // and resumes the task. A losing racer must produce ZERO side effects —
+    // no duplicate grant, no duplicate skill.enabled audit, no second resume.
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear-final-double",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }]
+      })
+    );
+    // Seed a terminal task so the resume branch is exercised but bails fast
+    // (resumeChatTask no-ops on a completed task) instead of polling for a
+    // waiting_approval flip that never comes.
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "grant final double");
+      task.status = "completed";
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        taskId,
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-linear-final-double requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          credentialName: "LINEAR_API_KEY",
+          credentialLabel: "Linear",
+          toolCallId: "call_grant_final_double"
+        }
+      })
+    );
+
+    const [a, b] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token)
+    ]);
+    expect([a.ok, b.ok].filter(Boolean).length).toBe(1);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.status).toBe("enabled");
+    // Exactly one grant — the loser double-granted nothing.
+    expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+    // Exactly ONE skill.enabled audit row (the loser produced no second one).
+    expect(state.audit.filter((a) => a.action === "skill.enabled").length).toBe(1);
+    // Exactly ONE grant audit row.
+    expect(state.audit.filter((a) => a.action === "skill.connector.granted").length).toBe(1);
+    // No extra pending grant rows from the losing racer.
+    expect(
+      state.setupRequests.filter((s) => s.status === "pending" && s.action === "skill.grant_connector").length
+    ).toBe(0);
+  });
+
+  test("POST /api/setup-requests/<id>/complete vs cancel on the same grant card: Cancel prevents the grant+enable", async () => {
+    const config = testConfig("setup-complete-skill-grant-cancel-race");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill, createTask, upsertTask } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-linear-cancel-race",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredConnectors: [{ provider: "linear" }]
+      })
+    );
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "grant cancel race");
+      task.status = "completed";
+      upsertTask(state, task);
+      return task.id;
+    });
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        taskId,
+        action: "skill.grant_connector",
+        target: "Linear",
+        reason: "Skill needs-linear-cancel-race requests access to your Linear credential.",
+        payload: {
+          skillId: skill.id,
+          skillName: skill.name,
+          credentialName: "LINEAR_API_KEY",
+          credentialLabel: "Linear",
+          toolCallId: "call_grant_cancel_race"
+        }
+      })
+    );
+
+    // Race a complete against a cancel on the SAME card. The per-instance
+    // mutateState lock serializes the two pending→terminal transitions, so
+    // exactly one wins. The consent gate must be honored: whichever side wins,
+    // a grant+enable happens ONLY if complete won — a winning cancel leaves the
+    // skill disabled and ungranted.
+    const [completeRes, cancelRes] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({})
+      }, config.token)
+    ]);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    const updated = state.skills.find((s) => s.id === skill.id);
+    const granted = state.audit.some((a) => a.action === "skill.connector.granted");
+    const enabled = state.audit.some((a) => a.action === "skill.enabled");
+
+    if (resolved?.status === "cancelled") {
+      // Cancel won — the consent gate is honored: NO grant, NO enable.
+      expect(completeRes.ok).toBe(false);
+      expect(updated?.status).toBe("disabled");
+      expect(updated?.grantedConnectors ?? []).toEqual([]);
+      expect(granted).toBe(false);
+      expect(enabled).toBe(false);
+    } else {
+      // Complete won — cancel is a no-op against the now-completed row, and
+      // the skill is granted+enabled.
+      expect(resolved?.status).toBe("completed");
+      expect(cancelRes.ok).toBe(false);
+      expect(updated?.status).toBe("enabled");
+      expect(updated?.grantedConnectors).toEqual(["LINEAR_API_KEY"]);
+      expect(granted).toBe(true);
+      expect(enabled).toBe(true);
+    }
+  });
+
+  test("POST /api/setup-requests/<id>/complete returns ok:false, claims the request, and cleans up the connector on probe failure", async () => {
     const config = testConfig("setup-requests-complete-probe-fail");
     const handler = createHandler(config);
     const { createSetupRequest } = await import("./state");
@@ -836,9 +1563,157 @@ describe("runtime api", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+    // The row was claimed BEFORE the create (claim-first race safety), so a
+    // probe failure cannot bounce it back to pending — it stays completed
+    // with a persisted failure outcome, and the orphaned unhealthy connector
+    // is cleaned up so it never lingers as a half-configured record.
     const state = readState(config.instance);
     const after = state.setupRequests.find((a) => a.id === approval.id);
-    expect(after?.status).toBe("pending");
+    expect(after?.status).toBe("completed");
+    expect(after?.connectOutcome?.ok).toBe(false);
+    expect(state.connectors.some((c) => c.provider === "linear")).toBe(false);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: an UNEXPECTED post-claim throw resumes the task instead of stranding it", async () => {
+    // Strand-the-task regression: after the winning claim, createConnector /
+    // grant / enable / resume can still throw (here: a duplicate credential
+    // name). The route's catch-all would return 500 while the setup row sits
+    // `completed` and the task stays `waiting_approval` — orphaned. The fix
+    // wraps the whole post-claim block: any throw persists a failure outcome
+    // and resumes the task. We seed a genuine waiting_approval task with a
+    // resumable toolCallState (one pending request_connector call) so the
+    // resume re-enters the echo loop and the task settles terminally.
+    const config = testConfig("setup-complete-postclaim-throw");
+    const handler = createHandler(config);
+    const { createSetupRequest, createTask, upsertTask } = await import("./state");
+
+    // Pre-seed a connector under the requested name so createConnector throws
+    // on instance-wide name uniqueness AFTER the claim.
+    await seedTypedCredential(config, "DUP_API_KEY", "generic");
+
+    const toolCallId = "call_postclaim_throw";
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "needs dup key");
+      task.status = "waiting_approval";
+      task.toolCallState = {
+        messages: [
+          { role: "system", content: "you are gini" },
+          { role: "user", content: "connect dup" },
+          { role: "assistant", content: "", tool_calls: [{ id: toolCallId, type: "function", function: { name: "request_connector", arguments: "{}" } }] }
+        ],
+        toolsHash: "test",
+        pending: [{ toolCallId, toolName: "request_connector", approvalId: "" }],
+        iterations: 1
+      };
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    const approval = await mutateState(config.instance, (state) => {
+      const a = createSetupRequest(state, {
+        taskId,
+        action: "connector.request",
+        target: "DUP_API_KEY",
+        reason: "Enter your Dup API key",
+        payload: {
+          credentialName: "DUP_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Dup",
+          reason: "Enter your Dup API key",
+          toolCallId
+        }
+      });
+      // Bind the approval to the task so the pending entry resolves on resume.
+      const item = state.tasks.find((t) => t.id === taskId)!;
+      item.toolCallState!.pending[0]!.approvalId = a.id;
+      item.approvalIds.push(a.id);
+      return a;
+    });
+
+    const raw = await rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { DUP_API_KEY: "dup-secret" } })
+    }, config.token);
+    const response = await raw.json();
+    // The route returned a structured failure body (the outcome + resume ran;
+    // it is NOT the bare catch-all 500 that bypasses both).
+    expect(response.ok).toBe(false);
+    expect(response.message).toBeString();
+
+    const settled = await waitForTask(handler, config, taskId);
+    // The task RESUMED — it is no longer stranded at waiting_approval.
+    expect(settled.task.status).not.toBe("waiting_approval");
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((a) => a.id === approval.id);
+    // The setup row is claimed (resolved) with a persisted failure outcome.
+    expect(resolved?.status).toBe("completed");
+    expect(resolved?.connectOutcome?.ok).toBe(false);
+    // No duplicate connector was created — only the pre-seeded one remains.
+    expect(state.connectors.filter((c) => c.name === "DUP_API_KEY").length).toBe(1);
+  });
+
+  test("POST /api/setup-requests/<id>/complete: a double-submit of a connector.request resolves once with no extra mutations", async () => {
+    // Claim-first race safety for connector.request: two concurrent completes
+    // of the same card — the mutateState lock serializes the atomic claim, so
+    // exactly one wins and creates exactly one connector; the loser produces
+    // zero side effects.
+    const config = testConfig("setup-complete-connector-double");
+    const handler = createHandler(config);
+    const { createSetupRequest, createSkill } = await import("./state");
+    const skill = await mutateState(config.instance, (state) =>
+      createSkill(state, {
+        name: "needs-race-key",
+        description: "",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "disabled",
+        source: "user",
+        requiredCredentials: ["RACE_API_KEY"]
+      })
+    );
+    const approval = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "connector.request",
+        target: "RACE_API_KEY",
+        reason: "Enter your Race API key",
+        payload: {
+          credentialName: "RACE_API_KEY",
+          credentialType: "api-key",
+          credentialLabel: "Race",
+          skillId: skill.id,
+          reason: "Enter your Race API key",
+          toolCallId: "call_race"
+        }
+      })
+    );
+
+    const [a, b] = await Promise.all([
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { RACE_API_KEY: "race-secret" } })
+      }, config.token),
+      rawCall(handler, config, `/api/setup-requests/${approval.id}/complete`, {
+        method: "POST",
+        body: JSON.stringify({ secrets: { RACE_API_KEY: "race-secret" } })
+      }, config.token)
+    ]);
+    // Exactly one winner.
+    expect([a.ok, b.ok].filter(Boolean).length).toBe(1);
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === approval.id);
+    expect(resolved?.status).toBe("completed");
+    // Exactly one connector created — the loser created nothing.
+    expect(state.connectors.filter((c) => c.name === "RACE_API_KEY").length).toBe(1);
+    // The skill was granted the credential exactly once and enabled.
+    const updated = state.skills.find((s) => s.id === skill.id);
+    expect(updated?.grantedConnectors).toEqual(["RACE_API_KEY"]);
+    expect(updated?.status).toBe("enabled");
+    // Exactly one grant audit row from the single winner.
+    expect(state.audit.filter((au) => au.action === "skill.connector.granted").length).toBe(1);
   });
 
   test("POST /api/setup-requests/<id>/complete 404s for an authorization id", async () => {
@@ -864,6 +1739,267 @@ describe("runtime api", () => {
     // Authorization ids never appear in the setupRequests collection, so
     // /complete returns 404 — the two endpoint families are independent.
     expect(response.status).toBe(404);
+  });
+
+  test("POST /api/setup-requests/<id>/complete creates a messaging bridge and resolves the setup request", async () => {
+    // Happy-path pin for the chat-side Add Telegram flow. The card's
+    // Submit button POSTs the name + bot token under `secrets`; the
+    // gateway routes them into addMessagingBridge (the same code path
+    // the CLI and the settings page already call) and resolves the
+    // setup request so the chat-task loop can resume.
+    const config = testConfig("setup-complete-bridge-happy");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "chat-test-bridge", toolCallId: "call_bridge_happy" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "chat-test-bridge", botToken: "1234:ABCDEFGHIJKLMNOPQR" } })
+    });
+    expect(response.ok).toBe(true);
+    expect(response.bridge?.name).toBe("chat-test-bridge");
+    expect(response.bridge?.kind).toBe("telegram");
+
+    const state = readState(config.instance);
+    const resolved = state.setupRequests.find((s) => s.id === setup.id);
+    expect(resolved?.status).toBe("completed");
+    const bridge = state.messagingBridges.find((b) => b.name === "chat-test-bridge");
+    expect(bridge).toBeDefined();
+    expect(bridge?.kind).toBe("telegram");
+
+    // Audit-row traceability pin: the chat-card create writes a
+    // dedicated audit row with the originating setup-request id AND the
+    // resulting bridge.id so operators can reconstruct
+    // "setup X via chat-card → bridge Y" from the activity feed.
+    // Without this row the chat path is indistinguishable from the
+    // CLI / settings dialog in the audit log (both write the same
+    // generic messaging.configured row via createMessagingBridgeRecord).
+    const chatAddRow = state.audit.find(
+      (e) => e.action === "messaging.add_bridge" && e.approvalId === setup.id
+    );
+    expect(chatAddRow).toBeDefined();
+    expect(chatAddRow?.target).toBe(bridge?.id);
+    expect((chatAddRow?.evidence as { kind?: string } | undefined)?.kind).toBe("telegram");
+    expect((chatAddRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("chat-test-bridge");
+
+    // Durable outcome pin: the /complete handler writes
+    // setup.connectOutcome so a post-reload render of the resolved
+    // card reads the truthful past-tense summary. Without this, the
+    // React component's sticky state evaporates on reload and the
+    // card would fall back to "Bridge added." even when the side
+    // effect actually failed.
+    expect(resolved?.connectOutcome?.ok).toBe(true);
+    expect(resolved?.connectOutcome?.message).toContain("chat-test-bridge");
+  });
+
+  test("POST /api/setup-requests/<id>/complete refuses messaging.add_bridge that was already cancelled, and creates no bridge", async () => {
+    // Race-safety pin: the messaging.add_bridge branch must resolve the
+    // setup request BEFORE addMessagingBridge so a concurrent /cancel
+    // (or cancel cascade) cannot leave an orphan bridge + encrypted
+    // secret on disk after the user has already abandoned the prompt.
+    // Mirrors the resolve-first contract in
+    // src/execution/browser-fill-secrets.ts. We simulate the race by
+    // pre-cancelling the setup request and then hitting /complete — the
+    // handler must short-circuit at the "already !pending" guard,
+    // return 410, and never touch addMessagingBridge.
+    const config = testConfig("setup-complete-bridge-cancel-race");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "race-bridge", toolCallId: "call_bridge_race" }
+      })
+    );
+    // Pre-cancel the setup request as if a concurrent operator had
+    // clicked Cancel between the user's typing and the Submit landing
+    // on the server.
+    await call(handler, config, `/api/setup-requests/${setup.id}/cancel`, { method: "POST" });
+    expect(readState(config.instance).setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+    const beforeBridges = readState(config.instance).messagingBridges.length;
+
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/setup-requests/${setup.id}/complete`,
+      {
+        method: "POST",
+        body: JSON.stringify({ secrets: { name: "race-bridge", botToken: "1234:ABCDEFGHIJKL" } })
+      },
+      config.token
+    );
+    // 410 Gone — the resolution-before-creation contract is upheld by
+    // the outer "already !pending" guard. The load-bearing invariant
+    // is the absence of any bridge / orphan secret on the other side.
+    expect(response.status).toBe(410);
+
+    const after = readState(config.instance);
+    expect(after.messagingBridges.length).toBe(beforeBridges);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("cancelled");
+  });
+
+  test("POST /api/setup-requests/<id>/complete rejects malformed messaging.add_bridge tokens BEFORE resolving the setup request", async () => {
+    // Token-format pre-check: addMessagingBridge runs
+    // assertHeaderSafeToken internally, and the chat card disappears
+    // once the setup request flips out of pending state. Without
+    // pre-resolve token validation, a malformed token would burn the
+    // request and the user could not retype from the same card.
+    // The bounded module calls assertHeaderSafeToken BEFORE resolving;
+    // this test pins that ordering by submitting a token with a control
+    // character and asserting the request stays pending.
+    const config = testConfig("setup-complete-bridge-bad-token-stays-pending");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "bad-token", toolCallId: "call_bridge_bad_token" }
+      })
+    );
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      // Control character in the token — assertHeaderSafeToken
+      // refuses any byte outside printable ASCII [\x21-\x7E].
+      body: JSON.stringify({ secrets: { name: "bad-token", botToken: "1234:abc\ndef" } })
+    });
+    expect(response.ok).toBe(false);
+    expect(typeof response.message).toBe("string");
+
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+    expect(after.messagingBridges.length).toBe(0);
+  });
+
+  test("POST /api/setup-requests/<id>/complete returns ok:false when messaging.add_bridge is missing a name or token", async () => {
+    // The chat card disables Submit until both inputs are non-empty,
+    // but a CLI/API caller could POST a partial body. The gateway
+    // mirrors the same readiness gate as the card so a partial
+    // submission can't silently create a half-configured bridge.
+    const config = testConfig("setup-complete-bridge-missing");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.add_bridge",
+        target: "telegram",
+        reason: "Add a Telegram bridge",
+        payload: { kind: "telegram", suggestedName: "missing-fields", toolCallId: "call_bridge_missing" }
+      })
+    );
+    const missingToken = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { name: "missing-fields" } })
+    });
+    expect(missingToken.ok).toBe(false);
+    expect(missingToken.message).toContain("Bot token");
+
+    const missingName = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({ secrets: { botToken: "1234:ABCDEFGHIJ" } })
+    });
+    expect(missingName.ok).toBe(false);
+    expect(missingName.message).toContain("name");
+
+    // Both rejections must leave the setup request pending — otherwise
+    // the chat card would flip out of pending state and the user
+    // couldn't retry.
+    const after = readState(config.instance).setupRequests.find((s) => s.id === setup.id);
+    expect(after?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete refuses a code-less messaging.approve_pairing approve and keeps the request pending", async () => {
+    // allowChat's pending-row presence check is gated on `expectedCode`
+    // being defined (the legacy CLI's "operator knows what they're
+    // doing" trust model). If a chat-card pairing payload arrives
+    // without verificationCode (group chat: groups intentionally never
+    // mint a code, or a stale request whose pending row was cleared and
+    // recreated), a no-code allowChat call would bypass the pending-row
+    // check and enroll a chat that is no longer pending. Pin that
+    // messaging-pairing-connect refuses the approve branch up-front when
+    // verificationCode is missing.
+    const config = testConfig("setup-complete-pairing-codeless-refuses");
+    const handler = createHandler(config);
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.approve_pairing",
+        target: "bridge_codeless:7",
+        reason: "Confirm pairing",
+        // Deliberately omit verificationCode — the chat card normally
+        // carries one for private chats, but a stale or group-chat
+        // payload would not.
+        payload: { bridgeId: "bridge_codeless", chatId: 7, toolCallId: "call_codeless" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(false);
+    expect(response.message).toContain("code-less");
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("pending");
+  });
+
+  test("POST /api/setup-requests/<id>/complete removes a messaging bridge through the setup-request flow", async () => {
+    // Happy path for the chat-side Remove bridge card. The /complete
+    // handler delegates to runMessagingRemoveConnect, which resolves
+    // the setup request atomically then calls removeMessagingBridge.
+    const config = testConfig("setup-complete-remove-bridge-happy");
+    const handler = createHandler(config);
+
+    // Create a real bridge via the existing endpoint so its
+    // encrypted secret + state record exist before we try to remove it.
+    const created = await call(handler, config, `/api/messaging`, {
+      method: "POST",
+      body: JSON.stringify({ name: "remove-me", kind: "telegram", botToken: "1234:ABCDEFGHIJKLMNOPQR" })
+    });
+    expect(created.id).toBeString();
+
+    const { createSetupRequest } = await import("./state");
+    const setup = await mutateState(config.instance, (state) =>
+      createSetupRequest(state, {
+        action: "messaging.remove_bridge",
+        target: created.id,
+        reason: "Remove bridge",
+        payload: { bridgeId: created.id, bridgeName: "remove-me", kind: "telegram", toolCallId: "call_remove" }
+      })
+    );
+
+    const response = await call(handler, config, `/api/setup-requests/${setup.id}/complete`, {
+      method: "POST",
+      body: JSON.stringify({})
+    });
+    expect(response.ok).toBe(true);
+    expect(response.removed).toBe(true);
+    expect(response.bridgeId).toBe(created.id);
+
+    const after = readState(config.instance);
+    expect(after.setupRequests.find((s) => s.id === setup.id)?.status).toBe("completed");
+    expect(after.messagingBridges.find((b) => b.id === created.id)).toBeUndefined();
+
+    // Chat-card lineage audit row pin: the chat-card remove path
+    // writes a dedicated audit row carrying the setup-request id +
+    // bridgeId, so a chat-card remove is distinguishable from a CLI /
+    // settings remove in the activity feed.
+    const chatRemoveRow = after.audit.find(
+      (e) => e.action === "messaging.remove_bridge" && e.approvalId === setup.id
+    );
+    expect(chatRemoveRow).toBeDefined();
+    expect(chatRemoveRow?.target).toBe(created.id);
+    expect((chatRemoveRow?.evidence as { bridgeName?: string } | undefined)?.bridgeName).toBe("remove-me");
   });
 
   test("POST /api/setup-requests/<id>/complete refuses partial browser.fill_secret submissions", async () => {
@@ -2415,6 +3551,67 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
+  test("GET /api/chat/:id/poll cursor reflects the LATEST block when a newer block lands during the coalesce window", async () => {
+    // Pins the closure-scoped cursor race in chatBlockPoll's backfill
+    // branch. The bug: backfill captures `last` at backfill time and
+    // freezes it in the timer closure. When a newer block lands on the
+    // live subscription within the 25 ms coalesce window
+    // (LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS), it pushes onto
+    // `accumulated` but the timer still fires with the stale backfill
+    // cursor — the client's next poll resumes from the backfill point
+    // and re-receives the newer block. The fix reads
+    // `accumulated[accumulated.length - 1]` INSIDE the timer callback.
+    const { insertChatBlock } = await import("./state");
+    const config = testConfig("chat-blocks-poll-cursor-race");
+    const handler = createHandler(config);
+    const session = await call(handler, config, "/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ title: "poll cursor race" })
+    });
+    // Seed a backfill block so the backfill branch arms its timer.
+    const backfillBlock = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: "backfill"
+    });
+    // Start the long poll. The handler returns a Promise<Response>;
+    // backfill arms the 25 ms timer immediately
+    // (LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS), so we have a 25 ms
+    // window to inject a fresh block via the subscription.
+    const pollPromise = rawCall(
+      handler,
+      config,
+      `/api/chat/${session.id}/poll`,
+      {},
+      config.token
+    );
+    // Schedule a fresh insert mid-window — 5 ms after the timer arms,
+    // well inside the 25 ms coalesce gate but well after the backfill
+    // pushed its entry.
+    await Bun.sleep(5);
+    const laterBlock = insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: session.id,
+      text: "later"
+    });
+    // Wait for the poll response. With the fix, the cursor encodes
+    // laterBlock.id; pre-fix it would encode backfillBlock.id and the
+    // client would re-receive laterBlock on the next poll.
+    const response = await pollPromise;
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(Array.isArray(body.events)).toBe(true);
+    expect(body.events.length).toBeGreaterThanOrEqual(2);
+    // The cursor is `<block_id>:<ts>` — split on the FIRST colon since
+    // block ids never contain `:` (block_<random>) but ISO timestamps
+    // do.
+    const colon = body.cursor.indexOf(":");
+    expect(colon).toBeGreaterThan(0);
+    const cursorBlockId = body.cursor.slice(0, colon);
+    expect(cursorBlockId).toBe(laterBlock.id);
+    expect(cursorBlockId).not.toBe(backfillBlock.id);
+  });
+
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.
@@ -2482,7 +3679,7 @@ describe("runtime api", () => {
       expect(dump.userProfile.budget.overCap).toBe(false);
       // INSTRUCTIONS.md is materialized by scaffold; the route returns
       // its content trimmed.
-      expect(dump.instructions.content).toMatch(/local-first personal agent/);
+      expect(dump.instructions.content).toMatch(/You are Gini, a personal agent/);
     });
 
     test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
@@ -2637,6 +3834,143 @@ describe("runtime api", () => {
       // Second delete of the same token: 404.
       const repeatDelete = await rawCall(handler, config, "/api/push/devices/tok_phone", { method: "DELETE" }, claimed.token);
       expect(repeatDelete.status).toBe(404);
+    });
+
+    test("vetted POST with tunnel enabled + secret present → 200 row written with origin='tunnel'", async () => {
+      // The happy path: the request carries the proxy-stamped vetted
+      // marker AND the live tunnel state has enabled=true with a
+      // populated secret, so the handler proceeds and tags the row as
+      // tunneled. The bearer the gateway sees here is the BFF-injected
+      // runtime token (config.token); the tunnel secret is the proxy's
+      // concern, not the gateway's.
+      const config = testConfig("push-devices-vetted-ok");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: true,
+        secret: "T".repeat(48)
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_t", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
+          headers: { "x-gini-tunnel-vetted": "1" }
+        },
+        config.token
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.device.origin).toBe("tunnel");
+      const all = listAllDevices(config.instance);
+      expect(all.length).toBe(1);
+      expect(all[0]!.origin).toBe("tunnel");
+      __resetTunnelManagerForTests();
+    });
+
+    test("vetted POST with tunnel disabled in-flight → 503 Retry-After, no row written", async () => {
+      // A vetted request that arrives after the operator disables the
+      // tunnel must NOT write a new tunnel-origin row — the purge that
+      // ran during disable would already have deleted the rest, and this
+      // late insert would be an orphan against a dead lane.
+      const config = testConfig("push-devices-vetted-disabled");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      // Tunnel is disabled at the moment the in-flight request is
+      // processed by the handler. The secret may still be on disk
+      // (disable doesn't null it), but enabled=false is the gate.
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: false,
+        secret: "T".repeat(48)
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_dis", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
+          headers: { "x-gini-tunnel-vetted": "1" }
+        },
+        config.token
+      );
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("2");
+      const body = await res.json();
+      expect(body.error).toBe("tunnel_state_changed");
+      expect(listAllDevices(config.instance).length).toBe(0);
+      __resetTunnelManagerForTests();
+    });
+
+    test("vetted POST with null secret in-flight → 503 Retry-After, no row written", async () => {
+      // Defense in depth: a vetted marker with a null on-disk secret
+      // means the tunnel state file is in an inconsistent shape (no
+      // production write path leaves enabled=true with secret=null, but
+      // a partial disable / boot-reconcile race could). 503 keeps the
+      // gateway from writing a tunnel-tagged row against a missing
+      // identity.
+      const config = testConfig("push-devices-vetted-no-secret");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: true,
+        secret: null
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_ns", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
+          headers: { "x-gini-tunnel-vetted": "1" }
+        },
+        config.token
+      );
+      expect(res.status).toBe(503);
+      expect(res.headers.get("retry-after")).toBe("2");
+      const body = await res.json();
+      expect(body.error).toBe("tunnel_state_changed");
+      expect(listAllDevices(config.instance).length).toBe(0);
+      __resetTunnelManagerForTests();
+    });
+
+    test("non-vetted POST (loopback) → 200 row written with origin='loopback' regardless of tunnel state", async () => {
+      // Loopback POSTs from the local web UI don't carry the marker and
+      // shouldn't be affected by the live-state recheck — the handler
+      // proceeds as today and writes a loopback row even when the live
+      // tunnel is fully off.
+      const config = testConfig("push-devices-loopback");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      tunnelManager(config).__setSnapshotForTest({
+        enabled: false,
+        secret: null
+      });
+
+      const res = await rawCall(
+        handler,
+        config,
+        "/api/push/devices",
+        {
+          method: "POST",
+          body: JSON.stringify({ token: "tok_loop", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+        },
+        config.token
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.device.origin).toBe("loopback");
+      __resetTunnelManagerForTests();
     });
 
     test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
@@ -2808,6 +4142,149 @@ describe("runtime api", () => {
       expect(badgeB.unread).toBe(1);
     });
 
+    test("DELETE /api/chat/:id/read marks just the latest assistant turn unread", async () => {
+      const config = testConfig("chat-unread-swipe");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const session = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "swipe" })
+      });
+      // Realistic chat: a few user messages culminating in an assistant
+      // reply. After Mark Unread the badge should show 1 (just the
+      // assistant turn), not 4 (every visible block).
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "still hi" });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: session.id, text: "ok last one" });
+      const assistant = insertChatBlock(config.instance, {
+        kind: "assistant_text",
+        sessionId: session.id,
+        text: "hello back",
+        streaming: false
+      });
+
+      // Both devices catch up first so the baseline badge is 0.
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerA, body: JSON.stringify({ lastReadBlockId: assistant.id })
+      });
+      await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "POST", headers: headerB, body: JSON.stringify({ lastReadBlockId: assistant.id })
+      });
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(0);
+
+      // iPhone A swipes "Mark unread". The badge surfaces just the
+      // latest assistant turn (1), not the full session.
+      const cleared = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(cleared.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+      // iPhone B is unaffected (still caught up).
+      expect((await call(handler, config, "/api/badge", { headers: headerB })).unread).toBe(0);
+
+      // Idempotent — replaying lands on the same cursor; still 1.
+      const second = await call(handler, config, `/api/chat/${session.id}/read`, {
+        method: "DELETE", headers: headerA
+      });
+      expect(second.ok).toBe(true);
+      expect((await call(handler, config, "/api/badge", { headers: headerA })).unread).toBe(1);
+
+      // Unknown session: 404.
+      const noSession = await rawCall(
+        handler,
+        config,
+        "/api/chat/chat_nonexistent/read",
+        { method: "DELETE", headers: headerA },
+        config.token
+      );
+      expect(noSession.status).toBe(404);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        `/api/chat/${session.id}/read`,
+        { method: "DELETE" },
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+    });
+
+    test("GET /api/unread returns per-session unread counts scoped to the device", async () => {
+      const config = testConfig("chat-unread-counts");
+      const handler = createHandler(config);
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_a", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      await call(handler, config, "/api/push/devices", {
+        method: "POST",
+        body: JSON.stringify({ token: "tok_iphone_b", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" })
+      });
+      const headerA = { "x-device-token": "tok_iphone_a" };
+      const headerB = { "x-device-token": "tok_iphone_b" };
+      const sessionA = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "A" })
+      });
+      const sessionB = await call(handler, config, "/api/chat", {
+        method: "POST",
+        body: JSON.stringify({ title: "B" })
+      });
+      const { insertChatBlock } = await import("./state");
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionA.id, text: "1" });
+      const a2 = insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId: sessionA.id,
+        text: "2"
+      });
+      insertChatBlock(config.instance, { kind: "user_text", sessionId: sessionB.id, text: "3" });
+
+      // Fresh device A — both sessions show their full count.
+      const initial = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(initial.counts[sessionA.id]).toBe(2);
+      expect(initial.counts[sessionB.id]).toBe(1);
+
+      // A catches up on session A — it drops out of the map for A.
+      await call(handler, config, `/api/chat/${sessionA.id}/read`, {
+        method: "POST",
+        headers: headerA,
+        body: JSON.stringify({ lastReadBlockId: a2.id })
+      });
+      const after = await call(handler, config, "/api/unread", { headers: headerA });
+      expect(after.counts[sessionA.id]).toBeUndefined();
+      expect(after.counts[sessionB.id]).toBe(1);
+
+      // Device B is unaffected.
+      const bView = await call(handler, config, "/api/unread", { headers: headerB });
+      expect(bView.counts[sessionA.id]).toBe(2);
+      expect(bView.counts[sessionB.id]).toBe(1);
+
+      // Missing X-Device-Token: 400.
+      const noDevice = await rawCall(
+        handler,
+        config,
+        "/api/unread",
+        {},
+        config.token
+      );
+      expect(noDevice.status).toBe(400);
+
+      // Unauth: 401.
+      const noAuth = await rawCall(handler, config, "/api/unread");
+      expect(noAuth.status).toBe(401);
+    });
+
     test("read + badge endpoints require authentication", async () => {
       const config = testConfig("chat-read-auth");
       const handler = createHandler(config);
@@ -2960,6 +4437,140 @@ describe("runtime api", () => {
       });
     });
   });
+
+  describe("tunnel QR rotate window", () => {
+    test("QR endpoints return 503 with Retry-After while rotating is true", async () => {
+      const config = testConfig("qr-rotate-window");
+      // The tunnel manager constructor immediately writes config.json
+      // through atomic-write, which needs the per-instance directory
+      // to already exist. testConfig's rmSync leaves no directory
+      // behind, so create it before either createHandler or
+      // tunnelManager runs.
+      mkdirSync(config.stateRoot, { recursive: true });
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      // Drive the manager into the rotate window without spinning up
+      // a real cloudflared. The test-only setter mirrors what the
+      // rotateSecret try block does between the secret persist and
+      // the recycle.
+      mgr.__setRotatingForTest(true);
+      try {
+        const svg = await rawCall(handler, config, "/api/tunnel/qr.svg", {
+          headers: { authorization: `Bearer ${config.token}` }
+        });
+        expect(svg.status).toBe(503);
+        expect(svg.headers.get("retry-after")).toBe("2");
+        const svgBody = await svg.json() as { error: string; retryAfterSec: number };
+        expect(svgBody.error).toBe("tunnel_rotating");
+        expect(svgBody.retryAfterSec).toBe(2);
+
+        const txt = await rawCall(handler, config, "/api/tunnel/qr.txt", {
+          headers: { authorization: `Bearer ${config.token}` }
+        });
+        expect(txt.status).toBe(503);
+        expect(txt.headers.get("retry-after")).toBe("2");
+      } finally {
+        mgr.__setRotatingForTest(false);
+      }
+    });
+  });
+
+  describe("PATCH /api/tunnel error code → HTTP status mapping", () => {
+    // The HTTP status mapping must key off the typed `code` field on
+    // the manager's error result, not a substring of the prose. Pin
+    // both branches so a future reword of the human-readable message
+    // cannot silently flip an operator-actionable 409 into a generic
+    // 500 (and vice versa).
+    test("enable() returning code=web_port_unhealthy → 409", async () => {
+      const config = testConfig("tunnel-enable-unhealthy-409");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      // Plant a web.port so the pre-enable readWebPort gate passes
+      // and execution reaches mgr.enable(), where the override fires.
+      writeFileSync(webPortPath(config.instance), "7338", "utf8");
+      mgr.__setNextEnableResultForTest({
+        ok: false,
+        error: "web port 7338 not healthy — swap aborted, prior cloudflared stopped",
+        code: "web_port_unhealthy"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toContain("not healthy");
+      __resetTunnelManagerForTests();
+    });
+
+    test("enable() returning generic failure (no code) → 500", async () => {
+      const config = testConfig("tunnel-enable-generic-500");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      writeFileSync(webPortPath(config.instance), "7338", "utf8");
+      mgr.__setNextEnableResultForTest({
+        ok: false,
+        error: "cloudflared banner timeout"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toBe("cloudflared banner timeout");
+      __resetTunnelManagerForTests();
+    });
+
+    test("rotateSecret() returning code=web_port_unhealthy → 409", async () => {
+      const config = testConfig("tunnel-rotate-unhealthy-409");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      mgr.__setNextRotateSecretResultForTest({
+        ok: false,
+        error: "web port 7338 not healthy — rotation aborted before commit",
+        code: "web_port_unhealthy"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ rotateSecret: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toContain("not healthy");
+      __resetTunnelManagerForTests();
+    });
+
+    test("rotateSecret() returning generic failure (no code) → 500", async () => {
+      const config = testConfig("tunnel-rotate-generic-500");
+      mkdirSync(config.stateRoot, { recursive: true });
+      __resetTunnelManagerForTests();
+      const handler = createHandler(config);
+      const mgr = tunnelManager(config);
+      mgr.__setNextRotateSecretResultForTest({
+        ok: false,
+        error: "swap recycle failed"
+      });
+      const res = await rawCall(handler, config, "/api/tunnel", {
+        method: "PATCH",
+        body: JSON.stringify({ rotateSecret: true }),
+        headers: { authorization: `Bearer ${config.token}` }
+      });
+      expect(res.status).toBe(500);
+      const body = await res.json();
+      expect(body.error).toBe("swap recycle failed");
+      __resetTunnelManagerForTests();
+    });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
@@ -2992,6 +4603,32 @@ function testConfig(instance: string): RuntimeConfig {
   const root = "/tmp/gini-http-tests";
   process.env.GINI_STATE_ROOT = root;
   process.env.GINI_LOG_ROOT = `${root}-logs`;
+  // Drop the cached SQLite handle for this instance before nuking the
+  // directory. Without this, a prior test that opened the per-instance
+  // memory DB leaves an open `bun:sqlite` handle pointing at the now-
+  // unlinked file. The next call to getMemoryDb returns that cached
+  // handle (the cache key is the instance name) and any write fails
+  // because the inode is gone. removeMemoryDb closes the cached handle
+  // AND unlinks the file + WAL/SHM siblings in one shot.
+  removeMemoryDb(instance);
+  // The unreachable-CDP test posts to the real /api/browser/connect route,
+  // which omits the in-process probe override by design. Shrink the probe via
+  // the server-side env knob so the test exercises the 400 mapping without
+  // burning the production probe deadline. Server env, not POST body, so the
+  // network-input boundary stays intact.
+  process.env.GINI_CDP_PROBE_TIMEOUT_MS = "60";
+  process.env.GINI_CDP_PROBE_INTERVAL_MS = "10";
+  // resumeChatTask polls for the loop's flip to waiting_approval before
+  // staging a tool result. In-process the flip lands within a couple of
+  // mutateState boundaries, and several fill_secret / approval tests seed a
+  // task that never reaches waiting_approval at all — so the production
+  // 1000ms/100ms budget is pure dead wall here (the fill_secret leak test
+  // measured 1079.00ms in isolation, nearly all of it this poll). Shrink the
+  // budget via the server-side env knob the production code reads (default
+  // preserved at 1000/100); the race still resolves well within 40ms over 5ms
+  // ticks in-process.
+  process.env.GINI_RESUME_WAIT_BUDGET_MS = "40";
+  process.env.GINI_RESUME_WAIT_TICK_MS = "5";
   rmSync(`${root}/instances/${instance}`, { recursive: true, force: true });
   return {
     instance,
@@ -3006,6 +4643,28 @@ function testConfig(instance: string): RuntimeConfig {
     // are exercised in approval-mode.test.ts.
     approvalMode: "strict"
   };
+}
+
+// Seed a typed api-key credential so the per-(skill, credential) consent gate
+// (firstUngrantedCredential) treats it as carrying a secret that needs consent.
+async function seedTypedCredential(config: RuntimeConfig, name: string, provider: string) {
+  const at = new Date().toISOString();
+  await mutateState(config.instance, (state) => {
+    state.connectors.push({
+      id: `id_${name}`,
+      instance: state.instance,
+      name,
+      provider,
+      type: "api-key",
+      status: "configured",
+      scopes: [],
+      secretRefs: [{ purpose: name, path: `/tmp/${name}.json` }],
+      createdAt: at,
+      updatedAt: at,
+      health: "healthy",
+      source: "user"
+    });
+  });
 }
 
 async function waitForTask(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, taskId: string) {

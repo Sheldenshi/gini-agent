@@ -15,6 +15,7 @@ import {
   decideIdentityEmission,
   getDefaultGiniInstructions,
   identityBudgetState,
+  renderEphemeralContext,
   renderFullIdentity,
   renderIdentityDelta,
   renderSoulBlock,
@@ -158,54 +159,51 @@ describe("decideIdentityEmission", () => {
 
 describe("buildAgentSystemContext", () => {
   test("uses the bundled default instructions file when no override is provided", () => {
-    const out = buildAgentSystemContext(undefined, undefined);
+    const out = buildAgentSystemContext();
     expect(out).toBe(expectedDefaultInstructions);
   });
 
   test("instructionsOverride wins over the bundled defaults", () => {
-    const out = buildAgentSystemContext(undefined, undefined, {
+    const out = buildAgentSystemContext({
       instructionsOverride: "Custom rules only."
     });
     expect(out).toBe("Custom rules only.");
-    expect(out).not.toContain("local-first personal agent");
+    expect(out).not.toContain("You are Gini");
   });
 
   test("blank instructionsOverride falls back to the default", () => {
     // Whitespace-only override should not silently empty the preamble.
-    const out = buildAgentSystemContext(undefined, undefined, {
+    const out = buildAgentSystemContext({
       instructionsOverride: "   \n"
     });
     expect(out).toBe(expectedDefaultInstructions);
   });
 
-  test("assembles blocks in the documented order: instructions, soul, identity, user, recalled", () => {
-    const identityBlock = "Your runtime identity:\n- instance: test";
-    const out = buildAgentSystemContext(
-      "1. (semantic) recalled snippet",
-      identityBlock,
-      {
-        instructionsOverride: "RULES",
-        soul: "SOUL persona body",
-        userProfile: "USER profile body"
-      }
-    );
+  test("assembles the stable prefix in the documented order: instructions, soul, user", () => {
+    // The system prefix is now byte-stable: identity and recalled memory
+    // moved out to the ephemeral role:"user" tail (renderEphemeralContext)
+    // so message 0 stays a warm cache prefix. See ADR stable-system-prefix.md.
+    const out = buildAgentSystemContext({
+      instructionsOverride: "RULES",
+      soul: "SOUL persona body",
+      userProfile: "USER profile body"
+    });
     const rulesIdx = out.indexOf("RULES");
     const soulIdx = out.indexOf("SOUL persona body");
-    const identityIdx = out.indexOf("Your runtime identity:");
     const userIdx = out.indexOf("USER profile body");
-    const recalledIdx = out.indexOf("Long-term memory");
     expect(rulesIdx).toBe(0);
     expect(rulesIdx).toBeLessThan(soulIdx);
-    expect(soulIdx).toBeLessThan(identityIdx);
-    expect(identityIdx).toBeLessThan(userIdx);
-    expect(userIdx).toBeLessThan(recalledIdx);
+    expect(soulIdx).toBeLessThan(userIdx);
+    // Per-turn content no longer lives in the stable prefix.
+    expect(out).not.toContain("Your runtime identity:");
+    expect(out).not.toContain("Long-term memory");
   });
 
   test("no longer renders the legacy 'Pinned memories about this user' block", () => {
     // The pinned-memory surface was consolidated into USER.md / SOUL.md /
     // Hindsight; the block should not appear in any assembled prompt
     // regardless of caller options. See ADR runtime-identity-files.md.
-    const out = buildAgentSystemContext("1. (semantic) snip", "Your runtime identity:\n- instance: test", {
+    const out = buildAgentSystemContext({
       instructionsOverride: "RULES",
       soul: "SOUL body",
       userProfile: "USER body"
@@ -214,31 +212,46 @@ describe("buildAgentSystemContext", () => {
   });
 
   test("elides soul and userProfile blocks when blank or absent", () => {
-    const out = buildAgentSystemContext(undefined, "ID-BLOCK", {
+    const out = buildAgentSystemContext({
       instructionsOverride: "RULES",
       soul: "   ",
       userProfile: ""
     });
-    expect(out).toBe(["RULES", "ID-BLOCK"].join("\n\n"));
+    expect(out).toBe("RULES");
   });
+});
 
-  test("preserves prior contract: recalled with no override or files", () => {
-    // Existing callers that don't pass the new options object must keep
-    // producing the same block shape as before: bundled instructions
-    // verbatim, then the recalled-memory block. No soul / user / identity
-    // / pinned-memory blocks land in the prompt.
-    const out = buildAgentSystemContext("1. (semantic) snip");
-    expect(out).toContain(expectedDefaultInstructions);
-    expect(out).toContain("Long-term memory of prior conversations");
-    expect(out).not.toContain("Pinned memories about this user");
-    // The output is exactly the instructions + the recalled block, joined
-    // by the standard separator — no other blocks slipped in.
+describe("renderEphemeralContext", () => {
+  test("joins emitted identity then recalled memory, mirroring the old system order", () => {
+    const out = renderEphemeralContext("Your runtime identity:\n- instance: test", "1. (semantic) snip");
+    const identityIdx = out.indexOf("Your runtime identity:");
+    const recalledIdx = out.indexOf("Long-term memory");
+    expect(identityIdx).toBe(0);
+    expect(identityIdx).toBeLessThan(recalledIdx);
     expect(out).toBe(
       [
-        expectedDefaultInstructions,
+        "Your runtime identity:\n- instance: test",
         "Long-term memory of prior conversations with this user (use these facts when answering):\n1. (semantic) snip"
       ].join("\n\n")
     );
+  });
+
+  test("renders only the recalled block when no identity is emitted", () => {
+    const out = renderEphemeralContext(undefined, "1. (semantic) snip");
+    expect(out).toBe(
+      "Long-term memory of prior conversations with this user (use these facts when answering):\n1. (semantic) snip"
+    );
+  });
+
+  test("renders only the identity block when nothing is recalled", () => {
+    const out = renderEphemeralContext("Your runtime identity:\n- instance: test", undefined);
+    expect(out).toBe("Your runtime identity:\n- instance: test");
+    expect(out).not.toContain("Long-term memory");
+  });
+
+  test("returns an empty string when both pieces are empty", () => {
+    expect(renderEphemeralContext(undefined, undefined)).toBe("");
+    expect(renderEphemeralContext("", "   ")).toBe("");
   });
 });
 
@@ -284,7 +297,7 @@ describe("identity-file budget headers", () => {
   });
 
   test("buildAgentSystemContext renders USER and SOUL blocks with budget headers", () => {
-    const out = buildAgentSystemContext(undefined, "ID-BLOCK", {
+    const out = buildAgentSystemContext({
       instructionsOverride: "RULES",
       soul: "PERSONA body",
       userProfile: "USER body"
@@ -297,7 +310,7 @@ describe("identity-file budget headers", () => {
 
   test("BLOCKED notices skip the budget header (it's a safety message, not file content)", () => {
     const blocked = "[BLOCKED: USER.md contained potential prompt injection (prompt_injection). Content not loaded.]";
-    const out = buildAgentSystemContext(undefined, "ID-BLOCK", {
+    const out = buildAgentSystemContext({
       instructionsOverride: "RULES",
       userProfile: blocked
     });

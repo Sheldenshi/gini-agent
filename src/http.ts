@@ -1,17 +1,21 @@
 import { writeFileSync } from "node:fs";
-import type { ApprovalMode, ChatBlock, RuntimeConfig } from "./types";
-import { cancelTask, decideApproval, resolveSetupRequest, retryTask, submitTask } from "./agent";
+import type { ApprovalMode, ChatBlock, RuntimeConfig, SkillRecord } from "./types";
+import { cancelTask, decideApproval, findTask, resolveSetupRequest, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
 import {
   addAudit,
   addSseSubscription,
   appendTrace,
+  createSetupRequest,
   getDevice,
   listChatBlocks,
   listChatBlocksAfter,
   markRead,
+  markUnread,
   mutateState,
+  now,
   readState,
+  unreadCountsByDevice,
   readTrace,
   readUpload,
   removeDeviceForCredential,
@@ -24,8 +28,11 @@ import {
 } from "./state";
 import { browserNavigate, safetyCheck } from "./tools/browser";
 import { runFillSecretConnect } from "./execution/browser-fill-secrets";
+import { runMessagingBridgeConnect } from "./execution/messaging-bridge-connect";
+import { runMessagingPairingConnect } from "./execution/messaging-pairing-connect";
+import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
-import { checkConnector, createConnector, deleteConnector, updateConnector } from "./integrations/connectors";
+import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
@@ -67,14 +74,70 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
-import { createSkillFromInput, getSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
+import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
+import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { sttStatus } from "./stt";
+import { resumeChatTask } from "./execution/chat-task";
+import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
+import { approvalToolCallId } from "./execution/tool-dispatch";
 import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
-import { projectRoot } from "./paths";
+import { projectRoot, webPortPath } from "./paths";
+import { existsSync, readFileSync } from "node:fs";
+import { tunnelManager, bootstrapUrl, renderQrSvg, renderQrAnsi } from "./runtime/tunnel";
+import type { RedactedTunnelSnapshot, TunnelSnapshot } from "./runtime/tunnel/types";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
+
+function redactedSnapshot(snapshot: TunnelSnapshot): RedactedTunnelSnapshot {
+  return {
+    enabled: snapshot.enabled,
+    secret: null,
+    publicUrl: null,
+    // The revision is a SHA-256 prefix of the secret — non-reversible and
+    // safe to expose. The browser uses it as a cache-buster for the QR
+    // image. A tunneled browser doesn't actually need it (the launcher is
+    // hidden in tunneled contexts) but exposing it keeps the shape uniform.
+    secretRevision: snapshot.secretRevision,
+    // Transport indicator is non-secret — the client uses it to pick
+    // between SSE and the long-poll fallback for runtime events + chat
+    // streaming. Exposing it on the redacted shape lets the tunneled
+    // browser see the same value the privileged endpoint exposes.
+    tunnelTransport: snapshot.tunnelTransport,
+    lastError: snapshot.lastError,
+    // The typed error code is non-secret — clients use it to branch on
+    // failure mode without substring-matching the human-readable
+    // `lastError`. Mirrors the contract on the privileged endpoint.
+    lastErrorCode: snapshot.lastErrorCode,
+    // Constant, non-secret manual-install guidance — mirrors the privileged
+    // shape so the tunneled card can render the same fallback if cloudflared
+    // ever fails to install.
+    cloudflaredInstall: snapshot.cloudflaredInstall,
+    appleNotes: {
+      enabled: snapshot.appleNotes.enabled,
+      notesAvailable: snapshot.appleNotes.notesAvailable,
+      lastError: snapshot.appleNotes.lastError
+    }
+  };
+}
+
+function readWebPort(instance: string): number | null {
+  const p = webPortPath(instance);
+  if (!existsSync(p)) return null;
+  const raw = readFileSync(p, "utf8").trim();
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// `isSupervisedWebChild` lives in `./runtime/health-probe` and the
+// TunnelManager runs it inside its apply chain (swapCloudflared) as
+// the sole probe per enable transition. The PATCH /api/tunnel
+// handler no longer runs a pre-probe of its own — that would land
+// outside the apply chain and let concurrent enable/disable PATCH
+// requests reorder against the queue, silently overwriting the
+// later-issued operation.
 
 // Per-action audit row for connector.request completion. createConnector
 // and checkConnector emit their own connector.create / connector.health
@@ -101,6 +164,10 @@ async function emitConnectorRequestAudit(
         evidence: {
           provider: String(setup.payload.provider ?? ""),
           providerLabel: typeof setup.payload.providerLabel === "string" ? setup.payload.providerLabel : null,
+          // Templateless requests carry no provider id; record the credential
+          // name so the audit row is still attributable. NO secret value is
+          // ever recorded — the secret stays server-side (ADR browser-fill-secret.md).
+          credentialName: typeof setup.payload.credentialName === "string" ? setup.payload.credentialName : null,
           connectorId
         }
       },
@@ -117,6 +184,113 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
   const routes: Array<[string, RegExp, Handler]> = [
     ["GET", /^\/api\/status$/, () => json(status(config))],
     ["GET", /^\/api\/version$/, () => json(currentVersionInfo())],
+    // Tunnel surface. /api/tunnel is the privileged shape (secret + publicUrl);
+    // /api/tunnel/redacted is the browser-safe shape (secret=null, publicUrl=null).
+    // See docs/adr/tunnel-and-mobile-access.md "Trust radius".
+    ["GET", /^\/api\/tunnel$/, () => json(tunnelManager(config).current())],
+    ["GET", /^\/api\/tunnel\/redacted$/, () => json(redactedSnapshot(tunnelManager(config).current()))],
+    ["PATCH", /^\/api\/tunnel$/, async (request) => {
+      const payload = await body(request);
+      const mgr = tunnelManager(config);
+      if (typeof payload.rotateSecret === "boolean" && payload.rotateSecret) {
+        const result = await mgr.rotateSecret();
+        if (!result.ok) return json({ error: result.error }, result.code ? 409 : 500);
+      }
+      if (typeof payload.enabled === "boolean") {
+        if (payload.enabled) {
+          const port = readWebPort(config.instance);
+          if (!port) return json({ error: "Web port unknown; start `gini run` first." }, 409);
+          // Health probe lives INSIDE the manager's apply chain
+          // (swapCloudflared). The previous version probed here before
+          // calling enable(), which created an ordering race: two
+          // PATCH requests issued in close succession (enable then
+          // disable) could land out of order because the enable's
+          // pre-probe await happens BEFORE the manager's queue slot,
+          // while disable's body parse is fast and disable enters the
+          // queue first. The later-issued disable then loses to the
+          // earlier-issued enable's probe-then-queue path, silently
+          // re-enabling a tunnel the operator just disabled. Calling
+          // mgr.enable() synchronously after body parse keeps queue
+          // arrival order = request order, so the later disable
+          // wins. The HTTP status keys off the typed `code` field on
+          // the manager's error payload: any operator-actionable code
+          // (web_port_unhealthy, cloudflared_unavailable, …) maps to
+          // 409 Conflict, while an absent code is a generic failure and
+          // maps to 500. The human-readable prose is for client
+          // display; the discrete code is what gates the mapping, so a
+          // reword of the message can't flip the status.
+          const result = await mgr.enable(port);
+          if (!result.ok) {
+            return json({ error: result.error }, result.code ? 409 : 500);
+          }
+        } else {
+          const result = await mgr.disable();
+          if (!result.ok) return json({ error: result.error }, 500);
+        }
+      }
+      if (payload.appleNotes && typeof payload.appleNotes === "object" && !Array.isArray(payload.appleNotes)) {
+        const desired = (payload.appleNotes as { enabled?: unknown }).enabled;
+        if (typeof desired === "boolean") {
+          const result = await mgr.setAppleNotesEnabled(desired);
+          if (!result.ok) return json({ error: result.error }, 500);
+        }
+      }
+      return json(mgr.current());
+    }],
+    ["POST", /^\/api\/tunnel\/refresh-notes$/, async () => {
+      const result = await tunnelManager(config).refreshNotes();
+      if (!result.ok) return json({ error: result.error }, 500);
+      return json(result.snapshot);
+    }],
+    ["GET", /^\/api\/tunnel\/qr\.svg$/, () => {
+      const mgr = tunnelManager(config);
+      const snap = mgr.current();
+      // Rotate window: the new on-disk secret is bonded to the OLD
+      // publicUrl until the recycle finishes. Handing out that mix
+      // would yield a bootstrap the old tunnel immediately rejects.
+      // Tell the caller to retry shortly; the rotate window is
+      // bounded by the cloudflared banner timeout.
+      if (mgr.isRotating() || !snap.publicUrl) {
+        return new Response(JSON.stringify({ error: "tunnel_rotating", retryAfterSec: 2 }), {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "retry-after": "2",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!snap.secret) {
+        return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+      const svg = renderQrSvg(bootstrapUrl(snap.publicUrl, snap.secret));
+      return new Response(svg, {
+        status: 200,
+        headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
+    ["GET", /^\/api\/tunnel\/qr\.txt$/, () => {
+      const mgr = tunnelManager(config);
+      const snap = mgr.current();
+      if (mgr.isRotating() || !snap.publicUrl) {
+        return new Response(JSON.stringify({ error: "tunnel_rotating", retryAfterSec: 2 }), {
+          status: 503,
+          headers: {
+            "content-type": "application/json; charset=utf-8",
+            "retry-after": "2",
+            "cache-control": "no-store"
+          }
+        });
+      }
+      if (!snap.secret) {
+        return new Response("Tunnel not enabled", { status: 409, headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+      const ansi = renderQrAnsi(bootstrapUrl(snap.publicUrl, snap.secret));
+      return new Response(ansi, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
+      });
+    }],
     ["POST", /^\/api\/update\/check$/, () => json(refreshVersionInfo())],
     ["POST", /^\/api\/update$/, () => {
       assertCurrentRuntimeUpdateSupported();
@@ -207,7 +381,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
       const filename = file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
-      if (!mimeType.startsWith("image/")) {
+      if (!mimeType.startsWith("image/") && !mimeType.startsWith("audio/")) {
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
@@ -238,6 +412,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         }
       });
     }],
+    // Speech-to-text readiness. Lets clients warn before the first voice
+    // message that the local whisper model still needs its one-time download.
+    ["GET", /^\/api\/stt\/status$/, () => json(sttStatus())],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
     // /blocks endpoint returns the full ordered list for initial render;
@@ -270,6 +447,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // to them anyway.
       const deviceToken = deviceTokenFromRequest(config, request, credential);
       return chatBlockStream(config, request, params[0], deviceToken);
+    }],
+    // Long-polling fallback for chat-block streaming — used by clients
+    // talking to the gateway via a Cloudflare quick tunnel
+    // (`*.trycloudflare.com`), which drops SSE at the edge. Same event-
+    // emitter source as the SSE endpoint above; semantics documented on
+    // the chatBlockPoll helper. We skip the device-token registration
+    // here because per-device APNs suppression is keyed off live SSE
+    // subscriptions; a polling client doesn't hold the socket the
+    // dispatcher uses to detect "watching now", so its completion
+    // pushes are not suppressed (correct, since the client is on a
+    // tunnel and may not have foreground attention anyway).
+    ["GET", /^\/api\/chat\/([^/]+)\/poll$/, (request, params) => {
+      return chatBlockPoll(config, request, params[0]);
     }],
     ["GET", /^\/api\/runs$/, () => json(listRuns(config))],
     ["GET", /^\/api\/runs\/([^/]+)$/, (_request, params) => json(getRun(config, params[0]))],
@@ -306,8 +496,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // SetupRequest endpoints (user-actor): the user performs a setup step
     // and signals completion. The /complete handler owns the per-action
     // side effect (createConnector + checkConnector for connector.request;
-    // playwright.fill for browser.fill_secret; nothing extra for
-    // browser.connect — its side effect ran inside /open-browser).
+    // playwright.fill for browser.fill_secret; addMessagingBridge /
+    // allowChat / removeMessagingBridge for the messaging.* actions;
+    // nothing extra for browser.connect — its side effect ran inside
+    // /open-browser). The messaging.* and browser.fill_secret branches
+    // delegate to bounded runtime modules in src/execution/* that own the
+    // atomic resolve-then-side-effect-then-resume sequence; the connector
+    // and browser.connect branches resolve inline.
     ["GET", /^\/api\/setup-requests$/, (request) => {
       const agentId = agentIdFilter(request);
       const rows = readState(config.instance).setupRequests;
@@ -324,52 +519,374 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         ? payload.secrets as Record<string, string>
         : {};
 
+      if (setup.action === "messaging.add_bridge") {
+        // Thin delegate to the bounded module — mirrors the
+        // browser.fill_secret branch's two-line shape. The lifecycle
+        // (kind parsing, pre-resolve field + token-format validation,
+        // atomic resolve, addMessagingBridge, chat resume with
+        // failTask recovery) lives in src/execution/messaging-bridge-connect.ts
+        // so it can be unit-tested in isolation and so http.ts stays
+        // a routing layer per the AGENTS.md boundary rule.
+        const result = await runMessagingBridgeConnect(config, setup, secrets, payload.deliveryTargets);
+        return json(result.body, result.status);
+      }
+
+      if (setup.action === "messaging.approve_pairing") {
+        // Approve / Reject for an inbound Telegram pairing request.
+        // Delegate forwards `payload.reject` so a single endpoint
+        // covers both outcomes; allowChat / rejectPendingChat live
+        // inside the bounded module along with the atomic
+        // resolveSetupRequest + safeResume wrapping.
+        const result = await runMessagingPairingConnect(config, setup, { reject: payload.reject });
+        return json(result.body, result.status);
+      }
+
+      if (setup.action === "messaging.remove_bridge") {
+        // Destructive bridge teardown from chat. Same shape as
+        // add_bridge — atomic resolveSetupRequest BEFORE
+        // removeMessagingBridge, then safeResume back into the
+        // chat-task loop with the outcome.
+        const result = await runMessagingRemoveConnect(config, setup);
+        return json(result.body, result.status);
+      }
+
       if (setup.action === "browser.fill_secret") {
-        // Bounded module owns slot validation, atomic flip, per-slot fill
-        // loop, redacted audit, and chat resume.
+        // The fill_secret flow is bounded inside
+        // src/execution/browser-fill-secrets.ts. The handler here is
+        // a thin routing seam: parse the body's `secrets` field,
+        // delegate to the module, return its {status, body} envelope
+        // as the HTTP response. All of the runtime concerns — slot
+        // validation, structural approved-URL check, atomic setup-request
+        // resolution, per-slot fill with per-slot origin /
+        // task-status re-checks, redacted audit row, chat-task
+        // resume — live in the bounded module so they can be
+        // unit-tested in isolation.
         const result = await runFillSecretConnect(config, setup, secrets);
         return json(result.body, result.status);
       }
 
       if (setup.action === "connector.request") {
         const scopes = Array.isArray(payload.scopes) ? payload.scopes.map(String) : [];
+        // Two payload shapes (see SetupRequest.target doc in types.ts):
+        //   known provider → {provider, providerLabel, fields, ...}
+        //   templateless    → {credentialName, credentialType:"api-key", credentialLabel, mcpUrl?}
+        // The trusted shape (name, type, metadata) comes from the SETUP
+        // PAYLOAD the dispatcher minted, NOT the browser-supplied body — the
+        // body carries only the secret. Threading `type`/`metadata` here makes
+        // a templateless request land a TYPED record; known-provider requests
+        // already get typed via the module's credentialTemplate inside
+        // createConnector, so we leave their type unset and let that path stand.
+        // Templateless requests are api-key ONLY (oauth2 needs a provider
+        // module / setup skill — see docs/adr/chat-credential-provisioning.md).
+        const credentialType = setup.payload.credentialType === "api-key"
+          ? setup.payload.credentialType
+          : undefined;
         const providerId = String(setup.payload.provider ?? "");
         const providerLabel = typeof setup.payload.providerLabel === "string"
           ? setup.payload.providerLabel
           : providerId;
-        const overrideName = typeof payload.name === "string" && payload.name.trim().length > 0
-          ? payload.name.trim()
-          : providerLabel;
+        const credentialName = typeof setup.payload.credentialName === "string"
+          ? setup.payload.credentialName
+          : "";
+        const credentialLabel = typeof setup.payload.credentialLabel === "string"
+          ? setup.payload.credentialLabel
+          : credentialName;
+        const isTemplateless = Boolean(credentialType) && !providerId;
+        // Templateless requests carry no provider module, so use the same
+        // "generic" provider key the type-driven Add Connector dialog uses; the
+        // explicit `type` makes createConnector stamp a typed record regardless.
+        const provider = providerId || "generic";
+        // For a templateless api-key, derive metadata from the TRUSTED setup
+        // payload only: an mcpUrl gets an mcp binding. The api-key name IS its
+        // env var, so there is no envMap to mint and nothing is read from the
+        // browser body. Known-provider requests pass no metadata so the
+        // module's template fills it.
+        const metadata: Record<string, unknown> | undefined =
+          isTemplateless && typeof setup.payload.mcpUrl === "string" && setup.payload.mcpUrl.length > 0
+            ? { mcp: { url: setup.payload.mcpUrl, headerName: "Authorization", scheme: "Bearer" } }
+            : undefined;
+        // Connector name: the credential name for templateless, else the
+        // browser-supplied override (back-compat) falling back to the label.
+        const overrideName = isTemplateless
+          ? credentialName
+          : typeof payload.name === "string" && payload.name.trim().length > 0
+            ? payload.name.trim()
+            : providerLabel;
+
+        const skillId = typeof setup.payload.skillId === "string" ? setup.payload.skillId : "";
+        const toolCallId = typeof setup.payload.toolCallId === "string" ? setup.payload.toolCallId : undefined;
+
+        // Atomically claim THIS setup request BEFORE any observable side effect
+        // (createConnector + secret write, grant, enable, audit, resume). The
+        // claim transitions pending→completed inside the per-instance
+        // mutateState lock and throws ApprovalRaceLostError ("already <status>")
+        // when the row is no longer pending — the route's catch surfaces that
+        // as an error response. A double-submit's loser, and any complete that
+        // races a cancel, throws here and performs ZERO side effects: a cancel
+        // that wins prevents the create AND the grant entirely. We claim with
+        // resumeChatTask:false / no toolResult so the resume is staged LATER,
+        // exactly once, on the winning claim. Mirrors the skill.grant_connector
+        // branch below.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+
+        // Only the winner reaches here. Every post-claim path — successful
+        // create + grant + enable + resume, probe failure, or an UNEXPECTED
+        // throw (duplicate credential name, malformed secret, grant/enable
+        // error) — must persist an outcome and resume the task exactly once.
+        // Without this wrapper, a throw after the claim returns the route's
+        // catch-all 500 while the row sits `completed` and the task stays
+        // `waiting_approval` — stranded with no live executor. The catch below
+        // mirrors the probe-failure handling: persist a failure outcome and
+        // safeResume the task with a failure message so the agent can re-issue
+        // request_connector.
+        // Track a connector created during THIS attempt so the post-claim
+        // catch can roll it back. Without this, a throw AFTER a successful
+        // create + healthy probe (e.g. an audit/grant/enable failure) would
+        // leave a healthy connector behind; the agent then re-requests, hits
+        // the existing-healthy fast path, and skips the missing skill grant —
+        // the skill stays env-denied. Only set for connectors this attempt
+        // created, so the rollback never touches a pre-existing record.
+        let createdConnectorId: string | undefined;
+        try {
+        // Create the typed record, then probe.
         const connector = await createConnector(config, {
           name: overrideName,
-          provider: providerId,
+          provider,
+          ...(isTemplateless ? { type: credentialType } : {}),
           scopes,
-          secrets
+          secrets,
+          ...(metadata ? { metadata } : {})
         });
+        createdConnectorId = connector.id;
         const probed = await checkConnector(config, connector.id);
         if (probed.health !== "healthy") {
-          return json({
-            ok: false,
-            connector: probed,
-            message: probed.message ?? "Connector probe failed; please verify the credentials and retry."
-          });
+          // The secret was wrong/unreachable. The row is already claimed
+          // (the race window is closed), so it cannot bounce back to pending
+          // for an in-place retype — instead drop the orphaned unhealthy
+          // record, persist the failure outcome so a reloaded card reads
+          // truthfully, and resume the chat-task with the failure so the agent
+          // can re-issue request_connector for a fresh card. Mirrors the
+          // messaging.add_bridge side-effect-failure path.
+          const message = probed.message ?? "Connector probe failed; please verify the credentials and retry.";
+          try {
+            await deleteConnector(config, connector.id);
+          } catch {
+            // Best-effort cleanup — a leftover unhealthy record is inert
+            // (inactive skills never resolve env from it) and far less
+            // harmful than failing the response over a delete throw.
+          }
+          await persistConnectOutcome(config, setupId, { ok: false, message });
+          if (setup.taskId && toolCallId) {
+            await safeResume(
+              config,
+              setup.taskId,
+              toolCallId,
+              `Could not connect ${isTemplateless ? credentialLabel : providerLabel}: ${message}. Tell the user the credential was rejected; you can call request_connector again so they can re-enter it.`,
+              { context: "connector.request", approvalId: setupId }
+            );
+          }
+          return json({ ok: false, connector: probed, message });
         }
         await emitConnectorRequestAudit(config, setup, connector.id);
-        // Resume the paused agent run in the background: the connector is
-        // already saved + probed healthy, so the modal should close now
-        // rather than hang until the resumed run finishes streaming.
-        await resolveSetupRequest(config, setupId, "complete", {
-          actor: "user",
-          toolResult: `Connected to ${providerLabel}. Proceed with the original request.`,
-          awaitResume: false
-        });
+        // Auto-grant to the requesting skill (LOCKED decision). When the
+        // dispatcher minted this card with a `skillId`, the human entering the
+        // secret for that named skill IS the consent — so completing the card
+        // both creates the credential AND grants it to the skill, no second
+        // consent card. The model can't forge this because it never sees the
+        // secret. GUARD: only auto-grant when the named skill actually DECLARES
+        // this credential in its requiredCredentials. The model supplies
+        // skillId, so without this check it could grant a credential a skill
+        // never declared (or target a different skill); the credential model's
+        // "a skill only gets credentials it declared + the user granted" must
+        // hold. When the skill does not declare the credential, the connector
+        // is still created — it just isn't granted or enabled.
+        if (skillId) {
+          let skill: SkillRecord | undefined;
+          try {
+            skill = getSkill(config, skillId);
+          } catch {
+            // Unknown skillId — create the connector but grant nothing.
+            skill = undefined;
+          }
+          if (skill && (skill.requiredCredentials ?? []).includes(connector.name)) {
+            await grantConnectorToSkill(config, skillId, connector.name);
+            // Enable ONLY when the skill is now fully satisfiable: every
+            // required credential resolves to a configured + healthy connector
+            // AND is granted. isSkillActive covers the resolution half (a
+            // required credential with no connector row at all keeps it
+            // inactive — firstUngrantedCredential alone would miss that); the
+            // firstUngrantedCredential check covers the consent half. A
+            // multi-credential skill stays disabled until the next missing
+            // credential is requested separately.
+            const granted = getSkill(config, skillId);
+            const afterState = readState(config.instance);
+            if (isSkillActive(afterState, granted) && !firstUngrantedCredential(afterState, granted)) {
+              await setSkillStatus(config, skillId, "enabled");
+            }
+          }
+        }
+
+        const connectedLabel = isTemplateless ? credentialLabel : providerLabel;
+        // Resume the chat-task LAST, exactly once, on the winning claim. The
+        // request was already claimed above, so reuse the resume wiring
+        // directly (calling resolveSetupRequest again would throw on the
+        // now-completed row). A losing racer never reaches here. Route it
+        // through safeResume so a throw from the chat-task loop AFTER the
+        // mutations landed flips the task out of the orphan-running state
+        // instead of being left dangling. Fire it DETACHED (no await): the
+        // connector is already saved + granted, so the connect modal should
+        // close as soon as this responds rather than hang until the resumed
+        // agent run finishes streaming. safeResume owns its own failure
+        // recovery (trace + failTask), so the detached run can't reject
+        // unhandled.
+        if (setup.taskId && toolCallId) {
+          void safeResume(
+            config,
+            setup.taskId,
+            toolCallId,
+            `Connected to ${connectedLabel}. Proceed with the original request.`,
+            { context: "connector.request", approvalId: setupId }
+          );
+        }
         return json({ ok: true, connector: probed });
+        } catch (error) {
+          // An unexpected throw after the claim (createConnector duplicate
+          // name, malformed secret, grant/enable error). The probe-failure
+          // path above already handled its own resume + return, so we only
+          // reach here for errors OTHER than a clean probe failure. Persist a
+          // failure outcome and resume the task so it never strands at
+          // waiting_approval. Mirrors the probe-failure cleanup.
+          const message = error instanceof Error ? error.message : String(error);
+          // Roll back a connector created during THIS attempt. The create +
+          // probe may have succeeded and a LATER step (audit, grant, enable)
+          // thrown, leaving a healthy record behind. Drop it so a re-request
+          // starts fresh and creates + grants cleanly instead of short-circuiting
+          // on the existing-healthy fast path (which would skip the skill grant).
+          // Mirrors the probe-fail orphan cleanup; best-effort so a delete throw
+          // never masks the original failure.
+          if (createdConnectorId) {
+            try {
+              await deleteConnector(config, createdConnectorId);
+            } catch {
+              // A leftover record is inert; failing the response over a delete
+              // throw would be worse than leaving it.
+            }
+          }
+          await persistConnectOutcome(config, setupId, { ok: false, message });
+          if (setup.taskId && toolCallId) {
+            await safeResume(
+              config,
+              setup.taskId,
+              toolCallId,
+              `Could not connect ${isTemplateless ? credentialLabel : providerLabel}: ${message}. Tell the user setup failed; you can call request_connector again so they can re-enter it.`,
+              { context: "connector.request", approvalId: setupId }
+            );
+          }
+          return json({ ok: false, message }, statusFromErrorMessage(message));
+        }
       }
 
       if (setup.action === "browser.connect") {
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
         await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
         return json({ ok });
+      }
+
+      if (setup.action === "skill.grant_connector") {
+        // Per-(skill, credential) consent (ADR skill-connector-consent.md).
+        // No secrets are entered here — the credential already lives in the
+        // connector record; this card only records the user's consent for
+        // the skill to use it. Append the grant, then check whether the skill
+        // still has ungranted credentials. The skill is enabled (and "enabled"
+        // reported) ONLY when ALL of them are granted — for a multi-credential
+        // skill we mint the NEXT grant card and keep the task pending rather
+        // than enabling on the first grant. This is server-driven so we never
+        // claim "enabled" while credentials remain env-denied.
+        const skillId = String(setup.payload.skillId ?? "");
+        const credentialName = String(setup.payload.credentialName ?? "");
+        const credentialLabel = typeof setup.payload.credentialLabel === "string"
+          ? setup.payload.credentialLabel
+          : credentialName;
+        const toolCallId = typeof setup.payload.toolCallId === "string"
+          ? setup.payload.toolCallId
+          : undefined;
+
+        // Atomically claim THIS setup request BEFORE any observable side
+        // effect (grant write, skill enable, audit row, next-card mint,
+        // resume). resolveSetupRequest transitions pending→completed inside
+        // the per-instance mutateState lock and throws ApprovalRaceLostError
+        // ("already <status>") if the row is no longer pending — which the
+        // route's catch surfaces as an error response. The loser of a
+        // double-complete, and any complete that races a cancel (the row is
+        // already non-pending), throws here and performs ZERO side effects.
+        // We claim with resumeChatTask:false / no toolResult so the resume is
+        // staged LATER, as the final step, exactly once on the winning claim.
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", resumeChatTask: false });
+
+        // Only the winner reaches here. Record the grant for the approved
+        // credential by NAME, then check whether the skill still has ungranted
+        // credentials. `firstUngrantedCredential` is the same predicate
+        // setSkillStatusTool uses (a credential needs consent when it carries a
+        // secret), so the two stay in lockstep. The skill is enabled ONLY when
+        // ALL of them are granted — for a multi-credential skill we mint the
+        // NEXT grant card and keep the task pending rather than enabling on the
+        // first grant.
+        const skill = await grantConnectorToSkill(config, skillId, credentialName);
+        const nextUngranted = firstUngrantedCredential(readState(config.instance), skill);
+
+        if (nextUngranted) {
+          // More credentials to grant — mint the next grant card attached to
+          // the same task + tool call, leaving the task pending (not enabled).
+          // The web reconciles the new pending card from the setup-requests
+          // query (refreshed by the setup SSE event). Dedupe to the same task
+          // as a second safety layer — a retried mint must not double up.
+          const nextLabel = nextUngranted.label;
+          const reason = `Skill "${skill.name}" requests access to your ${nextLabel} credential. Granting lets its scripts use ${nextLabel}; you can revoke by disabling the skill.`;
+          await mutateState(config.instance, (mutable) => {
+            const dup = mutable.setupRequests.find(
+              (s) =>
+                s.status === "pending" &&
+                s.action === "skill.grant_connector" &&
+                s.taskId === setup.taskId &&
+                s.payload.skillId === skillId &&
+                s.payload.credentialName === nextUngranted.name
+            );
+            if (dup) return;
+            const approval = createSetupRequest(mutable, {
+              taskId: setup.taskId,
+              action: "skill.grant_connector",
+              target: nextLabel,
+              reason,
+              payload: { skillId, skillName: skill.name, credentialName: nextUngranted.name, credentialLabel: nextLabel, toolCallId }
+            });
+            if (setup.taskId) {
+              const item = findTask(mutable, setup.taskId);
+              item.approvalIds.push(approval.id);
+              item.updatedAt = now();
+            }
+          });
+          return json({ ok: true });
+        }
+
+        // All credentials granted: enable the skill, then resume the chat task
+        // LAST and exactly once with the success toolResult. The request was
+        // already claimed above, so we reuse resolveSetupRequest's internal
+        // resume wiring (approvalToolCallId + resumeChatTask) directly rather
+        // than calling resolveSetupRequest again (which would throw on the
+        // now-completed row). A losing racer never reaches this enable/resume.
+        await setSkillStatus(config, skillId, "enabled");
+        if (setup.taskId) {
+          const resumeToolCallId = approvalToolCallId(setup.payload);
+          if (resumeToolCallId) {
+            await resumeChatTask(
+              config,
+              setup.taskId,
+              resumeToolCallId,
+              `Granted ${credentialLabel} to skill "${skill.name}"; skill enabled.`
+            );
+          }
+        }
+        return json({ ok: true });
       }
 
       return json({ error: `Setup request ${setupId} action not supported: ${setup.action}` }, 400);
@@ -414,8 +931,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       let navigateError: string | undefined;
       if (targetUrl && setup.taskId) {
         try {
-          await browserNavigate(setup.taskId, { url: targetUrl });
-          openedUrl = targetUrl;
+          // browserNavigate returns a JSON envelope rather than
+          // throwing on a soft failure (safetyCheck refusal of a
+          // loopback redirect target, an unsupported URL, etc.).
+          // The previous code only caught throws and set openedUrl
+          // unconditionally — so a refused navigation falsely
+          // reported "user landed on the page." Parse the envelope
+          // and treat success:false as an error path so the
+          // setup-request row records the navigateError truthfully.
+          const navResult = await browserNavigate(setup.taskId, { url: targetUrl });
+          let parsed: { success?: boolean; error?: string } | undefined;
+          try {
+            parsed = JSON.parse(navResult) as { success?: boolean; error?: string };
+          } catch {
+            // Non-JSON return: treat as success for back-compat
+            // with any caller that might not stringify.
+            parsed = { success: true };
+          }
+          if (parsed && parsed.success === false) {
+            navigateError = parsed.error ?? "browser navigation refused";
+          } else {
+            openedUrl = targetUrl;
+          }
         } catch (error) {
           navigateError = error instanceof Error ? error.message : String(error);
         }
@@ -481,6 +1018,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
+    // Long-polling fallback for runtime events — used by clients hitting
+    // gateway via a Cloudflare quick tunnel (`*.trycloudflare.com`), which
+    // drops SSE at the edge. Same event source as the SSE endpoint;
+    // semantics are documented above the eventsPoll helper.
+    ["GET", /^\/api\/events\/poll$/, (request) => eventsPoll(config, request)],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);
@@ -664,8 +1206,8 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // POST /api/skills accepts two payload shapes per ADR connector-provider-spec-compliance.md:
     //   - { body: "<SKILL.md text>", files?: [...] }: install-from-disk
     //     flow used by the install-skill meta-skill and remote/mobile UIs.
-    //     Writes to ~/.gini/instances/<instance>/skills/<category>/<name>/
-    //     and reloads.
+    //     Writes the manifest flat to ~/.gini/instances/<instance>/skills/<name>/
+    //     and reloads. User skills never nest under a category subfolder.
     //   - legacy CRUD payload (`name`, `description`, `steps`, …): create
     //     an in-memory SkillRecord without a manifest file.
     ["POST", /^\/api\/skills$/, async (request) => {
@@ -677,7 +1219,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           : undefined;
         return json(await installSkillFromBody(config, {
           body: String(payload.body),
-          category: typeof payload.category === "string" ? payload.category : undefined,
           files
         }), 201);
       }
@@ -690,7 +1231,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/skills\/([^/]+)$/, (_request, params) => json(getSkill(config, params[0]))],
     ["PATCH", /^\/api\/skills\/([^/]+)$/, async (request, params) => json(await updateSkill(config, params[0], await body(request)))],
     ["POST", /^\/api\/skills\/([^/]+)\/test$/, async (_request, params) => json(await testSkill(config, params[0]))],
-    ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "enabled"))],
+    ["POST", /^\/api\/skills\/([^/]+)\/enable$/, async (_request, params) => {
+      // Enabling a skill never grants a connector. A non-bundled credentialed
+      // skill enabled here stays env-denied (resolveSkillEnv returns {} for any
+      // provider not bundled and not in grantedConnectors) until the user
+      // grants it through the skill.grant_connector consent flow (ADR
+      // skill-connector-consent.md). That consent path is the only way grants
+      // are recorded — enabling must never silently auto-grant, or the model
+      // could reach this route to bypass the gate.
+      return json(await setSkillStatus(config, params[0], "enabled"));
+    }],
     ["POST", /^\/api\/skills\/([^/]+)\/disable$/, async (_request, params) => json(await setSkillStatus(config, params[0], "disabled"))],
     ["POST", /^\/api\/skills\/([^/]+)\/rollback$/, async (_request, params) => json(await rollbackSkill(config, params[0]))],
     ["GET", /^\/api\/jobs$/, (request) => {
@@ -727,7 +1277,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),
       hasDetect: Boolean(p.detect),
-      probeIntervalMs: p.probeIntervalMs
+      // Whether the provider owns a chat-driven setup skill. Drives the Skills
+      // page "Set up via chat" routing for providers whose setup is more than
+      // pasting a secret (e.g. google-oauth-desktop's gws/gcloud walkthrough),
+      // which can't be inferred from field shape now that all its fields are
+      // secret.
+      hasSetupSkill: Boolean(p.setupSkill),
+      probeIntervalMs: p.probeIntervalMs,
+      // Optional credential-template the Add Connector dialog prefills when a
+      // provider is picked as a template. Derived from the module's secret
+      // bindings: one env binding → api-key (name == that env var, MCP URL
+      // from the module's mcpServer); two+ → oauth2 (envMap = purpose→ENV).
+      // Modules with no secret spec (presence-only, generic) carry none.
+      credentialTemplate: credentialTemplateForProvider(p)
     })))],
     ["POST", /^\/api\/connectors$/, async (request) => {
       const payload = await body(request);
@@ -737,9 +1299,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const metadata = payload.metadata && typeof payload.metadata === "object" && !Array.isArray(payload.metadata)
         ? payload.metadata as Record<string, unknown>
         : undefined;
+      const type = payload.type === "api-key" || payload.type === "oauth2" ? payload.type : undefined;
       return json(await createConnector(config, {
         name: String(payload.name ?? ""),
         provider: String(payload.provider ?? ""),
+        type,
         scopes: Array.isArray(payload.scopes) ? payload.scopes.map(String) : undefined,
         secrets,
         metadata
@@ -793,11 +1357,41 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!token) return json({ error: "token is required" }, 400);
       if (platform !== "ios") return json({ error: "platform must be 'ios'" }, 400);
       if (!bundleId) return json({ error: "bundleId is required" }, 400);
+      // The BFF forwards the proxy-stamped `x-gini-tunnel-vetted: 1`
+      // marker on tunneled requests. We tag the resulting row with its
+      // origin so rotateSecret / disable can purge every tunneled
+      // registration without disturbing loopback rows.
+      const vetted = request.headers.get("x-gini-tunnel-vetted") === "1";
+      // Recheck the live tunnel state under the marker so a request that
+      // passed the proxy gate before tunnel.disable runs can't sneak a
+      // new tunnel-origin row in AFTER the purge runs. Mobile retries
+      // the registration once /api/tunnel reports the new state, so a
+      // 503 + Retry-After is the cooperative answer here. The bearer
+      // reaching this handler is the BFF-injected runtime token, not
+      // the proxy's tunnel secret, so the recheck gates on the
+      // enabled/secret-presence state rather than a bearer comparison —
+      // a rotated-secret in-flight request still satisfies
+      // `enabled && secret`, and the new row stays attributable to a
+      // surviving credential.
+      if (vetted) {
+        const live = tunnelManager(config).current();
+        if (!live.enabled || !live.secret) {
+          return new Response(
+            JSON.stringify({ error: "tunnel_state_changed" }),
+            {
+              status: 503,
+              headers: { "Content-Type": "application/json", "Retry-After": "2" }
+            }
+          );
+        }
+      }
+      const origin = vetted ? "tunnel" : "loopback";
       const device = upsertDevice(config.instance, {
         token,
         credentialId: credential,
         platform: "ios",
-        bundleId
+        bundleId,
+        origin
       });
       return json({ ok: true, device });
     }],
@@ -851,6 +1445,24 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const result = markRead(config.instance, sessionId, dev.token, lastReadBlockId);
       return json({ ok: true, readState: result });
     }],
+    // Mark a chat unread for the calling device. Pins the read cursor
+    // to the block before the latest assistant_text so the badge
+    // settles at "just the agent's last turn" (typically 1), matching
+    // iOS Mail / Messages behavior — not "every block since session
+    // start". Sessions with no assistant_text fall back to clearing
+    // the cursor entirely so the action still surfaces them as unread.
+    ["DELETE", /^\/api\/chat\/([^/]+)\/read$/, async (request, params) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const sessionId = params[0];
+      if (!readState(config.instance).chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      markUnread(config.instance, sessionId, dev.token);
+      return json({ ok: true });
+    }],
     ["GET", /^\/api\/badge$/, async (request) => {
       const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
       if (!credential) return json({ error: "Unauthorized" }, 401);
@@ -859,6 +1471,19 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!dev.ok) return json({ error: dev.reason }, dev.status);
       const unread = unreadCountForDevice(config.instance, dev.token);
       return json({ unread });
+    }],
+    // Per-session unread counts for the calling device. Powers the
+    // mobile chat list's per-row badge (blue pill + count) — /badge
+    // gives the cross-session total, /unread gives the breakdown so
+    // the list can mark each row independently. Sessions with zero
+    // unread blocks are omitted; callers default to 0.
+    ["GET", /^\/api\/unread$/, async (request) => {
+      const credential = await resolveCredentialFromBearer(config, bearerFromRequest(request));
+      if (!credential) return json({ error: "Unauthorized" }, 401);
+      const dev = requireDeviceToken(config, request, credential);
+      if (!dev.ok) return json({ error: dev.reason }, dev.status);
+      const counts = unreadCountsByDevice(config.instance, dev.token);
+      return json({ counts: Object.fromEntries(counts) });
     }],
     ["GET", /^\/api\/promotions$/, () => json(readState(config.instance).promotions)],
     ["POST", /^\/api\/promotions$/, async (request) => json(await proposePromotion(config, await body(request)), 201)],
@@ -934,6 +1559,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const payload = await body(request);
       const providerName = typeof payload.provider === "string" ? payload.provider : "";
       const result = removeSetupProvider(config, providerName);
+      return json(result, result.ok ? 200 : 400);
+    }],
+    // Cache warmer: model-agnostic, single-integer-of-state knob. GET
+    // returns the persisted minutes (0 = disabled), POST validates and
+    // saves. The runtime loop in src/server.ts reads `config.cacheWarmerMinutes`
+    // every tick, so a POST takes effect on the next loop iteration
+    // without needing a restart or any pub/sub plumbing.
+    ["GET", /^\/api\/settings\/cache-warmer$/, () => json(getCacheWarmer(config))],
+    ["POST", /^\/api\/settings\/cache-warmer$/, async (request) => {
+      const payload = await body(request);
+      const result = setCacheWarmer(config, payload);
       return json(result, result.ok ? 200 : 400);
     }],
     ["GET", /^\/api\/agents$/, () => json(listAgents(config))],
@@ -1422,6 +2058,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Messaging bridge not found")) return 404;
   if (message.startsWith("Messaging bridge is not configured")) return 400;
   if (message.startsWith("Messaging bridge name is required")) return 400;
+  // rejectPendingChat throws these when the operator clicks Reject
+  // on a stale card (the pending row was re-DM'd and the code rotated)
+  // or on a card whose chat was already enrolled by a parallel
+  // operator. Both are user-input class — 400, not 500.
+  if (message.startsWith("Cannot reject")) return 400;
+  if (message.startsWith("Pairing request for chat")) return 400;
   if (/^(Telegram|Discord) bridges require a botToken/.test(message)) return 400;
   if (/^(Telegram|Discord) bot token contains invalid characters/.test(message)) return 400;
   if (message.startsWith("Inbound message text or media is required")) return 400;
@@ -1438,6 +2080,189 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
   return 500;
+}
+
+// Long-polling fallback constants — used by `/api/events/poll` and
+// `/api/chat/:id/poll`, the JSON-over-HTTP mirrors of the SSE endpoints
+// below. Cloudflare quick tunnels (`*.trycloudflare.com`) drop
+// `text/event-stream` at the edge, so any tunneled client (web or
+// mobile) hitting a quick-tunnel host must use these endpoints instead.
+// See `src/runtime/tunnel/transport.ts` for the classifier the clients
+// consult.
+//
+// LONG_POLL_TIMEOUT_MS = 25_000: an idle long-poll resolves with an
+// empty `events` array after this. 25 s sits comfortably under the
+// 30 s timeout most proxies enforce on hung requests so we don't get
+// cut off mid-flight, and is long enough that an idle session doesn't
+// burn through HTTP overhead on every short poll.
+//
+// LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS = 25: once at least one event
+// has arrived, wait 25 ms before resolving so a burst (e.g. a chat
+// task firing multiple chat_block updates in one tick) coalesces into
+// a single response instead of N tiny ones. The coalesce delay is
+// short enough to feel real-time to the user; longer would smear
+// streaming-text deltas perceptibly.
+const LONG_POLL_TIMEOUT_MS = 25_000;
+const LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS = 25;
+
+// Mirrors `eventStream` semantics: returns events whose id is past
+// `since`, with a 25_000 ms idle timeout and a 25 ms post-first-event
+// flush window. The event-source is the same ring buffer the SSE
+// endpoint reads from (`readState(...).events`), polled at the same
+// 1 s cadence — no event emitter to subscribe to for this surface.
+// Resolves with the events accumulated since the cursor plus a fresh
+// cursor (the last event's id, or `since` unchanged on idle). Returns
+// `application/json` so Cloudflare's quick-tunnel proxy treats it as
+// an ordinary HTTP response and doesn't strip it.
+function eventsPoll(config: RuntimeConfig, request: Request): Promise<Response> {
+  const since = new URL(request.url).searchParams.get("since") ?? "";
+  // Promise.withResolvers lets us hand the timer + interval the same
+  // resolver without wrapping a `new Promise((res) => …)` callback.
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let resolved = false;
+  let interval: Timer | undefined;
+  let timeoutTimer: Timer | undefined;
+  let coalesceTimer: Timer | undefined;
+  let accumulated: unknown[] = [];
+
+  const finish = (cursor: string): void => {
+    if (resolved) return;
+    resolved = true;
+    if (interval) clearInterval(interval);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    resolve(Response.json({ events: accumulated, cursor }));
+  };
+
+  // Honor client cancellation. AbortSignal fires on browser navigation
+  // away / fetch abort; unsubscribing immediately keeps the gateway
+  // from accumulating dead timers behind clients that hung up.
+  request.signal.addEventListener("abort", () => {
+    // Match the empty-result shape so a cancelled poll doesn't claim
+    // it received events it never delivered.
+    finish(since);
+  });
+
+  // The poll resolves when EITHER (a) at least one event has been
+  // accumulated AND LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS ms have
+  // elapsed since the first event landed, OR (b) LONG_POLL_TIMEOUT_MS
+  // ms have elapsed total. Walking the ring buffer at 1 s matches the
+  // SSE endpoint's polling cadence; there's no event-emitter to
+  // subscribe to for runtime events.
+  const check = (): void => {
+    if (resolved) return;
+    const events = readState(config.instance).events.slice().reverse();
+    const cutoff = since ? events.findIndex((e) => e.id === since) : -1;
+    // Slice off the events past the cursor. cutoff < 0 means the cursor
+    // rolled out of the 1000-entry ring (or no cursor was given), so we
+    // return everything currently retained.
+    const fresh = cutoff >= 0 ? events.slice(cutoff + 1) : events;
+    if (fresh.length === 0) return;
+    accumulated = fresh;
+    if (!coalesceTimer) {
+      const last = fresh[fresh.length - 1];
+      const cursor = last && typeof last === "object" && "id" in last && typeof last.id === "string"
+        ? last.id
+        : since;
+      coalesceTimer = setTimeout(() => finish(cursor), LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    }
+  };
+
+  check();
+  if (!resolved) {
+    interval = setInterval(check, 1_000);
+    timeoutTimer = setTimeout(() => finish(since), LONG_POLL_TIMEOUT_MS);
+  }
+  return promise;
+}
+
+// Mirrors `chatBlockStream` semantics over long-polling. The
+// subscription source is `subscribeChatBlocks` (the same event-emitter
+// the SSE path uses), which fires AFTER the SQLite commit so we
+// observe durable rows. Cursor is the SSE wire id (`<block_id>:<ts>`)
+// the client received last; if the client has never connected we fall
+// back to the full block list via `listChatBlocksAfter(null)`.
+function chatBlockPoll(config: RuntimeConfig, request: Request, sessionId: string): Promise<Response> {
+  const state = readState(config.instance);
+  if (!state.chatSessions.some((s) => s.id === sessionId)) {
+    return Promise.resolve(json({ error: `Chat session not found: ${sessionId}` }, 404));
+  }
+  const since = new URL(request.url).searchParams.get("since") ?? "";
+  const { promise, resolve } = Promise.withResolvers<Response>();
+  let resolved = false;
+  let unsubscribe: (() => void) | undefined;
+  let timeoutTimer: Timer | undefined;
+  let coalesceTimer: Timer | undefined;
+  const accumulated: ChatBlock[] = [];
+
+  // The cursor we return is `<block_id>:<ts>` (matching the SSE id
+  // line) of the last block in the response so the next poll resumes
+  // from the exact same point. listChatBlocksAfter parses the suffix
+  // to detect in-place upserts on the cursor row.
+  const wireId = (block: ChatBlock): string => {
+    const ts =
+      block.kind === "assistant_text" || block.kind === "tool_call"
+        ? block.updatedAt
+        : block.createdAt;
+    return `${block.id}:${ts}`;
+  };
+
+  const finish = (cursor: string): void => {
+    if (resolved) return;
+    resolved = true;
+    if (unsubscribe) unsubscribe();
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    resolve(Response.json({ events: accumulated, cursor }));
+  };
+
+  request.signal.addEventListener("abort", () => {
+    finish(since);
+  });
+
+  // Initial backfill — same as the SSE path's start() handler. If the
+  // cursor is fresh enough to be present in chat_blocks, replay only
+  // missing rows; otherwise replay everything (the gateway caps
+  // listChatBlocksAfter's fallback behavior).
+  const backfill = listChatBlocksAfter(config.instance, sessionId, since || null);
+  for (const block of backfill) {
+    accumulated.push(block);
+  }
+  if (accumulated.length > 0) {
+    // Read the latest entry INSIDE the timer callback rather than
+    // freezing the backfill's last block in this closure. If a newer
+    // block lands on the live subscription within the 25 ms coalesce
+    // window, it pushes onto `accumulated`; the cursor we return must
+    // reflect THAT block, not the backfill's. Otherwise the client's
+    // next poll resumes from the backfill cursor and re-receives the
+    // newer block on top of the one it just got.
+    coalesceTimer = setTimeout(() => {
+      const last = accumulated[accumulated.length - 1]!;
+      finish(wireId(last));
+    }, LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+  }
+
+  // Live subscription for blocks that land after the backfill snapshot.
+  // The dedup gate stays loose: assistant_text streaming deltas reuse
+  // the same block id with growing payloads, so id-dedup would drop
+  // intermediate frames. Instead we accept every emitted block; the
+  // client upserts by id and the last seen `<id>:<ts>` is what we
+  // return as the cursor.
+  unsubscribe = subscribeChatBlocks(config.instance, sessionId, (block) => {
+    if (resolved) return;
+    accumulated.push(block);
+    if (!coalesceTimer) {
+      coalesceTimer = setTimeout(() => {
+        const last = accumulated[accumulated.length - 1]!;
+        finish(wireId(last));
+      }, LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS);
+    }
+  });
+
+  if (!resolved) {
+    timeoutTimer = setTimeout(() => finish(since), LONG_POLL_TIMEOUT_MS);
+  }
+  return promise;
 }
 
 function eventStream(config: RuntimeConfig, request: Request): Response {

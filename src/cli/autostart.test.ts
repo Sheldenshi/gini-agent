@@ -10,13 +10,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  GINI_SUPERVISOR_VALUE,
   LABEL_PREFIX,
   generatePlist,
   guiDomain,
   labelFor,
   plistPathFor,
   resolveLaunchSpec,
-  serviceTarget
+  serviceTarget,
+  supervisor
 } from "./autostart";
 
 function makeTempHome(tag: string): string {
@@ -84,8 +86,8 @@ describe("resolveLaunchSpec", () => {
     });
 
     // Direct exec of bun against the server entry — no wrapper, no CLI
-    // layer. Single-process job so SIGKILL is reliably observed by launchd
-    // and KeepAlive.SuccessfulExit:false respawns it.
+    // layer. Single-process job so the launchd-tracked PID is the runtime
+    // itself and KeepAlive respawns it on any exit.
     expect(spec.programArguments).toEqual([
       "/Users/test/.bun/bin/bun",
       "run",
@@ -477,6 +479,64 @@ describe("resolveLaunchSpecPair", () => {
     expect(pair.gateway.workingDirectory).toBe(pair.web.workingDirectory);
   });
 
+  test("gateway and web env both carry GINI_SUPERVISOR=launchd", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => null
+    });
+    // The marker is how a launchd-spawned runtime/web recognizes its
+    // supervisor at runtime (supervisor()==="launchd"). Foreground/
+    // `gini start` never set it.
+    expect(pair.gateway.environment.GINI_SUPERVISOR).toBe("launchd");
+    expect(pair.web.environment.GINI_SUPERVISOR).toBe("launchd");
+  });
+
+  test("watchdog spec runs `gini watchdog --instance <name>` with the launchd marker", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      readSecretsFile: () => "OPENAI_API_KEY=sk-should-not-leak\n"
+    });
+    expect(pair.watchdog.programArguments).toEqual([
+      "/opt/bun/bin/bun",
+      "run",
+      "gini",
+      "watchdog",
+      "--instance",
+      "main"
+    ]);
+    expect(pair.watchdog.environment.GINI_SUPERVISOR).toBe("launchd");
+    expect(pair.watchdog.environment.GINI_INSTANCE).toBe("main");
+    expect(pair.watchdog.workingDirectory).toBe(pair.gateway.workingDirectory);
+  });
+
+  test("watchdog env carries NO provider secrets (it never talks to a provider)", async () => {
+    const { resolveLaunchSpecPair } = await import("./autostart");
+    const pair = resolveLaunchSpecPair({
+      instance: "main",
+      homeOverride: home,
+      bunPathOverride: "/opt/bun/bin/bun",
+      projectRootOverride: "/repo/gini",
+      cwdOverride: "/tmp/neutral",
+      // A secret here MUST land in the gateway env but never the watchdog env.
+      readSecretsFile: () => "OPENAI_API_KEY=sk-secret-value\n"
+    });
+    expect(pair.gateway.environment.OPENAI_API_KEY).toBe("sk-secret-value");
+    expect(pair.watchdog.environment.OPENAI_API_KEY).toBeUndefined();
+    // The watchdog also doesn't need the web's Next.js knobs.
+    expect(pair.watchdog.environment.PORT).toBeUndefined();
+    expect(pair.watchdog.environment.GINI_DIST_DIR).toBeUndefined();
+  });
+
   test("rejects suspicious instance names that could break out of the shell shim", async () => {
     const { resolveLaunchSpecPair } = await import("./autostart");
     expect(() => resolveLaunchSpecPair({
@@ -551,6 +611,34 @@ describe("parseSecretsEnv", () => {
   });
 });
 
+describe("supervisor", () => {
+  let prior: string | undefined;
+
+  beforeEach(() => {
+    prior = process.env.GINI_SUPERVISOR;
+  });
+
+  afterEach(() => {
+    if (prior === undefined) delete process.env.GINI_SUPERVISOR;
+    else process.env.GINI_SUPERVISOR = prior;
+  });
+
+  test('returns "launchd" when GINI_SUPERVISOR matches the marker', () => {
+    process.env.GINI_SUPERVISOR = GINI_SUPERVISOR_VALUE;
+    expect(supervisor()).toBe("launchd");
+  });
+
+  test("returns null when GINI_SUPERVISOR is unset (foreground/`gini run`)", () => {
+    delete process.env.GINI_SUPERVISOR;
+    expect(supervisor()).toBeNull();
+  });
+
+  test("returns null for an unrelated GINI_SUPERVISOR value", () => {
+    process.env.GINI_SUPERVISOR = "systemd";
+    expect(supervisor()).toBeNull();
+  });
+});
+
 describe("generatePlist", () => {
   const baseSpec = {
     programArguments: ["/Users/test/.local/bin/gini", "run", "--instance", "main", "--no-web"],
@@ -589,17 +677,20 @@ describe("generatePlist", () => {
     expect(web).toContain(`<string>${LABEL_PREFIX}.main.web</string>`);
   });
 
-  test("KeepAlive is a dict with SuccessfulExit=false", () => {
+  test("KeepAlive is true (always respawn; bootout is the stop mechanism)", () => {
     const xml = generatePlist({
       instance: "main",
       spec: baseSpec,
       stdoutPath: "/tmp/out.log",
       stderrPath: "/tmp/err.log"
     });
-    // The exact dict shape is load-bearing: changing it to a <true/>
-    // bool would make `gini stop` immediately respawn, which defeats the
-    // whole "user intent honored" contract.
-    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<dict>[\s\S]*?<key>SuccessfulExit<\/key>\s*<false\/>[\s\S]*?<\/dict>/);
+    // KeepAlive:true means launchd respawns on ANY exit — the runtime must
+    // stay up across crashes and clean exits alike. Stopping is done via
+    // `launchctl bootout` (see `gini stop`), never by a clean exit. A
+    // SuccessfulExit dict would let a clean exit keep the service down,
+    // which would re-open the orphan/stay-dead failure mode.
+    expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+    expect(xml).not.toContain("<key>SuccessfulExit</key>");
     // NetworkState was deliberately omitted — see the comment in
     // generatePlist for why (pended-spawn semaphore prevents respawn).
     expect(xml).not.toContain("<key>NetworkState</key>");
@@ -699,5 +790,46 @@ describe("generatePlist", () => {
     expect(xml).toContain("&apos;");
     expect(xml).toContain("&amp; such");
     expect(xml).toContain("&lt;out&gt;");
+  });
+});
+
+describe("generatePlist (watchdog kind: periodic StartInterval)", () => {
+  const baseSpec = {
+    programArguments: ["/opt/bun/bin/bun", "run", "gini", "watchdog", "--instance", "main"],
+    workingDirectory: "/Users/test/.gini/runtime",
+    environment: { PATH: "/usr/bin", GINI_INSTANCE: "main", HOME: "/Users/test", LANG: "en_US.UTF-8" }
+  };
+
+  test("emits StartInterval + RunAtLoad and NO KeepAlive for the watchdog", () => {
+    const xml = generatePlist({
+      instance: "main",
+      kind: "watchdog",
+      spec: baseSpec,
+      stdoutPath: "/tmp/watchdog.log",
+      stderrPath: "/tmp/watchdog.err.log",
+      startIntervalSeconds: 30
+    });
+    expect(xml).toMatch(/<key>StartInterval<\/key>\s*<integer>30<\/integer>/);
+    expect(xml).toMatch(/<key>RunAtLoad<\/key>\s*<true\/>/);
+    // The watchdog is a periodic one-shot that always exits 0 — KeepAlive
+    // would respawn it in a tight loop the instant it finishes.
+    expect(xml).not.toContain("<key>KeepAlive</key>");
+    // ThrottleInterval is a KeepAlive-job knob; the periodic plist drops it.
+    expect(xml).not.toContain("<key>ThrottleInterval</key>");
+    expect(xml).toContain(`<string>${LABEL_PREFIX}.main.watchdog</string>`);
+  });
+
+  test("gateway and web still carry KeepAlive <true/> (StartInterval is watchdog-only)", () => {
+    for (const kind of ["gateway", "web"] as const) {
+      const xml = generatePlist({
+        instance: "main",
+        kind,
+        spec: baseSpec,
+        stdoutPath: "/tmp/out.log",
+        stderrPath: "/tmp/err.log"
+      });
+      expect(xml).toMatch(/<key>KeepAlive<\/key>\s*<true\/>/);
+      expect(xml).not.toContain("<key>StartInterval</key>");
+    }
   });
 });

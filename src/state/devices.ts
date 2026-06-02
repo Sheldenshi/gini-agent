@@ -19,6 +19,13 @@ import type { Instance } from "../types";
 import { now } from "./ids";
 import { getMemoryDb } from "./memory-db";
 
+// Network path the registration arrived over. `loopback` means the operator's
+// local browser; `tunnel` means the request crossed the BFF's tunnel branch.
+// Tunneled rows are wiped on rotateSecret / disable so a leaked
+// QR-bootstrap holder can't keep receiving APNs notifications after the
+// operator revokes the tunnel.
+export type DeviceOrigin = "loopback" | "tunnel";
+
 export interface PushDevice {
   token: string;
   credentialId: string;
@@ -26,6 +33,7 @@ export interface PushDevice {
   bundleId: string;
   registeredAt: string;
   lastSeenAt: string;
+  origin: DeviceOrigin;
 }
 
 interface PushDeviceRow {
@@ -35,6 +43,7 @@ interface PushDeviceRow {
   bundle_id: string;
   registered_at: string;
   last_seen_at: string;
+  origin: DeviceOrigin;
 }
 
 function rowToDevice(row: PushDeviceRow): PushDevice {
@@ -44,7 +53,8 @@ function rowToDevice(row: PushDeviceRow): PushDevice {
     platform: row.platform,
     bundleId: row.bundle_id,
     registeredAt: row.registered_at,
-    lastSeenAt: row.last_seen_at
+    lastSeenAt: row.last_seen_at,
+    origin: row.origin
   };
 }
 
@@ -53,6 +63,10 @@ export interface UpsertDeviceInput {
   credentialId: string;
   platform: "ios";
   bundleId: string;
+  // Optional so legacy callers (CLI tests, fixtures) keep registering as
+  // loopback without churn. Production registration through src/http.ts
+  // always passes the explicit value derived from the request marker.
+  origin?: DeviceOrigin;
 }
 
 // Idempotent: if the same token re-registers, rebind it to the
@@ -68,15 +82,17 @@ export function upsertDevice(instance: Instance, input: UpsertDeviceInput): Push
     .query<PushDeviceRow, [string]>("SELECT * FROM devices WHERE token = ?")
     .get(input.token);
   const registeredAt = existing ? existing.registered_at : at;
+  const origin: DeviceOrigin = input.origin ?? "loopback";
   db.run(
-    `INSERT INTO devices (token, credential_id, platform, bundle_id, registered_at, last_seen_at)
-     VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO devices (token, credential_id, platform, bundle_id, registered_at, last_seen_at, origin)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(token) DO UPDATE SET
        credential_id = excluded.credential_id,
        platform = excluded.platform,
        bundle_id = excluded.bundle_id,
-       last_seen_at = excluded.last_seen_at`,
-    [input.token, input.credentialId, input.platform, input.bundleId, registeredAt, at]
+       last_seen_at = excluded.last_seen_at,
+       origin = excluded.origin`,
+    [input.token, input.credentialId, input.platform, input.bundleId, registeredAt, at, origin]
   );
   return {
     token: input.token,
@@ -84,8 +100,20 @@ export function upsertDevice(instance: Instance, input: UpsertDeviceInput): Push
     platform: input.platform,
     bundleId: input.bundleId,
     registeredAt,
-    lastSeenAt: at
+    lastSeenAt: at,
+    origin
   };
+}
+
+// Wipes every device row that registered through the tunneled lane.
+// Called by tunnel manager.rotateSecret / disable: the old QR-bootstrap
+// is now invalid, so any device that paired through it must re-register
+// against the new credentials before resuming APNs delivery. Returns
+// the number of rows deleted.
+export function purgeTunnelDevices(instance: Instance): { deleted: number } {
+  const db = getMemoryDb(instance);
+  const result = db.run("DELETE FROM devices WHERE origin = 'tunnel'");
+  return { deleted: result.changes ?? 0 };
 }
 
 export function listDevicesForCredential(instance: Instance, credentialId: string): PushDevice[] {

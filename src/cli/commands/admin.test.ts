@@ -17,8 +17,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import type { ProviderConfig, RuntimeConfig } from "../../types";
-import { install_ } from "./admin";
+import { install_, shouldStopViaBootout, stop } from "./admin";
 import { loadConfig } from "../../paths";
+import type { PlistKind } from "../autostart";
 
 describe("install_ provider env override", () => {
   let scratchHome: string;
@@ -229,6 +230,135 @@ describe("install_ provider env override", () => {
     expect(cfg.provider.apiKeyEnv).toBeUndefined();
   });
 });
+
+// `gini stop` dispatches on supervisor(): a launchd-supervised instance
+// (GINI_SUPERVISOR=launchd) is stopped via `launchctl bootout` because
+// KeepAlive:true would respawn a SIGTERM; everything else keeps the
+// existing SIGTERM-based stopRuntime behavior.
+describe("stop dispatch (launchd vs foreground)", () => {
+  let scratchHome: string;
+  let originalHome: string | undefined;
+  let originalState: string | undefined;
+  let originalSupervisor: string | undefined;
+  let logs: string[];
+  let originalLog: typeof console.log;
+
+  beforeEach(() => {
+    scratchHome = `/tmp/gini-stop-cli-tests/${process.pid}-${Math.random().toString(36).slice(2)}`;
+    mkdirSync(join(scratchHome, ".gini"), { recursive: true });
+    originalHome = process.env.HOME;
+    originalState = process.env.GINI_STATE_ROOT;
+    originalSupervisor = process.env.GINI_SUPERVISOR;
+    process.env.HOME = scratchHome;
+    process.env.GINI_STATE_ROOT = join(scratchHome, ".gini");
+    logs = [];
+    originalLog = console.log;
+    console.log = (...args: unknown[]) => { logs.push(args.map(String).join(" ")); };
+  });
+
+  afterEach(() => {
+    console.log = originalLog;
+    restore("HOME", originalHome);
+    restore("GINI_STATE_ROOT", originalState);
+    restore("GINI_SUPERVISOR", originalSupervisor);
+    rmSync(scratchHome, { recursive: true, force: true });
+  });
+
+  test("foreground (GINI_SUPERVISOR unset) takes the stopRuntime path", () => {
+    delete process.env.GINI_SUPERVISOR;
+    const instance = "stop-foreground";
+    const ctx = makeStopCtx(instance);
+    stop(ctx);
+    const out = JSON.parse(logs.join("\n")) as Record<string, unknown>;
+    // stopRuntime with no pid file reports "No pid file" and stopped:false —
+    // and crucially does NOT carry the bootout `results` array.
+    expect(out.reason).toBe("No pid file");
+    expect(out.results).toBeUndefined();
+  });
+
+  // Real launchctl is only available on macOS, and bootout of a service
+  // that was never registered is a harmless "Could not find service"
+  // no-op that stopViaBootout folds into ok:true.
+  (process.platform === "darwin" ? test : test.skip)(
+    "launchd (GINI_SUPERVISOR=launchd) takes the bootout path",
+    () => {
+      process.env.GINI_SUPERVISOR = "launchd";
+      const instance = `stop-launchd-${Math.random().toString(36).slice(2)}`;
+      const ctx = makeStopCtx(instance);
+      stop(ctx);
+      const out = JSON.parse(logs.join("\n")) as Record<string, unknown>;
+      // bootout result carries the per-kind `results` array (gateway, web,
+      // watchdog) — the stopRuntime path never does.
+      expect(out.instance).toBe(instance);
+      const results = out.results as Array<Record<string, unknown>>;
+      expect(Array.isArray(results)).toBe(true);
+      expect(results.map((r) => r.kind)).toEqual(["gateway", "web", "watchdog"]);
+      // Nothing was registered, so every bootout is a "Could not find
+      // service" no-op folded into a successful stop.
+      expect(out.ok).toBe(true);
+    }
+  );
+});
+
+// `gini stop` decides bootout-vs-SIGTERM on the TARGET instance's launchd
+// state, not the calling process's env. A user running `gini stop` from a
+// terminal has no GINI_SUPERVISOR, so the decision must come from
+// isLoaded()/plist-on-disk — otherwise a launchd instance gets a SIGTERM
+// that KeepAlive immediately respawns. Inject fakes so no real launchctl runs.
+describe("shouldStopViaBootout (target launchd state, not process env)", () => {
+  const noPlist = () => false;
+  const plistFor = (instance: string, kind?: PlistKind) => `/fake/${instance}.${kind}.plist`;
+
+  test("any service loaded -> bootout (even with GINI_SUPERVISOR unset)", () => {
+    const loadedKinds: Array<PlistKind | undefined> = [];
+    const decision = shouldStopViaBootout("inst", {
+      isLoaded: (_inst: string, kind?: PlistKind) => {
+        loadedKinds.push(kind);
+        return kind === "gateway";
+      },
+      plistExists: noPlist,
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(true);
+    // Short-circuits on the first loaded kind (gateway).
+    expect(loadedKinds).toEqual(["gateway"]);
+  });
+
+  test("a plist on disk (registered but stopped) -> bootout", () => {
+    const decision = shouldStopViaBootout("inst", {
+      isLoaded: () => false,
+      plistExists: (path: string) => path.includes("web"),
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(true);
+  });
+
+  test("nothing loaded and no plist (pure foreground) -> SIGTERM path", () => {
+    const decision = shouldStopViaBootout("inst", {
+      isLoaded: () => false,
+      plistExists: noPlist,
+      plistPathFor: plistFor
+    });
+    expect(decision).toBe(false);
+  });
+});
+
+function makeStopCtx(instance: string): CliContext {
+  const rawArgs = ["stop", "--instance", instance];
+  let cached: RuntimeConfig | null = null;
+  return {
+    get config(): RuntimeConfig {
+      if (!cached) cached = loadConfig(instance);
+      return cached;
+    },
+    cliArgs: rawArgs,
+    command: "stop",
+    ephemeralSmoke: false,
+    explicitInstance: true,
+    rawArgs,
+    web: { webPort: 0, webPortPinned: false, noWeb: true }
+  };
+}
 
 function restore(key: string, value: string | undefined): void {
   if (value === undefined) delete process.env[key];

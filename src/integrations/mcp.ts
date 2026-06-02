@@ -1,8 +1,8 @@
 import type { McpServerRecord, RuntimeConfig } from "../types";
 import { addAudit, appendEvent, createMcpServerRecord, mutateState, now, readState } from "../state";
 import { spawn } from "bun";
-import { envBindingsForProviders, resolveConnectorSecret } from "./connectors";
-import { getProvider, listProviders } from "./connectors/registry";
+import { bindingsForCredentials, envBindingsForProviders, resolveConnectorSecret } from "./connectors";
+import { listProviders } from "./connectors/registry";
 import { httpMcpCallTool, httpMcpInitialize, httpMcpListTools, resolveHeaderValue } from "./mcp-http";
 
 export async function addMcpServer(config: RuntimeConfig, input: Record<string, unknown>) {
@@ -160,28 +160,30 @@ export async function removeMcpServer(config: RuntimeConfig, idOrName: string) {
 }
 
 // Resolve each header value's `${VAR}` placeholders against the union of:
-//  - active connector secrets (via envBindingsForProviders), and
-//  - process.env (fallback ONLY for vars no provider claims as a secret
-//    envBinding).
+//  - live typed-credential secrets (resolved BY NAME), and
+//  - process.env (fallback ONLY for vars no credential or provider claims as
+//    a secret).
 // Throws when any placeholder can't resolve so the caller surfaces a
 // "missing credential" error before the request goes out.
 //
 // Two trust properties this function preserves:
 //
-//  1. Probe-based providers (e.g. `linear`) must have `health === "healthy"`
-//     to contribute their secret. A freshly-created, never-probed second
-//     connector with a bad token must not supply credentials to an MCP row
-//     that an older healthy connector originally enabled. (Mirrors the same
-//     gate in `isSkillActive` and `resolveSkillEnv`.)
+//  1. Probe-based credentials (e.g. the LINEAR_API_KEY credential) must have
+//     `health === "healthy"` to contribute their secret. A freshly-created,
+//     never-probed second connector with a bad token must not supply
+//     credentials to an MCP row that an older healthy credential originally
+//     enabled. (`bindingsForCredentials` applies the same usability guard as
+//     `isSkillActive` and `resolveSkillEnv`.)
 //
-//  2. Variables that any provider declares as a secret envBinding can ONLY
-//     be supplied by a live connector. Falling back to `process.env` for
-//     these would silently keep an MCP row authenticated after the
-//     connector is deleted/disabled (the user's shell still exports
-//     `LINEAR_API_KEY`), bypassing the `connector.secret.use` audit. We
-//     still permit `process.env` for vars no provider owns (e.g.
-//     `MCP-Protocol-Version`-style passthrough that the user wired by hand
-//     into the header map).
+//  2. Variables that any credential OR provider claims as a secret can ONLY be
+//     supplied by a live credential. Falling back to `process.env` for these
+//     would silently keep an MCP row authenticated after the credential is
+//     deleted/disabled (the user's shell still exports `LINEAR_API_KEY`),
+//     bypassing the `connector.secret.use` audit. The provider-declared set is
+//     kept in the block-list (not as a resolution source) so a deleted
+//     credential can never be quietly replaced by the operator's shell. We
+//     still permit `process.env` for vars nothing owns (e.g.
+//     `MCP-Protocol-Version`-style passthrough wired into the header by hand).
 export async function resolveMcpHeaders(
   config: RuntimeConfig,
   server: McpServerRecord,
@@ -189,23 +191,57 @@ export async function resolveMcpHeaders(
 ): Promise<Record<string, string>> {
   const raw = server.headers ?? {};
   if (Object.keys(raw).length === 0) return {};
-  // Bindings owned by ANY known provider — used both to populate
-  // credentials from live connectors and to block process.env fallback
-  // for those same variable names.
-  const allBindings = envBindingsForProviders(listProviders().map((p) => p.id));
   const state = readState(config.instance);
+  // The `${VAR}` placeholders this server's headers actually reference. We only
+  // resolve secrets for THESE — resolving every typed credential's secret would
+  // emit spurious `connector.secret.use` audits for unrelated credentials, and
+  // a single unrelated credential failing to resolve would break the call.
+  const referencedVars = new Set<string>();
+  for (const value of Object.values(raw)) {
+    for (const m of value.matchAll(/\$\{([A-Z0-9_]+)\}/g)) referencedVars.add(m[1] as string);
+  }
+
+  // Block-list: every env var ANY typed credential owns — INCLUDING
+  // disabled/error/tombstoned records — plus any provider-declared secret var.
+  // These can ONLY be supplied by a live (configured + healthy) credential,
+  // never by process.env, so deleting/disabling a credential can't leave an
+  // MCP row authenticated from the operator's shell (which would bypass the
+  // connector.secret.use audit). A credential whose status excludes it from
+  // resolution therefore yields a "missing credential" error rather than
+  // silently falling back. The provider-declared set is a defense-in-depth
+  // guard, NOT a resolution source.
+  const claimedVars = new Set<string>(Object.keys(envBindingsForProviders(listProviders().map((p) => p.id))));
+  // Map each typed credential's owned env vars → its name, for ALL typed
+  // records regardless of status. The same loop seeds the block-list.
+  const envVarToCredentialName = new Map<string, string>();
+  for (const connector of state.connectors) {
+    if (!connector.type) continue;
+    const ownedVars = connector.type === "oauth2"
+      ? Object.values(connector.metadata?.envMap ?? {})
+      : [connector.name];
+    for (const envVar of ownedVars) {
+      claimedVars.add(envVar);
+      // Only the first owner of an env var maps (names are unique
+      // instance-wide once migrated; this just keeps the map deterministic).
+      if (!envVarToCredentialName.has(envVar)) envVarToCredentialName.set(envVar, connector.name);
+    }
+  }
+
+  // Resolve ONLY the referenced placeholders, name-based. Collect the typed
+  // credential names that own a referenced var, then resolve through
+  // `bindingsForCredentials` (which applies the configured + healthy guard so
+  // a disabled/never-probed credential contributes nothing). api-key env var ==
+  // credential name; oauth2 materializes each metadata.envMap entry.
+  const referencedNames = new Set<string>();
+  for (const envVar of referencedVars) {
+    const name = envVarToCredentialName.get(envVar);
+    if (name) referencedNames.add(name);
+  }
+  const credentialBindings = bindingsForCredentials(state, Array.from(referencedNames));
   const env: Record<string, string> = {};
-  for (const [envName, binding] of Object.entries(allBindings)) {
-    const providerModule = getProvider(binding.provider);
-    const hasProbe = Boolean(providerModule?.probe);
-    const match = state.connectors.find(
-      (c) =>
-        c.provider === binding.provider
-        && c.status === "configured"
-        && (c.health === "healthy" || (!hasProbe && c.health === "unknown"))
-    );
-    if (!match) continue;
-    const value = await resolveConnectorSecret(config, match.id, binding.purpose, taskId);
+  for (const [envName, binding] of Object.entries(credentialBindings)) {
+    if (!referencedVars.has(envName)) continue;
+    const value = await resolveConnectorSecret(config, binding.credentialId, binding.purpose, taskId);
     if (value) env[envName] = value;
   }
   // Build the resolution env per header: connector-bound vars come ONLY
@@ -213,12 +249,12 @@ export async function resolveMcpHeaders(
   // process.env so users can wire in non-secret values like
   // `MCP-Protocol-Version` by hand. The fallback never overrides a
   // connector-bound value because the env map shadows process.env for
-  // any name in `allBindings`.
+  // any claimed var.
   const resolved: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw)) {
-    const referencedVars = Array.from(value.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((m) => m[1] as string);
+    const headerVars = Array.from(value.matchAll(/\$\{([A-Z0-9_]+)\}/g)).map((m) => m[1] as string);
     let usedEnv: Record<string, string> = env;
-    const fallbackCandidates = referencedVars.filter((name) => !(name in allBindings));
+    const fallbackCandidates = headerVars.filter((name) => !claimedVars.has(name));
     if (fallbackCandidates.length > 0) {
       const fallback: Record<string, string> = {};
       for (const name of fallbackCandidates) {
