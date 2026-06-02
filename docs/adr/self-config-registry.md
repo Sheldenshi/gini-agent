@@ -78,14 +78,18 @@ is actually used.
   the op name and its args are top-level, so `dispatchSelfOp` carries them onto
   the approval payload and `executeApprovedAction` re-runs the handler from
   there.
-- The nine self tool names do not trip the `riskForTool` substring heuristic
+- The self tool names do not trip the `riskForTool` substring heuristic
   (none contain `write`/`exec`/`invoke`/`send`), so they correctly seed as
   `low` at the tool-name level; per-operation gating happens inside dispatch
   via `self.config`, not via the tool-name heuristic.
 
-Seed operations: `get_self`, `list_providers`, `list_agents`,
-`list_skills`, `list_mcp_servers`, `list_connectors` (`query`); `set_provider`,
-`use_agent`, `create_agent` (`mutate`).
+Seed operations:
+
+- `query` — `get_self`, `list_providers`, `list_agents`, `list_skills`,
+  `list_mcp_servers`, `list_connectors`, `list_toolsets`.
+- `mutate` — `set_provider`, `use_agent`, `create_agent`,
+  `set_approval_mode`, `enable_toolset`, `disable_toolset`, `delete_agent`,
+  `remove_provider`, `set_auto_approve_commands`, `set_dangerous_patterns`.
 
 ## Config vs Action
 

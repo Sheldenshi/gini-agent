@@ -1426,6 +1426,134 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: ["mode"]
       }
     }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List toolsets",
+    deferred: true,
+    indexSummary: "Instance toolsets with status (enabled/disabled), description, and the tools each gates.",
+    type: "function",
+    function: {
+      name: "list_toolsets",
+      description: "List the instance toolsets with id, name, status (enabled/disabled), description, and the tool names each gates. Read-only. Call before enable_toolset/disable_toolset.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Enable toolset",
+    deferred: true,
+    indexSummary: "Enable a toolset so its tools become available. Reversible via disable_toolset.",
+    type: "function",
+    function: {
+      name: "enable_toolset",
+      description: "Enable a toolset so its tools become available to agents on this instance. Call list_toolsets first for the name. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+        },
+        required: ["toolset"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Disable toolset",
+    deferred: true,
+    indexSummary: "Disable a toolset so its tools stop being offered. Self-config tools bypass gating, so this can't lock the agent out. Reversible via enable_toolset.",
+    type: "function",
+    function: {
+      name: "disable_toolset",
+      description: "Disable a toolset so its tools stop being offered to agents. Self-config tools bypass toolset gating, so this can't lock the agent out of its own config surface; reversible via enable_toolset. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+        },
+        required: ["toolset"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Delete agent",
+    deferred: true,
+    indexSummary: "Hard-delete an agent and its memory bank. Refuses the default and the active agent (switch first).",
+    type: "function",
+    function: {
+      name: "delete_agent",
+      description: "Hard-delete an agent and its per-agent memory bank. Refuses the default agent and the currently-active agent (switch via use_agent first). Call list_agents for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name to delete (e.g. 'agent_abc123' or 'athena')." }
+        },
+        required: ["agentId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove provider",
+    deferred: true,
+    indexSummary: "Disconnect an env-keyed LLM provider: scrub its API key. Falls back to codex/echo if it was active.",
+    type: "function",
+    function: {
+      name: "remove_provider",
+      description: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex and local cannot be removed this way. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek')." }
+        },
+        required: ["provider"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set auto-approve commands",
+    deferred: true,
+    indexSummary: "REPLACE the auto-approve command allowlist. Include existing entries (from get_self.approvalSettings) to keep them.",
+    type: "function",
+    function: {
+      name: "set_auto_approve_commands",
+      description: "REPLACE the auto-approve command allowlist (shell prefixes auto-approved without gating). This REPLACES the existing list — read get_self.approvalSettings.autoApproveCommands first and include any entries you want to keep. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          patterns: {
+            type: "array",
+            description: "The FULL allowlist of command prefixes to auto-approve. This REPLACES the existing list — include existing entries (visible via get_self.approvalSettings.autoApproveCommands) to keep them.",
+            items: { type: "string" }
+          }
+        },
+        required: ["patterns"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set dangerous patterns",
+    deferred: true,
+    indexSummary: "REPLACE the dangerous-terminal-pattern list. Include existing entries (from get_self.approvalSettings) to keep them.",
+    type: "function",
+    function: {
+      name: "set_dangerous_patterns",
+      description: "REPLACE the dangerous-terminal-pattern list (substrings that always force a gate even in auto). This REPLACES the existing list — read get_self.approvalSettings.dangerousTerminalPatterns first and include any entries you want to keep. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          patterns: {
+            type: "array",
+            description: "The FULL list of dangerous command substrings that always require approval. This REPLACES the existing list — include existing entries (visible via get_self.approvalSettings.dangerousTerminalPatterns) to keep them.",
+            items: { type: "string" }
+          }
+        },
+        required: ["patterns"]
+      }
+    }
   }
 ];
 
@@ -1906,6 +2034,7 @@ export function chatBlockArgsPreviewFor(
     case "list_agents":
     case "list_mcp_servers":
     case "list_connectors":
+    case "list_toolsets":
       return "";
     case "list_skills":
       return truncatePreview(previewValue(safe.nameContains) || previewValue(safe.status) || "");
@@ -1917,6 +2046,16 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.name));
     case "set_approval_mode":
       return truncatePreview(previewValue(safe.mode));
+    case "enable_toolset":
+    case "disable_toolset":
+      return truncatePreview(previewValue(safe.toolset));
+    case "delete_agent":
+      return truncatePreview(previewValue(safe.agentId));
+    case "remove_provider":
+      return truncatePreview(previewValue(safe.provider));
+    case "set_auto_approve_commands":
+    case "set_dangerous_patterns":
+      return truncatePreview(Array.isArray(safe.patterns) ? `${safe.patterns.length} patterns` : "");
     default: {
       // Generic fallback: key=value, ... for the first few entries.
       // Keeps unmapped or future tools from emitting an empty preview.

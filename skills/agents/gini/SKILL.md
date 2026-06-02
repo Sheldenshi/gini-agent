@@ -45,36 +45,77 @@ next:
    Do NOT wrap args in a `{ name, args }` envelope and do NOT pass a
    tool's arguments to `load_tools`.
 
-The self-config tools (load the ones you need):
+The self-config tools (load the ones you need), grouped by surface:
+
+Snapshot
 
 - `get_self` (query) — one-call snapshot: provider, model, active
-  agent, approval mode, instance, version, counts. Start here for broad
-  "what / who are you?" questions.
+  agent, approval mode, instance, version, counts, plus
+  `approvalSettings` (`approvalMode`, `autoApproveCommands`,
+  `dangerousTerminalPatterns`). Start here for broad
+  "what / who are you?" questions and before any approval-list replace.
+
+Toolsets
+
+- `list_toolsets` (query) — instance toolsets with status, description,
+  and the tools each gates. Use before enabling/disabling one.
+- `enable_toolset` (mutate) — turn a toolset on so its tools become
+  available.
+- `disable_toolset` (mutate) — turn a toolset off. Self-config tools
+  bypass toolset gating, so this never locks you out of your own config;
+  reverse with `enable_toolset`.
+
+Agents
+
+- `list_agents` (query) — agents + each agent's provider/model
+  override + the active id. Use before `use_agent` / `delete_agent`.
+- `use_agent` (mutate) — switch the active agent. Provider/model/
+  SOUL.md/toolset filter follow the new active row on the next turn.
+- `create_agent` (mutate) — create a new agent row. The new agent is
+  NOT activated; follow up with `use_agent`.
+- `delete_agent` (mutate) — hard-delete an agent and its memory bank.
+  Refuses the default and the active agent — switch away first.
+
+Providers
+
 - `list_providers` (query) — provider catalog with `configured` and
   `isActive` per row. Check a target here before `set_provider`.
-- `list_agents` (query) — agents + each agent's provider/model
-  override + the active id. Use before `use_agent`.
-- `list_skills` (query) — installed skills with status. Distinct from
-  `read_skill`, which fetches one skill's body.
-- `list_mcp_servers` (query) — registered MCP servers.
-- `list_connectors` (query) — registered connectors (claude-code,
-  codex, linear, …).
 - `set_provider` (mutate) — switch provider and/or model. Confirm the
   target is `configured: true` via `list_providers` first. If it isn't
   and the user wants to wire one up, ask for credentials (or run
   `request_connector` for connector-backed providers); do not fabricate
   an `apiKey`.
-- `use_agent` (mutate) — switch the active agent. Provider/model/
-  SOUL.md/toolset filter follow the new active row on the next turn.
-- `create_agent` (mutate) — create a new agent row. The new agent is
-  NOT activated; follow up with `use_agent`.
+- `remove_provider` (mutate) — disconnect an env-keyed provider (scrub
+  its key). Codex and local can't be removed this way.
+
+Approvals
+
 - `set_approval_mode` (mutate) — set the runtime approval mode (`strict`
   / `auto` / `yolo`). Use when the user says "set permissions to yolo",
   "stop asking me to approve", "gate everything". In `strict` this change
   itself requires approval.
+- `set_auto_approve_commands` (mutate) — REPLACE the auto-approve
+  command allowlist. Read `get_self.approvalSettings.autoApproveCommands`
+  first and include the entries you want to keep.
+- `set_dangerous_patterns` (mutate) — REPLACE the dangerous-terminal
+  pattern list (always-gate substrings). Same replace semantics — read
+  `get_self.approvalSettings.dangerousTerminalPatterns` first.
 
-Query tools resolve immediately; mutate tools (`set_provider`,
-`use_agent`, `create_agent`) may require user approval.
+MCP
+
+- `list_mcp_servers` (query) — registered MCP servers.
+
+Connectors
+
+- `list_connectors` (query) — registered connectors (claude-code,
+  codex, linear, …).
+
+Skills
+
+- `list_skills` (query) — installed skills with status. Distinct from
+  `read_skill`, which fetches one skill's body.
+
+Query tools resolve immediately; mutate tools may require user approval.
 
 ### Recipe — answering "what model are you using"
 
@@ -134,6 +175,24 @@ and `echo` — see `list_providers` for the full catalog.
    now", pass `{ status: "enabled" }`.
 2. Reply with names + brief descriptions. If the user asks for
    detail on one, call `read_skill` with that id.
+
+### Recipe — "disable browser tools"
+
+1. `load_tools({ names: ["list_toolsets", "disable_toolset"] })`, then
+   call `list_toolsets({})` to confirm the `browser` toolset name.
+2. Call `disable_toolset({ toolset: "browser" })`. The browser tools
+   stop being offered next turn; your self-config tools are unaffected.
+   Re-enable any time with `enable_toolset({ toolset: "browser" })`.
+
+### Recipe — "always auto-approve git commands"
+
+1. `load_tools({ names: ["get_self", "set_auto_approve_commands"] })`,
+   then call `get_self({})` and read
+   `approvalSettings.autoApproveCommands` — the current allowlist.
+2. `set_auto_approve_commands` REPLACES the list, so pass the existing
+   entries plus the new one:
+   `set_auto_approve_commands({ patterns: [...existing, "git "] })`.
+   Dropping the existing entries here would silently un-approve them.
 
 ## API and registered tools — not the CLI
 

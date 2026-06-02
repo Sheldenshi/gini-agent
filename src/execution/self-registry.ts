@@ -25,9 +25,10 @@ import type { ApprovalMode, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendTrace, mutateState, now, readState } from "../state";
 import { status as runtimeStatus, updateAutoApproveSettings } from "../runtime";
 import { providerCatalogWithStatus } from "../provider";
-import { setSetupProvider } from "../runtime/setup-api";
-import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability } from "../capabilities/agents";
+import { setSetupProvider, removeSetupProvider } from "../runtime/setup-api";
+import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, deleteAgent } from "../capabilities/agents";
 import { listSkills } from "../capabilities/skills";
+import { listToolsets, setToolsetStatus } from "../capabilities/toolsets";
 
 export interface SelfOperation {
   name: string;
@@ -100,6 +101,11 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
     port: snapshot.port,
     version: snapshot.version,
     approvalMode: config.approvalMode ?? "auto",
+    approvalSettings: {
+      approvalMode: config.approvalMode ?? "auto",
+      autoApproveCommands: config.autoApproveCommands ?? [],
+      dangerousTerminalPatterns: config.dangerousTerminalPatterns ?? []
+    },
     provider: snapshot.provider,
     activeAgent: snapshot.activeAgent,
     counts
@@ -387,6 +393,166 @@ async function createAgent(
   }
 }
 
+async function listToolsetsOp(config: RuntimeConfig, taskId: string): Promise<string> {
+  const { toolsets } = listToolsets(config);
+  const summary = toolsets.map((toolset) => ({
+    id: toolset.id,
+    name: toolset.name,
+    status: toolset.status,
+    description: toolset.description ?? "",
+    toolNames: toolset.toolNames
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed toolsets",
+    data: { count: summary.length }
+  });
+  await recordLowRiskAudit(config, taskId, "toolset.listed", "toolsets", { count: summary.length });
+  return JSON.stringify({ ok: true, toolsets: summary });
+}
+
+async function enableToolset(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.toolset === "string" ? args.toolset.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "enable_toolset requires a 'toolset' (name or id)." });
+  }
+  try {
+    const toolset = await setToolsetStatus(config, name, "enabled");
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Enabled toolset",
+      data: { toolset: toolset.name }
+    });
+    await recordLowRiskAudit(config, taskId, "toolset.enabled", toolset.name, { status: toolset.status });
+    return JSON.stringify({ ok: true, toolset: toolset.name, status: toolset.status });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function disableToolset(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.toolset === "string" ? args.toolset.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "disable_toolset requires a 'toolset' (name or id)." });
+  }
+  try {
+    const toolset = await setToolsetStatus(config, name, "disabled");
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Disabled toolset",
+      data: { toolset: toolset.name }
+    });
+    await recordLowRiskAudit(config, taskId, "toolset.disabled", toolset.name, { status: toolset.status });
+    return JSON.stringify({ ok: true, toolset: toolset.name, status: toolset.status });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function deleteAgentOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.agentId === "string" ? args.agentId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "delete_agent requires an 'agentId' (id or name)." });
+  }
+  try {
+    const result = await deleteAgent(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Deleted agent",
+      data: { agentId: result.id, unitsDeleted: result.unitsDeleted }
+    });
+    await recordLowRiskAudit(config, taskId, "agent.deleted", result.id, {
+      unitsDeleted: result.unitsDeleted,
+      bankDeleted: result.bankDeleted
+    });
+    return JSON.stringify({
+      ok: true,
+      agentId: result.id,
+      unitsDeleted: result.unitsDeleted,
+      bankDeleted: result.bankDeleted
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function removeProvider(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const provider = typeof args.provider === "string" ? args.provider.trim() : "";
+  if (!provider) {
+    return JSON.stringify({ ok: false, error: "remove_provider requires a 'provider' name." });
+  }
+  const result = removeSetupProvider(config, provider);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: result.ok ? "Removed provider" : "Provider removal failed",
+    data: { provider, ok: result.ok, switched: result.switched, error: result.error }
+  });
+  await recordLowRiskAudit(config, taskId, "provider.removed", provider, {
+    ok: result.ok,
+    switched: result.switched,
+    error: result.error
+  });
+  return JSON.stringify({ ok: result.ok, switched: result.switched, error: result.error });
+}
+
+async function setAutoApproveCommands(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  if (!Array.isArray(args.patterns)) {
+    return JSON.stringify({ ok: false, error: "set_auto_approve_commands requires 'patterns' to be an array of strings." });
+  }
+  const patterns = args.patterns.filter((p): p is string => typeof p === "string");
+  const result = updateAutoApproveSettings(config, { patterns });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Set auto-approve commands",
+    data: { count: result.patterns.length }
+  });
+  await recordLowRiskAudit(config, taskId, "auto_approve_commands.set", "auto_approve_commands", {
+    count: result.patterns.length
+  });
+  return JSON.stringify({ ok: true, autoApproveCommands: result.patterns });
+}
+
+async function setDangerousPatterns(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  if (!Array.isArray(args.patterns)) {
+    return JSON.stringify({ ok: false, error: "set_dangerous_patterns requires 'patterns' to be an array of strings." });
+  }
+  const patterns = args.patterns.filter((p): p is string => typeof p === "string");
+  const result = updateAutoApproveSettings(config, { dangerousTerminalPatterns: patterns });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Set dangerous terminal patterns",
+    data: { count: result.dangerousTerminalPatterns.length }
+  });
+  await recordLowRiskAudit(config, taskId, "dangerous_patterns.set", "dangerous_patterns", {
+    count: result.dangerousTerminalPatterns.length
+  });
+  return JSON.stringify({ ok: true, dangerousTerminalPatterns: result.dangerousTerminalPatterns });
+}
+
 // ---------------- Registry ----------------
 
 export const SELF_OPERATIONS: SelfOperation[] = [
@@ -507,6 +673,99 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       required: ["mode"]
     },
     handler: (config, taskId, args) => setApprovalMode(config, taskId, args)
+  },
+  {
+    name: "list_toolsets",
+    summary: "Instance toolsets with id, name, status (enabled/disabled), description, and the tool names each gates.",
+    tag: "query",
+    schema: { type: "object", properties: {} },
+    handler: (config, taskId) => listToolsetsOp(config, taskId)
+  },
+  {
+    name: "enable_toolset",
+    summary: "Enable a toolset so its tools become available to agents on this instance. Reversible via disable_toolset.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+      },
+      required: ["toolset"]
+    },
+    handler: (config, taskId, args) => enableToolset(config, taskId, args)
+  },
+  {
+    name: "disable_toolset",
+    summary: "Disable a toolset so its tools stop being offered to agents. Self-config tools bypass toolset gating, so this can't lock the agent out of its own config surface. Reversible via enable_toolset.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+      },
+      required: ["toolset"]
+    },
+    handler: (config, taskId, args) => disableToolset(config, taskId, args)
+  },
+  {
+    name: "delete_agent",
+    summary: "Hard-delete an agent and its per-agent memory bank. Refuses the default agent and the currently-active agent (switch first via use_agent).",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        agentId: { type: "string", description: "Agent id or name to delete (e.g. 'agent_abc123' or 'athena')." }
+      },
+      required: ["agentId"]
+    },
+    handler: (config, taskId, args) => deleteAgentOp(config, taskId, args)
+  },
+  {
+    name: "remove_provider",
+    summary: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex/local aren't removable this way.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek'). Codex and local cannot be removed here." }
+      },
+      required: ["provider"]
+    },
+    handler: (config, taskId, args) => removeProvider(config, taskId, args)
+  },
+  {
+    name: "set_auto_approve_commands",
+    summary: "REPLACE the auto-approve command allowlist (shell prefixes auto-approved without gating). Include existing entries (visible via get_self.approvalSettings.autoApproveCommands) to keep them.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        patterns: {
+          type: "array",
+          description: "The FULL allowlist of command prefixes to auto-approve. This REPLACES the existing list — read get_self.approvalSettings.autoApproveCommands first and include any entries you want to keep.",
+          items: { type: "string" }
+        }
+      },
+      required: ["patterns"]
+    },
+    handler: (config, taskId, args) => setAutoApproveCommands(config, taskId, args)
+  },
+  {
+    name: "set_dangerous_patterns",
+    summary: "REPLACE the dangerous-terminal-pattern list (substrings that always force a gate even in auto). Include existing entries (visible via get_self.approvalSettings.dangerousTerminalPatterns) to keep them.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        patterns: {
+          type: "array",
+          description: "The FULL list of dangerous command substrings that always require approval. This REPLACES the existing list — read get_self.approvalSettings.dangerousTerminalPatterns first and include any entries you want to keep.",
+          items: { type: "string" }
+        }
+      },
+      required: ["patterns"]
+    },
+    handler: (config, taskId, args) => setDangerousPatterns(config, taskId, args)
   }
 ];
 

@@ -149,7 +149,14 @@ const SELF_TOOLS = [
   "set_provider",
   "use_agent",
   "create_agent",
-  "set_approval_mode"
+  "set_approval_mode",
+  "list_toolsets",
+  "enable_toolset",
+  "disable_toolset",
+  "delete_agent",
+  "remove_provider",
+  "set_auto_approve_commands",
+  "set_dangerous_patterns"
 ];
 
 describe("buildToolCatalog", () => {
