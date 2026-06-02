@@ -36,7 +36,8 @@ import {
   listChatSessions,
   submitChatMessage,
   syncChatTaskResult,
-  createChat
+  createChat,
+  deleteChat
 } from "./chat";
 import type { Authorization, RuntimeConfig, SetupRequest, Task } from "../types";
 
@@ -543,6 +544,42 @@ describe("chat session waiting-approval placeholder", () => {
           audio: { id: ref.id, mimeType: ref.mimeType, size: ref.size, durationMs: 800 }
         })
       ).rejects.toThrow(/No speech detected/);
+
+      const stateNow = readState(config.instance);
+      expect(stateNow.tasks).toHaveLength(0);
+      expect(stateNow.chatMessages).toHaveLength(0);
+      expect(listChatBlocks(config.instance, session.id)).toHaveLength(0);
+    } finally {
+      delete process.env.GINI_STT_PROVIDER;
+      __setTransformersLoaderForTests(null);
+    }
+  });
+
+  test("rejects a voice message whose session is deleted during transcription, creating no task or block", async () => {
+    const config = buildConfig(workspaceRoot, "chat-voice-deleted-mid-stt");
+
+    const session = await createChat(config, { title: "voice-deleted" });
+
+    // Transcription can run a long time (the first voice message downloads
+    // the model); the chat can be deleted in that window. Simulate it by
+    // deleting the session from inside the transcriber await, then assert the
+    // submit rejects and lands nothing for the gone session.
+    process.env.GINI_STT_PROVIDER = "local";
+    __setTransformersLoaderForTests(async () => ({
+      env: {},
+      pipeline: async () => async () => {
+        await deleteChat(config, session.id);
+        return { text: "hello there" };
+      }
+    }));
+    try {
+      const ref = storeUpload(config.instance, makeWav([0, 1, -1]), "audio/wav", "voice.wav");
+      await expect(
+        submitChatMessage(config, session.id, {
+          content: "",
+          audio: { id: ref.id, mimeType: ref.mimeType, size: ref.size, durationMs: 900 }
+        })
+      ).rejects.toThrow(/Chat session not found/);
 
       const stateNow = readState(config.instance);
       expect(stateNow.tasks).toHaveLength(0);

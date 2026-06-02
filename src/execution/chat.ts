@@ -295,6 +295,14 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       audio ? "No speech detected in the voice message." : "Chat message content is required."
     );
   }
+  // Re-validate the session: transcription above can run a long time (the
+  // first voice message downloads the model), and the chat may have been
+  // deleted during that window. Re-read so a delete-during-transcription
+  // can't create a run/task/block for a gone session or attribute work to a
+  // stale record.
+  const liveState = readState(config.instance);
+  const liveSession = liveState.chatSessions.find((item) => item.id === sessionId);
+  if (!liveSession) throw new Error(`Chat session not found: ${sessionId}`);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
@@ -304,7 +312,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     runId: run.id,
     mode: "chat",
     chatSessionId: sessionId,
-    agentId: session.agentId,
+    agentId: liveSession.agentId,
     ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);
@@ -338,7 +346,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       text: content,
       taskId: task.id,
       runId: run.id,
-      agentId: session.agentId ?? null,
+      agentId: liveSession.agentId ?? null,
       ...(images.length > 0 ? { images } : {}),
       ...(audio ? { audio } : {})
     });
