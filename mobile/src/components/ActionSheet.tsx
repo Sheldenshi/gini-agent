@@ -88,6 +88,10 @@ export function ActionSheet({
   // yet — i.e. we're waiting on the first `onLayout` to learn the height.
   // Lets `onLayout` start the entrance exactly once per open.
   const enteringRef = useRef(false);
+  // The animation currently in flight (entrance or exit), wherever it was
+  // started — including the deferred entrance kicked off from `onLayout`.
+  // The effect cleanup stops it on unmount or when `visible` changes.
+  const animRef = useRef<Animated.CompositeAnimation | null>(null);
 
   useEffect(() => {
     if (visible) {
@@ -100,19 +104,24 @@ export function ActionSheet({
       if (sheetHeight.current > 0) {
         // Re-open: height is already known, run the entrance now.
         enteringRef.current = false;
-        const anim = startEntrance(translateY, opacity, sheetHeight.current);
-        return () => {
-          anim.stop();
-        };
+        animRef.current = startEntrance(translateY, opacity, sheetHeight.current);
+      } else {
+        // First open: defer the entrance to `onLayout`, once we know the height.
+        enteringRef.current = true;
       }
-      // First open: defer the entrance to `onLayout`, once we know the height.
-      enteringRef.current = true;
-      return;
+      // Stop whatever animation is in flight on unmount or when `visible`
+      // changes — covers the re-open entrance above and the deferred
+      // entrance that `onLayout` starts on first open.
+      return () => {
+        animRef.current?.stop();
+      };
     }
     enteringRef.current = false;
     // Nothing is mounted (e.g. the initial render with visible=false), so
     // skip the exit animation — there's no rendered sheet to slide away.
-    if (!mountedRef.current) return;
+    if (!mountedRef.current) return () => {
+      animRef.current?.stop();
+    };
     const anim = Animated.parallel([
       Animated.timing(translateY, {
         toValue: sheetHeight.current || FALLBACK_OFFSCREEN,
@@ -125,11 +134,12 @@ export function ActionSheet({
         useNativeDriver: USE_NATIVE_DRIVER
       })
     ]);
+    animRef.current = anim;
     anim.start(({ finished }) => {
       if (finished) setMounted(false);
     });
     return () => {
-      anim.stop();
+      animRef.current?.stop();
     };
   }, [visible, translateY, opacity]);
 
@@ -161,7 +171,7 @@ export function ActionSheet({
             // Start it now, exactly once, from the measured height.
             if (enteringRef.current) {
               enteringRef.current = false;
-              startEntrance(translateY, opacity, height);
+              animRef.current = startEntrance(translateY, opacity, height);
             }
           }}
           style={[
