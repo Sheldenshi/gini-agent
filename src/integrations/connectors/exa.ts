@@ -49,12 +49,11 @@ export const exaProvider: ProviderModule = {
   id: "exa",
   label: "Exa",
   description: "Neural web search + content extraction via Exa (https://exa.ai). Paid; free trial credits available.",
-  docsUrl: "https://github.com/Lilac-Labs/gini-agent/blob/main/docs/search/exa.md",
+  docsUrl: "https://gini.lilaclabs.ai/docs/search/exa",
   fields: [
     {
       name: "token",
       label: "API key",
-      description: "Your Exa API key.",
       secret: true,
       required: true,
       placeholder: "exa_…"

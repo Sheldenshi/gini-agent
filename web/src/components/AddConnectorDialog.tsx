@@ -200,7 +200,7 @@ export function AddConnectorDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className={mode === "request" ? "sm:max-w-md" : undefined}>
         <DialogHeader>
           <DialogTitle>
             {mode === "rotate"
@@ -253,21 +253,33 @@ export function AddConnectorDialog({
                   onChange={(e) => setFieldValues((prev) => ({ ...prev, [field.name]: e.target.value }))}
                   placeholder={field.placeholder}
                   autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
+                  className={field.secret ? "font-mono" : undefined}
                 />
-                {field.description ? <p className="text-[11px] text-muted-foreground">{field.description}</p> : null}
+                {field.description && !selectedProvider?.docsUrl ? (
+                  <p className="text-[11px] text-muted-foreground">{field.description}</p>
+                ) : null}
               </div>
             ))
           )}
 
           {selectedProvider?.docsUrl ? (
-            <a
-              href={selectedProvider.docsUrl}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-block text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
-            >
-              Learn more
-            </a>
+            <p className="text-[11px] text-muted-foreground">
+              Learn more at{" "}
+              <a
+                href={selectedProvider.docsUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="underline underline-offset-2 hover:text-foreground"
+              >
+                {selectedProvider.docsUrl.replace(/^https?:\/\//, "")}
+              </a>
+            </p>
           ) : null}
 
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
