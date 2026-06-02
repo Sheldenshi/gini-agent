@@ -3679,7 +3679,7 @@ describe("runtime api", () => {
       expect(dump.userProfile.budget.overCap).toBe(false);
       // INSTRUCTIONS.md is materialized by scaffold; the route returns
       // its content trimmed.
-      expect(dump.instructions.content).toMatch(/running on the gini-agent framework/);
+      expect(dump.instructions.content).toMatch(/You are a personal agent\./);
     });
 
     test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
