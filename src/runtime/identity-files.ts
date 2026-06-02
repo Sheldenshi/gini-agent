@@ -36,7 +36,7 @@ import {
 import { basename, dirname, join } from "node:path";
 import { instanceRoot } from "../paths";
 import { appendLog } from "../state/trace";
-import { DEFAULT_INSTRUCTIONS_PATH } from "../system-prompt";
+import { DEFAULT_INSTRUCTIONS_PATH, sanitizeAgentName } from "../system-prompt";
 import type { Instance } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -94,12 +94,13 @@ export function soulHistoryDir(instance: Instance, agentId: string): string {
 // `src/runtime/defaults/INSTRUCTIONS.md` so a user opening the file has a
 // working preamble to edit against; the seed has no header comment or
 // other meta text because any byte in the file goes verbatim into the
-// system prompt. USER.md and per-agent SOUL.md stay zero-byte — no
-// defaults exist for them.
+// system prompt. USER.md stays zero-byte — no default exists for it.
+// Per-agent SOUL.md is seeded with `Your name is <name>.` so a new agent
+// self-identifies by its own name (see `seedAgentSoulFile`).
 //
 // Reads still go through the load-and-scan helpers, which treat a zero-byte
 // (or whitespace-only) file as absent and fall back to defaults — so a
-// zero-byte USER.md or SOUL.md does not change prompt behavior.
+// zero-byte USER.md does not change prompt behavior.
 //
 // Filesystem errors on the user-instance write side are swallowed and
 // logged through `appendLog` (a permission glitch on the instance dir
@@ -222,19 +223,89 @@ export function scaffoldInstanceIdentityFiles(instance: Instance): ScaffoldInsta
   return { created };
 }
 
+// First-line identity sentences shipped by earlier bundled defaults.
+// Existing instances seeded INSTRUCTIONS.md first-write-wins, so they keep
+// one of these on disk even after the bundled default changed — and that
+// on-disk file overrides the bundled default at load time. The agent's
+// name now lives in its SOUL.md, so the shared operating-rules file must
+// not carry a name (a stale "You are Gini, a personal agent." otherwise
+// bleeds into a non-default agent's self-description as "your Gini ...").
+const LEGACY_INSTRUCTIONS_IDENTITY_LINES = new Set<string>([
+  "You are Gini, a personal agent.",
+  "You are a personal assistant running on the gini-agent framework.",
+  "You are a personal agent."
+]);
+const CURRENT_INSTRUCTIONS_IDENTITY_LINE = "You are a personal agent running on the gini-agent framework.";
+
+// One-time, per-boot migration: when the on-disk INSTRUCTIONS.md leads with
+// a known legacy identity sentence, rewrite ONLY that first line to the
+// current generic preamble and leave the rest of the file (any user edits)
+// intact. Idempotent — the current line isn't in the legacy set — and
+// best-effort. A user who replaced the first line with their own wording
+// is left untouched. Returns true when it rewrote the file.
+export function migrateInstructionsIdentityLine(instance: Instance): boolean {
+  const path = instructionsPath(instance);
+  if (!existsSync(path)) return false;
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return false;
+  }
+  const newlineIdx = raw.indexOf("\n");
+  // trimEnd drops a trailing \r so a CRLF file still matches.
+  const firstLine = (newlineIdx === -1 ? raw : raw.slice(0, newlineIdx)).trimEnd();
+  if (!LEGACY_INSTRUCTIONS_IDENTITY_LINES.has(firstLine)) return false;
+  const rest = newlineIdx === -1 ? "" : raw.slice(newlineIdx);
+  try {
+    writeFileSafe(path, `${CURRENT_INSTRUCTIONS_IDENTITY_LINE}${rest}`);
+    return true;
+  } catch (error) {
+    try {
+      appendLog(instance, "identity.migrate.error", {
+        file: "INSTRUCTIONS.md",
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Best-effort — see scaffoldInstanceIdentityFiles.
+    }
+    return false;
+  }
+}
+
 export interface ScaffoldAgentResult {
   created: string | null;
 }
 
-// Touch agents/<agentId>/SOUL.md at the instance root if absent. Never
-// overwrites. Returns the created path or null when the file already
-// existed (or the touch failed and was logged).
-export function scaffoldAgentSoulFile(instance: Instance, agentId: string): ScaffoldAgentResult {
+// Seed agents/<agentId>/SOUL.md with `Your name is <name>.` so a freshly
+// created agent self-identifies by its own name (INSTRUCTIONS.md is
+// generic — it carries no name). The name lives in SOUL.md, the per-agent
+// "about the agent" file, so it flows through the same load→scan→budget
+// pipeline as any other persona content. See ADR runtime-identity-files.md.
+//
+// Guards:
+//   - No-op when the name sanitizes to empty (never write "Your name is .").
+//   - NEVER clobber an existing SOUL — only seeds when the file is absent
+//     or empty/whitespace-only (e.g. the legacy zero-byte scaffold). A
+//     user/agent-authored body is left untouched.
+//
+// Best-effort: a per-instance filesystem error is swallowed and logged
+// via `appendLog`; the load path tolerates a missing SOUL. Returns the
+// seeded path or null (already populated, empty name, or write failed).
+//
+// The only callers are `createAgent` (a brand-new agent — no SOUL author
+// can exist yet) and the `install()` boot loop (runs before the gateway
+// serves traffic, so no `edit_soul` write is in flight). Even so, the
+// absent-file path creates atomically (O_CREAT|O_EXCL) so a racing writer
+// is never clobbered, and an unreadable existing file is left untouched
+// rather than treated as empty.
+export function seedAgentSoulFile(instance: Instance, agentId: string, name: string | undefined): ScaffoldAgentResult {
+  const clean = sanitizeAgentName(name);
+  if (!clean) return { created: null };
   const path = soulPath(instance, agentId);
-  try {
-    if (touchIfMissing(path)) return { created: path };
-    return { created: null };
-  } catch (error) {
+  const seed = `Your name is ${clean}.`;
+  const logError = (error: unknown): void => {
     try {
       appendLog(instance, "identity.scaffold.error", {
         file: "SOUL.md",
@@ -245,7 +316,92 @@ export function scaffoldAgentSoulFile(instance: Instance, agentId: string): Scaf
     } catch {
       // See scaffoldInstanceIdentityFiles — best-effort logging only.
     }
+  };
+  if (!existsSync(path)) {
+    // Absent: atomic create. If a writer wins the race the file now exists
+    // with their content (EEXIST) — leave it rather than clobber.
+    try {
+      ensureDir(dirname(path));
+      const fd = openSync(path, "wx");
+      try {
+        writeFileSync(fd, seed);
+      } finally {
+        closeSync(fd);
+      }
+      return { created: path };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === "EEXIST") return { created: null };
+      logError(error);
+      return { created: null };
+    }
+  }
+  // File exists: only reseed a genuinely empty/whitespace body (the legacy
+  // zero-byte scaffold). An unreadable file is treated as "has content" —
+  // never overwrite a SOUL we cannot inspect.
+  let body: string;
+  try {
+    body = readFileSync(path, "utf8");
+  } catch {
     return { created: null };
+  }
+  if (body.trim().length > 0) return { created: null };
+  try {
+    writeFileSync(path, seed);
+    return { created: path };
+  } catch (error) {
+    logError(error);
+    return { created: null };
+  }
+}
+
+// Keep the seeded SOUL.md name line in sync when an agent is renamed. The
+// name lives both in `AgentRecord.name` (the authoritative label) and in
+// the per-agent SOUL.md seed line `Your name is <name>.`. A rename rewrites
+// the SOUL line ONLY when the file is EXACTLY the untouched seed for the
+// old name — the same never-clobber rule `seedAgentSoulFile` enforces. A
+// SOUL the user/agent has customized (any other content) is left alone; the
+// model/operator owns updating the name reference inside a real persona.
+//
+// Best-effort: an absent file, an empty new name, or a customized body all
+// return false (nothing rewritten); a filesystem error is swallowed and
+// logged via `appendLog`. Returns true only when it rewrote the seed line.
+export function renameSeededSoulName(
+  instance: Instance,
+  agentId: string,
+  oldName: string | undefined,
+  newName: string | undefined
+): boolean {
+  const path = soulPath(instance, agentId);
+  if (!existsSync(path)) return false;
+  const cleanOld = sanitizeAgentName(oldName);
+  const cleanNew = sanitizeAgentName(newName);
+  if (!cleanNew) return false;
+  const logError = (error: unknown): void => {
+    try {
+      appendLog(instance, "identity.rename.error", {
+        file: "SOUL.md",
+        agentId,
+        path,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    } catch {
+      // Best-effort — see seedAgentSoulFile.
+    }
+  };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    logError(error);
+    return false;
+  }
+  if (raw.trim() !== `Your name is ${cleanOld}.`) return false;
+  try {
+    writeFileSafe(path, `Your name is ${cleanNew}.`);
+    return true;
+  } catch (error) {
+    logError(error);
+    return false;
   }
 }
 
@@ -938,5 +1094,30 @@ export function previewRemoveUserProfileSection(
   const { changed, result } = dropParagraphContaining(raw, needle);
   if (!changed) return { ok: false, reason: "no match" };
   const scan = scanForInjection(result, "USER.md");
+  return { ok: true, scanFindings: scan.findings, nextBody: result };
+}
+
+// Preview a remove against the active agent's SOUL.md without writing.
+// Same role as previewRemoveUserProfileSection: lets the dispatch layer
+// route a hostile residue body through the propose-gate instead of
+// auto-approving. Never touches disk.
+export function previewRemoveSoulSection(
+  instance: Instance,
+  agentId: string,
+  needle: string
+):
+  | { ok: true; scanFindings: string[]; nextBody: string }
+  | { ok: false; reason: "no source" | "no match" } {
+  const approvedPath = soulPath(instance, agentId);
+  if (!existsSync(approvedPath)) return { ok: false, reason: "no source" };
+  let raw: string;
+  try {
+    raw = readFileSync(approvedPath, "utf8");
+  } catch {
+    return { ok: false, reason: "no source" };
+  }
+  const { changed, result } = dropParagraphContaining(raw, needle);
+  if (!changed) return { ok: false, reason: "no match" };
+  const scan = scanForInjection(result, "SOUL.md");
   return { ok: true, scanFindings: scan.findings, nextBody: result };
 }

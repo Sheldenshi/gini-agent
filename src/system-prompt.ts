@@ -169,6 +169,16 @@ export function identityBudgetState(
 // The legacy "Pinned memories about this user" block was removed when
 // `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
 // See ADR runtime-identity-files.md.
+// Agent names flow into the system prompt (the runtime-identity block's
+// "- agent: <name>" line and the per-agent SOUL.md seed), so they must
+// stay a single-line label. Collapse every whitespace run (incl. embedded
+// \n/\r/\t) to a single space and trim. Returns undefined when nothing
+// is left, so callers can fall back. "Gini" is unchanged → byte-identical.
+export function sanitizeAgentName(name: string | undefined): string | undefined {
+  const collapsed = name?.replace(/\s+/g, " ").trim();
+  return collapsed && collapsed.length > 0 ? collapsed : undefined;
+}
+
 export function buildAgentSystemContext(options?: AgentSystemContextOptions): string {
   const instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
     ? options.instructionsOverride

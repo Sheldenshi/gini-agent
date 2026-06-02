@@ -47,8 +47,8 @@ async function newTask(config: RuntimeConfig): Promise<string> {
 }
 
 describe("self operation registry", () => {
-  test("SELF_OPERATIONS carries the 24 expected ops with name, summary, tag, handler", () => {
-    expect(SELF_OPERATIONS.length).toBe(24);
+  test("SELF_OPERATIONS carries the 25 expected ops with name, summary, tag, handler", () => {
+    expect(SELF_OPERATIONS.length).toBe(25);
     for (const op of SELF_OPERATIONS) {
       expect(typeof op.name).toBe("string");
       expect(op.name.length).toBeGreaterThan(0);
@@ -74,6 +74,7 @@ describe("self operation registry", () => {
       "remove_connector",
       "remove_mcp_server",
       "remove_provider",
+      "rename_agent",
       "rollback_skill",
       "rotate_connector",
       "set_approval_mode",
@@ -107,6 +108,7 @@ describe("self operation registry", () => {
       "remove_connector",
       "remove_mcp_server",
       "remove_provider",
+      "rename_agent",
       "rollback_skill",
       "rotate_connector",
       "set_approval_mode",

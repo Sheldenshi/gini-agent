@@ -40,6 +40,7 @@ import {
   dedupeAppendLines,
   loadSoul,
   loadUserProfile,
+  previewRemoveSoulSection,
   previewRemoveUserProfileSection,
   removeSoulSection,
   removeUserProfileSection,
@@ -244,6 +245,7 @@ export async function dispatchToolCall(
     case "set_provider":
     case "use_agent":
     case "create_agent":
+    case "rename_agent":
     case "set_approval_mode":
     case "enable_toolset":
     case "disable_toolset":
@@ -1740,13 +1742,13 @@ async function recallMemoryTool(
   });
 }
 
-// Propose an edit to the active agent's SOUL.md. The body always lands
-// as SOUL.md.proposed; the user approves via the identity-files
-// approval API before the new content rides the next system prompt.
-// `set` replaces the body; `append` layers a new section under the
-// existing approved body; `remove` drops the first paragraph containing
-// a substring (`needle`) from the existing approved body. All three
-// route through the same propose-vs-approve gate.
+// Edit the active agent's SOUL.md. Same flow as edit_user_profile:
+// a clean body auto-approves (lands at SOUL.md, effective on the next
+// system prompt); an injection-flagged body routes to SOUL.md.proposed
+// and stays out of the prompt until the user approves it. `set` replaces
+// the body; `append` layers a new section under the existing approved
+// body; `remove` drops the first paragraph containing a substring
+// (`needle`) from the existing approved body.
 // See ADR runtime-identity-files.md.
 async function editSoulTool(
   config: RuntimeConfig,
@@ -1765,26 +1767,45 @@ async function editSoulTool(
   }
   if (action === "remove") {
     const needle = requireString(args, "needle");
-    const removeResult = removeSoulSection(config.instance, agentId, needle, "proposed");
-    if (!removeResult.ok) {
+    // Pre-scan the post-remove body so a hostile pattern that survives
+    // the deletion still routes through the propose path. Without the
+    // pre-scan a remove against a file whose remaining paragraphs trip
+    // the scanner would auto-approve a tainted body.
+    const preview = previewRemoveSoulSection(config.instance, agentId, needle);
+    if (!preview.ok) {
       // No mutation hit disk — surface a clean failure to the model so
       // it can retry with a different needle instead of assuming the
-      // proposal landed. We deliberately do NOT throw: an invalid input
+      // edit landed. We deliberately do NOT throw: an invalid input
       // should leave the conversation intact.
+      const reason = preview.reason === "no source"
+        ? "no approved SOUL.md exists to remove from"
+        : `no paragraph matched needle "${needle}"`;
+      return `Could not remove SOUL.md section: ${reason}.`;
+    }
+    const targetStatus: IdentityFileStatus = preview.scanFindings.length > 0 ? "proposed" : "approved";
+    const removeResult = removeSoulSection(config.instance, agentId, needle, targetStatus);
+    if (!removeResult.ok) {
+      // The pre-scan already confirmed there is a source and a match — a
+      // fall-through here is only reachable on a concurrent filesystem
+      // race; surface the same clean failure shape.
       const reason = removeResult.reason === "no source"
         ? "no approved SOUL.md exists to remove from"
         : `no paragraph matched needle "${needle}"`;
       return `Could not remove SOUL.md section: ${reason}.`;
     }
+    const autoApproved = removeResult.status === "approved";
+    const auditAction = autoApproved
+      ? "identity.soul.approved"
+      : "identity.soul.proposed";
     await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
       addAudit(
         state,
         {
           actor: "agent",
-          action: "identity.soul.proposed",
+          action: auditAction,
           target: removeResult.path,
-          risk: "low",
+          risk: autoApproved ? "low" : "medium",
           taskId: item.id,
           runId: item.runId,
           evidence: {
@@ -1792,7 +1813,8 @@ async function editSoulTool(
             action,
             needle,
             path: removeResult.path,
-            scanFindings: removeResult.scanFindings
+            scanFindings: removeResult.scanFindings,
+            autoApproved
           }
         },
         { taskId: item.id }
@@ -1801,16 +1823,21 @@ async function editSoulTool(
     });
     appendTrace(config.instance, taskId, {
       type: "model",
-      message: "Proposed SOUL.md remove",
-      data: { agentId, action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings }
+      message: autoApproved
+        ? "SOUL.md remove (auto-approved)"
+        : "SOUL.md remove blocked from prompt (proposed)",
+      data: { agentId, action, needle, path: removeResult.path, scanFindings: removeResult.scanFindings, autoApproved }
     });
-    return `Proposed SOUL.md edit at ${removeResult.path} (removed paragraph matching "${needle}"). Awaiting user approval via POST /api/identity-files/soul/approve.`;
+    if (!autoApproved) {
+      const scanNote = ` (scan flagged: ${removeResult.scanFindings.join(", ")}; content blocked from prompt until approved)`;
+      return `Proposed SOUL.md remove at ${removeResult.path}${scanNote}. Awaiting user approval via POST /api/identity-files/soul/approve.`;
+    }
+    return `Updated SOUL.md at ${removeResult.path} (removed paragraph matching "${needle}").`;
   }
   const content = requireString(args, "content");
-  // For 'append', the new proposal carries the existing approved body
+  // For 'append', the new body carries the existing approved body
   // followed by a blank line and the new content. The approved file
-  // stays the source of truth — proposals are not chained on top of
-  // earlier unapproved proposals. Lines from `content` that already
+  // stays the source of truth. Lines from `content` that already
   // exist verbatim in the existing body are dropped so a model that
   // re-emits the current file alongside the new fact doesn't duplicate.
   let body = content;
@@ -1851,16 +1878,26 @@ async function editSoulTool(
       body = `${existing.trim()}\n\n${dedupe.residual}`;
     }
   }
-  const result = writeSoul(config.instance, agentId, body, "proposed");
+  // Pre-scan the proposed body. When the scan flags a threat the write
+  // is routed to `.proposed` so a hostile body never lands at the
+  // approved path. Only clean bodies auto-approve. See ADR
+  // runtime-identity-files.md.
+  const previewScan = scanForInjection(body, "SOUL.md");
+  const targetStatus: IdentityFileStatus = previewScan.findings.length > 0 ? "proposed" : "approved";
+  const result = writeSoul(config.instance, agentId, body, targetStatus);
+  const autoApproved = result.status === "approved";
+  const auditAction = autoApproved
+    ? "identity.soul.approved"
+    : "identity.soul.proposed";
   await mutateState(config.instance, (state) => {
     const item = findTask(state, taskId);
     addAudit(
       state,
       {
         actor: "agent",
-        action: "identity.soul.proposed",
+        action: auditAction,
         target: result.path,
-        risk: "low",
+        risk: autoApproved ? "low" : "medium",
         taskId: item.id,
         runId: item.runId,
         evidence: {
@@ -1869,6 +1906,7 @@ async function editSoulTool(
           path: result.path,
           contentBytes: body.length,
           scanFindings: result.scanFindings,
+          autoApproved,
           ...(appendDedupeDropped > 0 ? { droppedLineCount: appendDedupeDropped } : {})
         }
       },
@@ -1878,13 +1916,16 @@ async function editSoulTool(
   });
   appendTrace(config.instance, taskId, {
     type: "model",
-    message: "Proposed SOUL.md edit",
-    data: { agentId, action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings }
+    message: autoApproved
+      ? "SOUL.md edit (auto-approved)"
+      : "SOUL.md edit blocked from prompt (proposed)",
+    data: { agentId, action, path: result.path, contentBytes: body.length, scanFindings: result.scanFindings, autoApproved }
   });
-  const scanNote = result.scanFindings.length > 0
-    ? ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`
-    : "";
-  return `Proposed SOUL.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/soul/approve.`;
+  if (!autoApproved) {
+    const scanNote = ` (scan flagged: ${result.scanFindings.join(", ")}; content blocked from prompt until approved)`;
+    return `Proposed SOUL.md edit at ${result.path}${scanNote}. Awaiting user approval via POST /api/identity-files/soul/approve.`;
+  }
+  return `Updated SOUL.md at ${result.path}.`;
 }
 
 // Propose an edit to the instance-scoped USER.md. Same propose →

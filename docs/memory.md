@@ -5,7 +5,7 @@ Gini memory is visible, governable, and local by default.
 Gini has three memory surfaces (see [ADR runtime-identity-files.md](./adr/runtime-identity-files.md) for the partition):
 
 - **USER.md** — instance-scoped user identity, always injected into the prompt. Edited via the `edit_user_profile` tool, auto-approved when the injection scan passes (a flagged body routes through `.proposed` for review).
-- **SOUL.md** — per-agent persona, always injected. Edited via the `edit_soul` tool which always routes through `.proposed` for user approval.
+- **SOUL.md** — per-agent persona, always injected. Edited via the `edit_soul` tool, auto-approved when the injection scan passes (a flagged body routes through `.proposed` for review).
 - **Hindsight** — per-agent SQLite bank populated automatically by auto-retain at the end of every chat task. Queried by recall on each turn and by the `recall_memory` tool on demand.
 
 This document covers Hindsight; USER.md / SOUL.md are documented in [runtime-identity-files.md](./adr/runtime-identity-files.md).
@@ -90,7 +90,7 @@ The four channels cover different failure modes:
 
 ## Review And Governance
 
-Hindsight units do not flow through a propose/approve gate — auto-retain writes them directly to the bank. Provenance metadata (source task, source trace ids, embedding model) is recorded with every unit so the user can review them on the Memory page and prune individual units as needed. Curated identity facts go through the propose/approve gate for USER.md and SOUL.md instead, see [ADR runtime-identity-files.md](./adr/runtime-identity-files.md).
+Hindsight units do not flow through a propose/approve gate — auto-retain writes them directly to the bank. Provenance metadata (source task, source trace ids, embedding model) is recorded with every unit so the user can review them on the Memory page and prune individual units as needed. Curated identity edits to USER.md and SOUL.md auto-apply when clean and route through the propose/approve gate only when the injection scan flags them, see [ADR runtime-identity-files.md](./adr/runtime-identity-files.md).
 
 ## Embeddings
 

@@ -281,6 +281,57 @@ describe("runtime api", () => {
     expect(body.error).toContain("Cannot delete the active agent");
   });
 
+  test("PATCH /api/agents/:id renames the agent", async () => {
+    const config = testConfig("agents-rename");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Mansour" })
+    });
+    const renamed = await call(handler, config, `/api/agents/${created.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: "Bob" })
+    });
+    expect(renamed.id).toBe(created.id);
+    expect(renamed.name).toBe("Bob");
+
+    const after = await call(handler, config, "/api/agents");
+    expect(after.agents.find((agent: { id: string }) => agent.id === created.id)?.name).toBe("Bob");
+  });
+
+  test("PATCH /api/agents/:id returns 404 for an unknown agent", async () => {
+    const config = testConfig("agents-rename-missing");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/agents/agent_does_not_exist",
+      { method: "PATCH", body: JSON.stringify({ name: "Bob" }) },
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test("PATCH /api/agents/:id returns 400 for an empty name", async () => {
+    // A missing / blank name is user input, not a server fault — it must
+    // map to 400, never the catch-all 500.
+    const config = testConfig("agents-rename-empty");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Mansour" })
+    });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/agents/${created.id}`,
+      { method: "PATCH", body: JSON.stringify({}) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+  });
+
   test("supports relay degraded health and notification delivery records", async () => {
     const config = testConfig("relay-notifications");
     const handler = createHandler(config);
@@ -3679,7 +3730,7 @@ describe("runtime api", () => {
       expect(dump.userProfile.budget.overCap).toBe(false);
       // INSTRUCTIONS.md is materialized by scaffold; the route returns
       // its content trimmed.
-      expect(dump.instructions.content).toMatch(/You are Gini, a personal agent/);
+      expect(dump.instructions.content).toMatch(/You are a personal agent running on the gini-agent framework\./);
     });
 
     test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {

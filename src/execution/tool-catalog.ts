@@ -1192,10 +1192,12 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    // Propose an edit to the active agent's SOUL.md (per-agent persona).
-    // The tool writes the new body to SOUL.md.proposed; the runtime
-    // continues to read the approved SOUL.md (if any) until the user
-    // approves the proposal via `POST /api/identity-files/soul/approve`.
+    // Edit the active agent's SOUL.md (per-agent persona). Auto-approved:
+    // a clean body lands at SOUL.md directly and rides the system prompt
+    // on the next turn. The injection scan still gates content that trips
+    // a threat pattern — a flagged body routes to SOUL.md.proposed and
+    // stays out of the prompt until the user approves via
+    // `POST /api/identity-files/soul/approve`.
     // Always exposed alongside add_memory — the "identity" toolset is
     // not part of the legacy default set; gating on enable would silently
     // hide the per-agent persona surface on fresh instances.
@@ -1205,18 +1207,18 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "edit_soul",
-      description: "Propose an edit to the active agent's SOUL.md — the agent's persona / character / identity, as ASSIGNED BY THE USER. Rare: most chat sessions never call this. Only fire when the user is explicitly sculpting WHO the agent IS, not WHAT TO DO for them. Example phrasings that DO trigger this tool: \"You are Athena, a research assistant\"; \"Act as a stoic critic with strong opinions\"; \"You're a sardonic, witty assistant who doesn't hedge\"; \"Speak like a pirate from now on\". Example phrasings that DO NOT trigger this tool: \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points\" — those are USER preferences about how the user wants replies and route to `edit_user_profile`. When in doubt, default to `edit_user_profile`; SOUL.md is a deliberate opt-in. Prefer `action: \"set\"` with the full consolidated SOUL.md body under H2 sections (`## Voice`, `## Style`, `## Boundaries`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section. Write entries as facts about the agent's identity, not directives to yourself (\"Voice is terse\" ✓ — \"Always be terse\" ✗). Aim to keep the file under the soft cap shown in the SOUL persona header (1500 chars); when near or over cap, consolidate. The proposed body lands as SOUL.md.proposed and does NOT enter the system prompt until the user approves it via `POST /api/identity-files/soul/approve`. After calling, you MAY briefly mention the approval step but do NOT otherwise narrate the tool call. `action: \"append\"` adds a new section below existing content (prefer set; append is a legacy fallback). `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing approved body; requires `needle`. Requires an active agent — there is no per-instance SOUL.",
+      description: "Edit the active agent's SOUL.md — your own persona / character / identity (name, voice, tone, style, boundaries). Fire when the user shapes WHO YOU ARE, not WHAT TO DO for them. Example phrasings that DO trigger this tool: \"You are Athena, a research assistant\"; \"be more sardonic, don't hedge\"; \"act as a stoic critic with strong opinions\"; \"speak like a pirate from now on\". Example phrasings that DO NOT trigger this tool: \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points\" — those are USER preferences about how the user wants replies and route to `edit_user_profile`. Most turns are not about your identity, so most turns write nothing here. When in doubt, default to `edit_user_profile`; USER.md is about the user, SOUL.md is about you. Prefer `action: \"set\"` with the full consolidated SOUL.md body — keep a leading `Your name is <name>.` line and use H2 sections (`## Voice`, `## Style`, `## Boundaries`); the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section. Write entries as facts about who you are, not directives to yourself (\"Voice is terse\" ✓ — \"Always be terse\" ✗). Aim to keep the file under the soft cap shown in the SOUL persona header (1500 chars); when near or over cap, consolidate. Auto-approved: a clean body goes straight to SOUL.md and rides the system prompt on the next turn. The injection scan still gates content that trips a threat pattern. After a clean edit, give a short natural acknowledgment (\"Got it — I'll keep it dry.\"); do NOT narrate the tool call. `action: \"append\"` adds a new section below existing content (prefer set; append is a legacy fallback). `action: \"remove\"` drops the first paragraph containing the `needle` substring from the existing body; requires `needle`. Requires an active agent — there is no per-instance SOUL.",
       parameters: {
         type: "object",
         properties: {
           action: {
             type: "string",
             enum: ["set", "append", "remove"],
-            description: "Whether to replace the whole SOUL.md body (set), append a new section below the existing approved content (append), or drop the first paragraph containing `needle` from the existing approved content (remove).",
+            description: "Whether to replace the whole SOUL.md body (set), append a new section below the existing content (append), or drop the first paragraph containing `needle` from the existing content (remove).",
             default: "set"
           },
           content: { type: "string", description: "The new SOUL.md body (action=set) or the section to append (action=append). Keep it concise — every turn pays for this in tokens. Not required for action=remove." },
-          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing approved SOUL.md that contains this substring is dropped." }
+          needle: { type: "string", description: "Required when action=remove. A plain substring; the first paragraph in the existing SOUL.md that contains this substring is dropped." }
         },
         required: []
       }
@@ -1226,15 +1228,15 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     // Edit the instance-scoped USER.md. Auto-approved: writes land at
     // USER.md directly and ride the system prompt on the next turn.
     // USER.md is instance-scoped so the user's identity carries across
-    // agent switches. Distinct from edit_soul (per-agent persona, still
-    // propose → approve). Always exposed. See ADR
+    // agent switches. Distinct from edit_soul (per-agent persona; same
+    // auto-approve policy). Always exposed. See ADR
     // runtime-identity-files.md.
     toolset: "identity",
     displayLabel: "Edit user profile",
     type: "function",
     function: {
       name: "edit_user_profile",
-      description: "Edit the instance-scoped USER.md — facts and preferences ABOUT THE USER. Two kinds of content fire this tool: (1) facts about the user — name, role, location, employer, languages, family; (2) preferences for how the user wants you to communicate — \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points for lists\", \"wants detailed technical explanations\". Even when the user phrases a preference as an imperative (\"be direct with me\", \"skip the preamble\"), it is a preference about how the user wants replies → this tool, NOT `edit_soul`. If the user is talking about themselves OR about how they want replies, use this tool. `edit_soul` is reserved for the rare case where the user is explicitly assigning the agent a persona (\"You are X\", \"Act as X\"). When in doubt, default to this tool. Prefer `action: \"set\"` with the full consolidated USER.md content under H2 sections (`## Identity`, `## Preferences`, `## Background`, `## Goals`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section rather than appending a chunk below. Only call when the user's CURRENT message contains a NEW durable fact or preference NOT already in USER.md. Write entries as facts ABOUT the user, not directives to yourself (\"User prefers concise replies\" ✓ — \"Always reply concisely\" ✗); imperative phrasing in USER.md gets re-read next session as a system directive. Casual chat and follow-up questions are NOT identity facts — most turns should produce ZERO calls. Aim to keep the file under the soft cap shown in the USER profile header (1500 chars); when near or over cap, consolidate. DO NOT save task progress, PR/issue/commit IDs, completed-work logs, or other transient state — those belong in long-term memory (auto-retain handles them silently). Do NOT narrate the call: just acknowledge briefly (\"Got it, X.\", \"Noted.\"). Auto-approved: writes go straight to USER.md and ride the system prompt on the next turn. USER.md is instance-scoped so the user's identity bridges across agent switches. The injection scan still gates content that trips a threat pattern. `action: \"append\"` adds a new section (legacy fallback; the storage layer de-duplicates lines that already exist); `action: \"remove\"` drops the first paragraph containing the `needle` substring (requires `needle`). Distinct from edit_soul which still requires user approval.",
+      description: "Edit the instance-scoped USER.md — facts and preferences ABOUT THE USER. Two kinds of content fire this tool: (1) facts about the user — name, role, location, employer, languages, family; (2) preferences for how the user wants you to communicate — \"I prefer concise replies\", \"be more concise\", \"no pleasantries\", \"use bullet points for lists\", \"wants detailed technical explanations\". Even when the user phrases a preference as an imperative (\"be direct with me\", \"skip the preamble\"), it is a preference about how the user wants replies → this tool, NOT `edit_soul`. If the user is talking about themselves OR about how they want replies, use this tool. `edit_soul` is reserved for the rare case where the user is explicitly assigning the agent a persona (\"You are X\", \"Act as X\"). When in doubt, default to this tool. Prefer `action: \"set\"` with the full consolidated USER.md content under H2 sections (`## Identity`, `## Preferences`, `## Background`, `## Goals`) — the current file is visible in the system prompt above, so emit the new version with the new content integrated under the right section rather than appending a chunk below. Only call when the user's CURRENT message contains a NEW durable fact or preference NOT already in USER.md. Write entries as facts ABOUT the user, not directives to yourself (\"User prefers concise replies\" ✓ — \"Always reply concisely\" ✗); imperative phrasing in USER.md gets re-read next session as a system directive. Casual chat and follow-up questions are NOT identity facts — most turns should produce ZERO calls. Aim to keep the file under the soft cap shown in the USER profile header (1500 chars); when near or over cap, consolidate. DO NOT save task progress, PR/issue/commit IDs, completed-work logs, or other transient state — those belong in long-term memory (auto-retain handles them silently). Do NOT narrate the call: just acknowledge briefly (\"Got it, X.\", \"Noted.\"). Auto-approved: writes go straight to USER.md and ride the system prompt on the next turn. USER.md is instance-scoped so the user's identity bridges across agent switches. The injection scan still gates content that trips a threat pattern. `action: \"append\"` adds a new section (legacy fallback; the storage layer de-duplicates lines that already exist); `action: \"remove\"` drops the first paragraph containing the `needle` substring (requires `needle`). Distinct from edit_soul (per-agent persona; same auto-approve policy).",
       parameters: {
         type: "object",
         properties: {
@@ -1405,6 +1407,25 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           }
         },
         required: ["name"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Rename agent",
+    deferred: true,
+    indexSummary: "Rename an agent. Updates the agent's name and keeps its seeded SOUL.md name line in sync. The folder/memory bank are id-keyed and never move.",
+    type: "function",
+    function: {
+      name: "rename_agent",
+      description: "Rename an agent. Updates the agent's name and keeps its seeded SOUL.md name line in sync (the folder/memory bank are id-keyed and never move). If the agent has a customized SOUL persona, also update the name reference there via edit_soul. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name to rename (e.g. 'agent_abc123' or 'Mansour')." },
+          name: { type: "string", description: "New human-readable name (e.g. 'Bob')." }
+        },
+        required: ["agentId", "name"]
       }
     }
   },
@@ -2171,6 +2192,8 @@ export function chatBlockArgsPreviewFor(
     case "use_agent":
       return truncatePreview(previewValue(safe.agentId));
     case "create_agent":
+      return truncatePreview(previewValue(safe.name));
+    case "rename_agent":
       return truncatePreview(previewValue(safe.name));
     case "set_approval_mode":
       return truncatePreview(previewValue(safe.mode));

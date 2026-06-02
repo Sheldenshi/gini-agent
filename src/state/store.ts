@@ -874,6 +874,39 @@ function backfillDefaultAgentToolsets(state: RuntimeState): void {
   }
 }
 
+// Rename the default agent from the legacy "default" name to "Gini" on
+// existing instances. `AgentRecord.name` is the agent's display label (the
+// switcher, list_agents, the runtime-identity block) and the source the
+// boot-time SOUL.md seed reads ("Your name is <name>."); an instance
+// seeded before the default agent was named "Gini" carries
+// `name === "default"`, which would surface as "default" everywhere.
+// Strictly gated on the literal "default" name so a user who renamed their
+// default agent is left alone, and idempotent (after the rename the name
+// is "Gini" and the guard no longer matches).
+function renameDefaultAgentToGini(state: RuntimeState): void {
+  // Defensive: iterate every default row (also the legacy `profile_default`
+  // id) in case a corrupt state file ended up with duplicates.
+  const candidates = state.agents.filter(
+    (candidate) => candidate.id === "agent_default" || candidate.id === "profile_default"
+  );
+  for (const agent of candidates) {
+    if (agent.name !== "default") continue;
+    agent.name = "Gini";
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "runtime",
+        action: "agent.default.renamed",
+        target: agent.id,
+        risk: "low",
+        evidence: { from: "default", to: "Gini", agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+  }
+}
+
 // Phase C — per-agent backfill on the SQLite hindsight store. Pre-Phase-C
 // rows have a NULL agent_id (default value from the ALTER TABLE). Walk the
 // DB once and stamp them with the migration-time active agent, mirroring
@@ -1119,6 +1152,11 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   if (!state.agents.some((agent) => agent.id === state.activeAgentId)) {
     state.activeAgentId = state.agents.find((item) => item.status === "active")?.id ?? state.agents[0]?.id;
   }
+  // Rename the legacy "default"-named default agent to "Gini" so its label
+  // and SOUL.md name seed read "Gini". Runs after the default-agent seed
+  // branch above so it sees a real default row; a freshly seeded default is
+  // already "Gini", so it's a no-op there. Idempotent.
+  renameDefaultAgentToGini(state);
   // Backfill the default agent's toolsets whitelist with `messaging` and
   // `mcp` when the agent still carries the prior default set exactly.
   // Runs after the default-agent seed branch above so the migration sees
