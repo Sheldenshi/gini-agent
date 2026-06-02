@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { ShieldAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { DocReference } from "@/components/DocReference";
 import type { SystemNoteBlock } from "@runtime/types";
 
 // Muted italic line used for terminal flags ("Cancelled", "Failed: …") and
@@ -35,15 +36,17 @@ export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
         {detail ? (
           <p className="mt-1 text-[11px] italic text-muted-foreground">{detail}</p>
         ) : null}
-        <Button asChild size="sm" variant="outline" className="mt-2">
-          {kind === "docs" ? (
-            <a href={url} target="_blank" rel="noreferrer">
+        {kind === "docs" ? (
+          <DocReference url={url}>
+            <Button size="sm" variant="outline" className="mt-2">
               {ctaLabel}
-            </a>
-          ) : (
+            </Button>
+          </DocReference>
+        ) : (
+          <Button asChild size="sm" variant="outline" className="mt-2">
             <Link href={url}>{ctaLabel}</Link>
-          )}
-        </Button>
+          </Button>
+        )}
       </div>
     );
   }

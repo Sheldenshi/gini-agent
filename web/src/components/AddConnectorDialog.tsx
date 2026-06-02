@@ -19,6 +19,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { DocReference } from "@/components/DocReference";
 import type { ProviderDescriptor } from "@/lib/queries";
 
 export interface CreateConnectorBody {
@@ -598,14 +599,14 @@ export function AddConnectorDialog({
           {selectedProvider?.docsUrl ? (
             <p className="text-[11px] text-muted-foreground">
               Learn more at{" "}
-              <a
-                href={selectedProvider.docsUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="underline underline-offset-2 hover:text-foreground"
-              >
-                {selectedProvider.docsUrl.replace(/^https?:\/\//, "")}
-              </a>
+              <DocReference url={selectedProvider.docsUrl}>
+                <button
+                  type="button"
+                  className="underline underline-offset-2 hover:text-foreground"
+                >
+                  {selectedProvider.docsUrl.replace(/^https?:\/\//, "")}
+                </button>
+              </DocReference>
             </p>
           ) : null}
 
