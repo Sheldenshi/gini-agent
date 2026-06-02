@@ -944,6 +944,45 @@ describe("disconnectSharedBrowser pending-launch handling", () => {
   });
 });
 
+// isHandleAlive must force a relaunch when the underlying Chrome died out
+// from under us. After an EXTERNAL kill (crash, or — now that the agent
+// launches the user's branded Chrome — the user quitting their everyday
+// Chrome) Playwright's context.pages() still returns [] without throwing, so
+// the old pages()-only probe reported the dead context as alive and wedged
+// every later tool call on a stale handle. The Browser's isConnected() is the
+// signal that actually flips on an external kill.
+describe("isHandleAlive persistent liveness", () => {
+  afterEach(() => {
+    browserTest.uninstallFakeBrowserForTest();
+  });
+
+  test("reports dead when the persistent context's Browser disconnected", () => {
+    browserTest.installFakeHeadlessPersistentContextForTest({
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => false })
+    });
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(false);
+  });
+
+  test("reports alive when the persistent context's Browser is connected", () => {
+    browserTest.installFakeHeadlessPersistentContextForTest({
+      close: async () => undefined,
+      pages: () => [],
+      browser: () => ({ isConnected: () => true })
+    });
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(true);
+  });
+
+  test("assumes alive when no Browser handle is exposed (cannot probe)", () => {
+    browserTest.installFakeHeadlessPersistentContextForTest({
+      close: async () => undefined,
+      pages: () => []
+    });
+    expect(browserTest.isSharedHandleAliveForTest()).toBe(true);
+  });
+});
+
 // Round-1 fix 5: realistic coverage that the no-record default tool
 // path launches launchPersistentContext against the per-instance profile
 // dir with headless: true. Mocks playwright-core at the module level so
@@ -1007,8 +1046,71 @@ describe("ensureShared default headless persistent launch", () => {
     expect(launchCalls.length).toBe(1);
     const call = launchCalls[0]!;
     expect(call.options.headless).toBe(true);
+    // Stealth arg is present so navigator.webdriver reads false.
+    expect(call.options.args as string[]).toContain(
+      "--disable-blink-features=AutomationControlled"
+    );
     expect(call.dataDir).toContain("chrome-profile");
     expect(call.dataDir).toContain(instance);
+  });
+
+  // Same-task recovery: a cached session whose Chrome was killed mid-task
+  // must not be handed back (its page is dead). getOrCreate drops it and
+  // ensureShared relaunches, so the next tool call for that task heals.
+  test("drops a cached session whose browser was killed and relaunches", async () => {
+    const TEST_ROOT = "/tmp/gini-browser-samekill";
+    process.env["GINI_STATE_ROOT"] = TEST_ROOT;
+    const instance = `samekill-${process.pid}`;
+    rmSync(`${TEST_ROOT}/instances/${instance}`, { recursive: true, force: true });
+    setBrowserInstance(instance);
+
+    // Pre-install a session for this task whose context's Browser reports
+    // disconnected (simulating an external kill after the session was made).
+    browserTest.installFakeSessionWithPageAndContextForTest(
+      "samekill-task",
+      { url: () => "https://example.com/", close: () => Promise.resolve() } as never,
+      { browser: () => ({ isConnected: () => false }) } as never
+    );
+
+    const launchCalls: Array<{ dataDir: string }> = [];
+    mock.module("playwright-core", () => ({
+      chromium: {
+        executablePath: () => "/fake/path/to/chromium",
+        launchPersistentContext: async (dataDir: string) => {
+          launchCalls.push({ dataDir });
+          return {
+            pages: () => [],
+            newPage: async () => ({
+              on: () => undefined,
+              close: () => Promise.resolve(),
+              goto: () => Promise.resolve(null),
+              url: () => "about:blank",
+              title: () => Promise.resolve(""),
+              evaluate: () => Promise.resolve([])
+            }),
+            close: async () => undefined
+          };
+        }
+      }
+    }));
+    browserTest.resetChromiumImportForTest();
+
+    try {
+      await browserNavigate("samekill-task", { url: "https://example.com/" });
+    } catch {
+      // Snapshot wiring may throw on the fake page; the assertion is the relaunch.
+    } finally {
+      mock.restore();
+      browserTest.uninstallFakeBrowserForTest();
+      browserTest.clearFakeSessionsForTest();
+      browserTest.resetChromiumImportForTest();
+      setBrowserInstance("dev");
+      rmSync(TEST_ROOT, { recursive: true, force: true });
+    }
+
+    // The dead cached session was dropped, so ensureShared relaunched rather
+    // than reusing it. Without the liveness check, launch is never called.
+    expect(launchCalls.length).toBe(1);
   });
 });
 

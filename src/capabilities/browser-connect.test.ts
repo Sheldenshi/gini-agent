@@ -569,6 +569,10 @@ describe("browser-connect managed launch via playwright", () => {
       expect(launchCalls[0]!.dataDir).toContain("chrome-profile");
       expect(launchCalls[0]!.options.headless).toBe(false);
       expect(Array.isArray(launchCalls[0]!.options.args)).toBe(true);
+      // Stealth arg is present so navigator.webdriver reads false.
+      expect(launchCalls[0]!.options.args as string[]).toContain(
+        "--disable-blink-features=AutomationControlled"
+      );
       // Downloads land in the per-instance state dir, not ~/Downloads —
       // macOS sandboxes ~/Downloads so the agent can't read files saved
       // there. Saving under the instance dir keeps any download

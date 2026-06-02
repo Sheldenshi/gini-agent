@@ -38,7 +38,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { instanceRoot } from "../paths";
 import { addAudit, mutateState, now, readState } from "../state";
-import { findChromePath } from "../tools/chrome-discovery";
+import { launchPersistentChrome } from "../tools/chrome-discovery";
 import {
   chromeProfileDirFor,
   disconnectSharedBrowser,
@@ -547,16 +547,11 @@ async function launchManaged(
   // the headless context is already signed in. Falls back to visible
   // (`headless: false`) for any other value.
   const wantHeadless = opts.headless === true;
-  // findChromePath honors GINI_CHROME_PATH first, then falls back to
-  // Playwright's bundled Chromium, then system browsers. For the
-  // launchPersistentContext path we pass the resolved path through to
-  // Playwright as executablePath only when the discovery returned
-  // something specific; otherwise we let Playwright default to its bundled
-  // Chromium. Either way, the lifecycle is owned by Playwright — no
+  // launchPersistentChrome picks the launch binary: GINI_CHROME_PATH
+  // override, the detected branded Chrome, or the bundled-first fallback. It
+  // returns the binary that actually backed the context so the UI shows a
+  // meaningful path. Either way, the lifecycle is owned by Playwright — no
   // separate spawn() / CDP probe / PID tracking.
-  const chromePath = await findChromePath();
-  // chromePath stored for UI display. Null means "Playwright chose its
-  // default", which is the normal happy path.
   const dataDir = profileDirFor(config);
   mkdirSync(dataDir, { recursive: true });
 
@@ -615,23 +610,13 @@ async function launchManaged(
   // launchPersistentContext starting — re-acquiring the profile lock with
   // a headless persistent context and forcing this launch to fail with
   // "user data directory is already in use".
-  const context = await withTeardownLock(async () => {
+  const { context, chromePath: usedPath } = await withTeardownLock(async () => {
     await disconnectSharedBrowser();
 
     try {
-      return await chromium.launchPersistentContext(dataDir, {
+      return await launchPersistentChrome(chromium, dataDir, {
         headless: wantHeadless,
-        executablePath: chromePath ?? undefined,
-        acceptDownloads: true,
-        downloadsPath,
-        args: [
-          "--no-first-run",
-          "--no-default-browser-check",
-          // Suppress the "restore previous session?" dialog that appears
-          // after a hard kill. We don't restore state because the user
-          // signs in fresh per connect anyway.
-          "--disable-features=ChromeWhatsNewUI,Translate"
-        ]
+        extraOptions: { acceptDownloads: true, downloadsPath }
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -645,33 +630,24 @@ async function launchManaged(
 
   // Hand the live BrowserContext to the session manager so the next
   // browser_* tool call can reuse it directly without re-launching.
-  await materializeManagedForConnect(context);
+  await materializeManagedForConnect(context as import("playwright-core").BrowserContext);
 
   // Best-effort PID extraction for UI display. Playwright exposes the
   // child via context.browser()?.process(); the .process() method is on
   // playwright-core's Node-side Browser but isn't in the public typing,
   // so we duck-type it. Returns null on any failure — Playwright owns the
   // lifecycle so the PID is purely cosmetic.
-  const browserAny = context.browser() as unknown as
+  const browserAny = (context as import("playwright-core").BrowserContext).browser() as unknown as
     | { process?: () => { pid?: number } | undefined }
     | null;
   const pid = browserAny?.process?.()?.pid ?? null;
-  // Resolve the executable Playwright actually used so the UI shows a
-  // meaningful path even when chromePath was null.
-  const resolvedChromePath = chromePath ?? (() => {
-    try {
-      return chromium.executablePath();
-    } catch {
-      return null;
-    }
-  })();
 
   const record: BrowserConnectionRecord = {
     mode: "managed",
     cdpUrl: MANAGED_CDP_SENTINEL,
     pid,
     dataDir,
-    chromePath: resolvedChromePath ?? null,
+    chromePath: usedPath ?? null,
     startedAt: now(),
     headless: wantHeadless
   };

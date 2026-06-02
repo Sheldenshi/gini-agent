@@ -7,6 +7,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Local Runtime Architecture](local-runtime-architecture.md)
 - [Approval And Audit Substrate](approval-and-audit-substrate.md) — supersedes [Trust Substrate](trust-substrate.md)
 - [Browser Fill-Secret Tool](browser-fill-secret.md)
+- [Browser Stealth Identity](browser-stealth-identity.md)
 - [Instances And Control Surface](instances-and-control-surface.md)
 - [Agent Loop With Native Tool Calling](agent-loop-tool-calling.md)
 - [Deferred Tools (Load-On-Demand Catalog)](deferred-tools.md)
