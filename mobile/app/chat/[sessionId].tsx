@@ -28,7 +28,8 @@ import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/
 import {
   isTaskInFlight,
   useChatStream,
-  useSendMessage
+  useSendMessage,
+  useVoiceStatus
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
 import type { ChatBlock } from "@/src/types";
@@ -86,10 +87,16 @@ export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const stream = useChatStream(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
+  const voice = useVoiceStatus();
   const qc = useQueryClient();
 
   const [text, setText] = useState("");
   const [images, setImages] = useState<PendingImage[]>([]);
+  // True from the moment a voice message is posted until the gateway
+  // finishes transcribing it. Drives the inline pending bubble below the
+  // thread; on the very first voice message the local whisper model still
+  // has to download, so the bubble's label switches to a setup notice.
+  const [voicePending, setVoicePending] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
 
   // Tracks whether the ScrollView is currently pinned near the bottom.
@@ -246,7 +253,7 @@ export default function ChatDetailScreen() {
       scrollRef.current?.scrollToEnd({ animated: true });
     }, 50);
     return () => clearTimeout(id);
-  }, [list.length, sessionId, lastAssistantUpdatedAt]);
+  }, [list.length, sessionId, lastAssistantUpdatedAt, voicePending]);
 
   // Switching sessions starts a fresh transcript pinned to the bottom.
   useEffect(() => {
@@ -289,7 +296,21 @@ export default function ChatDetailScreen() {
   const sendVoice = (audio: VoiceRef): void => {
     if (!sessionId) return;
     pinnedToBottomRef.current = true;
-    send.mutate({ content: "", audio });
+    setVoicePending(true);
+    send.mutate(
+      { content: "", audio },
+      {
+        // Transcription is synchronous on the gateway and the first-run
+        // model download can run long enough that a quick tunnel times
+        // out — surface the failure instead of leaving the bubble spinning.
+        onError: (err) => {
+          Alert.alert("Voice message failed", err.message);
+        },
+        onSettled: () => {
+          setVoicePending(false);
+        }
+      }
+    );
   };
 
   // Each picker asset gets a local id so the tray entry can be replaced
@@ -455,11 +476,27 @@ export default function ChatDetailScreen() {
                   />
                 )
               )
-            ) : (
+            ) : !voicePending ? (
               <View style={styles.emptyChat}>
                 <Text style={styles.emptyChatText}>What can I help with?</Text>
               </View>
-            )}
+            ) : null}
+            {/* Inline pending bubble while a voice message transcribes. On
+                the first voice message the local whisper model still needs
+                its one-time download, so the label warns that setup will
+                take a moment; afterwards it's just "Transcribing…". */}
+            {voicePending ? (
+              <View style={styles.voicePendingRow}>
+                <View style={styles.voicePendingBubble}>
+                  <ActivityIndicator color={theme.muted} size="small" />
+                  <Text style={styles.voicePendingText}>
+                    {voice.data?.ready === false
+                      ? "Setting up voice messages — first time only, this can take a minute."
+                      : "Transcribing…"}
+                  </Text>
+                </View>
+              </View>
+            ) : null}
           </ScrollView>
         )}
 
@@ -705,5 +742,32 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  sendButtonDisabled: { backgroundColor: theme.buttonDisabled }
+  sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
+
+  // Right-aligned pending indicator for an in-flight voice message.
+  // Mirrors the user-bubble row alignment but uses a muted gray surface
+  // (not the near-black user bubble) so it reads as transient status.
+  voicePendingRow: {
+    alignSelf: "flex-end",
+    maxWidth: "80%"
+  },
+  voicePendingBubble: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: theme.codeChipBg,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 4,
+    borderBottomLeftRadius: 18
+  },
+  voicePendingText: {
+    flex: 1,
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 19
+  }
 });

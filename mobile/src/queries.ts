@@ -45,6 +45,19 @@ export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
   });
 }
 
+// Speech-to-text readiness. `ready` is false until the local whisper model
+// has finished its one-time download, which lets the composer warn the user
+// that the first voice message will take a moment to set up. Cached for a
+// while since readiness only flips once; useSendMessage invalidates this key
+// after a successful send so the flip is picked up promptly.
+export function useVoiceStatus() {
+  return useQuery<{ provider: string; model: string; ready: boolean }>({
+    queryKey: ["voice-status"],
+    queryFn: () => api<{ provider: string; model: string; ready: boolean }>("/stt/status"),
+    staleTime: 60_000
+  });
+}
+
 export function useAgents() {
   return useQuery<AgentsResponse>({
     queryKey: ["agents"],
@@ -745,6 +758,10 @@ export function useSendMessage(sessionId: string | null) {
       // sidebar chat list so titles + previews refresh promptly.
       qc.invalidateQueries({ queryKey: ["chat", sessionId] });
       qc.invalidateQueries({ queryKey: ["chats"] });
+      // A successful send means the local STT model has finished downloading
+      // (transcription ran), so re-fetch readiness — the first-run setup
+      // notice should only appear once.
+      qc.invalidateQueries({ queryKey: ["voice-status"] });
     }
   });
 }
