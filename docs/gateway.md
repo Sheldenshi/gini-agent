@@ -7,12 +7,14 @@ Gini's runtime is the gateway: one Bun process per instance owns state, executio
 ```text
                  GATEWAY (Bun runtime, one per instance)
                  /api/* HTTP + /api/events/stream SSE
+                 + reverse proxy → Next.js (UI, /api/runtime/*, HMR WS)
                               ^
           --------------------+--------------------
           |                    |                   |
       Next.js BFF          CLI / scripts       future clients
       browser UI           bearer token        mobile, MCP, messaging
       no browser token
+      (also reachable through the gateway as a single origin)
 ```
 
 The gateway starts from `src/server.ts`. `gini start` launches it as a daemon. `gini run` launches it in the foreground and ties its lifecycle to the terminal.
@@ -27,6 +29,17 @@ The web app in `web/` is both a browser UI and a backend-for-frontend:
 - the browser never receives the token
 
 The web app is stateless. Restarting it does not lose runtime data because all state lives in the gateway.
+
+## Single-origin reverse proxy
+
+The gateway can also front the web app so the whole product is reachable on **one origin** (the gateway port) instead of two. `src/http.ts` routes by path:
+
+- `/api/*` (except `/api/runtime/*`) — handled natively by the gateway, bearer-gated.
+- `/api/runtime/*` — proxied to the Next.js BFF so its server-side token injection still runs.
+- everything else (HTML, `/_next/*` assets) — proxied to the Next.js server.
+- WebSocket upgrades (Next HMR at `/_next/webpack-hmr`) — bridged socket-to-socket (`src/server.ts` wires `proxyWebSocketUpgrade` + `webSocketProxyHandler`).
+
+When the web server is down (or a `--no-web` instance) the proxy falls back to the runtime banner. The upstream port is resolved through `src/web-target.ts`, which validates the recorded `web.port` against the BFF `/api/runtime/__healthz` (`service: "gini-web"` + matching `instance`) before forwarding — a reused/stale port can't route to a foreign instance. This single origin is what lets a tunnel expose UI + API over one public URL. Direct access to the Next.js port still works unchanged.
 
 ## CLI
 

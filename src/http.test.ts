@@ -663,6 +663,37 @@ describe("runtime api", () => {
     expect(String(value.message)).toContain("Next.js");
   });
 
+  // The web reverse proxy: non-/api traffic and the /api/runtime/* BFF
+  // namespace route to the Next.js server, while native /api/* stays
+  // bearer-gated. With no web server running in tests, the proxy falls back
+  // to the runtime banner — which is exactly what proves the routing: a path
+  // that reached the bearer gate would 401, not return the banner.
+  test("/api/runtime/* bypasses the gateway bearer gate and reaches the web proxy", async () => {
+    const config = testConfig("bff-carveout");
+    const handler = createHandler(config);
+
+    // No Authorization header. A native /api/* path is gated → 401.
+    const native = await handler(new Request(`http://127.0.0.1:${config.port}/api/status`));
+    expect(native.status).toBe(401);
+
+    // The BFF namespace is carved out of the gate; with web down it falls
+    // through to the proxy's banner (200), NOT a 401.
+    const bff = await handler(new Request(`http://127.0.0.1:${config.port}/api/runtime/status`));
+    expect(bff.status).toBe(200);
+    const body = (await bff.json()) as { name?: string };
+    expect(body.name).toBe("gini-runtime");
+  });
+
+  test("non-/api paths proxy to the web server (banner fallback when web is down)", async () => {
+    const config = testConfig("web-proxy-fallback");
+    const handler = createHandler(config);
+
+    const page = await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`));
+    expect(page.status).toBe(200);
+    const body = (await page.json()) as { name?: string };
+    expect(body.name).toBe("gini-runtime");
+  });
+
   test("preserves full terminal stdout in a trace artifact when audit evidence is truncated", async () => {
     // Master plan §6.2 requires that "outputs are truncated intelligently
     // with full logs stored." The audit `evidence` field caps stdout/stderr

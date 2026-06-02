@@ -85,6 +85,26 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
   validates Origin/Host before injecting the bearer, regardless of
   which gateway route a request targets.
 
+## Gateway reverse-proxy interaction
+
+The gateway can now front the BFF as a single origin (ADR
+[gateway-web-reverse-proxy.md](./gateway-web-reverse-proxy.md)): a browser
+request to the gateway port for `/api/runtime/*` is reverse-proxied to the
+Next.js BFF, which still runs this guard and injects the bearer server-side.
+The guard's inputs are unchanged in the common case — the gateway forwards the
+browser's original `Origin` and `Host`, and both the gateway and Next.js bind
+loopback, so a same-origin loopback browser session still presents a loopback
+`Host` and matching `Origin` and passes. The bearer boundary is preserved: the
+gateway hands `/api/runtime/*` to the BFF rather than answering it natively, so
+token injection remains the BFF's job and the browser still never sees the
+token.
+
+The operational consequence is the same knob as direct exposure: if the gateway
+is exposed on a non-loopback hostname (the tunnel case the single-origin proxy
+enables), the BFF guard sees a non-loopback `Host` and fails closed unless
+`GINI_TRUSTED_ORIGINS` includes the gateway's external origin. Fronting the BFF
+behind the gateway does not remove that requirement.
+
 ## Alternatives considered
 
 - **Host-equality with no allowlist.** This was the previous behavior;

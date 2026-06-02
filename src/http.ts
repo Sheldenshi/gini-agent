@@ -85,7 +85,7 @@ import { v1Readiness } from "./runtime/readiness";
 import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
-import { recordedWebPort } from "./cli/process";
+import { resolveWebPort } from "./web-target";
 import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
@@ -1463,8 +1463,8 @@ function corsOriginFor(request: Request): string | undefined {
 // recorded (web down, or a --no-web instance) we self-describe with the
 // runtime banner instead of failing — the banner's natural home is exactly the
 // case where the UI isn't there to serve.
-function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Response | Promise<Response> {
-  const port = recordedWebPort(config);
+async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
+  const port = await resolveWebPort(config);
   if (port === null) {
     return withCors(request, json({
       name: "gini-runtime",
@@ -1501,6 +1501,7 @@ interface WsProxyData {
   toUpstream: Array<string | ArrayBuffer>;
   clientOpen: boolean;
   upstreamOpen: boolean;
+  upstreamClosed: boolean;
   client?: ServerWebSocket<WsProxyData>;
 }
 
@@ -1515,8 +1516,8 @@ function wsFrame(data: string | ArrayBuffer | ArrayBufferView): string | ArrayBu
 // to the live web server. fetch() can't carry an upgrade, so we bridge two
 // sockets: dial the upstream WS, accept the client WS via server.upgrade, and
 // pump frames both ways. The websocket handler below does the pumping.
-export function proxyWebSocketUpgrade(request: Request, server: Server<WsProxyData>, config: RuntimeConfig): Response | undefined {
-  const port = recordedWebPort(config);
+export async function proxyWebSocketUpgrade(request: Request, server: Server<WsProxyData>, config: RuntimeConfig): Promise<Response | undefined> {
+  const port = await resolveWebPort(config);
   if (port === null) return new Response("Web UI not running", { status: 502 });
   const url = new URL(request.url);
   const wsUrl = `ws://127.0.0.1:${port}${url.pathname}${url.search}`;
@@ -1525,7 +1526,7 @@ export function proxyWebSocketUpgrade(request: Request, server: Server<WsProxyDa
     ? new WebSocket(wsUrl, proto.split(",").map((p) => p.trim()))
     : new WebSocket(wsUrl);
   upstream.binaryType = "arraybuffer";
-  const data: WsProxyData = { upstream, toClient: [], toUpstream: [], clientOpen: false, upstreamOpen: false };
+  const data: WsProxyData = { upstream, toClient: [], toUpstream: [], clientOpen: false, upstreamOpen: false, upstreamClosed: false };
   upstream.addEventListener("open", () => {
     data.upstreamOpen = true;
     for (const m of data.toUpstream) { try { upstream.send(m); } catch { /* dropped */ } }
@@ -1536,6 +1537,16 @@ export function proxyWebSocketUpgrade(request: Request, server: Server<WsProxyDa
     if (data.clientOpen && data.client) { try { data.client.send(payload); } catch { /* dropped */ } }
     else data.toClient.push(payload);
   });
+  // Register failure handlers immediately — an upstream that dies BEFORE the
+  // client socket opens (e.g. a refused dial during a web restart) would
+  // otherwise leave the client half-open with frames buffered forever. If the
+  // client is already up we close it now; if not, open() reads upstreamClosed.
+  const onUpstreamDown = (code?: number, reason?: string) => {
+    data.upstreamClosed = true;
+    if (data.client) { try { data.client.close(code || 1000, reason); } catch { /* already closed */ } }
+  };
+  upstream.addEventListener("close", (event) => onUpstreamDown(event.code, event.reason));
+  upstream.addEventListener("error", () => onUpstreamDown());
   if (!server.upgrade(request, { data })) {
     upstream.close();
     return new Response("WebSocket upgrade failed", { status: 426 });
@@ -1555,12 +1566,12 @@ export const webSocketProxyHandler = {
   open(ws: ServerWebSocket<WsProxyData>) {
     ws.data.client = ws;
     ws.data.clientOpen = true;
+    // The upstream may have died during the upgrade window; its failure
+    // handler (registered at dial time) couldn't reach a client that didn't
+    // exist yet, so honor the flag here.
+    if (ws.data.upstreamClosed) { try { ws.close(); } catch { /* already closed */ } return; }
     for (const m of ws.data.toClient) { try { ws.send(m); } catch { /* dropped */ } }
     ws.data.toClient = [];
-    ws.data.upstream.addEventListener("close", (event) => {
-      try { ws.close(event.code || 1000, event.reason); } catch { /* already closed */ }
-    });
-    ws.data.upstream.addEventListener("error", () => { try { ws.close(); } catch { /* already closed */ } });
   },
   message(ws: ServerWebSocket<WsProxyData>, message: string | Buffer) {
     const frame = wsFrame(message);
