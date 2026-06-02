@@ -610,4 +610,45 @@ describe("memory-db schema and storage", () => {
       .get("legacy-tok");
     expect(row?.origin).toBe("loopback");
   });
+
+  test("purges legacy tunnel-origin device rows on open while keeping loopback rows", () => {
+    // Simulate a DB paired before the Cloudflare tunnel was removed: the
+    // devices table allowed origin='tunnel', and one device registered over
+    // the tunnel. After removal the tunnel row can never re-validate, yet the
+    // dispatcher fans pushes out to every row. applyMigrations must delete the
+    // tunnel row on open and leave the loopback row untouched.
+    const instance = "mem-devices-tunnel-purge";
+    mkdirSync(instanceRoot(instance), { recursive: true });
+    const path = memoryDbPath(instance);
+    const direct = new Database(path, { create: true });
+    direct.exec(`
+      CREATE TABLE devices (
+        token TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL,
+        platform TEXT NOT NULL CHECK (platform IN ('ios')),
+        bundle_id TEXT NOT NULL,
+        registered_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'loopback' CHECK (origin IN ('loopback', 'tunnel'))
+      );
+    `);
+    direct.run(
+      `INSERT INTO devices (token, credential_id, platform, bundle_id, registered_at, last_seen_at, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ["tunnel-tok", "cred_a", "ios", "ai.lilaclabs.gini.mobile", "now", "now", "tunnel"]
+    );
+    direct.run(
+      `INSERT INTO devices (token, credential_id, platform, bundle_id, registered_at, last_seen_at, origin)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ["loopback-tok", "cred_a", "ios", "ai.lilaclabs.gini.mobile", "now", "now", "loopback"]
+    );
+    direct.close();
+
+    // Re-open via the cached helper so applyMigrations runs.
+    const tokens = getMemoryDb(instance)
+      .query<{ token: string }, []>("SELECT token FROM devices ORDER BY token ASC")
+      .all()
+      .map((r) => r.token);
+    expect(tokens).toEqual(["loopback-tok"]);
+  });
 });

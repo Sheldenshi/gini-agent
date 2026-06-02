@@ -398,6 +398,13 @@ function applyMigrations(db: Database): void {
   // reject `CREATE INDEX ... ON devices(origin)` on the legacy shape.
   ensureColumn(db, "devices", "origin", "TEXT NOT NULL DEFAULT 'loopback'");
   db.exec("CREATE INDEX IF NOT EXISTS devices_by_origin ON devices(origin);");
+  // Purge push-device rows paired over the removed Cloudflare tunnel. Those
+  // rows carry a non-loopback origin and can survive an in-place upgrade: the
+  // narrowed CHECK only governs new writes and SQLite never re-validates it
+  // against existing rows. listAllDevices does not filter by origin, so the
+  // dispatcher would otherwise keep fanning approval/completion pushes out to a
+  // device that can no longer reach the runtime — delete them on open.
+  db.exec("DELETE FROM devices WHERE origin <> 'loopback';");
 
   // Step 6 — chat_read_state table (schema version 6). Tracks the
   // last block id each device has acknowledged seeing on a given chat
