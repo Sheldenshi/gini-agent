@@ -155,6 +155,10 @@ describe("CHROME_LAUNCH_ARGS", () => {
   test("includes the AutomationControlled toggle that clears navigator.webdriver", () => {
     expect(CHROME_LAUNCH_ARGS).toContain("--disable-blink-features=AutomationControlled");
   });
+
+  test("uses the basic password store so logins persist independent of the Keychain", () => {
+    expect(CHROME_LAUNCH_ARGS).toContain("--password-store=basic");
+  });
 });
 
 describe("resolveBrowserLaunchTarget", () => {

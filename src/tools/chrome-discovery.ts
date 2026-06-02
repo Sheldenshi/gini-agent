@@ -16,15 +16,24 @@ const execFileAsync = promisify(execFile);
 
 const ENV_OVERRIDE = "GINI_CHROME_PATH";
 
-// Shared Chromium launch args for every managed/persistent launch. The
-// AutomationControlled toggle clears navigator.webdriver so sites with
-// automation-integrity checks treat the browser like a normal Chrome.
+// Shared Chromium launch args for every managed/persistent launch.
+// - AutomationControlled toggle clears navigator.webdriver so sites with
+//   automation-integrity checks treat the browser like a normal Chrome.
+// - password-store=basic makes Chrome encrypt the cookie/credential store
+//   with a stable file-based key instead of the macOS Keychain ("Chrome Safe
+//   Storage"). Gini runs on headless Macs where the Keychain is often locked;
+//   keychain-encrypted cookies then can't be decrypted on the next launch and
+//   the agent appears logged out. The basic store keeps logins consistent
+//   across restarts independent of Keychain state (the per-instance profile
+//   already lives under ~/.gini, so the weaker on-disk obfuscation is an
+//   acceptable trade for persistent login).
 // See ADR browser-stealth-identity.md (issue #218).
 export const CHROME_LAUNCH_ARGS: readonly string[] = [
   "--no-first-run",
   "--no-default-browser-check",
   "--disable-features=ChromeWhatsNewUI,Translate",
-  "--disable-blink-features=AutomationControlled"
+  "--disable-blink-features=AutomationControlled",
+  "--password-store=basic"
 ];
 
 // macOS canonical paths in priority order: Chrome stable → Chromium →
