@@ -721,10 +721,10 @@ function buildAttachmentContent(
     parts.push({
       type: "text",
       text:
-        "Attached files (in order). Each is in Gini's upload space by id — NOT yet on disk. " +
-        "To read or use one, load the attachments skill (read_skill name=\"attachments\") and run its " +
-        "`materialize` script with the uploadId to write it into the workspace, then read it with file_read:\n" +
-        lines.join("\n")
+        "Attached files (in order):\n" + lines.join("\n") +
+        "\n\nEach file above is in Gini's upload space by id — NOT yet on disk. To read or use one, " +
+        "load the attachments skill (read_skill name=\"attachments\") and run its `materialize` script " +
+        "with the uploadId to write it into the workspace, then read it with file_read."
     });
   }
   // Provider requires non-empty content. If every attachment failed to load

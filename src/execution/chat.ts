@@ -15,7 +15,7 @@ import {
   renameChatSession
 } from "../state";
 import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
-import { readUpload, uploadExists, uploadStat } from "../state/uploads";
+import { readUpload, uploadStat } from "../state/uploads";
 import { getSttProvider } from "../stt";
 import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
@@ -214,24 +214,25 @@ export async function renameChat(config: RuntimeConfig, id: string, input: Recor
   return updated;
 }
 
-function parseImageAttachments(instance: string, raw: unknown): ImageAttachment[] {
+function parseAttachments(instance: string, raw: unknown): ImageAttachment[] {
   if (!Array.isArray(raw)) return [];
   const out: ImageAttachment[] = [];
   for (const entry of raw) {
     if (!entry || typeof entry !== "object") continue;
     const item = entry as Record<string, unknown>;
     const id = typeof item.id === "string" ? item.id : "";
-    const mimeType = typeof item.mimeType === "string" ? item.mimeType : "";
-    const size = typeof item.size === "number" ? item.size : Number(item.size ?? 0);
-    if (!id || !mimeType) continue;
-    // Reject upload ids that haven't been registered with this instance.
-    // Submitting a phantom id would let a client pin an arbitrary value
-    // in chat history without backing bytes — the renderer would 404 and
-    // the provider would skip the image at dispatch.
-    if (!uploadExists(instance, id)) {
-      throw new Error(`Invalid input: image upload not found: ${id}`);
+    if (!id) continue;
+    // Take the mimeType + size from the STORED upload metadata, not the
+    // client's claim. buildAttachmentContent partitions image-vs-file on
+    // mimeType, so a forged mimeType could route non-image bytes through the
+    // vision image_url path (or hide an image from vision). uploadStat also
+    // confirms the id is registered with this instance — a phantom id with no
+    // backing bytes throws here rather than pinning a 404 in chat history.
+    const stat = uploadStat(instance, id);
+    if (!stat) {
+      throw new Error(`Invalid input: upload not found: ${id}`);
     }
-    out.push({ id, mimeType, size });
+    out.push({ id, mimeType: stat.mimeType, size: stat.size });
   }
   return out;
 }
@@ -262,7 +263,7 @@ function parseAudioAttachment(instance: string, raw: unknown): AudioAttachment |
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
   let content = String(input.content ?? "").trim();
-  const images = parseImageAttachments(config.instance, input.images);
+  const images = parseAttachments(config.instance, input.images);
   const audio = parseAudioAttachment(config.instance, input.audio);
   // Validate the session before transcribing — STT (and, on the first voice
   // message, the one-time model download) is expensive, so a stale or deleted

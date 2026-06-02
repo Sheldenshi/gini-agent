@@ -688,7 +688,7 @@ export default function ChatDetailScreen() {
             <TouchableOpacity
               onPress={openAttachmentMenu}
               accessibilityRole="button"
-              accessibilityLabel="Attach photo"
+              accessibilityLabel="Add attachment"
               hitSlop={8}
               style={styles.plusButton}
             >

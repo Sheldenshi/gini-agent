@@ -4580,10 +4580,12 @@ describe("GET /api/files", () => {
   });
 
   // The 415 gate fires on a structurally-invalid mime (no slash / whitespace).
-  // Bun's multipart encoder ignores a part's declared content-type and sniffs
-  // the mime from the filename extension, so an invalid mime can't be smuggled
-  // through a `File` part — it always arrives plausible. The gate predicate is
-  // exercised directly to pin the 415-triggering condition.
+  // It can't be reached through a real request: Bun's server-side
+  // request.formData() normalizes an invalid part Content-Type (e.g.
+  // "notamime") to application/octet-stream, and its File/FormData encoder
+  // sniffs the part mime from the filename extension — either way the part
+  // arrives plausible, so the predicate is exercised directly to pin the
+  // 415-triggering condition.
   test("isPlausibleMime rejects structurally-invalid mimes (the 415 gate)", () => {
     expect(isPlausibleMime("notamime")).toBe(false);
     expect(isPlausibleMime("text/csv")).toBe(true);

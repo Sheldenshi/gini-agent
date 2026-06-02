@@ -243,7 +243,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const form = await request.formData();
       const file = form.get("file");
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
-      const filename = file instanceof File ? file.name : undefined;
+      // Prefer an explicit `filename` form field (mobile sends the original
+      // name here because expo-file-system multipart can't set the part
+      // filename) over the streamed part's name. Web doesn't send the field,
+      // so it falls back to the File part's own name.
+      const filenameField = form.get("filename");
+      const filename =
+        typeof filenameField === "string" && filenameField.length > 0
+          ? filenameField
+          : file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
       const bytes = new Uint8Array(await file.arrayBuffer());
       // Accept any plausible MIME — storage already handles arbitrary file

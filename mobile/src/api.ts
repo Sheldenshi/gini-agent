@@ -140,6 +140,10 @@ async function uploadFile(file: {
     uploadType: FileSystem.FileSystemUploadType.MULTIPART,
     fieldName: "file",
     mimeType: file.mimeType,
+    // expo-file-system's multipart has no part-filename option, so the
+    // original name reaches the server as an explicit `filename` form field
+    // (the upload handler prefers it over the streamed part's cache basename).
+    parameters: { filename: file.name },
     headers: { Authorization: `Bearer ${creds.token}` }
   });
   const value = response.body ? safeParse(response.body) : null;
