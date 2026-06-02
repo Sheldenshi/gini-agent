@@ -29,6 +29,8 @@ import {
   ProviderAuthError,
   generateToolCallingResponse,
   isAuthExpiredError,
+  providerAuthNote,
+  redactSecrets,
   type ToolCallingMessage,
   type MessageContentPart,
   type ToolCall
@@ -1717,7 +1719,25 @@ async function runLoop(
     { role: "user", content: summaryInstruction }
   ];
   try {
-    const summaryResult = await generateToolCallingResponse(config, summaryMessages, []);
+    let summaryResult: Awaited<ReturnType<typeof generateToolCallingResponse>>;
+    try {
+      summaryResult = await generateToolCallingResponse(
+        config,
+        summaryMessages,
+        [],
+        undefined,
+        effective.providerSource === "agent" ? effective.provider : undefined
+      );
+    } catch (error) {
+      // Same provider-auth tagging as the main loop call, so an expired token
+      // on the final summary turn surfaces a named re-auth note instead of a
+      // raw failure (issue #205).
+      const summaryMessage = error instanceof Error ? error.message : String(error);
+      if (!(error instanceof ProviderAuthError) && isAuthExpiredError(summaryMessage)) {
+        throw new ProviderAuthError(effective.provider.name, summaryMessage);
+      }
+      throw error;
+    }
     accumulatedCost = addCost(accumulatedCost, summaryResult.cost);
     const finalText = summaryResult.text || "(no content)";
     const exhausted = await mutateState(config.instance, (state) => {
@@ -1776,14 +1796,20 @@ async function runLoop(
     }
     return exhausted;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    // An expired credential on the summary call gets the same named re-auth
+    // note as the main loop (issue #205); the raw detail is redacted in case
+    // the provider echoed a partial key.
+    const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
+    const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
     const exhausted = await mutateState(config.instance, (state) => {
       const item = findTask(state, taskId);
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "failed";
       item.currentStep = "Failed";
-      item.error = `Chat task exceeded ${cap} model iterations.`;
+      item.error = authProvider ? message : `Chat task exceeded ${cap} model iterations.`;
+      if (authProvider) item.authErrorProvider = authProvider;
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
       item.cost = accumulatedCost;
@@ -1796,7 +1822,12 @@ async function runLoop(
     // an explicit marker rather than just trailing off after the last
     // assistant_text. Phase blocks track currentStep; the system_note
     // captures the error condition.
-    emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+    if (authProvider) {
+      const note = providerAuthNote(authProvider, message);
+      emitSystemNote(emitCtx, note.text, note.authError);
+    } else {
+      emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+    }
     emitPhase(emitCtx, "Failed");
     appendTrace(config.instance, taskId, {
       type: "error",

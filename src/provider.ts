@@ -5,7 +5,7 @@ import { buildAgentSystemContext, renderEphemeralContext } from "./system-prompt
 import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-files";
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
-import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig } from "./types";
+import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -189,11 +189,13 @@ export function providerDisplayLabel(name: ProviderName): string {
 // `session_expired`) match too — `_` is a word char, so `\b` alone would miss
 // them.
 const AUTH_NOUN = "(?:auth\\w*|session|token|credential|api[\\s_-]*key|access[\\s_-]*token)";
-const AUTH_VERB = "(?:expired|invalid|revoked|rejected|incorrect|missing|failed)";
+const AUTH_VERB =
+  "(?:expired|invalid|revoked|rejected|incorrect|missing|failed|disabled|deactivated|suspended)";
 const AUTH_EXPIRED_RE = new RegExp(
   [
-    "\\b401\\b",
-    "\\bunauthorized\\b",
+    "\\b40[13]\\b",
+    "\\b(?:unauthorized|forbidden)\\b",
+    "not[\\s_-]+authori[sz]ed",
     "(?:sign|log)(?:ing|ging)?[\\s-]*in[\\s-]*again",
     "login[\\s-]*again",
     "re-?authenticate",
@@ -203,9 +205,25 @@ const AUTH_EXPIRED_RE = new RegExp(
   "i"
 );
 
+// Classifies provider auth failures. Called ONLY at provider-call sites (the
+// chat-task model call and the iteration-cap summary call), where a match
+// definitively means the credential failed — so a tool/browser/terminal error
+// that merely mentions "401" can never be misread as a provider re-auth. The
+// matcher therefore favors recall: expired/invalid/revoked/disabled tokens,
+// 401/403, "not authorized", and "sign/log in again".
 export function isAuthExpiredError(message: string | undefined): boolean {
   if (!message) return false;
   return AUTH_EXPIRED_RE.test(message);
+}
+
+// Mask credential-shaped substrings before a provider's raw error is stored or
+// rendered — some providers echo a partial key in their auth error. Conservative
+// on purpose: only well-known key/token shapes, so ordinary prose is untouched.
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, "sk-***")
+    .replace(/\bBearer\s+[A-Za-z0-9._-]{6,}/gi, "Bearer ***")
+    .replace(/\b(api[_-]?key|token|secret|password)(["'\s:=]+)[A-Za-z0-9._-]{6,}/gi, "$1$2***");
 }
 
 // Thrown in place of the raw provider error when a tool-calling / model call
@@ -238,9 +256,28 @@ const DOCS_BASE_URL = "https://gini.lilaclabs.ai/docs";
 export function providerReauth(name: ProviderName): ProviderReauth {
   const entry = providerCatalog().find((item) => item.name === name);
   if (entry?.auth === "codex-oauth") {
-    return { kind: "docs", url: `${DOCS_BASE_URL}/providers/${name}#reauth` };
+    // `#re-authentication` is the natural GitHub/standard-renderer slug for the
+    // "## Re-authentication" heading in docs/providers/<id>.md, so the anchor
+    // resolves both in-repo and on the hosted docs site.
+    return { kind: "docs", url: `${DOCS_BASE_URL}/providers/${name}#re-authentication` };
   }
   return { kind: "settings", url: "/settings" };
+}
+
+// Build the chat system-note payload for a provider auth failure — the
+// provider-named line plus the structured metadata the web renders as a CTA.
+// Shared by failTask and the iteration-cap summary path so both surface
+// identical notes. `detail` should already be redacted by the caller.
+export function providerAuthNote(
+  provider: ProviderName,
+  detail: string
+): { text: string; authError: SystemNoteAuthError } {
+  const providerLabel = providerDisplayLabel(provider);
+  const reauth = providerReauth(provider);
+  return {
+    text: providerAuthFailureText(providerLabel),
+    authError: { provider, providerLabel, detail, reauthKind: reauth.kind, reauthUrl: reauth.url }
+  };
 }
 
 // Actionable copy for a failed provider credential, shared by the chat system

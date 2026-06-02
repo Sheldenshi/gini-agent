@@ -8,7 +8,7 @@ whichever is present on each turn and writes nothing to Gini config.
 Because the token is owned by the Codex CLI, there is no key field in
 **Settings → Providers** for Codex. Re-authentication happens in a terminal.
 
-## Re-authentication {#reauth}
+## Re-authentication
 
 When a chat turn fails with `Codex authentication failed` (the underlying
 provider message is usually `Provided authentication token is expired. Please

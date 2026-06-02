@@ -14,7 +14,6 @@ import { spawn } from "bun";
 import type {
   Authorization,
   ImageAttachment,
-  ProviderName,
   RuntimeConfig,
   RuntimeState,
   SetupRequest,
@@ -73,10 +72,8 @@ function findApprovalRow(state: RuntimeState, id: string):
 import {
   ProviderAuthError,
   generateTaskSummary,
-  isAuthExpiredError,
-  providerAuthFailureText,
-  providerDisplayLabel,
-  providerReauth
+  providerAuthNote,
+  redactSecrets
 } from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
 import { fetchWeb } from "./tools/web";
@@ -794,30 +791,17 @@ export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
     });
 }
 
-// Identify the provider whose credential failed for a task failure, or
-// undefined when the failure isn't an auth error (issue #205). A
-// ProviderAuthError carries the exact provider that served the turn (captured
-// at the model-call site, accurate across an active-agent switch mid-call);
-// otherwise we best-effort match the message and resolve the current effective
-// provider. Resolution is defensive — a throw yields undefined and the caller
-// falls back to the raw provider message.
-function authProviderForFailure(
-  config: RuntimeConfig,
-  error: unknown,
-  message: string
-): ProviderName | undefined {
-  if (error instanceof ProviderAuthError) return error.provider;
-  if (!isAuthExpiredError(message)) return undefined;
-  try {
-    return resolveEffectiveContext(readState(config.instance), config).provider.name;
-  } catch {
-    return undefined;
-  }
-}
-
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
-  const authProvider = authProviderForFailure(config, error, message);
+  // Enrich provider auth failures with a named provider + re-auth CTA (issue
+  // #205) ONLY when the error is a ProviderAuthError — i.e. it originated at a
+  // provider call (tagged with the provider that served the turn), not a
+  // tool/browser/terminal failure whose message merely mentions "401".
+  const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  // Redact credential-shaped substrings from provider auth errors before they
+  // are stored (task.error, audit) or rendered (the note's detail) — some
+  // providers echo a partial key in the error text.
+  const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
   const task = await mutateState(config.instance, (state) => {
     // The two `runTask(...).catch(failTask(...))` fire-and-forget call
     // sites in createTask/retryTask can race with test cleanup or a
@@ -888,15 +872,8 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
         // provider and carries re-auth metadata for the client CTA (issue
         // #205). Every other failure passes the raw message through unchanged.
         if (authProvider) {
-          const providerLabel = providerDisplayLabel(authProvider);
-          const reauth = providerReauth(authProvider);
-          emitSystemNote(emitCtx, providerAuthFailureText(providerLabel), {
-            provider: authProvider,
-            providerLabel,
-            detail: message,
-            reauthKind: reauth.kind,
-            reauthUrl: reauth.url
-          });
+          const note = providerAuthNote(authProvider, message);
+          emitSystemNote(emitCtx, note.text, note.authError);
         } else {
           emitSystemNote(emitCtx, message);
         }

@@ -114,7 +114,7 @@ gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
 ```
 
-The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#reauth) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
+The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
 
 ## Parallel Instances
 

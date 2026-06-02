@@ -436,10 +436,12 @@ describe("chat session waiting-approval placeholder", () => {
       if (record) record.taskIds.push(task.id);
     });
 
+    // Provider auth failures arrive as a ProviderAuthError (thrown at the
+    // provider-call site, tagging the provider that served the turn).
     await failTask(
       config,
       taskId,
-      new Error("Provided authentication token is expired. Please try signing in again.")
+      new ProviderAuthError("codex", "Provided authentication token is expired. Please try signing in again.")
     );
 
     const note = listChatBlocks(config.instance, session.id).find((b) => b.kind === "system_note");
@@ -449,7 +451,7 @@ describe("chat session waiting-approval placeholder", () => {
       providerLabel: "Codex",
       detail: "Provided authentication token is expired. Please try signing in again.",
       reauthKind: "docs",
-      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     });
     expect(note.text).toBe("Codex authentication failed. Re-authenticate Codex to continue.");
 
@@ -460,11 +462,12 @@ describe("chat session waiting-approval placeholder", () => {
     expect(failedTask?.authErrorProvider).toBe("codex");
     const synced = await syncChatTaskResult(config, session.id, taskId);
     expect(synced?.content).toBe(
-      "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+      "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     );
 
     // A non-auth failure must NOT carry authError — the raw message passes
-    // through as before.
+    // through as before. (A plain Error whose text merely mentions "401" must
+    // also not be misread as a provider re-auth — only ProviderAuthError is.)
     const plainTaskId = "task_plainfail";
     await mutateState(config.instance, (state) => {
       const task: Task = {
@@ -486,13 +489,15 @@ describe("chat session waiting-approval placeholder", () => {
       const record = state.chatSessions.find((s) => s.id === session.id);
       if (record) record.taskIds.push(task.id);
     });
-    await failTask(config, plainTaskId, new Error("Rate limit exceeded"));
+    // Auth-shaped text on a PLAIN Error (e.g. a tool hitting a 401) must stay
+    // raw — only a ProviderAuthError triggers the provider re-auth card.
+    await failTask(config, plainTaskId, new Error("Tool failed: HTTP 401 Unauthorized from example.com"));
     const plainNote = listChatBlocks(config.instance, session.id)
       .filter((b) => b.kind === "system_note")
       .at(-1);
     if (plainNote?.kind !== "system_note") throw new Error("expected a system_note block");
     expect(plainNote.authError).toBeUndefined();
-    expect(plainNote.text).toBe("Rate limit exceeded");
+    expect(plainNote.text).toBe("Tool failed: HTTP 401 Unauthorized from example.com");
   });
 
   test("ProviderAuthError names the provider that served the turn, not the active one", async () => {
@@ -527,8 +532,12 @@ describe("chat session waiting-approval placeholder", () => {
     });
 
     // Instance provider is codex, but the turn ran on openai — the tagged
-    // error wins.
-    await failTask(config, taskId, new ProviderAuthError("openai", "401 unauthorized"));
+    // error wins. The message carries a key fragment that must be redacted.
+    await failTask(
+      config,
+      taskId,
+      new ProviderAuthError("openai", "Incorrect API key provided: sk-proj-ABC123def456ghi")
+    );
 
     const note = listChatBlocks(config.instance, session.id).find((b) => b.kind === "system_note");
     if (note?.kind !== "system_note") throw new Error("expected a system_note block");
@@ -536,6 +545,11 @@ describe("chat session waiting-approval placeholder", () => {
     // openai is API-key, so the CTA routes to the in-app Settings form, not docs.
     expect(note.authError?.reauthKind).toBe("settings");
     expect(note.authError?.reauthUrl).toBe("/settings");
+    // The key fragment is redacted in the rendered detail and in task.error.
+    expect(note.authError?.detail).toBe("Incorrect API key provided: sk-***");
+    expect(readState(config.instance).tasks.find((t) => t.id === taskId)?.error).toBe(
+      "Incorrect API key provided: sk-***"
+    );
     expect(note.text).toBe("OpenAI authentication failed. Re-authenticate OpenAI to continue.");
 
     // Text-only clients get the Settings-form line for an API-key provider.

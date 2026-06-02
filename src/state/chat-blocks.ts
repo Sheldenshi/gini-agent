@@ -23,6 +23,7 @@ import type {
   ChatBlock,
   ChatBlockKind,
   Instance,
+  ProviderName,
   RiskLevel,
   SetupRequestAction,
   SystemNoteAuthError,
@@ -200,10 +201,22 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
         summary: String(payload.summary ?? "")
       };
     case "system_note": {
-      const authError =
+      const raw =
         payload.authError && typeof payload.authError === "object"
-          ? (payload.authError as SystemNoteAuthError)
+          ? (payload.authError as Partial<SystemNoteAuthError>)
           : undefined;
+      // Backfill the routing fields for rows written before they existed so
+      // every returned block satisfies SystemNoteAuthError (the renderer never
+      // sees a half-populated authError).
+      const authError: SystemNoteAuthError | undefined = raw
+        ? {
+            provider: raw.provider as ProviderName,
+            providerLabel: String(raw.providerLabel ?? raw.provider ?? ""),
+            detail: String(raw.detail ?? ""),
+            reauthKind: raw.reauthKind === "docs" ? "docs" : "settings",
+            reauthUrl: typeof raw.reauthUrl === "string" ? raw.reauthUrl : "/settings"
+          }
+        : undefined;
       return {
         ...base,
         kind: "system_note",

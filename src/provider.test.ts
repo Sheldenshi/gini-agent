@@ -12,9 +12,11 @@ import {
   isAuthExpiredError,
   normalizeProvider,
   providerAuthFailureText,
+  providerAuthNote,
   providerDisplayLabel,
   providerHealth,
   providerReauth,
+  redactSecrets,
   setEchoToolCallingResponse,
   setEchoVisionResponse,
   type ToolFunctionSpec
@@ -2974,7 +2976,10 @@ describe("auth-error classification", () => {
       "Your authorization has expired",
       "Incorrect API key provided",
       "Please log in again",
-      "please login again"
+      "please login again",
+      "403 Forbidden",
+      "You are not authorized to access this resource",
+      "This API key has been disabled"
     ];
     for (const message of positives) {
       expect(isAuthExpiredError(message)).toBe(true);
@@ -3008,7 +3013,7 @@ describe("auth-error classification", () => {
   test("providerReauth routes OAuth/CLI providers to docs and API-key providers to settings", () => {
     expect(providerReauth("codex")).toEqual({
       kind: "docs",
-      url: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+      url: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     });
     expect(providerReauth("openai")).toEqual({ kind: "settings", url: "/settings" });
     expect(providerReauth("deepseek")).toEqual({ kind: "settings", url: "/settings" });
@@ -3023,11 +3028,37 @@ describe("auth-error classification", () => {
     );
     // Text-only docs target — the URL is inline since there's no button.
     expect(providerAuthFailureText("Codex", providerReauth("codex"))).toBe(
-      "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+      "Codex authentication failed. Re-authenticate Codex to continue: https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     );
     // Text-only settings target — point at the in-app key form.
     expect(providerAuthFailureText("OpenAI", providerReauth("openai"))).toBe(
       "OpenAI authentication failed. Update your OpenAI API key in Settings → Providers."
     );
+  });
+
+  test("redactSecrets masks key/token shapes, leaves prose intact", () => {
+    expect(redactSecrets("Incorrect API key provided: sk-proj-ABC123def456ghi")).toBe(
+      "Incorrect API key provided: sk-***"
+    );
+    expect(redactSecrets("Authorization: Bearer abcDEF123456 is invalid")).toBe(
+      "Authorization: Bearer *** is invalid"
+    );
+    expect(redactSecrets("Provided authentication token is expired.")).toBe(
+      "Provided authentication token is expired."
+    );
+  });
+
+  test("providerAuthNote builds the note text + routing metadata", () => {
+    expect(providerAuthNote("codex", "token expired")).toEqual({
+      text: "Codex authentication failed. Re-authenticate Codex to continue.",
+      authError: {
+        provider: "codex",
+        providerLabel: "Codex",
+        detail: "token expired",
+        reauthKind: "docs",
+        reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
+      }
+    });
+    expect(providerAuthNote("openai", "Incorrect API key").authError.reauthKind).toBe("settings");
   });
 });

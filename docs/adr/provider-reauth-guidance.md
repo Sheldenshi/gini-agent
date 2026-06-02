@@ -10,24 +10,34 @@ in code or duplicated across surfaces:
 
 | Provider class | `auth` | CTA destination | Where instructions live |
 |---|---|---|---|
-| OAuth / CLI (codex) | `codex-oauth` | Hosted docs step-through: `https://gini.lilaclabs.ai/docs/providers/<id>#reauth` | A docs page per such provider |
+| OAuth / CLI (codex) | `codex-oauth` | Hosted docs step-through: `https://gini.lilaclabs.ai/docs/providers/<id>#re-authentication` | A docs page per such provider |
 | API-key (openai, deepseek, openrouter, local) | `env` | In-app **Settings → Providers** key form (`/settings`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
 
 The runtime classifies the failure, tags it with the provider that served the
 turn, and stamps the chat block so every client renders the same thing:
 
-- `ProviderAuthError` is thrown at the model-call site (`src/execution/chat-task.ts`),
-  carrying the provider from the effective context — accurate even if the active
-  agent changed while the call was in flight.
-- `failTask` (`src/agent.ts`) resolves the provider (the tagged error, else a
-  best-effort effective-context lookup), persists `task.authErrorProvider`, and
-  emits a `system_note` whose `authError` carries `{ provider, providerLabel,
-  detail, reauthKind, reauthUrl }` (see `SystemNoteAuthError`).
+- `ProviderAuthError` is thrown at the provider-call sites (`src/execution/chat-task.ts`
+  — both the main loop call and the iteration-cap summary call), carrying the
+  provider from the effective context — accurate even if the active agent
+  changed while the call was in flight.
+- Enrichment is keyed on that typed error, not on message-sniffing. `failTask`
+  (`src/agent.ts`) and the iteration-cap path enrich a failure **only** when the
+  error is a `ProviderAuthError`, so a tool/browser/terminal failure whose text
+  merely mentions "401" is never misread as a provider re-auth. They persist
+  `task.authErrorProvider` and emit a `system_note` whose `authError` carries
+  `{ provider, providerLabel, detail, reauthKind, reauthUrl }` (see
+  `SystemNoteAuthError`). `isAuthExpiredError` therefore runs only at the
+  provider-call sites, where a match definitively means the credential failed.
+- The raw provider message is run through `redactSecrets` before it is stored
+  (`task.error`, audit) or rendered (`detail`), since some providers echo a
+  partial key in their error.
 - `providerReauth(name)` (`src/provider.ts`) derives `reauthKind`/`reauthUrl`
   from the catalog `auth` field — the single place the routing lives.
-- The web `BlockSystemNote` renders the alert card + CTA. Text-only clients
-  (CLI, messaging) get the same actionable line via `syncChatTaskResult`
-  (`src/execution/chat.ts`), which reads `task.authErrorProvider`.
+- The web `BlockSystemNote` renders the alert card + CTA (and falls back to the
+  Settings form if a legacy row lacks the routing fields; `rowToBlock` also
+  backfills them on read). Text-only clients (CLI, messaging) get the same
+  actionable line via `syncChatTaskResult` (`src/execution/chat.ts`), which
+  reads `task.authErrorProvider`.
 
 ## Context
 
@@ -61,15 +71,15 @@ avoids that entirely.
 - Adding a new API-key provider needs no re-auth doc — the catalog `auth: "env"`
   routes its CTA to Settings, and its own error text carries the cause.
 - Adding a new OAuth/CLI provider means adding a `docs/providers/<id>.md` with a
-  `## Re-authentication {#reauth}` section; the URL is derived by convention
-  (`/providers/<id>#reauth`), so no per-provider routing data is added.
+  `## Re-authentication` section; the URL is derived by convention
+  (`/providers/<id>#re-authentication`, the heading's natural slug), so no per-provider routing data is added.
 - The runtime owns `reauthUrl`, so clients stay dumb. The hosted-docs base URL
   is a constant in `src/provider.ts`.
 
 ### Acceptance checks
 
 - A chat turn that fails on an expired Codex token renders a note naming Codex
-  with a CTA linking to `…/docs/providers/codex#reauth`.
+  with a CTA linking to `…/docs/providers/codex#re-authentication`.
 - A chat turn that fails on a rejected API key names the provider, shows the
   provider's own message as the detail, and links to `/settings`.
 - A non-auth failure renders the raw message unchanged (no `authError`).

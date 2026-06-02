@@ -605,7 +605,7 @@ describe("chat-blocks persistence", () => {
         providerLabel: "Codex",
         detail: "Provided authentication token is expired. Please try signing in again.",
         reauthKind: "docs",
-        reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+        reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
       }
     });
     insertChatBlock(instance, {
@@ -623,8 +623,43 @@ describe("chat-blocks persistence", () => {
       providerLabel: "Codex",
       detail: "Provided authentication token is expired. Please try signing in again.",
       reauthKind: "docs",
-      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#reauth"
+      reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
     });
     expect(plainNote.authError).toBeUndefined();
+  });
+
+  test("rowToBlock backfills routing fields for a legacy authError row", () => {
+    const instance = "chat-blocks-autherror-legacy";
+    const inserted = insertChatBlock(instance, {
+      kind: "system_note",
+      sessionId: "chat_legacy",
+      text: "Codex authentication failed. Re-authenticate Codex to continue.",
+      authError: {
+        provider: "codex",
+        providerLabel: "Codex",
+        detail: "token expired",
+        reauthKind: "docs",
+        reauthUrl: "https://gini.lilaclabs.ai/docs/providers/codex#re-authentication"
+      }
+    });
+    // Rewrite the payload to a pre-routing-fields shape (no reauthKind/reauthUrl)
+    // to simulate a row written by an older build.
+    getMemoryDb(instance).run("UPDATE chat_blocks SET payload_json = ? WHERE id = ?", [
+      JSON.stringify({
+        text: "Codex authentication failed. Re-authenticate Codex to continue.",
+        authError: { provider: "codex", providerLabel: "Codex", detail: "token expired" }
+      }),
+      inserted.id
+    ]);
+
+    const note = listChatBlocks(instance, "chat_legacy")[0];
+    if (note?.kind !== "system_note") throw new Error("expected a system_note block");
+    expect(note.authError).toEqual({
+      provider: "codex",
+      providerLabel: "Codex",
+      detail: "token expired",
+      reauthKind: "settings",
+      reauthUrl: "/settings"
+    });
   });
 });
