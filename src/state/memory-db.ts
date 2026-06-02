@@ -45,7 +45,12 @@ import { id, now } from "./ids";
 // Bumped to 7 for devices.origin: tags each push-device row with the
 // network path it arrived over. Always `loopback` now — the operator's
 // local browser or a device paired over the LAN.
-export const MEMORY_SCHEMA_VERSION = 7;
+//
+// Bumped to 8 for the Cloudflare-tunnel removal: narrows the
+// devices.origin CHECK to `IN ('loopback')` and purges any legacy
+// non-loopback (tunnel-paired) rows on open, so a device paired over the
+// removed tunnel can no longer receive pushes.
+export const MEMORY_SCHEMA_VERSION = 8;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
