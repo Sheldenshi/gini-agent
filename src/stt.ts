@@ -10,13 +10,15 @@
 //            only on first use so the native-binding + model download cost
 //            is paid only when someone actually records a voice message.
 //   - echo:  deterministic stub. transcribe() always returns "[voice
-//            message]" — what tests + offline dev need so the chat path
-//            works without downloading whisper.
+//            message]" — for tests + offline dev so the chat path works
+//            without downloading whisper. Test-only: never a production
+//            fallback (it would post fabricated content), so it is selected
+//            ONLY by an explicit GINI_STT_PROVIDER=echo opt-in.
 //
 // Selection priority (mirrors embeddings/reranker):
-//   1. GINI_STT_PROVIDER env (explicit override) — local|echo
-//   2. Default: local. If init fails, log a single warning and fall through
-//      to echo for the rest of the process.
+//   1. GINI_STT_PROVIDER=echo (explicit opt-in) — echo, for tests/offline dev.
+//   2. Otherwise (default or GINI_STT_PROVIDER=local) — local. A load failure
+//      surfaces as a thrown error from transcribe(), never a silent echo.
 //
 // WAV-only: clients record 16 kHz mono 16-bit LinearPCM WAV, so the gateway
 // decodes the RIFF header with the tiny pure-JS parser below and feeds the
@@ -43,7 +45,7 @@ export type SttProviderName = "local" | "echo";
 export interface SttChoice {
   name: SttProviderName;
   model: string;
-  reason: "explicit" | "default" | "fallback-echo";
+  reason: "explicit" | "default";
   cacheDir?: string;
 }
 
@@ -78,11 +80,9 @@ export function resolveSttChoice(): SttChoice {
       cacheDir: localCacheDir()
     };
   }
-  // Default is local. If init has previously failed in this process, report
-  // the user-visible fallback so status surfaces don't claim local works.
-  if (localProviderUnavailable) {
-    return { name: "echo", model: "echo-stt-v0", reason: "fallback-echo" };
-  }
+  // Default is local. Echo is only ever selected by an explicit
+  // GINI_STT_PROVIDER=echo (test/offline opt-in); a local load failure never
+  // silently swaps in echo, so the status signal always reflects local here.
   return {
     name: "local",
     model: localModelId(),
@@ -153,19 +153,18 @@ export function sttStatus(): { provider: SttProviderName; model: string; ready: 
 }
 
 // Track local-provider load failures so we don't spam the same warning per
-// transcribe call. Once it fails, callers fall back to echo for the rest of
-// the process lifetime.
+// transcribe call and don't retry the load on every voice message. Once it
+// fails, transcribe() throws immediately for the rest of the process lifetime.
 let localProviderUnavailable: { reason: string } | null = null;
 
 export function getSttProvider(): SttProvider {
-  const choice = resolveSttChoice();
-  if (choice.name === "echo") return echoProvider();
-  // local — try it. If init has previously failed, fall through to echo so
-  // the chat path always gets a valid transcriber.
-  if (!localProviderUnavailable) {
-    return localProvider(choice.model);
-  }
-  return echoProvider();
+  // Echo is test/offline only: select it solely when GINI_STT_PROVIDER is
+  // explicitly "echo". For the default and explicit "local", always return the
+  // local provider — a load failure surfaces as a thrown error from
+  // transcribe(), never a fabricated "[voice message]" transcript.
+  const explicit = (process.env.GINI_STT_PROVIDER ?? "").toLowerCase();
+  if (explicit === "echo") return echoProvider();
+  return localProvider(localModelId());
 }
 
 // --------------------------------------------------------------------------
@@ -236,7 +235,7 @@ async function loadTranscriber(modelId: string): Promise<Transcriber> {
     pipelineCache.delete(key);
     const message = error instanceof Error ? error.message : String(error);
     if (!localProviderUnavailable) {
-      process.stderr.write(`Local speech-to-text provider unavailable (${message}); falling back to echo.\n`);
+      process.stderr.write(`Local speech-to-text provider unavailable (${message}); voice transcription will error until resolved.\n`);
     }
     localProviderUnavailable = { reason: message };
     throw error;
@@ -250,6 +249,13 @@ export function localProvider(modelId: string = localModelId()): SttProvider {
     name: "local",
     model: modelId,
     async transcribe(wavBytes: Uint8Array): Promise<string> {
+      // Once the model load has failed in this process, fail fast rather than
+      // retrying the load on every voice message. loadTranscriber sets this on
+      // its first failure, so this guarantees an error (never echo) on the
+      // local path after a load failure.
+      if (localProviderUnavailable) {
+        throw new Error(`Local speech-to-text unavailable: ${localProviderUnavailable.reason}`);
+      }
       const samples = decodeWav(wavBytes);
       const transcriber = await loadTranscriber(modelId);
       const result = await transcriber(samples, { chunk_length_s: 30, stride_length_s: 5 });

@@ -92,6 +92,39 @@ describe("echo provider", () => {
   });
 });
 
+describe("getSttProvider on a local load failure", () => {
+  // A throwing transformers loader simulates an interrupted first-run model
+  // download. Echo is test-only: the default and explicit "local" must surface
+  // the failure as a rejected transcribe(), never the fabricated "[voice
+  // message]" placeholder. Only an explicit GINI_STT_PROVIDER=echo opts in.
+  const throwingLoader = async (): Promise<never> => {
+    throw new Error("model load failed");
+  };
+
+  test("default config rejects instead of echoing a placeholder", async () => {
+    __setTransformersLoaderForTests(throwingLoader);
+    const provider = getSttProvider();
+    expect(provider.name).toBe("local");
+    await expect(provider.transcribe(makeWav([0, 1, -1], 16000, 1))).rejects.toThrow();
+  });
+
+  test("explicit GINI_STT_PROVIDER=local rejects instead of echoing a placeholder", async () => {
+    process.env.GINI_STT_PROVIDER = "local";
+    __setTransformersLoaderForTests(throwingLoader);
+    const provider = getSttProvider();
+    expect(provider.name).toBe("local");
+    await expect(provider.transcribe(makeWav([0, 1, -1], 16000, 1))).rejects.toThrow();
+  });
+
+  test("explicit GINI_STT_PROVIDER=echo still returns the placeholder", async () => {
+    process.env.GINI_STT_PROVIDER = "echo";
+    __setTransformersLoaderForTests(throwingLoader);
+    const provider = getSttProvider();
+    expect(provider.name).toBe("echo");
+    expect(await provider.transcribe(makeWav([0, 1, -1], 16000, 1))).toBe("[voice message]");
+  });
+});
+
 describe("WAV decoder", () => {
   test("decodes 16 kHz mono 16-bit PCM to normalized floats", () => {
     const samples = [0, 16384, -16384, 32767, -32768];
