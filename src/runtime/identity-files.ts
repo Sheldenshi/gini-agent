@@ -242,26 +242,19 @@ export interface ScaffoldAgentResult {
 // Best-effort: a per-instance filesystem error is swallowed and logged
 // via `appendLog`; the load path tolerates a missing SOUL. Returns the
 // seeded path or null (already populated, empty name, or write failed).
+//
+// The only callers are `createAgent` (a brand-new agent — no SOUL author
+// can exist yet) and the `install()` boot loop (runs before the gateway
+// serves traffic, so no `edit_soul` write is in flight). Even so, the
+// absent-file path creates atomically (O_CREAT|O_EXCL) so a racing writer
+// is never clobbered, and an unreadable existing file is left untouched
+// rather than treated as empty.
 export function seedAgentSoulFile(instance: Instance, agentId: string, name: string | undefined): ScaffoldAgentResult {
   const clean = sanitizeAgentName(name);
   if (!clean) return { created: null };
   const path = soulPath(instance, agentId);
-  try {
-    // Don't overwrite a SOUL that already has content. existsSync +
-    // trimmed-length check treats a zero-byte / whitespace-only file (the
-    // legacy scaffold) as seedable, matching how the load path treats it
-    // as absent.
-    if (existsSync(path)) {
-      try {
-        if (readFileSync(path, "utf8").trim().length > 0) return { created: null };
-      } catch {
-        // Unreadable file — treat as absent and reseed below.
-      }
-    }
-    ensureDir(dirname(path));
-    writeFileSync(path, `Your name is ${clean}.`);
-    return { created: path };
-  } catch (error) {
+  const seed = `Your name is ${clean}.`;
+  const logError = (error: unknown): void => {
     try {
       appendLog(instance, "identity.scaffold.error", {
         file: "SOUL.md",
@@ -272,6 +265,40 @@ export function seedAgentSoulFile(instance: Instance, agentId: string, name: str
     } catch {
       // See scaffoldInstanceIdentityFiles — best-effort logging only.
     }
+  };
+  if (!existsSync(path)) {
+    // Absent: atomic create. If a writer wins the race the file now exists
+    // with their content (EEXIST) — leave it rather than clobber.
+    try {
+      ensureDir(dirname(path));
+      const fd = openSync(path, "wx");
+      try {
+        writeFileSync(fd, seed);
+      } finally {
+        closeSync(fd);
+      }
+      return { created: path };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code === "EEXIST") return { created: null };
+      logError(error);
+      return { created: null };
+    }
+  }
+  // File exists: only reseed a genuinely empty/whitespace body (the legacy
+  // zero-byte scaffold). An unreadable file is treated as "has content" —
+  // never overwrite a SOUL we cannot inspect.
+  let body: string;
+  try {
+    body = readFileSync(path, "utf8");
+  } catch {
+    return { created: null };
+  }
+  if (body.trim().length > 0) return { created: null };
+  try {
+    writeFileSync(path, seed);
+    return { created: path };
+  } catch (error) {
+    logError(error);
     return { created: null };
   }
 }
