@@ -1,5 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import { useQueryClient } from "@tanstack/react-query";
+import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 import { router, Stack, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -37,14 +38,26 @@ import {
 import { family, theme } from "@/src/theme";
 import type { ChatBlock } from "@/src/types";
 
-interface PendingImage {
+interface PendingAttachment {
   localId: string;
-  previewUri: string;
+  kind: "image" | "file";
+  // Set only for images — the tray renders a thumbnail from it. Non-image
+  // files render a chip instead and carry no preview.
+  previewUri?: string;
   filename: string;
   mimeType: string;
+  size?: number;
   status: "uploading" | "ready" | "error";
   errorMessage?: string;
   ref?: UploadRef;
+}
+
+// B / KB / MB for a file chip's size line. Files can be anything (PDF,
+// CSV, logs), so the tray shows a human-readable byte count.
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // Pull a reasonable filename + mime from the picker asset. iOS hands us
@@ -113,7 +126,7 @@ export default function ChatDetailScreen() {
   const qc = useQueryClient();
 
   const [text, setText] = useState("");
-  const [images, setImages] = useState<PendingImage[]>([]);
+  const [images, setImages] = useState<PendingAttachment[]>([]);
   const [attachMenuVisible, setAttachMenuVisible] = useState(false);
   // True from the moment a voice message is posted until the gateway
   // finishes transcribing it. Drives the inline pending bubble below the
@@ -362,7 +375,15 @@ export default function ChatDetailScreen() {
     const { filename, mimeType } = describeAsset(asset);
     setImages((prev) => [
       ...prev,
-      { localId, previewUri: asset.uri, filename, mimeType, status: "uploading" }
+      {
+        localId,
+        kind: "image",
+        previewUri: asset.uri,
+        filename,
+        mimeType,
+        size: asset.fileSize,
+        status: "uploading"
+      }
     ]);
     try {
       const ref = await uploadImage({ uri: asset.uri, name: filename, mimeType });
@@ -378,6 +399,54 @@ export default function ChatDetailScreen() {
           image.localId === localId
             ? { ...image, status: "error", errorMessage: message }
             : image
+        )
+      );
+      Alert.alert("Upload failed", message);
+    }
+  };
+
+  // Files tile: the OS document picker hands back arbitrary files (PDF,
+  // CSV, logs, code). Each is uploaded through the same MIME-agnostic
+  // /api/uploads path images use; the tray renders a file chip while it
+  // uploads and until send. A file that happens to be an image is tagged
+  // "image" so it still gets a thumbnail.
+  const pickFile = async (): Promise<void> => {
+    const result = await DocumentPicker.getDocumentAsync({
+      multiple: true,
+      copyToCacheDirectory: true
+    });
+    if (result.canceled) return;
+    for (const asset of result.assets) void beginFileUpload(asset);
+  };
+
+  const beginFileUpload = async (
+    asset: DocumentPicker.DocumentPickerAsset
+  ): Promise<void> => {
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const mimeType = asset.mimeType ?? "application/octet-stream";
+    const isImage = mimeType.startsWith("image/");
+    setImages((prev) => [
+      ...prev,
+      {
+        localId,
+        kind: isImage ? "image" : "file",
+        previewUri: isImage ? asset.uri : undefined,
+        filename: asset.name,
+        mimeType,
+        size: asset.size,
+        status: "uploading"
+      }
+    ]);
+    try {
+      const ref = await uploadImage({ uri: asset.uri, name: asset.name, mimeType });
+      setImages((prev) =>
+        prev.map((a) => (a.localId === localId ? { ...a, status: "ready", ref } : a))
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setImages((prev) =>
+        prev.map((a) =>
+          a.localId === localId ? { ...a, status: "error", errorMessage: message } : a
         )
       );
       Alert.alert("Upload failed", message);
@@ -554,31 +623,65 @@ export default function ChatDetailScreen() {
               style={styles.thumbTray}
               contentContainerStyle={styles.thumbTrayContent}
             >
-              {images.map((image) => (
-                <View
-                  key={image.localId}
-                  style={[
-                    styles.thumb,
-                    image.status === "error" && styles.thumbError
-                  ]}
-                >
-                  <Image source={{ uri: image.previewUri }} style={styles.thumbImage} />
-                  {image.status === "uploading" ? (
-                    <View style={styles.thumbOverlay}>
-                      <ActivityIndicator color={theme.buttonText} />
-                    </View>
-                  ) : null}
-                  <TouchableOpacity
-                    accessibilityRole="button"
-                    accessibilityLabel="Remove attachment"
-                    onPress={() => removeImage(image.localId)}
-                    style={styles.thumbRemove}
-                    hitSlop={6}
+              {images.map((image) =>
+                image.kind === "image" ? (
+                  <View
+                    key={image.localId}
+                    style={[
+                      styles.thumb,
+                      image.status === "error" && styles.thumbError
+                    ]}
                   >
-                    <Feather name="x" size={12} color={theme.buttonText} />
-                  </TouchableOpacity>
-                </View>
-              ))}
+                    <Image source={{ uri: image.previewUri }} style={styles.thumbImage} />
+                    {image.status === "uploading" ? (
+                      <View style={styles.thumbOverlay}>
+                        <ActivityIndicator color={theme.buttonText} />
+                      </View>
+                    ) : null}
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityLabel="Remove attachment"
+                      onPress={() => removeImage(image.localId)}
+                      style={styles.thumbRemove}
+                      hitSlop={6}
+                    >
+                      <Feather name="x" size={12} color={theme.buttonText} />
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <View
+                    key={image.localId}
+                    style={[
+                      styles.fileChip,
+                      image.status === "error" && styles.thumbError
+                    ]}
+                  >
+                    <Feather name="file" size={20} color={theme.subtle} />
+                    <View style={styles.fileChipBody}>
+                      <Text style={styles.fileChipName} numberOfLines={1}>
+                        {image.filename}
+                      </Text>
+                      <Text style={styles.fileChipMeta} numberOfLines={1}>
+                        {image.size !== undefined ? formatBytes(image.size) : image.mimeType}
+                      </Text>
+                    </View>
+                    {image.status === "uploading" ? (
+                      <View style={styles.thumbOverlay}>
+                        <ActivityIndicator color={theme.buttonText} />
+                      </View>
+                    ) : null}
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      accessibilityLabel="Remove attachment"
+                      onPress={() => removeImage(image.localId)}
+                      style={styles.thumbRemove}
+                      hitSlop={6}
+                    >
+                      <Feather name="x" size={12} color={theme.buttonText} />
+                    </TouchableOpacity>
+                  </View>
+                )
+              )}
             </ScrollView>
           ) : null}
           <View style={styles.inputPill}>
@@ -660,7 +763,8 @@ export default function ChatDetailScreen() {
         visible={attachMenuVisible}
         sources={[
           { key: "camera", label: "Camera", icon: "camera", onPress: () => void takePhoto() },
-          { key: "photos", label: "Photos", icon: "image", onPress: () => void pickFromLibrary() }
+          { key: "photos", label: "Photos", icon: "image", onPress: () => void pickFromLibrary() },
+          { key: "files", label: "Files", icon: "file-plus", onPress: () => void pickFile() }
         ]}
         onClose={() => setAttachMenuVisible(false)}
       />
@@ -794,6 +898,37 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(0,0,0,0.7)",
     alignItems: "center",
     justifyContent: "center"
+  },
+  // Non-image attachment chip — a wider rounded box (vs the square image
+  // thumb) with a file icon, the filename, and a formatted size. Shares
+  // the same height as the image thumb so a mixed tray stays aligned, and
+  // reuses thumbOverlay / thumbRemove for the uploading + remove states.
+  fileChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    width: 180,
+    height: 64,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    backgroundColor: theme.codeChipBg,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    position: "relative"
+  },
+  fileChipBody: {
+    flex: 1
+  },
+  fileChipName: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14
+  },
+  fileChipMeta: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12,
+    marginTop: 2
   },
   inputText: {
     flex: 1,

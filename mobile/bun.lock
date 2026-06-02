@@ -16,6 +16,7 @@
         "expo-audio": "~56.0.11",
         "expo-constants": "~56.0.16",
         "expo-dev-client": "~56.0.18",
+        "expo-document-picker": "~56.0.4",
         "expo-font": "~56.0.5",
         "expo-image-picker": "~56.0.15",
         "expo-linking": "~56.0.13",
@@ -653,6 +654,8 @@
     "expo-dev-menu": ["expo-dev-menu@56.0.16", "", { "dependencies": { "expo-dev-menu-interface": "~56.0.0" }, "peerDependencies": { "expo": "*", "react-native": "*" } }, "sha512-aVgoe+YGhrQnpwiB5BRI7G+uQnGHMUij32bBnEVdc6eJrVZCStxQlV9NeFbbXxrDhLJt6OSqbCHbLR+XToWUUA=="],
 
     "expo-dev-menu-interface": ["expo-dev-menu-interface@56.0.1", "", { "peerDependencies": { "expo": "*" } }, "sha512-odATx0ZL/Kis10sKSBiKiGQxAB6coSi/KQtKcMhnQVNno6FkRh5/4e5BqcEvpq2rNMTiQp4ytNAQHtdwbPXvGA=="],
+
+    "expo-document-picker": ["expo-document-picker@56.0.4", "", { "peerDependencies": { "expo": "*" } }, "sha512-75Apf74XNkYYohObIH19VZw42xpe0gmEnPccuzGXKVAzlvTYCfibSgW17F+6vt4paOfZEnAoZ1QFZM6dmaujRA=="],
 
     "expo-eas-client": ["expo-eas-client@56.0.1", "", {}, "sha512-r8h0ZIExacCrSRgY+ARfhMvFqosLHLJt1L7jyhvabfr1DN/ZDKDsYbovss2tzkpEUZGxZ3BPcB5epCwUsBBdOA=="],
 

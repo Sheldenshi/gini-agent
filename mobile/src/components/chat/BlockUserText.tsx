@@ -16,8 +16,14 @@ import { SelectableBlockText } from "./SelectableBlockText";
 // Attached images render as a wrapped grid of thumbnails above the
 // bubble. The bubble itself is omitted when the user only sent images
 // (no text), so an image-only message doesn't show an empty pill.
+// Non-image attachments (PDF, CSV, logs) render as static file chips —
+// the block carries no filename (ImageAttachment is {id, mimeType,
+// size}), so the chip shows the mime subtype + size, not a name. Without
+// this branch a sent file would render as a broken <Image>.
 export function BlockUserText({ block }: { block: UserTextBlock }) {
-  const images = block.images ?? [];
+  const attachments = block.images ?? [];
+  const images = attachments.filter((a) => a.mimeType.startsWith("image/"));
+  const files = attachments.filter((a) => !a.mimeType.startsWith("image/"));
   const hasText = block.text.length > 0;
   // Gateway uploads require the same bearer token the SSE / REST paths
   // use; <Image> on RN supports a headers prop on its source object.
@@ -45,6 +51,23 @@ export function BlockUserText({ block }: { block: UserTextBlock }) {
               </Pressable>
             );
           })}
+        </View>
+      ) : null}
+      {files.length > 0 ? (
+        <View style={styles.fileColumn}>
+          {files.map((file) => (
+            <View key={file.id} style={styles.fileChip}>
+              <Feather name="file" size={18} color={theme.userBubbleText} />
+              <View style={styles.fileChipBody}>
+                <Text style={styles.fileChipLabel} numberOfLines={1}>
+                  {fileTypeLabel(file.mimeType)}
+                </Text>
+                <Text style={styles.fileChipMeta} numberOfLines={1}>
+                  {formatBytes(file.size)}
+                </Text>
+              </View>
+            </View>
+          ))}
         </View>
       ) : null}
       {block.audio ? <VoiceBubble audio={block.audio} /> : null}
@@ -115,6 +138,20 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// The block carries no original filename, so the chip's primary line is a
+// short type label derived from the mime subtype (e.g. "application/pdf"
+// → "PDF", "text/csv" → "CSV").
+function fileTypeLabel(mimeType: string): string {
+  const sub = mimeType.split("/")[1] ?? mimeType;
+  return sub.toUpperCase();
 }
 
 const styles = StyleSheet.create({
@@ -189,6 +226,39 @@ const styles = StyleSheet.create({
     flexWrap: "wrap",
     justifyContent: "flex-end",
     gap: 6
+  },
+  // Sent non-image files stack as right-aligned chips reusing the
+  // user-bubble color so they read as part of the same message.
+  fileColumn: {
+    alignItems: "flex-end",
+    gap: 6
+  },
+  fileChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    minWidth: 180,
+    maxWidth: 240,
+    backgroundColor: theme.userBubble,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 4,
+    borderBottomLeftRadius: 18
+  },
+  fileChipBody: { flex: 1 },
+  fileChipLabel: {
+    color: theme.userBubbleText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14
+  },
+  fileChipMeta: {
+    color: theme.userBubbleText,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12,
+    opacity: 0.7,
+    marginTop: 2
   },
   imageWrapper: {
     width: 160,
