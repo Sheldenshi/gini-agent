@@ -22,7 +22,7 @@
 // decodes the RIFF header with the tiny pure-JS parser below and feeds the
 // Float32Array straight to the pipeline (which expects 16 kHz mono samples).
 
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -93,17 +93,23 @@ export function resolveSttChoice(): SttChoice {
 
 // Whether the local model's onnx weights are already on disk, so the first
 // voice message can be transcribed without the one-time ~727MB download. The
-// onnx-community build stores the encoder + merged decoder for the configured
-// dtype under <cacheDir>/<modelId>/onnx (q4 → encoder_model_q4.onnx +
-// decoder_model_merged_q4.onnx; fp32 omits the dtype suffix). Pure disk check —
-// no model load, no download.
+// onnx-community build stores the encoder + merged decoder under
+// <cacheDir>/<modelId>/onnx, with a dtype-dependent filename suffix
+// (encoder_model_q4.onnx, decoder_model_merged_quantized.onnx, etc.). The check
+// is dtype-agnostic — any downloaded encoder + merged-decoder pair counts as
+// cached — so a non-default GINI_STT_DTYPE still reports ready. Pure disk
+// check; no model load, no download.
 export function isLocalSttModelCached(modelId: string = localModelId()): boolean {
-  const dtype = localDtype();
   const onnxDir = join(localCacheDir(), modelId, "onnx");
-  const suffix = dtype === "fp32" ? "" : `_${dtype}`;
+  let files: string[];
+  try {
+    files = readdirSync(onnxDir);
+  } catch {
+    return false;
+  }
   return (
-    existsSync(join(onnxDir, `encoder_model${suffix}.onnx`)) &&
-    existsSync(join(onnxDir, `decoder_model_merged${suffix}.onnx`))
+    files.some((f) => f.startsWith("encoder_model") && f.endsWith(".onnx")) &&
+    files.some((f) => f.startsWith("decoder_model_merged") && f.endsWith(".onnx"))
   );
 }
 

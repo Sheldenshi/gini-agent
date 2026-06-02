@@ -221,8 +221,20 @@ describe("sttStatus", () => {
     expect(status.ready).toBe(false);
   });
 
-  test("local is ready once both onnx files exist for the configured dtype", () => {
+  test("local is ready once both onnx files exist", () => {
     process.env.GINI_LOCAL_STT_MODEL = modelId;
+    mkdirSync(onnxDir, { recursive: true });
+    writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
+    writeFileSync(join(onnxDir, "decoder_model_merged_q4.onnx"), "");
+    expect(sttStatus().ready).toBe(true);
+  });
+
+  test("readiness is dtype-agnostic — any downloaded encoder/decoder pair counts", () => {
+    // Configured dtype (q8) differs from the cached filenames (q4): the check
+    // must not key off the dtype suffix, so a model downloaded under a
+    // different dtype still reports ready.
+    process.env.GINI_LOCAL_STT_MODEL = modelId;
+    process.env.GINI_STT_DTYPE = "q8";
     mkdirSync(onnxDir, { recursive: true });
     writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
     writeFileSync(join(onnxDir, "decoder_model_merged_q4.onnx"), "");
