@@ -76,7 +76,7 @@ self-descriptively.
 - The browser cluster — 16 of 18 tools. `browser_fill_secrets` and
   `browser_connect` stay core: they are escalation / onboarding meta-tools that
   must be reachable before the cluster is loaded (a sign-in wall mid-task).
-- The nine self-config tools (ADR self-config-registry.md).
+- The self-config tools (ADR self-config-registry.md).
 
 Messaging-lifecycle, jobs, skill-lifecycle, identity-edit, and `mcp_call` tools
 stay core for now; deferring a cluster later is a per-tool flag flip using this

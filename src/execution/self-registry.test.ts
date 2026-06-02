@@ -96,8 +96,7 @@ describe("self operation registry", () => {
       "list_mcp_servers",
       "list_providers",
       "list_skills",
-      "list_toolsets",
-      "test_skill"
+      "list_toolsets"
     ]);
     expect(mutates).toEqual([
       "add_mcp_server",
@@ -114,6 +113,7 @@ describe("self operation registry", () => {
       "set_auto_approve_commands",
       "set_dangerous_patterns",
       "set_provider",
+      "test_skill",
       "update_self",
       "use_agent"
     ]);
@@ -123,6 +123,10 @@ describe("self operation registry", () => {
     expect(findSelfOperation("nope")).toBeUndefined();
     expect(findSelfOperation("get_self")).toBeDefined();
     expect(findSelfOperation("set_provider")?.tag).toBe("mutate");
+  });
+
+  test("test_skill is tagged mutate because it records a pass/fail counter on the skill", () => {
+    expect(findSelfOperation("test_skill")?.tag).toBe("mutate");
   });
 });
 
@@ -159,24 +163,6 @@ describe("direct self tools — query", () => {
       const parsed = JSON.parse(result.result) as { ok: boolean; toolsets: unknown[] };
       expect(parsed.ok).toBe(true);
       expect(Array.isArray(parsed.toolsets)).toBe(true);
-    }
-  });
-
-  test("test_skill is a query and reports a missing skill as {ok:false} without throwing", async () => {
-    const instance = `self-testskill-${Math.random().toString(36).slice(2, 8)}`;
-    const config = buildConfig(instance);
-    const taskId = await newTask(config);
-    const result = await dispatchToolCall(
-      config,
-      taskId,
-      "test_skill",
-      "call_1",
-      JSON.stringify({ skillId: "does_not_exist" })
-    );
-    expect(result.kind).toBe("sync");
-    if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean };
-      expect(parsed.ok).toBe(false);
     }
   });
 
@@ -270,6 +256,32 @@ describe("direct self tools — mutate", () => {
       const payloadArgs = approval?.payload.args as Record<string, unknown> | undefined;
       expect(payloadArgs?.provider).toBe("echo");
     }
+  });
+
+  test("auto-resolving a self.config op scrubs secret args from the resolved approval payload", async () => {
+    const instance = `self-scrub-payload-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_provider",
+      "call_1",
+      JSON.stringify({ provider: "echo", apiKey: "sk-super-secret" })
+    );
+    expect(result.kind).toBe("sync");
+    // The handler ran on approval (the real apiKey reached setSetupProvider),
+    // but the now-resolved authorization row served to clients must not retain
+    // the credential — executeApprovedAction redacts payload.args after the run.
+    const state = readState(instance);
+    const approval = state.authorizations.find(
+      (a) => a.action === "self.config" && (a.payload.opName as string) === "set_provider"
+    );
+    expect(approval).toBeDefined();
+    const payloadArgs = approval?.payload.args as Record<string, unknown> | undefined;
+    expect(payloadArgs?.apiKey).toBe("[redacted]");
+    // Non-secret args still survive so the historical row stays legible.
+    expect(payloadArgs?.provider).toBe("echo");
   });
 
   test("set_approval_mode auto-resolves in auto mode and lands the side effect on config", async () => {
@@ -392,5 +404,105 @@ describe("direct self tools — mutate", () => {
       expect(parsed.ok).toBe(false);
     }
     expect(config.autoApproveCommands).toBeUndefined();
+  });
+
+  test("set_auto_approve_commands rejects non-string elements without wiping the saved list", async () => {
+    const instance = `self-allowlist-nonstring-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    config.autoApproveCommands = ["git status"];
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_auto_approve_commands",
+      "call_1",
+      JSON.stringify({ patterns: [123] })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean };
+      expect(parsed.ok).toBe(false);
+    }
+    // The setter was never called, so the saved allowlist is untouched —
+    // a [123] payload must NOT silently overwrite it with an empty list.
+    expect(config.autoApproveCommands).toEqual(["git status"]);
+  });
+
+  test("set_dangerous_patterns rejects non-string elements without wiping the saved list", async () => {
+    const instance = `self-danger-nonstring-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    config.dangerousTerminalPatterns = ["rm -rf"];
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "set_dangerous_patterns",
+      "call_1",
+      JSON.stringify({ patterns: [123] })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean };
+      expect(parsed.ok).toBe(false);
+    }
+    expect(config.dangerousTerminalPatterns).toEqual(["rm -rf"]);
+  });
+
+  test("rotate_connector rejects a supplied purpose that doesn't exist on the connector", async () => {
+    const instance = `self-rotate-badpurpose-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    // Seed a connector with a single secret slot named "token". The handler
+    // checks the supplied purpose against the connector's secretRefs BEFORE
+    // calling updateConnector, so it never reaches the secret-write path.
+    await mutateState(instance, (state) => {
+      state.connectors.push({
+        id: "conn_rotate_1",
+        instance,
+        name: "rotate-test",
+        provider: "generic",
+        status: "configured",
+        scopes: [],
+        secretRefs: [{ purpose: "token", path: "conn_rotate_1/token" }],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        health: "unknown",
+        source: "user"
+      });
+    });
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "rotate_connector",
+      "call_1",
+      JSON.stringify({ connector: "conn_rotate_1", token: "new-secret", purpose: "ghost" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean; error?: string };
+      expect(parsed.ok).toBe(false);
+      expect(parsed.error).toContain("ghost");
+    }
+    // The bogus purpose did NOT get appended as a new secret slot.
+    const after = readState(instance).connectors.find((c) => c.id === "conn_rotate_1");
+    expect(after?.secretRefs.map((r) => r.purpose)).toEqual(["token"]);
+  });
+
+  test("test_skill routes through the seam and reports a missing skill as {ok:false}", async () => {
+    const instance = `self-testskill-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "test_skill",
+      "call_1",
+      JSON.stringify({ skillId: "does_not_exist" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind === "sync") {
+      const parsed = JSON.parse(result.result) as { ok: boolean };
+      expect(parsed.ok).toBe(false);
+    }
   });
 });

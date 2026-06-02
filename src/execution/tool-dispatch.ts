@@ -241,7 +241,6 @@ export async function dispatchToolCall(
     case "list_mcp_servers":
     case "list_connectors":
     case "list_toolsets":
-    case "test_skill":
     case "set_provider":
     case "use_agent":
     case "create_agent":
@@ -258,6 +257,7 @@ export async function dispatchToolCall(
     case "rotate_connector":
     case "update_self":
     case "rollback_skill":
+    case "test_skill":
       return await dispatchSelfOp(config, taskId, toolCallId, toolName, args);
     case "browser_connect": {
       // browser.connect is a SetupRequest (user-actor): the user opens the

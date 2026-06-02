@@ -1255,10 +1255,9 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   // SelfOperation in self-registry.ts (the handler home). All are DEFERRED:
   // their names + one-line summaries surface in the on-demand index, and the
   // model loads the ones it needs via load_tools. Query tools resolve
-  // synchronously; the three mutate tools (set_provider, use_agent,
-  // create_agent) route through the generic self.config approval branch in
-  // the dispatcher (auto-approved in `auto`, gated in `strict`). Args are
-  // passed at TOP LEVEL — no `{name, args}` envelope.
+  // synchronously; the mutate tools route through the generic self.config
+  // approval branch in the dispatcher (auto-approved in `auto`, gated in
+  // `strict`). Args are passed at TOP LEVEL — no `{name, args}` envelope.
   {
     toolset: "self",
     displayLabel: "Get self",
@@ -1673,7 +1672,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "test_skill",
-      description: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Read-only diagnostic. Call list_skills first for the id.",
+      description: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Records the test outcome on the skill, so it is approval-gated: auto-approved in `auto` mode, gated in `strict`. Call list_skills first for the id.",
       parameters: {
         type: "object",
         properties: {
@@ -1836,9 +1835,9 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
     // Self-knowledge surface. The self-config / introspection tools
-    // (get_self, list_*, set_provider, use_agent, create_agent,
-    // set_approval_mode) are direct deferred tools on the "self" toolset,
-    // which is not a legacy default;
+    // (get_self, the list_* readers, and the mutate ops like set_provider /
+    // use_agent / set_approval_mode) are direct deferred tools on the "self"
+    // toolset, which is not a legacy default;
     // gating on enable would mean a fresh instance couldn't answer "what
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by

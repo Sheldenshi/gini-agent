@@ -61,11 +61,11 @@ is actually used.
   without an operator-only toggle. They are `deferred: true`, so deferral —
   not gating — is what keeps them out of the live tools array until the model
   `load_tools` them.
-- The dispatcher routes the nine tool cases through one helper
+- The dispatcher routes the self tool cases through one helper
   (`dispatchSelfOp`): a `query` tool runs its handler synchronously; a
-  `mutate` tool (`set_provider`, `use_agent`, `create_agent`) routes through
-  the approval seam (`pendingOrAuto`) as PolicyAction `self.config`. The tool
-  name IS the op name and args are passed at top level.
+  `mutate` tool (`set_provider`, `use_agent`, …) routes through the approval
+  seam (`pendingOrAuto`) as PolicyAction `self.config`. The tool name IS the
+  op name and args are passed at top level.
 - `self.config` policy (ADR approval-mode.md): auto-approves under `auto` (the
   default — frictionless when the user says "set provider to deepseek"), gates
   under `strict`, auto-resolves under `yolo`. The approval row carries
@@ -86,12 +86,14 @@ is actually used.
 Seed operations:
 
 - `query` — `get_self`, `list_providers`, `list_agents`, `list_skills`,
-  `list_mcp_servers`, `list_connectors`, `list_toolsets`, `test_skill`.
+  `list_mcp_servers`, `list_connectors`, `list_toolsets`.
 - `mutate` — `set_provider`, `use_agent`, `create_agent`,
   `set_approval_mode`, `enable_toolset`, `disable_toolset`, `delete_agent`,
   `remove_provider`, `set_auto_approve_commands`, `set_dangerous_patterns`,
   `add_mcp_server`, `remove_mcp_server`, `remove_connector`,
-  `rotate_connector`, `update_self`, `rollback_skill`.
+  `rotate_connector`, `update_self`, `rollback_skill`, `test_skill`.
+  (`test_skill` records its pass/fail outcome on the skill — a state write —
+  so it is `mutate`, not a read.)
 
 ## Config vs Action
 
@@ -139,7 +141,7 @@ operations, add their catalog entries (deferred), and tag their risk.
 
 ## Acceptance Checks
 
-- `buildToolCatalog` carries the nine self tools (toolset `self`,
+- `buildToolCatalog` carries the self tools (toolset `self`,
   `deferred: true`); `applyDeferralFilter(catalog, ∅)` excludes them until
   loaded.
 - A `query` tool (`get_self`) dispatched directly returns a sync result; a

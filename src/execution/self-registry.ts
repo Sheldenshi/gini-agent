@@ -42,8 +42,10 @@ export interface SelfOperation {
   // gate provider/agent changes.
   tag: "query" | "mutate";
   // JSON Schema for the op's args — same shape a tool's function.parameters
-  // carries. The catalog entry for this op mirrors this schema in its
-  // function.parameters; this field is the canonical source it is copied from.
+  // carries. The catalog entry for this op carries the schema the MODEL
+  // actually sees in its function.parameters; this field is documentation
+  // that mirrors it and is no longer read by any consumer at runtime (only
+  // `tag` and `handler` are). Keep the two in sync by hand when editing an op.
   schema: Record<string, unknown>;
   handler: (config: RuntimeConfig, taskId: string, args: Record<string, unknown>) => Promise<string>;
 }
@@ -523,7 +525,13 @@ async function setAutoApproveCommands(
   if (!Array.isArray(args.patterns)) {
     return JSON.stringify({ ok: false, error: "set_auto_approve_commands requires 'patterns' to be an array of strings." });
   }
-  const patterns = args.patterns.filter((p): p is string => typeof p === "string");
+  // Reject before calling the setter: it silently drops non-strings, so a
+  // payload like [123] would otherwise become [] and OVERWRITE the saved
+  // allowlist with an empty list.
+  if (!args.patterns.every((p) => typeof p === "string")) {
+    return JSON.stringify({ ok: false, error: "patterns must be an array of strings." });
+  }
+  const patterns = args.patterns as string[];
   const result = updateAutoApproveSettings(config, { patterns });
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -544,7 +552,13 @@ async function setDangerousPatterns(
   if (!Array.isArray(args.patterns)) {
     return JSON.stringify({ ok: false, error: "set_dangerous_patterns requires 'patterns' to be an array of strings." });
   }
-  const patterns = args.patterns.filter((p): p is string => typeof p === "string");
+  // Reject before calling the setter: it silently drops non-strings, so a
+  // payload like [123] would otherwise become [] and OVERWRITE the saved
+  // pattern list with an empty list.
+  if (!args.patterns.every((p) => typeof p === "string")) {
+    return JSON.stringify({ ok: false, error: "patterns must be an array of strings." });
+  }
+  const patterns = args.patterns as string[];
   const result = updateAutoApproveSettings(config, { dangerousTerminalPatterns: patterns });
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -653,11 +667,20 @@ async function rotateConnector(
   }
   // Resolve which secret slot the token rotates. Writing an arbitrary
   // `purpose` would create an unused credential slot the connector never
-  // reads, so when the caller omits `purpose` we only auto-pick when the
-  // record has exactly one existing slot; ambiguity surfaces the choices.
+  // reads (updateConnector appends an unknown purpose as a new ref), so the
+  // purpose must match an EXISTING slot. When the caller omits `purpose` we
+  // auto-pick only when the record has exactly one existing slot; ambiguity
+  // surfaces the choices.
+  const purposes = connector.secretRefs.map((ref) => ref.purpose);
   let purpose = typeof args.purpose === "string" ? args.purpose.trim() : "";
-  if (!purpose) {
-    const purposes = connector.secretRefs.map((ref) => ref.purpose);
+  if (purpose) {
+    if (!purposes.includes(purpose)) {
+      return JSON.stringify({
+        ok: false,
+        error: `purpose '${purpose}' not found on connector; available: [${purposes.join(", ")}].`
+      });
+    }
+  } else {
     if (purposes.length === 1) {
       purpose = purposes[0]!;
     } else if (purposes.length === 0) {
@@ -1059,8 +1082,8 @@ export const SELF_OPERATIONS: SelfOperation[] = [
   },
   {
     name: "test_skill",
-    summary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Diagnostic — no approval needed.",
-    tag: "query",
+    summary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Records the test outcome on the skill (success/failure counters), so it routes through the approval seam.",
+    tag: "mutate",
     schema: {
       type: "object",
       properties: {

@@ -79,6 +79,7 @@ import {
 } from "./execution/chat-task-emit";
 import { approvalToolCallId } from "./execution/tool-dispatch";
 import { findSelfOperation } from "./execution/self-registry";
+import { redactSensitiveToolArgs } from "./execution/tool-args-redact";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
@@ -2128,6 +2129,17 @@ async function runApprovedAction(
         },
         approvalAgentContext(approval)
       );
+      // Scrub any secret args (set_provider.apiKey, rotate_connector.token,
+      // add_mcp_server.headers) from the now-resolved approval payload. The
+      // approvals list serves the payload to clients, so the historical row
+      // must not retain credentials. The handler already ran above, so the
+      // real args are no longer needed. The brief pending window (strict
+      // mode, before approval) keeps the real args so the action can execute
+      // on approval — only the approving user sees that, which is acceptable.
+      const row = state.authorizations.find((a) => a.id === approval.id);
+      if (row && row.payload.args && typeof row.payload.args === "object" && !Array.isArray(row.payload.args)) {
+        row.payload.args = redactSensitiveToolArgs(row.payload.args as Record<string, unknown>);
+      }
     });
     if (shouldResumeChat && chatToolCallId) {
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);

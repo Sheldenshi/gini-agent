@@ -46,6 +46,7 @@ import type {
   ToolCallStatus
 } from "../types";
 import { chatBlockArgsPreviewFor, chatBlockLabelFor } from "./tool-catalog";
+import { redactSensitiveToolArgs } from "./tool-args-redact";
 
 // Resolved chat-task emission context. Callers pass this through every
 // per-iteration emission so we don't re-read state on each row.
@@ -201,10 +202,13 @@ export function finalizeAssistantText(
 }
 
 // Insert a tool_call block in `running` status right before dispatch.
-// `argsFull` carries the verbatim parsed JSON args (clients expand to
-// it for the "show full args" affordance); `argsPreview` is the inline
+// `argsFull` carries the parsed JSON args with credential-bearing values
+// scrubbed via redactSensitiveToolArgs (clients expand to it for the
+// "show full args" affordance, so a secret arg — apiKey / token /
+// Authorization header — must not land here); `argsPreview` is the inline
 // headline (file path / URL / command), capped to 80 chars by
-// chatBlockArgsPreviewFor.
+// chatBlockArgsPreviewFor. argsFull is DISPLAY-only — dispatch parses the
+// raw tool args independently, so redacting here does not affect execution.
 export function emitToolCallRunning(
   ctx: ChatEmitContext | undefined,
   params: {
@@ -219,7 +223,7 @@ export function emitToolCallRunning(
     toolName: params.toolName,
     displayLabel: chatBlockLabelFor(params.toolName),
     argsPreview: chatBlockArgsPreviewFor(params.toolName, params.args),
-    argsFull: params.args,
+    argsFull: redactSensitiveToolArgs(params.args),
     status: "running",
     callId: params.callId,
     ...bookkeepingFor(ctx)
