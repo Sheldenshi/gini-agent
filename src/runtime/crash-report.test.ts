@@ -1,5 +1,5 @@
 // Tests for the pure crash-report module: fingerprint stability/divergence,
-// redaction (patterns + literal secrets-env + tunnel secret), jsonl-tail
+// redaction (patterns + literal secrets-env), jsonl-tail
 // payload dropping, and clock-injected rate-limit state round-trips.
 //
 // All disk writes are routed to a unique GINI_STATE_ROOT under /tmp so nothing

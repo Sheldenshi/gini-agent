@@ -301,7 +301,7 @@ export function useDeleteChatSession() {
 //   - All other kinds are append-only, but the merge logic is uniform.
 
 // Merge the REST seed snapshot with whatever's already in state. A live
-// SSE/poll frame can arrive BEFORE the seed promise resolves; a naive
+// SSE frame can arrive BEFORE the seed promise resolves; a naive
 // setBlocks(seed) would wipe it. For id collisions, prev (live) wins
 // because the live frame is fresher than the REST snapshot — assistant
 // streaming deltas in particular keep updating the same block id, and
@@ -378,7 +378,7 @@ export function useChatBlocks(sessionId: string | null) {
     api<ChatBlock[]>(`/chat/${sessionId}/blocks`)
       .then((initial) => {
         if (cancelled || activeSessionRef.current !== sessionId) return;
-        // Merge with whatever's already in state — a live SSE/poll
+        // Merge with whatever's already in state — a live SSE
         // block can arrive BEFORE the seed promise resolves, and a
         // plain setBlocks(sorted) would silently drop it.
         setBlocks((prev) => mergeSeedWithLive(initial, prev));

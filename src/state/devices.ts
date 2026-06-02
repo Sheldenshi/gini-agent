@@ -61,9 +61,8 @@ export interface UpsertDeviceInput {
   credentialId: string;
   platform: "ios";
   bundleId: string;
-  // Optional so legacy callers (CLI tests, fixtures) keep registering as
-  // loopback without churn. Production registration through src/http.ts
-  // always passes the explicit value derived from the request marker.
+  // Optional; "loopback" is the only origin, so callers may omit it and
+  // upsertDevice fills the default.
   origin?: DeviceOrigin;
 }
 
