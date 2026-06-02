@@ -14,7 +14,8 @@ import type {
   AgentsResponse,
   ChatBlock,
   ChatSession,
-  RuntimeStatus
+  RuntimeStatus,
+  Task
 } from "./types";
 
 // Web parity: chat task statuses where partial text is no longer arriving.
@@ -42,6 +43,19 @@ export function useStatus(options?: Partial<UseQueryOptions<RuntimeStatus>>) {
     queryKey: ["status"],
     queryFn: () => api<RuntimeStatus>("/status"),
     ...options
+  });
+}
+
+// Speech-to-text readiness. `ready` is false until the local whisper model
+// has finished its one-time download, which lets the composer warn the user
+// that the first voice message will take a moment to set up. Cached for a
+// while since readiness only flips once; useSendMessage invalidates this key
+// after a successful send so the flip is picked up promptly.
+export function useVoiceStatus() {
+  return useQuery<{ provider: string; model: string; ready: boolean }>({
+    queryKey: ["voice-status"],
+    queryFn: () => api<{ provider: string; model: string; ready: boolean }>("/stt/status"),
+    staleTime: 60_000
   });
 }
 
@@ -719,15 +733,20 @@ export function useMarkChatUnread() {
 export interface SendMessageInput {
   content: string;
   images?: UploadRef[];
+  // Voice-message attachment. When set with empty content the gateway
+  // transcribes the audio and uses the transcript as the message text;
+  // the ref is also persisted so the thread renders a playable bubble.
+  audio?: { id: string; mimeType: string; size: number; durationMs?: number };
 }
 
 export function useSendMessage(sessionId: string | null) {
   const qc = useQueryClient();
   return useMutation<{ taskId: string }, Error, SendMessageInput>({
-    mutationFn: ({ content, images }: SendMessageInput) => {
+    mutationFn: ({ content, images, audio }: SendMessageInput) => {
       if (!sessionId) throw new Error("No session selected");
       const body: Record<string, unknown> = { content };
       if (images && images.length > 0) body.images = images;
+      if (audio) body.audio = audio;
       return api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify(body)
@@ -739,6 +758,21 @@ export function useSendMessage(sessionId: string | null) {
       // legacy session query (used by older list affordances) and the
       // sidebar chat list so titles + previews refresh promptly.
       qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+      // A successful send means the local STT model has finished downloading
+      // (transcription ran), so re-fetch readiness — the first-run setup
+      // notice should only appear once.
+      qc.invalidateQueries({ queryKey: ["voice-status"] });
+    }
+  });
+}
+
+export function useCancelTask() {
+  const qc = useQueryClient();
+  return useMutation<Task, Error, string>({
+    mutationFn: (taskId: string) => api<Task>(`/tasks/${taskId}/cancel`, { method: "POST" }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["chat"] });
       qc.invalidateQueries({ queryKey: ["chats"] });
     }
   });

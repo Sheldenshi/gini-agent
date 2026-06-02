@@ -18,7 +18,7 @@ You move bytes between three places:
 - **External URLs** — any https endpoint (signed PUT/GET URLs from APIs, raw file URLs, etc.).
 - **Workspace files** — files on disk under the agent's workspace root.
 
-This skill ships three scripts you invoke via `skill_run`, plus a recipe for each common direction. The base primitive `vision_query` (asking the model to describe an image upload) is in core, not here — combine it with the scripts below when the model needs to "see" what it just moved.
+This skill ships four scripts you invoke via `skill_run`, plus a recipe for each common direction. The base primitive `vision_query` (asking the model to describe an image upload) is in core, not here — combine it with the scripts below when the model needs to "see" what it just moved.
 
 ## When to use this skill
 
@@ -27,7 +27,7 @@ This skill ships three scripts you invoke via `skill_run`, plus a recipe for eac
 - `code_exec` / `terminal_exec` produced a workspace file (chart, exported PDF, downloaded artifact) and you need to send it somewhere or run `vision_query` on it.
 - An MCP server returned an `assetUrl` / signed URL pointing to file content and you want to do something with the bytes.
 
-## The three scripts
+## The four scripts
 
 ### `signed-upload` — chat-attached upload → external URL
 
@@ -89,15 +89,38 @@ skill_run({
 
 Path is workspace-relative and escape-protected (same guard as `file_read`).
 
+### `materialize` — Gini upload → workspace file
+
+The inverse of `promote-file`: write a Gini upload's bytes to a workspace file. Used when you need a chat-attached (or downloaded / promoted) upload on disk so `terminal_exec`, `code_exec`, or a git flow can read the actual file — e.g. committing an image to an asset branch.
+
+```
+skill_run({
+  skill: "attachments",
+  script: "materialize",
+  args: {
+    uploadId: "abc-123-...",   // from the user message marker, signed-download, or promote-file
+    path: "assets/diagram.png" // optional, workspace-relative; defaults to the manifest filename
+  }
+})
+// → { ok: true, path: "assets/diagram.png", absPath: "/abs/.../assets/diagram.png",
+//     mimeType: "image/png", size: 36116, filename: "diagram.png" }
+```
+
+Destination is workspace-relative and escape-protected (same guard as `promote-file`). When `path` is omitted it defaults to the upload's original filename (basename, sanitized) at the workspace root, or `<uploadId>.<ext>` when the manifest has none. `absPath` is the absolute on-disk path — hand it to commands that need an absolute path (e.g. `git hash-object -w <absPath>`).
+
 ## Recipe patterns
 
-### Filing an issue with a chat-attached screenshot (Linear / GitHub / etc.)
+### Filing an issue with a chat-attached screenshot (providers with a signed-upload API)
+
+Applies to providers that expose a public prepare → PUT → finalize upload API (Linear, S3 / any presigned-URL backend):
 
 1. **Prepare** — call the provider's prepare-upload tool via `mcp_call`. Linear: `prepare_attachment_upload({issue, filename, contentType, size})`. The response carries the signed URL, headers to send verbatim, and an asset URL for the finalize step.
 2. **PUT bytes** — `skill_run({skill: "attachments", script: "signed-upload", args: {uploadId, url: <prepared.url>, headers: <prepared.headers>}})`.
 3. **Finalize** — call the provider's finalize tool. Linear: `create_attachment_from_upload({issue, assetUrl, title})`.
 
 `uploadId` is in the user message marker: `Attached image uploads (in order): - <id> (<mime>, <bytes> bytes)`. Read the mime and size from the same marker so the prepare call doesn't fail with `EntityTooLarge` / `EntityTooSmall`.
+
+Targets without a public upload API (e.g. GitHub issues) don't use this recipe — `materialize` the upload to disk instead (recipe below) and follow that integration skill's own attach flow.
 
 ### Reading a screenshot the user posted as a URL
 
@@ -116,10 +139,17 @@ Path is workspace-relative and escape-protected (same guard as `file_read`).
 2. `skill_run({skill: "attachments", script: "promote-file", args: {path: "chart.png"}})` → `{uploadId, mimeType, size}`.
 3. Run the 3-step Linear flow with that `uploadId`.
 
+### Putting a chat-attached screenshot on disk
+
+When an integration needs the actual file (not an upload id) — e.g. a git flow that has to `git hash-object` the bytes:
+
+1. `skill_run({skill: "attachments", script: "materialize", args: {uploadId: "<id-from-marker>"}})` → `{path, absPath}`.
+2. Hand off `absPath` to the integration skill that consumes a file — it owns the provider-specific attach flow (e.g. github-issues' "Attaching an image to an issue").
+
 ## Rules
 
 1. **Always invoke through `skill_run`** with `skill: "attachments"`. The scripts read JSON from stdin and write JSON to stdout — don't try to `terminal_exec` them by hand.
 2. **Pass signed-upload headers through verbatim** from the prepare step's response. Omitting one or rewriting the casing usually means a 403 from the storage backend.
 3. **Signed URLs expire fast** (often 60 seconds). On `signed-upload` failure, re-run the provider's prepare step rather than retrying with the stale URL.
 4. **Don't attempt vision on non-image uploads.** `vision_query` only accepts `image/png` and `image/jpeg`. Convert via `terminal_exec` (`sips -s format jpeg ...`) and `promote-file` the result if you need to vision a different format.
-5. **The provider-specific prepare/finalize steps live in each integration's skill** (Linear's `SKILL.md` documents the Linear-specific args, GitHub's would document its own). This skill owns the byte-PUT/byte-GET middle steps only.
+5. **The provider-specific prepare/finalize (or other attach) steps live in each integration's skill** (Linear's `SKILL.md` documents Linear's args; `github-issues` documents GitHub's attach flow). This skill owns the byte-PUT / byte-GET / materialize middle steps only.

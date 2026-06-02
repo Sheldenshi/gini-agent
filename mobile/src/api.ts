@@ -126,7 +126,7 @@ export interface UploadRef {
 // FormDataPart implementation"). FileSystem.uploadAsync streams the
 // file from disk through native URLSession, sidestepping the polyfill
 // and avoiding loading the bytes into JS memory at all.
-export async function uploadImage(file: {
+async function uploadFile(file: {
   uri: string;
   name: string;
   mimeType: string;
@@ -152,6 +152,25 @@ export async function uploadImage(file: {
     throw new ApiError(response.status, message);
   }
   return value as UploadRef;
+}
+
+export function uploadImage(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  return uploadFile(file);
+}
+
+// Voice-message upload. The gateway's /api/uploads gate accepts audio/*
+// alongside image/*; the recorder hands us a 16 kHz mono WAV with an
+// explicit `audio/wav` mimeType so it passes the prefix check.
+export function uploadAudio(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  return uploadFile(file);
 }
 
 // Absolute URL for a stored upload. The gateway serves the bytes with

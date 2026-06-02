@@ -12,6 +12,7 @@ export type {
   ChatBlock,
   ChatBlockKind,
   UserTextBlock,
+  AudioAttachment,
   AssistantTextBlock,
   ToolCallBlock,
   ToolCallStatus,

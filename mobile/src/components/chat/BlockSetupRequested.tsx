@@ -11,20 +11,29 @@ export function BlockSetupRequested({
 }: {
   block: SetupRequestedBlock;
 }) {
-  const title = block.action === "browser.connect"
-    ? "Connect to agent's browser"
-    : block.action === "connector.request"
-      ? "Provider setup"
-      : block.action === "browser.fill_secret"
-        ? "Fill credentials"
-        : block.action;
+  const title =
+    block.action === "browser.connect"
+      ? "Browser sign-in needed"
+      : block.action === "connector.request"
+        ? "Connection setup needed"
+        : block.action === "browser.fill_secret"
+          ? "Credentials needed"
+          : block.action;
+  const hint =
+    block.action === "connector.request"
+      ? "Finish this setup in Gini on your Mac. This chat is paused until the connection is completed or the turn is stopped."
+      : block.action === "browser.connect"
+        ? "Finish signing in from Gini on your Mac. This chat is paused until setup is completed or the turn is stopped."
+        : block.action === "browser.fill_secret"
+          ? "Enter the requested value from Gini on your Mac. This chat is paused until the value is submitted or the turn is stopped."
+          : "Open Gini on your Mac to continue, or stop this turn from the composer.";
   return (
     <View style={styles.row}>
       <View style={styles.header}>
         <Text style={styles.action}>{title}</Text>
       </View>
       <Text style={styles.summary}>{block.summary}</Text>
-      <Text style={styles.hint}>Open the chat on the web client to continue.</Text>
+      <Text style={styles.hint}>{hint}</Text>
     </View>
   );
 }

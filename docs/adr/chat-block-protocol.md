@@ -169,8 +169,13 @@ remote previews, screen readers) would need the same translation code.
   `TOOL_DEFS` entry plus `chatBlockLabelFor` / `chatBlockArgsPreviewFor`
   helpers in `src/execution/tool-catalog.ts` keep the per-tool
   vocabulary in one place. `argsPreview` is capped at 80 chars (single
-  bubble line on a phone); `argsFull` is the verbatim parsed JSON for
-  "show full args" affordances.
+  bubble line on a phone); `argsFull` is the parsed JSON for
+  "show full args" affordances, with credential-bearing keys
+  (`apiKey`, `token`, `headers`, …) replaced by `[redacted]` via
+  `redactSensitiveToolArgs` (`src/execution/tool-args-redact.ts`). The
+  same helper scrubs the resolved `self.config` approval payload, so a
+  tool's secret args never persist to a client-rendered surface (the
+  real values still reach the handler for execution).
 
 - The SSE endpoint is its own handler (`chatBlockStream` in
   `src/http.ts`), not a reuse of the existing global `eventStream`.
@@ -215,7 +220,12 @@ remote previews, screen readers) would need the same translation code.
 
 - **Write paths:**
   - `submitChatMessage` inserts the `user_text` block alongside the
-    legacy ChatMessageRecord.
+    legacy ChatMessageRecord. The block carries optional `images` and
+    `audio` upload refs (`{ id, mimeType, size }`); clients fetch the
+    bytes via `GET /api/uploads/:id`. A voice message's `audio` is
+    render-only — it is transcribed on the gateway and only the
+    transcript becomes the block text and model input (see
+    [voice-messages-and-local-stt.md](voice-messages-and-local-stt.md)).
   - `runChatTask` emits `phase("Thinking")` before each model call,
     `assistant_text` on streaming deltas (full text on every frame),
     `phase("Working: <tool>")` + `tool_call(running)` before each

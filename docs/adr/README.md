@@ -39,3 +39,5 @@ Each file in this directory captures one architecture decision: the context, the
 - [Skill Env Containment For terminal_exec And skill_run](skill-env-containment.md)
 - [Per-Skill Connector Consent Grant](skill-connector-consent.md)
 - [Chat-Driven Credential Provisioning](chat-credential-provisioning.md)
+- [Provider Re-Authentication Guidance](provider-reauth-guidance.md)
+- [Voice Messages With Gateway-Side Local Speech-To-Text](voice-messages-and-local-stt.md)

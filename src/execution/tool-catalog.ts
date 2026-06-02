@@ -916,7 +916,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
           approvalMode: {
             type: "string",
             enum: ["strict", "auto", "yolo"],
-            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" (instance default) auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
+            description: "Approval policy for this job's spawned tasks only. \"strict\" gates every approval-eligible action. \"auto\" auto-approves file writes / safe shell commands, gates dangerous shell patterns. \"yolo\" bypasses everything (full audit trail still written). When omitted, the spawned task inherits the operator's instance default."
           },
           dangerousTerminalPatterns: {
             type: "array",
@@ -1257,10 +1257,9 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   // SelfOperation in self-registry.ts (the handler home). All are DEFERRED:
   // their names + one-line summaries surface in the on-demand index, and the
   // model loads the ones it needs via load_tools. Query tools resolve
-  // synchronously; the four mutate tools (set_provider, use_agent,
-  // create_agent, rename_agent) route through the generic self.config approval
-  // branch in the dispatcher (auto-approved in `auto`, gated in `strict`). Args
-  // are passed at TOP LEVEL — no `{name, args}` envelope.
+  // synchronously; the mutate tools route through the generic self.config
+  // approval branch in the dispatcher (auto-approved in `auto`, gated in
+  // `strict`). Args are passed at TOP LEVEL — no `{name, args}` envelope.
   {
     toolset: "self",
     displayLabel: "Get self",
@@ -1429,6 +1428,280 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
         required: ["agentId", "name"]
       }
     }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set approval mode",
+    deferred: true,
+    indexSummary: "Set the runtime approval mode (strict / auto / yolo).",
+    type: "function",
+    function: {
+      name: "set_approval_mode",
+      description: "Set the runtime approval mode: strict (gate every high-risk action), auto (auto-approve safe actions, gate dangerous shell), or yolo (skip the per-action gate). Use when the user says 'set permissions to yolo' or 'stop asking me to approve'. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["strict", "auto", "yolo"], description: "strict | auto | yolo." }
+        },
+        required: ["mode"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "List toolsets",
+    deferred: true,
+    indexSummary: "Instance toolsets with status (enabled/disabled), description, and the tools each gates.",
+    type: "function",
+    function: {
+      name: "list_toolsets",
+      description: "List the instance toolsets with id, name, status (enabled/disabled), description, and the tool names each gates. Read-only. Call before enable_toolset/disable_toolset.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Enable toolset",
+    deferred: true,
+    indexSummary: "Enable a toolset so its tools become available. Reversible via disable_toolset.",
+    type: "function",
+    function: {
+      name: "enable_toolset",
+      description: "Enable a toolset so its tools become available to agents on this instance. Call list_toolsets first for the name. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+        },
+        required: ["toolset"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Disable toolset",
+    deferred: true,
+    indexSummary: "Disable a toolset so its tools stop being offered. Self-config tools bypass gating, so this can't lock the agent out. Reversible via enable_toolset.",
+    type: "function",
+    function: {
+      name: "disable_toolset",
+      description: "Disable a toolset so its tools stop being offered to agents. Self-config tools bypass toolset gating, so this can't lock the agent out of its own config surface; reversible via enable_toolset. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+        },
+        required: ["toolset"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Delete agent",
+    deferred: true,
+    indexSummary: "Hard-delete an agent and its memory bank. Refuses the default and the active agent (switch first).",
+    type: "function",
+    function: {
+      name: "delete_agent",
+      description: "Hard-delete an agent and its per-agent memory bank. Refuses the default agent and the currently-active agent (switch via use_agent first). Call list_agents for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          agentId: { type: "string", description: "Agent id or name to delete (e.g. 'agent_abc123' or 'athena')." }
+        },
+        required: ["agentId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove provider",
+    deferred: true,
+    indexSummary: "Disconnect an env-keyed LLM provider: scrub its API key. Falls back to codex/echo if it was active.",
+    type: "function",
+    function: {
+      name: "remove_provider",
+      description: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex and local cannot be removed this way. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek')." }
+        },
+        required: ["provider"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set auto-approve commands",
+    deferred: true,
+    indexSummary: "REPLACE the auto-approve command allowlist. Include existing entries (from get_self.approvalSettings) to keep them.",
+    type: "function",
+    function: {
+      name: "set_auto_approve_commands",
+      description: "REPLACE the auto-approve command allowlist (shell prefixes auto-approved without gating). This REPLACES the existing list — read get_self.approvalSettings.autoApproveCommands first and include any entries you want to keep. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          patterns: {
+            type: "array",
+            description: "The FULL allowlist of command prefixes to auto-approve. This REPLACES the existing list — include existing entries (visible via get_self.approvalSettings.autoApproveCommands) to keep them.",
+            items: { type: "string" }
+          }
+        },
+        required: ["patterns"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Set dangerous patterns",
+    deferred: true,
+    indexSummary: "REPLACE the dangerous-terminal-pattern list. Include existing entries (from get_self.approvalSettings) to keep them.",
+    type: "function",
+    function: {
+      name: "set_dangerous_patterns",
+      description: "REPLACE the dangerous-terminal-pattern list (substrings that always force a gate even in auto). This REPLACES the existing list — read get_self.approvalSettings.dangerousTerminalPatterns first and include any entries you want to keep. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          patterns: {
+            type: "array",
+            description: "The FULL list of dangerous command substrings that always require approval. This REPLACES the existing list — include existing entries (visible via get_self.approvalSettings.dangerousTerminalPatterns) to keep them.",
+            items: { type: "string" }
+          }
+        },
+        required: ["patterns"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Add MCP server",
+    deferred: true,
+    indexSummary: "Register a new MCP server (stdio command or http url) so its tools become available.",
+    type: "function",
+    function: {
+      name: "add_mcp_server",
+      description: "Register a new MCP server so its tools become available. http transport needs a url; stdio needs a command. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Server name (e.g. 'linear')." },
+          transport: { type: "string", enum: ["stdio", "http"], description: "Transport. Defaults to 'stdio', or 'http' when a url is given." },
+          command: { type: "string", description: "Executable for a stdio server (e.g. 'npx'). Required for stdio." },
+          args: { type: "array", description: "Argument list for the stdio command.", items: { type: "string" } },
+          url: { type: "string", description: "Streamable-HTTP endpoint for an http server (e.g. 'https://mcp.linear.app/mcp'). Required for http." },
+          headers: { type: "object", description: "Static or ${ENV}-placeholder header map for an http server." },
+          exposedTools: { type: "array", description: "Optional whitelist of tool names to expose from this server.", items: { type: "string" } }
+        },
+        required: ["name"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove MCP server",
+    deferred: true,
+    indexSummary: "Disable a registered MCP server so its tools stop being offered.",
+    type: "function",
+    function: {
+      name: "remove_mcp_server",
+      description: "Disable a registered MCP server so its tools stop being offered. Call list_mcp_servers first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server id or name." }
+        },
+        required: ["server"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Remove connector",
+    deferred: true,
+    indexSummary: "Disconnect a connector: wipe its secrets (user) or tombstone it (auto-detected).",
+    type: "function",
+    function: {
+      name: "remove_connector",
+      description: "Disconnect a connector: wipe its encrypted secrets (user connectors) or tombstone it (auto-detected ones). Call list_connectors first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          connector: { type: "string", description: "Connector id to remove." }
+        },
+        required: ["connector"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Rotate connector",
+    deferred: true,
+    indexSummary: "Rotate a connector's credential — write a new token into one of its secret slots.",
+    type: "function",
+    function: {
+      name: "rotate_connector",
+      description: "Rotate a connector's credential — write a new token into one of its secret slots. Pass 'purpose' when the connector has more than one slot. Call list_connectors first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          connector: { type: "string", description: "Connector id to rotate." },
+          token: { type: "string", description: "The new secret value to store." },
+          purpose: { type: "string", description: "Which secret slot to write (e.g. 'token'). Optional when the connector has exactly one slot; required when it has several." }
+        },
+        required: ["connector", "token"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Update runtime",
+    deferred: true,
+    indexSummary: "Update the runtime to the latest commit and RESTART the gateway to run the new code.",
+    type: "function",
+    function: {
+      name: "update_self",
+      description: "Update the runtime to the latest commit (git fetch + reset + bun install) and RESTART the gateway so the new code takes effect. Only works from the installer-managed runtime. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Roll back skill",
+    deferred: true,
+    indexSummary: "Roll a skill back to its previous saved version. Fails if it has no rollback history.",
+    type: "function",
+    function: {
+      name: "rollback_skill",
+      description: "Roll a skill back to its previous saved version. Fails if the skill has no rollback history. Call list_skills first for the id. Approval-gated: auto-approved in `auto` mode, gated in `strict`.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name to roll back." }
+        },
+        required: ["skillId"]
+      }
+    }
+  },
+  {
+    toolset: "self",
+    displayLabel: "Test skill",
+    deferred: true,
+    indexSummary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail.",
+    type: "function",
+    function: {
+      name: "test_skill",
+      description: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Records the test outcome on the skill, so it is approval-gated: auto-approved in `auto` mode, gated in `strict`. Call list_skills first for the id.",
+      parameters: {
+        type: "object",
+        properties: {
+          skillId: { type: "string", description: "Skill id or name to test." }
+        },
+        required: ["skillId"]
+      }
+    }
   }
 ];
 
@@ -1582,15 +1855,16 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // prompt regardless of toolset state, so always-on here is safe.
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
-    // Self-knowledge surface. The 10 self-config / introspection tools
-    // (get_self, list_*, set_provider, use_agent, create_agent, rename_agent)
-    // are direct deferred tools on the "self" toolset, which is not a legacy default;
+    // Self-knowledge surface. The self-config / introspection tools
+    // (get_self, the list_* readers, and the mutate ops like set_provider /
+    // use_agent / set_approval_mode) are direct deferred tools on the "self"
+    // toolset, which is not a legacy default;
     // gating on enable would mean a fresh instance couldn't answer "what
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by
     // applyDeferralFilter) is what keeps them out of the live tools array
-    // until the model loads them. Query tools are read-only; the four
-    // mutate tools gate via the self.config approval branch in dispatch.
+    // until the model loads them. Query tools are read-only; the mutate
+    // tools gate via the self.config approval branch in dispatch.
     if (tool.toolset === "self") return true;
     if (!enabled.has(tool.toolset)) return false;
     if (agentToolsetFilter && !agentToolsetFilter.has(tool.toolset)) return false;
@@ -1908,6 +2182,8 @@ export function chatBlockArgsPreviewFor(
     case "list_agents":
     case "list_mcp_servers":
     case "list_connectors":
+    case "list_toolsets":
+    case "update_self":
       return "";
     case "list_skills":
       return truncatePreview(previewValue(safe.nameContains) || previewValue(safe.status) || "");
@@ -1919,6 +2195,28 @@ export function chatBlockArgsPreviewFor(
       return truncatePreview(previewValue(safe.name));
     case "rename_agent":
       return truncatePreview(previewValue(safe.name));
+    case "set_approval_mode":
+      return truncatePreview(previewValue(safe.mode));
+    case "enable_toolset":
+    case "disable_toolset":
+      return truncatePreview(previewValue(safe.toolset));
+    case "delete_agent":
+      return truncatePreview(previewValue(safe.agentId));
+    case "remove_provider":
+      return truncatePreview(previewValue(safe.provider));
+    case "set_auto_approve_commands":
+    case "set_dangerous_patterns":
+      return truncatePreview(Array.isArray(safe.patterns) ? `${safe.patterns.length} patterns` : "");
+    case "add_mcp_server":
+      return truncatePreview(previewValue(safe.name));
+    case "remove_mcp_server":
+      return truncatePreview(previewValue(safe.server));
+    case "remove_connector":
+    case "rotate_connector":
+      return truncatePreview(previewValue(safe.connector));
+    case "rollback_skill":
+    case "test_skill":
+      return truncatePreview(previewValue(safe.skillId));
     default: {
       // Generic fallback: key=value, ... for the first few entries.
       // Keeps unmapped or future tools from emitting an empty preview.

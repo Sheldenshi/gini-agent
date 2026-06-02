@@ -77,6 +77,7 @@ import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
 import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { sttStatus } from "./stt";
 import { resumeChatTask } from "./execution/chat-task";
 import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
 import { approvalToolCallId } from "./execution/tool-dispatch";
@@ -380,7 +381,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!(file instanceof Blob)) return json({ error: "Missing 'file' part" }, 400);
       const filename = file instanceof File ? file.name : undefined;
       const mimeType = file.type || "application/octet-stream";
-      if (!mimeType.startsWith("image/")) {
+      if (!mimeType.startsWith("image/") && !mimeType.startsWith("audio/")) {
         return json({ error: `Unsupported upload type: ${mimeType}` }, 415);
       }
       const bytes = new Uint8Array(await file.arrayBuffer());
@@ -411,6 +412,9 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         }
       });
     }],
+    // Speech-to-text readiness. Lets clients warn before the first voice
+    // message that the local whisper model still needs its one-time download.
+    ["GET", /^\/api\/stt\/status$/, () => json(sttStatus())],
     ["POST", /^\/api\/chat\/([^/]+)\/tasks\/([^/]+)\/sync$/, async (_request, params) => json(await syncChatTaskResult(config, params[0], params[1]))],
     // ChatBlock protocol endpoints (ADR chat-block-protocol.md). The
     // /blocks endpoint returns the full ordered list for initial render;

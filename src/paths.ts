@@ -277,11 +277,15 @@ export function defaultConfig(instance: Instance): RuntimeConfig {
     workspaceRoot: workspaceDir(instance),
     stateRoot: instanceRoot(instance),
     logRoot: logDir(instance),
-    // New instances default to "auto": auto-approve safe actions, gate
-    // dangerous terminal patterns. See ADR approval-mode.md. Legacy
-    // configs with `dangerouslyAutoApprove: true` are aliased to "yolo"
-    // at load time by `runtime/index.ts`.
-    approvalMode: "auto"
+    // Fresh installs default to "yolo": full bypass of every approval
+    // gate. This is the install template only. Existing on-disk configs
+    // that predate an explicit `approvalMode` are NOT escalated to yolo
+    // — `loadConfig` backfills "auto" for them so the default flip never
+    // silently removes approval gates from an instance the operator
+    // already created. See ADR approval-mode.md. Legacy configs with
+    // `dangerouslyAutoApprove: true` are aliased to "yolo" at load time
+    // by `runtime/index.ts`.
+    approvalMode: "yolo"
   };
 }
 
@@ -302,18 +306,26 @@ export function loadConfig(instance: Instance): RuntimeConfig {
   }
 
   const parsed = JSON.parse(readFileSync(path, "utf8")) as RuntimeConfig;
-  // Don't let the `defaultConfig` spread below stamp `approvalMode:
-  // "auto"` onto a legacy config that carries `dangerouslyAutoApprove:
-  // true` without an explicit `approvalMode`. Leaving the field
-  // undefined here is what lets the install-time migration shim
-  // detect "this is a pre-flip config" and alias it to "yolo".
-  // Synthesizing a `defaultConfig` without `approvalMode` for the
-  // legacy case keeps the legacy detection working without changing
-  // any other default.
+  // `defaultConfig` is both the fresh-install template (which stamps
+  // "yolo") AND the merge base for existing files below. An existing
+  // on-disk config that predates an explicit `approvalMode` must NOT
+  // inherit the "yolo" install default — that would silently strip
+  // every approval gate from an instance the operator never opted into.
+  // So for an existing file without `approvalMode`, override the merge
+  // base instead of letting "yolo" through:
+  //   - `dangerouslyAutoApprove: true` → drop `approvalMode` so the
+  //     install-time migration shim aliases it to "yolo" (legacy
+  //     behavior, audited as `from: "dangerouslyAutoApprove: true"`).
+  //   - otherwise → backfill "auto" so pre-flip / explicit-false files
+  //     keep their documented effective mode and the pre-flip migration
+  //     records `to: "auto"`.
   const defaults = defaultConfig(instance);
-  const isLegacyDangerousFile = parsed.approvalMode === undefined && parsed.dangerouslyAutoApprove === true;
-  if (isLegacyDangerousFile) {
-    delete (defaults as { approvalMode?: unknown }).approvalMode;
+  if (parsed.approvalMode === undefined) {
+    if (parsed.dangerouslyAutoApprove === true) {
+      delete (defaults as { approvalMode?: unknown }).approvalMode;
+    } else {
+      defaults.approvalMode = "auto";
+    }
   }
   // Pre-flip existing instance: on-disk config has neither
   // `approvalMode` nor `dangerouslyAutoApprove`. Pre-flip, this

@@ -11,7 +11,14 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { spawn } from "bun";
-import type { Authorization, ImageAttachment, RuntimeConfig, RuntimeState, SetupRequest, Task } from "./types";
+import type {
+  Authorization,
+  ImageAttachment,
+  RuntimeConfig,
+  RuntimeState,
+  SetupRequest,
+  Task
+} from "./types";
 import { statePath, traceDir } from "./paths";
 import {
   addAudit,
@@ -62,7 +69,12 @@ function findApprovalRow(state: RuntimeState, id: string):
   if (setup) return { kind: "setup_request", row: setup };
   return undefined;
 }
-import { generateTaskSummary } from "./provider";
+import {
+  ProviderAuthError,
+  generateTaskSummary,
+  providerAuthNote,
+  redactSecrets
+} from "./provider";
 import { listFiles, readFile, requestFilePatch, requestFileWrite, searchFiles } from "./tools/file";
 import { fetchWeb } from "./tools/web";
 import { requestShell } from "./tools/terminal";
@@ -79,6 +91,7 @@ import {
 } from "./execution/chat-task-emit";
 import { approvalToolCallId } from "./execution/tool-dispatch";
 import { findSelfOperation } from "./execution/self-registry";
+import { redactSensitiveToolArgs } from "./execution/tool-args-redact";
 import { resolveApprovalPolicy, type PolicyAction } from "./execution/policy";
 import { resolveEffectiveContext } from "./execution/effective-context";
 import { browserUploadFileApproved } from "./tools/browser";
@@ -780,7 +793,16 @@ export function scheduleAutoRetain(config: RuntimeConfig, task: Task): void {
 }
 
 export async function failTask(config: RuntimeConfig, taskId: string, error: unknown): Promise<void> {
-  const message = error instanceof Error ? error.message : String(error);
+  // Enrich provider auth failures with a named provider + re-auth CTA (issue
+  // #205) ONLY when the error is a ProviderAuthError — i.e. it originated at a
+  // provider call (tagged with the provider that served the turn), not a
+  // tool/browser/terminal failure whose message merely mentions "401".
+  const authProvider = error instanceof ProviderAuthError ? error.provider : undefined;
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  // Redact credential-shaped substrings from provider auth errors before they
+  // are stored (task.error, audit) or rendered (the note's detail) — some
+  // providers echo a partial key in the error text.
+  const message = authProvider ? redactSecrets(rawMessage) : rawMessage;
   const task = await mutateState(config.instance, (state) => {
     // The two `runTask(...).catch(failTask(...))` fire-and-forget call
     // sites in createTask/retryTask can race with test cleanup or a
@@ -800,6 +822,10 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
     }
     task.status = "failed";
     task.error = message;
+    // Record the failed provider so syncChatTaskResult can render the same
+    // actionable, provider-named message for legacy/text-only clients that the
+    // chat system note shows the web (issue #205).
+    if (authProvider) task.authErrorProvider = authProvider;
     task.currentStep = "Failed";
     task.updatedAt = now();
     addAudit(
@@ -842,7 +868,16 @@ export async function failTask(config: RuntimeConfig, taskId: string, error: unk
         if (inFlight) {
           finalizeAssistantText(emitCtx, inFlight.blockId, inFlight.text);
         }
-        emitSystemNote(emitCtx, message);
+        // When the turn died because the provider credential failed, replace
+        // the raw provider line with an actionable note that names the
+        // provider and carries re-auth metadata for the client CTA (issue
+        // #205). Every other failure passes the raw message through unchanged.
+        if (authProvider) {
+          const note = providerAuthNote(authProvider, message);
+          emitSystemNote(emitCtx, note.text, note.authError);
+        } else {
+          emitSystemNote(emitCtx, message);
+        }
         emitPhase(emitCtx, "Failed");
       }
     } catch (error) {
@@ -2128,6 +2163,17 @@ async function runApprovedAction(
         },
         approvalAgentContext(approval)
       );
+      // Scrub any secret args (set_provider.apiKey, rotate_connector.token,
+      // add_mcp_server.headers) from the now-resolved approval payload. The
+      // approvals list serves the payload to clients, so the historical row
+      // must not retain credentials. The handler already ran above, so the
+      // real args are no longer needed. The brief pending window (strict
+      // mode, before approval) keeps the real args so the action can execute
+      // on approval — only the approving user sees that, which is acceptable.
+      const row = state.authorizations.find((a) => a.id === approval.id);
+      if (row && row.payload.args && typeof row.payload.args === "object" && !Array.isArray(row.payload.args)) {
+        row.payload.args = redactSensitiveToolArgs(row.payload.args as Record<string, unknown>);
+      }
     });
     if (shouldResumeChat && chatToolCallId) {
       await resumeChatTask(config, approval.taskId, chatToolCallId, resultStr);

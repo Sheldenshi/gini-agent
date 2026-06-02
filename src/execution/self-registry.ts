@@ -21,13 +21,18 @@
 // audit write is inlined below against ../state so the registry pulls in no
 // helper that transitively re-enters agent.ts and forms a cycle.
 
-import type { RuntimeConfig, RuntimeState } from "../types";
+import type { ApprovalMode, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendTrace, mutateState, now, readState } from "../state";
-import { status as runtimeStatus } from "../runtime";
+import { status as runtimeStatus, updateAutoApproveSettings } from "../runtime";
 import { providerCatalogWithStatus } from "../provider";
-import { setSetupProvider } from "../runtime/setup-api";
-import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, renameAgent as renameAgentCapability } from "../capabilities/agents";
-import { listSkills } from "../capabilities/skills";
+import { setSetupProvider, removeSetupProvider } from "../runtime/setup-api";
+import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, renameAgent as renameAgentCapability, deleteAgent } from "../capabilities/agents";
+import { listSkills, rollbackSkill, testSkill } from "../capabilities/skills";
+import { listToolsets, setToolsetStatus } from "../capabilities/toolsets";
+import { addMcpServer, removeMcpServer } from "../integrations/mcp";
+import { deleteConnector, updateConnector } from "../integrations/connectors";
+import { assertCurrentRuntimeUpdateSupported, scheduleRuntimeRestart, updateRuntime } from "../runtime/update";
+import { projectRoot } from "../paths";
 
 export interface SelfOperation {
   name: string;
@@ -37,8 +42,10 @@ export interface SelfOperation {
   // gate provider/agent changes.
   tag: "query" | "mutate";
   // JSON Schema for the op's args — same shape a tool's function.parameters
-  // carries. The catalog entry for this op mirrors this schema in its
-  // function.parameters; this field is the canonical source it is copied from.
+  // carries. The catalog entry for this op carries the schema the MODEL
+  // actually sees in its function.parameters; this field is documentation
+  // that mirrors it and is no longer read by any consumer at runtime (only
+  // `tag` and `handler` are). Keep the two in sync by hand when editing an op.
   schema: Record<string, unknown>;
   handler: (config: RuntimeConfig, taskId: string, args: Record<string, unknown>) => Promise<string>;
 }
@@ -100,6 +107,11 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
     port: snapshot.port,
     version: snapshot.version,
     approvalMode: config.approvalMode ?? "auto",
+    approvalSettings: {
+      approvalMode: config.approvalMode ?? "auto",
+      autoApproveCommands: config.autoApproveCommands ?? [],
+      dangerousTerminalPatterns: config.dangerousTerminalPatterns ?? []
+    },
     provider: snapshot.provider,
     activeAgent: snapshot.activeAgent,
     counts
@@ -290,6 +302,27 @@ async function setProvider(
   });
 }
 
+async function setApprovalMode(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const mode = typeof args.mode === "string" ? args.mode.trim() : "";
+  if (!["strict", "auto", "yolo"].includes(mode)) {
+    return JSON.stringify({ ok: false, error: "set_approval_mode requires 'mode' to be one of: strict, auto, yolo." });
+  }
+  const result = updateAutoApproveSettings(config, { approvalMode: mode as ApprovalMode });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Set approval mode",
+    data: { approvalMode: result.approvalMode }
+  });
+  await recordLowRiskAudit(config, taskId, "approval_mode.set", result.approvalMode, {
+    approvalMode: result.approvalMode
+  });
+  return JSON.stringify({ ok: true, approvalMode: result.approvalMode });
+}
+
 async function useAgent(
   config: RuntimeConfig,
   taskId: string,
@@ -398,6 +431,393 @@ async function renameAgent(
         model: record.model
       }
     });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function listToolsetsOp(config: RuntimeConfig, taskId: string): Promise<string> {
+  const { toolsets } = listToolsets(config);
+  const summary = toolsets.map((toolset) => ({
+    id: toolset.id,
+    name: toolset.name,
+    status: toolset.status,
+    description: toolset.description ?? "",
+    toolNames: toolset.toolNames
+  }));
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Listed toolsets",
+    data: { count: summary.length }
+  });
+  await recordLowRiskAudit(config, taskId, "toolset.listed", "toolsets", { count: summary.length });
+  return JSON.stringify({ ok: true, toolsets: summary });
+}
+
+async function enableToolset(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.toolset === "string" ? args.toolset.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "enable_toolset requires a 'toolset' (name or id)." });
+  }
+  try {
+    const toolset = await setToolsetStatus(config, name, "enabled");
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Enabled toolset",
+      data: { toolset: toolset.name }
+    });
+    await recordLowRiskAudit(config, taskId, "toolset.enabled", toolset.name, { status: toolset.status });
+    return JSON.stringify({ ok: true, toolset: toolset.name, status: toolset.status });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function disableToolset(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.toolset === "string" ? args.toolset.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "disable_toolset requires a 'toolset' (name or id)." });
+  }
+  try {
+    const toolset = await setToolsetStatus(config, name, "disabled");
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Disabled toolset",
+      data: { toolset: toolset.name }
+    });
+    await recordLowRiskAudit(config, taskId, "toolset.disabled", toolset.name, { status: toolset.status });
+    return JSON.stringify({ ok: true, toolset: toolset.name, status: toolset.status });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function deleteAgentOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.agentId === "string" ? args.agentId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "delete_agent requires an 'agentId' (id or name)." });
+  }
+  try {
+    const result = await deleteAgent(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Deleted agent",
+      data: { agentId: result.id, unitsDeleted: result.unitsDeleted }
+    });
+    await recordLowRiskAudit(config, taskId, "agent.deleted", result.id, {
+      unitsDeleted: result.unitsDeleted,
+      bankDeleted: result.bankDeleted
+    });
+    return JSON.stringify({
+      ok: true,
+      agentId: result.id,
+      unitsDeleted: result.unitsDeleted,
+      bankDeleted: result.bankDeleted
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function removeProvider(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const provider = typeof args.provider === "string" ? args.provider.trim() : "";
+  if (!provider) {
+    return JSON.stringify({ ok: false, error: "remove_provider requires a 'provider' name." });
+  }
+  const result = removeSetupProvider(config, provider);
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: result.ok ? "Removed provider" : "Provider removal failed",
+    data: { provider, ok: result.ok, switched: result.switched, error: result.error }
+  });
+  await recordLowRiskAudit(config, taskId, "provider.removed", provider, {
+    ok: result.ok,
+    switched: result.switched,
+    error: result.error
+  });
+  return JSON.stringify({ ok: result.ok, switched: result.switched, error: result.error });
+}
+
+async function setAutoApproveCommands(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  if (!Array.isArray(args.patterns)) {
+    return JSON.stringify({ ok: false, error: "set_auto_approve_commands requires 'patterns' to be an array of strings." });
+  }
+  // Reject before calling the setter: it silently drops non-strings, so a
+  // payload like [123] would otherwise become [] and OVERWRITE the saved
+  // allowlist with an empty list.
+  if (!args.patterns.every((p) => typeof p === "string")) {
+    return JSON.stringify({ ok: false, error: "patterns must be an array of strings." });
+  }
+  const patterns = args.patterns as string[];
+  const result = updateAutoApproveSettings(config, { patterns });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Set auto-approve commands",
+    data: { count: result.patterns.length }
+  });
+  await recordLowRiskAudit(config, taskId, "auto_approve_commands.set", "auto_approve_commands", {
+    count: result.patterns.length
+  });
+  return JSON.stringify({ ok: true, autoApproveCommands: result.patterns });
+}
+
+async function setDangerousPatterns(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  if (!Array.isArray(args.patterns)) {
+    return JSON.stringify({ ok: false, error: "set_dangerous_patterns requires 'patterns' to be an array of strings." });
+  }
+  // Reject before calling the setter: it silently drops non-strings, so a
+  // payload like [123] would otherwise become [] and OVERWRITE the saved
+  // pattern list with an empty list.
+  if (!args.patterns.every((p) => typeof p === "string")) {
+    return JSON.stringify({ ok: false, error: "patterns must be an array of strings." });
+  }
+  const patterns = args.patterns as string[];
+  const result = updateAutoApproveSettings(config, { dangerousTerminalPatterns: patterns });
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Set dangerous terminal patterns",
+    data: { count: result.dangerousTerminalPatterns.length }
+  });
+  await recordLowRiskAudit(config, taskId, "dangerous_patterns.set", "dangerous_patterns", {
+    count: result.dangerousTerminalPatterns.length
+  });
+  return JSON.stringify({ ok: true, dangerousTerminalPatterns: result.dangerousTerminalPatterns });
+}
+
+async function addMcpServerOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const name = typeof args.name === "string" ? args.name.trim() : "";
+  if (!name) {
+    return JSON.stringify({ ok: false, error: "add_mcp_server requires a 'name'." });
+  }
+  try {
+    const server = await addMcpServer(config, args);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Added MCP server",
+      data: { serverId: server.id, name: server.name, transport: server.transport }
+    });
+    await recordLowRiskAudit(config, taskId, "mcp.added", server.id, {
+      name: server.name,
+      transport: server.transport
+    });
+    return JSON.stringify({
+      ok: true,
+      server: { id: server.id, name: server.name, transport: server.transport, status: server.status }
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function removeMcpServerOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.server === "string" ? args.server.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "remove_mcp_server requires a 'server' (id or name)." });
+  }
+  try {
+    const server = await removeMcpServer(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Removed MCP server",
+      data: { serverId: server.id, name: server.name }
+    });
+    await recordLowRiskAudit(config, taskId, "mcp.removed", server.id, { name: server.name });
+    return JSON.stringify({ ok: true, serverId: server.id, status: server.status });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function removeConnectorOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const connectorId = typeof args.connector === "string" ? args.connector.trim() : "";
+  if (!connectorId) {
+    return JSON.stringify({ ok: false, error: "remove_connector requires a 'connector' id." });
+  }
+  try {
+    const result = await deleteConnector(config, connectorId);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Removed connector",
+      data: { connectorId: result.id, tombstoned: result.tombstoned }
+    });
+    await recordLowRiskAudit(config, taskId, "connector.removed", result.id, {
+      tombstoned: result.tombstoned ?? false
+    });
+    return JSON.stringify({ ok: true, connectorId: result.id, tombstoned: result.tombstoned ?? false });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function rotateConnector(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const connectorId = typeof args.connector === "string" ? args.connector.trim() : "";
+  const token = typeof args.token === "string" ? args.token : "";
+  if (!connectorId) {
+    return JSON.stringify({ ok: false, error: "rotate_connector requires a 'connector' id." });
+  }
+  if (!token) {
+    return JSON.stringify({ ok: false, error: "rotate_connector requires a non-empty 'token'." });
+  }
+  const connector = readState(config.instance).connectors.find((c) => c.id === connectorId);
+  if (!connector) {
+    return JSON.stringify({ ok: false, error: `Connector not found: ${connectorId}` });
+  }
+  // Resolve which secret slot the token rotates. Writing an arbitrary
+  // `purpose` would create an unused credential slot the connector never
+  // reads (updateConnector appends an unknown purpose as a new ref), so the
+  // purpose must match an EXISTING slot. When the caller omits `purpose` we
+  // auto-pick only when the record has exactly one existing slot; ambiguity
+  // surfaces the choices.
+  const purposes = connector.secretRefs.map((ref) => ref.purpose);
+  let purpose = typeof args.purpose === "string" ? args.purpose.trim() : "";
+  if (purpose) {
+    if (!purposes.includes(purpose)) {
+      return JSON.stringify({
+        ok: false,
+        error: `purpose '${purpose}' not found on connector; available: [${purposes.join(", ")}].`
+      });
+    }
+  } else {
+    if (purposes.length === 1) {
+      purpose = purposes[0]!;
+    } else if (purposes.length === 0) {
+      return JSON.stringify({ ok: false, error: `Connector '${connectorId}' has no secret slot to rotate; pass a 'purpose'.` });
+    } else {
+      return JSON.stringify({
+        ok: false,
+        error: `Connector '${connectorId}' has multiple secret slots; pass 'purpose' (one of: ${purposes.join(", ")}).`
+      });
+    }
+  }
+  try {
+    const updated = await updateConnector(config, connectorId, { secrets: { [purpose]: token } });
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Rotated connector credential",
+      data: { connectorId: updated.id, purpose }
+    });
+    await recordLowRiskAudit(config, taskId, "connector.rotated", updated.id, { purpose });
+    return JSON.stringify({ ok: true, connectorId: updated.id, purpose });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function updateSelf(config: RuntimeConfig, taskId: string): Promise<string> {
+  try {
+    assertCurrentRuntimeUpdateSupported();
+    const result = updateRuntime(projectRoot());
+    const restart = result.upToDate ? false : scheduleRuntimeRestart(config.instance);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: result.upToDate ? "Runtime already up to date" : "Updated runtime",
+      data: { beforeSha: result.beforeSha, afterSha: result.afterSha, restart }
+    });
+    await recordLowRiskAudit(config, taskId, "runtime.updated", result.afterSha, {
+      beforeSha: result.beforeSha,
+      commitCount: result.commitCount,
+      restart
+    });
+    return JSON.stringify({
+      ok: true,
+      beforeSha: result.beforeSha,
+      afterSha: result.afterSha,
+      commitCount: result.commitCount,
+      upToDate: result.upToDate,
+      restart
+    });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function rollbackSkillOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.skillId === "string" ? args.skillId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "rollback_skill requires a 'skillId' (id or name)." });
+  }
+  try {
+    const skill = await rollbackSkill(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Rolled back skill",
+      data: { skillId: skill.id, name: skill.name, version: skill.version }
+    });
+    await recordLowRiskAudit(config, taskId, "skill.rolledBack", skill.id, {
+      name: skill.name,
+      version: skill.version
+    });
+    return JSON.stringify({ ok: true, skillId: skill.id, name: skill.name, version: skill.version });
+  } catch (error) {
+    return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function testSkillOp(
+  config: RuntimeConfig,
+  taskId: string,
+  args: Record<string, unknown>
+): Promise<string> {
+  const idOrName = typeof args.skillId === "string" ? args.skillId.trim() : "";
+  if (!idOrName) {
+    return JSON.stringify({ ok: false, error: "test_skill requires a 'skillId' (id or name)." });
+  }
+  try {
+    const result = await testSkill(config, idOrName);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: "Tested skill",
+      data: { skillId: result.skill.id, ok: result.ok, failures: result.failures.length }
+    });
+    await recordLowRiskAudit(config, taskId, "skill.tested", result.skill.id, {
+      ok: result.ok,
+      failures: result.failures
+    });
+    return JSON.stringify({ ok: result.ok, skillId: result.skill.id, name: result.skill.name, failures: result.failures });
   } catch (error) {
     return JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) });
   }
@@ -524,6 +944,205 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       required: ["agentId", "name"]
     },
     handler: (config, taskId, args) => renameAgent(config, taskId, args)
+  },
+  {
+    name: "set_approval_mode",
+    summary: "Set the runtime approval mode: strict (gate every high-risk action), auto (auto-approve safe actions, gate dangerous shell), or yolo (skip the per-action gate).",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["strict", "auto", "yolo"], description: "strict | auto | yolo." }
+      },
+      required: ["mode"]
+    },
+    handler: (config, taskId, args) => setApprovalMode(config, taskId, args)
+  },
+  {
+    name: "list_toolsets",
+    summary: "Instance toolsets with id, name, status (enabled/disabled), description, and the tool names each gates.",
+    tag: "query",
+    schema: { type: "object", properties: {} },
+    handler: (config, taskId) => listToolsetsOp(config, taskId)
+  },
+  {
+    name: "enable_toolset",
+    summary: "Enable a toolset so its tools become available to agents on this instance. Reversible via disable_toolset.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+      },
+      required: ["toolset"]
+    },
+    handler: (config, taskId, args) => enableToolset(config, taskId, args)
+  },
+  {
+    name: "disable_toolset",
+    summary: "Disable a toolset so its tools stop being offered to agents. Self-config tools bypass toolset gating, so this can't lock the agent out of its own config surface. Reversible via enable_toolset.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        toolset: { type: "string", description: "Toolset name or id (e.g. 'browser', 'messaging')." }
+      },
+      required: ["toolset"]
+    },
+    handler: (config, taskId, args) => disableToolset(config, taskId, args)
+  },
+  {
+    name: "delete_agent",
+    summary: "Hard-delete an agent and its per-agent memory bank. Refuses the default agent and the currently-active agent (switch first via use_agent).",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        agentId: { type: "string", description: "Agent id or name to delete (e.g. 'agent_abc123' or 'athena')." }
+      },
+      required: ["agentId"]
+    },
+    handler: (config, taskId, args) => deleteAgentOp(config, taskId, args)
+  },
+  {
+    name: "remove_provider",
+    summary: "Disconnect an env-keyed LLM provider: scrub its API key from process.env + secrets.env. If it was active, falls back to codex (or echo). Codex/local aren't removable this way.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        provider: { type: "string", description: "Provider id to remove (e.g. 'openai', 'openrouter', 'deepseek'). Codex and local cannot be removed here." }
+      },
+      required: ["provider"]
+    },
+    handler: (config, taskId, args) => removeProvider(config, taskId, args)
+  },
+  {
+    name: "set_auto_approve_commands",
+    summary: "REPLACE the auto-approve command allowlist (shell prefixes auto-approved without gating). Include existing entries (visible via get_self.approvalSettings.autoApproveCommands) to keep them.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        patterns: {
+          type: "array",
+          description: "The FULL allowlist of command prefixes to auto-approve. This REPLACES the existing list — read get_self.approvalSettings.autoApproveCommands first and include any entries you want to keep.",
+          items: { type: "string" }
+        }
+      },
+      required: ["patterns"]
+    },
+    handler: (config, taskId, args) => setAutoApproveCommands(config, taskId, args)
+  },
+  {
+    name: "set_dangerous_patterns",
+    summary: "REPLACE the dangerous-terminal-pattern list (substrings that always force a gate even in auto). Include existing entries (visible via get_self.approvalSettings.dangerousTerminalPatterns) to keep them.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        patterns: {
+          type: "array",
+          description: "The FULL list of dangerous command substrings that always require approval. This REPLACES the existing list — read get_self.approvalSettings.dangerousTerminalPatterns first and include any entries you want to keep.",
+          items: { type: "string" }
+        }
+      },
+      required: ["patterns"]
+    },
+    handler: (config, taskId, args) => setDangerousPatterns(config, taskId, args)
+  },
+  {
+    name: "add_mcp_server",
+    summary: "Register a new MCP server (stdio command or http url) so its tools become available. http transport needs a url; stdio needs a command.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Server name (e.g. 'linear')." },
+        transport: { type: "string", enum: ["stdio", "http"], description: "Transport. Defaults to 'stdio', or 'http' when a url is given." },
+        command: { type: "string", description: "Executable for a stdio server (e.g. 'npx'). Required for stdio." },
+        args: { type: "array", description: "Argument list for the stdio command.", items: { type: "string" } },
+        url: { type: "string", description: "Streamable-HTTP endpoint for an http server (e.g. 'https://mcp.linear.app/mcp'). Required for http." },
+        headers: { type: "object", description: "Static or ${ENV}-placeholder header map for an http server." },
+        exposedTools: { type: "array", description: "Optional whitelist of tool names to expose from this server.", items: { type: "string" } }
+      },
+      required: ["name"]
+    },
+    handler: (config, taskId, args) => addMcpServerOp(config, taskId, args)
+  },
+  {
+    name: "remove_mcp_server",
+    summary: "Disable a registered MCP server so its tools stop being offered. Call list_mcp_servers first for the id.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        server: { type: "string", description: "MCP server id or name." }
+      },
+      required: ["server"]
+    },
+    handler: (config, taskId, args) => removeMcpServerOp(config, taskId, args)
+  },
+  {
+    name: "remove_connector",
+    summary: "Disconnect a connector: wipe its encrypted secrets (user connectors) or tombstone it (auto-detected ones). Call list_connectors first for the id.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        connector: { type: "string", description: "Connector id to remove." }
+      },
+      required: ["connector"]
+    },
+    handler: (config, taskId, args) => removeConnectorOp(config, taskId, args)
+  },
+  {
+    name: "rotate_connector",
+    summary: "Rotate a connector's credential — write a new token into one of its secret slots. Pass 'purpose' when the connector has more than one slot.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        connector: { type: "string", description: "Connector id to rotate." },
+        token: { type: "string", description: "The new secret value to store." },
+        purpose: { type: "string", description: "Which secret slot to write (e.g. 'token'). Optional when the connector has exactly one slot; required when it has several." }
+      },
+      required: ["connector", "token"]
+    },
+    handler: (config, taskId, args) => rotateConnector(config, taskId, args)
+  },
+  {
+    name: "update_self",
+    summary: "Update the runtime to the latest commit (git fetch + reset + bun install) and RESTART the gateway to run the new code. Only works from the installer-managed runtime.",
+    tag: "mutate",
+    schema: { type: "object", properties: {} },
+    handler: (config, taskId) => updateSelf(config, taskId)
+  },
+  {
+    name: "rollback_skill",
+    summary: "Roll a skill back to its previous saved version. Fails if the skill has no rollback history. Call list_skills first for the id.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        skillId: { type: "string", description: "Skill id or name to roll back." }
+      },
+      required: ["skillId"]
+    },
+    handler: (config, taskId, args) => rollbackSkillOp(config, taskId, args)
+  },
+  {
+    name: "test_skill",
+    summary: "Validate a skill's record (required fields, steps, spec compliance) and report pass/fail. Records the test outcome on the skill (success/failure counters), so it routes through the approval seam.",
+    tag: "mutate",
+    schema: {
+      type: "object",
+      properties: {
+        skillId: { type: "string", description: "Skill id or name to test." }
+      },
+      required: ["skillId"]
+    },
+    handler: (config, taskId, args) => testSkillOp(config, taskId, args)
   }
 ];
 

@@ -157,8 +157,9 @@ export interface ProviderConfig {
 // - "strict" — every approval-eligible action creates a pending approval
 //   row and pauses the task for a human decision. Matches the legacy
 //   pre-flip default.
-// - "auto" — the new default. Auto-approve `file.write`, `file.patch`,
-//   and `browser.upload_file` unconditionally. For `terminal.exec` and
+// - "auto" — a safe-middle mode (no longer the default; operators can
+//   switch to it). Auto-approve `file.write`, `file.patch`, and
+//   `browser.upload_file` unconditionally. For `terminal.exec` and
 //   `code_exec`, auto-approve unless the command (or, for `code_exec`,
 //   either the shell wrapper OR the raw source — see
 //   `matchDangerousSource`) matches a dangerous-pattern entry (see
@@ -203,10 +204,12 @@ export interface RuntimeConfig {
   // blocklist below — explicit operator opt-in wins over the heuristic.
   autoApproveCommands?: string[];
   // Approval-policy mode. Drives `resolveApprovalPolicy`. Fresh instances
-  // default to "auto" via `defaultConfig`. Legacy config files that carry
-  // `dangerouslyAutoApprove: true` without an `approvalMode` set are
-  // migrated to "yolo" at load time and emit a one-time `config.migrated`
-  // audit row. See ADR approval-mode.md.
+  // default to "yolo" via `defaultConfig`; existing configs that predate
+  // an explicit `approvalMode` backfill "auto" in `loadConfig` so the
+  // default flip never silently escalates an already-created instance.
+  // Legacy config files that carry `dangerouslyAutoApprove: true` without
+  // an `approvalMode` set are migrated to "yolo" at load time and emit a
+  // one-time `config.migrated` audit row. See ADR approval-mode.md.
   approvalMode?: ApprovalMode;
   // Optional operator-supplied list of substring patterns that should
   // GATE a `terminal.exec` call even under `approvalMode: "auto"`. Each
@@ -290,10 +293,24 @@ export interface ImageAttachment {
   size: number;
 }
 
+// Voice recording attached to a user message. Render-only: audio NEVER goes
+// to the model/provider — it is transcribed to text at submit time and only
+// the transcript reaches the agent. The bytes live on disk like images
+// (upload id is the canonical reference; clients fetch via GET
+// /api/uploads/:id for playback). `durationMs` is the client-measured clip
+// length so the bubble can render m:ss without decoding the file.
+export interface AudioAttachment {
+  id: string;
+  mimeType: string;
+  size: number;
+  durationMs?: number;
+}
+
 export interface UserTextBlock extends ChatBlockBase {
   kind: "user_text";
   text: string;
   images?: ImageAttachment[];
+  audio?: AudioAttachment;
 }
 
 export interface AssistantTextBlock extends ChatBlockBase {
@@ -405,9 +422,35 @@ export interface SetupRequestedBlock extends ChatBlockBase {
   summary: string;
 }
 
+// Provider-credential failure metadata attached to a terminal-failure
+// system note when a chat turn dies because the provider's auth token
+// expired / was rejected. Lets clients name which provider failed and
+// render a "Re-authenticate <provider>" CTA instead of passing the raw
+// provider line through verbatim. See issue #205.
+export interface SystemNoteAuthError {
+  // Provider whose credential failed (e.g. "codex").
+  provider: ProviderName;
+  // Short human label for the provider (e.g. "Codex").
+  providerLabel: string;
+  // The raw provider error message, preserved as secondary detail. For
+  // API-key providers this carries the specific cause (the provider's own
+  // 401/403 text — "incorrect key", "quota exceeded", "key disabled").
+  detail: string;
+  // Where the CTA sends the user to re-establish the credential. "docs" → the
+  // hosted step-through (OAuth/CLI providers like codex, whose re-auth is a
+  // non-obvious terminal flow); "settings" → the in-app Settings → Providers
+  // key form (API-key providers). See ADR provider-reauth-guidance.md.
+  reauthKind: "docs" | "settings";
+  reauthUrl: string;
+}
+
 export interface SystemNoteBlock extends ChatBlockBase {
   kind: "system_note";
   text: string;
+  // Present only when this note marks a provider authentication failure
+  // (see SystemNoteAuthError). Absent for ordinary notes (cancellation,
+  // iteration-cap, approval-denied).
+  authError?: SystemNoteAuthError;
 }
 
 export type ChatBlock =
@@ -563,6 +606,13 @@ export interface Task {
   // text mid-flight instead of waiting for the buffered final response.
   partialSummary?: string;
   error?: string;
+  // Provider whose credential failed when the task died on a provider auth
+  // error (expired/invalid/rejected token, 401). Captured at the model-call
+  // site so every render surface — the chat system note and the legacy
+  // assistant ChatMessageRecord — names the same provider and offers a re-auth
+  // CTA, even if the active agent changed while the call was in flight. See
+  // issue #205. Absent for non-auth failures.
+  authErrorProvider?: ProviderName;
   tracePath: string;
   auditIds: string[];
   approvalIds: string[];
@@ -753,6 +803,10 @@ export interface ChatMessageRecord {
   // ~/.gini/instances/<inst>/uploads/. Mirrored on the user_text ChatBlock so
   // either persistence path can drive transcript rendering.
   images?: ImageAttachment[];
+  // User-role messages may carry a voice recording. Render-only — the audio
+  // is transcribed into `content` at submit time and never sent to the
+  // provider. Mirrored on the user_text ChatBlock for playback rendering.
+  audio?: AudioAttachment;
   // Optional tag used to distinguish multiple assistant messages emitted by
   // the same task. Today only "approval_reason" is set — when an approval
   // (e.g. connector.request) is created, the runtime persists its `reason`

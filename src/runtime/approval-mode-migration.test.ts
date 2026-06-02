@@ -6,7 +6,7 @@
 //      on next install/restart, AND a one-time `config.migrated` audit
 //      row records the change.
 //   2. A fresh instance with no prior `config.json` defaults to
-//      `approvalMode: "auto"` via `defaultConfig`/`loadConfig`.
+//      `approvalMode: "yolo"` via `defaultConfig`/`loadConfig`.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -144,7 +144,7 @@ describe("approval-mode migration shim", () => {
     await install(loaded);
     await migrateLegacyApprovalMode(loaded);
 
-    expect(loaded.approvalMode).toBe("auto");
+    expect(loaded.approvalMode).toBe("yolo");
     const state = readState(loaded.instance);
     const migrated = state.audit.filter((event) => event.action === "config.migrated");
     expect(migrated).toHaveLength(0);
@@ -152,10 +152,14 @@ describe("approval-mode migration shim", () => {
 
   test("pre-flip existing instance (no approvalMode, no dangerouslyAutoApprove) emits config.migrated audit", async () => {
     // An instance whose config.json was written before the default
-    // flip. Effective pre-flip behavior: "gate everything"
-    // (`strict`). Effective post-flip behavior: `"auto"` via the
-    // merged defaults. That's a silent change in approval policy
-    // that operators need to see in the audit trail.
+    // flip. `defaultConfig` now returns "yolo", but `loadConfig`
+    // deliberately backfills "auto" for an existing file that has no
+    // explicit `approvalMode` so the default flip never silently
+    // escalates this instance to full bypass. Effective pre-flip
+    // behavior: "gate everything" (`strict`). Effective post-flip
+    // behavior: `"auto"` via the backfilled default. That's a silent
+    // change in approval policy that operators need to see in the
+    // audit trail.
     const instance = "pre-flip-existing";
     const legacy = {
       ...defaultConfig(instance)
@@ -226,20 +230,20 @@ describe("fresh-instance default approval mode", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("defaultConfig sets approvalMode to auto for a fresh instance", () => {
+  test("defaultConfig sets approvalMode to yolo for a fresh instance", () => {
     const config = defaultConfig("fresh-default");
-    expect(config.approvalMode).toBe("auto");
+    expect(config.approvalMode).toBe("yolo");
     expect(config.dangerouslyAutoApprove).toBeUndefined();
   });
 
-  test("loadConfig on a fresh instance writes approvalMode: auto to disk", () => {
+  test("loadConfig on a fresh instance writes approvalMode: yolo to disk", () => {
     const instance = "fresh-disk-default";
     // No prior config file — loadConfig should write a fresh one.
     expect(existsSync(configPath(instance))).toBe(false);
     const loaded = loadConfig(instance);
-    expect(loaded.approvalMode).toBe("auto");
+    expect(loaded.approvalMode).toBe("yolo");
     const persisted = JSON.parse(readFileSync(configPath(instance), "utf8")) as RuntimeConfig;
-    expect(persisted.approvalMode).toBe("auto");
+    expect(persisted.approvalMode).toBe("yolo");
   });
 
   test("updateAutoApproveSettings trims dangerousTerminalPatterns entries before persisting", () => {

@@ -211,6 +211,64 @@ With curl, read the file into the `body` field: `jq -nc --arg b "$(cat
 templates/bug-report.md)" '{title:"…", body:$b}'`. Edit the placeholders
 before submitting — don't file an issue with the `<!-- … -->` hints intact.
 
+## Attaching an image to an issue
+
+GitHub exposes **no public attachment-upload API** — `gh issue`, REST, and
+GraphQL all lack an image upload, and the web drag-drop hits a private,
+browser-only endpoint. To embed an image, commit it to a dedicated
+`issue-assets` branch and reference its raw URL from the issue body.
+
+1. **Materialize the chat upload to disk.** The upload id comes from the
+   user message marker (`Attached image uploads (in order): - <id> (<mime>,
+   <bytes> bytes)`).
+
+   `skill_run({skill: "attachments", script: "materialize", args: {uploadId: "<id-from-marker>"}})`
+   → `{path, absPath}`. Use `absPath` below so git reads the real file
+   regardless of the working directory.
+
+2. **Push the image to `issue-assets` with pure git plumbing** — this never
+   touches the working tree, index, or current branch. `git commit-tree`
+   takes an *explicit* tree object; the parent it's given is history only and
+   does **not** contribute its tree. So to add an asset to the existing
+   branch you can't just `mktree` the new blob — you have to rebuild a tree
+   that contains both the prior assets and the new one. Do that in a throwaway
+   index (`GIT_INDEX_FILE`) so the real index stays untouched: seed it from
+   the prior tip's tree, add the new blob, then write the combined tree.
+
+   ```bash
+   # Find the existing issue-assets tip on the remote — empty the first time,
+   # before the branch exists. Don't read FETCH_HEAD instead: a failed fetch
+   # leaves it pointing at an unrelated ref (e.g. the clone's default branch),
+   # which would fork that whole history into the asset branch.
+   PARENT=$(git ls-remote origin refs/heads/issue-assets | awk '{print $1}')
+   [ -n "$PARENT" ] && git fetch origin issue-assets   # make that commit's objects local
+   BLOB=$(git hash-object -w "<absPath>")
+   # mktemp reserves the path; remove the empty file so git creates a fresh
+   # empty index there when there's no parent to read-tree (the first asset,
+   # before the issue-assets branch exists).
+   TMPIDX=$(mktemp); rm -f "$TMPIDX"
+   # Seed the temp index from the prior tip's tree so old assets are retained.
+   [ -n "$PARENT" ] && GIT_INDEX_FILE="$TMPIDX" git read-tree "$PARENT"
+   GIT_INDEX_FILE="$TMPIDX" git update-index --add --cacheinfo 100644 "$BLOB" "<filename>.png"
+   TREE=$(GIT_INDEX_FILE="$TMPIDX" git write-tree)
+   rm -f "$TMPIDX"
+   COMMIT=$(git commit-tree "$TREE" ${PARENT:+-p "$PARENT"} -m "Add issue asset: <desc>")
+   git push origin "$COMMIT":refs/heads/issue-assets
+   ```
+
+3. **Verify the raw URL resolves**, then reference it in the issue body:
+
+   ```bash
+   curl -s -o /dev/null -w '%{http_code}\n' \
+     "https://raw.githubusercontent.com/$OWNER/$REPO/issue-assets/<filename>.png"
+   # expect 200
+   ```
+
+   Body markdown: `![alt](https://raw.githubusercontent.com/$OWNER/$REPO/issue-assets/<filename>.png)`.
+
+4. **Create or comment as usual** — `gh issue create --body-file …` /
+   `gh issue comment …` (Sections 2 and 3) with that markdown in the body.
+
 ## 3. Managing Issues
 
 ### Labels
@@ -374,6 +432,8 @@ curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
   `/search/issues` for a few seconds. List endpoints reflect it immediately.
 - No batch mutation endpoint — bulk changes loop one issue at a time and
   are subject to the REST secondary rate limit.
+- No public attachment-upload API — embed images via the `issue-assets`
+  branch + raw URL (see "Attaching an image to an issue").
 
 ## Rules
 

@@ -43,7 +43,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
 - Persistent chat, runs, tasks, approvals, traces, audit events, jobs, memories, and skills
 - Approval-gated file, terminal, and code tools
 - Provider support: Codex OAuth, OpenAI API key, OpenRouter, and any OpenAI-compatible local server
-- Local embeddings and reranking by default
+- Local embeddings, reranking, and voice-message speech-to-text by default
 - Parallel instances with isolated state, ports, and logs
 
 See the [Whitepaper](docs/whitepaper.md) and [Architecture Overview](docs/architecture-overview.md) for the design.
@@ -114,7 +114,7 @@ gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
 ```
 
-The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract.
+The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
 
 ## Parallel Instances
 
@@ -158,7 +158,7 @@ gini import apply openclaw   # import the openclaw state into gini
 
 ```text
 ~/.gini/instances/<instance>/   # config, state.json, memory.db, traces, snapshots, workspace, logs
-~/.gini/models/                 # shared embedding/reranker model cache
+~/.gini/models/                 # shared embedding/reranker/speech-to-text model cache
 ```
 
 Use `gini uninstall` to remove an instance or the whole install. See [Operations](docs/operations.md) for diagnostics and cleanup.

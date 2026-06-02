@@ -12,8 +12,8 @@ Replace the binary `dangerouslyAutoApprove` flag with a three-state
 - `"strict"` — every approval-eligible action creates a pending
   approval row and pauses the task for a human decision. Matches the
   legacy pre-flip default.
-- `"auto"` — **new instance default**. Auto-approve `file.write`,
-  `file.patch`, `browser.upload_file`, and `messaging.send`
+- `"auto"` — the safe-middle mode operators can switch to. Auto-approve
+  `file.write`, `file.patch`, `browser.upload_file`, and `messaging.send`
   unconditionally. For
   `terminal.exec` and `code_exec`, auto-approve unless the command
   (or, for `code_exec`, either the wrapper command OR the raw
@@ -23,11 +23,21 @@ Replace the binary `dangerouslyAutoApprove` flag with a three-state
   `DEFAULT_DANGEROUS_TERMINAL_PATTERNS`
   (`src/execution/auto-approve.ts`). The `autoApproveCommands`
   allowlist always short-circuits the blocklist.
-- `"yolo"` — full bypass for every approval-gated tool. Same audit
+- `"yolo"` — **new instance default**. Full bypass for every
+  approval-gated tool. Same audit
   contract as the legacy `dangerouslyAutoApprove: true`: each call
   still produces an approval row (status="approved") and matching
   audit rows stamped `evidence.autoApproved=true` plus
   `evidence.autoApprovedReason="approval-mode-yolo"`.
+
+The fresh-install default flipped from `"auto"` to `"yolo"` because
+operators wanted full auto-approve out of the box. The flip applies to
+**brand-new instances only**: an existing on-disk `config.json` that
+predates an explicit `approvalMode` is NOT retroactively escalated.
+`paths.loadConfig` backfills `"auto"` for such files (and lets the
+legacy `dangerouslyAutoApprove: true` shape alias to `"yolo"` as
+before), so the default change never silently strips approval gates
+from an instance the operator already created.
 
 Every dispatcher (`tool-dispatch.ts:pendingOrAuto`,
 `tool-dispatch.ts:terminalExecDispatch`,
@@ -104,7 +114,10 @@ and [telegram-bridge.md](telegram-bridge.md) for the lifecycle.
 ## Required Now
 
 - `RuntimeConfig.approvalMode?: ApprovalMode` field, defaulting to
-  `"auto"` for fresh instances via `paths.defaultConfig`.
+  `"yolo"` for fresh instances via `paths.defaultConfig`. Existing
+  on-disk configs without an explicit `approvalMode` backfill `"auto"`
+  in `paths.loadConfig` so the default flip does not escalate
+  already-created instances.
 - `RuntimeConfig.dangerousTerminalPatterns?: string[]` operator
   overlay for the built-in blocklist. **Extension semantics**: the
   built-in `DEFAULT_DANGEROUS_TERMINAL_PATTERNS` always apply;
@@ -176,8 +189,8 @@ about "was this auto").
 
 ## Acceptance Checks
 
-- A chat-task `file_write` with `approvalMode: "auto"` (or the new
-  default) completes synchronously with the file on disk and the
+- A chat-task `file_write` with `approvalMode: "auto"` completes
+  synchronously with the file on disk and the
   `file.write` audit row carries `autoApprovedReason: "approval-mode-auto"`.
 - `approvalMode: "strict"` makes the same `file_write` pause for
   approval — no file on disk, one pending approval.
@@ -196,7 +209,11 @@ about "was this auto").
   "dangerouslyAutoApprove: true", to: "yolo"`. Restarting the
   runtime does NOT double-emit the audit row.
 - A fresh instance (no prior `config.json`) writes
-  `approvalMode: "auto"` to disk.
+  `approvalMode: "yolo"` to disk.
+- An existing instance whose `config.json` predates an explicit
+  `approvalMode` (and has no `dangerouslyAutoApprove`) resolves to
+  `"auto"`, not `"yolo"`, and emits a single `config.migrated` audit
+  row with `from: "no-approval-mode", to: "auto"`.
 - `create_job` accepts `approvalMode` directly and the legacy
   `dangerouslyAutoApprove` alias. Both persist onto the JobRecord;
   `approvalMode` wins when both are set.

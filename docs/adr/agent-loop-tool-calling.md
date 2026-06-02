@@ -79,7 +79,7 @@ through the same loop. So the loop comes first.
       row creation entirely for matching commands and stamps the
       matched pattern on the `terminal.exec` audit row's
       `evidence.autoApprovedReason`.
-    - Under `approvalMode: "auto"` (the default), safe actions
+    - Under `approvalMode: "auto"`, safe actions
       (file_write, file_patch, code_exec, browser_upload_file,
       send_message) and non-dangerous terminal commands
       still create an approval row, but `resolveApprovalPolicy`
