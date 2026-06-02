@@ -2,7 +2,13 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { findChromePath, platformCandidates } from "./chrome-discovery";
+import {
+  CHROME_LAUNCH_ARGS,
+  cleanChromeUserAgent,
+  findChromePath,
+  platformCandidates,
+  resolveBrowserLaunchTarget
+} from "./chrome-discovery";
 
 // Save / restore the env var so tests don't leak state into each other.
 const ORIGINAL_ENV = process.env["GINI_CHROME_PATH"];
@@ -20,6 +26,22 @@ async function withFakeBinary<T>(fn: (path: string) => T | Promise<T>): Promise<
   const dir = mkdtempSync(join(tmpdir(), "gini-chrome-"));
   const binary = join(dir, "fake-chrome");
   writeFileSync(binary, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+  try {
+    return await fn(binary);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Like withFakeBinary but the script prints `version` to stdout (so
+// cleanChromeUserAgent's `--version` probe can parse a major version).
+async function withVersionBinary<T>(
+  version: string,
+  fn: (path: string) => T | Promise<T>
+): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "gini-chrome-ver-"));
+  const binary = join(dir, "fake-chrome");
+  writeFileSync(binary, `#!/bin/sh\necho "${version}"\n`, { mode: 0o755 });
   try {
     return await fn(binary);
   } finally {
@@ -125,5 +147,59 @@ describe("findChromePath", () => {
     if (typeof result === "string") {
       expect(result).not.toBe(missing);
     }
+  });
+});
+
+describe("CHROME_LAUNCH_ARGS", () => {
+  test("includes the AutomationControlled toggle that clears navigator.webdriver", () => {
+    expect(CHROME_LAUNCH_ARGS).toContain("--disable-blink-features=AutomationControlled");
+  });
+});
+
+describe("resolveBrowserLaunchTarget", () => {
+  test("GINI_CHROME_PATH override yields the explicit binary with no channel", async () => {
+    await withFakeBinary(async (path) => {
+      process.env["GINI_CHROME_PATH"] = path;
+      const target = await resolveBrowserLaunchTarget();
+      expect(target.executablePath).toBe(path);
+      expect(target.channel).toBeUndefined();
+    });
+  });
+
+  test("invariant: a chrome-channel target always carries a non-null executablePath", async () => {
+    delete process.env["GINI_CHROME_PATH"];
+    const target = await resolveBrowserLaunchTarget();
+    if (target.channel === "chrome") {
+      expect(target.executablePath).not.toBeNull();
+    } else {
+      expect(target.channel).toBeUndefined();
+    }
+  });
+});
+
+describe("cleanChromeUserAgent", () => {
+  test("returns undefined for a null path", () => {
+    expect(cleanChromeUserAgent(null)).toBeUndefined();
+  });
+
+  test("derives a reduced Chrome UA (major only) with no Headless token", async () => {
+    await withVersionBinary("Google Chrome 142.0.7000.1", (path) => {
+      const ua = cleanChromeUserAgent(path, "darwin");
+      expect(ua).toBeDefined();
+      expect(ua!).toContain("Chrome/142.0.0.0");
+      expect(ua!).toContain("Macintosh; Intel Mac OS X 10_15_7");
+      expect(ua!).not.toContain("Headless");
+    });
+  });
+
+  // Separate binaries per platform: the UA is cached per execPath, so reusing
+  // one path would return the first platform's cached result for the second.
+  test("uses the platform token for the passed platform", async () => {
+    await withVersionBinary("Google Chrome 142.0.7000.1", (linuxPath) => {
+      expect(cleanChromeUserAgent(linuxPath, "linux")!).toContain("X11; Linux x86_64");
+    });
+    await withVersionBinary("Google Chrome 142.0.7000.1", (winPath) => {
+      expect(cleanChromeUserAgent(winPath, "win32")!).toContain("Windows NT 10.0; Win64; x64");
+    });
   });
 });

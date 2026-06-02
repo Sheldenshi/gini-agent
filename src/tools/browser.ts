@@ -29,6 +29,7 @@ import { join } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
 import { instanceRoot } from "../paths";
+import { launchPersistentChrome } from "./chrome-discovery";
 import { generateVisionAnalysis } from "../provider";
 import { assertInsideWorkspace, readState } from "../state";
 import { sanitizeUrlForAuditTarget } from "../execution/browser-fill-secrets-types";
@@ -345,17 +346,10 @@ async function ensureShared(): Promise<SharedHandle> {
           "No instance registered for the browser session manager; call setBrowserInstance() before triggering a browser tool."
         );
       }
-      const chromePath = record?.chromePath ?? undefined;
-      const context = await chromium.launchPersistentContext(dataDir, {
-        headless: !headed,
-        executablePath: chromePath,
-        args: [
-          "--no-first-run",
-          "--no-default-browser-check",
-          "--disable-features=ChromeWhatsNewUI,Translate"
-        ]
+      const { context: ctx } = await launchPersistentChrome(chromium, dataDir, {
+        headless: !headed
       });
-      built = { kind: "persistent", context, headed };
+      built = { kind: "persistent", context: ctx as BrowserContext, headed };
     } else {
       // cdp
       if (!record?.cdpUrl) {

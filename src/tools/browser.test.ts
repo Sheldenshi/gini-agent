@@ -1007,6 +1007,10 @@ describe("ensureShared default headless persistent launch", () => {
     expect(launchCalls.length).toBe(1);
     const call = launchCalls[0]!;
     expect(call.options.headless).toBe(true);
+    // Stealth arg is present so navigator.webdriver reads false.
+    expect(call.options.args as string[]).toContain(
+      "--disable-blink-features=AutomationControlled"
+    );
     expect(call.dataDir).toContain("chrome-profile");
     expect(call.dataDir).toContain(instance);
   });
