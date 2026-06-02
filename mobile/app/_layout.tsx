@@ -23,6 +23,7 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
+import { FilePreviewProvider } from "@/src/components/FilePreview";
 import { ImagePreviewProvider } from "@/src/components/ImagePreview";
 import {
   primeDeviceTokenFromStorage,
@@ -128,22 +129,24 @@ export default function RootLayout() {
               against the white header chrome. */}
           <StatusBar style="dark" />
           <ImagePreviewProvider>
-            <Stack screenOptions={screenOptions}>
-              <Stack.Screen name="index" options={{ headerShown: false }} />
-              <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
-              {/* agents.tsx owns its own header via a <Stack.Screen> inside
-                  the component (custom left/right buttons), so we set
-                  headerShown: false here and let the screen draw its own
-                  hamburger + title + plus row. */}
-              <Stack.Screen name="agents" options={{ headerShown: false }} />
-              <Stack.Screen name="settings" options={{ title: "Settings" }} />
-              {/* Chat detail draws its own header (back arrow + centered
-                  title). */}
-              <Stack.Screen
-                name="chat/[sessionId]"
-                options={{ headerShown: false }}
-              />
-            </Stack>
+            <FilePreviewProvider>
+              <Stack screenOptions={screenOptions}>
+                <Stack.Screen name="index" options={{ headerShown: false }} />
+                <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
+                {/* agents.tsx owns its own header via a <Stack.Screen> inside
+                    the component (custom left/right buttons), so we set
+                    headerShown: false here and let the screen draw its own
+                    hamburger + title + plus row. */}
+                <Stack.Screen name="agents" options={{ headerShown: false }} />
+                <Stack.Screen name="settings" options={{ title: "Settings" }} />
+                {/* Chat detail draws its own header (back arrow + centered
+                    title). */}
+                <Stack.Screen
+                  name="chat/[sessionId]"
+                  options={{ headerShown: false }}
+                />
+              </Stack>
+            </FilePreviewProvider>
           </ImagePreviewProvider>
         </QueryClientProvider>
       </SafeAreaProvider>

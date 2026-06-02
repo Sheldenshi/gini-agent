@@ -170,6 +170,46 @@ export function authHeader(): Record<string, string> {
   return { Authorization: `Bearer ${creds.token}` };
 }
 
+// A workspace file read via GET /api/files. `content` is the utf8 text (null
+// for binary files); `truncated` is set when the file exceeds the gateway's
+// read cap. Mirrors web/src/lib/api.ts's WorkspaceFile.
+export interface WorkspaceFile {
+  path: string;
+  absolutePath: string;
+  name: string;
+  bytes: number;
+  content: string | null;
+  truncated: boolean;
+  binary: boolean;
+}
+
+export function fetchWorkspaceFile(path: string): Promise<WorkspaceFile> {
+  return api<WorkspaceFile>(`/files?path=${encodeURIComponent(path)}`);
+}
+
+// Absolute gateway URL + bearer/device-token headers for a workspace file's
+// raw bytes. `inline=1` makes the gateway serve the real content-type (so
+// <Image source> can decode it); plain raw streams an octet-stream attachment
+// suitable for FileSystem.downloadAsync. Reuses the same transport guard and
+// credential resolution as api()/uploadUrl so a public-http base URL can't
+// leak the bearer.
+export function fileRawSource(
+  path: string,
+  opts: { inline?: boolean } = {}
+): { uri: string; headers: Record<string, string> } {
+  const creds = readCachedCredentials();
+  if (!creds) throw new ApiError(401, "No credentials configured");
+  const parsed = assertTransportAllowed(creds.baseUrl);
+  const inline = opts.inline ? "&inline=1" : "";
+  return {
+    uri: `${parsed.origin}/api/files?path=${encodeURIComponent(path)}&raw=1${inline}`,
+    headers: {
+      authorization: `Bearer ${creds.token}`,
+      ...resolveDeviceTokenHeader()
+    }
+  };
+}
+
 // Resolve the absolute gateway URL + auth headers for an SSE subscription.
 // react-native-sse opens its own XHR, so we can't reuse the `api()` fetcher;
 // this helper centralizes origin normalization and bearer injection so the
