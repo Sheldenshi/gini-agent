@@ -4669,6 +4669,24 @@ describe("GET /api/files", () => {
 
     rmSync(workspace, { recursive: true, force: true });
   });
+
+  test("raw=1 streams the file as a download attachment", async () => {
+    const config = testConfig("files-raw");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-raw`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/note.md`, "# Hello\nworld\n");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=note.md&raw=1", {}, config.token);
+    expect(response.status).toBe(200);
+    const disposition = response.headers.get("content-disposition") ?? "";
+    expect(disposition).toContain("attachment");
+    expect(disposition).toContain("note.md");
+    expect(await response.text()).toBe("# Hello\nworld\n");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {

@@ -427,6 +427,28 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
+      // Raw download mode: stream the file bytes back as an attachment so the
+      // web app's Download button saves the original file. Always served as
+      // application/octet-stream + content-disposition: attachment so the
+      // browser never renders HTML/SVG from the app origin (XSS-safe).
+      if (new URL(request.url).searchParams.get("raw")) {
+        try {
+          const stat = statSync(absolutePath);
+          if (!stat.isFile()) return json({ error: "Not a file" }, 400);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException)?.code;
+          if (code === "ENOENT") return json({ error: "File not found" }, 404);
+          return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+        }
+        const filename = basename(absolutePath).replace(/"/g, "");
+        return new Response(Bun.file(absolutePath), {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-disposition": `attachment; filename="${filename}"`,
+            "cache-control": "private, max-age=0"
+          }
+        });
+      }
       const MAX = 512 * 1024;
       try {
         const stat = statSync(absolutePath);
