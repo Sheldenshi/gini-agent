@@ -156,6 +156,12 @@
 .chat-markdown table { border-collapse: collapse; margin: 0.5rem 0; }
 .chat-markdown th, .chat-markdown td { border: 1px solid var(--color-border); padding: 0.25rem 0.5rem; }
 
+/* Inline doc panel: bump heading sizes so sections stand out in the slide-over
+   (the flat chat sizing reads as undifferentiated for a docs page). */
+.doc-panel .chat-markdown h1 { font-size: 1.1rem; }
+.doc-panel .chat-markdown h2 { font-size: 1rem; }
+.doc-panel .chat-markdown h3 { font-size: 0.95rem; }
+
 /* Streaming cursor */
 .chat-markdown .streaming-cursor::after {
   content: "▉";
