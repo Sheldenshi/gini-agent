@@ -15,7 +15,7 @@ import {
   renameChatSession
 } from "../state";
 import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
-import { readUpload, uploadExists } from "../state/uploads";
+import { readUpload, uploadExists, uploadStat } from "../state/uploads";
 import { getSttProvider } from "../stt";
 import { generateStructured } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
@@ -238,23 +238,26 @@ function parseImageAttachments(instance: string, raw: unknown): ImageAttachment[
 
 // Parse the optional voice attachment on a submit. Mirrors the image-upload
 // validation: reject a missing/foreign upload id so a client can't pin an
-// audio bubble with no backing bytes. Audio must be an audio/* upload —
-// guard the mime so a stray image id can't masquerade as a recording.
+// audio bubble with no backing bytes. The mimeType + size are taken from the
+// STORED upload metadata, not the client's claim, so a stray image id can't
+// masquerade as a recording and persist as a playable bubble over non-audio
+// bytes. The optional client-supplied durationMs is render-only metadata and
+// safe to trust.
 function parseAudioAttachment(instance: string, raw: unknown): AudioAttachment | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const item = raw as Record<string, unknown>;
   const id = typeof item.id === "string" ? item.id : "";
   const mimeType = typeof item.mimeType === "string" ? item.mimeType : "";
   if (!id || !mimeType) throw new Error("Invalid input: audio attachment requires id and mimeType.");
-  if (!mimeType.startsWith("audio/")) {
-    throw new Error(`Invalid input: audio attachment must be an audio/* upload: ${mimeType}`);
-  }
-  if (!uploadExists(instance, id)) {
+  const stat = uploadStat(instance, id);
+  if (!stat) {
     throw new Error(`Invalid input: audio upload not found: ${id}`);
   }
-  const size = typeof item.size === "number" ? item.size : Number(item.size ?? 0);
+  if (!stat.mimeType.startsWith("audio/")) {
+    throw new Error(`Invalid input: audio attachment must be audio/* (got ${stat.mimeType})`);
+  }
   const durationMs = typeof item.durationMs === "number" ? item.durationMs : undefined;
-  return { id, mimeType, size, ...(durationMs !== undefined ? { durationMs } : {}) };
+  return { id, mimeType: stat.mimeType, size: stat.size, ...(durationMs !== undefined ? { durationMs } : {}) };
 }
 
 export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {

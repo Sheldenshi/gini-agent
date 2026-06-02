@@ -468,6 +468,32 @@ describe("chat session waiting-approval placeholder", () => {
     }
   });
 
+  test("rejects an audio attachment whose stored upload is not audio/*", async () => {
+    const config = buildConfig(workspaceRoot, "chat-voice-mime-mismatch");
+
+    // A client can claim mimeType audio/wav on the request while pointing at a
+    // non-audio upload id. Validation reads the STORED mime, so the mismatched
+    // upload is rejected before any task or block is created.
+    process.env.GINI_STT_PROVIDER = "echo";
+    try {
+      const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3, 4]), "image/png", "not-audio.png");
+      const session = await createChat(config, { title: "voice-mime" });
+      await expect(
+        submitChatMessage(config, session.id, {
+          content: "here is a clip",
+          audio: { id: ref.id, mimeType: "audio/wav", size: ref.size, durationMs: 1200 }
+        })
+      ).rejects.toThrow(/audio attachment must be audio\/\*/);
+
+      const stateNow = readState(config.instance);
+      expect(stateNow.tasks).toHaveLength(0);
+      expect(stateNow.chatMessages).toHaveLength(0);
+      expect(listChatBlocks(config.instance, session.id)).toHaveLength(0);
+    } finally {
+      delete process.env.GINI_STT_PROVIDER;
+    }
+  });
+
   test("rejects a voice message when transcription fails, creating no task or block", async () => {
     const config = buildConfig(workspaceRoot, "chat-voice-stt-failure");
 
