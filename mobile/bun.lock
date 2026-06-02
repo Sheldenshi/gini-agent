@@ -13,6 +13,7 @@
         "@react-native-async-storage/async-storage": "2.2.0",
         "@tanstack/react-query": "^5.100.9",
         "expo": "~56.0.8",
+        "expo-audio": "~56.0.11",
         "expo-constants": "~56.0.16",
         "expo-dev-client": "~56.0.18",
         "expo-font": "~56.0.5",
@@ -640,6 +641,8 @@
     "expo-application": ["expo-application@56.0.3", "", { "peerDependencies": { "expo": "*" } }, "sha512-DdGGPlMuM6cSTeKhbvh6OeLr2O/+EI5BHKYrD+Do8sJPYgLwzGrgESELfyjJCpEhFzT+TgKIdmLmWXhNUQnHiw=="],
 
     "expo-asset": ["expo-asset@56.0.15", "", { "dependencies": { "@expo/image-utils": "^0.10.1", "expo-constants": "~56.0.16" }, "peerDependencies": { "expo": "*", "react": "*", "react-native": "*" } }, "sha512-BHGi2IAOPQTcOelkUdcz1WIknfCTRjkcpYHX1azjMwgYenrVC+J5qcqJGaC8eUOWLCRtkRJWGnmFQRYtLU1nUQ=="],
+
+    "expo-audio": ["expo-audio@56.0.11", "", { "peerDependencies": { "expo": "*", "expo-asset": "*", "react": "*", "react-native": "*" } }, "sha512-naionxilr49IpEjmMqCj5gXHCSfOsgu3nZ/KXndexR05Tv6dET7dmespyZkcMrADJN07gA5hyqPUC5WqWuaFLw=="],
 
     "expo-constants": ["expo-constants@56.0.16", "", { "dependencies": { "@expo/env": "~2.3.0" }, "peerDependencies": { "expo": "*", "react-native": "*" } }, "sha512-6tsiN+gmTUPp/atyA+uY9Tg8VOdXdmb4s/3TVGolfn6A/oCAraw1pcPZX5XllyD+xUguxB6eBSFAT8494hZVMA=="],
 

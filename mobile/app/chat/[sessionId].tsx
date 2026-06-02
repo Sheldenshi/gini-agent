@@ -22,13 +22,15 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
+import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
   useCancelTask,
   useChatStream,
-  useSendMessage
+  useSendMessage,
+  useVoiceStatus
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
 import type { ChatBlock } from "@/src/types";
@@ -104,11 +106,23 @@ export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const stream = useChatStream(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
+  const voice = useVoiceStatus();
   const cancel = useCancelTask();
   const qc = useQueryClient();
 
   const [text, setText] = useState("");
   const [images, setImages] = useState<PendingImage[]>([]);
+  // True from the moment a voice message is posted until the gateway
+  // finishes transcribing it. Drives the inline pending bubble below the
+  // thread; on the very first voice message the local whisper model still
+  // has to download, so the bubble's label switches to a setup notice.
+  const [voicePending, setVoicePending] = useState(false);
+  // True while the recorder is recording or its WAV is still uploading.
+  // Keeps the trailing control on the recorder (never the send arrow) so it
+  // can't unmount mid-upload, and blocks a typed/return-key send until the
+  // voice op finishes — otherwise a voice message could post around a
+  // separate text send.
+  const [voiceBusy, setVoiceBusy] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
 
   // Tracks whether the ScrollView is currently pinned near the bottom.
@@ -266,7 +280,7 @@ export default function ChatDetailScreen() {
       scrollRef.current?.scrollToEnd({ animated: true });
     }, 50);
     return () => clearTimeout(id);
-  }, [list.length, sessionId, lastAssistantUpdatedAt]);
+  }, [list.length, sessionId, lastAssistantUpdatedAt, voicePending]);
 
   // Switching sessions starts a fresh transcript pinned to the bottom.
   useEffect(() => {
@@ -281,7 +295,7 @@ export default function ChatDetailScreen() {
   const anyUploading = images.some((image) => image.status === "uploading");
   const showSendBusy = send.isPending || inFlight;
   const sendDisabled =
-    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId;
+    (!trimmed && readyImages.length === 0) || showSendBusy || anyUploading || !sessionId || voiceBusy;
   const canStop = Boolean(inFlightTaskId) && !cancel.isPending;
 
   const submit = () => {
@@ -298,6 +312,30 @@ export default function ChatDetailScreen() {
         onSuccess: () => {
           setText("");
           setImages([]);
+        }
+      }
+    );
+  };
+
+  // Voice messages post with empty content and the uploaded audio ref;
+  // the gateway transcribes the WAV and uses the transcript as the
+  // message text. Re-pin to the bottom so the user sees the reply, the
+  // same as a typed send.
+  const sendVoice = (audio: VoiceRef): void => {
+    if (!sessionId) return;
+    pinnedToBottomRef.current = true;
+    setVoicePending(true);
+    send.mutate(
+      { content: "", audio },
+      {
+        // Transcription is synchronous on the gateway and the first-run
+        // model download can run long enough that a quick tunnel times
+        // out — surface the failure instead of leaving the bubble spinning.
+        onError: (err) => {
+          Alert.alert("Voice message failed", err.message);
+        },
+        onSettled: () => {
+          setVoicePending(false);
         }
       }
     );
@@ -488,11 +526,27 @@ export default function ChatDetailScreen() {
                   />
                 )
               )
-            ) : (
+            ) : !voicePending ? (
               <View style={styles.emptyChat}>
                 <Text style={styles.emptyChatText}>What can I help with?</Text>
               </View>
-            )}
+            ) : null}
+            {/* Inline pending bubble while a voice message transcribes. On
+                the first voice message the local whisper model still needs
+                its one-time download, so the label warns that setup will
+                take a moment; afterwards it's just "Transcribing…". */}
+            {voicePending ? (
+              <View style={styles.voicePendingRow}>
+                <View style={styles.voicePendingBubble}>
+                  <ActivityIndicator color={theme.muted} size="small" />
+                  <Text style={styles.voicePendingText}>
+                    {voice.data?.ready === false
+                      ? "Setting up voice messages — first time only, this can take a minute."
+                      : "Transcribing…"}
+                  </Text>
+                </View>
+              </View>
+            ) : null}
           </ScrollView>
         )}
 
@@ -560,26 +614,56 @@ export default function ChatDetailScreen() {
               style={styles.inputText}
               accessibilityLabel="Message input"
             />
-            <Pressable
-              onPress={canStop ? stopTask : submit}
-              disabled={canStop ? false : sendDisabled}
-              style={[
-                styles.sendButton,
-                canStop && styles.stopButton,
-                !canStop && sendDisabled && styles.sendButtonDisabled,
-                cancel.isPending && styles.sendButtonDisabled
-              ]}
-              accessibilityRole="button"
-              accessibilityLabel={canStop ? "Stop response" : "Send"}
-            >
-              {cancel.isPending || send.isPending ? (
-                <ActivityIndicator color={theme.buttonText} />
-              ) : canStop ? (
-                <Feather name="square" size={16} color={theme.buttonText} />
-              ) : (
-                <Feather name="arrow-up" size={22} color={theme.buttonText} />
-              )}
-            </Pressable>
+            {/* Trailing control: while a task is in flight, show the Stop
+                button (cancels the run). Otherwise mirror Telegram/iMessage —
+                the send arrow appears once there's text or a ready image (or
+                on non-iOS, where the recorder can't emit a decodable WAV),
+                and an empty iOS composer shows the press-and-hold mic. While a
+                voice take is in flight we keep the recorder mounted so its
+                upload can't resolve from an unmounted component and race a
+                text send. */}
+            {canStop ? (
+              <Pressable
+                onPress={stopTask}
+                disabled={cancel.isPending}
+                style={[
+                  styles.sendButton,
+                  styles.stopButton,
+                  cancel.isPending && styles.sendButtonDisabled
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Stop response"
+              >
+                {cancel.isPending ? (
+                  <ActivityIndicator color={theme.buttonText} />
+                ) : (
+                  <Feather name="square" size={16} color={theme.buttonText} />
+                )}
+              </Pressable>
+            ) : !voiceBusy && (trimmed || readyImages.length > 0 || Platform.OS !== "ios") ? (
+              <Pressable
+                onPress={submit}
+                disabled={sendDisabled}
+                style={[
+                  styles.sendButton,
+                  sendDisabled && styles.sendButtonDisabled
+                ]}
+                accessibilityRole="button"
+                accessibilityLabel="Send"
+              >
+                {send.isPending ? (
+                  <ActivityIndicator color={theme.buttonText} />
+                ) : (
+                  <Feather name="arrow-up" size={22} color={theme.buttonText} />
+                )}
+              </Pressable>
+            ) : (
+              <VoiceRecorder
+                disabled={!sessionId || showSendBusy || anyUploading}
+                onSend={sendVoice}
+                onBusyChange={setVoiceBusy}
+              />
+            )}
           </View>
         </View>
       </KeyboardAvoidingView>
@@ -732,6 +816,33 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
+  sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
   stopButton: { backgroundColor: theme.danger },
-  sendButtonDisabled: { backgroundColor: theme.buttonDisabled }
+
+  // Right-aligned pending indicator for an in-flight voice message.
+  // Mirrors the user-bubble row alignment but uses a muted gray surface
+  // (not the near-black user bubble) so it reads as transient status.
+  voicePendingRow: {
+    alignSelf: "flex-end",
+    maxWidth: "80%"
+  },
+  voicePendingBubble: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: theme.codeChipBg,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 18,
+    borderBottomRightRadius: 4,
+    borderBottomLeftRadius: 18
+  },
+  voicePendingText: {
+    flex: 1,
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 19
+  }
 });

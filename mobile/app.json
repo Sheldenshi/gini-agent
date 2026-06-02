@@ -48,7 +48,13 @@
           "cameraPermission": "Gini uses the camera to capture images to attach to chat messages."
         }
       ],
-      "expo-updates"
+      "expo-updates",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow Gini to record voice messages."
+        }
+      ]
     ],
     "experiments": { "typedRoutes": true },
     "extra": {

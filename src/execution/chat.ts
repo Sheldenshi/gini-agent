@@ -14,8 +14,9 @@ import {
   readState,
   renameChatSession
 } from "../state";
-import type { AssistantTextBlock, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
-import { uploadExists } from "../state/uploads";
+import type { AssistantTextBlock, AudioAttachment, ChatBlock, ChatMessageRecord, ImageAttachment, RuntimeConfig, TaskStatus, UserTextBlock } from "../types";
+import { readUpload, uploadExists, uploadStat } from "../state/uploads";
+import { getSttProvider } from "../stt";
 import { generateStructured, providerAuthFailureText, providerDisplayLabel, providerReauth } from "../provider";
 import { providerOverrideForRuntime, resolveEffectiveContext } from "./effective-context";
 import { createConversationRun, linkRunToTask } from "./runs";
@@ -235,15 +236,73 @@ function parseImageAttachments(instance: string, raw: unknown): ImageAttachment[
   return out;
 }
 
-export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
-  const content = String(input.content ?? "").trim();
-  const images = parseImageAttachments(config.instance, input.images);
-  if (!content && images.length === 0) {
-    throw new Error("Chat message content is required.");
+// Parse the optional voice attachment on a submit. Mirrors the image-upload
+// validation: reject a missing/foreign upload id so a client can't pin an
+// audio bubble with no backing bytes. The mimeType + size are taken from the
+// STORED upload metadata, not the client's claim, so a stray image id can't
+// masquerade as a recording and persist as a playable bubble over non-audio
+// bytes. The optional client-supplied durationMs is render-only metadata and
+// safe to trust.
+function parseAudioAttachment(instance: string, raw: unknown): AudioAttachment | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const item = raw as Record<string, unknown>;
+  const id = typeof item.id === "string" ? item.id : "";
+  const mimeType = typeof item.mimeType === "string" ? item.mimeType : "";
+  if (!id || !mimeType) throw new Error("Invalid input: audio attachment requires id and mimeType.");
+  const stat = uploadStat(instance, id);
+  if (!stat) {
+    throw new Error(`Invalid input: audio upload not found: ${id}`);
   }
+  if (!stat.mimeType.startsWith("audio/")) {
+    throw new Error(`Invalid input: audio attachment must be audio/* (got ${stat.mimeType})`);
+  }
+  const durationMs = typeof item.durationMs === "number" ? item.durationMs : undefined;
+  return { id, mimeType: stat.mimeType, size: stat.size, ...(durationMs !== undefined ? { durationMs } : {}) };
+}
+
+export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
+  let content = String(input.content ?? "").trim();
+  const images = parseImageAttachments(config.instance, input.images);
+  const audio = parseAudioAttachment(config.instance, input.audio);
+  // Validate the session before transcribing — STT (and, on the first voice
+  // message, the one-time model download) is expensive, so a stale or deleted
+  // sessionId must fail fast here rather than after the work is done.
   const state = readState(config.instance);
   const session = state.chatSessions.find((item) => item.id === sessionId);
   if (!session) throw new Error(`Chat session not found: ${sessionId}`);
+  // A voice message arrives with empty content — transcribe the recording so
+  // the transcript becomes the message content. The audio itself never
+  // reaches the provider; only this transcript does. A transcription failure
+  // surfaces as a user-facing error so the client retries rather than posting
+  // a do-nothing task with no prompt.
+  if (audio && !content) {
+    const upload = readUpload(config.instance, audio.id);
+    if (upload) {
+      try {
+        content = (await getSttProvider().transcribe(upload.bytes)).trim();
+      } catch (error) {
+        appendLog(config.instance, "chat.stt.failed", {
+          sessionId,
+          uploadId: audio.id,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        throw new Error("Could not transcribe the voice message. Please try again.");
+      }
+    }
+  }
+  if (!content && images.length === 0) {
+    throw new Error(
+      audio ? "No speech detected in the voice message." : "Chat message content is required."
+    );
+  }
+  // Re-validate the session: transcription above can run a long time (the
+  // first voice message downloads the model), and the chat may have been
+  // deleted during that window. Re-read so a delete-during-transcription
+  // can't create a run/task/block for a gone session or attribute work to a
+  // stale record.
+  const liveState = readState(config.instance);
+  const liveSession = liveState.chatSessions.find((item) => item.id === sessionId);
+  if (!liveSession) throw new Error(`Chat session not found: ${sessionId}`);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
@@ -253,7 +312,7 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     runId: run.id,
     mode: "chat",
     chatSessionId: sessionId,
-    agentId: session.agentId,
+    agentId: liveSession.agentId,
     ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);
@@ -264,7 +323,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       content,
       taskId: task.id,
       runId: run.id,
-      ...(images.length > 0 ? { images } : {})
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
     });
     const runRecord = current.runs.find((item) => item.id === run.id);
     if (runRecord) {
@@ -286,8 +346,9 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       text: content,
       taskId: task.id,
       runId: run.id,
-      agentId: session.agentId ?? null,
-      ...(images.length > 0 ? { images } : {})
+      agentId: liveSession.agentId ?? null,
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
     });
   } catch (error) {
     appendLog(config.instance, "chat.user_block.insert_failed", {

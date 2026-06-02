@@ -32,6 +32,7 @@ bun run gini evidence
 | Persistent memory | USER.md (instance), SOUL.md (per-agent), Hindsight (per-agent SQLite bank). `gini memory retain/recall/reflect/units/banks/migrate`, `/api/memory/{retain,recall,reflect,units,banks}` |
 | Embeddings | Local Transformers.js by default; OpenAI and echo are opt-in. `gini embedding status`, `gini embedding reembed`, `/api/embedding/*` |
 | Reranker | Local Transformers.js cross-encoder by default; echo and none are opt-in. `gini reranker status`, `/api/reranker/status` |
+| Voice messages / speech-to-text | Mobile (iOS) press-and-hold records a 16 kHz mono WAV; `/api/uploads` accepts `audio/*`, `POST /api/chat/:id/messages` takes an `audio` ref, and the gateway transcribes it locally (Transformers.js whisper-small by default; echo is opt-in) so only the transcript reaches the model — the audio is kept render-only for playback. Readiness at `/api/stt/status`. See [voice-messages-and-local-stt.md](adr/voice-messages-and-local-stt.md) |
 | Skills | Skills load enabled by default and can be enabled or disabled. `gini skills list/add/show/search/validate/test/enable/disable/rollback`, `/api/skills` |
 | Search | `gini search <query>`, `/api/search` with task, trace, skill, and audit citations (pinned-memory citations were dropped with the state.memories consolidation; Hindsight recall is its own surface via `recall_memory`) |
 | Jobs | `gini jobs list/add/run/pause/resume/remove/runs/replay`, prompt jobs, and script jobs |
@@ -60,7 +61,8 @@ Stable local clients use the gateway API:
 - `/api/version`, `/api/update/check`, `/api/update`
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/memory/migrate`
-- `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`
+- `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`, `/api/stt/status`
+- `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
 - `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/tunnel`, `/api/tunnel/redacted`, `/api/tunnel/qr.svg`, `/api/tunnel/qr.txt`, `POST /api/tunnel/refresh-notes`, and the `/connect` interstitial that mints the `gini://connect` deep link

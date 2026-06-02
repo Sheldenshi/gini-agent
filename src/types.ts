@@ -293,10 +293,24 @@ export interface ImageAttachment {
   size: number;
 }
 
+// Voice recording attached to a user message. Render-only: audio NEVER goes
+// to the model/provider — it is transcribed to text at submit time and only
+// the transcript reaches the agent. The bytes live on disk like images
+// (upload id is the canonical reference; clients fetch via GET
+// /api/uploads/:id for playback). `durationMs` is the client-measured clip
+// length so the bubble can render m:ss without decoding the file.
+export interface AudioAttachment {
+  id: string;
+  mimeType: string;
+  size: number;
+  durationMs?: number;
+}
+
 export interface UserTextBlock extends ChatBlockBase {
   kind: "user_text";
   text: string;
   images?: ImageAttachment[];
+  audio?: AudioAttachment;
 }
 
 export interface AssistantTextBlock extends ChatBlockBase {
@@ -789,6 +803,10 @@ export interface ChatMessageRecord {
   // ~/.gini/instances/<inst>/uploads/. Mirrored on the user_text ChatBlock so
   // either persistence path can drive transcript rendering.
   images?: ImageAttachment[];
+  // User-role messages may carry a voice recording. Render-only — the audio
+  // is transcribed into `content` at submit time and never sent to the
+  // provider. Mirrored on the user_text ChatBlock for playback rendering.
+  audio?: AudioAttachment;
   // Optional tag used to distinguish multiple assistant messages emitted by
   // the same task. Today only "approval_reason" is set — when an approval
   // (e.g. connector.request) is created, the runtime persists its `reason`
