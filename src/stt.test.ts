@@ -126,6 +126,18 @@ describe("WAV decoder", () => {
     new DataView(wav.buffer).setUint16(20, 3, true); // audioFormat = IEEE float
     expect(() => decodeWav(wav)).toThrow(/unsupported audio format/);
   });
+
+  test("rejects an implausibly small sample rate before allocating", () => {
+    // A forged header claiming sampleRate=0 would otherwise make the resample
+    // ratio zero and blow up the output buffer.
+    const wav = makeWav([0, 0], 0, 1);
+    expect(() => decodeWav(wav)).toThrow(/unsupported sample rate/);
+  });
+
+  test("rejects an implausibly large sample rate", () => {
+    const wav = makeWav([0, 0], 1_000_000, 1);
+    expect(() => decodeWav(wav)).toThrow(/unsupported sample rate/);
+  });
 });
 
 describe("local provider via test seam", () => {

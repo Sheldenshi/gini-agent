@@ -308,6 +308,13 @@ export function decodeWav(bytes: Uint8Array): Float32Array {
     throw new Error(`WAV decode failed: unsupported bit depth ${bitsPerSample} (only 16-bit PCM is supported).`);
   }
   if (numChannels < 1) throw new Error("WAV decode failed: invalid channel count.");
+  // Reject implausible sample rates before allocating. A forged header with a
+  // tiny rate would make the resample ratio approach zero and the output
+  // length explode; clamping to a sane range bounds the resampled output to a
+  // small multiple (≤4×) of the input frame count.
+  if (sampleRate < 4000 || sampleRate > 192000) {
+    throw new Error(`WAV decode failed: unsupported sample rate ${sampleRate}.`);
+  }
 
   const bytesPerSample = 2;
   const frameCount = Math.floor(dataLength / (bytesPerSample * numChannels));
