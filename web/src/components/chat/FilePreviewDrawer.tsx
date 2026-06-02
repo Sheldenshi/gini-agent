@@ -32,7 +32,7 @@ export function FilePreviewDrawer({
       <SheetContent
         side="right"
         showCloseButton={false}
-        className="flex w-full flex-col gap-0 border-l border-[#2A2B33] bg-[#101116] p-0 sm:max-w-[720px]"
+        className="flex w-full flex-col gap-0 border-l border-[#2A2B33] bg-[#101116] p-0 data-[side=right]:sm:max-w-[720px]"
       >
         {path !== null ? <DrawerBody path={path} /> : null}
       </SheetContent>
