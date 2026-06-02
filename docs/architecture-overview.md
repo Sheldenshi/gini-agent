@@ -68,7 +68,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - Server-side BFF attaches the gateway bearer token.
 - Uses the same API that CLI and future clients use.
 - Can be disabled with `--no-web` for smoke and runtime-only testing.
-- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one port (e.g. for tunnel exposure). The upstream is healthz-validated per instance (`src/web-target.ts`). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
+- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`src/web-target.ts`). This single origin is the foundation a future relay would front; off-LAN access itself is not built yet (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
 
 ### CLI
 

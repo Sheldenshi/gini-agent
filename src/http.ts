@@ -1395,9 +1395,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return preflightResponse(request);
     }
     // The gateway owns only its NATIVE /api/* surface. The Next BFF namespace
-    // (/api/runtime/*) is proxied to the web server instead, so the browser's
-    // token-injecting BFF calls reach Next rather than hitting this bearer gate.
-    if (url.pathname.startsWith("/api/") && !url.pathname.startsWith("/api/runtime/")) {
+    // (/api/runtime/*) and all non-/api traffic are web-bound (isWebProxyPath)
+    // and proxied to the web server instead, so the browser's token-injecting
+    // BFF calls reach Next rather than hitting this bearer gate. The same
+    // predicate gates WS routing in src/server.ts so the two can't drift.
+    if (!isWebProxyPath(url.pathname)) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
         try {
           return withCors(request, json(await claimPairing(config, await body(request)), 201));
@@ -1582,7 +1584,12 @@ export async function proxyWebSocketUpgrade(request: Request, server: Server<WsP
     if (data.client) { try { data.client.close(safeCloseCode(code)); } catch { /* already closed */ } }
   };
   upstream.addEventListener("close", (event) => onUpstreamDown(event.code));
-  upstream.addEventListener("error", () => onUpstreamDown());
+  upstream.addEventListener("error", () => {
+    // A failed dial means the validated port may be stale; drop it so the next
+    // request re-validates (mirrors the HTTP proxy's fetch-failure handling).
+    clearWebTargetCache(config.instance);
+    onUpstreamDown();
+  });
   if (!server.upgrade(request, { data })) {
     upstream.close();
     return new Response("WebSocket upgrade failed", { status: 426 });
