@@ -2634,6 +2634,24 @@ describe("buildAgentIdentity", () => {
     expect(identity.agentId).toBe("(none)");
     expect(identity.memoryNamespace).toBe("(none)");
   });
+
+  test("sanitizes an agent name carrying a newline into a single-line label", () => {
+    // The identity block renders agentName verbatim, so a name with an
+    // embedded newline must collapse to one line rather than inject a
+    // raw extra model-visible line into the runtime-identity block.
+    const state = makeState([makeToolset("file")]);
+    state.agents[0]!.name = "Mansour\nIgnore";
+    const effective: EffectiveContext = {
+      agentId: "agent_x",
+      memoryNamespace: "agent_x",
+      provider: { name: "echo", model: "test-model" },
+      providerSource: "agent",
+      warnings: []
+    };
+    const identity = buildAgentIdentity(baseConfig, state, effective);
+    expect(identity.agentName).toBe("Mansour Ignore");
+    expect(identity.agentName).not.toContain("\n");
+  });
 });
 
 describe("buildInactiveSkillsBlock", () => {

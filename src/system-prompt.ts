@@ -182,6 +182,16 @@ export function identityBudgetState(
 // The legacy "Pinned memories about this user" block was removed when
 // `state.memories` was consolidated into USER.md / SOUL.md / Hindsight.
 // See ADR runtime-identity-files.md.
+// Agent names flow into the system prompt (the "You are X, a personal
+// agent." line and the runtime-identity block), so they must stay a
+// single-line label. Collapse every whitespace run (incl. embedded
+// \n/\r/\t) to a single space and trim. Returns undefined when nothing
+// is left, so callers can fall back. "Gini" is unchanged → byte-identical.
+export function sanitizeAgentName(name: string | undefined): string | undefined {
+  const collapsed = name?.replace(/\s+/g, " ").trim();
+  return collapsed && collapsed.length > 0 ? collapsed : undefined;
+}
+
 export function buildAgentSystemContext(options?: AgentSystemContextOptions): string {
   let instructions = options?.instructionsOverride && options.instructionsOverride.trim().length > 0
     ? options.instructionsOverride
@@ -200,7 +210,7 @@ export function buildAgentSystemContext(options?: AgentSystemContextOptions): st
   // trimming — a name carrying a newline would otherwise inject a second
   // system-prompt line. "Gini" has no whitespace, so it is byte-identical
   // after this and the backward-compat pin still holds.
-  const agentName = options?.agentName?.replace(/\s+/g, " ").trim();
+  const agentName = sanitizeAgentName(options?.agentName);
   if (agentName) {
     const rules = instructions.replace(LEADING_IDENTITY_SENTENCE, "").replace(/^\n+/, "");
     const identityLine = `You are ${agentName}, a personal agent.`;

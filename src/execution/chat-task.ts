@@ -40,7 +40,8 @@ import {
   decideIdentityEmission,
   identityBudgetState,
   renderEphemeralContext,
-  renderFullIdentity
+  renderFullIdentity,
+  sanitizeAgentName
 } from "../system-prompt";
 import { loadInstructions, loadSoul, loadUserProfile } from "../runtime/identity-files";
 import type {
@@ -499,7 +500,7 @@ export function buildAgentIdentity(
   return {
     instance: config.instance,
     runtimePort: config.port,
-    agentName: agent?.name ?? "default",
+    agentName: sanitizeAgentName(agent?.name) ?? "default",
     agentId: effective.agentId ?? "(none)",
     provider: `${effective.provider.name}/${effective.provider.model}`,
     toolsets,
