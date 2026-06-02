@@ -4,9 +4,10 @@
 // dynamic import via __setTransformersLoaderForTests so the local-provider
 // code path runs without the network or the native binding.
 
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, relative } from "node:path";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import {
   __setTransformersLoaderForTests,
   DEFAULT_LOCAL_STT_MODEL,
@@ -175,13 +176,34 @@ describe("local provider via test seam", () => {
 });
 
 describe("sttStatus", () => {
-  // Use a unique model id so the on-disk onnx files we create can't collide
-  // with the real whisper cache, and clean them up after each case.
-  const modelId = `test-org/stt-status-${process.pid}-${Math.random().toString(36).slice(2)}`;
-  const onnxDir = join(localCacheDir(), modelId, "onnx");
+  // localCacheDir() resolves from os.homedir(), which Bun derives from the
+  // system passwd entry and won't redirect via $HOME — so writing fake onnx
+  // files under it would touch the real ~/.gini/models cache. Instead, the
+  // configured model id is a relative path that join() normalizes back out of
+  // the cache dir into a throwaway temp dir we own. isLocalSttModelCached then
+  // reads/writes only inside that temp dir; the real cache is never touched.
+  let tempDir: string;
+  let modelId: string;
+  let onnxDir: string;
 
+  beforeAll(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "gini-stt-"));
+    const modelDir = join(tempDir, "model");
+    modelId = relative(localCacheDir(), modelDir);
+    onnxDir = join(modelDir, "onnx");
+    // Fail loudly if the relative model id doesn't actually resolve into the
+    // temp dir, rather than silently writing into the real cache.
+    expect(join(localCacheDir(), modelId, "onnx")).toBe(onnxDir);
+  });
+
+  afterAll(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  // Clear the onnx dir between cases so files written by one test don't leak
+  // into another's readiness check.
   afterEach(() => {
-    rmSync(join(localCacheDir(), modelId.split("/")[0]!), { recursive: true, force: true });
+    rmSync(onnxDir, { recursive: true, force: true });
   });
 
   test("echo provider is always ready", () => {
