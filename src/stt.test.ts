@@ -241,15 +241,18 @@ describe("sttStatus", () => {
     expect(sttStatus().ready).toBe(true);
   });
 
-  test("readiness is dtype-agnostic — any downloaded encoder/decoder pair counts", () => {
-    // Configured dtype (q8) differs from the cached filenames (q4): the check
-    // must not key off the dtype suffix, so a model downloaded under a
-    // different dtype still reports ready.
+  test("readiness keys off the active dtype", () => {
+    // Configured dtype (q8 → _quantized) differs from the cached filenames
+    // (q4 → _q4): the loader would still fetch the q8 build, so readiness must
+    // report not-ready until the active dtype's weights are on disk.
     process.env.GINI_LOCAL_STT_MODEL = modelId;
     process.env.GINI_STT_DTYPE = "q8";
     mkdirSync(onnxDir, { recursive: true });
     writeFileSync(join(onnxDir, "encoder_model_q4.onnx"), "");
     writeFileSync(join(onnxDir, "decoder_model_merged_q4.onnx"), "");
+    expect(sttStatus().ready).toBe(false);
+    writeFileSync(join(onnxDir, "encoder_model_quantized.onnx"), "");
+    writeFileSync(join(onnxDir, "decoder_model_merged_quantized.onnx"), "");
     expect(sttStatus().ready).toBe(true);
   });
 

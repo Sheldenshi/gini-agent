@@ -91,13 +91,32 @@ export function resolveSttChoice(): SttChoice {
   };
 }
 
-// Whether the local model's onnx weights are already on disk, so the first
-// voice message can be transcribed without the one-time ~727MB download. The
-// onnx-community build stores the encoder + merged decoder under
-// <cacheDir>/<modelId>/onnx, with a dtype-dependent filename suffix
-// (encoder_model_q4.onnx, decoder_model_merged_quantized.onnx, etc.). The check
-// is dtype-agnostic — any downloaded encoder + merged-decoder pair counts as
-// cached — so a non-default GINI_STT_DTYPE still reports ready. Pure disk
+// Maps a Transformers.js dtype to the ONNX filename suffix the model is cached
+// under (mirrors DEFAULT_DTYPE_SUFFIX_MAPPING in @huggingface/transformers).
+const DTYPE_FILE_SUFFIX: Record<string, string> = {
+  fp32: "",
+  fp16: "_fp16",
+  int8: "_int8",
+  uint8: "_uint8",
+  q8: "_quantized",
+  q4: "_q4",
+  q2: "_q2",
+  q1: "_q1",
+  q4f16: "_q4f16",
+  q2f16: "_q2f16",
+  q1f16: "_q1f16",
+  bnb4: "_bnb4"
+};
+
+// Whether the local model's onnx weights for the ACTIVE dtype are already on
+// disk, so the first voice message can be transcribed without the one-time
+// ~727MB download. The onnx-community build stores the encoder + merged decoder
+// under <cacheDir>/<modelId>/onnx with a dtype-specific suffix (q4 → _q4, q8 →
+// _quantized, fp32 → "", ...). The check keys off the configured dtype so a
+// dtype the loader will fetch but hasn't cached reports not-ready (rather than
+// claiming ready and then blocking the first request on a download). For an
+// unrecognized or "auto" dtype, where the resolved filename can't be predicted,
+// it falls back to "any encoder + merged-decoder pair present". Pure disk
 // check; no model load, no download.
 export function isLocalSttModelCached(modelId: string = localModelId()): boolean {
   const onnxDir = join(localCacheDir(), modelId, "onnx");
@@ -107,9 +126,16 @@ export function isLocalSttModelCached(modelId: string = localModelId()): boolean
   } catch {
     return false;
   }
+  const suffix = DTYPE_FILE_SUFFIX[localDtype()];
+  if (suffix === undefined) {
+    return (
+      files.some((f) => f.startsWith("encoder_model") && f.endsWith(".onnx")) &&
+      files.some((f) => f.startsWith("decoder_model_merged") && f.endsWith(".onnx"))
+    );
+  }
   return (
-    files.some((f) => f.startsWith("encoder_model") && f.endsWith(".onnx")) &&
-    files.some((f) => f.startsWith("decoder_model_merged") && f.endsWith(".onnx"))
+    files.includes(`encoder_model${suffix}.onnx`) &&
+    files.includes(`decoder_model_merged${suffix}.onnx`)
   );
 }
 
