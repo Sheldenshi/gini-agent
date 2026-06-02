@@ -420,6 +420,13 @@ export default function ChatDetailScreen() {
             ref={scrollRef}
             contentContainerStyle={styles.messages}
             keyboardShouldPersistTaps="handled"
+            // Dragging the transcript dismisses the keyboard so the user
+            // can read the conversation or recover screen space without
+            // sending. on-drag (not interactive) so scrolling up to older
+            // messages dismisses too, not just a downward drag toward the
+            // keyboard. Taps on non-interactive content still dismiss via
+            // keyboardShouldPersistTaps; taps on buttons stay handled.
+            keyboardDismissMode="on-drag"
             scrollEventThrottle={16}
             onScroll={(e) => {
               const { contentOffset, contentSize, layoutMeasurement } =
