@@ -82,8 +82,14 @@ remote previews, screen readers) would need the same translation code.
   Each block carries `id`, `sessionId`, `instance`, `ordinal`,
   `createdAt`, optional `taskId`/`runId`, plus the kind-specific
   fields. `AssistantTextBlock` also carries `updatedAt` and a
-  `streaming` flag; `ToolCallBlock` carries `updatedAt` and a `status`
-  in `{ running, ok, error, denied }`.
+  `streaming` flag; `ToolCallBlock` carries `updatedAt`, a `status`
+  in `{ running, ok, error, denied }`, and an optional `errorSeverity`
+  in `{ info, error }`. `errorSeverity` lets a failed call render as a
+  muted "needs setup" notice instead of a red error — e.g. `web_search`
+  with no connector keeps the verbose steering as the model-facing tool
+  result and shows the user a short `"info"` line. The runtime derives
+  it from a `ToolDisplayError` thrown by the tool; clients default to
+  `"error"` when it is absent (see ADR web-search-connectors.md).
 
 - Persistence in `src/state/chat-blocks.ts`. SQLite is the source of
   truth, not the JSON `RuntimeState` blob. `ordinal` is allocated as
@@ -120,7 +126,12 @@ remote previews, screen readers) would need the same translation code.
     `action`:
     - `connector.request` — render the Connect dialog. Submit posts
       `{ secrets, scopes, name }` to
-      `/api/setup-requests/<id>/complete`.
+      `/api/setup-requests/<id>/complete`. The model's reason is emitted
+      as its own `assistant_text` bubble above this card (so the card
+      itself stays minimal), and `/complete` resumes the paused run in
+      the background so the dialog closes immediately rather than
+      blocking on the resumed agent stream (see ADR
+      web-search-connectors.md).
     - `browser.fill_secret` — render an inline form with one input
       per slot in `setupRequest.payload.slots`. Submit posts
       `{ secrets: { <slot.name>: <value>, ... } }` to
