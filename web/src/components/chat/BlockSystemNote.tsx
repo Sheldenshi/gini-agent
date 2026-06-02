@@ -21,8 +21,11 @@ export function BlockSystemNote({ block }: { block: SystemNoteBlock }) {
     // broken CTA.
     const kind = reauthKind ?? "settings";
     const url = reauthUrl ?? "/settings";
+    // "docs" opens an instruction page (the user re-auths themselves, e.g. in a
+    // terminal), so the label must read as "show me how" — not as a button that
+    // performs the auth. "settings" navigates to the in-app key form.
     const ctaLabel =
-      kind === "docs" ? `Re-authenticate ${providerLabel}` : `Update ${providerLabel} key`;
+      kind === "docs" ? `How to re-authenticate ${providerLabel}` : `Update ${providerLabel} key`;
     return (
       <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3">
         <div className="flex items-center gap-2">
