@@ -167,6 +167,7 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
           : {}),
         status: (payload.status as ToolCallStatus) ?? "running",
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
+        errorSeverity: payload.errorSeverity === "info" || payload.errorSeverity === "error" ? payload.errorSeverity : undefined,
         callId: String(payload.callId ?? ""),
         runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined
       };
@@ -275,6 +276,7 @@ function payloadFor(block: ChatBlock): string {
         argsFull: block.argsFull,
         status: block.status,
         errorMessage: block.errorMessage,
+        errorSeverity: block.errorSeverity,
         callId: block.callId,
         runningHint: block.runningHint
       });
@@ -377,6 +379,7 @@ export function insertChatBlock(
             argsFull: input.argsFull,
             status: input.status,
             errorMessage: input.errorMessage,
+            errorSeverity: input.errorSeverity,
             callId: input.callId,
             runningHint: input.runningHint
           };
@@ -574,6 +577,7 @@ export function updateToolCallBlock(
   patch: {
     status?: "running" | "ok" | "error" | "denied";
     errorMessage?: string;
+    errorSeverity?: "info" | "error";
     runningHint?: string;
   }
 ): ChatBlock | null {
@@ -597,6 +601,7 @@ export function updateToolCallBlock(
   }
   if (patch.status !== undefined) payload.status = patch.status;
   if (patch.errorMessage !== undefined) payload.errorMessage = patch.errorMessage;
+  if (patch.errorSeverity !== undefined) payload.errorSeverity = patch.errorSeverity;
   // Clear the running hint when the tool leaves the running state — the
   // amber waiting-card is only meaningful while we're still waiting.
   if (patch.runningHint !== undefined) payload.runningHint = patch.runningHint;

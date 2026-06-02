@@ -1,4 +1,4 @@
-import { writeFileSync } from "node:fs";
+import { writeFileSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import type { ApprovalMode, ChatBlock, RuntimeConfig, SkillRecord } from "./types";
 import { cancelTask, decideApproval, findTask, resolveSetupRequest, retryTask, submitTask } from "./agent";
 import { pidPath } from "./paths";
@@ -6,6 +6,7 @@ import {
   addAudit,
   addSseSubscription,
   appendTrace,
+  assertInsideWorkspace,
   createSetupRequest,
   getDevice,
   listChatBlocks,
@@ -86,10 +87,27 @@ import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
 import { clearWebTargetCache, resolveWebPort } from "./web-target";
+import { basename } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
 
 type Handler = (request: Request, params: Record<string, string>) => Response | Promise<Response>;
 
+// Extensions the browser can safely render inline (PDFs + raster images) when
+// GET /api/files is called with `inline=1`. Everything else — html/htm, svg,
+// xml, js, and any unlisted type — is deliberately excluded so it falls
+// through to the octet-stream + attachment download path and can never execute
+// script in the app origin.
+const INLINE_MIME: Record<string, string> = {
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  bmp: "image/bmp",
+  ico: "image/x-icon"
+};
 
 // Per-action audit row for connector.request completion. createConnector
 // and checkConnector emit their own connector.create / connector.health
@@ -256,6 +274,98 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           "cache-control": "private, max-age=31536000, immutable"
         }
       });
+    }],
+    // Read a workspace file by relative path so the web app can show the
+    // contents (and absolute path) of files the agent generated in chat. The
+    // path is resolved and validated inside the workspace root;
+    // `assertInsideWorkspace` throws on escape, which we map to 400 rather
+    // than letting it bubble to the default 500.
+    ["GET", /^\/api\/files$/, (request) => {
+      const path = new URL(request.url).searchParams.get("path");
+      if (!path) return json({ error: "Missing 'path' query parameter" }, 400);
+      let absolutePath: string;
+      try {
+        absolutePath = assertInsideWorkspace(config.workspaceRoot, path);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+      // Raw download mode: stream the file bytes back as an attachment so the
+      // web app's Download button saves the original file. Always served as
+      // application/octet-stream + content-disposition: attachment so the
+      // browser never renders HTML/SVG from the app origin (XSS-safe).
+      if (new URL(request.url).searchParams.get("raw")) {
+        try {
+          const stat = statSync(absolutePath);
+          if (!stat.isFile()) return json({ error: "Not a file" }, 400);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException)?.code;
+          if (code === "ENOENT") return json({ error: "File not found" }, 404);
+          return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+        }
+        // Inline mode: for an allowlist of types the browser can safely embed
+        // (PDFs + raster images), serve with the real content-type and
+        // content-disposition: inline so the preview drawer can render them in
+        // an <iframe>/<img>. Non-allowlisted types (html/svg/xml/js/etc.) skip
+        // this branch and fall through to the attachment download below.
+        const dot = basename(absolutePath).lastIndexOf(".");
+        const ext = dot > 0 ? basename(absolutePath).slice(dot + 1).toLowerCase() : "";
+        if (new URL(request.url).searchParams.get("inline") && INLINE_MIME[ext]) {
+          return new Response(Bun.file(absolutePath), {
+            headers: {
+              "content-type": INLINE_MIME[ext],
+              "content-disposition": "inline",
+              "cache-control": "private, max-age=0"
+            }
+          });
+        }
+        // POSIX filenames may contain bytes (CR/LF, high-bit chars) that Bun
+        // rejects as a header value, which would 500 the download. Emit an
+        // ASCII-safe `filename` fallback plus an RFC 5987 `filename*` form
+        // that carries the original bytes percent-encoded as UTF-8.
+        const rawName = basename(absolutePath);
+        const asciiName = rawName.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+        const contentDisposition = `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(rawName)}`;
+        return new Response(Bun.file(absolutePath), {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-disposition": contentDisposition,
+            "cache-control": "private, max-age=0"
+          }
+        });
+      }
+      const MAX = 512 * 1024;
+      try {
+        const stat = statSync(absolutePath);
+        if (!stat.isFile()) return json({ error: "Not a file" }, 400);
+        const name = basename(absolutePath);
+        // Read at most MAX bytes through a file descriptor so memory stays
+        // bounded no matter how large the file is on disk.
+        const cap = Math.min(stat.size, MAX);
+        const buffer = Buffer.alloc(cap);
+        const fd = openSync(absolutePath, "r");
+        let read = 0;
+        try {
+          while (read < cap) {
+            const n = readSync(fd, buffer, read, cap - read, read);
+            if (n === 0) break;
+            read += n;
+          }
+        } finally {
+          closeSync(fd);
+        }
+        const data = buffer.subarray(0, read);
+        // A NUL byte in the leading sample is the standard text/binary
+        // heuristic (matches git / `grep -I`).
+        const binary = data.subarray(0, 8000).includes(0);
+        if (binary) {
+          return json({ path, absolutePath, name, bytes: stat.size, content: null, truncated: false, binary: true });
+        }
+        return json({ path, absolutePath, name, bytes: stat.size, content: data.toString("utf8"), truncated: stat.size > MAX, binary: false });
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code === "ENOENT") return json({ error: "File not found" }, 404);
+        return json({ error: error instanceof Error ? error.message : String(error) }, 500);
+      }
     }],
     // Speech-to-text readiness. Lets clients warn before the first voice
     // message that the local whisper model still needs its one-time download.
@@ -520,7 +630,6 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           return json({ ok: false, connector: probed, message });
         }
         await emitConnectorRequestAudit(config, setup, connector.id);
-
         // Auto-grant to the requesting skill (LOCKED decision). When the
         // dispatcher minted this card with a `skillId`, the human entering the
         // secret for that named skill IS the consent — so completing the card
@@ -566,9 +675,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         // now-completed row). A losing racer never reaches here. Route it
         // through safeResume so a throw from the chat-task loop AFTER the
         // mutations landed flips the task out of the orphan-running state
-        // instead of being left dangling.
+        // instead of being left dangling. Fire it DETACHED (no await): the
+        // connector is already saved + granted, so the connect modal should
+        // close as soon as this responds rather than hang until the resumed
+        // agent run finishes streaming. safeResume owns its own failure
+        // recovery (trace + failTask), so the detached run can't reject
+        // unhandled.
         if (setup.taskId && toolCallId) {
-          await safeResume(
+          void safeResume(
             config,
             setup.taskId,
             toolCallId,
@@ -616,7 +730,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
 
       if (setup.action === "browser.connect") {
         const { ok, result } = await completeBrowserConnectSetup(config, setup);
-        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result });
+        await resolveSetupRequest(config, setupId, "complete", { actor: "user", toolResult: result, awaitResume: false });
         return json({ ok });
       }
 
@@ -1095,6 +1209,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       id: p.id,
       label: p.label,
       description: p.description,
+      docsUrl: p.docsUrl,
       fields: p.fields,
       secrets: p.secrets,
       hasProbe: Boolean(p.probe),

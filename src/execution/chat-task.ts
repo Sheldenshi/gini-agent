@@ -88,7 +88,7 @@ import {
   updateAssistantTextDelta,
   type ChatEmitContext
 } from "./chat-task-emit";
-import { dispatchToolCall, parseToolArgsLenient } from "./tool-dispatch";
+import { dispatchToolCall, parseToolArgsLenient, ToolDisplayError } from "./tool-dispatch";
 import { getSubagentForTask, syncSubagentFromTask } from "../capabilities/subagents";
 import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { autoRenameChatAfterTurn } from "./chat";
@@ -1601,6 +1601,16 @@ async function runLoop(
           } else {
             const setupRow = stateForBlock.setupRequests.find((s) => s.id === dispatch.approvalId);
             if (setupRow) {
+              // connector.request renders a minimal card (no inline reason),
+              // so the model's reason — its natural "here's why connecting
+              // helps" explanation — is surfaced as its own assistant bubble
+              // above the card. Without this the reason would be invisible in
+              // the block UI (the legacy ChatMessageRecord persisted in
+              // tool-dispatch only feeds the deprecated getChatSession path).
+              if (setupRow.action === "connector.request" && setupRow.reason) {
+                const reasonBlock = emitAssistantTextStart(emitCtx, setupRow.reason);
+                if (reasonBlock?.id) finalizeAssistantText(emitCtx, reasonBlock.id, setupRow.reason);
+              }
               emitSetupRequested(emitCtx, {
                 setupRequestId: setupRow.id,
                 action: setupRow.action,
@@ -1633,8 +1643,14 @@ async function runLoop(
         }
 
         // Dispatch failed (bad args, unknown tool, validation error). Feed
-        // the error back to the model as the tool result so it can recover.
+        // the FULL error back to the model as the tool result so it can
+        // recover/steer. The chat UI may show a shorter, calmer line: a
+        // ToolDisplayError carries a separate `displayMessage`/`severity`
+        // (e.g. web_search with no provider keeps the verbose steering for
+        // the model but shows "No search provider connected." in gray).
         const message = error instanceof Error ? error.message : String(error);
+        const display = error instanceof ToolDisplayError ? error.displayMessage : message;
+        const severity = error instanceof ToolDisplayError ? error.displaySeverity : "error";
         appendTrace(config.instance, taskId, {
           type: "error",
           message: `Tool call ${call.function.name} failed: ${message}`,
@@ -1653,7 +1669,8 @@ async function runLoop(
         emitToolCallStatus(emitCtx, {
           callId: call.id,
           status: "error",
-          errorMessage: message
+          errorMessage: display,
+          errorSeverity: severity
         });
         await mutateState(config.instance, (state) => {
           updateRecentToolCall(findTask(state, taskId), call.id, "error");

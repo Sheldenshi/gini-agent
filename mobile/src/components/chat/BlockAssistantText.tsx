@@ -136,7 +136,7 @@ const renderAsText =
 // wrappers per rule and the defaults omit the prop — without these
 // overrides a long-press in the middle of a paragraph hits an inner
 // non-selectable Text and the gesture finds nothing to copy.
-const markdownRules: Record<string, RenderRule> = {
+export const markdownRules: Record<string, RenderRule> = {
   paragraph: renderAsText(blockTextStyles.paragraph),
   heading1: renderAsText(blockTextStyles.heading1),
   heading2: renderAsText(blockTextStyles.heading2),

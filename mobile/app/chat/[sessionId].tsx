@@ -23,6 +23,7 @@ import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
+import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
@@ -500,6 +501,8 @@ export default function ChatDetailScreen() {
                     calls={item.calls}
                     resultsByCallId={toolResultsByCallId}
                   />
+                ) : item.kind === "file_artifact" ? (
+                  <GeneratedFilesCard key={item.id} files={item.files} />
                 ) : (
                   <BlockRenderer
                     key={item.block.id}

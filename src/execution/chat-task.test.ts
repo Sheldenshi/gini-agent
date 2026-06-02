@@ -1597,6 +1597,50 @@ describe("chat-task loop", () => {
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
+  test("connector.request surfaces the reason as an assistant bubble above the setup card", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-blocks-connector");
+    const provider = normalizeProvider(config.provider);
+
+    const session = await mutateState(config.instance, (state) =>
+      createChatSession(state, "block-connector", undefined, "agent_z")
+    );
+
+    const reason = "Brave Search would help me find a fresh answer here. Want to connect it?";
+    setEchoToolCallingResponse({
+      provider,
+      text: "",
+      toolCalls: [
+        { id: "call_c", type: "function", function: { name: "request_connector", arguments: JSON.stringify({ provider: "brave-search", reason }) } }
+      ],
+      finishReason: "tool_calls"
+    });
+
+    const { submitChatMessage } = await import("./chat");
+    const submitted = await submitChatMessage(config, session.id, { content: "search the web for the best cafe" });
+    const paused = await waitForTerminal(config, submitted.taskId);
+    expect(paused.status).toBe("waiting_approval");
+
+    const { listChatBlocks } = await import("../state");
+    const blocks = listChatBlocks(config.instance, session.id);
+
+    // The minimal setup card carries no inline reason; the reason is its
+    // own assistant bubble, ordered above the card.
+    const setupIdx = blocks.findIndex((b) => b.kind === "setup_requested");
+    expect(setupIdx).toBeGreaterThanOrEqual(0);
+    const setup = blocks[setupIdx];
+    if (setup?.kind === "setup_requested") {
+      expect(setup.action).toBe("connector.request");
+    } else {
+      throw new Error("missing setup_requested block");
+    }
+    const reasonIdx = blocks.findIndex((b) => b.kind === "assistant_text" && b.text === reason);
+    expect(reasonIdx).toBeGreaterThanOrEqual(0);
+    expect(reasonIdx).toBeLessThan(setupIdx);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
   test("emits parallel tool_calls with distinct callIds and ordinals", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     writeFileSync(join(workspaceRoot, "a.md"), "alpha");

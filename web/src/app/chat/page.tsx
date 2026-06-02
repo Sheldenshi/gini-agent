@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
+import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
 import { SessionItem } from "@/components/chat/SessionItem";
 import { api, type UploadRef } from "@/lib/api";
@@ -289,15 +290,25 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   <ul className="space-y-5">
-                    {renderItems.map((item) =>
-                      item.kind === "tool_group" ? (
-                        <li key={item.id}>
-                          <BlockToolCallsCollapsed
-                            calls={item.calls}
-                            resultsByCallId={toolResultsByCallId}
-                          />
-                        </li>
-                      ) : (
+                    {renderItems.map((item) => {
+                      if (item.kind === "tool_group") {
+                        return (
+                          <li key={item.id}>
+                            <BlockToolCallsCollapsed
+                              calls={item.calls}
+                              resultsByCallId={toolResultsByCallId}
+                            />
+                          </li>
+                        );
+                      }
+                      if (item.kind === "file_artifact") {
+                        return (
+                          <li key={item.id}>
+                            <GeneratedFilesCard files={item.files} />
+                          </li>
+                        );
+                      }
+                      return (
                         <li key={item.block.id}>
                           <BlockRenderer
                             block={item.block}
@@ -308,8 +319,8 @@ export default function ChatPage() {
                             }
                           />
                         </li>
-                      )
-                    )}
+                      );
+                    })}
                   </ul>
                 )}
                 <div ref={messagesEndRef} />

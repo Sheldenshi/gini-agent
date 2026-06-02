@@ -331,6 +331,11 @@ export interface ToolCallBlock extends ChatBlockBase {
   argsFull: Record<string, unknown>;
   status: ToolCallStatus;
   errorMessage?: string;
+  // How the client should style `errorMessage`. "error" (default) renders
+  // red; "info" renders muted/gray for a calm needs-setup notice (e.g.
+  // web_search with no provider connected) where the verbose steering goes
+  // to the model only and the user sees a short neutral line.
+  errorSeverity?: "info" | "error";
   // Provider-issued tool call id. Used by `tool_result` blocks to
   // associate result with call, and by resume paths to flip the
   // matching running block to `ok`/`error` after the approval lands.

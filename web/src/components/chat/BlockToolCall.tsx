@@ -16,7 +16,9 @@ import { iconForTool } from "./tool-icons";
 //
 // Three render variants:
 //   - Default (any tool, any status): the row above. Failed (error/denied)
-//     tool calls surface the error string in red below the row.
+//     tool calls surface the error string below the row — red by default,
+//     muted gray when errorSeverity is "info" (a calm needs-setup notice,
+//     e.g. web_search with no connector).
 //   - Inline spinner (status === "running" && !result, no runningHint):
 //     a small Loader2 sits after the chip while the dispatch is in flight.
 //     Right for short tools (web_fetch, code_exec).
@@ -109,7 +111,13 @@ export function BlockToolCall({
     <div className="flex flex-col gap-1.5">
       {row}
       {failed && block.errorMessage ? (
-        <span className="pl-[23px] text-[12px] text-red-400/90">{block.errorMessage}</span>
+        <span
+          className={`pl-[23px] text-[12px] ${
+            block.errorSeverity === "info" ? "text-[#9A9AA0]" : "text-red-400/90"
+          }`}
+        >
+          {block.errorMessage}
+        </span>
       ) : null}
       {expanded && result ? (
         <pre className="ml-[23px] max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-[#2B2B31] p-2.5 font-mono text-[12px] text-[#C8C8D2]">

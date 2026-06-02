@@ -6,7 +6,7 @@
 // Stays a controlled component (open/onOpenChange owned by the caller)
 // so the call site decides when to surface it.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -106,6 +106,35 @@ export interface AddConnectorDialogProps {
   // dialog titles the action as granting the credential to that named skill so
   // the consent is accurate about which skill receives the grant.
   requestSkillName?: string;
+}
+
+// Render plain text with any http(s) URLs turned into links. Trailing
+// sentence punctuation after a URL stays as text so a URL ending a
+// sentence (".../api/.") doesn't pull the period into the link.
+function linkify(text: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  const re = /(https?:\/\/[^\s]+?)([.,;:!?)\]]*)(?=\s|$)/g;
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(
+      <a
+        key={key++}
+        href={m[1]}
+        target="_blank"
+        rel="noreferrer"
+        className="underline underline-offset-2 hover:text-foreground"
+      >
+        {m[1]}
+      </a>
+    );
+    if (m[2]) out.push(m[2]);
+    last = re.lastIndex;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
 }
 
 export function AddConnectorDialog({
@@ -389,7 +418,7 @@ export function AddConnectorDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
+      <DialogContent className={mode === "request" ? "sm:max-w-md" : undefined}>
         <DialogHeader>
           <DialogTitle>
             {mode === "rotate"
@@ -408,7 +437,7 @@ export function AddConnectorDialog({
               ? "Replace the stored secret(s). The connector record, name, and scopes stay the same."
               : templatelessRequest
                 ? "Enter the secret below. It is stored encrypted server-side and never shown to the agent."
-                : selectedProvider?.description ?? "Connect a new external system."}
+                : linkify(selectedProvider?.description ?? "Connect a new external system.")}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
@@ -551,16 +580,39 @@ export function AddConnectorDialog({
                   onChange={(e) => setFieldValues((prev) => ({ ...prev, [field.name]: e.target.value }))}
                   placeholder={field.placeholder}
                   autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  data-1p-ignore="true"
+                  data-lpignore="true"
+                  data-form-type="other"
+                  className={field.secret ? "font-mono" : undefined}
                 />
-                {field.description ? <p className="text-[11px] text-muted-foreground">{field.description}</p> : null}
+                {field.description && !selectedProvider?.docsUrl ? (
+                  <p className="text-[11px] text-muted-foreground">{field.description}</p>
+                ) : null}
               </div>
             ))
           )}
 
+          {selectedProvider?.docsUrl ? (
+            <p className="text-[11px] text-muted-foreground">
+              Learn more at{" "}
+              <a
+                href={selectedProvider.docsUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="underline underline-offset-2 hover:text-foreground"
+              >
+                {selectedProvider.docsUrl.replace(/^https?:\/\//, "")}
+              </a>
+            </p>
+          ) : null}
+
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
           {externalError ? <p className="text-xs text-destructive">{externalError}</p> : null}
         </div>
-        <DialogFooter>
+        <DialogFooter className={mode === "request" ? "bg-transparent" : undefined}>
           <Button onClick={submit} disabled={pending}>
             {pending
               ? mode === "rotate"

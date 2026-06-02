@@ -57,7 +57,9 @@ import { searchSessions } from "./search";
 import { installSkillFromBody, setSkillStatus } from "../capabilities/skills";
 import { credentialTemplateForProvider, firstUngrantedCredential, isSkillActive } from "../integrations/connectors";
 import { getProvider } from "../integrations/connectors/registry";
+import { resolveConnectorSecret } from "../integrations/connectors";
 import { invokeMcpTool } from "../integrations/mcp";
+import { braveWebSearch, exaWebSearch, formatWebSearchResults } from "../tools/web-search";
 import { findSkillScript, invokeSkillScript } from "../capabilities/skill-scripts";
 import { invokeVisionQuery } from "../capabilities/vision-query";
 import { checkMessagingBridge, listAllowedChats } from "../integrations/messaging";
@@ -86,6 +88,23 @@ import { parseFillSecretSlots, sanitizeUrlForAuditTarget } from "./browser-fill-
 export type DispatchResult =
   | { kind: "sync"; result: string }
   | { kind: "pending"; approvalId: string };
+
+// A tool failure whose model-facing message (the thrown `message`, fed back
+// as the tool result so the model can steer itself) differs from what the
+// user should see in the chat UI. `displayMessage` is the short, calm line
+// rendered under the tool-call row; `displaySeverity` lets the client style
+// it as a neutral "info" notice (gray) instead of a red error. Plain Errors
+// continue to surface their full message to both the model and the user.
+export class ToolDisplayError extends Error {
+  readonly displayMessage: string;
+  readonly displaySeverity: "info" | "error";
+  constructor(modelMessage: string, opts: { displayMessage: string; severity?: "info" | "error" }) {
+    super(modelMessage);
+    this.name = "ToolDisplayError";
+    this.displayMessage = opts.displayMessage;
+    this.displaySeverity = opts.severity ?? "error";
+  }
+}
 
 // Top-level entry. Routes the tool call to its handler. Throws on unknown
 // tool names so the loop can surface that to the model as an error
@@ -122,6 +141,8 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await fileSearch(config, taskId, args) };
     case "web_fetch":
       return { kind: "sync", result: await webFetchTool(config, taskId, args) };
+    case "web_search":
+      return { kind: "sync", result: await webSearchTool(config, taskId, args) };
     case "read_skill":
       return { kind: "sync", result: await readSkillTool(config, taskId, args) };
     case "spawn_subagent":
@@ -738,6 +759,78 @@ async function webFetchTool(config: RuntimeConfig, taskId: string, args: Record<
 // exception while still naming the origin of the redirect chain.
 function parsed_origin(url: URL): string {
   return `${url.protocol}//${url.host}`;
+}
+
+// Web search via Brave or Exa. Pick a healthy connector by provider id
+// (model-supplied `provider` arg wins; otherwise Brave > Exa). The token
+// is resolved through the standard connector secrets path so the audit
+// trail records the resolution without ever logging the key.
+type WebSearchProvider = "brave-search" | "exa";
+
+const WEB_SEARCH_PREFERENCE: WebSearchProvider[] = ["brave-search", "exa"];
+
+async function webSearchTool(config: RuntimeConfig, taskId: string, args: Record<string, unknown>): Promise<string> {
+  const query = requireString(args, "query");
+  const count = Math.min(Math.max(Math.trunc(optionalNumber(args, "count", 5)), 1), 10);
+  const requested = (args.provider === undefined || args.provider === null || args.provider === "")
+    ? undefined
+    : requireString(args, "provider");
+  if (requested && requested !== "brave-search" && requested !== "exa") {
+    throw new Error(`Unsupported web_search provider: ${requested}. Use 'brave-search' or 'exa'.`);
+  }
+
+  const state = readState(config.instance);
+  const candidates: WebSearchProvider[] = requested
+    ? [requested as WebSearchProvider]
+    : WEB_SEARCH_PREFERENCE;
+
+  let connector: typeof state.connectors[number] | undefined;
+  let providerId: WebSearchProvider | undefined;
+  for (const id of candidates) {
+    const found = state.connectors.find(
+      (c) => c.provider === id && c.status === "configured" && c.health === "healthy"
+    );
+    if (found) {
+      connector = found;
+      providerId = id;
+      break;
+    }
+  }
+  if (!connector || !providerId) {
+    const wanted = requested ?? "brave-search or exa";
+    // When the model named a specific provider, the user may already have a
+    // DIFFERENT search provider connected — so "No search provider connected."
+    // would be false. Name the missing one instead. The no-`provider` case
+    // keeps the generic line (nothing is connected at all).
+    const requestedLabel = requested ? (getProvider(requested)?.label ?? requested) : undefined;
+    throw new ToolDisplayError(
+      `Web search is unavailable: no healthy ${wanted} connector. Your next move is to call request_connector with provider '${requested ?? "brave-search"}' so the user can paste an API key — then retry this search. Do NOT fall back to web_fetch on guessed URLs; the user asked for real web search, and guessing URLs bypasses that intent.`,
+      {
+        displayMessage: requestedLabel ? `${requestedLabel} is not connected.` : "No search provider connected.",
+        severity: "info"
+      }
+    );
+  }
+
+  const token = await resolveConnectorSecret(config, connector.id, "token", taskId);
+  if (!token) throw new Error(`Connector ${connector.name} is missing its token secret.`);
+
+  const results = providerId === "brave-search"
+    ? await braveWebSearch(token, query, count)
+    : await exaWebSearch(token, query, count);
+
+  appendTrace(config.instance, taskId, {
+    type: "tool",
+    message: "Web search completed",
+    data: { provider: providerId, query, count: results.length }
+  });
+  await recordLowRiskAudit(config, taskId, "web.search", query, {
+    provider: providerId,
+    requested,
+    count: results.length,
+    connectorId: connector.id
+  });
+  return formatWebSearchResults(providerId, query, results);
 }
 
 // Skill catalog access. Returns the full markdown body of an enabled skill

@@ -7,7 +7,8 @@ import type { ChatBlock, ToolCallBlock } from "@/src/types";
 // inline so the user sees progress as it streams.
 export type ChatRenderItem =
   | { kind: "block"; block: ChatBlock }
-  | { kind: "tool_group"; id: string; calls: ToolCallBlock[] };
+  | { kind: "tool_group"; id: string; calls: ToolCallBlock[] }
+  | { kind: "file_artifact"; id: string; files: { path: string; toolName: string }[] };
 
 export function groupExchanges(blocks: ChatBlock[]): ChatRenderItem[] {
   const items: ChatRenderItem[] = [];
@@ -48,6 +49,23 @@ function appendExchange(items: ChatRenderItem[], exchange: ChatBlock[]) {
     const b = exchange[i]!;
     if (b.kind === "tool_call" || b.kind === "tool_result") continue;
     items.push({ kind: "block", block: b });
+  }
+  // Group every successfully generated file into one always-visible card so
+  // the user can open them directly instead of digging through the collapsed
+  // tool group. Dedupe by path, keeping the last write's toolName. The card is
+  // pushed after the trailing blocks (assistant_text) so it renders below the
+  // agent's reply rather than above it.
+  const filesByPath = new Map<string, string>();
+  for (const call of calls) {
+    if (call.toolName !== "file_write" && call.toolName !== "file_patch") continue;
+    if (call.status !== "ok") continue;
+    const path = String(call.argsFull?.path ?? call.argsPreview ?? "").trim();
+    if (!path) continue;
+    filesByPath.set(path, call.toolName);
+  }
+  if (filesByPath.size > 0) {
+    const files = Array.from(filesByPath, ([path, toolName]) => ({ path, toolName }));
+    items.push({ kind: "file_artifact", id: `files-${calls[0]!.id}`, files });
   }
 }
 

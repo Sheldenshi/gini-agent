@@ -106,6 +106,23 @@ export interface ProxyOptions {
   signal?: AbortSignal;
 }
 
+// Forward a small allowlist of response headers from the upstream runtime.
+// The QR endpoints (and any future bearer-gated response that needs
+// browser-caching control) set `Cache-Control: no-store`; without this
+// passthrough the BFF would silently allow a browser to cache the QR
+// pixels — which encode the bootstrap URL. Other entries are headers a
+// BFF typically wants to forward (content-disposition for downloads,
+// etag/last-modified for revalidation, vary for cache key correctness).
+const PASSTHROUGH_RESPONSE_HEADERS = [
+  "cache-control",
+  "etag",
+  "last-modified",
+  "vary",
+  "content-disposition",
+  "content-language",
+  "content-encoding"
+];
+
 export async function proxyRequest(
   request: Request,
   pathSegments: string[],
@@ -161,40 +178,26 @@ export async function proxyRequest(
     });
   }
   const upstreamContentType = upstream.headers.get("content-type") ?? "application/json";
-  // Binary passthrough for non-text payloads (image uploads, future
-  // file downloads). Routing on text() would UTF-8-decode bytes and
-  // corrupt them. Anything not obviously text gets ArrayBuffer'd.
+  // Binary passthrough for non-text payloads (image uploads, file
+  // downloads). Routing on text() would UTF-8-decode bytes and corrupt
+  // them. Anything not obviously text streams the upstream body through
+  // unbuffered, mirroring the SSE branch above.
   const isText = /^(application\/(json|xml|.*\+json|.*\+xml)|text\/)/i.test(upstreamContentType);
   if (!isText) {
-    const buffer = await upstream.arrayBuffer();
     const passthroughHeaders = new Headers();
     passthroughHeaders.set("content-type", upstreamContentType);
-    const cacheControl = upstream.headers.get("cache-control");
-    if (cacheControl) passthroughHeaders.set("cache-control", cacheControl);
+    for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
+      const v = upstream.headers.get(name);
+      if (v) passthroughHeaders.set(name, v);
+    }
     const contentLength = upstream.headers.get("content-length");
     if (contentLength) passthroughHeaders.set("content-length", contentLength);
-    return new Response(buffer, { status: upstream.status, headers: passthroughHeaders });
+    return new Response(upstream.body, { status: upstream.status, headers: passthroughHeaders });
   }
   const text = await upstream.text();
   const outHeaders: Record<string, string> = {
     "content-type": upstreamContentType
   };
-  // Forward a small allowlist of response headers from the upstream runtime.
-  // A bearer-gated response that needs browser-caching control can set
-  // `Cache-Control: no-store`; forwarding it keeps the BFF from silently
-  // letting a browser cache a response the runtime marked uncacheable. The
-  // other entries are headers a BFF typically wants to forward
-  // (content-disposition for downloads, etag/last-modified for
-  // revalidation, vary for cache key correctness).
-  const PASSTHROUGH_RESPONSE_HEADERS = [
-    "cache-control",
-    "etag",
-    "last-modified",
-    "vary",
-    "content-disposition",
-    "content-language",
-    "content-encoding"
-  ];
   for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
     const v = upstream.headers.get(name);
     if (v) outHeaders[name] = v;

@@ -7,6 +7,7 @@ Each file in this directory captures one architecture decision: the context, the
 - [Local Runtime Architecture](local-runtime-architecture.md)
 - [Approval And Audit Substrate](approval-and-audit-substrate.md) — supersedes [Trust Substrate](trust-substrate.md)
 - [Browser Fill-Secret Tool](browser-fill-secret.md)
+- [Browser Stealth Identity](browser-stealth-identity.md)
 - [Instances And Control Surface](instances-and-control-surface.md)
 - [Agent Loop With Native Tool Calling](agent-loop-tool-calling.md)
 - [Deferred Tools (Load-On-Demand Catalog)](deferred-tools.md)
@@ -41,3 +42,4 @@ Each file in this directory captures one architecture decision: the context, the
 - [Chat-Driven Credential Provisioning](chat-credential-provisioning.md)
 - [Provider Re-Authentication Guidance](provider-reauth-guidance.md)
 - [Voice Messages With Gateway-Side Local Speech-To-Text](voice-messages-and-local-stt.md)
+- [Connector-Backed Web Search](web-search-connectors.md)

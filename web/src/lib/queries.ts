@@ -178,6 +178,7 @@ export interface ProviderDescriptor {
   id: string;
   label: string;
   description: string;
+  docsUrl?: string;
   fields: Array<{ name: string; label: string; description?: string; secret: boolean; required?: boolean; placeholder?: string }>;
   secrets?: { purposes: string[]; envBindings: Record<string, string> };
   hasProbe: boolean;

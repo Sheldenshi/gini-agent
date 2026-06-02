@@ -54,3 +54,35 @@ export async function uploadImage(file: File): Promise<UploadRef> {
 export function uploadUrl(id: string): string {
   return `/api/runtime/uploads/${encodeURIComponent(id)}`;
 }
+
+// A workspace file read via GET /api/files. `content` is the utf8 text (null
+// for binary files); `truncated` is set when the file exceeds the gateway's
+// read cap.
+export interface WorkspaceFile {
+  path: string;
+  absolutePath: string;
+  name: string;
+  bytes: number;
+  content: string | null;
+  truncated: boolean;
+  binary: boolean;
+}
+
+export function fetchWorkspaceFile(path: string): Promise<WorkspaceFile> {
+  return api<WorkspaceFile>(`/files?path=${encodeURIComponent(path)}`);
+}
+
+// Direct BFF URL for downloading a workspace file. The gateway's raw mode
+// streams the bytes back as an attachment, so this is safe to use as an
+// <a download href={...}> target.
+export function fileRawUrl(path: string): string {
+  return `/api/runtime/files?path=${encodeURIComponent(path)}&raw=1`;
+}
+
+// Direct BFF URL for embedding a workspace file inline. The gateway's inline
+// mode serves an allowlist of safe types (PDFs + raster images) with their real
+// content-type + content-disposition: inline, so this is suitable as an
+// <img>/<iframe> src in the preview drawer.
+export function fileInlineUrl(path: string): string {
+  return `/api/runtime/files?path=${encodeURIComponent(path)}&raw=1&inline=1`;
+}

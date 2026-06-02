@@ -13,7 +13,7 @@ import {
 export function iconForTool(toolName: string): LucideIcon {
   const name = toolName.toLowerCase();
   if (name === "file_write" || name === "file_patch") return FilePenLine;
-  if (name === "file_search" || name === "search_history") return Search;
+  if (name === "file_search" || name === "search_history" || name === "web_search") return Search;
   if (name === "file_read" || name === "file_list") return FileText;
   if (name === "read_skill") return BookOpen;
   if (name === "terminal_exec" || name === "code_exec") return Terminal;

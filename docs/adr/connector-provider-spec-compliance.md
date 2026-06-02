@@ -5,7 +5,7 @@
 Gini's external-system integration surface uses the following vocabulary and conventions:
 
 - **Connector** — the managed record for an external system Gini connects to (renamed from `Identity`, reverting to the original term now that the concept is precise). Holds credentials, scopes, secret references, health.
-- **Provider** — the discriminator inside a connector (renamed from `kind`). Identifies which integration code handles this connector — `linear`, `demo`, `claude-code`, `codex`, `generic`, etc.
+- **Provider** — the discriminator inside a connector (renamed from `kind`). Identifies which integration code handles this connector — `linear`, `demo`, `claude-code`, `codex`, `generic`, `brave-search`, `exa`, etc. Connectors back three consumers: skill env-bindings, auto-registered MCP servers, and built-in tools (the `web_search` tool resolves a search provider's key directly — see ADR web-search-connectors.md).
 - **Skill** — the package, as defined by the Anthropic Agent Skills specification. A folder containing `SKILL.md` plus optional `scripts/`, `references/`, `assets/`.
 
 A skill is active iff every connector it declares as required exists and is healthy. Activation is automatic, deactivation is automatic.
@@ -80,6 +80,10 @@ The cost of fixing all three is small (mechanical renames + frontmatter migratio
 - Reserved provider id `generic`. Form fields are dynamic: user supplies a label and a list of `{ name, value, secret: boolean }` pairs in the Add Connector dialog. Probe is "all required fields non-empty" (best-effort; no remote check).
 - Used as the install-skill fallback when a skill requires a provider Gini does not have natively.
 - A connector record with `provider: "generic"` has its fields stored in `secretRefs` (for secret fields) or `metadata` (for non-secret fields like base URLs).
+
+### Optional `docsUrl`
+
+- A `ProviderModule` may set `docsUrl` — a setup/help page surfaced as a "Learn more" link under the Add Connector / Connect form. Optional; absent it, no link renders. The search providers point at `gini.lilaclabs.ai/docs/search/<provider>`.
 
 ### Probe contract
 

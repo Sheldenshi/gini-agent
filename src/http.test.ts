@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
 import { listAllDevices } from "./state/devices";
@@ -4342,6 +4342,203 @@ describe("runtime api", () => {
         expect(denied.headers.get("access-control-allow-origin")).toBeNull();
       });
     });
+  });
+});
+
+describe("GET /api/files", () => {
+  test("returns content, absolute path, and name for an existing text file", async () => {
+    const config = testConfig("files-read-ok");
+    const workspace = `/tmp/gini-files-test-${Date.now()}`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/note.md`, "# Hello\n");
+    const handler = createHandler(config);
+
+    const file = await call(handler, config, "/api/files?path=note.md");
+    expect(file.name).toBe("note.md");
+    expect(file.absolutePath).toBe(`${workspace}/note.md`);
+    expect(file.content).toBe("# Hello\n");
+    expect(file.binary).toBe(false);
+    expect(file.truncated).toBe(false);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("rejects a path that escapes the workspace with 400", async () => {
+    const config = testConfig("files-escape-400");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-escape`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=../outside.txt", {}, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toContain("outside workspace");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("returns 404 for a non-existent file", async () => {
+    const config = testConfig("files-missing-404");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-missing`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=nope.txt", {}, config.token);
+    expect(response.status).toBe(404);
+    const body = await response.json();
+    expect(body.error).toBe("File not found");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("reports a binary file without returning its content", async () => {
+    const config = testConfig("files-binary");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-binary`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/blob.bin`, Buffer.from([0x89, 0x50, 0x00, 0x01]));
+    const handler = createHandler(config);
+
+    const file = await call(handler, config, "/api/files?path=blob.bin");
+    expect(file.binary).toBe(true);
+    expect(file.content).toBe(null);
+    expect(file.bytes).toBe(4);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("returns 400 for a directory", async () => {
+    const config = testConfig("files-directory");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-directory`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    mkdirSync(`${workspace}/sub`);
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=sub", {}, config.token);
+    expect(response.status).toBe(400);
+    const body = await response.json();
+    expect(body.error).toBe("Not a file");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("truncates a file larger than the read cap", async () => {
+    const config = testConfig("files-truncate");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-truncate`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/big.txt`, "a".repeat(600 * 1024));
+    const handler = createHandler(config);
+
+    const file = await call(handler, config, "/api/files?path=big.txt");
+    expect(file.truncated).toBe(true);
+    expect(file.content.length).toBe(512 * 1024);
+    expect(file.bytes).toBe(600 * 1024);
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("raw=1 streams the file as a download attachment", async () => {
+    const config = testConfig("files-raw");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-raw`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/note.md`, "# Hello\nworld\n");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=note.md&raw=1", {}, config.token);
+    expect(response.status).toBe(200);
+    const disposition = response.headers.get("content-disposition") ?? "";
+    expect(disposition).toContain("attachment");
+    expect(disposition).toContain("note.md");
+    expect(await response.text()).toBe("# Hello\nworld\n");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("raw=1 download for a non-ASCII filename returns 200 with both header forms", async () => {
+    const config = testConfig("files-raw-unicode");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-raw-unicode`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/café.md`, "# Hello\n");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, `/api/files?path=${encodeURIComponent("café.md")}&raw=1`, {}, config.token);
+    expect(response.status).toBe(200);
+    const disposition = response.headers.get("content-disposition") ?? "";
+    expect(disposition).toContain(`filename="caf_.md"`);
+    expect(disposition).toContain("filename*=UTF-8''");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 serves a PDF inline with the application/pdf content-type", async () => {
+    const config = testConfig("files-inline-pdf");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-pdf`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/doc.pdf`, Buffer.from("%PDF-1.4\n"));
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=doc.pdf&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/pdf");
+    expect(response.headers.get("content-disposition")).toBe("inline");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 serves a PNG inline with the image/png content-type", async () => {
+    const config = testConfig("files-inline-png");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-png`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/pic.png`, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=pic.png&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("image/png");
+    expect(response.headers.get("content-disposition")).toBe("inline");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 never serves an SVG inline — falls back to attachment download", async () => {
+    const config = testConfig("files-inline-svg");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-svg`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/evil.svg`, "<svg onload=\"alert(1)\"></svg>");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=evil.svg&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/octet-stream");
+    expect(response.headers.get("content-disposition") ?? "").toContain("attachment");
+
+    rmSync(workspace, { recursive: true, force: true });
+  });
+
+  test("inline=1 never serves HTML inline — falls back to attachment download", async () => {
+    const config = testConfig("files-inline-html");
+    const workspace = `/tmp/gini-files-test-${Date.now()}-inline-html`;
+    mkdirSync(workspace, { recursive: true });
+    config.workspaceRoot = workspace;
+    writeFileSync(`${workspace}/evil.html`, "<script>alert(1)</script>");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/files?path=evil.html&raw=1&inline=1", {}, config.token);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/octet-stream");
+    expect(response.headers.get("content-disposition") ?? "").toContain("attachment");
+
+    rmSync(workspace, { recursive: true, force: true });
   });
 });
 

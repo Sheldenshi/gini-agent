@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mutateState, createChatSession, createMcpServerRecord, createTask, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
-import { dispatchToolCall } from "./tool-dispatch";
+import { dispatchToolCall, ToolDisplayError } from "./tool-dispatch";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-mcp-dispatch-"));
 process.env.GINI_STATE_ROOT = ROOT;
@@ -1544,5 +1544,64 @@ describe("request_connector dispatch", () => {
       expect(approval!.action).toBe("connector.request");
       expect(approval!.target).toBe("linear");
     }
+  });
+});
+
+describe("web_search dispatch", () => {
+  test("no connector throws ToolDisplayError: verbose steering to the model, calm info line to the user", async () => {
+    const instance = `web-search-no-connector-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Fresh instance has no brave-search/exa connector, so the dispatch
+    // throws before touching the network or resolving any secret.
+    let thrown: unknown;
+    try {
+      await dispatchToolCall(config, taskId, "web_search", "call_1", JSON.stringify({ query: "latest bun version" }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ToolDisplayError);
+    const err = thrown as ToolDisplayError;
+    // The model still receives the full steering so it calls
+    // request_connector and doesn't guess URLs with web_fetch.
+    expect(err.message).toContain("request_connector");
+    expect(err.message).toContain("Do NOT fall back to web_fetch");
+    // The user only sees a short, neutral line.
+    expect(err.displayMessage).toBe("No search provider connected.");
+    expect(err.displaySeverity).toBe("info");
+  });
+
+  test("explicit provider that isn't connected names that provider, even when another is connected", async () => {
+    const instance = `web-search-wrong-provider-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    // Brave is connected and healthy; the model explicitly asks for Exa.
+    // "No search provider connected." would be false here — the user has
+    // Brave — so the display line must name the missing provider instead.
+    await mutateState(instance, (state) => {
+      state.connectors.unshift({
+        id: "id_brave",
+        instance,
+        name: "Brave Search",
+        provider: "brave-search",
+        status: "configured",
+        scopes: [],
+        secretRefs: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        health: "healthy",
+        source: "user"
+      });
+    });
+    let thrown: unknown;
+    try {
+      await dispatchToolCall(config, taskId, "web_search", "call_2", JSON.stringify({ query: "q", provider: "exa" }));
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ToolDisplayError);
+    const err = thrown as ToolDisplayError;
+    expect(err.displayMessage).toBe("Exa is not connected.");
+    expect(err.displaySeverity).toBe("info");
   });
 });
