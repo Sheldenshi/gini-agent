@@ -10,7 +10,7 @@ in code or duplicated across surfaces:
 
 | Provider class | `auth` | CTA destination | Where instructions live |
 |---|---|---|---|
-| OAuth / CLI (codex) | `codex-oauth` | Hosted docs step-through: `https://gini.lilaclabs.ai/docs/providers/<id>#re-authentication` | A docs page per such provider |
+| OAuth / CLI (codex) | `codex-oauth` | The `#re-authentication` section of `https://gini.lilaclabs.ai/docs/providers/<id>`, rendered **inline** in a slide-over (with an Open full docs ↗ escape hatch) | A docs page per such provider |
 | API-key (openai, deepseek, openrouter, local) | `env` | In-app **Settings → Providers** key form (`/settings`) | The provider's own 401/403 message (shown as the note's detail) — no doc |
 
 The runtime classifies the failure, tags it with the provider that served the
@@ -35,7 +35,10 @@ turn, and stamps the chat block so every client renders the same thing:
   from the catalog `auth` field — the single place the routing lives.
 - The web `BlockSystemNote` renders the alert card + CTA (and falls back to the
   Settings form if a legacy row lacks the routing fields; `rowToBlock` also
-  backfills them on read). Text-only clients (CLI, messaging) get the same
+  backfills them on read). For `reauthKind: "docs"` the CTA opens the referenced
+  doc section inline via `DocReference` (ADR in-app-doc-references.md) rather
+  than a new tab; the hosted URL it carries remains the source of the prose and
+  the Open full docs ↗ target. Text-only clients (CLI, messaging) get the same
   actionable line via `syncChatTaskResult` (`src/execution/chat.ts`), which
   reads `task.authErrorProvider`.
 
@@ -74,12 +77,16 @@ avoids that entirely.
   `## Re-authentication` section; the URL is derived by convention
   (`/providers/<id>#re-authentication`, the heading's natural slug), so no per-provider routing data is added.
 - The runtime owns `reauthUrl`, so clients stay dumb. The hosted-docs base URL
-  is a constant in `src/provider.ts`.
+  is a constant in `src/provider.ts`. The web client derives the inline doc path
+  from that URL (ADR in-app-doc-references.md); the runtime contract is
+  unchanged.
 
 ### Acceptance checks
 
 - A chat turn that fails on an expired Codex token renders a note naming Codex
-  with a CTA linking to `…/docs/providers/codex#re-authentication`.
+  with a CTA carrying `…/docs/providers/codex#re-authentication`; clicking it
+  opens that section inline (ADR in-app-doc-references.md) with an Open full
+  docs ↗ escape hatch.
 - A chat turn that fails on a rejected API key names the provider, shows the
   provider's own message as the detail, and links to `/settings`.
 - A non-auth failure renders the raw message unchanged (no `authError`).
@@ -91,3 +98,4 @@ avoids that entirely.
 - [Connector + Provider Vocabulary, Spec Compliance, And Meta-Skills](connector-provider-spec-compliance.md)
 - [Authorization vs SetupRequest](authorization-vs-setup-request.md)
 - [Chat Block Protocol](chat-block-protocol.md)
+- [In-App Doc References Render Inline](in-app-doc-references.md)
