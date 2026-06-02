@@ -11,8 +11,8 @@ issues. Filing happens only on the user's explicit "yes", and runs through the
 `gini-bug-report` skill, which delegates the actual `gh` work to the
 `github-issues` skill. Nothing leaves the machine without consent.
 
-Crash reports can contain provider API keys, bearer tokens, the tunnel secret,
-and user/task content. Because a GitHub issue *publishes* that content,
+Crash reports can contain provider API keys, bearer tokens, and user/task
+content. Because a GitHub issue *publishes* that content,
 redaction before the report is even offered to the agent or the user is a hard
 trust boundary, not a nicety.
 
@@ -62,8 +62,7 @@ it can be read by the agent or shown to the user. `buildCrashReport`
   just the first token),
 - every literal value parsed out of `~/.gini/secrets.env`, unquoted through the
   repo's `unquoteSecretsValue` and scrubbed verbatim so a hand-edited or
-  odd-format key is caught even when it doesn't match a pattern,
-- the per-instance tunnel secret.
+  odd-format key is caught even when it doesn't match a pattern.
 
 Independently, the `runtime.jsonl` tail carried into a report keeps only each
 line's event name + timestamp; the `data` payload is **dropped at build time**
@@ -156,7 +155,7 @@ distinct crash for one-click filing.
   report pending for a later offer.
 - Nothing is published without explicit consent, and `gh` authentication
   happens interactively with the user present — there is no headless `gh` path.
-- No report or issue body carries a provider key, bearer/tunnel secret, gh
+- No report or issue body carries a provider key, bearer secret, gh
   token, or user/task content: redaction at capture and the dropped `data`
   payload are the enforced boundary, and the skill files only from the queued
   JSON.
@@ -178,9 +177,9 @@ distinct crash for one-click filing.
   `source: "web"` report into `pending/`; a missing port or a web failure while
   the runtime is down writes none.
 - `redactReportText` removes `sk-…`, `ghp_…`, `github_pat_…`, `gho_…`,
-  `Bearer …`, an `Authorization:` header value, a literal secrets-env value,
-  and the tunnel secret; the serialized `runtime.jsonl` tail carries no `data`
-  payload — all before the report reaches the queue.
+  `Bearer …`, an `Authorization:` header value, and a literal secrets-env
+  value; the serialized `runtime.jsonl` tail carries no `data` payload — all
+  before the report reaches the queue.
 - On a `default` launchd restart with fresh pending reports, exactly one ask job
   is created, its prompt mentions the count and the `gini-bug-report` skill, and
   `lastAskedAt` is stamped for each fresh fingerprint; a second restart within

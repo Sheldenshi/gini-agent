@@ -8,7 +8,7 @@ import { resolveEffectiveContext } from "../execution/effective-context";
 import { closeMemoryDb, getMemoryDb, memoryDbPath } from "../state/memory-db";
 import { migratePinnedMemoriesToUserProfile } from "../memory/migrate-pinned-to-user-md";
 import { providerHealth } from "../provider";
-import { scaffoldAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
+import { migrateInstructionsIdentityLine, seedAgentSoulFile, scaffoldInstanceIdentityFiles } from "./identity-files";
 import { currentVersionInfo } from "./update";
 
 export function status(config: RuntimeConfig) {
@@ -98,6 +98,12 @@ export async function install(config: RuntimeConfig): Promise<void> {
   // the filesystem for the user to discover. Best-effort: scaffolding never
   // throws on a filesystem error.
   scaffoldInstanceIdentityFiles(config.instance);
+  // Existing instances seeded INSTRUCTIONS.md before the preamble went
+  // name-free; that on-disk file overrides the bundled default, so rewrite
+  // a stale leading "You are Gini, a personal agent." (or the interim
+  // framework wording) to the current generic line. The agent's name now
+  // lives in its SOUL.md. Idempotent + best-effort.
+  migrateInstructionsIdentityLine(config.instance);
   // Approval-mode migration: legacy configs that carry
   // `dangerouslyAutoApprove: true` without an explicit `approvalMode`
   // get aliased to `approvalMode: "yolo"`. Patch the in-memory config
@@ -133,12 +139,14 @@ export async function install(config: RuntimeConfig): Promise<void> {
     }
   }
   const state = readState(config.instance);
-  // Backfill per-agent SOUL.md placeholders for every existing agent.
-  // Catches the 21+ already-provisioned instances on disk that pre-date
-  // the scaffold logic. Quiet on no-ops — only the first creation per
-  // file matters; the rest are silent.
+  // Backfill per-agent SOUL.md for every existing agent: any agent whose
+  // SOUL is absent or empty/whitespace-only (incl. the legacy zero-byte
+  // scaffold) gets seeded `Your name is <name>.` from its AgentRecord.name.
+  // `readState` above already ran `normalizeState`, so the default agent is
+  // "Gini" by this point. A populated SOUL is never clobbered, so this is
+  // idempotent and quiet on no-ops.
   for (const agent of state.agents) {
-    scaffoldAgentSoulFile(config.instance, agent.id);
+    seedAgentSoulFile(config.instance, agent.id, agent.name);
   }
   // Audit + side-effects of the migration. Fire-and-forget; the
   // synchronous patch above is what the policy seam actually consults.

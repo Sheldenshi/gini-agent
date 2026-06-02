@@ -552,8 +552,9 @@ Three surfaces, no fourth:
   prompt on the next turn. Cross-agent — switching agents preserves
   the user profile.
 - `SOUL.md` (per-agent, always-inject) — agent persona and behavior
-  rules. Edits go through `edit_soul` with a propose-vs-approve gate
-  because persona edits change behavior across every turn.
+  rules. `edit_soul` auto-approves a clean body (lands at the approved
+  file, rides the prompt next turn); the injection scanner routes a body
+  that trips a threat pattern through `SOUL.md.proposed` until approved.
 - Hindsight (per-agent SQLite bank, recall-on-demand) — long-term
   memory populated by auto-retain at task end. Recall surfaces relevant
   units automatically; `recall_memory` is the on-demand lookup tool.

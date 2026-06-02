@@ -59,12 +59,11 @@ export interface BuildCrashReportArgs {
   logTail: RuntimeLogLine[];
   sysInfo: CrashSysInfo;
   clock: () => Date;
-  // Best-effort literal-redaction inputs. Pattern-based redaction always runs;
-  // these scrub the exact secrets-env values + tunnel secret when provided. A
-  // producer that can't read them (e.g. a crash path) passes undefined and
-  // still gets pattern redaction.
+  // Best-effort literal-redaction input. Pattern-based redaction always runs;
+  // this scrubs the exact secrets-env values when provided. A producer that
+  // can't read them (e.g. a crash path) passes undefined and still gets
+  // pattern redaction.
   secretsEnvBody?: string;
-  tunnelSecret?: string;
 }
 
 function errorParts(error: unknown): { name: string; message: string; stack: string } {
@@ -143,8 +142,6 @@ export interface RedactOptions {
   // scrubbed verbatim so a hand-edited or odd-format key still gets caught
   // even if it doesn't match a pattern above.
   secretsEnvBody?: string;
-  // The per-instance tunnel secret literal.
-  tunnelSecret?: string;
 }
 
 // Parse literal secret values out of a secrets.env body. Reuses the same
@@ -166,9 +163,9 @@ function secretsEnvValues(body: string): string[] {
 }
 
 // Redact secrets/tokens from arbitrary report text. Applies the extended
-// pattern list, then scrubs the literal secrets-env values and tunnel secret.
-// Default to dropping rather than including: pattern redaction runs first so a
-// token is removed even when its literal value isn't in the provided lists.
+// pattern list, then scrubs the literal secrets-env values. Default to
+// dropping rather than including: pattern redaction runs first so a token is
+// removed even when its literal value isn't in the provided lists.
 export function redactReportText(text: string, opts: RedactOptions = {}): string {
   // A malformed log/error field can carry a non-string (e.g. a numeric
   // `message`). String.replace on a number throws, which would drop the whole
@@ -182,7 +179,6 @@ export function redactReportText(text: string, opts: RedactOptions = {}): string
   }
   const literals: string[] = [];
   if (opts.secretsEnvBody) literals.push(...secretsEnvValues(opts.secretsEnvBody));
-  if (opts.tunnelSecret) literals.push(opts.tunnelSecret);
   if (literals.length > 0) out = redactSecretValuesFromString(out, literals);
   return out;
 }
@@ -194,8 +190,7 @@ export function buildCrashReport(args: BuildCrashReportArgs): CrashReport {
   // fields that reach the published issue body.
   const fp = fingerprint(error);
   const redactOpts: RedactOptions = {
-    secretsEnvBody: args.secretsEnvBody,
-    tunnelSecret: args.tunnelSecret
+    secretsEnvBody: args.secretsEnvBody
   };
   const raw = errorParts(error);
   // `name` reaches the published issue title AND body, so it crosses the same

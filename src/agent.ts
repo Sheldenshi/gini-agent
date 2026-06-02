@@ -1348,7 +1348,7 @@ export async function resolveSetupRequest(
   config: RuntimeConfig,
   approvalId: string,
   decision: "complete" | "cancel",
-  opts: { actor?: "user" | "runtime"; toolResult?: string; resumeChatTask?: boolean } = {}
+  opts: { actor?: "user" | "runtime"; toolResult?: string; resumeChatTask?: boolean; awaitResume?: boolean } = {}
 ): Promise<SetupRequest> {
   const actor = opts.actor ?? "user";
   const resume = opts.resumeChatTask ?? true;
@@ -1421,8 +1421,23 @@ export async function resolveSetupRequest(
   // Proceed.") since it owns the side-effect outcome.
   if (resume && decision === "complete" && opts.toolResult !== undefined && result.item.taskId) {
     const toolCallId = approvalToolCallId(result.item.payload);
+    const taskId = result.item.taskId;
     if (toolCallId) {
-      await resumeChatTask(config, result.item.taskId, toolCallId, opts.toolResult);
+      if (opts.awaitResume === false) {
+        // Detached resume. The resumed agent run can be long — it retries
+        // the original request now that the connector exists. The
+        // HTTP-driven completion path (the chat connect modal's POST
+        // /complete) must return as soon as the connector is saved and
+        // verified, so the modal closes immediately and the user watches
+        // the agent stream on. Mirrors submitTask's fire-and-forget
+        // runTask(...).catch(failTask) instead of blocking the request for
+        // the whole run.
+        void resumeChatTask(config, taskId, toolCallId, opts.toolResult).catch((error) =>
+          failTask(config, taskId, error)
+        );
+      } else {
+        await resumeChatTask(config, taskId, toolCallId, opts.toolResult);
+      }
     }
   }
   return result.item;

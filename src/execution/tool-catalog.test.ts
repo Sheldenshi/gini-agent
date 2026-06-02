@@ -149,6 +149,7 @@ const SELF_TOOLS = [
   "set_provider",
   "use_agent",
   "create_agent",
+  "rename_agent",
   "set_approval_mode",
   "list_toolsets",
   "enable_toolset",

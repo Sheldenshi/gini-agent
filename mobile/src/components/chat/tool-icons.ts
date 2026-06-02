@@ -17,7 +17,7 @@ export interface ToolIcon {
 export function iconForTool(toolName: string): ToolIcon {
   const name = toolName.toLowerCase();
   if (name === "file_write" || name === "file_patch") return { name: "edit-3", family: "Feather" };
-  if (name === "file_search" || name === "search_history") return { name: "search", family: "Feather" };
+  if (name === "file_search" || name === "search_history" || name === "web_search") return { name: "search", family: "Feather" };
   if (name === "file_read" || name === "file_list") return { name: "file-text", family: "Feather" };
   if (name === "read_skill") return { name: "book-open", family: "Feather" };
   if (name === "terminal_exec" || name === "code_exec") return { name: "terminal", family: "Feather" };

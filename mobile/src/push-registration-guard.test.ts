@@ -78,7 +78,7 @@ describe("push-registration-guard", () => {
   });
 
   test("a credential swap (modeled as a single generation bump) invalidates the prior session's capture but lets a follow-up capture start fresh", () => {
-    // Models resetRegistrationForCredentialSwap: the deep-link path
+    // Models resetRegistrationForCredentialSwap: a credential swap
     // calls bumpGeneration to drop any in-flight registration that
     // captured the prior credential's generation. After the bump, a
     // brand-new registerForPushAsync invocation captures the new

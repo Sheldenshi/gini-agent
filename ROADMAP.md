@@ -53,7 +53,7 @@ The phone is not a place to run the gateway — the gateway lives on the Mac. Th
 - ⚪ **Run and task visibility.** Live view of in-flight runs, queued tasks, and recent traces — the same SSE stream the Mac client consumes.
 - ⚪ **Voice and quick triggers.** Shortcuts.app and Siri integration so a task can be kicked off without unlocking the phone.
 - ⚪ **Push notifications.** APNs delivery for pending approvals and run completion, with the user-facing payload generated server-side from existing event surfaces.
-- ⚪ **Off-LAN reachability.** Production relay so remote control works outside the home network. Tailscale-style mesh or a thin Cloudflare Worker relay, with end-to-end auth that never trusts the relay operator. Local-network usage works without it.
+- ⚪ **Off-LAN reachability.** Production relay so remote control works outside the home network — a hosted, self-hostable switchboard that forwards end-to-end-encrypted bytes it cannot read, with auth that never trusts the relay operator. Tailscale-style mesh works too. Local-network usage works without it.
 - ⚪ **Android later.** Same paired-device contract, lower priority.
 
 ### Trust layer

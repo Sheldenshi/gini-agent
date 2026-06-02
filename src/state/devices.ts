@@ -19,12 +19,10 @@ import type { Instance } from "../types";
 import { now } from "./ids";
 import { getMemoryDb } from "./memory-db";
 
-// Network path the registration arrived over. `loopback` means the operator's
-// local browser; `tunnel` means the request crossed the BFF's tunnel branch.
-// Tunneled rows are wiped on rotateSecret / disable so a leaked
-// QR-bootstrap holder can't keep receiving APNs notifications after the
-// operator revokes the tunnel.
-export type DeviceOrigin = "loopback" | "tunnel";
+// Network path the registration arrived over. Always `loopback` — the
+// operator's local browser or a paired device reaching the gateway over
+// the LAN.
+export type DeviceOrigin = "loopback";
 
 export interface PushDevice {
   token: string;
@@ -63,9 +61,8 @@ export interface UpsertDeviceInput {
   credentialId: string;
   platform: "ios";
   bundleId: string;
-  // Optional so legacy callers (CLI tests, fixtures) keep registering as
-  // loopback without churn. Production registration through src/http.ts
-  // always passes the explicit value derived from the request marker.
+  // Optional; "loopback" is the only origin, so callers may omit it and
+  // upsertDevice fills the default.
   origin?: DeviceOrigin;
 }
 
@@ -103,17 +100,6 @@ export function upsertDevice(instance: Instance, input: UpsertDeviceInput): Push
     lastSeenAt: at,
     origin
   };
-}
-
-// Wipes every device row that registered through the tunneled lane.
-// Called by tunnel manager.rotateSecret / disable: the old QR-bootstrap
-// is now invalid, so any device that paired through it must re-register
-// against the new credentials before resuming APNs delivery. Returns
-// the number of rows deleted.
-export function purgeTunnelDevices(instance: Instance): { deleted: number } {
-  const db = getMemoryDb(instance);
-  const result = db.run("DELETE FROM devices WHERE origin = 'tunnel'");
-  return { deleted: result.changes ?? 0 };
 }
 
 export function listDevicesForCredential(instance: Instance, credentialId: string): PushDevice[] {

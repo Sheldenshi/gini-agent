@@ -76,7 +76,7 @@ export function AgentSwitcher({ variant = "sidebar" }: { variant?: "sidebar" | "
       >
         {/* `unoptimized`: the Next.js dev image optimizer 400s on this
             asset (`The requested resource isn't a valid image ... received
-            null`) on both loopback and the tunneled host. The asset is a
+            null`) regardless of how the app is reached. The asset is a
             4.7 KB PNG rendered at 24–28 px square — there's nothing for
             the optimizer to save anyway. Skipping the optimizer drops
             the console error and keeps the favicon-cousin logo visible

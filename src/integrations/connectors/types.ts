@@ -69,6 +69,8 @@ export interface ProviderModule {
   label: string;
   // One-line product summary rendered in the Add Connector dialog.
   description: string;
+  // Optional "Learn more" link rendered under the connect form.
+  docsUrl?: string;
   // Form fields the Add Connector dialog renders. Empty for providers that
   // have no inputs (e.g. claude-code, codex use the host environment).
   fields: ProviderField[];

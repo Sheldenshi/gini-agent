@@ -77,23 +77,6 @@ export function instanceRoot(instance: Instance): string {
   return join(instancesRoot(), instance);
 }
 
-// Shared, instance-agnostic cache for the gateway-managed `cloudflared`
-// binary. The binary is byte-identical across instances and carries no
-// per-instance state, so it lives under the state root rather than any
-// per-instance dir — re-downloading it for every worktree / named instance
-// would be wasteful. Honors GINI_STATE_ROOT exactly like baseStateRoot() so
-// tests can point it at a temp dir.
-export function cloudflaredCacheDir(): string {
-  return join(baseStateRoot(), "bin");
-}
-
-// Resolved path of the managed cloudflared binary. `.exe` on Windows; bare
-// elsewhere. The auto-installer writes here and the tunnel manager spawns
-// from here when no system cloudflared is on PATH.
-export function cloudflaredBinPath(platform: NodeJS.Platform = process.platform): string {
-  return join(cloudflaredCacheDir(), platform === "win32" ? "cloudflared.exe" : "cloudflared");
-}
-
 // One-time migration of legacy on-disk layouts to ~/.gini/instances/<name>/.
 // We support two predecessor layouts in a single pass so users coming from
 // either era end up in the same place:
@@ -386,12 +369,10 @@ export function hasPreFlipMigrationMarker(config: RuntimeConfig): boolean {
 
 /** Atomic write of the runtime config. Replaces every
  *  `writeFileSync(configPath(...), JSON.stringify(config, null, 2) + "\n")`
- *  call site in the codebase so a `config.json` reader (the proxy reads
- *  `tunnel.enabled` + `tunnel.secret` on every request via per-request
- *  disk reads in `tunnel-policy.ts`) can never observe a torn JSON
- *  document. Uses the same tempfile + fsync + rename pattern as
- *  `patchTunnelConfig` — readers either see the OLD complete file or
- *  the NEW complete file, never a partial. */
+ *  call site in the codebase so a `config.json` reader can never observe
+ *  a torn JSON document. Uses a tempfile + fsync + rename so readers
+ *  either see the OLD complete file or the NEW complete file, never a
+ *  partial. */
 export function writeRuntimeConfig(config: RuntimeConfig): void {
   atomicWriteFile(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 }

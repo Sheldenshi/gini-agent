@@ -1,8 +1,6 @@
-// Mirror of src/runtime/tunnel/canonicalize.test.ts — pins the web copy
-// against the same invariants. Both files are tested independently so a
-// drift between the two (e.g., a developer edits one and forgets the
-// other) is caught by CI. See docs/adr/tunnel-and-mobile-access.md
-// "Architecture (summary)".
+// Pins the BFF path canonicalizer used by the /api/runtime/[...path] proxy
+// route — rejecting traversal, duplicate slashes, embedded delimiters, and
+// over-long input before a request path is forwarded to the gateway.
 import { describe, expect, test } from "bun:test";
 import { canonicalizePath, noTrailingSlash } from "./canonicalize";
 
@@ -20,34 +18,34 @@ function reason(input: string): string {
 
 describe("web canonicalizePath", () => {
   test("simple path", () => {
-    expect(pass("/api/runtime/tunnel")).toBe("/api/runtime/tunnel");
+    expect(pass("/api/runtime/status")).toBe("/api/runtime/status");
   });
   test("decodes percent-encoded characters", () => {
-    expect(pass("/api/runtime/%74unnel")).toBe("/api/runtime/tunnel");
+    expect(pass("/api/runtime/%73tatus")).toBe("/api/runtime/status");
   });
   test("decodes doubly-encoded", () => {
     expect(pass("/api/runtime/%2570airing")).toBe("/api/runtime/pairing");
   });
   test("rejects traversal", () => {
-    expect(reason("/api/runtime/../tunnel")).toBe("traversal");
+    expect(reason("/api/runtime/../status")).toBe("traversal");
   });
   test("rejects doubly-encoded traversal", () => {
-    expect(reason("/api/runtime/%252e%252e/tunnel")).toBe("traversal");
+    expect(reason("/api/runtime/%252e%252e/status")).toBe("traversal");
   });
   test("rejects single-dot segment", () => {
-    expect(reason("/api/runtime/./tunnel")).toBe("dot-segment");
+    expect(reason("/api/runtime/./status")).toBe("dot-segment");
   });
   test("rejects duplicate interior slash", () => {
-    expect(reason("/api/runtime//tunnel")).toBe("duplicate-slash");
+    expect(reason("/api/runtime//status")).toBe("duplicate-slash");
   });
   test("rejects backslash", () => {
-    expect(reason("/api/runtime\\tunnel")).toBe("backslash-or-nul");
+    expect(reason("/api/runtime\\status")).toBe("backslash-or-nul");
   });
   test("rejects embedded question mark", () => {
-    expect(reason("/api/runtime/tunnel%3Fqr")).toBe("embedded-delimiter");
+    expect(reason("/api/runtime/status%3Fqr")).toBe("embedded-delimiter");
   });
   test("rejects embedded hash", () => {
-    expect(reason("/api/runtime/tunnel%23foo")).toBe("embedded-delimiter");
+    expect(reason("/api/runtime/status%23foo")).toBe("embedded-delimiter");
   });
   test("rejects malformed percent", () => {
     expect(reason("/api/runtime/%ZZ")).toBe("malformed-percent-encoding");
@@ -56,14 +54,14 @@ describe("web canonicalizePath", () => {
     expect(pass("/")).toBe("/");
   });
   test("preserves single trailing slash", () => {
-    const r = canonicalizePath("/api/runtime/tunnel/");
+    const r = canonicalizePath("/api/runtime/status/");
     expect(r.ok).toBe(true);
     expect(r.ok && r.hadTrailingSlash).toBe(true);
   });
   test("collapses multiple trailing slashes to one", () => {
-    const r = canonicalizePath("/api/runtime/tunnel///");
+    const r = canonicalizePath("/api/runtime/status///");
     expect(r.ok).toBe(true);
-    expect(r.ok && r.path).toBe("/api/runtime/tunnel/");
+    expect(r.ok && r.path).toBe("/api/runtime/status/");
   });
   test("rejects over-length input", () => {
     expect(reason("/" + "a".repeat(5000))).toBe("too-long");
@@ -72,7 +70,7 @@ describe("web canonicalizePath", () => {
 
 describe("web noTrailingSlash", () => {
   test("strips trailing slash", () => {
-    expect(noTrailingSlash("/api/runtime/tunnel/")).toBe("/api/runtime/tunnel");
+    expect(noTrailingSlash("/api/runtime/status/")).toBe("/api/runtime/status");
   });
   test("leaves bare slash alone", () => {
     expect(noTrailingSlash("/")).toBe("/");

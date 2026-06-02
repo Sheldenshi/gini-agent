@@ -97,8 +97,8 @@ describe("normalizeBaseUrl", () => {
   test("accepts https:// to any host", () => {
     expect(normalizeBaseUrl("https://example.com")).toBe("https://example.com");
     expect(normalizeBaseUrl("https://127.0.0.1:7421")).toBe("https://127.0.0.1:7421");
-    expect(normalizeBaseUrl("https://my-tunnel.trycloudflare.com")).toBe(
-      "https://my-tunnel.trycloudflare.com"
+    expect(normalizeBaseUrl("https://gateway.example.net")).toBe(
+      "https://gateway.example.net"
     );
   });
 
@@ -129,7 +129,7 @@ describe("normalizeBaseUrl", () => {
   test("rejects http:// to public hosts with the cleartext warning", () => {
     expect(() => normalizeBaseUrl("http://example.com")).toThrow(PUBLIC_HTTP_REJECTION);
     expect(() => normalizeBaseUrl("http://203.0.113.5")).toThrow(PUBLIC_HTTP_REJECTION);
-    expect(() => normalizeBaseUrl("http://my-tunnel.trycloudflare.com")).toThrow(
+    expect(() => normalizeBaseUrl("http://gateway.example.net")).toThrow(
       PUBLIC_HTTP_REJECTION
     );
   });

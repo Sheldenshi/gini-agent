@@ -192,19 +192,6 @@ install_deps() {
   fi
 }
 
-# Pre-fetch the cloudflared binary so enabling the mobile tunnel is instant and
-# works on a machine with no package manager. Best-effort: if the download
-# fails (e.g. an offline install), the runtime fetches it lazily on the first
-# tunnel enable, so this never blocks the install. Runs via Bun (the cloudflared
-# npm package's own postinstall needs Node, which we don't require).
-provision_cloudflared() {
-  if (cd "$RUNTIME_DIR" && GINI_INSTANCE="$DEFAULT_INSTANCE" bun run gini tunnel install-cloudflared >/dev/null 2>&1); then
-    step "cloudflared ready (mobile tunnel)"
-  else
-    info "cloudflared will be fetched on first tunnel enable"
-  fi
-}
-
 write_wrapper() {
   mkdir -p "$BIN_DIR"
   if [ -e "$WRAPPER_PATH" ] && ! grep -Fq 'gini-agent-installer-managed' "$WRAPPER_PATH" 2>/dev/null; then
@@ -489,7 +476,6 @@ main() {
   write_wrapper
   update_path
   initialize_instance
-  provision_cloudflared
   # run_setup is still attempted for interactive installs that want the
   # legacy terminal flow. For the piped-curl path it's a no-op (no TTY)
   # — the user goes through the browser /setup route instead.

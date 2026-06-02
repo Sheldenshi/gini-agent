@@ -63,9 +63,9 @@ is actually used.
   `load_tools` them.
 - The dispatcher routes the self tool cases through one helper
   (`dispatchSelfOp`): a `query` tool runs its handler synchronously; a
-  `mutate` tool (`set_provider`, `use_agent`, …) routes through the approval
-  seam (`pendingOrAuto`) as PolicyAction `self.config`. The tool name IS the
-  op name and args are passed at top level.
+  `mutate` tool (`set_provider`, `use_agent`, `rename_agent`, …) routes through
+  the approval seam (`pendingOrAuto`) as PolicyAction `self.config`. The tool
+  name IS the op name and args are passed at top level.
 - `self.config` policy (ADR approval-mode.md): auto-approves under `auto` (the
   default — frictionless when the user says "set provider to deepseek"), gates
   under `strict`, auto-resolves under `yolo`. The approval row carries
@@ -87,7 +87,7 @@ Seed operations:
 
 - `query` — `get_self`, `list_providers`, `list_agents`, `list_skills`,
   `list_mcp_servers`, `list_connectors`, `list_toolsets`.
-- `mutate` — `set_provider`, `use_agent`, `create_agent`,
+- `mutate` — `set_provider`, `use_agent`, `create_agent`, `rename_agent`,
   `set_approval_mode`, `enable_toolset`, `disable_toolset`, `delete_agent`,
   `remove_provider`, `set_auto_approve_commands`, `set_dangerous_patterns`,
   `add_mcp_server`, `remove_mcp_server`, `remove_connector`,

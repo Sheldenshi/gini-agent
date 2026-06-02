@@ -3,7 +3,6 @@ import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Providers } from "@/components/providers";
 import { MobileTopBar, Sidebar } from "@/components/Sidebar";
-import { TunnelQrLauncher } from "@/components/TunnelQrLauncher";
 
 export const dynamic = "force-dynamic";
 
@@ -27,7 +26,6 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
               <main className="flex flex-1 flex-col overflow-hidden">{children}</main>
             </div>
           </div>
-          <TunnelQrLauncher />
         </Providers>
       </body>
     </html>

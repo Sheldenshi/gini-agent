@@ -30,7 +30,6 @@ import { logDir, runtimePortPath, webPortPath } from "../../paths";
 import { kickstart, supervisor, type LaunchctlResult, type PlistKind } from "../../integrations/launchd";
 import { isSupervisedWebChild } from "../../runtime/health-probe";
 import { secretsEnvPath } from "../../state/secrets-env";
-import { readTunnelConfig } from "../../runtime/tunnel/config-store";
 import { appendLog } from "../../state/trace";
 import {
   buildCrashReport,
@@ -106,9 +105,8 @@ function readWebLogTail(instance: string, filename: string): RuntimeLogLine[] {
 // Best-effort literal-redaction inputs for the report. Sourcing these must
 // never stop us from reviving web, so any read failure yields undefined — the
 // report's pattern-based redaction still runs regardless.
-function readRedactionLiterals(instance: string): {
+function readRedactionLiterals(): {
   secretsEnvBody?: string;
-  tunnelSecret?: string;
 } {
   let secretsEnvBody: string | undefined;
   try {
@@ -117,13 +115,7 @@ function readRedactionLiterals(instance: string): {
   } catch {
     secretsEnvBody = undefined;
   }
-  let tunnelSecret: string | undefined;
-  try {
-    tunnelSecret = readTunnelConfig(instance)?.secret;
-  } catch {
-    tunnelSecret = undefined;
-  }
-  return { secretsEnvBody, tunnelSecret };
+  return { secretsEnvBody };
 }
 
 export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promise<void> {
@@ -194,7 +186,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
             ...readWebLogTail(instance, "web-launchd.err.log"),
             ...readWebLogTail(instance, "web.log")
           ];
-          const { secretsEnvBody, tunnelSecret } = readRedactionLiterals(instance);
+          const { secretsEnvBody } = readRedactionLiterals();
           const report = buildCrashReport({
             instance,
             supervisor: supervisorImpl(),
@@ -206,8 +198,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
             logTail,
             sysInfo: { platform: platform(), arch: arch(), nodeVersion: process.version },
             clock,
-            secretsEnvBody,
-            tunnelSecret
+            secretsEnvBody
           });
           writeCrashReportFile(report);
           actions.push("report:web");

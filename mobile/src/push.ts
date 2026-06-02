@@ -520,16 +520,15 @@ export function __resetRegistrationForSignOut(): void {
   if (receivedSub) { receivedSub.remove(); receivedSub = null; }
 }
 
-// Called from the deep-link flow right before `saveCredentials` swaps
-// the persisted base URL + bearer to a new pair. The new credentials
-// may target a different runtime instance (different devices table,
-// different APNs topic), so every short-circuit gate from the prior
-// session must drop: registrationStarted, the cached token, the
-// generation counter, and the listener subscriptions. Functionally
-// equivalent to __resetRegistrationForSignOut but exported under a
-// name that says what the caller actually means at the deep-link
-// boundary; idempotent — calling on a freshly-mounted process with
-// nothing cached is a no-op.
+// Call right before `saveCredentials` swaps the persisted base URL +
+// bearer to a new pair. The new credentials may target a different
+// runtime instance (different devices table, different APNs topic), so
+// every short-circuit gate from the prior session must drop:
+// registrationStarted, the cached token, the generation counter, and
+// the listener subscriptions. Functionally equivalent to
+// __resetRegistrationForSignOut but exported under a name that says
+// what the caller means at a credential-swap boundary; idempotent —
+// calling on a freshly-mounted process with nothing cached is a no-op.
 export function resetRegistrationForCredentialSwap(): void {
   __resetRegistrationForSignOut();
 }

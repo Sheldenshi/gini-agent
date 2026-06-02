@@ -343,11 +343,14 @@ describe("approvalMode dispatch matrix", () => {
 
     test("autoApproveCommands allowlist short-circuits the dangerous-pattern blocklist", async () => {
       const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-approval-mode-ws-"));
-      // Operator explicitly allows `sudo apt update` — the allowlist
-      // must win over the built-in `sudo ` block.
+      // Operator explicitly allows a `sudo` command — the allowlist must
+      // win over the built-in `sudo ` block. The command is a
+      // non-interactive no-op (`sudo -n true`) rather than a real package
+      // command so the auto-approved exec runs instantly and offline; the
+      // gate-vs-allowlist decision is identical regardless of the payload.
       const config = buildConfig(workspaceRoot, "auto-allowlist-wins", {
         approvalMode: "auto",
-        autoApproveCommands: ["sudo apt update"]
+        autoApproveCommands: ["sudo -n true"]
       });
       const provider = normalizeProvider(config.provider);
 
@@ -355,7 +358,7 @@ describe("approvalMode dispatch matrix", () => {
         provider,
         text: "",
         toolCalls: [
-          { id: "call_t", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "sudo apt update" }) } }
+          { id: "call_t", type: "function", function: { name: "terminal_exec", arguments: JSON.stringify({ command: "sudo -n true" }) } }
         ],
         finishReason: "tool_calls"
       });
@@ -369,7 +372,7 @@ describe("approvalMode dispatch matrix", () => {
       // Allowlist fast-path bypasses approval-row creation entirely.
       expect(state.authorizations.filter((a) => a.taskId === task.id)).toHaveLength(0);
       const execAudits = state.audit.filter((a) => a.action === "terminal.exec" && a.taskId === task.id);
-      expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("sudo apt update");
+      expect(execAudits[0]?.evidence?.autoApprovedReason).toBe("sudo -n true");
 
       rmSync(workspaceRoot, { recursive: true, force: true });
     });

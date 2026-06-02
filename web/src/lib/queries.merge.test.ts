@@ -2,7 +2,7 @@
 //
 // Pins the fix for the seed-overwrites-live regression: useChatBlocks
 // previously did `setBlocks(sorted)` on the REST snapshot resolution,
-// which clobbered any live SSE/poll block that had arrived BEFORE the
+// which clobbered any live SSE block that had arrived BEFORE the
 // seed promise resolved (the live frame went through the merge
 // functional updater; the seed wiped the slate). The fix routes the
 // seed through this helper so it merges with `prev` instead — and for
@@ -41,7 +41,7 @@ function assistantBlock(id: string, ordinal: number, text: string, streaming = f
 
 describe("mergeSeedWithLive", () => {
   test("retains a live block that arrived before the seed resolved", () => {
-    // Live block landed first via SSE/poll (ordinal 2). Then the REST
+    // Live block landed first via SSE (ordinal 2). Then the REST
     // seed lands carrying only the older block (ordinal 1). A plain
     // setBlocks(seed) would have dropped the live block; the merge
     // must keep it.

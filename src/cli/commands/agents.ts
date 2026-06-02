@@ -21,6 +21,16 @@ export async function agent(ctx: CliContext): Promise<void> {
     print(await api(config, `/api/agents/${encodeURIComponent(id)}/use`, { method: "POST" }));
     return;
   }
+  if (sub === "rename") {
+    const [idOrName, ...rest] = restAfter(cliArgs, sub);
+    const name = rest.join(" ");
+    if (!idOrName || !name) throw new Error("Usage: gini agent rename <id-or-name> <new name>");
+    print(await api(config, `/api/agents/${encodeURIComponent(idOrName)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name })
+    }));
+    return;
+  }
   if (sub === "delete" || sub === "remove") {
     const id = restAfter(cliArgs, sub)[0];
     if (!id) throw new Error(`Usage: gini agent ${sub} <agent-id-or-name>`);

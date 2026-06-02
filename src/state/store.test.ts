@@ -244,6 +244,23 @@ describe("normalizeState toolset/tool backfill", () => {
     expect(userCustom.updatedAt).toBe(originalUpdatedAt);
   });
 
+  test("unions web_search into a default agent persisted at the post-browser snapshot", () => {
+    // An instance created after `browser` joined the defaults but before
+    // `web_search` did carries exactly this 8-entry whitelist. The
+    // migration must recognize it as uncustomized and add web_search —
+    // otherwise the web_search tool stays invisible to the model.
+    const state = createEmptyState("test-instance-web-search-migrate");
+    const agent = state.agents.find((a) => a.id === "agent_default")!;
+    agent.toolsets = ["file", "terminal", "memory", "session_search", "delegation", "messaging", "mcp", "browser"];
+    agent.updatedAt = "2025-01-01T00:00:00.000Z";
+
+    const normalized = normalizeState("test-instance-web-search-migrate", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default")!;
+    expect(after.toolsets).toContain("web_search");
+    expect(after.toolsets).toContain("browser");
+    expect(after.updatedAt).not.toBe("2025-01-01T00:00:00.000Z");
+  });
+
   test("backfilled tool rows for a DISABLED toolset stay disabled", () => {
     const state = createEmptyState("test-instance-6");
     const browser = state.toolsets.find((ts) => ts.name === "browser");
@@ -379,6 +396,61 @@ describe("backfillDefaultAgentToolsets", () => {
     expect(audits.length).toBe(0);
   });
 });
+
+describe("renameDefaultAgentToGini", () => {
+  test("renames a legacy default-named default agent to Gini and audits it", () => {
+    const state = createEmptyState("test-instance-rename-default");
+    const agent = state.agents.find((a) => a.id === "agent_default")!;
+    // Simulate an instance seeded before the default agent was named
+    // "Gini" — its default agent still carries the legacy "default" name.
+    agent.name = "default";
+
+    const normalized = normalizeState("test-instance-rename-default", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default")!;
+    expect(after.name).toBe("Gini");
+    const audit = normalized.audit.find(
+      (e) => e.action === "agent.default.renamed" && e.target === "agent_default"
+    );
+    expect(audit).toBeDefined();
+    expect(audit?.evidence).toEqual({ from: "default", to: "Gini", agentId: "agent_default" });
+  });
+
+  test("leaves a user-renamed default agent untouched", () => {
+    const state = createEmptyState("test-instance-rename-custom");
+    const agent = state.agents.find((a) => a.id === "agent_default")!;
+    // User renamed their default agent — the migration must not clobber it.
+    agent.name = "Mansour";
+
+    const normalized = normalizeState("test-instance-rename-custom", state);
+    const after = normalized.agents.find((a) => a.id === "agent_default")!;
+    expect(after.name).toBe("Mansour");
+    const audit = normalized.audit.find((e) => e.action === "agent.default.renamed");
+    expect(audit).toBeUndefined();
+  });
+
+  test("is idempotent — a second pass writes no further audit row", () => {
+    const state = createEmptyState("test-instance-rename-idempotent");
+    const agent = state.agents.find((a) => a.id === "agent_default")!;
+    agent.name = "default";
+
+    const normalized = normalizeState("test-instance-rename-idempotent", state);
+    expect(normalized.agents.find((a) => a.id === "agent_default")!.name).toBe("Gini");
+    const renormalized = normalizeState("test-instance-rename-idempotent", normalized);
+    const audits = renormalized.audit.filter((e) => e.action === "agent.default.renamed");
+    expect(audits.length).toBe(1);
+  });
+
+  test("a freshly seeded default agent is already named Gini — no rename fires", () => {
+    const state = createEmptyState("test-instance-rename-fresh");
+    expect(state.agents.find((a) => a.id === "agent_default")!.name).toBe("Gini");
+
+    const normalized = normalizeState("test-instance-rename-fresh", state);
+    expect(normalized.agents.find((a) => a.id === "agent_default")!.name).toBe("Gini");
+    const audit = normalized.audit.find((e) => e.action === "agent.default.renamed");
+    expect(audit).toBeUndefined();
+  });
+});
+
 describe("dropDeadMemoryImprovements", () => {
   test("strips improvements with the legacy kind: memory and audits each removal", () => {
     const state = createEmptyState("legacy-memory-improvements");

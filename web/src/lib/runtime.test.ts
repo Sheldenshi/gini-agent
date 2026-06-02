@@ -20,14 +20,12 @@ function makeReq(opts: {
   method?: string;
   origin?: string;
   host?: string;
-  vetted?: boolean;
   secFetchSite?: string;
   url?: string;
 }): Request {
   const headers = new Headers();
   if (opts.origin !== undefined) headers.set("origin", opts.origin);
   if (opts.host !== undefined) headers.set("host", opts.host);
-  if (opts.vetted) headers.set("x-gini-tunnel-vetted", "1");
   if (opts.secFetchSite) headers.set("sec-fetch-site", opts.secFetchSite);
   return new Request(opts.url ?? "http://127.0.0.1:7777/api/runtime/chat", {
     method: opts.method ?? "GET",
@@ -35,43 +33,11 @@ function makeReq(opts: {
   });
 }
 
-describe("guardCsrf — no Origin + vetted tunnel marker", () => {
-  test("POST + no Origin + no vetted marker → 403", async () => {
+describe("guardCsrf — no Origin", () => {
+  test("POST + no Origin → 403 (unsafe methods require Origin)", async () => {
     const res = guardCsrf(makeReq({ method: "POST", host: "127.0.0.1:7777" }), []);
     expect(res).not.toBeNull();
     expect(res!.status).toBe(403);
-  });
-
-  test("POST + no Origin + vetted=1 → pass", () => {
-    const res = guardCsrf(
-      makeReq({ method: "POST", vetted: true, host: "example.trycloudflare.com" }),
-      []
-    );
-    expect(res).toBeNull();
-  });
-
-  test("PUT + no Origin + vetted=1 → pass (every unsafe method)", () => {
-    const res = guardCsrf(
-      makeReq({ method: "PUT", vetted: true, host: "example.trycloudflare.com" }),
-      []
-    );
-    expect(res).toBeNull();
-  });
-
-  test("DELETE + no Origin + vetted=1 → pass", () => {
-    const res = guardCsrf(
-      makeReq({ method: "DELETE", vetted: true, host: "example.trycloudflare.com" }),
-      []
-    );
-    expect(res).toBeNull();
-  });
-
-  test("PATCH + no Origin + vetted=1 → pass", () => {
-    const res = guardCsrf(
-      makeReq({ method: "PATCH", vetted: true, host: "example.trycloudflare.com" }),
-      []
-    );
-    expect(res).toBeNull();
   });
 });
 
@@ -118,13 +84,12 @@ describe("guardCsrf — safe methods", () => {
   });
 });
 
-describe("guardCsrf — Sec-Fetch-Site still fires for vetted requests", () => {
-  test("vetted POST with sec-fetch-site=cross-site → 403", () => {
+describe("guardCsrf — Sec-Fetch-Site", () => {
+  test("GET on loopback with sec-fetch-site=cross-site → 403", () => {
     const res = guardCsrf(
       makeReq({
-        method: "POST",
-        vetted: true,
-        host: "example.trycloudflare.com",
+        method: "GET",
+        host: "127.0.0.1:7777",
         secFetchSite: "cross-site"
       }),
       []

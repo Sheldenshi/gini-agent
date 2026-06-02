@@ -32,7 +32,6 @@ Each file in this directory captures one architecture decision: the context, the
 - [Identity-File Long-Horizon Design](identity-file-long-horizon-design.md)
 - [Openclaw Migration](openclaw-migration.md)
 - [BFF Trust Boundary For Privileged POSTs](bff-trust-boundary.md)
-- [Tunnel + Mobile Access Via Cloudflare Quick Tunnel](tunnel-and-mobile-access.md)
 - [Mobile Push Notifications (APNs + NSE + Inline Actions)](mobile-push-notifications.md)
 - [Codex Session-Rotation Retry, UA Mirroring, And auth.json Race Handling](codex-session-rotation-retry.md)
 - [Authorization vs SetupRequest](authorization-vs-setup-request.md)
@@ -40,3 +39,5 @@ Each file in this directory captures one architecture decision: the context, the
 - [Per-Skill Connector Consent Grant](skill-connector-consent.md)
 - [Chat-Driven Credential Provisioning](chat-credential-provisioning.md)
 - [Provider Re-Authentication Guidance](provider-reauth-guidance.md)
+- [Voice Messages With Gateway-Side Local Speech-To-Text](voice-messages-and-local-stt.md)
+- [Connector-Backed Web Search](web-search-connectors.md)

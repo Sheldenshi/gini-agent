@@ -15,7 +15,9 @@ import { iconForTool } from "./tool-icons";
 // indicate what kind of tool ran.
 //
 // Three render variants:
-//   - Default: the row above; failed (error/denied) calls add a red error string.
+//   - Default: the row above; failed (error/denied) calls add an error
+//     string below — red by default, muted gray when errorSeverity is
+//     "info" (a calm needs-setup notice, e.g. web_search with no connector).
 //   - Inline spinner (status === "running" && !result, no runningHint):
 //     a small ActivityIndicator sits at the end of the row. Right for
 //     short-lived tools.
@@ -122,7 +124,10 @@ export function BlockToolCall({
     <View style={styles.row}>
       {rowBody}
       {failed && block.errorMessage ? (
-        <Text style={styles.errorMessage} numberOfLines={3}>
+        <Text
+          style={block.errorSeverity === "info" ? styles.infoMessage : styles.errorMessage}
+          numberOfLines={3}
+        >
           {block.errorMessage}
         </Text>
       ) : null}
@@ -178,6 +183,14 @@ const styles = StyleSheet.create({
   },
   errorMessage: {
     color: theme.danger,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 13,
+    paddingLeft: 21
+  },
+  // Muted variant for errorSeverity "info" (e.g. web_search with no
+  // provider): a calm needs-setup notice rather than a red failure.
+  infoMessage: {
+    color: theme.muted,
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 13,
     paddingLeft: 21

@@ -1,10 +1,9 @@
-// Identity probe shared between the runtime API's PATCH /api/tunnel
-// handler and the TunnelManager's swapCloudflared(). The handler probes
-// before entering the manager's apply chain so it can fail fast with a
-// 409; the manager re-probes inside the chain to close the race window
-// where the supervised Next.js child dies between the handler's probe
-// and the manager's spawn, and an opportunistic local process binds
-// the freed port before cloudflared launches against it.
+// Identity probe for the supervised Next.js web child: confirms the
+// process answering on a given port is genuinely gini-web for this
+// instance (service + instance match on /api/runtime/__healthz) rather
+// than a stale port file or a port-squatting process. Used by the
+// watchdog to decide whether the web service is actually alive before
+// reviving it.
 
 export async function isSupervisedWebChild(instance: string, port: number): Promise<boolean> {
   try {

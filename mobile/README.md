@@ -32,55 +32,21 @@ cd mobile && bunx tsc --noEmit
 
 ## First-run setup
 
-The mobile app does not embed the gateway URL or token. The primary
-onboarding flow is **scan the tunnel QR**; manual paste is kept as a
-fallback for non-tunneled setups.
-
-### Primary flow: scan QR from the desktop app
-
-With the runtime up and the tunnel enabled (Settings → Tunnel → Enable,
-or `gini tunnel enable`), the desktop web client surfaces a QR at
-`/api/tunnel/qr.svg`. Each QR encodes the live bootstrap URL
-(`<publicUrl>/<secret>`).
-
-1. Open the camera and scan the QR. iOS / Android opens the bootstrap
-   URL in Safari / Chrome.
-2. The proxy mints a host-bound `gini_tunnel_session` cookie from the
-   secret and 302s to the runtime's `/connect` interstitial. The
-   interstitial builds a `gini://connect?api=<runtime-url>&token=<bearer>`
-   deep link and asks the OS to route the scheme to the installed app.
-   If the app isn't installed, the page falls back to the supplied
-   `web` URL after `fallbackMs` (defaults to 1.5s).
-3. The app's `useDeepLinkAuth` hook (`mobile/src/use-deep-link-auth.ts`)
-   claims the URL, shows an `Alert` with the destination host so the
-   user can confirm they expected this link, then calls
-   `saveCredentials` and navigates to `/agents`.
-
-The `Alert` confirmation step is intentional: ANY app or web page can
-construct a `gini://connect?...` URL, so the explicit user gate
-prevents a crafted SMS / pasteboard payload from silently overwriting
-the device's credentials. See ADR
-[tunnel-and-mobile-access.md](../docs/adr/tunnel-and-mobile-access.md)
-for the full contract; a follow-up will replace the alert with a
-PKCE-style challenge protocol so the secret is bound to a freshly
-minted nonce.
-
-### Fallback: paste base URL and token by hand
-
-If the gateway isn't tunneled (LAN-only) or the deep-link handoff
-didn't fire, the setup screen accepts manual credentials.
+The mobile app does not embed the gateway URL or token — you paste them
+on the setup screen the first time you launch.
 
 - **Base URL**: the runtime gateway. Defaults to `http://localhost:7421`.
   For a real device on the same network, use your machine's LAN IP
   (e.g. `http://192.168.1.42:7421`); the simulator/emulator can keep
-  `localhost`.
+  `localhost`. Off-LAN access (Tailscale, or another stable address in
+  front of the gateway) is reached the same way — point the base URL at
+  whatever address fronts the gateway.
 - **Bearer token**: copy it from `~/.gini/instances/<instance>/config.json`
   (the `token` field) or run `gini status` and look for the token line.
 
 The setup screen calls `GET /api/status` once to validate; if it
 returns JSON, the credentials are persisted with `AsyncStorage` and
-you're routed to the agent picker. Tunneled clients carry the secret
-via the deep link instead of pasting `config.json`'s token.
+you're routed to the agent picker.
 
 ## Behavior
 

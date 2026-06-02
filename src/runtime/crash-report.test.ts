@@ -1,5 +1,5 @@
 // Tests for the pure crash-report module: fingerprint stability/divergence,
-// redaction (patterns + literal secrets-env + tunnel secret), jsonl-tail
+// redaction (patterns + literal secrets-env), jsonl-tail
 // payload dropping, and clock-injected rate-limit state round-trips.
 //
 // All disk writes are routed to a unique GINI_STATE_ROOT under /tmp so nothing
@@ -130,14 +130,12 @@ describe("redactReportText", () => {
     expect(out).toContain("[redacted]");
   });
 
-  test("redacts literal secrets-env values and the tunnel secret", () => {
-    const text = "leaked OPENAI value hunter2-literal and tunnel ts-secret-zzz here";
+  test("redacts literal secrets-env values", () => {
+    const text = "leaked OPENAI value hunter2-literal here";
     const out = redactReportText(text, {
-      secretsEnvBody: "export OPENAI_API_KEY='hunter2-literal'\nFOO=bar",
-      tunnelSecret: "ts-secret-zzz"
+      secretsEnvBody: "export OPENAI_API_KEY='hunter2-literal'\nFOO=bar"
     });
     expect(out).not.toContain("hunter2-literal");
-    expect(out).not.toContain("ts-secret-zzz");
     expect(out).toContain("[redacted]");
     // A non-secret value still present (FOO=bar is a value too, but "bar"
     // appears nowhere in the text, so the surrounding prose is intact).
@@ -170,12 +168,11 @@ describe("redactReportText", () => {
 describe("buildCrashReport redaction", () => {
   test("redacts secrets in error.message/stack and logTail, keeps fingerprint stable, drops raw data", () => {
     // An error whose message + stack embed a fake OpenAI token, a gh token, a
-    // bearer/authorization header, a literal secrets-env value, and a tunnel
-    // secret. None may survive into the built report.
+    // bearer/authorization header, and a literal secrets-env value. None may
+    // survive into the built report.
     const literalSecret = "hunter2-literal-value";
-    const tunnelSecret = "tunnel-secret-zzz999";
     const err = new Error(
-      `boom sk-abcdefghijklmnop1234 and ${literalSecret} and ${tunnelSecret}`
+      `boom sk-abcdefghijklmnop1234 and ${literalSecret}`
     );
     err.stack = [
       "Error: boom sk-abcdefghijklmnop1234",
@@ -192,14 +189,13 @@ describe("buildCrashReport redaction", () => {
       logTail: [
         {
           at: "2026-05-29T00:00:00.000Z",
-          message: `log gho_0123456789abcdefghijklmnopqrstuv and ${tunnelSecret}`,
+          message: "log gho_0123456789abcdefghijklmnopqrstuv",
           data: { secret: "raw payload bytes" }
         }
       ],
       sysInfo: SYS_INFO,
       clock: () => new Date("2026-05-29T00:00:02.000Z"),
-      secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'\nFOO=bar`,
-      tunnelSecret
+      secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'\nFOO=bar`
     });
 
     const serialized = JSON.stringify(report);
@@ -209,7 +205,6 @@ describe("buildCrashReport redaction", () => {
     expect(serialized).not.toContain("Bearer xyztoken123456");
     expect(serialized).not.toContain("xyztoken123456");
     expect(serialized).not.toContain(literalSecret);
-    expect(serialized).not.toContain(tunnelSecret);
     // The raw log `data` payload is dropped entirely.
     expect(serialized).not.toContain("raw payload bytes");
     expect(serialized).not.toContain("secret");
@@ -226,7 +221,6 @@ describe("buildCrashReport redaction", () => {
     process.env.GINI_STATE_ROOT = stateRoot;
     try {
       const literalSecret = "literal-disk-secret-77";
-      const tunnelSecret = "tunnel-disk-secret-88";
       const nameSecret = "ghp_0123456789abcdefghijklmnopqrstuv";
       const err = new Error(`disk sk-abcdefghijklmnop1234 ${literalSecret}`);
       // A secret embedded in error.name reaches the issue TITLE + body, so it
@@ -235,7 +229,7 @@ describe("buildCrashReport redaction", () => {
       err.stack = [
         "Error: disk",
         "  Authorization: Basic dXNlcjpwYXNzd29yZA==",
-        `  ghp_0123456789abcdefghijklmnopqrstuv ${tunnelSecret}`
+        "  ghp_0123456789abcdefghijklmnopqrstuv"
       ].join("\n");
       const report = buildCrashReport({
         instance: "test-inst",
@@ -245,8 +239,7 @@ describe("buildCrashReport redaction", () => {
         logTail: [{ at: "2026-05-29T00:00:00.000Z", message: "evt", data: { x: "raw" } }],
         sysInfo: SYS_INFO,
         clock: () => new Date("2026-05-29T00:00:00.000Z"),
-        secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'`,
-        tunnelSecret
+        secretsEnvBody: `export OPENAI_API_KEY='${literalSecret}'`
       });
       // The redacted name no longer carries the secret token.
       expect(report.error.name).not.toContain(nameSecret);
@@ -257,7 +250,6 @@ describe("buildCrashReport redaction", () => {
       expect(onDisk).not.toContain("ghp_0123456789abcdefghijklmnopqrstuv");
       expect(onDisk).not.toContain("dXNlcjpwYXNzd29yZA==");
       expect(onDisk).not.toContain(literalSecret);
-      expect(onDisk).not.toContain(tunnelSecret);
       expect(onDisk).not.toContain("raw");
       expect(onDisk).toContain("[redacted]");
     } finally {

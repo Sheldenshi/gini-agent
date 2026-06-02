@@ -19,6 +19,7 @@
 import { EventEmitter } from "node:events";
 import type {
   AssistantTextBlock,
+  AudioAttachment,
   AuthorizationAction,
   ChatBlock,
   ChatBlockKind,
@@ -87,6 +88,23 @@ interface ChatBlockRow {
   updated_at: string;
 }
 
+// Parse the optional voice attachment off a user_text payload, guarding
+// types the same way the inline-image parse does (a hand-edited or
+// truncated row must not yield a half-formed attachment).
+function parseAudioPayload(raw: unknown): AudioAttachment | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const item = raw as Record<string, unknown>;
+  const id = String(item.id ?? "");
+  if (id.length === 0) return undefined;
+  const durationMs = typeof item.durationMs === "number" ? item.durationMs : undefined;
+  return {
+    id,
+    mimeType: String(item.mimeType ?? ""),
+    size: Number(item.size ?? 0),
+    ...(durationMs !== undefined ? { durationMs } : {})
+  };
+}
+
 function rowToBlock(row: ChatBlockRow): ChatBlock {
   // The payload column carries the typed kind-specific fields
   // (text/label/toolName/etc.). Bookkeeping fields are denormalized
@@ -119,11 +137,13 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
             }))
             .filter((image) => image.id.length > 0)
         : undefined;
+      const audio = parseAudioPayload(payload.audio);
       return {
         ...base,
         kind: "user_text",
         text: String(payload.text ?? ""),
-        ...(images && images.length > 0 ? { images } : {})
+        ...(images && images.length > 0 ? { images } : {}),
+        ...(audio ? { audio } : {})
       };
     }
     case "assistant_text":
@@ -147,6 +167,7 @@ function rowToBlock(row: ChatBlockRow): ChatBlock {
           : {}),
         status: (payload.status as ToolCallStatus) ?? "running",
         errorMessage: typeof payload.errorMessage === "string" ? payload.errorMessage : undefined,
+        errorSeverity: payload.errorSeverity === "info" || payload.errorSeverity === "error" ? payload.errorSeverity : undefined,
         callId: String(payload.callId ?? ""),
         runningHint: typeof payload.runningHint === "string" ? payload.runningHint : undefined
       };
@@ -242,7 +263,8 @@ function payloadFor(block: ChatBlock): string {
     case "user_text":
       return JSON.stringify({
         text: block.text,
-        ...(block.images && block.images.length > 0 ? { images: block.images } : {})
+        ...(block.images && block.images.length > 0 ? { images: block.images } : {}),
+        ...(block.audio ? { audio: block.audio } : {})
       });
     case "assistant_text":
       return JSON.stringify({ text: block.text, streaming: block.streaming });
@@ -254,6 +276,7 @@ function payloadFor(block: ChatBlock): string {
         argsFull: block.argsFull,
         status: block.status,
         errorMessage: block.errorMessage,
+        errorSeverity: block.errorSeverity,
         callId: block.callId,
         runningHint: block.runningHint
       });
@@ -334,7 +357,8 @@ export function insertChatBlock(
             ...base,
             kind: "user_text",
             text: input.text,
-            ...(input.images && input.images.length > 0 ? { images: input.images } : {})
+            ...(input.images && input.images.length > 0 ? { images: input.images } : {}),
+            ...(input.audio ? { audio: input.audio } : {})
           };
         case "assistant_text":
           return {
@@ -355,6 +379,7 @@ export function insertChatBlock(
             argsFull: input.argsFull,
             status: input.status,
             errorMessage: input.errorMessage,
+            errorSeverity: input.errorSeverity,
             callId: input.callId,
             runningHint: input.runningHint
           };
@@ -552,6 +577,7 @@ export function updateToolCallBlock(
   patch: {
     status?: "running" | "ok" | "error" | "denied";
     errorMessage?: string;
+    errorSeverity?: "info" | "error";
     runningHint?: string;
   }
 ): ChatBlock | null {
@@ -575,6 +601,7 @@ export function updateToolCallBlock(
   }
   if (patch.status !== undefined) payload.status = patch.status;
   if (patch.errorMessage !== undefined) payload.errorMessage = patch.errorMessage;
+  if (patch.errorSeverity !== undefined) payload.errorSeverity = patch.errorSeverity;
   // Clear the running hint when the tool leaves the running state — the
   // amber waiting-card is only meaningful while we're still waiting.
   if (patch.runningHint !== undefined) payload.runningHint = patch.runningHint;

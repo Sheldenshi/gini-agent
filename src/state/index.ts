@@ -102,8 +102,7 @@ export {
   listAllDevices,
   getDevice,
   removeDevice,
-  removeDeviceForCredential,
-  purgeTunnelDevices
+  removeDeviceForCredential
 } from "./devices";
 export type { PushDevice, UpsertDeviceInput, DeviceOrigin } from "./devices";
 export {

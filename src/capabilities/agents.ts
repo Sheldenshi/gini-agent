@@ -9,7 +9,8 @@ import {
   readState
 } from "../state";
 import { addAudit } from "../state/audit";
-import { scaffoldAgentSoulFile } from "../runtime/identity-files";
+import { now } from "../state/ids";
+import { renameSeededSoulName, seedAgentSoulFile } from "../runtime/identity-files";
 import { DEFAULT_AGENT_TOOLSETS } from "../state/defaults";
 
 export function listAgents(config: RuntimeConfig) {
@@ -18,7 +19,12 @@ export function listAgents(config: RuntimeConfig) {
 }
 
 export async function createAgent(config: RuntimeConfig, input: Record<string, unknown>) {
-  const name = String(input.name ?? "");
+  // The name is seeded into the agent's SOUL.md (`Your name is <name>.`)
+  // and surfaced in the runtime-identity block, so collapse every
+  // whitespace run (incl. embedded \n/\r/\t) to a single space and trim —
+  // this keeps the stored name a clean single-line label and rejects
+  // whitespace-only input.
+  const name = String(input.name ?? "").replace(/\s+/g, " ").trim();
   if (!name) throw new Error("Agent name is required.");
   const record = await mutateState(config.instance, (state) => {
     // Config (provider, toolsets, memory scopes, messaging targets) is
@@ -78,18 +84,72 @@ export async function createAgent(config: RuntimeConfig, input: Record<string, u
   // there's no copying of memories or hindsight units from the default
   // agent or any other agent.
   ensureAgentBank(config.instance, record.id);
-  // Scaffold the per-agent SOUL.md as a zero-byte placeholder so the
-  // user can fill it in without first having to create the directory.
-  // The load path treats an empty file as absent, so this does not
-  // change prompt behavior — it only surfaces the file on disk.
+  // Seed the per-agent SOUL.md with `Your name is <name>.` so the new
+  // agent self-identifies by its own name (INSTRUCTIONS.md is generic).
   // Order matters: state has already been persisted, so a crash here
   // can never leave a SOUL.md for a non-existent agent.
-  scaffoldAgentSoulFile(config.instance, record.id);
+  seedAgentSoulFile(config.instance, record.id, record.name);
   return record;
 }
 
 export async function useAgent(config: RuntimeConfig, idOrName: string) {
   return mutateState(config.instance, (state) => activateAgent(state, idOrName));
+}
+
+// Rename an agent. `AgentRecord.name` is the authoritative label (drives
+// the switcher, list, `use_agent <name>`, and the `- agent:` identity
+// block). The folder + Hindsight bank are keyed by the stable opaque id,
+// so a rename never moves them. After the state write we best-effort sync
+// the agent's seeded SOUL.md name line — but only when the SOUL is exactly
+// the untouched seed (`renameSeededSoulName`); a customized persona is left
+// to the model/user.
+export async function renameAgent(
+  config: RuntimeConfig,
+  idOrName: string,
+  rawName: string
+) {
+  // Collapse every whitespace run to a single space and trim — same
+  // hygiene as `createAgent`, so the stored name stays a clean single-line
+  // label and a whitespace-only rename is rejected.
+  const newName = String(rawName ?? "").replace(/\s+/g, " ").trim();
+  if (!newName) throw new Error("New agent name is required.");
+  // "default" is the sentinel the `renameDefaultAgentToGini` migration keys
+  // on: it flips an `agent_default` row named "default" back to "Gini" on the
+  // next state read, which would drift the AgentRecord name away from a SOUL
+  // that says "default". Reject it outright rather than let the rename silently
+  // un-stick.
+  if (newName === "default") throw new Error('"default" is a reserved name.');
+  // Resolve id-first, then fall back to name, so an agent whose NAME happens
+  // to equal another agent's id can't shadow the intended target.
+  const found = readState(config.instance).agents;
+  const target = found.find((a) => a.id === idOrName) ?? found.find((a) => a.name === idOrName);
+  if (!target) throw new Error(`Agent not found: ${idOrName}`);
+  // No-op a rename to the current name: skip the state write, audit, and SOUL
+  // sync so an identity rename doesn't bump updatedAt or log a from===to event.
+  if (target.name === newName) return target;
+  const result = await mutateState(config.instance, (state) => {
+    const agent = state.agents.find((a) => a.id === target.id);
+    if (!agent) throw new Error(`Agent not found: ${idOrName}`);
+    const oldName = agent.name;
+    agent.name = newName;
+    agent.updatedAt = now();
+    addAudit(
+      state,
+      {
+        actor: "user",
+        action: "agent.renamed",
+        target: agent.id,
+        risk: "low",
+        evidence: { from: oldName, to: newName, agentId: agent.id }
+      },
+      { agentId: agent.id }
+    );
+    return { record: agent, oldName };
+  });
+  // Keep the seeded SOUL.md name line in sync outside the state write.
+  // Best-effort: never clobbers a customized SOUL (see renameSeededSoulName).
+  renameSeededSoulName(config.instance, result.record.id, result.oldName, newName);
+  return result.record;
 }
 
 // Hard-deletes an agent and cascades cleanup across its memory pools.

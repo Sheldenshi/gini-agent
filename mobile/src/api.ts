@@ -5,7 +5,6 @@ import {
   readCachedCredentials,
   type AuthCredentials
 } from "./auth";
-import { inferTunnelTransport } from "./transport";
 
 // Defense-in-depth runtime gate against credentials persisted by an
 // older build that didn't enforce the local-only http allowlist (or
@@ -126,7 +125,7 @@ export interface UploadRef {
 // FormDataPart implementation"). FileSystem.uploadAsync streams the
 // file from disk through native URLSession, sidestepping the polyfill
 // and avoiding loading the bytes into JS memory at all.
-export async function uploadImage(file: {
+async function uploadFile(file: {
   uri: string;
   name: string;
   mimeType: string;
@@ -152,6 +151,25 @@ export async function uploadImage(file: {
     throw new ApiError(response.status, message);
   }
   return value as UploadRef;
+}
+
+export function uploadImage(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  return uploadFile(file);
+}
+
+// Voice-message upload. The gateway's /api/uploads gate accepts audio/*
+// alongside image/*; the recorder hands us a 16 kHz mono WAV with an
+// explicit `audio/wav` mimeType so it passes the prefix check.
+export function uploadAudio(file: {
+  uri: string;
+  name: string;
+  mimeType: string;
+}): Promise<UploadRef> {
+  return uploadFile(file);
 }
 
 // Absolute URL for a stored upload. The gateway serves the bytes with
@@ -236,22 +254,6 @@ export function resolveStreamEndpoint(path: string): {
       ...resolveDeviceTokenHeader()
     }
   };
-}
-
-/** True when the cached gateway base URL points at a Cloudflare quick
- *  tunnel hostname (`*.trycloudflare.com`, case-insensitive). Quick
- *  tunnels drop `text/event-stream` at the edge, so chat streaming has
- *  to fall back to long-polling — `react-native-sse` would otherwise
- *  open an XHR that never receives frames. Returns false on missing /
- *  malformed credentials so the SSE path (which handles its own 401)
- *  stays the default.
- *
- *  Delegates host classification to the shared `inferTunnelTransport`
- *  helper so the mobile, web, and runtime copies stay in lockstep —
- *  parity is pinned in src/runtime/tunnel/transport.parity.test.ts. */
-export function gatewayUsesQuickTunnel(): boolean {
-  const creds = readCachedCredentials();
-  return inferTunnelTransport(creds?.baseUrl ?? null) === "poll";
 }
 
 // Pull the cached APNs token from push.ts on every call. We avoid a

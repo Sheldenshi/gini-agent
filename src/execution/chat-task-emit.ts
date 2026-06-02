@@ -264,12 +264,14 @@ export function emitToolCallStatus(
     callId: string;
     status: ToolCallStatus;
     errorMessage?: string;
+    errorSeverity?: "info" | "error";
   }
 ): ChatBlock | undefined {
   if (!ctx) return undefined;
   const updated = updateToolCallBlock(ctx.instance, params.callId, ctx.sessionId, {
     status: params.status,
-    errorMessage: params.errorMessage
+    errorMessage: params.errorMessage,
+    errorSeverity: params.errorSeverity
   });
   return updated ?? undefined;
 }

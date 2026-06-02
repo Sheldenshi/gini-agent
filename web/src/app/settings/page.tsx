@@ -11,7 +11,6 @@ import { McpCard, type McpRow } from "./_components/McpCard";
 import { MessagingCard, type MessagingRow } from "./_components/MessagingCard";
 import { DevicesCard, type DeviceRow } from "./_components/DevicesCard";
 import { BrowserSettingsCard } from "./_components/BrowserSettingsCard";
-import { TunnelCard } from "./_components/TunnelCard";
 import { CacheWarmerCard } from "./_components/CacheWarmerCard";
 
 export default function SettingsPage() {
@@ -99,8 +98,6 @@ export default function SettingsPage() {
           activeProviderName={activeProviderName}
           activeProviderModel={activeProviderModel}
         />
-
-        <TunnelCard />
 
         <CacheWarmerCard />
 

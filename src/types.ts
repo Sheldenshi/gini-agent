@@ -1,5 +1,3 @@
-import type { TunnelPersistedConfig } from "./runtime/tunnel/types";
-
 // `default` is the production end-user install (set by ~/.local/bin/gini).
 // Anything else is a developer worktree (auto-derived from the repo dir
 // basename) or a named test/smoke instance.
@@ -186,14 +184,6 @@ export interface RuntimeConfig {
   workspaceRoot: string;
   stateRoot: string;
   logRoot: string;
-  // On-disk tunnel block, kept in sync by TunnelManager so the four
-  // whole-config writers (`updateAutoApproveSettings`,
-  // `setSetupProvider`, the boot-time approval-mode migration, …) don't
-  // silently clobber an enable / disable / rotate-secret transition
-  // when they serialize the in-memory config back to disk. The manager
-  // mutates this field after every `patchTunnelConfig` call. Optional
-  // because legacy `config.json` files predate the field.
-  tunnel?: TunnelPersistedConfig;
   // User-curated allowlist of shell-glob patterns that bypass the approval
   // gate for terminal_exec. Patterns match the full command string (e.g.
   // `memo *` matches any command starting with "memo "). Auto-approved
@@ -293,10 +283,24 @@ export interface ImageAttachment {
   size: number;
 }
 
+// Voice recording attached to a user message. Render-only: audio NEVER goes
+// to the model/provider — it is transcribed to text at submit time and only
+// the transcript reaches the agent. The bytes live on disk like images
+// (upload id is the canonical reference; clients fetch via GET
+// /api/uploads/:id for playback). `durationMs` is the client-measured clip
+// length so the bubble can render m:ss without decoding the file.
+export interface AudioAttachment {
+  id: string;
+  mimeType: string;
+  size: number;
+  durationMs?: number;
+}
+
 export interface UserTextBlock extends ChatBlockBase {
   kind: "user_text";
   text: string;
   images?: ImageAttachment[];
+  audio?: AudioAttachment;
 }
 
 export interface AssistantTextBlock extends ChatBlockBase {
@@ -327,6 +331,11 @@ export interface ToolCallBlock extends ChatBlockBase {
   argsFull: Record<string, unknown>;
   status: ToolCallStatus;
   errorMessage?: string;
+  // How the client should style `errorMessage`. "error" (default) renders
+  // red; "info" renders muted/gray for a calm needs-setup notice (e.g.
+  // web_search with no provider connected) where the verbose steering goes
+  // to the model only and the user sees a short neutral line.
+  errorSeverity?: "info" | "error";
   // Provider-issued tool call id. Used by `tool_result` blocks to
   // associate result with call, and by resume paths to flip the
   // matching running block to `ok`/`error` after the approval lands.
@@ -789,6 +798,10 @@ export interface ChatMessageRecord {
   // ~/.gini/instances/<inst>/uploads/. Mirrored on the user_text ChatBlock so
   // either persistence path can drive transcript rendering.
   images?: ImageAttachment[];
+  // User-role messages may carry a voice recording. Render-only — the audio
+  // is transcribed into `content` at submit time and never sent to the
+  // provider. Mirrored on the user_text ChatBlock for playback rendering.
+  audio?: AudioAttachment;
   // Optional tag used to distinguish multiple assistant messages emitted by
   // the same task. Today only "approval_reason" is set — when an approval
   // (e.g. connector.request) is created, the runtime persists its `reason`

@@ -82,9 +82,16 @@ remote previews, screen readers) would need the same translation code.
   Each block carries `id`, `sessionId`, `instance`, `ordinal`,
   `createdAt`, optional `taskId`/`runId`, plus the kind-specific
   fields. `AssistantTextBlock` also carries `updatedAt` and a
-  `streaming` flag; `ToolCallBlock` carries `updatedAt` and a `status`
-  in `{ running, ok, error, denied }`, and an optional `runningHint`
-  string. The hint is advisory context a tool emits while parked in
+  `streaming` flag; `ToolCallBlock` carries `updatedAt`, a `status`
+  in `{ running, ok, error, denied }`, an optional `errorSeverity`
+  in `{ info, error }`, and an optional `runningHint` string.
+  `errorSeverity` lets a failed call render as a muted "needs setup"
+  notice instead of a red error — e.g. `web_search` with no connector
+  keeps the verbose steering as the model-facing tool result and shows
+  the user a short `"info"` line; the runtime derives it from a
+  `ToolDisplayError` thrown by the tool and clients default to
+  `"error"` when it is absent (see ADR web-search-connectors.md).
+  `runningHint` is advisory context a tool emits while parked in
   `running` to explain why it's waiting and what (if anything) the
   user can do to unblock it; clients MAY render a hint-bearing row
   more prominently than a bare running row. It's reserved for tools
@@ -127,7 +134,12 @@ remote previews, screen readers) would need the same translation code.
     `action`:
     - `connector.request` — render the Connect dialog. Submit posts
       `{ secrets, scopes, name }` to
-      `/api/setup-requests/<id>/complete`.
+      `/api/setup-requests/<id>/complete`. The model's reason is emitted
+      as its own `assistant_text` bubble above this card (so the card
+      itself stays minimal), and `/complete` resumes the paused run in
+      the background so the dialog closes immediately rather than
+      blocking on the resumed agent stream (see ADR
+      web-search-connectors.md).
     - `browser.fill_secret` — render an inline form with one input
       per slot in `setupRequest.payload.slots`. Submit posts
       `{ secrets: { <slot.name>: <value>, ... } }` to
@@ -220,7 +232,12 @@ remote previews, screen readers) would need the same translation code.
 
 - **Write paths:**
   - `submitChatMessage` inserts the `user_text` block alongside the
-    legacy ChatMessageRecord.
+    legacy ChatMessageRecord. The block carries optional `images` and
+    `audio` upload refs (`{ id, mimeType, size }`); clients fetch the
+    bytes via `GET /api/uploads/:id`. A voice message's `audio` is
+    render-only — it is transcribed on the gateway and only the
+    transcript becomes the block text and model input (see
+    [voice-messages-and-local-stt.md](voice-messages-and-local-stt.md)).
   - `runChatTask` emits `phase("Thinking")` before each model call,
     `assistant_text` on streaming deltas (full text on every frame),
     `phase("Working: <tool>")` + `tool_call(running)` before each

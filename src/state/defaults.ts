@@ -81,6 +81,17 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       updatedAt: at
     },
     {
+      id: "toolset_web_search",
+      instance,
+      name: "web_search",
+      description: "Public web search via configured Brave Search or Exa connectors.",
+      status: "enabled",
+      toolNames: ["web.search"],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
       id: "toolset_browser",
       instance,
       name: "browser",
@@ -152,7 +163,8 @@ export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "delegation",
   "messaging",
   "mcp",
-  "browser"
+  "browser",
+  "web_search"
 ];
 
 export function defaultAgent(instance: Instance, at: string): AgentRecord {
@@ -166,7 +178,7 @@ export function defaultAgent(instance: Instance, at: string): AgentRecord {
   return {
     id: "agent_default",
     instance,
-    name: "default",
+    name: "Gini",
     status: "active",
     providerName: undefined,
     model: undefined,

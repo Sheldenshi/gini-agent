@@ -124,7 +124,6 @@ Usage:
   bun run gini evidence
   bun run gini smoke
   bun run gini identity show|history|rollback
-  bun run gini tunnel status|qr|enable|disable|rotate-secret|sync-notes|apple-notes <on|off>
 
 Process lifecycle:
   gini start      - daemon mode; instance keeps running after the terminal

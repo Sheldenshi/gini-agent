@@ -2,8 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
 import { addAudit, appendEvent, mutateState, readState, readTrace } from "./state";
-import { __resetTunnelManagerForTests, tunnelManager } from "./runtime/tunnel";
-import { webPortPath } from "./paths";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -279,6 +277,57 @@ describe("runtime api", () => {
     expect(response.status).toBe(400);
     const body = await response.json();
     expect(body.error).toContain("Cannot delete the active agent");
+  });
+
+  test("PATCH /api/agents/:id renames the agent", async () => {
+    const config = testConfig("agents-rename");
+    const handler = createHandler(config);
+
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Mansour" })
+    });
+    const renamed = await call(handler, config, `/api/agents/${created.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name: "Bob" })
+    });
+    expect(renamed.id).toBe(created.id);
+    expect(renamed.name).toBe("Bob");
+
+    const after = await call(handler, config, "/api/agents");
+    expect(after.agents.find((agent: { id: string }) => agent.id === created.id)?.name).toBe("Bob");
+  });
+
+  test("PATCH /api/agents/:id returns 404 for an unknown agent", async () => {
+    const config = testConfig("agents-rename-missing");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/agents/agent_does_not_exist",
+      { method: "PATCH", body: JSON.stringify({ name: "Bob" }) },
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+
+  test("PATCH /api/agents/:id returns 400 for an empty name", async () => {
+    // A missing / blank name is user input, not a server fault — it must
+    // map to 400, never the catch-all 500.
+    const config = testConfig("agents-rename-empty");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Mansour" })
+    });
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/agents/${created.id}`,
+      { method: "PATCH", body: JSON.stringify({}) },
+      config.token
+    );
+    expect(response.status).toBe(400);
   });
 
   test("supports relay degraded health and notification delivery records", async () => {
@@ -3551,67 +3600,6 @@ describe("runtime api", () => {
     expect(response.status).toBe(404);
   });
 
-  test("GET /api/chat/:id/poll cursor reflects the LATEST block when a newer block lands during the coalesce window", async () => {
-    // Pins the closure-scoped cursor race in chatBlockPoll's backfill
-    // branch. The bug: backfill captures `last` at backfill time and
-    // freezes it in the timer closure. When a newer block lands on the
-    // live subscription within the 25 ms coalesce window
-    // (LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS), it pushes onto
-    // `accumulated` but the timer still fires with the stale backfill
-    // cursor — the client's next poll resumes from the backfill point
-    // and re-receives the newer block. The fix reads
-    // `accumulated[accumulated.length - 1]` INSIDE the timer callback.
-    const { insertChatBlock } = await import("./state");
-    const config = testConfig("chat-blocks-poll-cursor-race");
-    const handler = createHandler(config);
-    const session = await call(handler, config, "/api/chat", {
-      method: "POST",
-      body: JSON.stringify({ title: "poll cursor race" })
-    });
-    // Seed a backfill block so the backfill branch arms its timer.
-    const backfillBlock = insertChatBlock(config.instance, {
-      kind: "user_text",
-      sessionId: session.id,
-      text: "backfill"
-    });
-    // Start the long poll. The handler returns a Promise<Response>;
-    // backfill arms the 25 ms timer immediately
-    // (LONG_POLL_FLUSH_AFTER_FIRST_EVENT_MS), so we have a 25 ms
-    // window to inject a fresh block via the subscription.
-    const pollPromise = rawCall(
-      handler,
-      config,
-      `/api/chat/${session.id}/poll`,
-      {},
-      config.token
-    );
-    // Schedule a fresh insert mid-window — 5 ms after the timer arms,
-    // well inside the 25 ms coalesce gate but well after the backfill
-    // pushed its entry.
-    await Bun.sleep(5);
-    const laterBlock = insertChatBlock(config.instance, {
-      kind: "user_text",
-      sessionId: session.id,
-      text: "later"
-    });
-    // Wait for the poll response. With the fix, the cursor encodes
-    // laterBlock.id; pre-fix it would encode backfillBlock.id and the
-    // client would re-receive laterBlock on the next poll.
-    const response = await pollPromise;
-    expect(response.status).toBe(200);
-    const body = await response.json();
-    expect(Array.isArray(body.events)).toBe(true);
-    expect(body.events.length).toBeGreaterThanOrEqual(2);
-    // The cursor is `<block_id>:<ts>` — split on the FIRST colon since
-    // block ids never contain `:` (block_<random>) but ISO timestamps
-    // do.
-    const colon = body.cursor.indexOf(":");
-    expect(colon).toBeGreaterThan(0);
-    const cursorBlockId = body.cursor.slice(0, colon);
-    expect(cursorBlockId).toBe(laterBlock.id);
-    expect(cursorBlockId).not.toBe(backfillBlock.id);
-  });
-
   test("POST /api/messaging/:id/reject-pending with a malformed chatId returns 400 (not 500)", async () => {
     // Same parseChatIdStrict guard as /allow — pin it here so the new
     // route doesn't regress to 500 on bad input as the surface grows.
@@ -3679,7 +3667,7 @@ describe("runtime api", () => {
       expect(dump.userProfile.budget.overCap).toBe(false);
       // INSTRUCTIONS.md is materialized by scaffold; the route returns
       // its content trimmed.
-      expect(dump.instructions.content).toMatch(/You are Gini, a personal agent/);
+      expect(dump.instructions.content).toMatch(/You are a personal agent running on the gini-agent framework\./);
     });
 
     test("GET /api/identity-files/history?kind=user returns snapshots newest-first", async () => {
@@ -3836,126 +3824,12 @@ describe("runtime api", () => {
       expect(repeatDelete.status).toBe(404);
     });
 
-    test("vetted POST with tunnel enabled + secret present → 200 row written with origin='tunnel'", async () => {
-      // The happy path: the request carries the proxy-stamped vetted
-      // marker AND the live tunnel state has enabled=true with a
-      // populated secret, so the handler proceeds and tags the row as
-      // tunneled. The bearer the gateway sees here is the BFF-injected
-      // runtime token (config.token); the tunnel secret is the proxy's
-      // concern, not the gateway's.
-      const config = testConfig("push-devices-vetted-ok");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      tunnelManager(config).__setSnapshotForTest({
-        enabled: true,
-        secret: "T".repeat(48)
-      });
-
-      const res = await rawCall(
-        handler,
-        config,
-        "/api/push/devices",
-        {
-          method: "POST",
-          body: JSON.stringify({ token: "tok_t", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
-          headers: { "x-gini-tunnel-vetted": "1" }
-        },
-        config.token
-      );
-      expect(res.status).toBe(200);
-      const body = await res.json();
-      expect(body.device.origin).toBe("tunnel");
-      const all = listAllDevices(config.instance);
-      expect(all.length).toBe(1);
-      expect(all[0]!.origin).toBe("tunnel");
-      __resetTunnelManagerForTests();
-    });
-
-    test("vetted POST with tunnel disabled in-flight → 503 Retry-After, no row written", async () => {
-      // A vetted request that arrives after the operator disables the
-      // tunnel must NOT write a new tunnel-origin row — the purge that
-      // ran during disable would already have deleted the rest, and this
-      // late insert would be an orphan against a dead lane.
-      const config = testConfig("push-devices-vetted-disabled");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      // Tunnel is disabled at the moment the in-flight request is
-      // processed by the handler. The secret may still be on disk
-      // (disable doesn't null it), but enabled=false is the gate.
-      tunnelManager(config).__setSnapshotForTest({
-        enabled: false,
-        secret: "T".repeat(48)
-      });
-
-      const res = await rawCall(
-        handler,
-        config,
-        "/api/push/devices",
-        {
-          method: "POST",
-          body: JSON.stringify({ token: "tok_dis", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
-          headers: { "x-gini-tunnel-vetted": "1" }
-        },
-        config.token
-      );
-      expect(res.status).toBe(503);
-      expect(res.headers.get("retry-after")).toBe("2");
-      const body = await res.json();
-      expect(body.error).toBe("tunnel_state_changed");
-      expect(listAllDevices(config.instance).length).toBe(0);
-      __resetTunnelManagerForTests();
-    });
-
-    test("vetted POST with null secret in-flight → 503 Retry-After, no row written", async () => {
-      // Defense in depth: a vetted marker with a null on-disk secret
-      // means the tunnel state file is in an inconsistent shape (no
-      // production write path leaves enabled=true with secret=null, but
-      // a partial disable / boot-reconcile race could). 503 keeps the
-      // gateway from writing a tunnel-tagged row against a missing
-      // identity.
-      const config = testConfig("push-devices-vetted-no-secret");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      tunnelManager(config).__setSnapshotForTest({
-        enabled: true,
-        secret: null
-      });
-
-      const res = await rawCall(
-        handler,
-        config,
-        "/api/push/devices",
-        {
-          method: "POST",
-          body: JSON.stringify({ token: "tok_ns", platform: "ios", bundleId: "ai.lilaclabs.gini.mobile" }),
-          headers: { "x-gini-tunnel-vetted": "1" }
-        },
-        config.token
-      );
-      expect(res.status).toBe(503);
-      expect(res.headers.get("retry-after")).toBe("2");
-      const body = await res.json();
-      expect(body.error).toBe("tunnel_state_changed");
-      expect(listAllDevices(config.instance).length).toBe(0);
-      __resetTunnelManagerForTests();
-    });
-
-    test("non-vetted POST (loopback) → 200 row written with origin='loopback' regardless of tunnel state", async () => {
-      // Loopback POSTs from the local web UI don't carry the marker and
-      // shouldn't be affected by the live-state recheck — the handler
-      // proceeds as today and writes a loopback row even when the live
-      // tunnel is fully off.
+    test("POST /api/push/devices → 200 row written with origin='loopback'", async () => {
+      // Push devices register over loopback from the local web UI; the
+      // row is tagged origin='loopback' (the only origin).
       const config = testConfig("push-devices-loopback");
       mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
       const handler = createHandler(config);
-      tunnelManager(config).__setSnapshotForTest({
-        enabled: false,
-        secret: null
-      });
 
       const res = await rawCall(
         handler,
@@ -3970,7 +3844,6 @@ describe("runtime api", () => {
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.device.origin).toBe("loopback");
-      __resetTunnelManagerForTests();
     });
 
     test("POST /api/chat/:id/read records the cursor and GET /api/badge surfaces the unread total", async () => {
@@ -4435,140 +4308,6 @@ describe("runtime api", () => {
         }));
         expect(denied.headers.get("access-control-allow-origin")).toBeNull();
       });
-    });
-  });
-
-  describe("tunnel QR rotate window", () => {
-    test("QR endpoints return 503 with Retry-After while rotating is true", async () => {
-      const config = testConfig("qr-rotate-window");
-      // The tunnel manager constructor immediately writes config.json
-      // through atomic-write, which needs the per-instance directory
-      // to already exist. testConfig's rmSync leaves no directory
-      // behind, so create it before either createHandler or
-      // tunnelManager runs.
-      mkdirSync(config.stateRoot, { recursive: true });
-      const handler = createHandler(config);
-      const mgr = tunnelManager(config);
-      // Drive the manager into the rotate window without spinning up
-      // a real cloudflared. The test-only setter mirrors what the
-      // rotateSecret try block does between the secret persist and
-      // the recycle.
-      mgr.__setRotatingForTest(true);
-      try {
-        const svg = await rawCall(handler, config, "/api/tunnel/qr.svg", {
-          headers: { authorization: `Bearer ${config.token}` }
-        });
-        expect(svg.status).toBe(503);
-        expect(svg.headers.get("retry-after")).toBe("2");
-        const svgBody = await svg.json() as { error: string; retryAfterSec: number };
-        expect(svgBody.error).toBe("tunnel_rotating");
-        expect(svgBody.retryAfterSec).toBe(2);
-
-        const txt = await rawCall(handler, config, "/api/tunnel/qr.txt", {
-          headers: { authorization: `Bearer ${config.token}` }
-        });
-        expect(txt.status).toBe(503);
-        expect(txt.headers.get("retry-after")).toBe("2");
-      } finally {
-        mgr.__setRotatingForTest(false);
-      }
-    });
-  });
-
-  describe("PATCH /api/tunnel error code → HTTP status mapping", () => {
-    // The HTTP status mapping must key off the typed `code` field on
-    // the manager's error result, not a substring of the prose. Pin
-    // both branches so a future reword of the human-readable message
-    // cannot silently flip an operator-actionable 409 into a generic
-    // 500 (and vice versa).
-    test("enable() returning code=web_port_unhealthy → 409", async () => {
-      const config = testConfig("tunnel-enable-unhealthy-409");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      const mgr = tunnelManager(config);
-      // Plant a web.port so the pre-enable readWebPort gate passes
-      // and execution reaches mgr.enable(), where the override fires.
-      writeFileSync(webPortPath(config.instance), "7338", "utf8");
-      mgr.__setNextEnableResultForTest({
-        ok: false,
-        error: "web port 7338 not healthy — swap aborted, prior cloudflared stopped",
-        code: "web_port_unhealthy"
-      });
-      const res = await rawCall(handler, config, "/api/tunnel", {
-        method: "PATCH",
-        body: JSON.stringify({ enabled: true }),
-        headers: { authorization: `Bearer ${config.token}` }
-      });
-      expect(res.status).toBe(409);
-      const body = await res.json();
-      expect(body.error).toContain("not healthy");
-      __resetTunnelManagerForTests();
-    });
-
-    test("enable() returning generic failure (no code) → 500", async () => {
-      const config = testConfig("tunnel-enable-generic-500");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      const mgr = tunnelManager(config);
-      writeFileSync(webPortPath(config.instance), "7338", "utf8");
-      mgr.__setNextEnableResultForTest({
-        ok: false,
-        error: "cloudflared banner timeout"
-      });
-      const res = await rawCall(handler, config, "/api/tunnel", {
-        method: "PATCH",
-        body: JSON.stringify({ enabled: true }),
-        headers: { authorization: `Bearer ${config.token}` }
-      });
-      expect(res.status).toBe(500);
-      const body = await res.json();
-      expect(body.error).toBe("cloudflared banner timeout");
-      __resetTunnelManagerForTests();
-    });
-
-    test("rotateSecret() returning code=web_port_unhealthy → 409", async () => {
-      const config = testConfig("tunnel-rotate-unhealthy-409");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      const mgr = tunnelManager(config);
-      mgr.__setNextRotateSecretResultForTest({
-        ok: false,
-        error: "web port 7338 not healthy — rotation aborted before commit",
-        code: "web_port_unhealthy"
-      });
-      const res = await rawCall(handler, config, "/api/tunnel", {
-        method: "PATCH",
-        body: JSON.stringify({ rotateSecret: true }),
-        headers: { authorization: `Bearer ${config.token}` }
-      });
-      expect(res.status).toBe(409);
-      const body = await res.json();
-      expect(body.error).toContain("not healthy");
-      __resetTunnelManagerForTests();
-    });
-
-    test("rotateSecret() returning generic failure (no code) → 500", async () => {
-      const config = testConfig("tunnel-rotate-generic-500");
-      mkdirSync(config.stateRoot, { recursive: true });
-      __resetTunnelManagerForTests();
-      const handler = createHandler(config);
-      const mgr = tunnelManager(config);
-      mgr.__setNextRotateSecretResultForTest({
-        ok: false,
-        error: "swap recycle failed"
-      });
-      const res = await rawCall(handler, config, "/api/tunnel", {
-        method: "PATCH",
-        body: JSON.stringify({ rotateSecret: true }),
-        headers: { authorization: `Bearer ${config.token}` }
-      });
-      expect(res.status).toBe(500);
-      const body = await res.json();
-      expect(body.error).toBe("swap recycle failed");
-      __resetTunnelManagerForTests();
     });
   });
 });

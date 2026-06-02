@@ -31,7 +31,6 @@ import {
   registerApprovalCategoryAsync
 } from "@/src/push";
 import { family, theme } from "@/src/theme";
-import { useDeepLinkAuth } from "@/src/use-deep-link-auth";
 
 // Single shared client across the tree so navigating between screens
 // keeps caches warm. Built once per app lifetime — Expo Router never
@@ -124,7 +123,6 @@ export default function RootLayout() {
       <SafeAreaProvider>
         <QueryClientProvider client={queryClient}>
           <AuthCacheGuard />
-          <DeepLinkAuthBridge />
           {/* Light theme — status bar text needs to be dark so it reads
               against the white header chrome. */}
           <StatusBar style="dark" />
@@ -159,14 +157,6 @@ export default function RootLayout() {
 // so this single effect keeps stale data from leaking across
 // credential boundaries without baking baseUrl/token into every query
 // key.
-// Mounts `useDeepLinkAuth` so the `gini://connect?api=...&token=...`
-// flow has somewhere to consume the launch URL. Kept as its own zero-
-// render component so the hook lives inside the QueryClientProvider /
-// SafeAreaProvider tree without bloating the top-level layout.
-function DeepLinkAuthBridge() {
-  useDeepLinkAuth();
-  return null;
-}
 
 function AuthCacheGuard() {
   const { credentials } = useAuth();

@@ -1,14 +1,7 @@
-// Shared path canonicalization used by the Next.js proxy (web/src/proxy.ts)
-// and the BFF guard (web/src/app/api/runtime/[...path]/route.ts). Tests pin
-// both invocation sites. See docs/adr/tunnel-and-mobile-access.md
-// "Architecture (summary)".
-//
-// IMPORTANT: this file is paired with src/runtime/tunnel/canonicalize.ts on
-// the runtime side. The duplication is deliberate — Next.js refuses to bundle
-// modules from outside its project root, so we keep a sibling copy here. The
-// two implementations are kept *behaviorally* equivalent — the parity test at
-// src/runtime/tunnel/canonicalize.parity.test.ts pins identical output on a
-// shared input corpus. Comments may drift between the two; behavior may not.
+// Path canonicalization used by the BFF proxy route
+// (web/src/app/api/runtime/[...path]/route.ts) to normalize a request path
+// before forwarding it to the gateway — rejecting traversal, duplicate
+// slashes, embedded delimiters, and over-long input.
 
 export interface CanonicalizeResult {
   ok: true;
@@ -16,9 +9,9 @@ export interface CanonicalizeResult {
    *  had one; collapses multiple trailing slashes to one. Bare "/" stays as
    *  "/". */
   path: string;
-  /** True when the canonical path ends in a single trailing slash. The deny
-   *  list treats `/foo` and `/foo/` as equivalent; this flag lets callers
-   *  forward the form the client actually sent without recomputing it. */
+  /** True when the canonical path ends in a single trailing slash, so a
+   *  consumer can preserve the exact form the client sent rather than
+   *  recomputing it. */
   hadTrailingSlash: boolean;
 }
 
