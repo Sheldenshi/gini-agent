@@ -43,7 +43,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
 - Persistent chat, runs, tasks, approvals, traces, audit events, jobs, memories, and skills
 - Approval-gated file, terminal, and code tools
 - Provider support: Codex OAuth, OpenAI API key, OpenRouter, and any OpenAI-compatible local server
-- Local embeddings and reranking by default
+- Local embeddings, reranking, and voice-message speech-to-text by default
 - Parallel instances with isolated state, ports, and logs
 
 See the [Whitepaper](docs/whitepaper.md) and [Architecture Overview](docs/architecture-overview.md) for the design.
@@ -158,7 +158,7 @@ gini import apply openclaw   # import the openclaw state into gini
 
 ```text
 ~/.gini/instances/<instance>/   # config, state.json, memory.db, traces, snapshots, workspace, logs
-~/.gini/models/                 # shared embedding/reranker model cache
+~/.gini/models/                 # shared embedding/reranker/speech-to-text model cache
 ```
 
 Use `gini uninstall` to remove an instance or the whole install. See [Operations](docs/operations.md) for diagnostics and cleanup.

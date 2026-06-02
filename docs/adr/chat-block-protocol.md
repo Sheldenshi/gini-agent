@@ -215,7 +215,12 @@ remote previews, screen readers) would need the same translation code.
 
 - **Write paths:**
   - `submitChatMessage` inserts the `user_text` block alongside the
-    legacy ChatMessageRecord.
+    legacy ChatMessageRecord. The block carries optional `images` and
+    `audio` upload refs (`{ id, mimeType, size }`); clients fetch the
+    bytes via `GET /api/uploads/:id`. A voice message's `audio` is
+    render-only — it is transcribed on the gateway and only the
+    transcript becomes the block text and model input (see
+    [voice-messages-and-local-stt.md](voice-messages-and-local-stt.md)).
   - `runChatTask` emits `phase("Thinking")` before each model call,
     `assistant_text` on streaming deltas (full text on every frame),
     `phase("Working: <tool>")` + `tool_call(running)` before each
