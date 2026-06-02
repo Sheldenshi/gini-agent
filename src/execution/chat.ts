@@ -261,6 +261,12 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   let content = String(input.content ?? "").trim();
   const images = parseImageAttachments(config.instance, input.images);
   const audio = parseAudioAttachment(config.instance, input.audio);
+  // Validate the session before transcribing — STT (and, on the first voice
+  // message, the one-time model download) is expensive, so a stale or deleted
+  // sessionId must fail fast here rather than after the work is done.
+  const state = readState(config.instance);
+  const session = state.chatSessions.find((item) => item.id === sessionId);
+  if (!session) throw new Error(`Chat session not found: ${sessionId}`);
   // A voice message arrives with empty content — transcribe the recording so
   // the transcript becomes the message content. The audio itself never
   // reaches the provider; only this transcript does. A transcription failure
@@ -286,9 +292,6 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       audio ? "No speech detected in the voice message." : "Chat message content is required."
     );
   }
-  const state = readState(config.instance);
-  const session = state.chatSessions.find((item) => item.id === sessionId);
-  if (!session) throw new Error(`Chat session not found: ${sessionId}`);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
