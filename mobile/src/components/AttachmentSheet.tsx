@@ -91,9 +91,17 @@ export function AttachmentSheet({
   // started — including the deferred entrance kicked off from `onLayout`.
   // The effect cleanup stops it on unmount or when `visible` changes.
   const animRef = useRef<Animated.CompositeAnimation | null>(null);
+  // The selected source's action, deferred until the sheet unmounts. Firing
+  // it while the Modal is still presented/dismissing is the iOS "present
+  // while dismissing" hazard (the picker presents a native VC); we run it
+  // only after the Modal is gone.
+  const pendingActionRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     if (visible) {
+      // A fresh open invalidates any action stored on a prior close that was
+      // never consumed, so it can't fire when this open later dismisses.
+      pendingActionRef.current = null;
       // Mount first and park the sheet fully off-screen with the backdrop
       // transparent, so nothing flashes at the rest position before measuring.
       setMounted(true);
@@ -142,6 +150,17 @@ export function AttachmentSheet({
     };
   }, [visible, translateY, opacity]);
 
+  // Once the sheet has fully unmounted (Modal gone), run the selected
+  // source's action — so the picker's native view controller presents
+  // cleanly instead of while the Modal is still dismissing.
+  useEffect(() => {
+    if (!mounted && pendingActionRef.current) {
+      const action = pendingActionRef.current;
+      pendingActionRef.current = null;
+      action();
+    }
+  }, [mounted]);
+
   if (!mounted) return null;
 
   return (
@@ -188,6 +207,7 @@ export function AttachmentSheet({
             <Pressable
               onPress={onClose}
               style={styles.closeButton}
+              hitSlop={8}
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
@@ -201,8 +221,8 @@ export function AttachmentSheet({
               <Pressable
                 key={source.key}
                 onPress={() => {
+                  pendingActionRef.current = source.onPress;
                   onClose();
-                  source.onPress();
                 }}
                 style={({ pressed }) => [styles.tile, pressed && { opacity: 0.6 }]}
                 accessibilityRole="button"
