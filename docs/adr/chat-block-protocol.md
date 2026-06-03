@@ -235,11 +235,22 @@ remote previews, screen readers) would need the same translation code.
     legacy ChatMessageRecord. The block carries optional `images` and
     `audio` upload refs (`{ id, mimeType, size }`); clients fetch the
     bytes via `GET /api/uploads/:id`. The `images` field name is
-    retained for wire compatibility but now carries refs to any attached
-    file (PDF, CSV, logs), not only images — non-image files reach the
-    model by reference rather than inline (see
-    [chat-file-attachments.md](chat-file-attachments.md)). A voice
-    message's `audio` is
+    retained for wire compatibility but now carries refs to **any**
+    attached file (PDF, CSV, logs), not only images: the
+    `POST /api/uploads` gate accepts any plausible MIME (storage was
+    already generic), and the stored `mimeType`/`size` are authoritative
+    so a client-forged MIME can't steer how the bytes are delivered.
+    Images inline as `image_url` data URLs; **non-image files reach the
+    model by reference**, named in an `Attached files (in order):` text
+    marker (id, filename, mime, size) that the agent reads on demand via
+    the `attachments` skill's `materialize` script. We deliberately do
+    not add provider-native `document` content parts — that is
+    provider-specific, costs per-turn context, and duplicates
+    infrastructure the `attachments` skill already owns. The inline
+    `image_url` path and `vision_query` stay image-only. Served uploads
+    are returned `Content-Disposition: attachment` + `nosniff` so an
+    arbitrary-MIME upload can't execute as a same-origin document. A
+    voice message's `audio` is
     render-only — it is transcribed on the gateway and only the
     transcript becomes the block text and model input (see
     [voice-messages-and-local-stt.md](voice-messages-and-local-stt.md)).
