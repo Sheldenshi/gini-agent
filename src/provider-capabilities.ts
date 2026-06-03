@@ -63,11 +63,13 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
       // Confirmed text-only API — no image/file content part.
       return { vision: false, nativeDocs: false };
     case "codex":
-      // ChatGPT-backend /responses is an undocumented OAuth backend; its
-      // image/file support is UNKNOWN. Stay conservative (false) until
-      // verified against the live backend.
-      // TODO: verify codex image/file ingestion and enable if supported.
-      return { vision: false, nativeDocs: false };
+      // Verified empirically against the live ChatGPT-backend /responses
+      // surface (gpt-5.x): it accepts a native `input_file` document part
+      // (a PDF sent as a document part — no inlined text — was read back
+      // verbatim) and an `image_url`/`input_image` part (text in an image
+      // was read back). The backend is undocumented but is a single known
+      // surface serving gpt-5.x, so treat it as natively multimodal.
+      return { vision: true, nativeDocs: true };
     case "local":
       // Text-only unless a vision-capable model is loaded; nativeDocs
       // essentially never. UNKNOWN → conservative false.

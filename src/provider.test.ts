@@ -662,7 +662,7 @@ describe("provider", () => {
     }
   });
 
-  test("codex tool-calling strips a document part the responses backend can't ingest", async () => {
+  test("codex tool-calling serializes a document part as a responses input_file part", async () => {
     const { restore } = installCodexAuth("codex-doc-test");
     const originalFetch = globalThis.fetch;
 
@@ -701,12 +701,13 @@ describe("provider", () => {
       );
       expect(captured?.url.endsWith("/responses")).toBe(true);
       const sent = JSON.parse(String(captured!.init!.body));
-      // codex modality is nativeDocs:false, so the request-boundary strip drops
-      // the document part before serialization — no input_file reaches /responses.
-      expect(sent.input[0].content).toEqual([{ type: "input_text", text: "summarize this" }]);
-      const serialized = JSON.stringify(sent);
-      expect(serialized).not.toContain("input_file");
-      expect(serialized).not.toContain("QUJD");
+      // codex modality is nativeDocs:true (verified against the live backend),
+      // so the document survives the request-boundary strip and serializes as a
+      // responses `input_file` part alongside the text.
+      expect(sent.input[0].content).toEqual([
+        { type: "input_text", text: "summarize this" },
+        { type: "input_file", filename: "report.pdf", file_data: "data:application/pdf;base64,QUJD" }
+      ]);
     } finally {
       globalThis.fetch = originalFetch;
       restore();

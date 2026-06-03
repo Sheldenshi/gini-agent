@@ -65,9 +65,9 @@ describe("resolveProviderModality", () => {
       .toEqual({ vision: false, nativeDocs: false });
   });
 
-  test("codex is conservatively unknown → false", () => {
+  test("codex is natively multimodal (verified against the live backend)", () => {
     expect(resolveProviderModality(provider("codex", "gpt-5.5")))
-      .toEqual({ vision: false, nativeDocs: false });
+      .toEqual({ vision: true, nativeDocs: true });
   });
 
   test("local is conservatively unknown → false", () => {

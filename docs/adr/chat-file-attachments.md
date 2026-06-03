@@ -34,7 +34,7 @@ For each non-image attachment, on the turn it arrives (`buildAttachmentContent` 
 |---|---|---|---|
 | openai (gpt-4o/4.1/5.x/o-series) | yes | yes | Responses `input_file` / Chat-Completions `file`; gated on a known family — unknown model ids and custom OpenAI-compatible endpoints default false |
 | openrouter (anthropic/* , google/gemini* , openai/*) | yes | yes | unified `file` part; other routed models default false |
-| codex (ChatGPT backend) | UNKNOWN → false | UNKNOWN → false | undocumented OAuth backend; conservative until verified |
+| codex (ChatGPT backend) | yes | yes | undocumented OAuth `/responses` backend, but verified empirically (gpt-5.x): `input_file` PDF and `image_url` both read back verbatim |
 | deepseek (incl. V4) | no | no | API confirmed text-only |
 | local | no (unless a vision model is loaded) | no | OpenAI-compatible text by default |
 | echo | no | no | test provider |
