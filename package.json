@@ -28,7 +28,10 @@
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "croner": "^10.0.1",
-    "playwright-core": "^1.60.0"
+    "mammoth": "^1.12.0",
+    "pdfjs-dist": "^6.0.227",
+    "playwright-core": "^1.60.0",
+    "xlsx": "^0.18.5"
   },
   "trustedDependencies": [
     "onnxruntime-node",
