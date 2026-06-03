@@ -25,12 +25,14 @@ function makeReq(opts: {
   origin?: string;
   host?: string;
   secFetchSite?: string;
+  secFetchDest?: string;
   url?: string;
 }): Request {
   const headers = new Headers();
   if (opts.origin !== undefined) headers.set("origin", opts.origin);
   if (opts.host !== undefined) headers.set("host", opts.host);
   if (opts.secFetchSite) headers.set("sec-fetch-site", opts.secFetchSite);
+  if (opts.secFetchDest) headers.set("sec-fetch-dest", opts.secFetchDest);
   return new Request(opts.url ?? "http://127.0.0.1:7778/api/runtime/chat", {
     method: opts.method ?? "GET",
     headers
@@ -164,5 +166,13 @@ describe("webBoundRequestAllowed — Sec-Fetch-Site", () => {
   test("same-origin and none are allowed", () => {
     expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "127.0.0.1:7778", secFetchSite: "same-origin" }))).toBe(true);
     expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "127.0.0.1:7778", secFetchSite: "none" }))).toBe(true);
+  });
+
+  test("a cross-site TOP-LEVEL navigation (Sec-Fetch-Dest=document) is allowed — opening the tunnel URL via a link", () => {
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "g31.gini-relay.lilaclabs.ai", url: "https://g31.gini-relay.lilaclabs.ai/", secFetchSite: "cross-site", secFetchDest: "document" }))).toBe(true);
+  });
+
+  test("a cross-site subresource (non-document destination) is still refused", () => {
+    expect(webBoundRequestAllowed(makeReq({ method: "GET", host: "127.0.0.1:7778", secFetchSite: "cross-site", secFetchDest: "image" }))).toBe(false);
   });
 });

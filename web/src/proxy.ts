@@ -113,9 +113,18 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const next = NextResponse.next();
   // Setup gate runs ONLY on loopback — /setup is a localhost-only experience,
   // so a Tailscale-front caller hitting `/` should not be redirected there.
+  // (When the gateway reverse-proxies the app it rewrites Host to loopback, so
+  // gateway-fronted requests land on this lane too.) Redirect ONLY top-level
+  // page navigations — never asset/subresource requests (images, JS chunks,
+  // fetches), so e.g. /gini-agent-logo.png is served instead of 307'd to
+  // /setup. Sec-Fetch-Dest=document marks a top-level navigation; clients that
+  // omit the header fall back to the Accept: text/html heuristic.
   if (classification === "loopback") {
     const { pathname } = url;
-    if (!pathname.startsWith("/setup") && !pathname.startsWith("/api/")) {
+    const dest = request.headers.get("sec-fetch-dest");
+    const isPageNav = dest === "document"
+      || (dest === null && (request.headers.get("accept") ?? "").includes("text/html"));
+    if (isPageNav && !pathname.startsWith("/setup") && !pathname.startsWith("/api/")) {
       const configured = await isProviderConfigured();
       if (configured === false) {
         const setupUrl = new URL("/setup", request.url);

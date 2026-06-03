@@ -18,10 +18,13 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-function makeRequest(opts: { url: string; host: string; method?: string }): NextRequest {
+function makeRequest(opts: { url: string; host: string; method?: string; secFetchDest?: string; accept?: string }): NextRequest {
+  const headers: Record<string, string> = { host: opts.host };
+  if (opts.secFetchDest) headers["sec-fetch-dest"] = opts.secFetchDest;
+  if (opts.accept) headers["accept"] = opts.accept;
   return new NextRequest(opts.url, {
     method: opts.method ?? "GET",
-    headers: { host: opts.host }
+    headers
   });
 }
 
@@ -69,21 +72,31 @@ describe("proxy loopback setup gate", () => {
 
   test("loopback + /setup is not redirected (avoids a redirect loop)", async () => {
     stubSetupStatus(false);
-    const res = await proxy(makeRequest({ url: "http://localhost/setup", host: "localhost" }));
+    const res = await proxy(makeRequest({ url: "http://localhost/setup", host: "localhost", secFetchDest: "document" }));
     expect(res.status).toBe(200);
   });
 
-  test("loopback + unconfigured provider → redirect to /setup", async () => {
+  test("loopback + unconfigured provider → redirect to /setup (top-level navigation)", async () => {
     stubSetupStatus(false);
-    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost" }));
+    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost", secFetchDest: "document" }));
     expect(res.status).toBeGreaterThanOrEqual(300);
     expect(res.status).toBeLessThan(400);
     expect(res.headers.get("location")).toContain("/setup");
   });
 
+  test("loopback + static asset is NOT redirected to /setup even when unconfigured", async () => {
+    // Regression: a static image (Sec-Fetch-Dest=image) must be served, not
+    // 307'd to /setup. The setup gate only redirects top-level page navigations,
+    // and must not even probe the provider for an asset request.
+    failIfFetched("setup status must not be probed for asset requests");
+    const res = await proxy(makeRequest({ url: "http://localhost/gini-agent-logo.png", host: "localhost", secFetchDest: "image" }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
   test("loopback + configured provider → pass (no redirect)", async () => {
     stubSetupStatus(true);
-    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost" }));
+    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost", secFetchDest: "document" }));
     expect(res.status).toBe(200);
   });
 });

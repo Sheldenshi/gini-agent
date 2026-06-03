@@ -115,7 +115,13 @@ export function webBoundRequestAllowed(request: Request): boolean {
   const isUnsafe = UNSAFE_METHODS.has(request.method);
   const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
   if (!hostOriginTrusted(origin, isUnsafe, expectedHost)) return false;
+  // Sec-Fetch-Site cross-site is rejected for credentialed subresources/fetches,
+  // but NOT for a top-level page navigation (Sec-Fetch-Dest=document): a user
+  // opening the tunnel URL via a link from another site is a legitimate
+  // cross-site navigation and must not be 404'd. Subresource data-leak
+  // protection is unaffected — those carry a non-document destination.
   const fetchSite = request.headers.get("sec-fetch-site");
-  if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") return false;
+  const isDocumentNav = request.headers.get("sec-fetch-dest") === "document";
+  if (!isDocumentNav && fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") return false;
   return true;
 }
