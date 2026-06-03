@@ -52,7 +52,7 @@ bun run gini evidence
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
 | Web control plane | Next.js app at `web/`, launched by `gini start` or `gini run` unless `--no-web` is set |
-| Off-LAN access (tunnel) | `gini tunnel [select <provider> \| connect [provider] \| cancel \| disconnect]`, `/api/tunnel{,/select,/connect,/cancel,/disconnect}`. The gini-relay provider runs an OAuth-loopback login on the host, assigns a per-device subdomain, and runs a supervised `frpc` child exposing the local web port at `https://<subdomain>.<relayDomain>`; `tailscale`/`ngrok`/`cloudflare` are disabled catalog placeholders. See [tunnel-connectivity.md](adr/tunnel-connectivity.md) |
+| Off-LAN access (tunnel) | `gini tunnel [select <provider> \| connect [provider] \| cancel \| disconnect]`, `/api/tunnel{,/select,/connect,/cancel,/disconnect}`. The gini-relay provider runs an OAuth-loopback login on the host, assigns a per-device subdomain, and runs a supervised `frpc` child exposing the gateway port (the single origin fronting UI + API) at `https://<subdomain>.<relayDomain>`; `tailscale`/`ngrok`/`cloudflare` are disabled catalog placeholders. See [tunnel-connectivity.md](adr/tunnel-connectivity.md) |
 
 ## Runtime Contracts
 

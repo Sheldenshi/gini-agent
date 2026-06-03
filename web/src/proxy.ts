@@ -50,17 +50,6 @@ function classifyHost(hostHeader: string | null): "loopback" | "trusted" | "unkn
   if (hostOnly === "localhost" || hostOnly === "127.0.0.1" || hostOnly === "[::1]") {
     return "loopback";
   }
-  // Tunnel lane: a subdomain of the gini-relay domain can only reach this web
-  // process through the operator's OWN frpc tunnel — the relay routes each
-  // random per-device subdomain solely to its owner's tunnel. A DNS-rebinding
-  // page cannot forge a `*.gini-relay.lilaclabs.ai` host that resolves to this
-  // machine (the relay controls that DNS), so trusting the relay domain is safe
-  // and is what lets the connected tunnel URL actually serve the app. See
-  // docs/adr/bff-trust-boundary.md.
-  const relayDomain = (process.env.GINI_RELAY_DOMAIN ?? "gini-relay.lilaclabs.ai").toLowerCase();
-  if (hostOnly === relayDomain || hostOnly.endsWith(`.${relayDomain}`)) {
-    return "trusted";
-  }
   // Share the env-var parse + validation with the BFF CSRF guard so the
   // two lanes can't drift apart on what counts as a valid entry (entries
   // with paths/queries/userinfo are rejected here as well as there, per

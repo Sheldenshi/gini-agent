@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
+import { webPortPath } from "./paths";
+import { clearWebTargetCache } from "./web-target";
+import { dirname } from "node:path";
 import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat, sanitizeFilename } from "./state";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
@@ -799,6 +802,56 @@ describe("runtime api", () => {
     expect(page.status).toBe(200);
     const body = (await page.json()) as { name?: string };
     expect(body.name).toBe("gini-runtime");
+  });
+
+  // The gateway is the single trust front: every web-bound request is validated
+  // before proxying so the inner web child stays relay-agnostic. An untrusted
+  // (non-loopback, non-relay, non-allowlisted) Host is refused here.
+  test("web-bound requests from an untrusted Host are refused before proxying", async () => {
+    const config = testConfig("web-proxy-gate");
+    const handler = createHandler(config);
+    // Page/asset path → 404 (don't confirm the host exists).
+    const page = await handler(new Request("http://evil.example/some/app/route", { headers: { host: "evil.example" } }));
+    expect(page.status).toBe(404);
+    // /api/runtime/* BFF namespace → 403 so a programmatic caller sees the refusal.
+    const bff = await handler(new Request("http://evil.example/api/runtime/status", { headers: { host: "evil.example" } }));
+    expect(bff.status).toBe(403);
+  });
+
+  // After validating the real Host/Origin, the gateway presents the inner web
+  // child a loopback Host AND Origin so the child needs no relay awareness.
+  test("proxyWeb rewrites Host and Origin to loopback before forwarding to the web child", async () => {
+    const config = testConfig("web-proxy-rewrite");
+    const handler = createHandler(config);
+    const captured: { host: string | null; origin: string | null } = { host: null, origin: null };
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        captured.host = req.headers.get("host");
+        captured.origin = req.headers.get("origin");
+        return new Response("ok");
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      // Loopback Host passes the gate; the original Origin points at the gateway
+      // port, so a correct rewrite makes the child see the loopback web port.
+      await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`, {
+        headers: { origin: `http://127.0.0.1:${config.port}` }
+      }));
+      expect(captured.host).toBe(`127.0.0.1:${upstream.port}`);
+      expect(captured.origin).toBe(`http://127.0.0.1:${upstream.port}`);
+    } finally {
+      upstream.stop(true);
+      clearWebTargetCache(config.instance);
+    }
   });
 
   test("preserves full terminal stdout in a trace artifact when audit evidence is truncated", async () => {

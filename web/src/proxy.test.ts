@@ -6,21 +6,15 @@ import { NextRequest } from "next/server";
 import { proxy } from "./proxy";
 
 const originalTrusted = process.env.GINI_TRUSTED_ORIGINS;
-const originalRelayDomain = process.env.GINI_RELAY_DOMAIN;
 const originalFetch = globalThis.fetch;
 
 beforeEach(() => {
   delete process.env.GINI_TRUSTED_ORIGINS;
-  // Force the default relay domain so the literal *.gini-relay.lilaclabs.ai
-  // expectations hold regardless of any GINI_RELAY_DOMAIN set in the CI/dev env.
-  delete process.env.GINI_RELAY_DOMAIN;
 });
 
 afterEach(() => {
   if (originalTrusted === undefined) delete process.env.GINI_TRUSTED_ORIGINS;
   else process.env.GINI_TRUSTED_ORIGINS = originalTrusted;
-  if (originalRelayDomain === undefined) delete process.env.GINI_RELAY_DOMAIN;
-  else process.env.GINI_RELAY_DOMAIN = originalRelayDomain;
   globalThis.fetch = originalFetch;
 });
 
@@ -49,6 +43,11 @@ function failIfFetched(reason: string): void {
 describe("proxy Host classifier", () => {
   test("unknown Host → 404", async () => {
     const res = await proxy(makeRequest({ url: "https://evil.example/", host: "evil.example" }));
+    expect(res.status).toBe(404);
+  });
+
+  test("relay-subdomain Host → 404 (BFF is relay-agnostic; the gateway fronts the tunnel)", async () => {
+    const res = await proxy(makeRequest({ url: "https://g31.gini-relay.lilaclabs.ai/", host: "g31.gini-relay.lilaclabs.ai" }));
     expect(res.status).toBe(404);
   });
 

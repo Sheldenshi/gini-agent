@@ -20,13 +20,13 @@
 // `loginUrl(deps)` mints the OAuth-loopback consent URL, which we open in
 // the HOST browser; `waitForSession()` resolves with the session token +
 // assigned subdomain; `buildTunnel(opts)` builds a supervised native frpc
-// child that exposes the instance's local web port. The public URL is
+// child that exposes the instance's gateway port. The public URL is
 // `https://<subdomain>.<relayDomain>`. Every gini-relay seam (login
 // primitive, tunnel builder, credential store, browser opener, port
 // resolver) is injectable so unit tests never hit the network, OAuth, or
 // the host browser. See `setTunnelDeps`.
 
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
   buildTunnel as realBuildTunnel,
@@ -50,7 +50,7 @@ import type {
 } from "../types";
 import { addAudit, createTunnelRecord, mutateState, readState } from "../state";
 import { appendLog } from "../state/trace";
-import { defaultWebPort, relayHome, webPortPath } from "../paths";
+import { relayHome } from "../paths";
 import { isSupervisedWebChild } from "../runtime/health-probe";
 
 // ---------------------------------------------------------------------------
@@ -85,10 +85,11 @@ export interface TunnelDeps {
   resolveDefaults: () => RelayDefaults;
   // Open the consent URL in the HOST browser. Defaults to `open <url>`.
   openBrowser: (url: string) => void;
-  // Resolve the local port the tunnel should expose for an instance.
+  // Resolve the local port the tunnel should expose for an instance (the gateway port).
   resolveLocalPort: (config: RuntimeConfig) => number;
-  // Probe whether THIS instance's Gini web server is serving on the resolved
-  // local port before we advertise a public URL that forwards to it. Verifies
+  // Probe whether THIS instance's web app is reachable on the resolved port (the
+  // gateway port; the /api/runtime/__healthz probe transits the gateway's
+  // reverse-proxy to the web child) before we advertise a public URL. Verifies
   // the gini-web identity marker (not just any HTTP response), so a stale port
   // file or a port-squatting process can't get published to the public relay
   // URL. Prevents a "connected" record pointing at a dead/foreign local port
@@ -110,27 +111,19 @@ export function defaultOpenBrowser(url: string, spawn: typeof Bun.spawn = Bun.sp
   spawn(["open", url]);
 }
 
-// The local port the tunnel exposes: the instance's Next.js web UI port, so
-// Gini's UI (and the chat API it proxies) is reachable remotely. Resolution
-// order, most-authoritative first:
+// The local port the tunnel exposes: the instance's GATEWAY port (config.port).
+// The gateway serves its native /api/* directly AND reverse-proxies the web app
+// — UI, assets, /api/runtime/*, HMR — to the Next.js web child (see ADR
+// gateway-web-reverse-proxy.md). Exposing the gateway therefore makes one relay
+// URL serve both the API (e.g. a mobile client's /api/* calls) and the web UI.
+// Resolution order, most-authoritative first:
 //   1. GINI_TUNNEL_PORT env override (operator escape hatch / tests).
-//   2. The web port recorded at `~/.gini/instances/<inst>/web.port` once the
-//      Next.js dev server has bound (the only reliably-correct value when the
-//      requested port was busy and rolled forward).
-//   3. The deterministic per-instance default (`defaultWebPort`).
+//   2. The gateway port (`config.port`), which the CLI pins to the actually-
+//      bound port before launch (src/cli/process.ts).
 function defaultResolveLocalPort(config: RuntimeConfig): number {
   const override = Number(process.env.GINI_TUNNEL_PORT);
   if (Number.isFinite(override) && override > 0) return override;
-  const recorded = readRecordedWebPort(config.instance);
-  if (recorded !== null) return recorded;
-  return defaultWebPort(config.instance);
-}
-
-function readRecordedWebPort(instance: Instance): number | null {
-  const path = webPortPath(instance);
-  if (!existsSync(path)) return null;
-  const value = Number(readFileSync(path, "utf8").trim());
-  return Number.isFinite(value) && value > 0 ? value : null;
+  return config.port;
 }
 
 // Builds the real gini-relay-backed seam set. Exported so a test can assert

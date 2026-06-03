@@ -76,6 +76,7 @@ import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrow
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
 import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
+import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -1608,6 +1609,17 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return withCors(request, json({ error: "Not found" }, 404));
     }
+    // Single-front trust boundary: validate the inbound Host/Origin for every
+    // web-bound request BEFORE proxying. The inner web child binds loopback and
+    // is relay-agnostic, so this is the one place DNS-rebinding / CSRF are
+    // stopped for the token-injecting proxied surface. Page/asset paths 404
+    // (don't confirm the host); the /api/runtime/* BFF namespace 403s so a
+    // programmatic caller sees the refusal. See src/lib/origin-trust.ts.
+    if (!webBoundRequestAllowed(request)) {
+      return url.pathname.startsWith("/api/")
+        ? withCors(request, json({ error: "Forbidden" }, 403))
+        : withCors(request, new Response("Not found", { status: 404 }));
+    }
     return proxyWeb(request, url, config);
   };
 }
@@ -1683,13 +1695,21 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
   const port = await resolveWebPort(config);
   if (port === null) return proxyFallback(request, url, config);
   const target = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
+  // Present the inner web child a loopback request. It binds loopback and is
+  // relay-agnostic, so it must never see the external relay Host/Origin — the
+  // gateway already validated those in webBoundRequestAllowed. Rewriting both
+  // satisfies the child's loopback trust lane and lets it drop all relay
+  // awareness. A fresh Headers copy avoids mutating the original request.
+  const headers = new Headers(request.headers);
+  headers.set("host", `127.0.0.1:${port}`);
+  if (headers.has("origin")) headers.set("origin", `http://127.0.0.1:${port}`);
   // decompress: false tells Bun not to auto-decompress the upstream response.
   // That keeps Content-Encoding and Content-Length consistent so the browser
   // can decompress normally. Without it, Bun decompresses the body but leaves
   // the stale headers, causing ERR_CONTENT_DECODING_FAILED in browsers.
   const init: BunFetchRequestInit = {
     method: request.method,
-    headers: request.headers,
+    headers,
     redirect: "manual",
     decompress: false,
   };

@@ -10,7 +10,7 @@
 // frpc child.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   awaitTunnelSettled,
@@ -29,7 +29,6 @@ import {
   type TunnelDeps
 } from "./tunnel";
 import { mutateState, readState } from "../state";
-import { webPortPath } from "../paths";
 import type { RuntimeConfig } from "../types";
 import type { LoginHandle, RelayDefaults, Session, Store, TunnelOptions } from "gini-relay";
 
@@ -183,7 +182,7 @@ function deps(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
 }
 
 // The same seams MINUS resolveLocalPort, so the module's default
-// (env override -> recorded web.port -> deterministic default) runs.
+// (env override -> gateway port config.port) runs.
 function depsNoPort(over: Partial<TunnelDeps> = {}): Partial<TunnelDeps> {
   const opened: string[] = [];
   return {
@@ -531,27 +530,11 @@ describe("tunnel integration", () => {
     expect(seenPort).toBe(9911);
   });
 
-  // The default resolveLocalPort path: recorded web.port wins over the
-  // deterministic default when no env override is set.
-  test("connectTunnel reads the recorded web.port for the local port", async () => {
-    delete process.env.GINI_TUNNEL_PORT; // restored in afterEach
-    mkdirSync(join(ROOT, "instances", config.instance), { recursive: true });
-    writeFileSync(webPortPath(config.instance), "5544\n");
-    let seenPort = -1;
-    setTunnelDeps(depsNoPort({
-      buildTunnel: (opts) => {
-        seenPort = opts.port;
-        return fakeChild();
-      }
-    }));
-    await connectTunnel(config, "gini-relay");
-    await awaitTunnelSettled(config.instance);
-    expect(seenPort).toBe(5544);
-  });
-
-  // The default resolveLocalPort path: falls back to the deterministic
-  // per-instance default when neither env nor web.port is present.
-  test("connectTunnel falls back to the deterministic web port", async () => {
+  // The default resolveLocalPort path: with no env override, the tunnel exposes
+  // the instance's GATEWAY port (config.port). The gateway fronts both the
+  // native /api/* surface and the reverse-proxied web app, so one relay URL
+  // serves the API and the UI.
+  test("connectTunnel exposes the gateway port (config.port) for the local port", async () => {
     delete process.env.GINI_TUNNEL_PORT; // restored in afterEach
     let seenPort = -1;
     setTunnelDeps(depsNoPort({
@@ -562,10 +545,7 @@ describe("tunnel integration", () => {
     }));
     await connectTunnel(config, "gini-relay");
     await awaitTunnelSettled(config.instance);
-    // The default is a deterministic positive port (not the env/recorded ones).
-    expect(seenPort).toBeGreaterThan(0);
-    expect(seenPort).not.toBe(9911);
-    expect(seenPort).not.toBe(5544);
+    expect(seenPort).toBe(config.port);
   });
 
   // disconnect fully logs out: it invokes the logout seam (revoke + clear) so a

@@ -1,5 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
+import { webBoundRequestAllowed } from "./lib/origin-trust";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -179,6 +180,11 @@ const server = Bun.serve({
     // /api surface (which has no WS endpoints) falls through to normal HTTP.
     if ((request.headers.get("upgrade") ?? "").toLowerCase() === "websocket"
         && isWebProxyPath(new URL(request.url).pathname)) {
+      // Same single-front trust gate as the HTTP path (src/http.ts): refuse a
+      // rebound/untrusted WS upgrade before bridging it to the loopback web child.
+      if (!webBoundRequestAllowed(request)) {
+        return new Response("Forbidden", { status: 403 });
+      }
       return proxyWebSocketUpgrade(request, server, config);
     }
     return httpHandler(request);

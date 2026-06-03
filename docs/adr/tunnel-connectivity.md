@@ -4,7 +4,7 @@
 
 Gini exposes a remote URL for an instance through a **tunnel provider**, selected and managed by the user through a uniform RPC contract. The gateway owns a small persisted singleton (the user's provider selection + connection status) and rebuilds the provider catalog from code on every read. Every tunnel route returns the **full `TunnelState`** so a single fetch drives the whole selection / connect / connected UI without follow-up requests.
 
-The provider catalog is fixed for now: `gini-relay` is the only enabled provider; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced to the UI with a `requires` string explaining the missing prerequisite. The gini-relay connect flow is wired through the [`gini-relay`](https://github.com/Lilac-Labs/gini-relay) client package: `connectTunnel` flips status to `connecting` and returns immediately, then a background handshake mints an OAuth-loopback consent URL (`loginUrl`), opens it in the host browser, awaits the session, builds + starts a native `frpc` tunnel (`buildTunnel`) that exposes the instance's local web port, and records the public `https://<subdomain>.<relayDomain>` url. The UI/CLI polls `GET /api/tunnel` until status flips to `connected` (with `url`) or `error` (with `message`).
+The provider catalog is fixed for now: `gini-relay` is the only enabled provider; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced to the UI with a `requires` string explaining the missing prerequisite. The gini-relay connect flow is wired through the [`gini-relay`](https://github.com/Lilac-Labs/gini-relay) client package: `connectTunnel` flips status to `connecting` and returns immediately, then a background handshake mints an OAuth-loopback consent URL (`loginUrl`), opens it in the host browser, awaits the session, builds + starts a native `frpc` tunnel (`buildTunnel`) that exposes the instance's gateway port (the single origin fronting UI + API; see *Exposed port*), and records the public `https://<subdomain>.<relayDomain>` url. The UI/CLI polls `GET /api/tunnel` until status flips to `connected` (with `url`) or `error` (with `message`).
 
 ## Context
 
@@ -95,20 +95,21 @@ It is defaulted to `null` in `createEmptyState` and backfilled with `state.tunne
 1. `loginUrl({ store, relayUrl, loopbackPorts })` binds a `127.0.0.1` callback server, asks the relay for a Google consent URL, and hands back `{ url, waitForSession, cancel }`. The URL is **machine-bound** — the auth code returns to this host's loopback, so it must be approved in a browser on this same machine (RFC 8252 loopback redirect + PKCE).
 2. The consent URL is opened in the **host browser** via `Bun.spawn(["open", url])` (the `openBrowser` seam).
 3. `waitForSession()` resolves once the user approves: the relay exchanges the code and returns `{ token, subdomain, account }`, persisted by the store to the **instance-scoped** relay home (`~/.gini/instances/<inst>/relay`, via `relayHome(instance)`) so concurrent instances never share a device/session or stomp each other's tunnel.
-4. `buildTunnel({ session, deviceId, port, defaults })` builds a supervised native `frpc` child for the **local web port** (see *Exposed port*), and `child.start()` resolves when the proxy is actually up.
+4. `buildTunnel({ session, deviceId, port, defaults })` builds a supervised native `frpc` child for the **gateway port** (see *Exposed port*), and `child.start()` resolves when the proxy is actually up.
 5. The record flips to `connected` with `url: https://<subdomain>.<relayDomain>` and the `subdomain` persisted.
 
 On any failure — relay error, login rejection, frpc start failure — the record flips to `error` with the thrown message; `url` is cleared. If the connect was cancelled mid-flight (the supervisor was torn down by `cancel`/`disconnect` before the background flow settled), the flow logs `tunnel.connect.aborted` and leaves the cancel-written `idle` record intact rather than clobbering it with a spurious error.
 
 ### Exposed port
 
-The tunnel exposes the instance's **Next.js web UI port**, so Gini's UI (and the chat API the BFF proxies) is reachable remotely. Resolution order (`resolveLocalPort`), most-authoritative first:
+The tunnel exposes the instance's **gateway port** (`config.port`). The gateway is the single origin that serves its native `/api/*` directly AND reverse-proxies the web app — UI, assets, the `/api/runtime/*` BFF namespace, and HMR — to the Next.js web child (see ADR [gateway-web-reverse-proxy.md](gateway-web-reverse-proxy.md)). Exposing the gateway therefore makes one relay URL serve both the API (e.g. a mobile client's direct `/api/*` calls) and the web UI. Resolution order (`resolveLocalPort`), most-authoritative first:
 
 1. `GINI_TUNNEL_PORT` env override (operator escape hatch / tests).
-2. The recorded web port at `~/.gini/instances/<inst>/web.port` (the only reliably-correct value when the requested port was busy and rolled forward at startup).
-3. The deterministic per-instance default (`defaultWebPort`).
+2. The gateway port (`config.port`), which the CLI pins to the actually-bound port before launch.
 
-Before advertising a public URL, connect verifies **this instance's** Gini web server is actually answering on the resolved port via the shared identity probe (`isSupervisedWebChild` → `{ service: "gini-web", instance }` on `/api/runtime/__healthz`), not just any HTTP response — so a stale port file or a port-squatting process can't be published to the public relay URL.
+Before advertising a public URL, connect verifies the web app is actually serving via the shared identity probe (`isSupervisedWebChild` → `{ service: "gini-web", instance }` on `/api/runtime/__healthz`). Because that path is web-bound, the probe transits the gateway's reverse-proxy to the web child, so a green probe means the gateway is up AND the web child is reachable through it — a stale port or a down web child can't be published to the public relay URL.
+
+The gateway owns the host/origin trust decision for every web-bound request (loopback / relay-subdomain / `GINI_TRUSTED_ORIGINS`, fail-closed, plus a `Sec-Fetch-Site` check) and rewrites `Host`/`Origin` to loopback before proxying, so the inner web child is purely internal and needs no relay awareness. See ADR [bff-trust-boundary.md](bff-trust-boundary.md).
 
 ### Supervision
 

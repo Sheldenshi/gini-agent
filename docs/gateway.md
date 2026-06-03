@@ -86,21 +86,15 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
 
-Every BFF request to `/api/runtime/*` carries a CSRF guard before the gateway bearer is injected — both read-only GETs (which would otherwise leak RuntimeState contents under DNS rebinding) and mutating POST/PUT/PATCH/DELETEs. The guard uses one of two policies:
+The trust boundary lives at the **gateway front**. Every web-bound request (non-`/api` traffic and the `/api/runtime/*` BFF namespace) is validated by the gateway before it is reverse-proxied — both read-only GETs (which would otherwise leak RuntimeState contents under DNS rebinding) and mutating POST/PUT/PATCH/DELETEs — and the gateway then rewrites `Host`/`Origin` to loopback so the inner Next.js child is purely internal and relay-agnostic. The gateway accepts a web-bound request when its `Host`/`Origin` is one of:
 
-1. **`GINI_TRUSTED_ORIGINS` set** — comma-separated list of full origins (scheme + host + port), e.g.
+1. **Loopback** — `localhost` / `127.0.0.1` / `[::1]`. The operator's own machine; a DNS-rebinding page cannot forge a loopback `Host`.
+2. **A `GINI_TRUSTED_ORIGINS` entry** — comma-separated full origins (scheme + host + port), e.g. `GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000`. Required for tailnet and public-DNS exposures. If the var is set but every entry is malformed, the gate fails closed and refuses every web-bound request until fixed — a typo bricks loudly rather than silently downgrading.
+3. **A gini-relay subdomain** — independent of `GINI_TRUSTED_ORIGINS`. The relay domain (`GINI_RELAY_DOMAIN`, default `gini-relay.lilaclabs.ai`) or one of its per-device subdomains. Safe because the relay owns DNS for `*.<relayDomain>` and routes each random per-device subdomain only to its owner's `frpc` tunnel — an attacker cannot rebind a relay name to this machine.
 
-   ```
-   GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000
-   ```
+A cross-site `Sec-Fetch-Site` value is rejected on every lane, and an unsafe method (POST/PUT/PATCH/DELETE) without an `Origin` is rejected — a non-browser client must use the native `/api/*` surface with its own bearer. The inner BFF keeps its own loopback/allowlist guard as defense-in-depth for direct access to the Next.js port; because the gateway only ever forwards a loopback `Host`/`Origin`, the BFF trusts that internal traffic via a loopback short-circuit and carries no relay awareness of its own. See [ADR: BFF trust boundary](adr/bff-trust-boundary.md) and [ADR: Tunnel connectivity](adr/tunnel-connectivity.md).
 
-   The guard accepts an `Origin` only if it exactly matches one of the listed entries. This is the required posture for tailnet and public-DNS exposures. If you set the env var but every entry is malformed, the guard fails closed and refuses every privileged POST until you fix the value — a typo bricks privileged routes loudly rather than silently downgrading.
-
-2. **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. The guard accepts requests only when both the request `Host` is loopback (`localhost`, `127.0.0.1`, or `[::1]`) and the `Origin` matches `Host`. Any non-loopback Host is refused without an explicit allowlist, so a BFF run on a tailnet hostname without `GINI_TRUSTED_ORIGINS` will see every privileged POST 403'd — set the env var or bind the BFF to loopback only.
-
-3. **gini-relay tunnel front** — independent of `GINI_TRUSTED_ORIGINS`. When the request `Host`/`Origin` is the relay domain (`GINI_RELAY_DOMAIN`, default `gini-relay.lilaclabs.ai`) or one of its per-device subdomains, the guard trusts it so the app served *through* the operator's own tunnel can call the BFF. This is safe because the relay controls DNS for `*.<relayDomain>` and routes each random per-device subdomain only to its owner's `frpc` tunnel — an attacker cannot rebind a relay name to this machine — and the `Sec-Fetch-Site` cross-site check still applies. See [ADR: BFF trust boundary](adr/bff-trust-boundary.md) and [ADR: Tunnel connectivity](adr/tunnel-connectivity.md).
-
-Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
+Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the gateway's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
 ## Lifecycle Commands
 

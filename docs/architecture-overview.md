@@ -68,7 +68,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - Server-side BFF attaches the gateway bearer token.
 - Uses the same API that CLI and future clients use.
 - Can be disabled with `--no-web` for smoke and runtime-only testing.
-- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`src/web-target.ts`). This single origin is the foundation a future relay would front; off-LAN access itself is not built yet (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
+- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`src/web-target.ts`). This single origin is what the gini-relay tunnel exposes for off-LAN access (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
 
 ### CLI
 
@@ -134,7 +134,7 @@ On macOS a launchd-managed instance is supervised to stay up across crashes, cle
 
 ## Off-LAN Access
 
-Off-LAN access is available through the **gini-relay tunnel**. The user picks a tunnel provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`); the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's local Next.js web port. The instance is then reachable at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `gini-relay` is the only enabled provider today; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced with the prerequisite they require. The app served through the tunnel can call the BFF because the BFF trusts the relay domain's per-device subdomains as a third trust lane. See [Tunnel Connectivity](./adr/tunnel-connectivity.md) and [BFF Trust Boundary](./adr/bff-trust-boundary.md).
+Off-LAN access is available through the **gini-relay tunnel**. The user picks a tunnel provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`); the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's gateway port (the single origin fronting UI + API). The instance is then reachable at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `gini-relay` is the only enabled provider today; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced with the prerequisite they require. The gateway owns the relay / loopback / `GINI_TRUSTED_ORIGINS` trust decision for web-bound requests and rewrites `Host`/`Origin` to loopback before proxying, so the inner web child (BFF) stays relay-agnostic. See [Tunnel Connectivity](./adr/tunnel-connectivity.md) and [BFF Trust Boundary](./adr/bff-trust-boundary.md).
 
 ## Not Yet Built
 

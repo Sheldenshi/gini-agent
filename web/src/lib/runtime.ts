@@ -308,23 +308,6 @@ function isLoopbackHost(host: string): boolean {
   return hostnameOnly === "localhost" || hostnameOnly === "127.0.0.1" || hostnameOnly === "[::1]";
 }
 
-// A host that is the gini-relay domain or one of its per-device subdomains.
-// The relay routes each random subdomain only to its owner's frpc tunnel, and
-// an attacker cannot point a `*.<relayDomain>` name at this machine (the relay
-// controls that DNS), so a request whose Origin/Host is a relay subdomain is a
-// trusted front — the same lane proxy.ts grants pages. This is what lets the
-// app reached THROUGH the tunnel make BFF calls (status, tunnel, events, …).
-// See docs/adr/bff-trust-boundary.md.
-function isRelayHost(host: string): boolean {
-  const domain = (process.env.GINI_RELAY_DOMAIN ?? "gini-relay.lilaclabs.ai").toLowerCase();
-  const lower = host.toLowerCase();
-  const closeBracket = lower.lastIndexOf("]");
-  const hostnameOnly = closeBracket >= 0
-    ? lower.slice(0, closeBracket + 1)
-    : lower.includes(":") ? lower.slice(0, lower.indexOf(":")) : lower;
-  return hostnameOnly === domain || hostnameOnly.endsWith(`.${domain}`);
-}
-
 // Tier the guard by method:
 // - Unsafe methods (POST/PUT/PATCH/DELETE): require Origin. Modern browsers
 //   always send it; absence indicates a non-browser client (curl/scripts/
@@ -346,61 +329,52 @@ export function guardCsrf(request: Request, _pathSegments: string[]): Response |
   const origin = request.headers.get("origin");
   const isUnsafe = UNSAFE_METHODS.has(request.method);
   const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-  if (!origin) {
-    // Mobile React Native fetch never sends Origin. An unsafe-method POST
-    // without Origin should talk to the gateway directly with its own token,
-    // not the BFF's bearer-injection surface, so reject it here.
-    if (isUnsafe) {
-      return forbidden();
+  // Host/Origin trust decision. The Sec-Fetch-Site check below runs regardless,
+  // so this resolves a `trusted` flag rather than returning early.
+  //
+  // Loopback short-circuit: this BFF is an internal service — in production it is
+  // reached only through the gateway's reverse-proxy, which validates the real
+  // Host/Origin at the single front and rewrites BOTH to loopback before
+  // forwarding (see src/http.ts proxyWeb + src/lib/origin-trust.ts). A loopback
+  // Host is therefore trusted regardless of GINI_TRUSTED_ORIGINS: a DNS-rebinding
+  // page cannot forge a loopback Host (the browser sends the real visited host),
+  // and direct local-dev access lands on this same lane. This is what lets the
+  // BFF stay relay-agnostic — it never sees a relay host of its own.
+  let trusted = false;
+  if (isLoopbackHost(expectedHost)) {
+    if (!origin) {
+      // Safe methods (top-level GET/HEAD) pass; an unsafe method without Origin
+      // must use the gateway's native /api/* with its own token.
+      trusted = !isUnsafe;
+    } else {
+      try {
+        trusted = isLoopbackHost(new URL(origin).host);
+      } catch {
+        return forbidden();
+      }
     }
-    // Safe method (GET/HEAD) without Origin. Browsers may omit Origin on
-    // same-origin safe requests, which is the exact shape a DNS-rebound page
-    // produces. Validate the Host: accept loopback, or the gini-relay tunnel
-    // front. When GINI_TRUSTED_ORIGINS is set we fail closed for everything
-    // except the relay front (a browser on a listed origin would send Origin).
-    const allowlist = trustedOrigins();
-    if (allowlist) {
-      if (!isRelayHost(expectedHost)) return forbidden();
-    } else if (!isLoopbackHost(expectedHost) && !isRelayHost(expectedHost)) {
-      return forbidden();
-    }
-  } else {
+  }
+  if (!trusted) {
+    if (!origin) return forbidden();
     let originUrl: URL;
     try {
       originUrl = new URL(origin);
     } catch {
       return forbidden();
     }
-    if (isRelayHost(originUrl.host)) {
-      // Relay-host Origin: the request reached this BFF over the operator's own
-      // gini-relay tunnel (the relay routes each random subdomain only to its
-      // owner, and a `*.<relayDomain>` name can't be rebound to this machine).
-      // This is the trusted tunnel front — the same lane proxy.ts grants pages
-      // — so it bypasses the loopback/allowlist checks. The sec-fetch-site
-      // check below still applies. See docs/adr/bff-trust-boundary.md.
+    // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS rebinding.
+    // When set, only requests whose Origin exactly matches one of the listed
+    // scheme+host[+port] entries pass; an env var set with only malformed
+    // entries yields an empty Set and fails closed.
+    const allowlist = trustedOrigins();
+    if (allowlist) {
+      if (!allowlist.has(`${originUrl.protocol}//${originUrl.host}`)) return forbidden();
     } else {
-      // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS
-      // rebinding. When set, only requests whose Origin exactly matches one of
-      // the listed scheme+host[+port] entries pass. If the operator set the env
-      // var but every entry was malformed (empty Set), we fail closed.
-      const allowlist = trustedOrigins();
-      if (allowlist) {
-        const normalized = `${originUrl.protocol}//${originUrl.host}`;
-        if (!allowlist.has(normalized)) {
-          return forbidden();
-        }
-      } else {
-        // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset. Compare the
-        // browser-supplied Origin host against the Host header. Restrict to
-        // loopback Host values so a non-loopback exposure (tailnet/public DNS)
-        // requires GINI_TRUSTED_ORIGINS — closing the rebindable path.
-        if (!isLoopbackHost(expectedHost)) {
-          return forbidden();
-        }
-        if (originUrl.host !== expectedHost) {
-          return forbidden();
-        }
-      }
+      // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset: the Origin host
+      // must equal a loopback Host (a non-loopback exposure requires the
+      // allowlist, closing the rebindable path).
+      if (!isLoopbackHost(expectedHost)) return forbidden();
+      if (originUrl.host !== expectedHost) return forbidden();
     }
   }
 
