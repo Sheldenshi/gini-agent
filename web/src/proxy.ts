@@ -124,7 +124,12 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     const dest = request.headers.get("sec-fetch-dest");
     const isPageNav = dest === "document"
       || (dest === null && (request.headers.get("accept") ?? "").includes("text/html"));
-    if (isPageNav && !pathname.startsWith("/setup") && !pathname.startsWith("/api/")) {
+    // /pair is the device-pairing entry point and, like /setup, must render
+    // regardless of provider-setup state — otherwise an unpaired relay device
+    // bounces /pair -> /setup (here) while the gateway bounces /setup -> /pair
+    // (its relay session gate), an infinite redirect. See ADR
+    // device-pairing-auth.md.
+    if (isPageNav && !pathname.startsWith("/setup") && !pathname.startsWith("/pair") && !pathname.startsWith("/api/")) {
       const configured = await isProviderConfigured();
       if (configured === false) {
         // The gateway rewrites Host to loopback before proxying, so this absolute

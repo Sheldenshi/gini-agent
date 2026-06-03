@@ -76,6 +76,16 @@ describe("proxy loopback setup gate", () => {
     expect(res.status).toBe(200);
   });
 
+  test("loopback + /pair is not redirected to /setup (pairing entry must always render)", async () => {
+    // Regression: /pair is the device-pairing entry point. If the setup gate
+    // bounced it to /setup while setup is incomplete, an unpaired relay device
+    // would loop forever (gateway: /setup -> /pair; here: /pair -> /setup).
+    stubSetupStatus(false);
+    const res = await proxy(makeRequest({ url: "http://localhost/pair", host: "localhost", secFetchDest: "document" }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
   test("loopback + unconfigured provider → redirect to /setup (top-level navigation)", async () => {
     stubSetupStatus(false);
     const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost", secFetchDest: "document" }));
