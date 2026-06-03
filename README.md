@@ -159,6 +159,16 @@ See [ROADMAP.md](ROADMAP.md) for shipped surfaces and what's planned.
 
 Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, verification commands, and PR conventions. For architecture conventions and module boundaries, see [AGENTS.md](AGENTS.md). Report security issues privately per [SECURITY.md](SECURITY.md).
 
+## Star History
+
+<a href="https://star-history.com/#Lilac-Labs/gini-agent&Date">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Lilac-Labs/gini-agent&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Lilac-Labs/gini-agent&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Lilac-Labs/gini-agent&type=Date" />
+ </picture>
+</a>
+
 ## License
 
 [MIT](LICENSE)
