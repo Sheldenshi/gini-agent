@@ -286,7 +286,14 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         headers: {
           "content-type": upload.mimeType,
           "content-length": String(upload.bytes.length),
-          "cache-control": "private, max-age=31536000, immutable"
+          "cache-control": "private, max-age=31536000, immutable",
+          // Arbitrary MIME is now accepted, so force a download + no-sniff: a
+          // text/html or SVG upload must never execute as a top-level document
+          // on the app origin. The bytes still render inline in <img>/<audio>
+          // (subresource loads ignore Content-Disposition). Bare `attachment`
+          // (no filename= param) avoids header injection from the stored name.
+          "content-disposition": "attachment",
+          "x-content-type-options": "nosniff"
         }
       });
     }],

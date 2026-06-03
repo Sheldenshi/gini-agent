@@ -34,6 +34,13 @@ export function isPlausibleMime(mimeType: string): boolean {
 }
 
 
+// Strip control/newline chars and collapse whitespace before persisting a
+// filename — it is later rendered into the model-facing attachment marker,
+// where an embedded newline could spoof extra marker lines / inject text.
+function sanitizeFilename(name: string): string {
+  return name.replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 255);
+}
+
 function ensureUploadsDir(instance: Instance): string {
   const dir = uploadsDir(instance);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -73,7 +80,7 @@ export function storeUpload(
   const manifest: UploadManifest = {
     id,
     mimeType,
-    filename,
+    filename: filename ? (sanitizeFilename(filename) || undefined) : undefined,
     size: bytes.length,
     createdAt: new Date().toISOString()
   };

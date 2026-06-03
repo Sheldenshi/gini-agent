@@ -111,14 +111,16 @@ export interface ProxyOptions {
 // browser-caching control) set `Cache-Control: no-store`; without this
 // passthrough the BFF would silently allow a browser to cache the QR
 // pixels — which encode the bootstrap URL. Other entries are headers a
-// BFF typically wants to forward (content-disposition for downloads,
-// etag/last-modified for revalidation, vary for cache key correctness).
+// BFF typically wants to forward (content-disposition + x-content-type-options
+// to keep served uploads download-only and no-sniff, etag/last-modified for
+// revalidation, vary for cache key correctness).
 const PASSTHROUGH_RESPONSE_HEADERS = [
   "cache-control",
   "etag",
   "last-modified",
   "vary",
   "content-disposition",
+  "x-content-type-options",
   "content-language",
   "content-encoding"
 ];

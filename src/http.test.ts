@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
-import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime } from "./state";
+import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat } from "./state";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -4562,6 +4562,10 @@ describe("GET /api/files", () => {
     const fetched = await rawCall(handler, config, `/api/uploads/${ref.id}`, {}, config.token);
     expect(fetched.status).toBe(200);
     expect(fetched.headers.get("content-type")).toBe("application/pdf");
+    // Arbitrary MIME is accepted, so served uploads are forced to download and
+    // never sniffed — a text/html or SVG upload can't execute on the app origin.
+    expect(fetched.headers.get("content-disposition")).toBe("attachment");
+    expect(fetched.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
   test("POST /api/uploads accepts a text/csv file", async () => {
@@ -4603,6 +4607,14 @@ describe("GET /api/files", () => {
       body: form
     }));
     expect(response.status).toBe(400);
+  });
+
+  test("storeUpload sanitizes a filename with embedded newline/control chars to a single line", () => {
+    const config = testConfig("uploads-filename");
+    const ref = storeUpload(config.instance, new Uint8Array([1, 2, 3]), "text/csv", "a\nb\t\rc.csv");
+    const stat = uploadStat(config.instance, ref.id);
+    expect(stat?.filename).toBe("a b c.csv");
+    expect(stat?.filename).not.toContain("\n");
   });
 });
 
