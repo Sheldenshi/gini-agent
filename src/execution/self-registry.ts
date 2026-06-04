@@ -31,6 +31,7 @@ import { listSkills, rollbackSkill, testSkill } from "../capabilities/skills";
 import { listToolsets, setToolsetStatus } from "../capabilities/toolsets";
 import { addMcpServer, removeMcpServer } from "../integrations/mcp";
 import { deleteConnector, updateConnector } from "../integrations/connectors";
+import { gwsSessionStatus } from "../integrations/connectors/gws-session";
 import { assertCurrentRuntimeUpdateSupported, scheduleRuntimeRestart, updateRuntime } from "../runtime/update";
 import { projectRoot } from "../paths";
 
@@ -238,6 +239,15 @@ async function listMcpServers(config: RuntimeConfig, taskId: string): Promise<st
 
 async function listConnectors(config: RuntimeConfig, taskId: string): Promise<string> {
   const state = readState(config.instance);
+  // Google Workspace sign-in liveness is SEPARATE from connector health:
+  // health == "client creds provisioned" (never expires), session ==
+  // "user gws token valid" (expires; checked by `gws auth status`). Without
+  // this the model reads health "healthy" and wrongly concludes it can
+  // access Workspace even when the session has expired. Resolved once and
+  // attached to each google-oauth-desktop record below.
+  const session = state.connectors.some((c) => c.provider === "google-oauth-desktop")
+    ? await gwsSessionStatus()
+    : undefined;
   const connectors = state.connectors.map((connector) => ({
     id: connector.id,
     name: connector.name,
@@ -247,7 +257,10 @@ async function listConnectors(config: RuntimeConfig, taskId: string): Promise<st
     scopes: connector.scopes,
     source: connector.source ?? "user",
     lastHealthAt: connector.lastHealthAt ?? null,
-    message: connector.message ?? null
+    message: connector.message ?? null,
+    ...(connector.provider === "google-oauth-desktop" && session
+      ? { session: { signedIn: session.signedIn, message: session.message } }
+      : {})
   }));
   appendTrace(config.instance, taskId, {
     type: "tool",

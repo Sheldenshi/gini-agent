@@ -1487,6 +1487,17 @@ export interface ConnectorRecord {
   // physically delete. Defaults to "user" via normalizeState for legacy
   // records that pre-date this field.
   source?: "auto" | "user";
+  // Transient, API-enrichment-only. Never persisted to state — GET
+  // /api/connectors attaches it to google-oauth-desktop records from
+  // `gws auth status` so clients can show Google sign-in liveness
+  // separately from the connector's provisioning `health`. See
+  // src/integrations/connectors/gws-session.ts.
+  session?: {
+    installed: boolean;
+    clientConfigured: boolean;
+    signedIn: boolean;
+    message: string;
+  };
 }
 
 export interface ImprovementProposal {

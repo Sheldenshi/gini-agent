@@ -14,6 +14,7 @@ import { MarkdownContent } from "@/components/chat/MarkdownContent";
 import { api } from "@/lib/api";
 import { useConnectors, useInvalidate, useProviders, useSkills, type ProviderDescriptor } from "@/lib/queries";
 import { AddConnectorDialog, type CreateConnectorBody } from "@/components/AddConnectorDialog";
+import { deriveActivation, type Activation } from "./_activation";
 import type { ChatSession } from "@/lib/view-types";
 import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 
@@ -212,6 +213,10 @@ export default function SkillsPage() {
     () => providerByCredentialNameMap(providers.data ?? []),
     [providers.data]
   );
+  const setupSkillProviders = useMemo(
+    () => setupSkillProvidersMap(providers.data ?? []),
+    [providers.data]
+  );
 
   return (
     <>
@@ -256,7 +261,7 @@ export default function SkillsPage() {
                     <div className="flex items-center justify-between gap-2">
                       <span className="line-clamp-1 text-sm font-medium">{skill.name}</span>
                       <ActivationPill
-                        activation={deriveActivation(skill, byName, providersById)}
+                        activation={deriveActivation(skill, byName, providersById, providerByCredentialName, setupSkillProviders)}
                       />
                     </div>
                     {skill.description ? (
@@ -288,7 +293,7 @@ export default function SkillsPage() {
                     ) : null}
                   </div>
                   <ActivationPill
-                    activation={deriveActivation(detail, byName, providersById)}
+                    activation={deriveActivation(detail, byName, providersById, providerByCredentialName, setupSkillProviders)}
                   />
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-1.5">
@@ -320,6 +325,8 @@ export default function SkillsPage() {
                   skill={detail}
                   byName={byName}
                   providersById={providersById}
+                  providerByCredentialName={providerByCredentialName}
+                  setupSkillProviders={setupSkillProviders}
                 />
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" disabled={action.isPending} onClick={() => action.mutate({ id: detail.id, op: "test" })}>Test</Button>
@@ -647,47 +654,6 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-type Activation = {
-  label: "active" | "needs setup" | "disabled" | "unsupported";
-  tone: "ok" | "warn" | "neutral" | "danger";
-};
-
-// Compute the effective activation status for the Skills page. The runtime
-// is the source of truth for "is this skill in the agent's set"; we replay
-// the same dependency check here so users see the badge that matches what
-// the agent loop sees. Mirrors src/integrations/connectors/index.ts
-// isSkillActive: a skill is active when every required credential NAME maps to
-// a connector that is healthy OR (when its provider has no probe) configured
-// with unknown health. Without the provider info we'd diverge from the runtime
-// gate for demo / generic providers, which sit at health: "unknown" at rest.
-function deriveActivation(
-  skill: SkillRecord,
-  byName: Map<string, ConnectorRecord[]>,
-  providersById: Map<string, ProviderDescriptor>
-): Activation {
-  if (skill.validationStatus === "unsupported") return { label: "unsupported", tone: "danger" };
-  if (skill.status === "disabled" || skill.status === "archived") return { label: "disabled", tone: "neutral" };
-  const required = skill.requiredCredentials ?? [];
-  if (required.length === 0) return { label: "active", tone: "ok" };
-  for (const credentialName of required) {
-    const matches = byName.get(credentialName) ?? [];
-    const satisfied = matches.some((c) => {
-      // Mirror the runtime gate exactly: only configured records ever
-      // satisfy. Disabled (tombstoned) and error-status records are
-      // excluded even if they carry a stale `health: "healthy"` from
-      // a prior probe. A typed credential whose provider has no probe is
-      // presence-healthy at unknown (no remote signal to refute it).
-      if (c.status !== "configured") return false;
-      if (c.health === "healthy") return true;
-      const hasProbe = Boolean(providersById.get(c.provider)?.hasProbe);
-      if (!hasProbe && c.health === "unknown") return true;
-      return false;
-    });
-    if (!satisfied) return { label: "needs setup", tone: "warn" };
-  }
-  return { label: "active", tone: "ok" };
-}
-
 function ActivationPill({ activation }: { activation: Activation }) {
   const tone = activation.tone === "ok"
     ? "bg-emerald-500/10 text-emerald-600"
@@ -704,13 +670,17 @@ function ActivationPill({ activation }: { activation: Activation }) {
 function ActivationRow({
   skill,
   byName,
-  providersById
+  providersById,
+  providerByCredentialName,
+  setupSkillProviders
 }: {
   skill: SkillRecord;
   byName: Map<string, ConnectorRecord[]>;
   providersById: Map<string, ProviderDescriptor>;
+  providerByCredentialName: Map<string, ProviderDescriptor>;
+  setupSkillProviders: Map<string, ProviderDescriptor>;
 }) {
-  const activation = deriveActivation(skill, byName, providersById);
+  const activation = deriveActivation(skill, byName, providersById, providerByCredentialName, setupSkillProviders);
   return (
     <div className="flex items-center gap-2 text-xs">
       <ActivationPill activation={activation} />
@@ -764,6 +734,19 @@ function providerByCredentialNameMap(providers: ProviderDescriptor[]): Map<strin
   }
   return map;
 }
+
+// Setup-skill NAME → the provider that owns it (google-workspace-setup →
+// google-oauth-desktop). Lets deriveActivation recognize a setup skill's own
+// card so its pill reflects sign-in liveness instead of the unconditional
+// "active" it would get from declaring no requiredCredentials.
+function setupSkillProvidersMap(providers: ProviderDescriptor[]): Map<string, ProviderDescriptor> {
+  const map = new Map<string, ProviderDescriptor>();
+  for (const p of providers) {
+    if (p.setupSkill && !map.has(p.setupSkill)) map.set(p.setupSkill, p);
+  }
+  return map;
+}
+
 
 function countDependentSkills(skills: SkillRecord[], credentialName: string): number {
   let count = 0;

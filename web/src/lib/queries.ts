@@ -186,6 +186,10 @@ export interface ProviderDescriptor {
   // Whether the provider declares a chat-driven setup skill (e.g.
   // google-workspace-setup). Skills page routes these to "Set up via chat".
   hasSetupSkill?: boolean;
+  // The setup skill NAME (e.g. "google-workspace-setup"). Lets the Skills
+  // page match a service skill's required-credential connector to its setup
+  // skill so the service pill defers to the setup card's sign-in status.
+  setupSkill?: string;
   probeIntervalMs?: number;
   // Defaults the Add Connector dialog prefills when this provider is picked
   // as a credential template. Present only for providers whose module

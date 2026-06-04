@@ -35,6 +35,7 @@ import { runMessagingPairingConnect } from "./execution/messaging-pairing-connec
 import { runMessagingRemoveConnect } from "./execution/messaging-remove-connect";
 import { mobileBootstrap, publicState } from "./runtime/views";
 import { checkConnector, createConnector, credentialTemplateForProvider, deleteConnector, firstUngrantedCredential, isSkillActive, updateConnector } from "./integrations/connectors";
+import { gwsSessionStatus } from "./integrations/connectors/gws-session";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
@@ -1261,7 +1262,23 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["POST", /^\/api\/job-runs\/([^/]+)\/replay$/, async (_request, params) => json(await replayJobRun(config, params[0]))],
     ["POST", /^\/api\/jobs\/([^/]+)\/pause$/, async (_request, params) => json(await updateJobStatus(config, params[0], "paused"))],
     ["POST", /^\/api\/jobs\/([^/]+)\/resume$/, async (_request, params) => json(await updateJobStatus(config, params[0], "active"))],
-    ["GET", /^\/api\/connectors$/, () => json(readState(config.instance).connectors)],
+    ["GET", /^\/api\/connectors$/, async () => {
+      const connectors = readState(config.instance).connectors;
+      // Enrich google-oauth-desktop records with the SEPARATE sign-in
+      // liveness signal (from `gws auth status`) so the UI can tell
+      // "client creds provisioned" (health) apart from "user session
+      // valid" (session). Health stays presence-only; this never feeds
+      // the connector.request /complete drop path. Other providers are
+      // returned untouched.
+      const session = connectors.some((c) => c.provider === "google-oauth-desktop")
+        ? await gwsSessionStatus()
+        : undefined;
+      return json(
+        connectors.map((c) =>
+          c.provider === "google-oauth-desktop" && session ? { ...c, session } : c
+        )
+      );
+    }],
     ["GET", /^\/api\/connectors\/providers$/, () => json(listProviders().map((p) => ({
       id: p.id,
       label: p.label,
@@ -1277,6 +1294,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // which can't be inferred from field shape now that all its fields are
       // secret.
       hasSetupSkill: Boolean(p.setupSkill),
+      // The setup skill NAME (e.g. "google-workspace-setup"), so the Skills
+      // page can match a service skill's required-credential connector back
+      // to its setup skill and defer the activation pill to it.
+      setupSkill: p.setupSkill,
       probeIntervalMs: p.probeIntervalMs,
       // Optional credential-template the Add Connector dialog prefills when a
       // provider is picked as a template. Derived from the module's secret
