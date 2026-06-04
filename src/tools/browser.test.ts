@@ -2242,6 +2242,41 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
+  // A session can exist but still sit on about:blank (or another non-http(s)
+  // page) when nothing real has been navigated to yet. That can't host a
+  // sign-in wall, so the navigate-first guard must still refuse — same as a
+  // missing session.
+  test("refuses when the only session is on about:blank", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-blank");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect blank", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "about:blank",
+      close: () => Promise.resolve()
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_blank_1",
+      JSON.stringify({ reason: "Sign in somewhere" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("browser_navigate");
+    expect(readState(config.instance).setupRequests.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
   // End-to-end coverage of the dispatch → approval → executor path. The
   // dispatch must surface a pending approval; once the user approves
   // (here via decideApproval, the same code path /approvals/<id>/approve

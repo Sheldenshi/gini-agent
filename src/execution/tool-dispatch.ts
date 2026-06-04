@@ -302,9 +302,12 @@ export async function dispatchToolCall(
       // the browser invisibly AFTER browser_close (post sign-in), so it has no
       // live session by design. The cold-call misuse is always headless-unset.
       const headlessReconnect = args.headless === true;
-      const liveUrl = peekCurrentBrowserUrl(taskId);
-      const hasOpenPage =
-        typeof liveUrl === "string" && liveUrl.length > 0 && liveUrl !== "about:blank";
+      // "Open page" means a live session on a real http(s) URL — the same
+      // notion browser_fill_secrets uses. sanitizeUrlForAuditTarget returns
+      // undefined when there's no session, the page is about:blank, or the
+      // scheme isn't http(s) (chrome://, data:, …) — none of which can host a
+      // sign-in wall to clear.
+      const hasOpenPage = sanitizeUrlForAuditTarget(peekCurrentBrowserUrl(taskId)) !== undefined;
       if (!headlessReconnect && !hasOpenPage) {
         return {
           kind: "sync",
