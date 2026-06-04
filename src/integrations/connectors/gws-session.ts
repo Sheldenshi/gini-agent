@@ -68,32 +68,51 @@ function notInstalled(): GwsSessionStatus {
 // Machine-global cache. Sign-in liveness is a property of the local gws
 // install, not of any one instance or connector, so a single ~15s-TTL cache
 // keeps repeated /api/connectors and list_connectors calls from spawning gws
-// on every request.
+// on every request. We cache the in-flight PROMISE (not just the resolved
+// value) so a burst of concurrent callers shares one spawn instead of forking
+// one `gws` each.
 const TTL_MS = 15_000;
-let cached: { at: number; value: GwsSessionStatus } | undefined;
+// `gws auth status` is a local status read — sub-second in practice. Bound it
+// anyway: a token-refresh network call, a wedged child, or a slow `zsh -lc`
+// profile could otherwise hang the connectors list until the HTTP idle timeout.
+const SPAWN_TIMEOUT_MS = 4_000;
+let cached: { at: number; promise: Promise<GwsSessionStatus> } | undefined;
 
-// Resolve the current Google Workspace sign-in liveness. Cached ~15s. Runs
-// `gws auth status` through a login shell so gws is on PATH (mirroring how
-// terminal_exec spawns in src/agent.ts). gws missing / command error /
-// non-JSON output → installed:false.
-export async function gwsSessionStatus(): Promise<GwsSessionStatus> {
+// Resolve the current Google Workspace sign-in liveness. Cached ~15s. gws
+// missing / command error / timeout / non-JSON output → installed:false. Never
+// rejects, so callers (GET /api/connectors, list_connectors) stay best-effort.
+export function gwsSessionStatus(): Promise<GwsSessionStatus> {
   const now = Date.now();
-  if (cached && now - cached.at < TTL_MS) return cached.value;
-  let value: GwsSessionStatus;
+  if (cached && now - cached.at < TTL_MS) return cached.promise;
+  const promise = runGwsAuthStatus();
+  cached = { at: now, promise };
+  return promise;
+}
+
+// Runs `gws auth status` through a login shell so gws is on PATH (mirroring how
+// terminal_exec spawns in src/agent.ts), bounded by a kill-on-timeout. stdin is
+// ignored so neither the login shell nor gws can block waiting on input.
+async function runGwsAuthStatus(): Promise<GwsSessionStatus> {
   try {
     const proc = spawn(["zsh", "-lc", "gws auth status"], {
+      stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
       env: { ...process.env }
     });
-    const stdout = await new Response(proc.stdout).text();
-    await proc.exited;
-    value = parseGwsAuthStatus(stdout);
+    const timeout = setTimeout(() => {
+      try { proc.kill(); } catch { /* already exited */ }
+    }, SPAWN_TIMEOUT_MS);
+    try {
+      const stdout = await new Response(proc.stdout).text();
+      await proc.exited;
+      return parseGwsAuthStatus(stdout);
+    } finally {
+      clearTimeout(timeout);
+    }
   } catch {
-    value = notInstalled();
+    return notInstalled();
   }
-  cached = { at: now, value };
-  return value;
 }
 
 // Test seam: drop the cache so a unit test can assert fresh behavior.
