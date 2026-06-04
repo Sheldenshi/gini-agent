@@ -1616,10 +1616,12 @@ export interface PairingRequest {
   id: string;
   instance: Instance;
   code: string;
-  // hashSecret(binding secret). The binding secret is set as an HttpOnly cookie
-  // on the requesting browser at creation and re-sent on poll/cancel, so only
-  // the browser that created the request can claim its approved session or
-  // cancel it — knowing the request id alone is not enough.
+  // hashSecret(binding secret). The binding secret is returned to the requester at
+  // creation — to a browser as an HttpOnly `gini_pair` cookie, to a verified native
+  // client (the mobile app) in the response body — and re-sent on poll/claim/cancel
+  // (cookie for browsers, `X-Gini-Pair-Secret` header for native), so only the
+  // requester that created the request can claim its approved session or cancel it;
+  // knowing the request id alone is not enough.
   bindHash: string;
   status: PairingRequestStatus;
   // Human-readable label derived from the User-Agent (e.g. "Safari · iPhone").
