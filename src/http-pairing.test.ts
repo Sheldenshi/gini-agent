@@ -473,6 +473,23 @@ describe("pairing routes — rate limit + pending cap", () => {
     expect(last).toBe(429);
   });
 
+  test("the legacy code-claim endpoint is rate limited per host", async () => {
+    const { handler } = makeHandler("pair-claim-ratelimit");
+    setSystemTime(new Date("2025-01-01T00:00:00.000Z"));
+    // Each wrong code is a 400, but it still consumes a claim token; with the
+    // clock frozen the bucket (capacity 10) never refills, so the 11th attempt
+    // from the same host trips the limiter before the claim is even attempted.
+    let last = 0;
+    for (let i = 0; i < 11; i++) {
+      const res = await pair(handler, "/api/pairing/claim", {
+        method: "POST",
+        body: { code: "000000", deviceName: "brute" }
+      });
+      last = res.status;
+    }
+    expect(last).toBe(429);
+  });
+
   test("the pending cap maps to 429", async () => {
     const { config, handler } = makeHandler("pair-pendingcap");
     const relay = RELAY("pair-pendingcap");

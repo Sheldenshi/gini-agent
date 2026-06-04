@@ -6,7 +6,10 @@
 
 // Parse a `Cookie:` request header into a name→value map. Tolerates missing
 // header, stray whitespace, and `=` inside values (only the first `=` splits a
-// pair). Values are URL-decoded; names are taken verbatim. Later duplicates win.
+// pair). Values are URL-decoded; names are taken verbatim. Later duplicates win
+// — safe here because the credential cookies (gini_session/gini_pair) are
+// validated against hashed server-stored secrets downstream, so a smuggled
+// duplicate can't be forged into a valid value and the gate fails closed.
 export function parseCookies(header: string | null | undefined): Record<string, string> {
   const out: Record<string, string> = {};
   if (!header) return out;

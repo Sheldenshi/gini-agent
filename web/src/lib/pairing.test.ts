@@ -68,9 +68,9 @@ describe("pairing fetchers", () => {
   });
 
   test("claimPairingRequest POSTs /request/:id/claim", async () => {
-    stubFetch({ status: "approved" });
+    stubFetch({ ok: true });
     const out = await claimPairingRequest("xyz");
-    expect(out).toEqual({ status: "approved" });
+    expect(out).toEqual({ ok: true });
     expect(lastCall?.url).toBe("/api/pairing/request/xyz/claim");
     expect(lastCall?.init.method).toBe("POST");
     expect(lastCall?.init.body).toBe("{}");

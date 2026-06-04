@@ -86,6 +86,16 @@ describe("proxy loopback setup gate", () => {
     expect(res.headers.get("location")).toBeNull();
   });
 
+  test("loopback + a /pair-prefixed route like /pairing IS still gated (exact match, not prefix)", async () => {
+    // The /pair exemption must be exact (/pair or /pair/*), not a broad prefix,
+    // so a future /pairing route is not accidentally exempted from the setup gate.
+    stubSetupStatus(false);
+    const res = await proxy(makeRequest({ url: "http://localhost/pairing", host: "localhost", secFetchDest: "document" }));
+    expect(res.status).toBeGreaterThanOrEqual(300);
+    expect(res.status).toBeLessThan(400);
+    expect(res.headers.get("location")).toContain("/setup");
+  });
+
   test("loopback + unconfigured provider → redirect to /setup (top-level navigation)", async () => {
     stubSetupStatus(false);
     const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost", secFetchDest: "document" }));

@@ -610,6 +610,12 @@ export function createPairingCode(
   return { pairing, code };
 }
 
+// Default capability scopes for a newly paired device/session. Shared by both
+// claimPairingCode (code-claimed mobile devices) and claimPairingRequest (relay
+// cookie sessions) so the two grant an identical surface and can't silently
+// drift when one is updated.
+const DEFAULT_SESSION_SCOPES = ["tasks:read", "tasks:write", "approvals:write", "state:read"];
+
 export function claimPairingCode(
   state: RuntimeState,
   code: string,
@@ -628,7 +634,7 @@ export function claimPairingCode(
     name: deviceName.trim() || "Unnamed device",
     tokenHash: hashSecret(token),
     status: "active",
-    scopes: ["tasks:read", "tasks:write", "approvals:write", "state:read"],
+    scopes: [...DEFAULT_SESSION_SCOPES],
     createdAt: at,
     updatedAt: at
   };
@@ -686,11 +692,6 @@ export function findActiveDeviceByToken(state: RuntimeState, token: string): Pai
   device.updatedAt = device.lastSeenAt;
   return device;
 }
-
-// Scopes granted to a browser session minted through the relay pairing flow.
-// Mirrors claimPairingCode's default device scope set so cookie sessions and
-// code-claimed mobile devices carry the same capability surface.
-const DEFAULT_SESSION_SCOPES = ["tasks:read", "tasks:write", "approvals:write", "state:read"];
 
 // Default relay-browser session lifetime. Bearer/mobile devices (claimed via
 // createPairingCode/claimPairingCode) have no expiry; relay browser sessions

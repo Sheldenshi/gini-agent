@@ -17,6 +17,7 @@
 // PairRequestsPanel.test, which mocks the same specifier's hook exports.
 
 import { afterEach, beforeEach, describe, expect, jest, mock, test } from "bun:test";
+import { StrictMode } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { PairingRequestStatus } from "@/lib/pairing";
@@ -248,5 +249,75 @@ describe("PairPage", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => expect(screen.queryByText("999000")).not.toBeNull());
+  });
+
+  test("creates exactly once under React Strict Mode's double mount", async () => {
+    // Strict Mode (Next dev) double-invokes the mount effect; without the
+    // createdRef once-guard that would fire two POST /api/pairing/request,
+    // orphaning a pending slot and racing two codes/cookies.
+    let creates = 0;
+    globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
+      const url = String(input);
+      const method = (init.method ?? "GET").toUpperCase();
+      if (url.endsWith("/api/pairing/request") && method === "POST") {
+        creates += 1;
+        return jsonResponse({ body: { id: "req-1", code: "428913" } });
+      }
+      return jsonResponse({ body: { status: "pending" } });
+    }) as unknown as typeof fetch;
+    render(
+      <StrictMode>
+        <PairPage />
+      </StrictMode>
+    );
+    await waitFor(() => expect(screen.queryByText("428913")).not.toBeNull());
+    await flush();
+    expect(creates).toBe(1);
+  });
+
+  test("a Cancel during an in-flight approved poll does not pair the device", async () => {
+    // Isolates the activeRef guard: the poll tick is parked mid-await when Cancel
+    // fires; cancel() is itself held awaiting its response, so setPhase('cancelled')
+    // hasn't run and the closure `cancelled` flag is still false. Only the
+    // synchronously-flipped activeRef can stop the resumed tick from claiming.
+    jest.useFakeTimers();
+    const pollGate = Promise.withResolvers<{ status: PairingRequestStatus }>();
+    const cancelGate = Promise.withResolvers<{ ok: true }>();
+    let claimCalls = 0;
+    globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
+      const url = String(input);
+      const method = (init.method ?? "GET").toUpperCase();
+      if (url.endsWith("/api/pairing/request") && method === "POST") {
+        return jsonResponse({ body: { id: "req-1", code: "428913" } });
+      }
+      if (url.includes("/claim") && method === "POST") {
+        claimCalls += 1;
+        return jsonResponse({ body: { ok: true } });
+      }
+      if (url.includes("/cancel") && method === "POST") {
+        return { ok: true, status: 200, json: async () => cancelGate.promise } as Response;
+      }
+      // poll GET: resolves only when we release pollGate, after Cancel is clicked.
+      return { ok: true, status: 200, json: async () => pollGate.promise } as Response;
+    }) as unknown as typeof fetch;
+
+    render(<PairPage />);
+    await flush();
+    expect(screen.queryByText("428913")).not.toBeNull();
+    // Fire one poll tick; it parks awaiting the still-pending poll response.
+    await act(async () => {
+      jest.advanceTimersByTime(POLL_MS);
+    });
+    const user = userEvent.setup({ advanceTimers: jest.advanceTimersByTime });
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    // Approval lands now. Without the guard this would claim + location.assign("/").
+    pollGate.resolve({ status: "approved" });
+    await flush();
+    expect(claimCalls).toBe(0);
+    expect(assignSpy).not.toHaveBeenCalled();
+    // Let cancel finish and assert the terminal cancelled view.
+    cancelGate.resolve({ ok: true });
+    await flush();
+    await waitFor(() => expect(screen.queryByText("Pairing cancelled")).not.toBeNull());
   });
 });

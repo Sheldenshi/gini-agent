@@ -46,6 +46,17 @@ export default function PairPage() {
   // terminal phase, or before starting a fresh request.
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Guards the mount effect against React Strict Mode (Next dev) double-invoking
+  // it, which would otherwise fire two POST /api/pairing/request — orphaning one
+  // pending slot and racing two codes/cookies. User-initiated retries call
+  // startRequest directly and are unaffected.
+  const createdRef = useRef(false);
+
+  // Flipped false synchronously by cancel() (before any await) so an in-flight
+  // poll/claim tick that resumes during the cancel round-trip can't pair the
+  // device after the user clicked Cancel. startRequest re-arms it.
+  const activeRef = useRef(true);
+
   const stopPolling = useCallback(() => {
     if (pollRef.current !== null) {
       clearInterval(pollRef.current);
@@ -57,6 +68,7 @@ export default function PairPage() {
   // poll is torn down first so we never run two loops at once.
   const startRequest = useCallback(async () => {
     stopPolling();
+    activeRef.current = true;
     setError(null);
     setId(null);
     setCode(null);
@@ -72,8 +84,11 @@ export default function PairPage() {
     }
   }, [stopPolling]);
 
-  // Mount once: kick off the first request.
+  // Mount once: kick off the first request. The createdRef guard makes this
+  // exactly-once even under Strict Mode's double mount in dev.
   useEffect(() => {
+    if (createdRef.current) return;
+    createdRef.current = true;
     void startRequest();
     return () => stopPolling();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -90,7 +105,7 @@ export default function PairPage() {
     const tick = async () => {
       try {
         const { status } = await pollPairingRequest(id);
-        if (cancelled) return;
+        if (cancelled || !activeRef.current) return;
         if (status === "approved") {
           // Hand off to the dedicated claim effect below. We must NOT claim
           // inline here: setPhase("claiming") re-runs THIS effect, whose
@@ -112,7 +127,7 @@ export default function PairPage() {
         }
         // "pending" / "claimed" → keep waiting.
       } catch (e) {
-        if (cancelled) return;
+        if (cancelled || !activeRef.current) return;
         // A 404 (request gone/expired) or 403 (binding mismatch — e.g. another
         // /pair tab overwrote this browser's gini_pair cookie) is terminal for
         // THIS request: stop polling and surface a restartable state instead of
@@ -146,7 +161,7 @@ export default function PairPage() {
     void (async () => {
       try {
         await claimPairingRequest(id);
-        if (cancelled) return;
+        if (cancelled || !activeRef.current) return;
         setPhase("paired");
         // The claim set the gini_session cookie; a full reload re-enters the
         // app authenticated instead of bouncing back to /pair.
@@ -163,6 +178,9 @@ export default function PairPage() {
   }, [phase, id]);
 
   const cancel = useCallback(async () => {
+    // Disarm synchronously, before any await, so a poll/claim tick already
+    // mid-flight bails instead of pairing the device after this cancel.
+    activeRef.current = false;
     stopPolling();
     if (!id) {
       setPhase("cancelled");

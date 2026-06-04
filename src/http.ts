@@ -1608,6 +1608,15 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // predicate gates WS routing in src/server.ts so the two can't drift.
     if (!isWebProxyPath(url.pathname)) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
+        // This legacy code-claim endpoint is public (it predates the bearer gate)
+        // and, now that the gateway is the relay-facing front, reachable from the
+        // internet. The code is a 6-digit value, so without throttling an
+        // attacker could brute-force a pending code within its TTL to mint a
+        // device bearer. Rate-limit it the same way the new request flow is
+        // gated; a legitimate single mobile/CLI claim stays well under capacity.
+        if (!pairingClaimAllowed(request)) {
+          return withCors(request, json({ error: "Too many pairing attempts. Try again shortly." }, 429));
+        }
         try {
           return withCors(request, json(await claimPairing(config, await body(request)), 201));
         } catch (error) {
@@ -1660,6 +1669,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // stay reachable so a new device can run the handshake. See ADR
     // device-pairing-auth.md.
     const webHost = request.headers.get("host") ?? url.host;
+    let gatedSessionToken: string | undefined;
     if (relaySessionGateRequired(webHost, url.pathname)) {
       const sessionToken = cookieValue(request, SESSION_COOKIE);
       if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
@@ -1670,8 +1680,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // Refresh last-seen on full page loads only (not every asset) so the
       // Active Sessions list stays current without per-request writes.
       if (request.headers.get("sec-fetch-dest") === "document") void touchPairedSession(config, sessionToken);
+      // Carry the validated token into proxyWeb so a long-lived SSE stream can be
+      // re-validated and torn down if this session is revoked mid-stream — the
+      // gate only runs once per connection, so without this an open event stream
+      // would outlive a revocation. Loopback (un-gated) needs no such check.
+      gatedSessionToken = sessionToken;
     }
-    return proxyWeb(request, url, config);
+    return proxyWeb(request, url, config, gatedSessionToken);
   };
 }
 
@@ -1742,7 +1757,36 @@ function proxyFallback(request: Request, url: URL, config: RuntimeConfig): Respo
   return runtimeBanner(request, config);
 }
 
-async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
+// How often a relay-gated SSE stream re-checks that its session is still valid.
+// The relay gate validates once at connect time; a revocation must also tear
+// down an already-open stream, so we re-resolve the session on this cadence and
+// abort the proxied connection when it's gone — bounding the post-revoke leak.
+// Overridable via env so tests can shrink the cadence instead of waiting 5s.
+function sessionRevalidateMs(): number {
+  const raw = Number(process.env.GINI_SESSION_REVALIDATE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5000;
+}
+
+// Drop the gateway's own cookies from a forwarded Cookie header, preserving all
+// other cookie segments verbatim (no decode/re-encode, so arbitrary inner-app
+// cookie values can't be corrupted).
+function stripGatewayCookies(headers: Headers): void {
+  const raw = headers.get("cookie");
+  if (!raw) return;
+  const kept = raw
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => {
+      if (!part) return false;
+      const eq = part.indexOf("=");
+      const name = (eq < 0 ? part : part.slice(0, eq)).trim();
+      return !GATEWAY_ONLY_COOKIES.has(name);
+    });
+  if (kept.length > 0) headers.set("cookie", kept.join("; "));
+  else headers.delete("cookie");
+}
+
+async function proxyWeb(request: Request, url: URL, config: RuntimeConfig, sessionToken?: string): Promise<Response> {
   const port = await resolveWebPort(config);
   if (port === null) return proxyFallback(request, url, config);
   const target = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
@@ -1754,6 +1798,7 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
   const headers = new Headers(request.headers);
   headers.set("host", `127.0.0.1:${port}`);
   if (headers.has("origin")) headers.set("origin", `http://127.0.0.1:${port}`);
+  stripGatewayCookies(headers);
   // decompress: false tells Bun not to auto-decompress the upstream response.
   // That keeps Content-Encoding and Content-Length consistent so the browser
   // can decompress normally. Without it, Bun decompresses the body but leaves
@@ -1764,7 +1809,21 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
     redirect: "manual",
     decompress: false,
   };
-  if (request.signal) init.signal = request.signal;
+  // For a relay-gated request, drive the upstream fetch from our own
+  // AbortController (chained to the client's signal) so the stream re-validator
+  // below can abort the upstream connection on revocation. Un-gated (loopback)
+  // requests pass the client's signal straight through, unchanged.
+  let ac: AbortController | null = null;
+  if (sessionToken) {
+    ac = new AbortController();
+    if (request.signal) {
+      if (request.signal.aborted) ac.abort();
+      else request.signal.addEventListener("abort", () => ac!.abort(), { once: true });
+    }
+    init.signal = ac.signal;
+  } else if (request.signal) {
+    init.signal = request.signal;
+  }
   if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
   try {
     const upstream = await fetch(target, init);
@@ -1780,6 +1839,20 @@ async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Prom
       const headers = new Headers(upstream.headers);
       headers.set("location", location.slice(loopbackBase.length) || "/");
       return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+    }
+    // Re-validate long-lived relay SSE streams: a revoked/expired session must
+    // not keep receiving events just because its connection opened while valid.
+    // Poll the session on an interval and abort the proxied connection when it
+    // resolves to nothing; the browser then reconnects and the gate refuses it.
+    if (ac && upstream.body && (upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      const controller = ac;
+      const interval = setInterval(() => {
+        if (!resolveSessionFromCookie(config, sessionToken!)) controller.abort();
+      }, sessionRevalidateMs());
+      const clearTimer = () => clearInterval(interval);
+      controller.signal.addEventListener("abort", clearTimer, { once: true });
+      const body = upstream.body.pipeThrough(new TransformStream({ flush: clearTimer }));
+      return new Response(body, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
     }
     return upstream;
   } catch {
@@ -2188,8 +2261,19 @@ async function rollbackIdentityFile(
 // See ADR device-pairing-auth.md. gini_pair carries the per-request binding
 // secret (scoped to /api/pairing so it only rides pairing calls); gini_session
 // carries the minted session token (scoped to the whole app).
+// Plain cookie names (no `__Host-` prefix) are deliberate: `__Host-` mandates
+// Secure, but pairingCookieSecure() sets Secure conditionally so a plain-http
+// GINI_TRUSTED_ORIGINS front can still pair (see ADR device-pairing-auth.md).
+// The protections `__Host-` would enforce are already met independently — the
+// cookies are host-only (no Domain) and Path-scoped, and Secure is set on every
+// secure transport.
 const PAIR_BIND_COOKIE = "gini_pair";
 export const SESSION_COOKIE = "gini_session";
+// Gateway-owned cookies that must never reach the inner web child: it is
+// relay-agnostic and authenticates via the BFF's owner bearer, never these, so
+// stripping them (in proxyWeb) keeps the pairing credentials from crossing into
+// the inner app.
+const GATEWAY_ONLY_COOKIES = new Set([SESSION_COOKIE, PAIR_BIND_COOKIE]);
 // Derived from the single source of truth so the cookie Max-Age and the
 // server-side device.expiresAt can't drift apart.
 const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
@@ -2202,12 +2286,19 @@ const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
 // createPairingRequest (see src/state/records.ts), not here.
 const pairingHostLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
 const pairingGlobalLimiter = new RateLimiter({ capacity: 40, refillPerSec: 40 / 60 });
+// Separate buckets for the legacy public code-claim endpoint so brute-force
+// attempts there can't be confused with (or starve) the request-create budget,
+// and vice versa. Same capacity/refill shape — a real claim is a single POST.
+const pairingClaimHostLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
+const pairingClaimGlobalLimiter = new RateLimiter({ capacity: 40, refillPerSec: 40 / 60 });
 
 // Test hook: drop the in-process pairing limiter buckets so a test file's many
 // create calls don't deplete the shared module-level buckets across tests.
 export function resetPairingLimiters(): void {
   pairingHostLimiter.reset();
   pairingGlobalLimiter.reset();
+  pairingClaimHostLimiter.reset();
+  pairingClaimGlobalLimiter.reset();
 }
 
 const sessionCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/" };
@@ -2232,6 +2323,11 @@ function pairingCreateAllowed(request: Request): boolean {
   const host = request.headers.get("host") ?? new URL(request.url).host;
   // Both buckets must admit the request; consume per-host first, then global.
   return pairingHostLimiter.tryConsume(host) && pairingGlobalLimiter.tryConsume("global");
+}
+
+function pairingClaimAllowed(request: Request): boolean {
+  const host = request.headers.get("host") ?? new URL(request.url).host;
+  return pairingClaimHostLimiter.tryConsume(host) && pairingClaimGlobalLimiter.tryConsume("global");
 }
 
 // Paths an UNPAIRED relay browser may still reach so it can run the pairing
@@ -2342,7 +2438,10 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       return json({ error: result.reason }, code);
     }
     const secure = pairingCookieSecure(request, host);
-    const response = json({ status: "approved" });
+    // The request is now "claimed"; the success signal is the 200 + the
+    // gini_session Set-Cookie below, not the body. Return a neutral { ok: true }
+    // (matching the cancel handler) rather than a stale status literal.
+    const response = json({ ok: true });
     response.headers.append(
       "set-cookie",
       serializeCookie(SESSION_COOKIE, result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })

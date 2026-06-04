@@ -4,7 +4,7 @@ import { createHandler } from "./http";
 import { webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
 import { dirname } from "node:path";
-import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat, sanitizeFilename } from "./state";
+import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, isPlausibleMime, mutateState, readState, readTrace, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -886,6 +886,110 @@ describe("runtime api", () => {
     } finally {
       await upstream.stop(true);
       clearWebTargetCache(config.instance);
+    }
+  });
+
+  // Gateway-owned pairing cookies must not cross into the inner web child, which
+  // is relay-agnostic and authenticates via the BFF bearer. Other cookies pass.
+  test("proxyWeb strips gini_session/gini_pair from the forwarded Cookie header", async () => {
+    const config = testConfig("web-proxy-cookie-strip");
+    const handler = createHandler(config);
+    const captured: { cookie: string | null } = { cookie: null };
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        captured.cookie = req.headers.get("cookie");
+        return new Response("ok");
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      // Loopback front (un-gated), so the request reaches proxyWeb directly with
+      // a Cookie carrying both a gateway cookie and an unrelated app cookie.
+      await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`, {
+        headers: {
+          origin: `http://127.0.0.1:${config.port}`,
+          cookie: "gini_session=sekret; theme=dark; gini_pair=bindy"
+        }
+      }));
+      expect(captured.cookie).toBe("theme=dark");
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+    }
+  });
+
+  // The relay session gate validates gini_session once at connect time; an open
+  // SSE stream must still be torn down when the session is revoked mid-stream,
+  // or a revoked relay device would keep receiving the owner's event feed.
+  test("proxyWeb tears down a relay SSE stream when its session is revoked", async () => {
+    process.env.GINI_SESSION_REVALIDATE_MS = "20";
+    const config = testConfig("web-proxy-sse-revoke");
+    const handler = createHandler(config);
+    const relay = "sse.gini-relay.lilaclabs.ai";
+    // Mint an active relay session (request → approve → claim) and grab its token.
+    const minted = await mutateState(config.instance, (state) => {
+      const req = createPairingRequest(state, { userAgent: "Mozilla/5.0 Safari", relayHost: relay, bindSecret: "bindy" });
+      approvePairingRequest(state, req.id);
+      const claimed = claimPairingRequest(state, req.id, "bindy");
+      if (!claimed.ok) throw new Error("mint failed");
+      return { token: claimed.token, deviceId: claimed.device.id };
+    });
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        // A long-lived SSE: emit one comment, then hold the connection open.
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(": open\n\n"));
+          }
+        });
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      const res = await handler(new Request(`http://127.0.0.1:${config.port}/api/runtime/events/stream`, {
+        headers: {
+          host: relay,
+          origin: `https://${relay}`,
+          "sec-fetch-site": "same-origin",
+          cookie: `gini_session=${encodeURIComponent(minted.token)}`
+        }
+      }));
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const reader = res.body!.getReader();
+      await reader.read(); // first chunk arrives while the session is valid
+      // Revoke mid-stream; the re-validation tick (20ms) must abort the stream.
+      await mutateState(config.instance, (state) => revokeDevice(state, minted.deviceId));
+      let ended = false;
+      try {
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) { ended = true; break; }
+        }
+      } catch {
+        ended = true; // aborted upstream surfaces as a stream error — also terminal
+      }
+      expect(ended).toBe(true);
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+      delete process.env.GINI_SESSION_REVALIDATE_MS;
     }
   });
 

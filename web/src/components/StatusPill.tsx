@@ -16,6 +16,7 @@ const TONES: Record<string, string> = {
   rejected: "bg-red-500/10 text-red-400 border-red-500/30",
   conflicted: "bg-red-500/10 text-red-400 border-red-500/30",
   cancelled: "bg-zinc-500/10 text-zinc-400 border-zinc-500/30",
+  expired: "bg-zinc-500/10 text-zinc-400 border-zinc-500/30",
   paused: "bg-zinc-500/10 text-zinc-400 border-zinc-500/30",
   archived: "bg-zinc-500/10 text-zinc-400 border-zinc-500/30",
   proposed: "bg-violet-500/10 text-violet-400 border-violet-500/30",

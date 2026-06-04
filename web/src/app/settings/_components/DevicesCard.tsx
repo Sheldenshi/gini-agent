@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { PairDeviceDialog } from "@/components/pairing/PairDeviceDialog";
+import { effectiveStatus } from "./deviceStatus";
 
 export interface DeviceRow { id: string; name: string; status: string; origin?: string; lastSeenAt?: string; expiresAt?: string }
 
@@ -40,7 +41,7 @@ export function DevicesCard({
         <div className="flex items-center justify-between gap-2">
           <div>
             <CardTitle className="text-sm">Active sessions</CardTitle>
-            <CardDescription>{devices.filter((d) => d.status === "active").length} active</CardDescription>
+            <CardDescription>{devices.filter((d) => effectiveStatus(d) === "active").length} active</CardDescription>
           </div>
           <div className="flex gap-2">
             <Button size="sm" variant="outline" disabled={createPending} onClick={onCreatePairing}>
@@ -71,7 +72,7 @@ export function DevicesCard({
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
-                  <StatusPill value={item.status} />
+                  <StatusPill value={effectiveStatus(item)} />
                   <Button
                     size="sm"
                     variant="outline"

@@ -46,7 +46,11 @@ that omit it are non-browsers (which should hit the gateway directly
 with their own token).
 
 `Sec-Fetch-Site` is checked as a secondary signal — it must be
-`same-origin`, `none`, or absent.
+`same-origin`, `none`, or absent, except for a top-level page navigation
+(`Sec-Fetch-Dest: document`), which is exempt so a user can open the
+tunnel URL from a cross-site link without being refused. The cross-site
+check still applies to credentialed subresources and fetches (any
+non-`document` destination), which is where the data-leak risk lives.
 
 The browser never receives the gateway bearer token; the BFF reads it
 server-side from the per-instance `config.json` and adds it to the
@@ -86,8 +90,10 @@ machine, and cannot rebind a relay subdomain because the relay (not the
 operator's resolver) owns those names. So a relay `Host` is as
 trustworthy as a loopback `Host`: it can only be present on a request
 that actually arrived through the operator's own tunnel. `Sec-Fetch-Site`
-still applies as the secondary signal — a genuine cross-site request
-through the tunnel front is rejected just as it is on the other lanes.
+still applies as the secondary signal — a genuine cross-site *subresource*
+request through the tunnel front is rejected just as it is on the other
+lanes, while a top-level document navigation is exempt (following a
+cross-site link to the tunnel URL is a legitimate way to reach it).
 
 ## Consequences
 
@@ -118,7 +124,8 @@ The gateway fronts the BFF as a single origin (ADR
 authoritative trust front. For every web-bound request (non-`/api` and
 `/api/runtime/*`) the gateway runs the host/origin guard
 (`webBoundRequestAllowed` in `src/lib/origin-trust.ts`) — the loopback /
-gini-relay / `GINI_TRUSTED_ORIGINS` lanes plus the `Sec-Fetch-Site` check — and
+gini-relay / `GINI_TRUSTED_ORIGINS` lanes plus the `Sec-Fetch-Site` check (with
+the top-level-navigation exemption) — and
 only then reverse-proxies to the Next.js BFF, rewriting `Host` and `Origin` to
 loopback on the way. The BFF therefore always sees an internal loopback request:
 it keeps its own loopback/allowlist guard as defense-in-depth for direct access

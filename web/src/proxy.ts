@@ -127,9 +127,17 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
     // /pair is the device-pairing entry point and, like /setup, must render
     // regardless of provider-setup state — otherwise an unpaired relay device
     // bounces /pair -> /setup (here) while the gateway bounces /setup -> /pair
-    // (its relay session gate), an infinite redirect. See ADR
-    // device-pairing-auth.md.
-    if (isPageNav && !pathname.startsWith("/setup") && !pathname.startsWith("/pair") && !pathname.startsWith("/api/")) {
+    // (its relay session gate), an infinite redirect. Match /pair exactly (and
+    // /pair/*), NOT a broad prefix, so a future /pairing route isn't also
+    // exempted from the setup gate (mirrors AppShell.tsx and providers.tsx).
+    // See ADR device-pairing-auth.md.
+    if (
+      isPageNav
+      && !pathname.startsWith("/setup")
+      && pathname !== "/pair"
+      && !pathname.startsWith("/pair/")
+      && !pathname.startsWith("/api/")
+    ) {
       const configured = await isProviderConfigured();
       if (configured === false) {
         // The gateway rewrites Host to loopback before proxying, so this absolute

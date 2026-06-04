@@ -53,7 +53,7 @@ export function createPairingRequest(): Promise<{ id: string; code: string }> {
 export function pollPairingRequest(id: string): Promise<{ status: PairingRequestStatus }> {
   return pairingFetch(`/request/${encodeURIComponent(id)}`);
 }
-export function claimPairingRequest(id: string): Promise<{ status: "approved" }> {
+export function claimPairingRequest(id: string): Promise<{ ok: true }> {
   return pairingFetch(`/request/${encodeURIComponent(id)}/claim`, { method: "POST", body: "{}" });
 }
 export function cancelPairingRequest(id: string): Promise<{ ok: true }> {
