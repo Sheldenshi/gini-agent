@@ -134,7 +134,13 @@ function hostOriginTrusted(origin: string | null, isUnsafe: boolean, expectedHos
   } catch {
     return false;
   }
-  if (isRelayHost(originUrl.host)) return true;
+  // A relay Origin is trusted only when it equals the inbound relay Host — i.e.
+  // a request to a relay subdomain whose page is that SAME subdomain. Trusting
+  // any relay Origin regardless of Host would let one relay subdomain (an
+  // attacker's) ride a same-site cookie to another subdomain (the victim's),
+  // since all *.<relayDomain> share one registrable domain. Match the Origin==Host
+  // discipline the loopback/allowlist lanes use.
+  if (isRelayHost(originUrl.host) && isRelayHost(expectedHost) && originUrl.host === expectedHost) return true;
   if (isLoopbackHost(expectedHost) && isLoopbackHost(originUrl.host)) return true;
   const allowlist = trustedOrigins();
   if (allowlist) return allowlist.has(`${originUrl.protocol}//${originUrl.host}`);

@@ -72,7 +72,13 @@ Stable local clients use the gateway API:
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
-Native gateway `/api/*` routes require `Authorization: Bearer <token>` except health checks, the limited SSE token compatibility path, and the device-pairing routes under `/api/pairing/*`. Pairing has its own trust model (see [ADR: Device-pairing authentication](adr/device-pairing-auth.md)): `POST /api/pairing/claim` and the device routes (`POST /api/pairing/request`, `GET /api/pairing/request/:id`, `POST /api/pairing/request/:id/{claim,cancel}`) are public/rate-limited and bound to the single-use `gini_pair` cookie rather than a bearer; the operator routes (`GET /api/pairing/requests`, `POST /api/pairing/requests/:id/{approve,reject}`) are loopback-only. Separately, web-bound `/api/runtime/*` calls arriving on a non-loopback (relay/allowlisted) front are authenticated by the `gini_session` cookie minted at pairing claim, not a bearer.
+Native gateway `/api/*` routes require `Authorization: Bearer <token>` except health checks, the limited SSE token compatibility path, and the device-pairing routes under `/api/pairing/*`. Pairing has its own trust model (see [ADR: Device-pairing authentication](adr/device-pairing-auth.md)), and the two claim paths are distinct:
+
+- **Legacy code-claim** — `POST /api/pairing/claim` takes a one-time operator-generated code in the request body and returns a `gini_device_<uuid>` bearer token (the mobile/CLI flow). It is public, not `gini_pair`-bound, and not rate-limited.
+- **Relay device-request flow** — `POST /api/pairing/request` (the only rate-limited route), `GET /api/pairing/request/:id`, and `POST /api/pairing/request/:id/{claim,cancel}` are public and bound to the single-use `gini_pair` binding cookie rather than a bearer; `POST /api/pairing/request/:id/claim` sets the `gini_session` cookie instead of returning a bearer.
+- **Operator routes** — `GET /api/pairing/requests` and `POST /api/pairing/requests/:id/{approve,reject}` are loopback-only.
+
+Separately, web-bound `/api/runtime/*` calls arriving on a non-loopback (relay/allowlisted) front are authenticated by the `gini_session` cookie minted at request-claim, not a bearer.
 
 ## Boundaries
 

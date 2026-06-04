@@ -170,6 +170,14 @@ describe("webBoundRequestAllowed — Origin present", () => {
     const sub = "g31.gini-relay.lilaclabs.ai";
     expect(webBoundRequestAllowed(makeReq({ method: "POST", origin: `https://${sub}`, host: sub, secFetchSite: "same-origin", url: `https://${sub}/api/runtime/tunnel` }))).toBe(true);
   });
+  test("a relay Origin from a DIFFERENT subdomain than the Host is refused (cross-subdomain CSRF)", () => {
+    const victim = "victim.gini-relay.lilaclabs.ai";
+    const attacker = "attacker.gini-relay.lilaclabs.ai";
+    // Attacker relay page POSTing to the victim's subdomain — same-site fetch.
+    expect(webBoundRequestAllowed(makeReq({ method: "POST", origin: `https://${attacker}`, host: victim, secFetchSite: "same-site", url: `https://${victim}/api/runtime/x` }))).toBe(false);
+    // Even a top-level document navigation (which skips the Sec-Fetch-Site check) is refused.
+    expect(webBoundRequestAllowed(makeReq({ method: "POST", origin: `https://${attacker}`, host: victim, secFetchDest: "document", url: `https://${victim}/api/x` }))).toBe(false);
+  });
   test("allowlist-matched Origin passes; unmatched is refused", () => {
     process.env.GINI_TRUSTED_ORIGINS = "https://allowed.example";
     expect(webBoundRequestAllowed(makeReq({ method: "POST", origin: "https://allowed.example", host: "allowed.example", url: "https://allowed.example/api/runtime/chat" }))).toBe(true);

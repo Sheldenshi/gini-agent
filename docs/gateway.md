@@ -84,7 +84,7 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 ## Auth
 
-The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
+The gateway uses a per-instance owner bearer token stored in the instance `config.json`; the Next.js BFF reads it server-side and does not expose it to client JavaScript. Paired devices receive their own session tokens through the pairing endpoints — the raw token is returned to the device exactly once (or set as the `gini_session` cookie), and only its hash (`tokenHash`) is persisted, in `state.json` as revocable `PairedDevice` rows under `state.devices` (see [Device-Pairing Authentication](adr/device-pairing-auth.md)).
 
 The trust boundary lives at the **gateway front**. Every web-bound request (non-`/api` traffic and the `/api/runtime/*` BFF namespace) is validated by the gateway before it is reverse-proxied — both read-only GETs (which would otherwise leak RuntimeState contents under DNS rebinding) and mutating POST/PUT/PATCH/DELETEs — and the gateway then rewrites `Host`/`Origin` to loopback so the inner Next.js child is purely internal and relay-agnostic. The gateway accepts a web-bound request when its `Host`/`Origin` is one of:
 

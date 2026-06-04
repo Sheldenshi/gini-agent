@@ -8,7 +8,6 @@ import {
   createPairingRequest,
   findActiveDeviceByToken,
   findActiveSessionByToken,
-  getPairingRequest,
   listPendingPairingRequests,
   pollPairingRequest,
   mutateState,
@@ -109,12 +108,6 @@ export async function requestPairing(
 export async function listPairingRequests(config: RuntimeConfig) {
   const pending = await mutateState(config.instance, (state) => listPendingPairingRequests(state));
   return pending.map(redactPairingRequest);
-}
-
-// Device-facing status poll. Returns the redacted request or null when unknown.
-export async function getPairingRequestStatus(config: RuntimeConfig, id: string) {
-  const request = await mutateState(config.instance, (state) => getPairingRequest(state, id));
-  return request ? redactPairingRequest(request) : null;
 }
 
 // Bind-checked status poll for the requesting device. Requires the gini_pair

@@ -7,7 +7,6 @@ import {
   approvePairing,
   cancelPairing,
   claimPairingSession,
-  getPairingRequestStatus,
   listPairingRequests,
   redactDevice,
   rejectPairing,
@@ -50,13 +49,6 @@ describe("governance pairing wrappers", () => {
     expect("bindHash" in request).toBe(false);
     const pending = await listPairingRequests(config);
     expect(pending.map((r) => r.id)).toContain(request.id);
-  });
-
-  test("getPairingRequestStatus returns the request or null", async () => {
-    const config = testConfig("gov-status");
-    const request = await open(config);
-    expect((await getPairingRequestStatus(config, request.id))?.status).toBe("pending");
-    expect(await getPairingRequestStatus(config, "preq_missing")).toBeNull();
   });
 
   test("approve then claim mints a resolvable session", async () => {
