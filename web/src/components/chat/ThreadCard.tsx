@@ -6,6 +6,7 @@ import { useThread } from "@/lib/queries";
 import type { ThreadSummary } from "@/lib/view-types";
 import { formatRelativeTime, formatMessageTimestamp } from "./relative-time";
 import { agentColor } from "@/lib/agent-visuals";
+import { MarkdownContent } from "./MarkdownContent";
 
 function previewText(block: ChatBlock): string | null {
   if (block.kind === "user_text") return block.text;
@@ -27,7 +28,13 @@ function ReplyRow({ block, agentName }: { block: ChatBlock; agentName: string })
           {formatMessageTimestamp(block.createdAt)}
         </span>
       </div>
-      <p className="text-[13px] font-medium leading-relaxed text-[#C2C2C8]">{text}</p>
+      {isUser ? (
+        <p className="whitespace-pre-wrap text-[13px] font-medium leading-relaxed text-[#C2C2C8]">{text}</p>
+      ) : (
+        <div className="text-[#C2C2C8]">
+          <MarkdownContent text={text} />
+        </div>
+      )}
     </div>
   );
 }
