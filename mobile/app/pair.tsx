@@ -155,12 +155,25 @@ export default function PairScreen() {
     // Switching an already-paired app to a different relay host needs explicit
     // confirmation; a first-time or same-host pair auto-starts.
     if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
+      // Invalidate any in-flight prior attempt so it can't complete and save
+      // credentials behind the confirm screen: bump the generation (its
+      // poll/claim closures bail), stop polling, drop its refs, and best-effort
+      // cancel its server request.
+      genRef.current += 1;
+      stopPolling();
+      const prevClient = clientRef.current;
+      const prevRequest = requestRef.current;
+      clientRef.current = null;
+      requestRef.current = null;
+      if (prevClient && prevRequest) {
+        void prevClient.cancel(prevRequest.id, prevRequest.secret).catch(() => {});
+      }
       setPendingOrigin(relayParam);
       setPhase("confirm");
       return;
     }
     void start(relayParam);
-  }, [relayParam, start]);
+  }, [relayParam, start, stopPolling]);
 
   // Component-wide unmount cleanup, installed regardless of entry path (manual
   // paste OR deep link). Bumps the generation so any in-flight create/poll/claim
@@ -224,12 +237,14 @@ export default function PairScreen() {
       if (!client || !request) return;
       try {
         const token = await client.claim(request.id, request.secret);
-        // Persist BEFORE the gen guard: a successful claim already minted an
-        // active server-side device row whose token is returned exactly once, so
-        // always store it — otherwise an unmount mid-claim would orphan that row
-        // (its token lost forever). saveCredentials is an AsyncStorage write with
-        // no setState on this screen, so it's safe after unmount. Only the
-        // navigation below stays attempt-scoped.
+        // Do NOT persist a superseded attempt's token. If the generation moved on
+        // (a new attempt started, the confirm phase took over, or the screen
+        // unmounted), bail BEFORE saving so a stale/late claim can't silently
+        // repoint the app to that attempt's gateway. The cost is a rare orphaned
+        // active device row when an unmount races a successful claim — bounded and
+        // self-healing (the row carries a TTL and its one-time token was discarded,
+        // so it's an unused session the server expires).
+        if (genRef.current !== myGen) return;
         await saveCredentials({ baseUrl: client.origin, token });
         if (genRef.current !== myGen) return;
         setPhase("paired");

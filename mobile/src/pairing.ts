@@ -12,6 +12,7 @@
 
 import type { PairingRequestStatus } from "@runtime/types";
 import { normalizeBaseUrl } from "./auth";
+import { isPairableHost } from "./relay-link";
 
 // Re-export the runtime contract's status union so the mobile client can't drift
 // from the wire (mirrors web/src/lib/pairing.ts). It's a type-only import,
@@ -77,6 +78,19 @@ function safeParse(text: string): unknown {
 // for tests.
 export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch): PairingClient {
   const origin = normalizeBaseUrl(relayUrl);
+  // Enforce the relay/loopback pairing policy in the client itself so it's
+  // safe-by-construction — a caller can never drive a pairing handshake (or, on
+  // claim, ship the bearer) against an arbitrary https host that merely passed the
+  // transport guard. normalizeBaseUrl permits any https origin; this narrows it.
+  let host: string;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    host = "";
+  }
+  if (!isPairableHost(host)) {
+    throw new PairingError(0, "Pairing requires a Gini relay or local gateway origin.");
+  }
 
   async function call(
     path: string,

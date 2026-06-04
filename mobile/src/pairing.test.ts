@@ -33,6 +33,10 @@ describe("createPairingClient", () => {
     expect(() => createPairingClient("http://evil.example.com")).toThrow();
   });
 
+  test("rejects a non-pairable https host (relay/loopback policy enforced in the client)", () => {
+    expect(() => createPairingClient("https://evil.example.com")).toThrow(PairingError);
+  });
+
   test("a local http gateway is allowed (dev / LAN)", () => {
     expect(createPairingClient("http://localhost:7351").origin).toBe("http://localhost:7351");
   });
