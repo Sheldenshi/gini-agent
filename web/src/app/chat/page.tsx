@@ -1,290 +1,209 @@
 "use client";
 
-import { useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
-import { Plus } from "lucide-react";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle
-} from "@/components/ui/dialog";
 import { BlockRenderer } from "@/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
-import { SessionItem } from "@/components/chat/SessionItem";
+import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
+import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
+import { ThreadChip } from "@/components/chat/ThreadChip";
+import { ThreadPanel } from "@/components/chat/ThreadPanel";
+import { ThreadsTab } from "@/components/chat/ThreadsTab";
+import { JobsTab } from "@/components/chat/JobsTab";
 import { api, type UploadRef } from "@/lib/api";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
+  splitBlocks,
+  useAgentChat,
   useCancelTask,
   useChatBlocks,
   useChatSessions,
-  useDeleteChatSession,
   useInvalidate,
-  useRenameChatSession
+  useStatus,
+  useThreads
 } from "@/lib/queries";
-import { useChatReadState } from "@/lib/use-chat-read-state";
-import type { ChatSession } from "@/lib/view-types";
+import type { ChatSession, ThreadSummary } from "@/lib/view-types";
 
-// Terminal phase labels. The runtime emits `phase("Completed" | "Cancelled"
-// | "Failed")` as the final block on a task, so the in-flight check below
-// can use the latest phase block to decide whether the cancel button is
-// active. Keeping the set local (rather than importing TaskStatus) keeps
-// the page free of legacy Task derivations — the block stream is the only
-// signal we care about.
+// Phase labels the runtime emits as the final block of a task; a non-terminal
+// latest phase means a task is still in flight.
 const TERMINAL_PHASE_LABELS = new Set(["Completed", "Cancelled", "Failed"]);
 
 export default function ChatPage() {
-  const sessions = useChatSessions();
   const params = useSearchParams();
-  const router = useRouter();
-  const initial = params?.get("session") ?? null;
-  const [selected, setSelectedState] = useState<string | null>(initial);
+  // ?session= deep-links open a specific session (a recurring-job channel
+  // from the sidebar, or an agent-chat link from Home/Tasks). Without it, the
+  // surface is the active agent's single canonical chat.
+  const pinnedSessionId = params?.get("session") ?? null;
+
+  const status = useStatus();
+  const activeAgentId = status.data?.activeAgent?.id;
+  const activeAgentName = status.data?.activeAgent?.name ?? "Gini";
+
+  const agentChat = useAgentChat(pinnedSessionId ? null : activeAgentId);
+  const pinnedSession = useChannelSession(pinnedSessionId);
+
+  const session: ChatSession | undefined = pinnedSessionId ? pinnedSession : agentChat.data;
+  const sessionId = session?.id ?? null;
+  // A pinned session is a "channel" surface only when it's a recurring-job
+  // channel; a pinned agent-chat link still renders as the agent surface.
+  const isChannel = Boolean(
+    pinnedSessionId && (session?.kind === "channel" || session?.origin === "job")
+  );
+
+  const headerName = isChannel ? session?.title?.trim() || "Channel" : activeAgentName;
+  const headerSeed = isChannel ? sessionId ?? "channel" : activeAgentId ?? "agent";
+  const resolving = !sessionId && (pinnedSessionId ? !pinnedSession : agentChat.isLoading);
+
+  return (
+    <div className="flex min-h-0 flex-1 overflow-hidden bg-[#0B0B0E]">
+      {!sessionId ? (
+        <section className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <AgentChatHeader name={headerName} seed={headerSeed} />
+          <ChatTabBar active="messages" onChange={() => {}} />
+          <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
+            {resolving ? "Loading…" : "No chat yet — say hello below."}
+          </div>
+        </section>
+      ) : (
+        // Key on sessionId so all transient view state (active tab, open
+        // thread, composer draft) resets cleanly when the user switches agents
+        // or opens a channel — no reset effect needed.
+        <ChatSurface
+          key={sessionId}
+          sessionId={sessionId}
+          session={session!}
+          headerName={headerName}
+          headerSeed={headerSeed}
+          isChannel={isChannel}
+        />
+      )}
+    </div>
+  );
+}
+
+function ChatSurface({
+  sessionId,
+  session,
+  headerName,
+  headerSeed,
+  isChannel
+}: {
+  sessionId: string;
+  session: ChatSession;
+  headerName: string;
+  headerSeed: string;
+  isChannel: boolean;
+}) {
+  const [tab, setTab] = useState<ChatTab>("messages");
+  const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
   const [text, setText] = useState("");
-  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
-  const { blocks, isLoading: blocksLoading } = useChatBlocks(selected);
   const invalidate = useInvalidate();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
-  // Apply the URL ?session= param ONCE on mount (and again only if the URL
-  // itself changes). Using `selected` as a dep would force the user back to
-  // the URL session every time they switch chats.
-  const appliedInitialRef = useRef(false);
 
-  // setSelected wrapper: also syncs ?session= via router.replace so the URL
-  // stays deep-linkable. Use replace (no history entry per click).
-  const setSelected = useCallback(
-    (id: string | null) => {
-      setSelectedState(id);
-      if (id) router.replace(`/chat?session=${id}`);
-      else router.replace("/chat");
-    },
-    [router]
-  );
+  const { blocks, isLoading: blocksLoading } = useChatBlocks(sessionId);
+  const threadsQuery = useThreads(sessionId);
+  const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
 
-  useEffect(() => {
-    if (!appliedInitialRef.current && initial) {
-      appliedInitialRef.current = true;
-      setSelectedState(initial);
+  // Main chat = blocks with no threadId; thread blocks render in the panel.
+  const mainBlocks = useMemo(() => splitBlocks(blocks).main, [blocks]);
+
+  // Map a thread's parent assistant block id → its summary, so the chip
+  // renders directly under the message it branched from.
+  const threadByParent = useMemo(() => {
+    const map = new Map<string, ThreadSummary>();
+    for (const t of threads) {
+      if (t.parentBlockId) map.set(t.parentBlockId, t);
     }
-  }, [initial]);
-
-  const orderedSessions = useMemo<ChatSession[]>(() => {
-    const all = sessions.data ?? [];
-    return [...all].sort((a, b) =>
-      (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt)
-    );
-  }, [sessions.data]);
-
-  // Pass the raw query data — `undefined` lets the read-state hook
-  // distinguish "list not loaded yet" from "list loaded with zero
-  // sessions", which matters for the one-time first-run seeding.
-  const { isUnread, markRead, activityAt } = useChatReadState(sessions.data);
-
-  // Whenever the selected session's activity advances (new message or
-  // a task on the session finishes while we're viewing it), mark it
-  // read so the indicator clears without requiring re-selection.
-  const selectedSession = useMemo(
-    () => orderedSessions.find((s) => s.id === selected) ?? null,
-    [orderedSessions, selected]
-  );
-  const selectedActivityAt = selectedSession ? activityAt(selectedSession) : null;
-  useEffect(() => {
-    if (selectedSession) markRead(selectedSession);
-  }, [selectedSession?.id, selectedActivityAt, selectedSession, markRead]);
-
-  useEffect(() => {
-    if (selected || orderedSessions.length === 0) return;
-    // Prefer the newest non-job session so opening the chat page doesn't
-    // immediately auto-mark a freshly-spawned job chat as read. Fall back
-    // to the newest job session only if that's all that exists.
-    const target = orderedSessions.find((s) => s.origin !== "job") ?? orderedSessions[0]!;
-    setSelected(target.id);
-  }, [selected, orderedSessions, setSelected]);
-
-  const create = useMutation({
-    mutationFn: () =>
-      api<ChatSession>("/chat", { method: "POST", body: JSON.stringify({ title: "" }) }),
-    onSuccess: (s) => {
-      setSelected(s.id);
-      invalidate(["chat"]);
-    },
-    onError: (error: Error) => toast.error(error.message)
-  });
+    return map;
+  }, [threads]);
 
   const send = useMutation({
     mutationFn: ({ content, images }: { content: string; images: UploadRef[] }) =>
-      api<{ taskId: string }>(`/chat/${selected}/messages`, {
+      api<{ taskId: string }>(`/chat/${sessionId}/messages`, {
         method: "POST",
         body: JSON.stringify({ content, ...(images.length > 0 ? { images } : {}) })
       }),
     onSuccess: () => {
       setText("");
-      invalidate(["chat", "tasks"]);
+      invalidate(["chat", "tasks", "threads"]);
     },
     onError: (error: Error) => toast.error(error.message)
   });
 
-  const deleteSession = useDeleteChatSession();
-  const renameSession = useRenameChatSession();
   const cancel = useCancelTask();
 
   useEffect(() => {
+    if (tab !== "messages") return;
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [blocks.length, selected]);
+  }, [mainBlocks.length, tab]);
 
   const submit = (images: UploadRef[]) => {
     const trimmed = text.trim();
-    if (send.isPending || !selected) return;
+    if (send.isPending) return;
     if (!trimmed && images.length === 0) return;
     send.mutate({ content: trimmed, images });
   };
 
-  // The in-flight task id is derived from the block stream: scan from the
-  // end for the latest phase block — if its label is non-terminal, that
-  // task is in flight. Falls back to scanning tool_call blocks in case
-  // the loop emitted a tool_call but the next phase hasn't landed yet.
-  // The runtime emits a terminal phase("Completed"/"Cancelled"/"Failed")
-  // on every task end, so a non-terminal latest phase is a reliable
-  // signal that a task is still in motion.
+  // In-flight detection over the main-chat block stream.
   const inflightTaskId: string | null = useMemo(() => {
-    for (let i = blocks.length - 1; i >= 0; i--) {
-      const b = blocks[i]!;
+    for (let i = mainBlocks.length - 1; i >= 0; i--) {
+      const b = mainBlocks[i]!;
       if (b.kind === "phase") {
         if (TERMINAL_PHASE_LABELS.has(b.label)) return null;
         return b.taskId ?? null;
       }
-      if (b.kind === "tool_call" && b.status === "running") {
-        return b.taskId ?? null;
-      }
+      if (b.kind === "tool_call" && b.status === "running") return b.taskId ?? null;
     }
     return null;
-  }, [blocks]);
+  }, [mainBlocks]);
 
-  const confirmDelete = () => {
-    const id = pendingDeleteId;
-    if (!id) return;
-    deleteSession.mutate(id, {
-      onSuccess: () => {
-        if (selected === id) {
-          const next = orderedSessions.find((s) => s.id !== id);
-          setSelected(next?.id ?? null);
-        }
-        setPendingDeleteId(null);
-      },
-      onError: (error) => {
-        toast.error(error.message);
-        setPendingDeleteId(null);
-      }
-    });
-  };
+  // Phase blocks are transient — render only the latest while non-terminal.
+  const visibleBlocks = useMemo(
+    () =>
+      mainBlocks.filter((b, i) => {
+        if (b.kind !== "phase") return true;
+        const isLast = i === mainBlocks.length - 1;
+        return isLast && !TERMINAL_PHASE_LABELS.has(b.label);
+      }),
+    [mainBlocks]
+  );
 
-  const pendingDeleteSession = pendingDeleteId
-    ? orderedSessions.find((s) => s.id === pendingDeleteId) ?? null
-    : null;
-
-  const handleRename = (id: string, title: string) => {
-    renameSession.mutate(
-      { id, title },
-      { onError: (error) => toast.error(error.message) }
-    );
-  };
-
-  // Phase blocks are transient indicators — only render the latest one,
-  // and only while it's still active (non-terminal). Historical phase
-  // markers ("Thinking" mid-conversation, "Completed" at the end) are
-  // internal state transitions; surfacing them in the transcript turns
-  // them into permanent noise. Non-phase blocks always render.
-  const visibleBlocks = useMemo(() => {
-    return blocks.filter((b, i) => {
-      if (b.kind !== "phase") return true;
-      const isLast = i === blocks.length - 1;
-      return isLast && !TERMINAL_PHASE_LABELS.has(b.label);
-    });
-  }, [blocks]);
-
-  // Map each tool_call's callId to its paired tool_result block so the
-  // BlockToolCall renderer can expand-on-click without re-walking the
-  // list per row. Tool results don't render as standalone blocks.
   const toolResultsByCallId = useMemo(() => {
-    const map = new Map<string, (typeof blocks)[number] & { kind: "tool_result" }>();
-    for (const b of blocks) {
+    const map = new Map<string, (typeof mainBlocks)[number] & { kind: "tool_result" }>();
+    for (const b of mainBlocks) {
       if (b.kind === "tool_result") map.set(b.callId, b);
     }
     return map;
-  }, [blocks]);
+  }, [mainBlocks]);
 
-  // Once an exchange (user_text → final assistant_text) has finished
-  // streaming, fold every tool_call inside it into one collapsed row
-  // so the transcript shows the question and the answer without a
-  // wall of intermediate tool steps. In-flight exchanges stay inline.
-  const renderItems = useMemo<ChatRenderItem[]>(
-    () => groupExchanges(visibleBlocks),
-    [visibleBlocks]
-  );
-
-  const sessionTitle = selectedSession?.title || "New chat";
+  const renderItems = useMemo<ChatRenderItem[]>(() => groupExchanges(visibleBlocks), [visibleBlocks]);
   const hasBlocks = visibleBlocks.length > 0;
 
   return (
-    <div className="flex flex-1 overflow-hidden">
-      <aside className="flex min-h-0 w-full shrink-0 flex-col border-b border-border md:w-[260px] md:border-r md:border-b-0">
-        <div className="p-2">
-          <button
-            className="flex h-9 w-full items-center gap-1.5 rounded-lg px-2.5 text-sm font-normal hover:bg-accent disabled:opacity-50"
-            disabled={create.isPending}
-            onClick={() => create.mutate()}
-          >
-            <Plus className="size-4" /> New chat
-          </button>
-        </div>
-        <ScrollArea className="min-h-0 flex-1">
-          <div className="px-2 pb-3">
-            {orderedSessions.length === 0 ? (
-              <p className="px-2.5 py-3 text-xs text-muted-foreground">No chats yet</p>
-            ) : (
-              <ul className="space-y-0.5">
-                {orderedSessions.map((s) => (
-                  <SessionItem
-                    key={s.id}
-                    session={s}
-                    isActive={selected === s.id}
-                    isUnread={selected !== s.id && isUnread(s)}
-                    onSelect={() => setSelected(s.id)}
-                    onDelete={() => setPendingDeleteId(s.id)}
-                    onRename={(title) => handleRename(s.id, title)}
-                  />
-                ))}
-              </ul>
-            )}
-          </div>
-        </ScrollArea>
-      </aside>
-
+    <>
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-        {!selected ? (
-          <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
-            {orderedSessions.length === 0 ? "No chats yet — start a new one" : "Select a chat"}
-          </div>
-        ) : blocksLoading && !hasBlocks ? (
-          <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
-            Loading…
-          </div>
-        ) : (
-          <>
-            <header className="sticky top-0 z-10 bg-background px-4 py-3">
-              <h1 className="truncate text-base font-semibold">{sessionTitle}</h1>
-            </header>
+        <AgentChatHeader
+          name={headerName}
+          seed={headerSeed}
+          lastActiveAt={session.updatedAt}
+          subtitle={isChannel ? "recurring job channel" : undefined}
+        />
+        <ChatTabBar active={tab} onChange={setTab} threadCount={threads.length} />
 
+        {tab === "messages" ? (
+          <>
             <ScrollArea className="min-h-0 flex-1">
-              <div className="mx-auto w-full max-w-3xl px-4 py-6">
-                {!hasBlocks ? (
+              <div className="mx-auto w-full max-w-3xl px-6 py-6">
+                {blocksLoading && !hasBlocks ? (
+                  <div className="flex min-h-[40vh] items-center justify-center text-sm text-muted-foreground">
+                    Loading…
+                  </div>
+                ) : !hasBlocks ? (
                   <div className="flex min-h-[40vh] items-center justify-center">
                     <h2 className="text-2xl font-semibold">What can I help with?</h2>
                   </div>
@@ -294,10 +213,7 @@ export default function ChatPage() {
                       if (item.kind === "tool_group") {
                         return (
                           <li key={item.id}>
-                            <BlockToolCallsCollapsed
-                              calls={item.calls}
-                              resultsByCallId={toolResultsByCallId}
-                            />
+                            <BlockToolCallsCollapsed calls={item.calls} resultsByCallId={toolResultsByCallId} />
                           </li>
                         );
                       }
@@ -308,16 +224,24 @@ export default function ChatPage() {
                           </li>
                         );
                       }
+                      const block = item.block;
+                      const thread =
+                        block.kind === "assistant_text" ? threadByParent.get(block.id) : undefined;
                       return (
-                        <li key={item.block.id}>
+                        <li key={block.id} className="space-y-2">
                           <BlockRenderer
-                            block={item.block}
+                            block={block}
                             toolResult={
-                              item.block.kind === "tool_call"
-                                ? toolResultsByCallId.get(item.block.callId)
+                              block.kind === "tool_call"
+                                ? toolResultsByCallId.get(block.callId)
                                 : undefined
                             }
                           />
+                          {thread ? (
+                            <div className="pl-[46px]">
+                              <ThreadChip thread={thread} onOpen={() => setOpenThread(thread)} />
+                            </div>
+                          ) : null}
                         </li>
                       );
                     })}
@@ -327,7 +251,7 @@ export default function ChatPage() {
               </div>
             </ScrollArea>
 
-            <div className="px-4 pb-4 pt-2">
+            <div className="px-6 pb-5 pt-2">
               <div className="mx-auto w-full max-w-3xl">
                 <Composer
                   value={text}
@@ -341,47 +265,37 @@ export default function ChatPage() {
                       });
                     }
                   }}
-                  disabled={!selected}
+                  placeholder={`Ask ${headerName} anything`}
                 />
               </div>
             </div>
           </>
+        ) : tab === "threads" ? (
+          <ThreadsTab threads={threads} agentName={headerName} onOpen={(t) => setOpenThread(t)} />
+        ) : (
+          <JobsTab />
         )}
       </section>
 
-      <Dialog
-        open={pendingDeleteId !== null}
-        onOpenChange={(open) => {
-          if (!open) setPendingDeleteId(null);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete chat?</DialogTitle>
-            <DialogDescription>
-              {pendingDeleteSession?.title?.trim()
-                ? `"${pendingDeleteSession.title}" will be permanently deleted. This cannot be undone.`
-                : "This chat will be permanently deleted. This cannot be undone."}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setPendingDeleteId(null)}
-              disabled={deleteSession.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={confirmDelete}
-              disabled={deleteSession.isPending}
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
+      {openThread ? (
+        <ThreadPanel
+          sessionId={sessionId}
+          thread={openThread}
+          agentName={headerName}
+          onClose={() => setOpenThread(null)}
+        />
+      ) : null}
+    </>
+  );
+}
+
+// Resolve a pinned session from the cached chat list by id. Channels and
+// agent-chat links already live in the list the sidebar fetches, so no extra
+// request is needed.
+function useChannelSession(sessionId: string | null): ChatSession | undefined {
+  const sessions = useChatSessions();
+  return useMemo(
+    () => (sessionId ? (sessions.data ?? []).find((s) => s.id === sessionId) : undefined),
+    [sessions.data, sessionId]
   );
 }
