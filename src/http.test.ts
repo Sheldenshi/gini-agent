@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
-import { addAudit, appendEvent, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat, sanitizeFilename } from "./state";
+import { addAudit, appendEvent, insertChatBlock, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat, sanitizeFilename } from "./state";
+import { getOrCreateAgentChat } from "./execution/chat";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
@@ -4672,6 +4673,253 @@ describe("GET /api/docs", () => {
     // matches and resolveDocPath's confinement check rejects the escaping path.
     const response = await rawCall(handler, config, "/api/docs/..%2F..%2Fpackage", {}, config.token);
     expect(response.status).toBe(400);
+  });
+});
+
+describe("agent-chat and thread endpoints", () => {
+  test("GET /api/agents/:id/chat returns a stable single session across calls", async () => {
+    const config = testConfig("agent-chat-resolve");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Nova" })
+    });
+
+    const first = await call(handler, config, `/api/agents/${agent.id}/chat`);
+    const second = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    expect(first.id).toBeString();
+    expect(first.kind).toBe("agent");
+    expect(first.agentId).toBe(agent.id);
+    expect(second.id).toBe(first.id);
+  });
+
+  test("GET /api/chat/:id/threads lists threads and 404s on a missing session", async () => {
+    const config = testConfig("thread-list");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Sage" })
+    });
+    const session = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    // Root the thread off a main-chat assistant block, then add an agent
+    // reply inside the thread.
+    const root = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Here is the research plan.",
+      streaming: false,
+      agentId: agent.id
+    });
+    insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Step one is done.",
+      streaming: false,
+      agentId: agent.id,
+      threadId: "thread_one",
+      parentBlockId: root.id
+    });
+
+    const threads = await call(handler, config, `/api/chat/${session.id}/threads`);
+    expect(threads).toHaveLength(1);
+    expect(threads[0].threadId).toBe("thread_one");
+    expect(threads[0].parentBlockId).toBe(root.id);
+    expect(threads[0].lastReplyAuthor).toBe("agent");
+    expect(threads[0].rootPreview).toContain("research plan");
+
+    const missing = await rawCall(handler, config, "/api/chat/chat_nope/threads", {}, config.token);
+    expect(missing.status).toBe(404);
+  });
+
+  test("GET /api/chat/:id/threads/:tid/blocks returns the thread's blocks and 404s on a missing session", async () => {
+    const config = testConfig("thread-blocks");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Scout" })
+    });
+    const session = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    const root = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Parent message",
+      streaming: false,
+      agentId: agent.id
+    });
+    const reply = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Threaded reply",
+      streaming: false,
+      agentId: agent.id,
+      threadId: "thread_blocks",
+      parentBlockId: root.id
+    });
+    // A main-chat block that must NOT leak into the thread fetch.
+    insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Main chat only",
+      streaming: false,
+      agentId: agent.id
+    });
+
+    const blocks = await call(handler, config, `/api/chat/${session.id}/threads/thread_blocks/blocks`);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].id).toBe(reply.id);
+    expect(blocks[0].threadId).toBe("thread_blocks");
+
+    const missing = await rawCall(handler, config, "/api/chat/chat_nope/threads/thread_blocks/blocks", {}, config.token);
+    expect(missing.status).toBe(404);
+  });
+
+  test("POST /api/chat/:id/threads/:tid/messages tags the block + task and mirrors to main with alsoToMain", async () => {
+    const config = testConfig("thread-reply");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Echo" })
+    });
+    const session = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    const root = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "Original answer",
+      streaming: false,
+      agentId: agent.id
+    });
+    insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: session.id,
+      text: "First thread reply",
+      streaming: false,
+      agentId: agent.id,
+      threadId: "thread_reply",
+      parentBlockId: root.id
+    });
+
+    const submitted = await call(handler, config, `/api/chat/${session.id}/threads/thread_reply/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "follow up in the thread", alsoToMain: true })
+    });
+
+    expect(submitted.threadId).toBe("thread_reply");
+    expect(submitted.taskId).toBeString();
+
+    // The spawned task carries the thread membership so the whole response
+    // threads (resolveEmitContext reads these off the task).
+    const task = readState(config.instance).tasks.find((t) => t.id === submitted.taskId);
+    expect(task?.threadId).toBe("thread_reply");
+    expect(task?.parentBlockId).toBe(root.id);
+
+    // The user reply lands as a thread-tagged user_text block...
+    const threadBlocks = await call(handler, config, `/api/chat/${session.id}/threads/thread_reply/blocks`);
+    const threadUser = threadBlocks.find(
+      (b: { kind: string; text?: string }) => b.kind === "user_text" && b.text === "follow up in the thread"
+    );
+    expect(threadUser.threadId).toBe("thread_reply");
+    expect(threadUser.parentBlockId).toBe(root.id);
+
+    // ...and alsoToMain mirrors it as an un-threaded main-chat user_text block.
+    const allBlocks = await call(handler, config, `/api/chat/${session.id}/blocks`);
+    const mainMirror = allBlocks.filter(
+      (b: { kind: string; text?: string; threadId?: string }) =>
+        b.kind === "user_text" && b.text === "follow up in the thread" && b.threadId === undefined
+    );
+    expect(mainMirror).toHaveLength(1);
+  });
+
+  test("POST /api/chat/:id/threads/:tid/messages 404s when the thread does not exist", async () => {
+    const config = testConfig("thread-reply-missing");
+    const handler = createHandler(config);
+
+    const agent = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Vega" })
+    });
+    const session = await call(handler, config, `/api/agents/${agent.id}/chat`);
+
+    const response = await rawCall(handler, config, `/api/chat/${session.id}/threads/thread_absent/messages`, {
+      method: "POST",
+      body: JSON.stringify({ content: "no thread here" })
+    }, config.token);
+    expect(response.status).toBe(404);
+    const value = await response.json();
+    expect(String(value.error)).toContain("Thread not found");
+  });
+
+  test("GET /api/threads aggregates across agent sessions with agentName, newest first", async () => {
+    const config = testConfig("threads-inbox");
+    const handler = createHandler(config);
+
+    const nova = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Nova" })
+    });
+    const sage = await call(handler, config, "/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ name: "Sage" })
+    });
+    const novaChat = await getOrCreateAgentChat(config.instance, nova.id);
+    const sageChat = await getOrCreateAgentChat(config.instance, sage.id);
+
+    // Nova's thread (older last reply).
+    const novaRoot = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: novaChat.id,
+      text: "Nova parent",
+      streaming: false,
+      agentId: nova.id
+    });
+    insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: novaChat.id,
+      text: "Nova thread reply",
+      streaming: false,
+      agentId: nova.id,
+      threadId: "thread_nova",
+      parentBlockId: novaRoot.id
+    });
+
+    // Sage's thread (newer last reply — must sort first).
+    await Bun.sleep(2);
+    const sageRoot = insertChatBlock(config.instance, {
+      kind: "assistant_text",
+      sessionId: sageChat.id,
+      text: "Sage parent",
+      streaming: false,
+      agentId: sage.id
+    });
+    insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId: sageChat.id,
+      text: "Sage thread reply",
+      agentId: sage.id,
+      threadId: "thread_sage",
+      parentBlockId: sageRoot.id
+    });
+
+    const inbox = await call(handler, config, "/api/threads");
+    expect(inbox).toHaveLength(2);
+    // Newest last reply first.
+    expect(inbox[0].threadId).toBe("thread_sage");
+    expect(inbox[0].agentName).toBe("Sage");
+    expect(inbox[0].lastReplyAuthor).toBe("user");
+    expect(inbox[1].threadId).toBe("thread_nova");
+    expect(inbox[1].agentName).toBe("Nova");
+    expect(inbox[1].lastReplyAuthor).toBe("agent");
+
+    // filter=unread is accepted but returns the full list (client filters).
+    const all = await call(handler, config, "/api/threads?filter=unread");
+    expect(all).toHaveLength(2);
   });
 });
 

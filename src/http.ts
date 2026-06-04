@@ -2218,6 +2218,12 @@ function agentIdFilter(request: Request): string | undefined {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Agent not found")) return 404;
+  // Chat-session and thread submit paths (submitChatMessage,
+  // submitThreadReply) throw these when the target was deleted or never
+  // existed. Map to 404 so a stale link surfaces a clean not-found rather
+  // than the catch-all 500.
+  if (message.startsWith("Chat session not found")) return 404;
+  if (message.startsWith("Thread not found")) return 404;
   // Agent create/rename name validation throws user-input errors that should
   // surface as 400 rather than the catch-all 500.
   if (message === "Agent name is required.") return 400;
