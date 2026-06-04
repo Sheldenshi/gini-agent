@@ -2134,6 +2134,12 @@ describe("dispatchToolCall(browser_connect)", () => {
     };
   }
 
+  afterEach(() => {
+    // Drop any fake session a test installed so the navigate-first
+    // precondition can't leak across tests.
+    browserTest.clearFakeSessionsForTest();
+  });
+
   test("returns kind:'pending' with an approval row at risk 'medium' and action 'browser.connect'", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
@@ -2142,6 +2148,12 @@ describe("dispatchToolCall(browser_connect)", () => {
       const task = createTask(state.instance, "connect test", undefined, undefined, undefined, undefined);
       upsertTask(state, task);
       return task.id;
+    });
+    // browser_connect now requires an already-open page (it only clears a
+    // sign-in wall the agent already hit), so seed a live session.
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://console.cloud.google.com/welcome",
+      close: () => Promise.resolve()
     });
 
     const result = await dispatchToolCall(
@@ -2194,6 +2206,42 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
+  // Navigate-first precondition: a cold browser_connect (no page open yet) is
+  // a misuse — the agent should browse headless first and only escalate to a
+  // Connect prompt when a navigation hits a sign-in wall. The dispatch must
+  // refuse it WITHOUT minting an approval, so the user is never prompted to
+  // connect for an ordinary browse-the-web request.
+  test("refuses a cold call when no browser page is open, without minting an approval", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-cold");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect cold", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // No browser_navigate has run, so there is no live session / open page.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_cold_1",
+      JSON.stringify({ reason: "Search hotel prices in Los Angeles" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("browser_navigate");
+
+    // The user must not be prompted — no approval row may exist.
+    const state = readState(config.instance);
+    expect(state.setupRequests.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
   // End-to-end coverage of the dispatch → approval → executor path. The
   // dispatch must surface a pending approval; once the user approves
   // (here via decideApproval, the same code path /approvals/<id>/approve
@@ -2209,6 +2257,13 @@ describe("dispatchToolCall(browser_connect)", () => {
       const task = createTask(state.instance, "connect approve", undefined, undefined, undefined, undefined);
       upsertTask(state, task);
       return task.id;
+    });
+    // browser_connect requires an already-open page; seed a live session so
+    // the dispatch passes its navigate-first precondition before exercising
+    // the approval → executor path.
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://console.cloud.google.com/welcome",
+      close: () => Promise.resolve()
     });
 
     // Seed an existing cdp-mode record so the strict-managed path has

@@ -287,6 +287,34 @@ export async function dispatchToolCall(
       // visible browser, signs in, then clicks Connect. There is no
       // "auto-approve" path — the user has to perform the action — so
       // bypass pendingOrAuto and always return the pending approval id.
+      //
+      // Navigate-first precondition (same contract as browser_fill_secrets):
+      // browser_connect's only job is to clear a sign-in / auth wall the agent
+      // ALREADY hit by navigating. Calling it cold — before any browser_navigate
+      // — is a misuse that would pop a spurious "Connect" card at the user for
+      // what is really an ordinary browse-the-web request. Refuse the cold call
+      // and steer the agent to browse headless first; it then only escalates to
+      // a Connect prompt when a navigation genuinely lands on a sign-in wall.
+      // Validate the reason first so a missing reason fails identically
+      // regardless of browser state.
+      requireString(args, "reason");
+      // Exempt an explicit headless:true reconnect: the setup skill re-opens
+      // the browser invisibly AFTER browser_close (post sign-in), so it has no
+      // live session by design. The cold-call misuse is always headless-unset.
+      const headlessReconnect = args.headless === true;
+      const liveUrl = peekCurrentBrowserUrl(taskId);
+      const hasOpenPage =
+        typeof liveUrl === "string" && liveUrl.length > 0 && liveUrl !== "about:blank";
+      if (!headlessReconnect && !hasOpenPage) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "browser_connect only clears a sign-in or auth wall you have already hit. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only if that navigation lands on a login, OAuth, or 401/403 wall."
+          })
+        };
+      }
       const approvalId = await requestBrowserConnect(config, taskId, toolCallId, args);
       return { kind: "pending", approvalId };
     }

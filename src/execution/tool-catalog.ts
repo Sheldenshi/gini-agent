@@ -544,7 +544,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
-    displayLabel: "See page",
+    displayLabel: "Connect browser to sign in",
     type: "function",
     function: {
       name: "browser_connect",
