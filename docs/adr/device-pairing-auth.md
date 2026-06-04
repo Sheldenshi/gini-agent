@@ -94,6 +94,12 @@ host/origin/CSRF trust; the two legacy routes do not (`POST /api/pairing` is
 bearer-gated, `POST /api/pairing/claim` is public + rate-limited only). The WS
 upgrade path (`src/server.ts`) mirrors the same relay session gate.
 
+The device rows above describe the **browser** client. A **verified native
+client** (the mobile app) reaches the same `request`/`request/:id*` routes
+cookielessly — binding secret via `X-Gini-Pair-Secret`, exempt from the no-Origin
+CSRF refusal, token returned in the claim body — gated by `isNativePairingClient`.
+See "Native pairing client (mobile app)" below.
+
 ## Relay sessions mirror loopback (DELIBERATE — do not "harden" this away)
 
 **A paired relay session is a full mirror of the local `127.0.0.1` operator.**
@@ -167,6 +173,75 @@ the BFF (owner bearer), so any paired session can create codes.
   silently dropped by the browser and the whole connection is already cleartext
   by the operator's transport choice. Use HTTPS for any remote front.
 
+## Native pairing client (mobile app)
+
+The mobile app runs the SAME device handshake (`request` → poll → `claim`) but
+is not a browser, which breaks two browser assumptions:
+
+1. **No cookie jar.** It can't reliably hold the HttpOnly `gini_pair` binding
+   cookie, and it can't read the `gini_session` token out of `Set-Cookie` (the
+   claim's whole point on the web).
+2. **No `Origin`.** React Native fetch sends no `Origin`, so
+   `webBoundRequestAllowed` — which refuses no-Origin *unsafe* requests — would
+   403 its `POST`s.
+
+A **verified native client** is therefore exempted, gated by
+`isNativePairingClient(request, host)`:
+
+- the explicit opt-in header `X-Gini-Pair-Client: native`, **and**
+- the **absence of every `Sec-Fetch-*` header**, **and**
+- a trusted front (relay or loopback Host).
+
+The `Sec-Fetch-*` absence is the security anchor: browsers always send those on
+`fetch`/XHR and page JS **cannot set or strip them** (forbidden header names), so
+their absence cannot be forged from a browser — an XSS on `/pair` can never make
+the gateway treat the page as native. The opt-in header additionally excludes a
+hypothetical pre-`Sec-Fetch` browser that merely lacks the headers. This single
+predicate authorises all three native deviations:
+
+- **CSRF exemption.** A native (no-Origin) `POST` to the device routes is allowed
+  even though `webBoundRequestAllowed` returns false — a non-browser is not a
+  confused deputy. Browsers still go through the full gate, and the admin routes
+  still re-validate the session, so this never widens admin reach.
+- **Binding secret in the body + header.** `POST /api/pairing/request` returns the
+  `bindSecret` in the JSON body for a native client (browsers get it only as the
+  HttpOnly cookie). The client echoes it back as `X-Gini-Pair-Secret` on
+  poll/claim/cancel; the gateway reads the secret as the `gini_pair` cookie **OR**
+  that header (`pairBindSecret`), cookie first, so the browser path is unchanged.
+- **Session token in the claim body.** `POST …/claim` returns
+  `{ ok: true, token }` for a native client — the same `gini_device_<uuid>` token
+  the cookie would carry, just the transport a non-browser needs. The client
+  stores it and sends it as `Authorization: Bearer` on every later call. The
+  browser claim body stays `{ ok: true }` (token cookie-only, so an XSS can't
+  exfiltrate it).
+
+Post-pairing needs no new gate: `isWebProxyPath` routes `/api/chat`,
+`/api/agents`, etc. to the native bearer surface, so the stored device token
+authenticates over the relay exactly like the CLI's owner bearer — only the
+initial handshake is relay-aware.
+
+### Universal-link entry (open the app from the relay link)
+
+So that a tap on `https://<sub>.gini-relay.lilaclabs.ai` opens the app (not
+mobile Safari), the gateway serves an **Apple App Site Association** file at
+`GET /.well-known/apple-app-site-association` — public, reachable unpaired, no
+redirect — claiming the bare origin + `/pair*` for the app
+(`WB6Y3K67AB.ai.lilaclabs.gini.mobile`, overridable via `GINI_IOS_APP_ID`). The
+app declares `applinks:*.gini-relay.lilaclabs.ai`. A **wildcard** associated
+domain is validated by Apple **per subdomain**, not at the apex, so the gateway —
+which serves each relay subdomain through the tunnel — is the correct AASA host
+(the relay control plane at the apex is not). `app/+native-intent.tsx` rewrites
+the incoming relay URL to `/pair?relay=<origin>` (the host identifies which
+gateway; the link's own path is irrelevant); the pair screen then runs the
+native handshake above.
+
+> **Operational caveat.** Universal links resolve through Apple's CDN, which
+> fetches and caches the per-subdomain AASA. A relay subdomain only serves while
+> the operator's tunnel is up, so a first tap can lag CDN propagation. The in-app
+> entry (paste the link on the pair screen) is the always-available fallback and
+> the surface RN-Web tests exercise; the universal-link open itself is verified on
+> a device build.
+
 ## Context
 
 The gateway reverse-proxies the web app as a single relay-facing front, but
@@ -231,9 +306,19 @@ pairing screen.
   next request (unified revocation).
 - `/pair` renders with provider setup incomplete and emits no authenticated
   `/api/runtime/*` calls.
+- A native client (opt-in header, no `Sec-Fetch-*`) creates with no `Origin`
+  (201 + `bindSecret` in the body), polls/claims with `X-Gini-Pair-Secret`, and
+  the claim returns the token in the body; that token authenticates a subsequent
+  `Authorization: Bearer` call over the relay. A browser that also sends the
+  opt-in header (but carries `Sec-Fetch-*`) still gets the cookie-only claim with
+  no body token.
+- `GET /.well-known/apple-app-site-association` returns the AASA JSON (with the
+  configured app id) unpaired on both relay and loopback fronts, with no redirect.
 - State mutators are pinned by `src/state/pairing-requests.test.ts`; the routes,
-  gate, cookies, loopback enforcement, and rate limiter by
-  `src/http-pairing.test.ts`; the governance wrappers by
+  gate, cookies, loopback enforcement, native-client path, AASA, and rate limiter
+  by `src/http-pairing.test.ts`; the governance wrappers by
   `src/governance/pairing-requests.test.ts`; cookie + rate-limit helpers by
   `src/lib/cookies.test.ts` and `src/lib/rate-limit.test.ts`; the `/pair`
-  setup-gate exemption by `web/src/proxy.test.ts`.
+  setup-gate exemption by `web/src/proxy.test.ts`. On the mobile side, the native
+  handshake client is pinned by `mobile/src/pairing.test.ts` and the universal-link
+  rewrite by `mobile/src/relay-link.test.ts`.

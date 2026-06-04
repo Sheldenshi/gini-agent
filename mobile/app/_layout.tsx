@@ -131,6 +131,7 @@ export default function RootLayout() {
               <Stack screenOptions={screenOptions}>
                 <Stack.Screen name="index" options={{ headerShown: false }} />
                 <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
+                <Stack.Screen name="pair" options={{ title: "Connect to Gini" }} />
                 {/* agents.tsx owns its own header via a <Stack.Screen> inside
                     the component (custom left/right buttons), so we set
                     headerShown: false here and let the screen draw its own

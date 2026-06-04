@@ -1601,6 +1601,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     if (request.method === "OPTIONS" && request.headers.get("access-control-request-method")) {
       return preflightResponse(request);
     }
+    // iOS universal-links association: a fixed public file served before the
+    // host/session gates so Apple's CDN (a no-Origin GET) can fetch it on any
+    // relay subdomain to validate the app's `applinks:*.<relayDomain>` claim.
+    if (request.method === "GET" && url.pathname === APPLE_APP_SITE_ASSOCIATION_PATH) {
+      return appleAppSiteAssociationResponse();
+    }
     // The gateway owns only its NATIVE /api/* surface. The Next BFF namespace
     // (/api/runtime/*) and all non-/api traffic are web-bound (isWebProxyPath)
     // and proxied to the web server instead, so the browser's token-injecting
@@ -2391,6 +2397,81 @@ function pairingClaimAllowed(request: Request): boolean {
   return pairingClaimHostLimiter.tryConsume(host) && pairingClaimGlobalLimiter.tryConsume("global");
 }
 
+// A non-browser pairing client (the native mobile app). It cannot read the
+// HttpOnly gini_pair / gini_session cookies, so it carries the per-request
+// binding secret in a header and needs the session token returned in the claim
+// BODY. Recognising it must be unforgeable from a browser: browsers always send
+// Sec-Fetch-* on fetch/XHR and JS cannot set or strip those (forbidden header
+// names), so their ABSENCE is a reliable "not a browser" signal — an XSS on the
+// /pair page can therefore never coax the token into the body. We also require
+// an explicit opt-in header (so a pre-Sec-Fetch browser that merely lacks the
+// headers is still excluded) and a trusted front (relay/loopback). This single
+// gate authorises BOTH the no-Origin CSRF exemption on the POST device routes
+// AND the in-body bind secret / session token — keeping the browser flow
+// (cookie-only, no body token) byte-for-byte unchanged. See ADR
+// device-pairing-auth.md ("Native pairing client").
+function isNativePairingClient(request: Request, host: string): boolean {
+  if (request.headers.get("x-gini-pair-client") !== "native") return false;
+  if (
+    request.headers.has("sec-fetch-site")
+    || request.headers.has("sec-fetch-mode")
+    || request.headers.has("sec-fetch-dest")
+  ) {
+    return false;
+  }
+  return isRelayHost(host) || isLoopbackHost(host);
+}
+
+// The per-request binding secret: the gini_pair cookie (browsers) or, when no
+// cookie is present, the X-Gini-Pair-Secret header (the cookieless native
+// client). Cookie wins so the browser path is unchanged — a browser always
+// carries the cookie it was issued on create and never reaches the header.
+function pairBindSecret(request: Request): string | undefined {
+  return cookieValue(request, PAIR_BIND_COOKIE) ?? (request.headers.get("x-gini-pair-secret") ?? undefined);
+}
+
+// iOS universal-links association file. A wildcard associated domain
+// (`applinks:*.<relayDomain>`) is validated by Apple PER SUBDOMAIN, not at the
+// apex — so the gateway, which serves each relay subdomain through the tunnel,
+// hosts this. Must be public, reachable unpaired, and served with no redirect
+// (Apple's CDN refuses redirected AASA). The appID is the Apple Team ID +
+// bundle id; env-overridable so a team/bundle change needs no code edit. See
+// docs/adr/device-pairing-auth.md ("Native pairing client").
+const APPLE_APP_SITE_ASSOCIATION_PATH = "/.well-known/apple-app-site-association";
+
+function iosAppId(): string {
+  return process.env.GINI_IOS_APP_ID ?? "WB6Y3K67AB.ai.lilaclabs.gini.mobile";
+}
+
+export function appleAppSiteAssociationResponse(): Response {
+  // Modern `components` form. Claim the bare relay origin (the link a user taps)
+  // plus the /pair entry so a tap opens the app straight into the handshake;
+  // assets and /api are left to the browser/native surfaces.
+  const body = JSON.stringify({
+    applinks: {
+      details: [
+        {
+          appIDs: [iosAppId()],
+          components: [
+            { "/": "/", comment: "Bare relay origin opens the Gini app to pair." },
+            { "/": "/pair", comment: "Pairing entry." },
+            { "/": "/pair/*", comment: "Pairing entry subpaths." }
+          ]
+        }
+      ]
+    }
+  });
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      // Apple caches via its CDN regardless; a short max-age keeps a tunnel
+      // restart from pinning a stale association for long.
+      "cache-control": "public, max-age=3600"
+    }
+  });
+}
+
 // Paths an UNPAIRED relay browser may still reach so it can run the pairing
 // handshake: the /pair page, Next's build assets, and static files. Never an
 // /api path (those are gated separately).
@@ -2427,10 +2508,15 @@ function isDevicePairingPath(pathname: string): boolean {
 // gini_session (the mirror model — a paired relay session is admin like
 // loopback); device routes are public but bound to the gini_pair cookie.
 async function handlePairingRoutes(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
-  // Host/Origin/CSRF trust for every pairing call (same gate as the proxied
-  // surface). Blocks cross-site POSTs and untrusted hosts.
-  if (!webBoundRequestAllowed(request)) return json({ error: "Forbidden" }, 403);
   const host = request.headers.get("host") ?? url.host;
+  // Host/Origin/CSRF trust for every pairing call (same gate as the proxied
+  // surface). Blocks cross-site POSTs and untrusted hosts. The native mobile
+  // app sends no Origin (so the browser CSRF gate would refuse its POSTs) and is
+  // not a confused deputy — a verified native client on a trusted front is
+  // exempt. Browsers still go through webBoundRequestAllowed; the admin routes
+  // below re-validate the session regardless.
+  const native = isNativePairingClient(request, host);
+  if (!webBoundRequestAllowed(request) && !native) return json({ error: "Forbidden" }, 403);
   const path = url.pathname;
   const method = request.method;
 
@@ -2473,7 +2559,13 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       if (error instanceof PairingCapExceededError) return json({ error: error.message }, 429);
       throw error;
     }
-    const response = json({ id: created.id, code: created.code }, 201);
+    // Browsers receive the binding secret ONLY as the HttpOnly gini_pair cookie
+    // (set below). A verified native client, which can't read that cookie, also
+    // gets it in the body so it can echo it back via X-Gini-Pair-Secret.
+    const response = json(
+      native ? { id: created.id, code: created.code, bindSecret } : { id: created.id, code: created.code },
+      201
+    );
     response.headers.append(
       "set-cookie",
       serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
@@ -2489,7 +2581,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   // match this request, not merely exist).
   const poll = path.match(/^\/api\/pairing\/request\/([^/]+)$/);
   if (method === "GET" && poll) {
-    const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
+    const bindSecret = pairBindSecret(request);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
     const result = pollPairingStatus(config, poll[1]!, bindSecret);
     if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
@@ -2499,7 +2591,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   // Device: claim an approved request → mint the session, set the cookie.
   const claim = path.match(/^\/api\/pairing\/request\/([^/]+)\/claim$/);
   if (method === "POST" && claim) {
-    const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
+    const bindSecret = pairBindSecret(request);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
     const result = await claimPairingSession(config, claim[1]!, bindSecret);
     if (!result.ok) {
@@ -2507,10 +2599,12 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       return json({ error: result.reason }, code);
     }
     const secure = pairingCookieSecure(request, host);
-    // The request is now "claimed"; the success signal is the 200 + the
-    // gini_session Set-Cookie below, not the body. Return a neutral { ok: true }
-    // (matching the cancel handler) rather than a stale status literal.
-    const response = json({ ok: true });
+    // Browsers: the success signal is the 200 + the gini_session Set-Cookie
+    // below, never the body (an HttpOnly cookie an XSS can't exfiltrate). A
+    // verified native client, which can't read Set-Cookie, gets the token in the
+    // body so it can store it and send it as `Authorization: Bearer` — the same
+    // token, just the transport a non-browser needs.
+    const response = json(native ? { ok: true, token: result.token } : { ok: true });
     response.headers.append(
       "set-cookie",
       serializeCookie(sessionCookieName(secure), result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
@@ -2523,7 +2617,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   // Device: cancel own pending/approved request (binding cookie required).
   const cancel = path.match(/^\/api\/pairing\/request\/([^/]+)\/cancel$/);
   if (method === "POST" && cancel) {
-    const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
+    const bindSecret = pairBindSecret(request);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
     const result = await cancelPairing(config, cancel[1]!, bindSecret);
     if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);

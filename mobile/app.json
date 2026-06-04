@@ -16,6 +16,7 @@
       "supportsTablet": true,
       "bundleIdentifier": "ai.lilaclabs.gini.mobile",
       "deploymentTarget": "16.4",
+      "associatedDomains": ["applinks:*.gini-relay.lilaclabs.ai"],
       "infoPlist": {
         "NSAppTransportSecurity": {
           "NSAllowsArbitraryLoads": true

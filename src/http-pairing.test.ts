@@ -40,6 +40,10 @@ interface CallOpts {
   xff?: string;
   userAgent?: string;
   body?: unknown;
+  // Native mobile-client headers: the cookieless pairing path.
+  pairClient?: string; // X-Gini-Pair-Client
+  pairSecret?: string; // X-Gini-Pair-Secret
+  auth?: string; // Authorization: Bearer <token>
 }
 
 function makeHandler(instance: string) {
@@ -56,6 +60,9 @@ async function pair(handler: ReturnType<typeof createHandler>, path: string, opt
   if (opts.secFetchSite) headers["sec-fetch-site"] = opts.secFetchSite;
   if (opts.xff) headers["x-forwarded-for"] = opts.xff;
   if (opts.userAgent) headers["user-agent"] = opts.userAgent;
+  if (opts.pairClient) headers["x-gini-pair-client"] = opts.pairClient;
+  if (opts.pairSecret) headers["x-gini-pair-secret"] = opts.pairSecret;
+  if (opts.auth) headers.authorization = `Bearer ${opts.auth}`;
   return handler(
     new Request(`http://127.0.0.1:7337${path}`, {
       method: opts.method ?? "GET",
@@ -659,5 +666,165 @@ describe("relay session gate (web-bound branch)", () => {
       host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin"
     });
     expect(res.status).toBe(200);
+  });
+});
+
+// Drive the native (mobile-app) handshake: no Origin, no Sec-Fetch, the opt-in
+// header, and the binding secret carried in a header instead of a cookie. The
+// claim returns the session token in the BODY so a bearer client can store it.
+async function nativePairedSession(instance: string) {
+  const { config, handler } = makeHandler(instance);
+  const relay = RELAY(instance);
+  const created = await pair(handler, "/api/pairing/request", {
+    method: "POST", host: relay, pairClient: "native", userAgent: "GiniMobile/1.0 (iOS)", body: {}
+  });
+  expect(created.status).toBe(201);
+  const body = await created.json();
+  expect(body.bindSecret).toMatch(/^[0-9a-f]{64}$/);
+  const approved = await pair(handler, `/api/pairing/requests/${body.id}/approve`, {
+    method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+  });
+  expect(approved.status).toBe(200);
+  const claimed = await pair(handler, `/api/pairing/request/${body.id}/claim`, {
+    method: "POST", host: relay, pairClient: "native", pairSecret: body.bindSecret as string, body: {}
+  });
+  expect(claimed.status).toBe(200);
+  const claimedBody = await claimed.json();
+  return { config, handler, relay, requestId: body.id as string, token: claimedBody.token as string, claimed };
+}
+
+describe("pairing routes — native client (mobile)", () => {
+  test("native create (no Origin) returns 201 with id, code, and the bindSecret in the body", async () => {
+    const { handler } = makeHandler("pair-native-create");
+    const relay = RELAY("pair-native-create");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, pairClient: "native", userAgent: "GiniMobile/1.0 (iOS)", body: {}
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.id).toMatch(/^preq_/);
+    expect(body.code).toMatch(/^\d{3}-\d{3}$/);
+    // Browsers never see the secret in the body (HttpOnly cookie only); native does.
+    expect(body.bindSecret).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("a no-Origin POST WITHOUT the native opt-in is still refused (the exemption requires opt-in)", async () => {
+    const { handler } = makeHandler("pair-native-nooptin");
+    const relay = RELAY("pair-native-nooptin");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, body: {} // no Origin, no Sec-Fetch, no opt-in header
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test("a native opt-in on an UNTRUSTED host is still refused", async () => {
+    const { handler } = makeHandler("pair-native-badhost");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: "evil.example.com", pairClient: "native", body: {}
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test("native poll via the X-Gini-Pair-Secret header returns the pending status", async () => {
+    const { handler } = makeHandler("pair-native-poll");
+    const relay = RELAY("pair-native-poll");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, pairClient: "native", body: {}
+    });
+    const { id, bindSecret } = await created.json();
+    const res = await pair(handler, `/api/pairing/request/${id}`, {
+      host: relay, pairClient: "native", pairSecret: bindSecret
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("pending");
+  });
+
+  test("native claim returns the token in the body, and that token authenticates a bearer call", async () => {
+    const { handler, relay, token } = await nativePairedSession("pair-native-claim");
+    expect(token).toMatch(/^gini_device_/);
+    // The minted device token works as Authorization: Bearer on the native API
+    // surface over the relay (isWebProxyPath routes /api/agents to the bearer gate).
+    const authed = await pair(handler, "/api/agents", { host: relay, auth: token });
+    expect(authed.status).toBe(200);
+    // A bogus bearer is rejected — proving the 200 above is the token, not an open route.
+    const denied = await pair(handler, "/api/agents", { host: relay, auth: "gini_device_bogus" });
+    expect(denied.status).toBe(401);
+  });
+
+  test("native cancel via the header clears the request", async () => {
+    const { handler } = makeHandler("pair-native-cancel");
+    const relay = RELAY("pair-native-cancel");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, pairClient: "native", body: {}
+    });
+    const { id, bindSecret } = await created.json();
+    const res = await pair(handler, `/api/pairing/request/${id}/cancel`, {
+      method: "POST", host: relay, pairClient: "native", pairSecret: bindSecret, body: {}
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).ok).toBe(true);
+  });
+
+  test("a browser is never native: the opt-in header + Sec-Fetch present stays cookie-only (no body token)", async () => {
+    // A real browser claim (Sec-Fetch present, cookie-bound) that ALSO sets the
+    // native opt-in header must NOT receive the token in the body — otherwise an
+    // XSS on /pair could exfiltrate it. Sec-Fetch is unforgeable from JS, so it
+    // is the security anchor; the opt-in alone never flips a browser to native.
+    const { handler } = makeHandler("pair-native-browserguard");
+    const relay = RELAY("pair-native-browserguard");
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin", body: {}
+    });
+    const { id } = await created.json();
+    const bind = setCookieValue(created, "gini_pair")!;
+    await pair(handler, `/api/pairing/requests/${id}/approve`, {
+      method: "POST", host: "127.0.0.1:7337", origin: "http://127.0.0.1:7337", secFetchSite: "same-origin", body: {}
+    });
+    const claimed = await pair(handler, `/api/pairing/request/${id}/claim`, {
+      method: "POST", host: relay, origin: `https://${relay}`, secFetchSite: "same-origin",
+      cookie: `gini_pair=${encodeURIComponent(bind)}`, pairClient: "native", body: {}
+    });
+    expect(claimed.status).toBe(200);
+    expect((await claimed.json()).token).toBeUndefined();
+    // The session still arrives the browser way — as the __Host- cookie.
+    expect(setCookieValue(claimed, "__Host-gini_session")).toBeTruthy();
+  });
+
+  test("the ordinary browser claim body never contains the token", async () => {
+    const { claimed } = await pairedSession("pair-native-nobodytoken");
+    expect((await claimed.json()).token).toBeUndefined();
+  });
+});
+
+describe("apple-app-site-association", () => {
+  test("served with the app id and JSON content-type, reachable unpaired on the relay", async () => {
+    const { handler } = makeHandler("aasa-relay");
+    const relay = RELAY("aasa-relay");
+    const res = await pair(handler, "/.well-known/apple-app-site-association", { host: relay });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const body = await res.json();
+    const detail = body.applinks.details[0];
+    expect(detail.appIDs).toContain("WB6Y3K67AB.ai.lilaclabs.gini.mobile");
+    expect(detail.components.some((c: Record<string, string>) => c["/"] === "/pair" || c["/"] === "/pair/*")).toBe(true);
+  });
+
+  test("reachable on loopback too", async () => {
+    const { handler } = makeHandler("aasa-loopback");
+    const res = await pair(handler, "/.well-known/apple-app-site-association", { host: "127.0.0.1:7337" });
+    expect(res.status).toBe(200);
+  });
+
+  test("honors the GINI_IOS_APP_ID override", async () => {
+    const previous = process.env.GINI_IOS_APP_ID;
+    process.env.GINI_IOS_APP_ID = "TEAM2XYZ.com.example.app";
+    try {
+      const { handler } = makeHandler("aasa-override");
+      const res = await pair(handler, "/.well-known/apple-app-site-association", { host: RELAY("aasa-override") });
+      expect((await res.json()).applinks.details[0].appIDs).toEqual(["TEAM2XYZ.com.example.app"]);
+    } finally {
+      if (previous === undefined) delete process.env.GINI_IOS_APP_ID;
+      else process.env.GINI_IOS_APP_ID = previous;
+    }
   });
 });

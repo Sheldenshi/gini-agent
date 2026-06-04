@@ -1,0 +1,399 @@
+import { Stack, router, useLocalSearchParams } from "expo-router";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
+import { createPairingClient, PairingError, type PairingClient } from "@/src/pairing";
+import { family, theme } from "@/src/theme";
+
+// The device-side pairing screen — the mirror of web/src/app/pair/page.tsx for
+// the native app. Entered either by a universal link to a relay subdomain
+// (app/+native-intent.tsx rewrites it to /pair?relay=<origin>) or by pasting a
+// link here. We create a pairing request, show its code as the hero, poll until
+// the operator approves it on the web app, then claim — storing the returned
+// device token so every later call authenticates as `Authorization: Bearer`.
+
+type Phase =
+  | "input" // no relay yet — ask for a link
+  | "creating"
+  | "create-error"
+  | "pending"
+  | "claiming"
+  | "paired"
+  | "rejected"
+  | "expired"
+  | "claim-error"
+  | "cancelled";
+
+// Match the web /pair cadence so the operator sees an approval reflected on the
+// device within a couple of seconds.
+const POLL_INTERVAL_MS = 2000;
+
+export default function PairScreen() {
+  const params = useLocalSearchParams<{ relay?: string | string[] }>();
+  const relayParam = Array.isArray(params.relay) ? params.relay[0] : params.relay;
+
+  const [phase, setPhase] = useState<Phase>(relayParam ? "creating" : "input");
+  const [linkInput, setLinkInput] = useState("");
+  const [code, setCode] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // The handshake client + the live request id/secret for this attempt.
+  const clientRef = useRef<PairingClient | null>(null);
+  const requestRef = useRef<{ id: string; secret: string } | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Disarmed synchronously by cancel()/unmount so an in-flight tick can't pair
+  // after the user backs out.
+  const activeRef = useRef(true);
+  // Exactly-once mount guard (Expo Router can re-run effects).
+  const startedRef = useRef(false);
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current !== null) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
+  }, []);
+
+  // Begin (or restart) a handshake against `origin`. Resolving the client throws
+  // for a malformed/public-http origin, surfaced as a create error.
+  const start = useCallback(
+    async (origin: string) => {
+      stopPolling();
+      activeRef.current = true;
+      setError(null);
+      setCode(null);
+      setPhase("creating");
+      let client: PairingClient;
+      try {
+        client = createPairingClient(origin);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "That doesn't look like a Gini link.");
+        setPhase("create-error");
+        return;
+      }
+      clientRef.current = client;
+      try {
+        const handshake = await client.create();
+        if (!activeRef.current) return;
+        requestRef.current = { id: handshake.id, secret: handshake.bindSecret };
+        setCode(handshake.code);
+        setPhase("pending");
+      } catch (e) {
+        if (!activeRef.current) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setPhase("create-error");
+      }
+    },
+    [stopPolling]
+  );
+
+  // Auto-start when a relay origin arrived via the deep link. Guarded so it runs
+  // once even if the effect re-fires.
+  useEffect(() => {
+    if (!relayParam || startedRef.current) return;
+    startedRef.current = true;
+    void start(relayParam);
+    return () => {
+      activeRef.current = false;
+      stopPolling();
+    };
+  }, [relayParam, start, stopPolling]);
+
+  // Poll while pending. On approval we hand off to the claim effect rather than
+  // claiming inline, so flipping to "claiming" can't self-cancel this tick.
+  useEffect(() => {
+    if (phase !== "pending") return;
+    const tick = async () => {
+      const client = clientRef.current;
+      const request = requestRef.current;
+      if (!client || !request) return;
+      try {
+        const status = await client.poll(request.id, request.secret);
+        if (!activeRef.current) return;
+        if (status === "approved") {
+          stopPolling();
+          setPhase("claiming");
+        } else if (status === "rejected") {
+          stopPolling();
+          setPhase("rejected");
+        } else if (status === "expired") {
+          stopPolling();
+          setPhase("expired");
+        } else if (status === "cancelled") {
+          stopPolling();
+          setPhase("cancelled");
+        }
+        // "pending" / "claimed" → keep waiting.
+      } catch (e) {
+        if (!activeRef.current) return;
+        // 401/403/404 are terminal for this request (gone/expired/binding lost);
+        // anything else is a transient relay blip — let the next tick retry.
+        const status = e instanceof PairingError ? e.status : 0;
+        if (status === 401 || status === 403 || status === 404) {
+          stopPolling();
+          setError("This pairing request is no longer valid. Start over.");
+          setPhase("claim-error");
+        }
+      }
+    };
+    pollRef.current = setInterval(() => void tick(), POLL_INTERVAL_MS);
+    return () => stopPolling();
+  }, [phase, stopPolling]);
+
+  // Claim once approved: mint + store the device token, then drop into the app.
+  useEffect(() => {
+    if (phase !== "claiming") return;
+    let cancelled = false;
+    void (async () => {
+      const client = clientRef.current;
+      const request = requestRef.current;
+      if (!client || !request) return;
+      try {
+        const token = await client.claim(request.id, request.secret);
+        if (cancelled || !activeRef.current) return;
+        await saveCredentials({ baseUrl: client.origin, token });
+        if (cancelled || !activeRef.current) return;
+        setPhase("paired");
+        router.replace("/agents");
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : String(e));
+        setPhase("claim-error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [phase]);
+
+  const submitLink = useCallback(() => {
+    let origin: string;
+    try {
+      origin = normalizeBaseUrl(linkInput);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Enter a valid Gini link.");
+      return;
+    }
+    void start(origin);
+  }, [linkInput, start]);
+
+  const cancel = useCallback(async () => {
+    activeRef.current = false;
+    stopPolling();
+    const client = clientRef.current;
+    const request = requestRef.current;
+    if (client && request) {
+      try {
+        await client.cancel(request.id, request.secret);
+      } catch {
+        // Already terminal server-side — we surface the cancelled state anyway.
+      }
+    }
+    setPhase("cancelled");
+  }, [stopPolling]);
+
+  const retry = useCallback(() => {
+    const origin = clientRef.current?.origin ?? relayParam;
+    if (origin) void start(origin);
+    else setPhase("input");
+  }, [relayParam, start]);
+
+  return (
+    <SafeAreaView style={styles.safe} edges={["bottom"]}>
+      <Stack.Screen options={{ title: "Connect to Gini" }} />
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
+        style={styles.flex}
+      >
+        <ScrollView contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled">
+          <Text style={styles.heading}>Pair this device</Text>
+          <Text style={styles.subhead}>
+            A code appears below. Approve it on the computer where Gini is signed
+            in, and this device connects.
+          </Text>
+
+          {phase === "input" ? (
+            <>
+              <Text style={styles.label}>Gini link</Text>
+              <TextInput
+                value={linkInput}
+                onChangeText={setLinkInput}
+                autoCapitalize="none"
+                autoCorrect={false}
+                inputMode="url"
+                keyboardType="url"
+                placeholder="https://….gini-relay.lilaclabs.ai"
+                placeholderTextColor={theme.placeholder}
+                style={styles.input}
+              />
+              {error ? <Text style={styles.error}>{error}</Text> : null}
+              <TouchableOpacity onPress={submitLink} style={styles.button}>
+                <Text style={styles.buttonText}>Connect</Text>
+              </TouchableOpacity>
+            </>
+          ) : (
+            <>
+              {code ? (
+                <Text style={[styles.code, (phase === "expired" || phase === "cancelled") && styles.codeDimmed]}>
+                  {code}
+                </Text>
+              ) : (
+                <ActivityIndicator color={theme.accent} style={styles.codeSpinner} />
+              )}
+
+              <StatusRow phase={phase} error={error} />
+
+              <Controls phase={phase} onRetry={retry} onCancel={() => void cancel()} />
+            </>
+          )}
+        </ScrollView>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
+  );
+}
+
+function StatusRow({ phase, error }: { phase: Phase; error: string | null }) {
+  const map: Partial<Record<Phase, { text: string; tone?: "error" | "muted" | "success" }>> = {
+    creating: { text: "Generating your code…" },
+    pending: { text: "Waiting for approval on your computer…" },
+    claiming: { text: "Approved — finishing up…" },
+    paired: { text: "Paired — taking you in…", tone: "success" },
+    rejected: { text: "Request denied.", tone: "error" },
+    expired: { text: "This code expired.", tone: "muted" },
+    cancelled: { text: "Pairing cancelled.", tone: "muted" },
+    "create-error": { text: error ?? "Couldn't start pairing.", tone: "error" },
+    "claim-error": { text: error ?? "Pairing couldn't be completed.", tone: "error" }
+  };
+  const entry = map[phase];
+  if (!entry) return null;
+  const color =
+    entry.tone === "error"
+      ? theme.danger
+      : entry.tone === "success"
+        ? theme.accent
+        : entry.tone === "muted"
+          ? theme.muted
+          : theme.subtle;
+  return <Text style={[styles.status, { color }]}>{entry.text}</Text>;
+}
+
+function Controls({
+  phase,
+  onRetry,
+  onCancel
+}: {
+  phase: Phase;
+  onRetry: () => void;
+  onCancel: () => void;
+}) {
+  if (phase === "pending" || phase === "claiming") {
+    return (
+      <TouchableOpacity onPress={onCancel} disabled={phase === "claiming"} style={styles.ghostButton}>
+        <Text style={styles.ghostButtonText}>Cancel</Text>
+      </TouchableOpacity>
+    );
+  }
+  if (phase === "rejected" || phase === "expired" || phase === "cancelled" || phase === "create-error" || phase === "claim-error") {
+    return (
+      <TouchableOpacity onPress={onRetry} style={styles.button}>
+        <Text style={styles.buttonText}>Try again</Text>
+      </TouchableOpacity>
+    );
+  }
+  return null;
+}
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: theme.bg },
+  flex: { flex: 1 },
+  scroll: { padding: 20, paddingTop: 24, gap: 12 },
+  heading: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 24
+  },
+  subhead: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    lineHeight: 20,
+    marginBottom: 8
+  },
+  label: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 13,
+    marginTop: 12
+  },
+  input: {
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 16,
+    color: theme.text,
+    borderColor: theme.inputBorder,
+    backgroundColor: theme.bg
+  },
+  code: {
+    alignSelf: "center",
+    marginTop: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    borderRadius: 12,
+    backgroundColor: theme.codeChipBg,
+    color: theme.codeChipText,
+    fontFamily: family("JetBrainsMono"),
+    fontSize: 40,
+    letterSpacing: 6
+  },
+  codeDimmed: { opacity: 0.4 },
+  codeSpinner: { marginTop: 28, marginBottom: 8 },
+  status: {
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    textAlign: "center",
+    marginTop: 4
+  },
+  error: {
+    color: theme.danger,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    marginTop: 4
+  },
+  button: {
+    marginTop: 20,
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: theme.button
+  },
+  buttonText: {
+    color: theme.buttonText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 16
+  },
+  ghostButton: {
+    marginTop: 16,
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  ghostButtonText: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  }
+});

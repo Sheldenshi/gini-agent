@@ -48,6 +48,22 @@ The setup screen calls `GET /api/status` once to validate; if it
 returns JSON, the credentials are persisted with `AsyncStorage` and
 you're routed to the agent picker.
 
+### Pair with a relay link (no token copy)
+
+If the gateway has a relay tunnel connected, you can skip the manual
+token paste. Opening the relay link
+(`https://<sub>.gini-relay.lilaclabs.ai`) on the phone opens the app
+straight into the pairing screen (iOS universal link, declared via
+`ios.associatedDomains` + the gateway-served
+`/.well-known/apple-app-site-association`). The screen shows a code;
+approve it from the **Pair requests** panel on the web app and the
+device connects — the gateway returns a device token the app stores as
+its bearer. You can also reach the same screen from setup ("Have a Gini
+link? Pair this device instead") and paste the link if the universal
+link hasn't resolved yet. See ADR
+[device-pairing-auth.md](../docs/adr/device-pairing-auth.md) ("Native
+pairing client").
+
 ## Behavior
 
 - **Agents** is the home screen. Tapping an agent activates it on the
