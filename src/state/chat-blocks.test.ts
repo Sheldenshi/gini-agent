@@ -19,7 +19,6 @@ import {
   insertChatBlock,
   listChatBlocks,
   listChatBlocksAfter,
-  listMainChatBlocks,
   listThreadBlocks,
   subscribeChatBlocks,
   summarizeThreads,
@@ -27,6 +26,7 @@ import {
   updateToolCallBlock,
   upsertAssistantTextBlock
 } from "./index";
+import { listMainChatBlocks } from "./chat-blocks";
 import type { ChatBlock } from "../types";
 
 const ROOT = "/tmp/gini-chat-blocks-test";

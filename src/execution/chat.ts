@@ -213,6 +213,9 @@ export async function getOrCreateAgentChat(
   agentId: string
 ): Promise<ChatSessionRecord> {
   return mutateState(instance, (state) => {
+    if (!state.agents.find((a) => a.id === agentId)) {
+      throw new Error(`Agent not found: ${agentId}`);
+    }
     const byRecency = (a: ChatSessionRecord, b: ChatSessionRecord): number =>
       b.updatedAt.localeCompare(a.updatedAt);
     const owned = state.chatSessions.filter((session) => session.agentId === agentId);
@@ -429,11 +432,21 @@ export async function submitThreadReply(
   threadId: string,
   input: Record<string, unknown>
 ) {
+  // Validate the session first so a bad sessionId fails as "Chat session not
+  // found" (404) rather than the misleading "Thread not found" — the thread
+  // lookup below is scoped to a session that may not exist.
+  const state = readState(config.instance);
+  if (!state.chatSessions.find((item) => item.id === sessionId)) {
+    throw new Error(`Chat session not found: ${sessionId}`);
+  }
   // Resolve the thread's parent_block_id from its existing blocks. A thread
   // with no blocks doesn't exist — reject before doing any STT/run work.
   const threadBlocks = listThreadBlocks(config.instance, sessionId, threadId);
   if (threadBlocks.length === 0) throw new Error(`Thread not found: ${threadId}`);
+  // Thread blocks always carry parentBlockId by construction; a missing one
+  // is corruption, so fail loudly rather than silently dropping the tag.
   const parentBlockId = threadBlocks[0].parentBlockId;
+  if (!parentBlockId) throw new Error("Thread is missing its parent message");
   const { content, images, audio, liveSession } = await prepareChatSubmission(config, sessionId, input);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   const task = await submitTask(config, content, {
@@ -442,7 +455,7 @@ export async function submitThreadReply(
     chatSessionId: sessionId,
     agentId: liveSession.agentId,
     threadId,
-    ...(parentBlockId ? { parentBlockId } : {}),
+    parentBlockId,
     ...(images.length > 0 ? { images } : {})
   });
   await linkRunToTask(config, run.id, task);
@@ -473,7 +486,7 @@ export async function submitThreadReply(
       runId: run.id,
       agentId: liveSession.agentId ?? null,
       threadId,
-      ...(parentBlockId ? { parentBlockId } : {}),
+      parentBlockId,
       ...(images.length > 0 ? { images } : {}),
       ...(audio ? { audio } : {})
     });

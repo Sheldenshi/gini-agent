@@ -199,12 +199,12 @@ function ThreadCard({
       <View style={styles.footer}>
         <View style={styles.avatars}>
           <View style={[styles.miniAvatar, styles.miniYou]}>
-            <Text style={styles.miniAvatarText}>Y</Text>
+            <Text style={styles.miniAvatarText} allowFontScaling={false}>Y</Text>
           </View>
           <View
             style={[styles.miniAvatar, styles.miniAgent, { backgroundColor: swatch.bg }]}
           >
-            <Text style={[styles.miniAvatarText, { color: swatch.fg }]}>
+            <Text style={[styles.miniAvatarText, { color: swatch.fg }]} allowFontScaling={false}>
               {agentInitial(agentName)}
             </Text>
           </View>

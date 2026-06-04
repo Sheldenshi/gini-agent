@@ -4856,6 +4856,19 @@ describe("agent-chat and thread endpoints", () => {
     expect(String(value.error)).toContain("Thread not found");
   });
 
+  test("POST /api/chat/:id/threads/:tid/messages 404s with Chat session not found on a bad session", async () => {
+    const config = testConfig("thread-reply-bad-session");
+    const handler = createHandler(config);
+
+    const response = await rawCall(handler, config, "/api/chat/chat_nope/threads/thread_one/messages", {
+      method: "POST",
+      body: JSON.stringify({ content: "no session here" })
+    }, config.token);
+    expect(response.status).toBe(404);
+    const value = await response.json();
+    expect(String(value.error)).toContain("Chat session not found");
+  });
+
   test("GET /api/threads aggregates across agent sessions with agentName, newest first", async () => {
     const config = testConfig("threads-inbox");
     const handler = createHandler(config);

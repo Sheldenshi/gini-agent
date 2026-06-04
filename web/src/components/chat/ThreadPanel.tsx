@@ -27,11 +27,13 @@ export function ThreadPanel({
   sessionId,
   thread,
   agentName,
+  agent,
   onClose
 }: {
   sessionId: string;
   thread: ThreadSummary;
   agentName: string;
+  agent?: { id: string; name: string };
   onClose: () => void;
 }) {
   const { blocks, isLoading } = useThread(sessionId, thread.threadId);
@@ -137,6 +139,7 @@ export function ThreadPanel({
                           ? toolResultsByCallId.get(item.block.callId)
                           : undefined
                       }
+                      agent={agent}
                     />
                   </li>
                 );

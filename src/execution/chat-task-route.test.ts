@@ -23,12 +23,12 @@ import {
 import {
   createTask,
   listChatBlocks,
-  listMainChatBlocks,
   listThreadBlocks,
   mutateState,
   readState,
   upsertTask
 } from "../state";
+import { listMainChatBlocks } from "../state/chat-blocks";
 import type { ChatBlock, RuntimeConfig, Task } from "../types";
 import { createChat, submitChatMessage } from "./chat";
 import { runChatTask } from "./chat-task";

@@ -1,6 +1,6 @@
 import { Feather } from "@expo/vector-icons";
 import { router, Stack } from "expo-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   RefreshControl,
@@ -54,8 +54,10 @@ export default function ChannelsScreen() {
   const [newAgentError, setNewAgentError] = useState<string | null>(null);
   // Resolving an agent's canonical chat is a network hop; track which
   // agent row is mid-resolve so its tap shows a spinner instead of a
-  // dead press.
+  // dead press. The ref is the actual re-entrancy guard — state alone
+  // would re-create openAgent and weaken a synchronous double-tap.
   const [openingAgentId, setOpeningAgentId] = useState<string | null>(null);
+  const openingRef = useRef(false);
 
   const unauthorized =
     agents.error instanceof ApiError && agents.error.status === 401;
@@ -76,7 +78,8 @@ export default function ChannelsScreen() {
   // we fetch the session id directly here (rather than via the cached
   // hook) so the push targets the right route even on the first tap.
   const openAgent = useCallback(async (agent: AgentRecord) => {
-    if (openingAgentId) return;
+    if (openingRef.current) return;
+    openingRef.current = true;
     setOpeningAgentId(agent.id);
     try {
       const session = await api<ChatSession>(`/agents/${agent.id}/chat`);
@@ -85,9 +88,10 @@ export default function ChannelsScreen() {
       // A failed resolve is rare (agent just deleted on another device);
       // leave the user on the list rather than pushing a dead route.
     } finally {
+      openingRef.current = false;
       setOpeningAgentId(null);
     }
-  }, [openingAgentId]);
+  }, []);
 
   const onSubmitNewAgent = useCallback(() => {
     const trimmed = newAgentName.trim();

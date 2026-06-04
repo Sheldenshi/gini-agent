@@ -57,6 +57,17 @@ export default function ChatPage() {
 
   const headerName = isChannel ? session?.title?.trim() || "Channel" : activeAgentName;
   const headerSeed = isChannel ? sessionId ?? "channel" : activeAgentId ?? "agent";
+  // The agent whose messages render in the transcript. On the agent surface
+  // this is the active agent; on a channel the assistant is the session's
+  // owning agent (named "Gini" by default since the channel title isn't the
+  // agent's name). Keys the colored-initial message-row avatar.
+  const messageAgent = isChannel
+    ? session?.agentId
+      ? { id: session.agentId, name: "Gini" }
+      : undefined
+    : activeAgentId
+      ? { id: activeAgentId, name: activeAgentName }
+      : undefined;
   const resolving = !sessionId && (pinnedSessionId ? !pinnedSession : agentChat.isLoading);
 
   return (
@@ -80,6 +91,7 @@ export default function ChatPage() {
           headerName={headerName}
           headerSeed={headerSeed}
           isChannel={isChannel}
+          messageAgent={messageAgent}
         />
       )}
     </div>
@@ -91,13 +103,15 @@ function ChatSurface({
   session,
   headerName,
   headerSeed,
-  isChannel
+  isChannel,
+  messageAgent
 }: {
   sessionId: string;
   session: ChatSession;
   headerName: string;
   headerSeed: string;
   isChannel: boolean;
+  messageAgent?: { id: string; name: string };
 }) {
   const [tab, setTab] = useState<ChatTab>("messages");
   const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
@@ -236,6 +250,7 @@ function ChatSurface({
                                 ? toolResultsByCallId.get(block.callId)
                                 : undefined
                             }
+                            agent={messageAgent}
                           />
                           {thread ? (
                             <div className="pl-[46px]">
@@ -278,10 +293,14 @@ function ChatSurface({
       </section>
 
       {openThread ? (
+        // Key on the thread id so the panel's transient state (composer draft,
+        // scroll) starts fresh per thread — no draft leaks across switches.
         <ThreadPanel
+          key={openThread.threadId}
           sessionId={sessionId}
           thread={openThread}
           agentName={headerName}
+          agent={messageAgent}
           onClose={() => setOpenThread(null)}
         />
       ) : null}

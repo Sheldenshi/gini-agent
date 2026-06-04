@@ -107,4 +107,11 @@ describe("getOrCreateAgentChat", () => {
     expect(resolved.id).toBe(liveChatId);
     expect(resolved.kind).toBe("agent");
   });
+
+  test("throws Agent not found for an unknown agent id", async () => {
+    const instance = "agent-chat-unknown";
+    await expect(getOrCreateAgentChat(instance, "agent_missing")).rejects.toThrow(
+      "Agent not found: agent_missing"
+    );
+  });
 });

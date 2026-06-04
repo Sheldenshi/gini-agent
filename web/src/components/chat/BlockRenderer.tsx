@@ -16,16 +16,18 @@ import { BlockUserText } from "./BlockUserText";
 // callId → tool_result mapping and passes the matching result here.
 export function BlockRenderer({
   block,
-  toolResult
+  toolResult,
+  agent
 }: {
   block: ChatBlock;
   toolResult?: ToolResultBlock;
+  agent?: { id: string; name: string };
 }) {
   switch (block.kind) {
     case "user_text":
       return <BlockUserText block={block} />;
     case "assistant_text":
-      return <BlockAssistantText block={block} />;
+      return <BlockAssistantText block={block} agent={agent} />;
     case "tool_call":
       return <BlockToolCall block={block} result={toolResult} />;
     case "tool_result":
