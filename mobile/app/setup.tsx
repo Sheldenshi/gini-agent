@@ -48,7 +48,7 @@ export default function SetupScreen() {
         auth: { baseUrl: normalizedUrl, token: trimmedToken }
       });
       await saveCredentials({ baseUrl: normalizedUrl, token: trimmedToken });
-      router.replace("/agents");
+      router.replace("/channels");
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         setError("Token rejected by gateway (401). Double-check the token.");

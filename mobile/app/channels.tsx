@@ -1,0 +1,611 @@
+import { Feather } from "@expo/vector-icons";
+import { router, Stack } from "expo-router";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+import { api, ApiError } from "@/src/api";
+import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
+import { chatListTime } from "@/src/format";
+import {
+  useAgents,
+  useChannels,
+  useCreateAgent,
+  useUnreadCounts
+} from "@/src/queries";
+import { family, theme } from "@/src/theme";
+import type { AgentRecord, ChatSession } from "@/src/types";
+
+// Channels — the redesigned home. Two sections: "Agents" (each agent is
+// a DM with its single canonical chat) and "Recurring Jobs" (channels =
+// job-derived sessions). A header inbox icon routes to the cross-agent
+// Threads Inbox. Tapping an agent resolves its one chat and pushes into
+// the chat detail; tapping a channel pushes directly into that session.
+export default function ChannelsScreen() {
+  const agents = useAgents();
+  const channels = useChannels();
+  const createAgent = useCreateAgent();
+  const unreadCountsQuery = useUnreadCounts();
+  const unreadCounts = unreadCountsQuery.data ?? {};
+
+  const [query, setQuery] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [newAgentName, setNewAgentName] = useState("");
+  const [newAgentError, setNewAgentError] = useState<string | null>(null);
+  // Resolving an agent's canonical chat is a network hop; track which
+  // agent row is mid-resolve so its tap shows a spinner instead of a
+  // dead press.
+  const [openingAgentId, setOpeningAgentId] = useState<string | null>(null);
+
+  const unauthorized =
+    agents.error instanceof ApiError && agents.error.status === 401;
+  useEffect(() => {
+    if (unauthorized) router.replace("/setup");
+  }, [unauthorized]);
+
+  const agentList = useMemo<AgentRecord[]>(() => agents.data?.agents ?? [], [agents.data]);
+  const channelList = channels.data ?? [];
+
+  const filteredAgents = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return agentList;
+    return agentList.filter((a) => a.name.toLowerCase().includes(q));
+  }, [agentList, query]);
+
+  // Open an agent's single chat. The resolver is idempotent server-side;
+  // we fetch the session id directly here (rather than via the cached
+  // hook) so the push targets the right route even on the first tap.
+  const openAgent = useCallback(async (agent: AgentRecord) => {
+    if (openingAgentId) return;
+    setOpeningAgentId(agent.id);
+    try {
+      const session = await api<ChatSession>(`/agents/${agent.id}/chat`);
+      router.push(`/chat/${session.id}`);
+    } catch {
+      // A failed resolve is rare (agent just deleted on another device);
+      // leave the user on the list rather than pushing a dead route.
+    } finally {
+      setOpeningAgentId(null);
+    }
+  }, [openingAgentId]);
+
+  const onSubmitNewAgent = useCallback(() => {
+    const trimmed = newAgentName.trim();
+    if (!trimmed) return;
+    setNewAgentError(null);
+    createAgent.mutate(trimmed, {
+      onSuccess: () => {
+        setCreateOpen(false);
+        setNewAgentName("");
+      },
+      onError: (err) => setNewAgentError(err.message || "Failed to create agent")
+    });
+  }, [createAgent, newAgentName]);
+
+  if (unauthorized) return null;
+
+  const refreshing =
+    (agents.isFetching && agentList.length > 0) ||
+    (channels.isFetching && channelList.length > 0);
+
+  return (
+    <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
+      <Stack.Screen options={{ headerShown: false }} />
+
+      {/* Header — brand title left, inbox + compose icons right. The
+          inbox icon routes to the cross-agent Threads Inbox. */}
+      <View style={styles.header}>
+        <Text style={styles.brand}>Gini</Text>
+        <View style={styles.headerActions}>
+          <TouchableOpacity
+            onPress={() => router.push("/threads/inbox")}
+            hitSlop={8}
+            style={styles.headerIconButton}
+            accessibilityRole="button"
+            accessibilityLabel="Open threads inbox"
+          >
+            <Feather name="inbox" size={22} color={theme.text} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={() => {
+              setNewAgentError(null);
+              setNewAgentName("");
+              setCreateOpen(true);
+            }}
+            hitSlop={8}
+            style={styles.headerIconButton}
+            accessibilityRole="button"
+            accessibilityLabel="New agent"
+          >
+            <Feather name="edit" size={20} color={theme.text} />
+          </TouchableOpacity>
+        </View>
+      </View>
+
+      <View style={styles.searchWrap}>
+        <View style={styles.searchPill}>
+          <Feather name="search" size={16} color={theme.placeholder} />
+          <TextInput
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Search agents"
+            placeholderTextColor={theme.placeholder}
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="search"
+            clearButtonMode="while-editing"
+            style={styles.searchInput}
+            accessibilityLabel="Search agents"
+          />
+        </View>
+      </View>
+
+      {agents.isLoading && agentList.length === 0 ? (
+        <View style={styles.center}>
+          <ActivityIndicator color={theme.muted} />
+        </View>
+      ) : agents.isError ? (
+        <View style={styles.center}>
+          <Text style={styles.error}>
+            {agents.error instanceof Error ? agents.error.message : "Failed to load agents"}
+          </Text>
+          <TouchableOpacity onPress={() => agents.refetch()} style={styles.retry}>
+            <Text style={styles.retryText}>Retry</Text>
+          </TouchableOpacity>
+        </View>
+      ) : (
+        <ScrollView
+          contentContainerStyle={styles.content}
+          keyboardShouldPersistTaps="handled"
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={() => {
+                agents.refetch();
+                channels.refetch();
+              }}
+              tintColor={theme.muted}
+            />
+          }
+        >
+          {/* Agents section */}
+          <View style={styles.sectionHeader}>
+            <Text style={styles.sectionLabel}>Agents</Text>
+            <Text style={styles.sectionCount}>{agentList.length}</Text>
+          </View>
+          {filteredAgents.length === 0 ? (
+            <Text style={styles.emptySub}>
+              {query.trim() ? `No agents match “${query}”` : "No agents yet"}
+            </Text>
+          ) : (
+            filteredAgents.map((agent) => (
+              <AgentRow
+                key={agent.id}
+                agent={agent}
+                opening={openingAgentId === agent.id}
+                onPress={() => void openAgent(agent)}
+              />
+            ))
+          )}
+
+          {/* Recurring Jobs section — channels */}
+          {channelList.length > 0 ? (
+            <>
+              <View style={[styles.sectionHeader, styles.jobsHeader]}>
+                <View style={styles.jobsHeaderLeft}>
+                  <Feather name="chevron-down" size={14} color="#8A8A90" />
+                  <Text style={styles.sectionLabel}>Recurring Jobs</Text>
+                </View>
+              </View>
+              {channelList.map((channel) => (
+                <ChannelRow
+                  key={channel.id}
+                  channel={channel}
+                  unreadCount={unreadCounts[channel.id] ?? 0}
+                />
+              ))}
+            </>
+          ) : null}
+        </ScrollView>
+      )}
+
+      {createOpen ? (
+        <NewAgentInline
+          name={newAgentName}
+          error={newAgentError}
+          creating={createAgent.isPending}
+          onChangeName={setNewAgentName}
+          onSubmit={onSubmitNewAgent}
+          onCancel={() => setCreateOpen(false)}
+        />
+      ) : null}
+    </SafeAreaView>
+  );
+}
+
+function AgentRow({
+  agent,
+  opening,
+  onPress
+}: {
+  agent: AgentRecord;
+  opening: boolean;
+  onPress: () => void;
+}) {
+  // The agent list isn't backed by per-agent last-message previews on
+  // this screen (those live on the canonical chat session, which we don't
+  // pre-resolve for every row), so the preview line shows the agent's
+  // runtime status text as a stable, cheap subtitle. The detail screen
+  // surfaces the real conversation once opened.
+  const online = agent.status === "ready" || agent.status === "active";
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.7}
+      style={styles.agentRow}
+      accessibilityRole="button"
+      accessibilityLabel={`Open ${agent.name}`}
+    >
+      <AgentAvatar name={agent.name} size={48} online={online} />
+      <View style={styles.agentBody}>
+        <View style={styles.agentTop}>
+          <Text style={styles.agentName} numberOfLines={1}>
+            {agent.name}
+          </Text>
+          {opening ? <ActivityIndicator size="small" color={theme.muted} /> : null}
+        </View>
+        <Text style={styles.agentPreview} numberOfLines={1}>
+          {agent.model ? `${agent.providerName ?? "model"} · ${agent.model}` : agent.status}
+        </Text>
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+function ChannelRow({
+  channel,
+  unreadCount
+}: {
+  channel: ChatSession;
+  unreadCount: number;
+}) {
+  const title = channel.title?.trim() || "Channel";
+  const preview = channel.lastMessagePreview?.trim() || channel.summary?.trim() || "";
+  const time = chatListTime(channel.updatedAt ?? channel.createdAt);
+  const isUnread = unreadCount > 0;
+  return (
+    <TouchableOpacity
+      onPress={() => router.push(`/chat/${channel.id}`)}
+      activeOpacity={0.7}
+      style={styles.channelRow}
+      accessibilityRole="button"
+      accessibilityLabel={`Open channel ${title}`}
+    >
+      <View style={styles.channelIcon}>
+        <Feather name="clock" size={18} color={theme.placeholder} />
+      </View>
+      <View style={styles.channelBody}>
+        <Text style={styles.channelName} numberOfLines={1}>
+          {title}
+        </Text>
+        <View style={styles.channelSchedule}>
+          <Feather name="repeat" size={11} color="#B0B0B6" />
+          <Text style={styles.channelCadence} numberOfLines={1}>
+            {preview || "Recurring delivery"}
+          </Text>
+        </View>
+      </View>
+      {isUnread ? (
+        <View style={styles.channelBadge}>
+          <Text style={styles.channelBadgeText}>
+            {unreadCount > 99 ? "99+" : unreadCount}
+          </Text>
+        </View>
+      ) : (
+        <Text style={styles.channelNext}>{time}</Text>
+      )}
+    </TouchableOpacity>
+  );
+}
+
+// Lightweight inline name-entry overlay for creating an agent. Anchored
+// to the bottom of the screen above the home indicator so it doesn't
+// fight the list for space.
+function NewAgentInline({
+  name,
+  error,
+  creating,
+  onChangeName,
+  onSubmit,
+  onCancel
+}: {
+  name: string;
+  error: string | null;
+  creating: boolean;
+  onChangeName: (v: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  const submitDisabled = creating || name.trim().length === 0;
+  return (
+    <View style={styles.createOverlay}>
+      <Text style={styles.createTitle}>New agent</Text>
+      <TextInput
+        value={name}
+        onChangeText={onChangeName}
+        placeholder="Agent name"
+        placeholderTextColor={theme.placeholder}
+        autoFocus
+        autoCapitalize="words"
+        autoCorrect={false}
+        returnKeyType="done"
+        onSubmitEditing={() => {
+          if (!submitDisabled) onSubmit();
+        }}
+        editable={!creating}
+        style={styles.createInput}
+        accessibilityLabel="Agent name"
+      />
+      {error ? <Text style={styles.createError}>{error}</Text> : null}
+      <View style={styles.createActions}>
+        <TouchableOpacity
+          onPress={onCancel}
+          disabled={creating}
+          style={[styles.createButton, styles.createCancel]}
+          accessibilityRole="button"
+          accessibilityLabel="Cancel"
+        >
+          <Text style={styles.createCancelText}>Cancel</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          onPress={onSubmit}
+          disabled={submitDisabled}
+          style={[
+            styles.createButton,
+            styles.createSubmit,
+            submitDisabled && styles.createButtonDisabled
+          ]}
+          accessibilityRole="button"
+          accessibilityLabel="Create agent"
+        >
+          {creating ? (
+            <ActivityIndicator color={theme.buttonText} />
+          ) : (
+            <Text style={styles.createSubmitText}>Create</Text>
+          )}
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  safe: { flex: 1, backgroundColor: theme.bg },
+
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    backgroundColor: theme.bg,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border
+  },
+  brand: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 19
+  },
+  headerActions: { flexDirection: "row", alignItems: "center", gap: 18 },
+  headerIconButton: { alignItems: "center", justifyContent: "center" },
+
+  searchWrap: { paddingHorizontal: 12, paddingVertical: 10 },
+  searchPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 9,
+    backgroundColor: theme.searchBg,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    borderRadius: 9
+  },
+  searchInput: {
+    flex: 1,
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 15,
+    padding: 0
+  },
+
+  content: { paddingHorizontal: 16, paddingBottom: 24 },
+
+  sectionHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingTop: 12,
+    paddingBottom: 8
+  },
+  jobsHeader: { paddingTop: 18 },
+  jobsHeaderLeft: { flexDirection: "row", alignItems: "center", gap: 6 },
+  sectionLabel: {
+    color: "#6A6A70",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 13,
+    letterSpacing: 0.3
+  },
+  sectionCount: {
+    color: "#B6B6BC",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 13
+  },
+
+  // Agent row — avatar + name/preview + time/badge.
+  agentRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border
+  },
+  agentBody: { flex: 1, gap: 5 },
+  agentTop: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8
+  },
+  agentName: {
+    flex: 1,
+    color: "#0A0A0A",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 17
+  },
+  agentPreview: {
+    color: "#3A3A3A",
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14,
+    lineHeight: 18
+  },
+
+  // Channel row — timer tile + name/schedule + next-run.
+  channelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F2F2F2"
+  },
+  channelIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 11,
+    backgroundColor: "#F2F2F2",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  channelBody: { flex: 1, gap: 2 },
+  channelName: {
+    color: "#3A3A3A",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
+  channelSchedule: { flexDirection: "row", alignItems: "center", gap: 5 },
+  channelCadence: {
+    flex: 1,
+    color: theme.placeholder,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12
+  },
+  channelNext: {
+    color: "#B6B6BC",
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12
+  },
+  channelBadge: {
+    minWidth: 20,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 999,
+    backgroundColor: "#2F6BFF",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  channelBadgeText: {
+    color: "#FFFFFF",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 12
+  },
+
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 12 },
+  emptySub: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    paddingVertical: 12
+  },
+  error: {
+    color: theme.danger,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    textAlign: "center"
+  },
+  retry: { padding: 8 },
+  retryText: {
+    color: theme.accent,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 14
+  },
+
+  // Create-agent overlay.
+  createOverlay: {
+    position: "absolute",
+    left: 16,
+    right: 16,
+    bottom: 24,
+    backgroundColor: theme.bg,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: theme.inputBorder,
+    padding: 16,
+    gap: 12,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 16,
+    elevation: 8
+  },
+  createTitle: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 17
+  },
+  createInput: {
+    backgroundColor: theme.bg,
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 16,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: theme.inputBorder
+  },
+  createError: {
+    color: theme.danger,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 13
+  },
+  createActions: { flexDirection: "row", gap: 8 },
+  createButton: {
+    flex: 1,
+    height: 44,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  createCancel: { backgroundColor: theme.bg, borderWidth: 1, borderColor: theme.inputBorder },
+  createCancelText: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
+  createSubmit: { backgroundColor: theme.accent },
+  createSubmitText: {
+    color: theme.buttonText,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
+  createButtonDisabled: { opacity: 0.5 }
+});

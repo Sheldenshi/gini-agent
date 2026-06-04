@@ -15,5 +15,5 @@ export default function Index() {
     return <View style={{ flex: 1, backgroundColor: theme.bg }} />;
   }
   if (!credentials) return <Redirect href="/setup" />;
-  return <Redirect href="/agents" />;
+  return <Redirect href="/channels" />;
 }

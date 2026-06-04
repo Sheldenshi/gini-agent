@@ -131,16 +131,25 @@ export default function RootLayout() {
               <Stack screenOptions={screenOptions}>
                 <Stack.Screen name="index" options={{ headerShown: false }} />
                 <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
-                {/* agents.tsx owns its own header via a <Stack.Screen> inside
-                    the component (custom left/right buttons), so we set
-                    headerShown: false here and let the screen draw its own
-                    hamburger + title + plus row. */}
-                <Stack.Screen name="agents" options={{ headerShown: false }} />
+                {/* channels.tsx (the Channels home) draws its own header
+                    with the brand title, inbox icon, and compose button. */}
+                <Stack.Screen name="channels" options={{ headerShown: false }} />
                 <Stack.Screen name="settings" options={{ title: "Settings" }} />
-                {/* Chat detail draws its own header (back arrow + centered
-                    title). */}
+                {/* Chat detail draws its own header (back arrow + agent
+                    header + tab bar). */}
                 <Stack.Screen
                   name="chat/[sessionId]"
+                  options={{ headerShown: false }}
+                />
+                {/* Slack-style Thread View, pushed as a card over the
+                    chat detail. Draws its own header. */}
+                <Stack.Screen
+                  name="chat/[sessionId]/thread/[threadId]"
+                  options={{ headerShown: false }}
+                />
+                {/* Cross-agent Threads Inbox. Draws its own header. */}
+                <Stack.Screen
+                  name="threads/inbox"
                   options={{ headerShown: false }}
                 />
               </Stack>
