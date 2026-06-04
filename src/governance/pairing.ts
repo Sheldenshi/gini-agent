@@ -103,7 +103,8 @@ export async function requestPairing(
   return redactPairingRequest(request);
 }
 
-// Operator-facing list of pending requests (loopback-only at the route). Uses
+// Admin-facing list of pending requests (the route admits loopback OR a valid
+// gini_session — the mirror model; see ADR device-pairing-auth.md). Uses
 // mutateState so the lazy expiry sweep persists.
 export async function listPairingRequests(config: RuntimeConfig) {
   const pending = await mutateState(config.instance, (state) => listPendingPairingRequests(state));

@@ -29,10 +29,11 @@ mobile pairing: here the **device initiates** and the **operator approves**.
    with a 6-digit display `code`, returns `{ id, code }`, and sets an HttpOnly
    binding cookie `gini_pair`. The page shows the code + a spinner and polls
    `GET /api/pairing/request/:id`.
-3. The loopback operator's "Pair requests" panel lists pending requests
-   (`GET /api/pairing/requests`, loopback-only) and shows the same `code`. The
-   operator **visually compares** the code, then approves
-   (`POST /api/pairing/requests/:id/approve`, loopback-only).
+3. An admin's "Pair requests" panel (loopback OR a paired relay session) lists
+   pending requests (`GET /api/pairing/requests`, admin: loopback OR a valid
+   `gini_session`) and shows the same `code`. The admin **visually compares** the
+   code, then approves (`POST /api/pairing/requests/:id/approve`, admin: loopback
+   OR a valid `gini_session`).
 4. The device's next poll sees `approved` and POSTs
    `/api/pairing/request/:id/claim` (binding cookie required). The gateway mints
    a `PairedDevice` session, returns `Set-Cookie: gini_session=<token>`, clears
@@ -182,12 +183,12 @@ pairing screen.
   comparison is unavoidable.
 - **Request-hijack.** Poll/claim/cancel are bound to the `gini_pair` cookie, so a
   known request id alone cannot steal a freshly-approved session.
-- **Unpaired self-approval.** The admin routes are reachable only by loopback or
-  a *paired* relay session (via the BFF; see "Relay sessions mirror loopback").
-  An UNPAIRED relay visitor has no `gini_session`, so it is 401'd at the relay
-  gate before it can reach the admin routes — it can never approve itself in. (A
-  *paired* session approving another device is intended admin behavior, not a
-  bypass.)
+- **Unpaired self-approval.** The admin routes (native same-origin
+  `/api/pairing/*`) are gated by loopback OR a valid `gini_session` (see "Relay
+  sessions mirror loopback"). An UNPAIRED relay visitor has no `gini_session` and
+  a non-loopback Host, so `handlePairingRoutes` refuses it (403) — it can never
+  approve itself in. (A *paired* session approving another device is intended
+  admin behavior, not a bypass.)
 - **Broadcast leakage.** The `pairing` SSE event is a content-free tick; codes
   travel only to an admin over the admin-only request list, tokens only in
   `Set-Cookie`.
@@ -201,9 +202,9 @@ pairing screen.
 - Create → operator list shows the matching code → approve → device claim sets
   `gini_session` → the same relay session reaches the app (no 302) and
   `/api/runtime/*` (200).
-- Native operator routes over the relay front (direct same-origin) return 403,
-  while a PAIRED relay session reaches them through the BFF
-  (`/api/runtime/pairing/*`) — the deliberate mirror of loopback (a paired
+- The admin routes over the relay front: an UNPAIRED visitor (no `gini_session`)
+  is refused (403), while a PAIRED relay session reaches them same-origin on
+  `/api/pairing/*` and succeeds — the deliberate mirror of loopback (a paired
   session can approve/add devices exactly like 127.0.0.1).
 - `revokeDevice` on a session immediately 302s its pages and 401s its API on the
   next request (unified revocation).

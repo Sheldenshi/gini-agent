@@ -1,10 +1,10 @@
 /// <reference lib="dom" />
 
 // Raw @/lib/pairing fetchers. The global fetch is stubbed so we can assert each
-// fetcher's URL/method and the shared error path. Device fetchers hit the native
-// same-origin /api/pairing/* surface; admin fetchers hit the BFF
-// /api/runtime/pairing/* surface (the mirror model — usable by any paired
-// session, loopback or relay). See ADR device-pairing-auth.md.
+// fetcher's URL/method and the shared error path. ALL fetchers hit the native
+// same-origin /api/pairing/* surface; handlePairingRoutes gates the admin routes
+// (list/approve/reject) by loopback OR a valid gini_session — the mirror model,
+// usable by any paired session (loopback or relay). See ADR device-pairing-auth.md.
 //
 // fetch is restored in afterEach.
 

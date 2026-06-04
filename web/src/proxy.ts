@@ -97,6 +97,13 @@ function notFound(): NextResponse {
 function applyResponsePolicy(res: NextResponse): NextResponse {
   // Outbound clicks send only the origin, never the full path.
   res.headers.set("referrer-policy", "strict-origin");
+  // Defense-in-depth against clickjacking: the control plane is never meant to be
+  // framed. gini_session is SameSite=Lax, so it isn't sent on a cross-site iframe
+  // load (a framed relay app is unpaired and only shows /pair, never the approve
+  // UI) — but a deny-all anti-framing header is the cheap, standard backstop and
+  // guards against any future SameSite relaxation.
+  res.headers.set("x-frame-options", "DENY");
+  res.headers.set("content-security-policy", "frame-ancestors 'none'");
   return res;
 }
 

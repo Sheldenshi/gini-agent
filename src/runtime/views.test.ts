@@ -33,8 +33,8 @@ describe("publicState pairing-request exposure", () => {
       })
     );
     const snapshot = publicState(config) as Record<string, unknown>;
-    // The whole field is omitted (it has no client consumer; the operator panel
-    // uses the loopback-only GET /api/pairing/requests).
+    // The whole field is omitted (it has no client consumer; the admin panel
+    // uses the GET /api/pairing/requests admin route).
     expect("pairingRequests" in snapshot).toBe(false);
     // And nothing in the payload carries the binding-secret hash.
     expect(JSON.stringify(snapshot)).not.toContain("bindHash");

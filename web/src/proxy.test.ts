@@ -70,6 +70,13 @@ describe("proxy loopback setup gate", () => {
     expect(res.status).toBe(200);
   });
 
+  test("every pass-through response carries the anti-framing headers", async () => {
+    failIfFetched("setup status must not be probed for /api/* paths");
+    const res = await proxy(makeRequest({ url: "http://localhost/api/runtime/chat", host: "localhost" }));
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+  });
+
   test("loopback + /setup is not redirected (avoids a redirect loop)", async () => {
     stubSetupStatus(false);
     const res = await proxy(makeRequest({ url: "http://localhost/setup", host: "localhost", secFetchDest: "document" }));

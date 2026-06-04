@@ -782,10 +782,10 @@ export function createPairingRequest(
     },
     { system: true }
   );
-  // A content-free tick for the loopback "Pair Requests" panel. The plaintext
-  // code is deliberately NOT in the event data — the broadcast events stream is
-  // readable by any current session; the operator reads the code only from the
-  // loopback-only request list.
+  // A content-free tick for the admin "Pair Requests" panel. The plaintext code
+  // is deliberately NOT in the event data — the broadcast events stream is
+  // readable by any current session; an admin reads the code only from the
+  // admin-only request list (GET /api/pairing/requests: loopback OR a session).
   appendEvent(
     state,
     {

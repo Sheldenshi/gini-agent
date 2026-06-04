@@ -2393,8 +2393,9 @@ function isDevicePairingPath(pathname: string): boolean {
 
 // Gateway-handled pairing API. Lives on the native /api surface but is
 // special-cased BEFORE the bearer gate so it can apply its own trust rules from
-// the TRUE inbound Host/Origin: operator routes are loopback-only; device
-// routes are public but bound to the gini_pair cookie.
+// the TRUE inbound Host/Origin: admin routes require loopback OR a valid
+// gini_session (the mirror model — a paired relay session is admin like
+// loopback); device routes are public but bound to the gini_pair cookie.
 async function handlePairingRoutes(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
   // Host/Origin/CSRF trust for every pairing call (same gate as the proxied
   // surface). Blocks cross-site POSTs and untrusted hosts.
