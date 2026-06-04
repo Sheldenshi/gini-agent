@@ -754,6 +754,16 @@ describe("pairing routes — native client (mobile)", () => {
     expect(denied.status).toBe(401);
   });
 
+  test("native claim sets no session cookie — the body token is the only credential", async () => {
+    const { claimed } = await nativePairedSession("pair-native-claim-nocookie");
+    // A native client can't read Set-Cookie and uses the body token as its bearer;
+    // setting a session cookie would only leave a stale credential in the iOS jar
+    // that sign-out doesn't clear.
+    expect(claimed.headers.getSetCookie()).toHaveLength(0);
+    expect(setCookieValue(claimed, "__Host-gini_session")).toBeUndefined();
+    expect(setCookieValue(claimed, "gini_session")).toBeUndefined();
+  });
+
   test("native cancel via the header clears the request", async () => {
     const { handler } = makeHandler("pair-native-cancel");
     const relay = RELAY("pair-native-cancel");

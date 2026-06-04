@@ -2620,12 +2620,15 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
     // body so it can store it and send it as `Authorization: Bearer` — the same
     // token, just the transport a non-browser needs.
     const response = json(native ? { ok: true, token: result.token } : { ok: true });
-    response.headers.append(
-      "set-cookie",
-      serializeCookie(sessionCookieName(secure), result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
-    );
-    // The binding cookie is single-use; clear it now that the session is minted.
-    response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure, maxAge: 0 }));
+    if (!native) {
+      response.headers.append(
+        "set-cookie",
+        serializeCookie(sessionCookieName(secure), result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
+      );
+      // The binding cookie is single-use; clear it now that the session is minted.
+      // (A native client set no gini_pair cookie, so there's nothing to clear.)
+      response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure, maxAge: 0 }));
+    }
     return response;
   }
 

@@ -222,9 +222,11 @@ all three native deviations:
 - **Session token in the claim body.** `POST …/claim` returns
   `{ ok: true, token }` for a native client — the same `gini_device_<uuid>` token
   the cookie would carry, just the transport a non-browser needs. The client
-  stores it and sends it as `Authorization: Bearer` on every later call. The
-  browser claim body stays `{ ok: true }` (token cookie-only, so an XSS can't
-  exfiltrate it).
+  stores it and sends it as `Authorization: Bearer` on every later call. It sets
+  **no** session cookie for native (the body token is the only credential); an iOS
+  cookie jar would otherwise persist a `__Host-gini_session` the client never
+  reads and that the app's sign-out can't clear. The browser claim body stays
+  `{ ok: true }` with the token delivered cookie-only, so an XSS can't exfiltrate it.
 
 Post-pairing needs no new gate: `isWebProxyPath` routes `/api/chat`,
 `/api/agents`, etc. to the native bearer surface, so the stored device token
