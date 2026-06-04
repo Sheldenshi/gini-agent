@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.5.0
+    version: 3.6.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -136,6 +136,14 @@ gcloud projects create gini-workspace-<suffix> --name="Gini Workspace"
 If even that ID is taken AND no DELETE_REQUESTED match was found in 4b (rare — only when a different user with the same email local-part already claimed it globally), append a 4-char random tiebreaker. `<PROJECT_ID>` is whichever ID succeeded.
 
 If `gcloud projects create` errors with `RATE_LIMIT_EXCEEDED` for `cloudresourcemanager.googleapis.com.write_requests`, the user has burned through Google's per-account project-create quota (usually from repeated testing). Surface the error verbatim and ask: "Google is rate-limiting project creates; the quota typically clears in ~10 minutes. Want to wait and retry, or do you have an existing Cloud project I can use? Reply with a project ID or 'wait'." Do not loop the create call.
+
+**First-time Google Cloud accounts.** If `gcloud projects create` errors with `FAILED_PRECONDITION` and a message like `Callers must accept Terms of Service`, the signed-in account has a working Google login but has never initialized Google Cloud, so it hasn't accepted the Cloud Terms of Service. There is no CLI command to accept them — it happens once in the browser, and it is **free**: the Workspace APIs don't require billing, so the user does **not** need to start the free trial or put a card on file (Google's console pushes that trial prominently, but we don't need it). Send one chat bubble and wait for a reply:
+
+> **One-time setup.** Open https://console.cloud.google.com/, pick your country, and accept the Terms of Service. You do **not** need to start the free trial or add a credit card — the Google Workspace APIs are free. Reply **done** once you've accepted.
+
+When the user replies, re-run the same `gcloud projects create`. Do not loop the create before they confirm, and never try to accept the terms on their behalf.
+
+**Organization-restricted accounts.** If create instead errors with `PERMISSION_DENIED` and a message like `You do not have permission to create projects`, the account belongs to an organization (common on managed `@company` Google Workspace accounts) whose policy reserves project creation for admins. Accepting the Terms of Service will not change this. Surface the error verbatim and ask: "Your Google account can't create Cloud projects — your Workspace admin restricts that. Reply with an existing Cloud project ID I should use, or set Gini up with a personal @gmail.com account instead." Take a project ID as the new `<PROJECT_ID>` and resume from `projects describe` in 4d.
 
 ### 4d. Verify access, then enable the APIs
 
