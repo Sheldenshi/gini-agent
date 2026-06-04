@@ -160,10 +160,10 @@ export function TunnelConnectedPopover({
 
         <div className="space-y-1">
           <p className="text-xs text-muted-foreground">
-            Anyone with this link can reach your local service.
+            Anyone you pair with this link can reach your agent.
           </p>
           <p className="text-xs text-muted-foreground">
-            The link stays live only while this tunnel is connected.
+            It&rsquo;s a stable link — it stays the same and reconnects automatically after a restart, so you can reach your agent 24/7.
           </p>
         </div>
 

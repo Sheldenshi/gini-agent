@@ -79,14 +79,16 @@ setBrowserInstance(config.instance);
   }
 }
 
-// Reconcile the tunnel singleton on startup. A persisted "connected" /
-// "connecting" record describes an frpc child the runtime spawned before it
-// restarted — that child is gone now, so the record is stale and would make
-// GET /api/tunnel falsely read connected. There is never a live tunnel
-// supervisor right after a fresh boot, so reset any non-idle record to
-// "idle" (keeping the selection). Awaited BEFORE Bun.serve binds so the first
-// GET /api/tunnel can't read the stale "connected"; the .catch keeps the
-// never-crash-boot guarantee. See ADR tunnel-connectivity.md.
+// Reconcile + resume the tunnel singleton on startup. The frpc child the runtime
+// spawned before this restart is gone, so the live status is stale. The tunnel
+// link is long-lasting (same deviceId-keyed URL on reconnect), so a tunnel that
+// was "connected" at shutdown is brought back AUTOMATICALLY: this flips it to
+// "connecting" (never a stale "connected" the first GET could read) and kicks off
+// a background reconnect that reuses the stored relay session and waits for the
+// web child to come back. Awaited BEFORE Bun.serve binds for the synchronous
+// status flip; the reconnect itself runs in the background (it probes the local
+// port with retry, so it tolerates serve binding a moment later). The .catch
+// keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
 await reconcileTunnelOnStartup(config).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)

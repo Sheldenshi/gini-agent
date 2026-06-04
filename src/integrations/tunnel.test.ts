@@ -2,7 +2,9 @@
 // tunnel-connectivity.md). Covers the full TunnelState contract returned by
 // every function, the provider catalog, selection validation, the real
 // gini-relay connect flow (connecting -> connected / error), cancel,
-// disconnect, and the startup reconcile — at 100% line + function coverage.
+// disconnect, and the startup reconcile + resume (a previously connected tunnel
+// comes back automatically by reusing the stored session) — at 100% line +
+// function coverage.
 //
 // Every gini-relay seam (login primitive, tunnel builder, store, defaults,
 // browser opener, local-port resolver) is injected via `setTunnelDeps`, so
@@ -29,7 +31,7 @@ import {
   type TunnelDeps
 } from "./tunnel";
 import { mutateState, readState } from "../state";
-import type { RuntimeConfig } from "../types";
+import type { RuntimeConfig, TunnelProviderId } from "../types";
 import type { LoginHandle, RelayDefaults, Session, Store, TunnelOptions } from "gini-relay";
 
 const ROOT = "/tmp/gini-tunnel-integration-tests";
@@ -791,13 +793,13 @@ describe("tunnel integration", () => {
     await expect(awaitTunnelSettled(config.instance)).resolves.toBeUndefined();
   });
 
-  // Startup reconcile: a stale "connected" record resets to idle (keeps
-  // selection) because no child is alive after a fresh boot.
-  test("reconcileTunnelOnStartup resets a stale connected record to idle", async () => {
-    await mutateState(config.instance, (s) => {
+  // Seed a persisted "connected" tunnel record (as if the runtime was exposing a
+  // tunnel before this restart). The link is long-lasting, so boot should resume.
+  async function seedConnectedRecord(c: RuntimeConfig, provider: TunnelProviderId = "gini-relay"): Promise<void> {
+    await mutateState(c.instance, (s) => {
       s.tunnel = {
-        instance: config.instance,
-        selectedProvider: "gini-relay",
+        instance: c.instance,
+        selectedProvider: provider,
         status: "connected",
         url: "https://subdom7.relay.test",
         subdomain: "subdom7",
@@ -805,11 +807,137 @@ describe("tunnel integration", () => {
         updatedAt: "2026-01-01T00:00:00.000Z"
       };
     });
+  }
+
+  // Startup reconcile RESUMES a tunnel that was connected before the restart by
+  // reusing the stored relay session (no browser login) — the link is meant to be
+  // long-lasting / 24-7, so it comes back automatically. It first flips to
+  // "connecting" so the first GET never reads a stale "connected".
+  test("reconcileTunnelOnStartup resumes a previously connected tunnel by reusing the session", async () => {
+    const child = fakeChild();
+    let loginCalls = 0;
+    const opened: string[] = [];
+    setTunnelDeps(
+      deps({
+        buildTunnel: () => child,
+        loginUrl: () => {
+          loginCalls += 1;
+          return Promise.resolve(fakeLoginHandle());
+        },
+        openBrowser: (url) => opened.push(url)
+      })
+    );
+    await seedConnectedRecord(config);
+    const immediate = await reconcileTunnelOnStartup(config);
+    expect(immediate.status).toBe("connecting");
+    expect(immediate.selectedProvider).toBe("gini-relay");
+    await awaitTunnelSettled(config.instance);
+    const settled = getTunnel(config);
+    expect(settled.status).toBe("connected");
+    // Same deviceId-keyed subdomain — the link is stable across the restart.
+    expect(settled.url).toBe("https://subdom7.relay.test");
+    // Headless resume: the stored session was reused, no browser/login.
+    expect(loginCalls).toBe(0);
+    expect(opened).toEqual([]);
+    expect(readState(config.instance).audit.some((a) => a.action === "tunnel.reconcile")).toBe(true);
+  });
+
+  // Resume is non-interactive: with no stored session it must NOT open a browser
+  // or mint a login on a headless restart — it settles idle for a manual reconnect.
+  test("reconcileTunnelOnStartup resume settles idle (no login) when there is no stored session", async () => {
+    let loginCalls = 0;
+    const opened: string[] = [];
+    setTunnelDeps(
+      depsLogin({
+        loginUrl: () => {
+          loginCalls += 1;
+          return Promise.resolve(fakeLoginHandle());
+        },
+        openBrowser: (url) => opened.push(url)
+      })
+    );
+    await seedConnectedRecord(config);
+    await reconcileTunnelOnStartup(config);
+    await awaitTunnelSettled(config.instance);
+    const settled = getTunnel(config);
+    expect(settled.status).toBe("idle");
+    expect(settled.selectedProvider).toBe("gini-relay");
+    expect(loginCalls).toBe(0);
+    expect(opened).toEqual([]);
+  });
+
+  // Resume waits for the web child to come back (it may still be compiling right
+  // after a restart): it polls the local port and connects once it answers.
+  test("reconcileTunnelOnStartup resume waits for the web child then connects", async () => {
+    const prevPoll = process.env.GINI_TUNNEL_RESUME_POLL_MS;
+    process.env.GINI_TUNNEL_RESUME_POLL_MS = "1";
+    try {
+      let probes = 0;
+      setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(++probes >= 3) }));
+      await seedConnectedRecord(config);
+      await reconcileTunnelOnStartup(config);
+      await awaitTunnelSettled(config.instance);
+      expect(getTunnel(config).status).toBe("connected");
+      expect(probes).toBeGreaterThanOrEqual(3);
+    } finally {
+      if (prevPoll === undefined) delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
+      else process.env.GINI_TUNNEL_RESUME_POLL_MS = prevPoll;
+    }
+  });
+
+  // Resume gives up cleanly (settles idle, never spawns frpc) if the web child
+  // never becomes reachable within the budget.
+  test("reconcileTunnelOnStartup resume settles idle when the web never becomes ready", async () => {
+    const prevWait = process.env.GINI_TUNNEL_RESUME_WAIT_MS;
+    process.env.GINI_TUNNEL_RESUME_WAIT_MS = "0";
+    try {
+      let built = 0;
+      setTunnelDeps(
+        deps({
+          probeLocalPort: () => Promise.resolve(false),
+          buildTunnel: () => {
+            built += 1;
+            return fakeChild();
+          }
+        })
+      );
+      await seedConnectedRecord(config);
+      await reconcileTunnelOnStartup(config);
+      await awaitTunnelSettled(config.instance);
+      expect(getTunnel(config).status).toBe("idle");
+      expect(built).toBe(0);
+    } finally {
+      if (prevWait === undefined) delete process.env.GINI_TUNNEL_RESUME_WAIT_MS;
+      else process.env.GINI_TUNNEL_RESUME_WAIT_MS = prevWait;
+    }
+  });
+
+  // A resume cancelled while it waits for the web child bails without clobbering
+  // the idle the cancel wrote (covers the supervisor-superseded guard in the wait).
+  test("reconcileTunnelOnStartup resume bails when cancelled during the web wait", async () => {
+    const prevPoll = process.env.GINI_TUNNEL_RESUME_POLL_MS;
+    process.env.GINI_TUNNEL_RESUME_POLL_MS = "5";
+    try {
+      setTunnelDeps(deps({ probeLocalPort: () => Promise.resolve(false) }));
+      await seedConnectedRecord(config);
+      await reconcileTunnelOnStartup(config);
+      const cancelled = await cancelTunnel(config);
+      expect(cancelled.status).toBe("idle");
+      await Bun.sleep(20);
+      expect(getTunnel(config).status).toBe("idle");
+    } finally {
+      if (prevPoll === undefined) delete process.env.GINI_TUNNEL_RESUME_POLL_MS;
+      else process.env.GINI_TUNNEL_RESUME_POLL_MS = prevPoll;
+    }
+  });
+
+  // A "connected" record for a provider that is no longer enabled does NOT resume
+  // (covers the disabled-provider guard); it just resets to idle.
+  test("reconcileTunnelOnStartup does not resume a connected record for a disabled provider", async () => {
+    await seedConnectedRecord(config, "tailscale");
     const state = await reconcileTunnelOnStartup(config);
     expect(state.status).toBe("idle");
-    expect(state.selectedProvider).toBe("gini-relay");
-    expect(state.url).toBeUndefined();
-    expect(readState(config.instance).audit.some((a) => a.action === "tunnel.reconcile")).toBe(true);
+    expect(state.selectedProvider).toBe("tailscale");
   });
 
   // Startup reconcile also resets a stale "connecting" record.

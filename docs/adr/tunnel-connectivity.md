@@ -121,9 +121,17 @@ Each instance owns at most one in-flight login + one running `frpc` child, track
 - A live child that exits on its own (crash, relay drop) flips the record `connected → error` via an exit watcher, so a dead tunnel never keeps advertising a URL; an intentional cancel/disconnect/supersede is guarded out of that path.
 - Runtime shutdown stops every live child (`stopAllTunnels`, awaited in the SIGTERM drain) so `frpc` is torn down gracefully with the runtime rather than left forwarding past exit.
 
-### Reconcile on startup
+### Reconcile + resume on startup
 
-A persisted `connected` / `connecting` record describes an `frpc` child the runtime spawned **before it restarted** — that child is gone after a restart, so the record is stale and would make `GET /api/tunnel` falsely read connected. `reconcileTunnelOnStartup` (called from `src/server.ts` boot, mirroring the `state.browser` stale-record clear) resets any non-idle record to `idle` (keeping the selection so the user can reconnect); `idle`/`error` records are left untouched. It's best-effort — the boot site wraps it in a `.catch()` so a state-write failure can never crash startup.
+The tunnel link is **long-lasting**, not ephemeral. The relay keys the public subdomain to a stable per-instance `deviceId` (persisted in the instance relay home, independent of the session token), so reconnecting — even after a re-login — reuses the **same** `https://<subdomain>.<relayDomain>` URL. The intent is that once you connect a tunnel, that URL keeps reaching your agent 24/7, surviving restarts.
+
+A persisted `connected` / `connecting` record describes an `frpc` child the runtime spawned **before it restarted** — that child is gone after a restart, so the live status is stale and a raw `connected` would make `GET /api/tunnel` falsely read connected. `reconcileTunnelOnStartup` (called from `src/server.ts` boot, mirroring the `state.browser` stale-record clear) handles this:
+
+- A record that was **`connected`** (for a still-enabled provider) is **resumed**: it flips to `connecting` (so the first `GET` never reads a stale `connected`) and kicks off a background reconnect that **reuses the stored relay session** — no browser login — and waits for the web child to come back up (it polls the local port with retry, since the gateway binds and the web child finishes compiling just after boot). On success the same stable URL is restored. The resume is **non-interactive and best-effort**: if there is no usable stored session, or the web never becomes reachable within the budget (`GINI_TUNNEL_RESUME_WAIT_MS`, default 60 s; poll interval `GINI_TUNNEL_RESUME_POLL_MS`, default 1 s), it settles back to `idle` rather than popping an OAuth tab on a headless server or surfacing a spurious `error`.
+- A stale **`connecting`** record (an incomplete attempt with no guaranteed session) just resets to `idle`.
+- `idle` / `error` records are left untouched.
+
+The whole thing is best-effort — the boot site wraps it in a `.catch()` so a state-write failure can never crash startup, and the background reconnect captures its own errors into state.
 
 **Clean shutdown vs. non-graceful exit.** On `SIGTERM` the drain awaits `stopAllTunnels()`, which terminates the `frpc` child cleanly, so a graceful shutdown leaves no orphan. A **non-graceful** exit (uncaught crash, `SIGKILL`, OOM, power loss) runs no drain: because `frpc` is spawned non-detached it is reparented rather than killed, so it can keep forwarding the public URL after the runtime dies, and the next boot's reconcile then marks state `idle` while that orphan is still live. Closing this residual window requires a persisted tunnel pidfile plus a signature-guarded reaper in reconcile (kill a matching live `frpc` from a prior run) — deferred as a separate, higher-risk change since it kills processes by signature.
 
@@ -148,7 +156,7 @@ Every gini-relay dependency is injectable through `setTunnelDeps` (the login pri
 - `POST /api/tunnel/select {provider:"gini-relay"}` saves the selection and stays `idle`; selecting a disabled (`ngrok`) or unknown provider returns `400`.
 - `POST /api/tunnel/connect` returns `status: "connecting"` immediately; the background handshake then flips `GET /api/tunnel` to `connected` (with `url: https://<subdomain>.<relayDomain>`) or `error` (with `message`). An explicit `provider` in the body overrides the saved selection.
 - `POST /api/tunnel/cancel` aborts a pending login and `POST /api/tunnel/disconnect` stops the live `frpc` child; both return to `status: "idle"` keeping `selectedProvider`.
-- A restart with a persisted `connected`/`connecting` record reconciles to `idle` on boot (the spawned child is gone), keeping the selection; `idle`/`error` records are left untouched.
+- A restart with a persisted `connected` record **resumes** on boot: it flips to `connecting` and the background reconnect reuses the stored session to restore the same stable URL (no browser login). With no stored session, or if the web never comes up within the budget, it settles to `idle`. A stale `connecting` record resets to `idle`; `idle`/`error` records are left untouched.
 - Every route returns the full `TunnelState`.
 - The CLI commands go through the gateway routes (verified by the CLI unit tests pinning URL + method + body).
 - 100% line and function coverage on `src/integrations/tunnel.ts` (every gini-relay seam injected via `setTunnelDeps`, so tests never hit the network/OAuth/browser/frpc) and `src/cli/commands/tunnel.ts`; the additions to `records.ts`/`store.ts`/`http.ts` are covered by the integration, http, and CLI tests.
