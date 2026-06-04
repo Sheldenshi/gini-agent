@@ -51,7 +51,10 @@ export interface PairingHandshake {
 export interface PairingClient {
   // The gateway origin this client is bound to (normalized).
   readonly origin: string;
-  create(): Promise<PairingHandshake>;
+  // deviceName is an optional human label (e.g. "iPhone 16 Pro") the operator
+  // sees on the approval row; the gateway sanitizes it and falls back to a
+  // User-Agent-derived label when absent.
+  create(deviceName?: string): Promise<PairingHandshake>;
   poll(id: string, bindSecret: string): Promise<PairingStatus>;
   // Returns the minted device token (used as Authorization: Bearer).
   claim(id: string, bindSecret: string): Promise<string>;
@@ -94,7 +97,7 @@ export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch
 
   async function call(
     path: string,
-    init: { method?: string; secret?: string; body?: boolean }
+    init: { method?: string; secret?: string; body?: boolean; payload?: Record<string, unknown> }
   ): Promise<unknown> {
     const headers: Record<string, string> = {
       "content-type": "application/json",
@@ -104,7 +107,7 @@ export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch
     const response = await fetchImpl(`${origin}/api/pairing${path}`, {
       method: init.method ?? "GET",
       headers,
-      body: init.body ? "{}" : undefined
+      body: init.payload ? JSON.stringify(init.payload) : init.body ? "{}" : undefined
     });
     const text = await response.text();
     const value = text ? safeParse(text) : null;
@@ -121,8 +124,12 @@ export function createPairingClient(relayUrl: string, fetchImpl: FetchFn = fetch
   return {
     origin,
 
-    async create() {
-      const body = await call("/request", { method: "POST", body: true });
+    async create(deviceName) {
+      const body = await call("/request", {
+        method: "POST",
+        body: true,
+        payload: deviceName ? { deviceName } : undefined
+      });
       if (
         !body
         || typeof body !== "object"

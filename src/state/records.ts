@@ -765,7 +765,7 @@ export function deviceNameFromUserAgent(userAgent: string): string {
 // 60-3600s window as createPairing.
 export function createPairingRequest(
   state: RuntimeState,
-  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number }
+  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number; deviceName?: string }
 ): PairingRequest {
   expirePairingRequests(state);
   if (state.pairingRequests.filter((r) => r.status === "pending").length >= MAX_PENDING_PAIRING_REQUESTS) {
@@ -779,7 +779,7 @@ export function createPairingRequest(
     code: randomPairingCode(),
     bindHash: hashSecret(input.bindSecret),
     status: "pending",
-    deviceName: deviceNameFromUserAgent(input.userAgent),
+    deviceName: input.deviceName ?? deviceNameFromUserAgent(input.userAgent),
     userAgent: input.userAgent,
     relayHost: input.relayHost,
     createdAt: at,

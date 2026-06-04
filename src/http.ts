@@ -2392,6 +2392,27 @@ function pairingCreateAllowed(request: Request): boolean {
   return pairingHostLimiter.tryConsume(host) && pairingGlobalLimiter.tryConsume("global");
 }
 
+// Clamp a client-supplied device label before it is stored and shown on the
+// operator's approval row: strip control chars, collapse whitespace, trim, and
+// cap length. Returns undefined for absent/blank input so the state layer applies
+// the User-Agent-derived fallback ("…"/"Unknown device") in one place.
+function sanitizeDeviceName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  // Drop control characters (codepoint below 0x20, and DEL 0x7f) by codepoint so
+  // no literal control chars live in this source; then collapse whitespace, trim,
+  // and cap length.
+  const cleaned = Array.from(raw)
+    .filter((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code >= 0x20 && code !== 0x7f;
+    })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 64);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
 function pairingClaimAllowed(request: Request): boolean {
   const host = request.headers.get("host") ?? new URL(request.url).host;
   return pairingClaimHostLimiter.tryConsume(host) && pairingClaimGlobalLimiter.tryConsume("global");
@@ -2558,12 +2579,18 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
       return json({ error: "Too many pairing requests. Try again shortly." }, 429);
     }
     const bindSecret = randomBindSecret();
+    // Optional human label the native client supplies in the body (e.g. its model
+    // name) so the operator's approval row reads "iPhone 16 Pro" rather than
+    // "Unknown device". Absent/blank → undefined, and the state layer falls back
+    // to the User-Agent-derived label.
+    const deviceName = sanitizeDeviceName((await body(request)).deviceName);
     let created: Awaited<ReturnType<typeof requestPairing>>;
     try {
       created = await requestPairing(config, {
         userAgent: request.headers.get("user-agent") ?? "",
         relayHost: host,
-        bindSecret
+        bindSecret,
+        deviceName
       });
     } catch (error) {
       // Cap enforced atomically inside the create mutation.

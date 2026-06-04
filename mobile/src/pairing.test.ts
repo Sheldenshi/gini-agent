@@ -57,6 +57,16 @@ describe("create", () => {
     expect(calls[0]!.init.body).toBe("{}");
   });
 
+  test("sends the device name in the body when provided", async () => {
+    const { fn, calls } = fakeFetch(() => ({
+      status: 201,
+      body: { id: "preq_1", code: "123-456", bindSecret: "deadbeef" }
+    }));
+    const client = createPairingClient(RELAY, fn);
+    await client.create("iPhone 16 Pro");
+    expect(calls[0]!.init.body).toBe(JSON.stringify({ deviceName: "iPhone 16 Pro" }));
+  });
+
   test("throws on a malformed create response", async () => {
     const { fn } = fakeFetch(() => ({ status: 201, body: { id: "preq_1", code: "123-456" } }));
     await expect(createPairingClient(RELAY, fn).create()).rejects.toThrow(PairingError);

@@ -11,6 +11,7 @@ import {
   TouchableOpacity
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import * as Device from "expo-device";
 import { normalizeBaseUrl, readCachedCredentials, saveCredentials } from "@/src/auth";
 import { QrScanner } from "@/src/components/QrScanner";
 import { createPairingClient, PairingError, type PairingClient } from "@/src/pairing";
@@ -49,6 +50,14 @@ const POLL_INTERVAL_MS = 2000;
 
 // Display host for a stored/incoming URL (the parsed host is un-spoofable, unlike
 // raw link text). Empty string when absent/unparseable.
+// Best-effort human label for this device (e.g. "iPhone 16 Pro") sent on create
+// so the operator's approval row shows it instead of "Unknown device". The
+// gateway sanitizes it and falls back to a User-Agent label when absent, so a
+// null from expo-device is harmless.
+function deviceLabel(): string | undefined {
+  return Device.modelName ?? Device.deviceName ?? undefined;
+}
+
 function hostOf(url: string | null | undefined): string {
   if (!url) return "";
   try {
@@ -162,7 +171,7 @@ export default function PairScreen() {
       if (genRef.current !== myGen) return;
       clientRef.current = client;
       try {
-        const handshake = await client.create();
+        const handshake = await client.create(deviceLabel());
         if (genRef.current !== myGen) {
           // Superseded WHILE create() was in flight: the request was never stored
           // in requestRef, so cancelActiveRequest can't reach it — best-effort

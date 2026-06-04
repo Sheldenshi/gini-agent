@@ -824,6 +824,51 @@ describe("pairing routes — native client (mobile)", () => {
   });
 });
 
+describe("pairing routes — device name", () => {
+  // Create a native pairing request with the given body, then read the stored
+  // deviceName back via the loopback admin list (what the operator's row shows).
+  async function createNativeAndRead(instance: string, reqBody: unknown): Promise<string> {
+    const { handler } = makeHandler(instance);
+    const relay = RELAY(instance);
+    const created = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, pairClient: "native", userAgent: "GiniMobile/1.0 (iOS)", body: reqBody
+    });
+    expect(created.status).toBe(201);
+    const { id } = await created.json();
+    const listed = await pair(handler, "/api/pairing/requests", {
+      host: "127.0.0.1:7337", secFetchSite: "same-origin"
+    });
+    const row = (await listed.json()).requests.find((r: { id: string }) => r.id === id);
+    return row.deviceName as string;
+  }
+
+  test("a supplied device name is stored and shown to the operator", async () => {
+    expect(await createNativeAndRead("pair-dn-basic", { deviceName: "iPhone 16 Pro" })).toBe("iPhone 16 Pro");
+  });
+
+  test("trims, collapses whitespace, and caps the name at 64 chars", async () => {
+    const noisy = "   " + "A".repeat(100) + String.fromCharCode(0) + "   ";
+    expect(await createNativeAndRead("pair-dn-cap", { deviceName: noisy })).toBe("A".repeat(64));
+  });
+
+  test("strips control characters", async () => {
+    const raw = "Wil" + String.fromCharCode(0) + "son" + String.fromCharCode(127);
+    expect(await createNativeAndRead("pair-dn-ctrl", { deviceName: raw })).toBe("Wilson");
+  });
+
+  test("a blank name falls back to the User-Agent label (never empty)", async () => {
+    const stored = await createNativeAndRead("pair-dn-blank", { deviceName: "   " });
+    expect(stored.length).toBeGreaterThan(0);
+    expect(stored.trim()).toBe(stored);
+  });
+
+  test("a non-string device name is ignored (falls back to the UA label)", async () => {
+    const stored = await createNativeAndRead("pair-dn-nonstring", { deviceName: 12345 });
+    expect(typeof stored).toBe("string");
+    expect(stored.length).toBeGreaterThan(0);
+  });
+});
+
 describe("apple-app-site-association", () => {
   test("served with the app id and JSON content-type, reachable unpaired on the relay", async () => {
     const { handler } = makeHandler("aasa-relay");

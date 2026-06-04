@@ -97,7 +97,7 @@ export function redactDevice(device: ReturnType<typeof readState>["devices"][num
 // per-request binding secret the route stores as the gini_pair cookie.
 export async function requestPairing(
   config: RuntimeConfig,
-  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number }
+  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number; deviceName?: string }
 ) {
   const request = await mutateState(config.instance, (state) => createPairingRequest(state, input));
   return redactPairingRequest(request);
