@@ -18,6 +18,7 @@ import { ThreadPanel } from "@/components/chat/ThreadPanel";
 import { ThreadsTab } from "@/components/chat/ThreadsTab";
 import { JobsTab } from "@/components/chat/JobsTab";
 import { api, type UploadRef } from "@/lib/api";
+import { useThreadReadState } from "@/lib/use-chat-read-state";
 import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   splitBlocks,
@@ -129,6 +130,15 @@ function ChatSurface({
   const { blocks, isLoading: blocksLoading } = useChatBlocks(sessionId);
   const threadsQuery = useThreads(sessionId);
   const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
+  const { markThreadRead } = useThreadReadState(threads);
+
+  // Mark the open thread read using the live summary, so a reply that lands
+  // while the panel is open clears too instead of re-flagging it as unread.
+  useEffect(() => {
+    if (!openThread) return;
+    const live = threads.find((t) => t.threadId === openThread.threadId) ?? openThread;
+    markThreadRead(live);
+  }, [openThread, threads, markThreadRead]);
 
   // Main chat = blocks with no threadId; thread blocks render in the panel.
   const mainBlocks = useMemo(() => splitBlocks(blocks).main, [blocks]);

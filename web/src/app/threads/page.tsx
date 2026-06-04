@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -20,9 +20,17 @@ type Filter = "all" | "unread";
 export default function ThreadsInboxPage() {
   const inbox = useThreadsInbox();
   const threads = useMemo(() => inbox.data ?? [], [inbox.data]);
-  const { isThreadUnread, markAllThreadsRead } = useThreadReadState(inbox.data);
+  const { isThreadUnread, markThreadRead, markAllThreadsRead } = useThreadReadState(inbox.data);
   const [filter, setFilter] = useState<Filter>("all");
   const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
+
+  // Mark the open thread read using the live summary, so a reply that lands
+  // while the panel is open clears too instead of re-flagging it as unread.
+  useEffect(() => {
+    if (!openThread) return;
+    const live = threads.find((t) => t.threadId === openThread.threadId) ?? openThread;
+    markThreadRead(live);
+  }, [openThread, threads, markThreadRead]);
 
   const visible = useMemo(
     () => (filter === "unread" ? threads.filter((t) => isThreadUnread(t)) : threads),
