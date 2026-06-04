@@ -568,6 +568,24 @@ describe("relay session gate (web-bound branch)", () => {
     expect(res.status).toBe(403);
   });
 
+  test("encoded /api/runtime/pairing variants are also refused for a relay session", async () => {
+    // url.pathname is not percent-decoded, so a literal compare alone would miss
+    // /api/runtime/%70airing — but the BFF recursively decodes it back to
+    // "pairing" and forwards legacy create. The gate decodes before comparing.
+    const { handler, relay, session } = await pairedSession("gate-legacy-create-encoded");
+    for (const path of ["/api/runtime/%70airing", "/api/runtime/%2570airing", "/api/runtime/pa%69ring"]) {
+      const res = await pair(handler, path, {
+        method: "POST",
+        host: relay,
+        origin: `https://${relay}`,
+        secFetchSite: "same-origin",
+        cookie: `gini_session=${encodeURIComponent(session)}`,
+        body: { ttlSeconds: 600 }
+      });
+      expect(res.status).toBe(403);
+    }
+  });
+
   test("loopback is NOT refused for legacy create (no relay gate)", async () => {
     const { handler } = makeHandler("gate-legacy-create-loopback");
     const res = await pair(handler, "/api/runtime/pairing", {

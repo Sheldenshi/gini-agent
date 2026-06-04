@@ -1682,10 +1682,11 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       // The legacy code-create endpoint is reachable from a browser only via the
       // BFF at /api/runtime/pairing (the BFF→gateway hop is loopback, so gating
       // the native /api/pairing by Host wouldn't catch it — this is the one place
-      // the true relay Host is still visible). Refuse it here so the create→claim
-      // bootstrap can't establish a non-expiring credential. Loopback operators
-      // and the CLI (native /api/pairing with the owner bearer) are unaffected.
-      if (request.method === "POST" && url.pathname === "/api/runtime/pairing") {
+      // the true relay Host is still visible). Compare the FULLY-DECODED path so
+      // an encoded variant (/api/runtime/%70airing) can't dodge the block and be
+      // canonicalized back to /api/pairing by the BFF. Loopback operators and the
+      // CLI (native /api/pairing with the owner bearer) are unaffected.
+      if (request.method === "POST" && fullyDecodedPath(url.pathname) === "/api/runtime/pairing") {
         return withCors(request, json({ error: "Forbidden" }, 403));
       }
       // Refresh last-seen on full page loads only (not every asset) so the
@@ -2384,6 +2385,28 @@ export function isPairingBootstrapPath(pathname: string): boolean {
 // rejection (HTTP redirects page navs / 401s the API; WS returns a flat 401).
 export function relaySessionGateRequired(host: string, pathname: string): boolean {
   return !isLoopbackHost(host) && !isPairingBootstrapPath(pathname);
+}
+
+// Fully percent-decode a pathname (looping until stable) so an encoded variant
+// like /api/runtime/%70airing or /api/runtime/%2570airing can't slip past a
+// literal path comparison: the inner BFF recursively decodes the segment back to
+// "pairing" (web/src/lib/canonicalize.ts decodes up to 8 rounds) and would
+// forward it to legacy create. The cap matches the BFF's depth; malformed input
+// that decodeURIComponent rejects is returned as-is (the BFF refuses residual
+// `%`, so it can't reach the native route either).
+export function fullyDecodedPath(pathname: string): string {
+  let current = pathname;
+  for (let round = 0; round < 8; round += 1) {
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      return current;
+    }
+    if (next === current) return current;
+    current = next;
+  }
+  return current;
 }
 
 // Exactly the device-pairing paths the gateway handles natively before the

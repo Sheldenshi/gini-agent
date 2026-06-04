@@ -1,6 +1,12 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import type { PairingRequestStatus } from "@runtime/types";
+
+// Re-export the runtime contract's status union so callers keep importing it from
+// here, but the single source of truth stays in @runtime/types (no hand-copied
+// duplicate that could drift from the wire).
+export type { PairingRequestStatus };
 
 // The device-pairing API lives on the gateway's NATIVE /api/pairing surface and
 // is reached SAME-ORIGIN — NOT through the /api/runtime BFF (so it does NOT use
@@ -10,14 +16,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 // public device routes. The gini_pair / gini_session cookies are HttpOnly and
 // managed entirely by the gateway — the client never reads them.
 // See ADR device-pairing-auth.md.
-
-export type PairingRequestStatus =
-  | "pending"
-  | "approved"
-  | "rejected"
-  | "claimed"
-  | "expired"
-  | "cancelled";
 
 export interface PairingRequestView {
   id: string;
