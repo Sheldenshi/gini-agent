@@ -130,7 +130,10 @@ function ChatSurface({
   const { blocks, isLoading: blocksLoading } = useChatBlocks(sessionId);
   const threadsQuery = useThreads(sessionId);
   const threads = useMemo(() => threadsQuery.data ?? [], [threadsQuery.data]);
-  const { markThreadRead } = useThreadReadState(threads);
+  const { markThreadRead, isThreadUnread } = useThreadReadState(threads);
+  // The Threads tab badge mirrors the sidebar nav badge: it counts UNREAD
+  // threads (and the pill hides at 0), not the total thread count.
+  const unreadThreadCount = threads.filter((t) => isThreadUnread(t)).length;
 
   const sessionsQuery = useChatSessions();
   const { markRead, activityAt } = useChatReadState(sessionsQuery.data);
@@ -294,7 +297,7 @@ function ChatSurface({
             />
           }
         />
-        <ChatTabBar active={tab} onChange={setTab} threadCount={threads.length} />
+        <ChatTabBar active={tab} onChange={setTab} threadCount={unreadThreadCount} />
 
         {tab === "messages" ? (
           <>
