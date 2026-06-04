@@ -9,6 +9,7 @@ import {
   insertChatBlock,
   isTerminalTaskStatus,
   listChatBlocks,
+  listThreadBlocks,
   mutateState,
   publishChatSession,
   readState,
@@ -297,7 +298,22 @@ function parseAudioAttachment(instance: string, raw: unknown): AudioAttachment |
   return { id, mimeType: stat.mimeType, size: stat.size, ...(durationMs !== undefined ? { durationMs } : {}) };
 }
 
-export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
+// Shared submit preparation for both the main-chat and thread-reply paths.
+// Resolves content + image + audio attachments, transcribes a voice message
+// when the content is empty, guards against an empty submission, and
+// re-validates the session after STT (which can run long enough for the
+// session to be deleted mid-flight). Returns the live session so the caller
+// inherits the owning agent without re-reading state.
+async function prepareChatSubmission(
+  config: RuntimeConfig,
+  sessionId: string,
+  input: Record<string, unknown>
+): Promise<{
+  content: string;
+  images: ImageAttachment[];
+  audio: AudioAttachment | undefined;
+  liveSession: ChatSessionRecord;
+}> {
   let content = String(input.content ?? "").trim();
   const images = parseAttachments(config.instance, input.images);
   const audio = parseAudioAttachment(config.instance, input.audio);
@@ -340,6 +356,11 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
   const liveState = readState(config.instance);
   const liveSession = liveState.chatSessions.find((item) => item.id === sessionId);
   if (!liveSession) throw new Error(`Chat session not found: ${sessionId}`);
+  return { content, images, audio, liveSession };
+}
+
+export async function submitChatMessage(config: RuntimeConfig, sessionId: string, input: Record<string, unknown>) {
+  const { content, images, audio, liveSession } = await prepareChatSubmission(config, sessionId, input);
   const run = await createConversationRun(config, { conversationId: sessionId, input: content });
   // Chat messages run through the tool-calling agent loop. The legacy
   // prefix-dispatch path stays available for the imperative CLI.
@@ -395,6 +416,99 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
     });
   }
   return { sessionId, runId: run.id, taskId: task.id, status: task.status };
+}
+
+// Posts a user reply inside an existing thread. The whole spawned task
+// threads (decision E: a user reply in a thread stays in the thread
+// regardless of the agent's routing directive), so threadId/parentBlockId
+// are stamped on the task up front — resolveEmitContext reads them and
+// every emit* block lands tagged with the same thread membership.
+export async function submitThreadReply(
+  config: RuntimeConfig,
+  sessionId: string,
+  threadId: string,
+  input: Record<string, unknown>
+) {
+  // Resolve the thread's parent_block_id from its existing blocks. A thread
+  // with no blocks doesn't exist — reject before doing any STT/run work.
+  const threadBlocks = listThreadBlocks(config.instance, sessionId, threadId);
+  if (threadBlocks.length === 0) throw new Error(`Thread not found: ${threadId}`);
+  const parentBlockId = threadBlocks[0].parentBlockId;
+  const { content, images, audio, liveSession } = await prepareChatSubmission(config, sessionId, input);
+  const run = await createConversationRun(config, { conversationId: sessionId, input: content });
+  const task = await submitTask(config, content, {
+    runId: run.id,
+    mode: "chat",
+    chatSessionId: sessionId,
+    agentId: liveSession.agentId,
+    threadId,
+    ...(parentBlockId ? { parentBlockId } : {}),
+    ...(images.length > 0 ? { images } : {})
+  });
+  await linkRunToTask(config, run.id, task);
+  await mutateState(config.instance, (current) => {
+    const message = createChatMessage(current, {
+      sessionId,
+      role: "user",
+      content,
+      taskId: task.id,
+      runId: run.id,
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
+    });
+    const runRecord = current.runs.find((item) => item.id === run.id);
+    if (runRecord) {
+      runRecord.userMessageId = message.id;
+      runRecord.updatedAt = message.createdAt;
+    }
+  });
+  // Dual-publish the user_text ChatBlock, tagged with the thread membership
+  // so it renders in the thread panel and threads the response.
+  try {
+    insertChatBlock(config.instance, {
+      kind: "user_text",
+      sessionId,
+      text: content,
+      taskId: task.id,
+      runId: run.id,
+      agentId: liveSession.agentId ?? null,
+      threadId,
+      ...(parentBlockId ? { parentBlockId } : {}),
+      ...(images.length > 0 ? { images } : {}),
+      ...(audio ? { audio } : {})
+    });
+  } catch (error) {
+    appendLog(config.instance, "chat.user_block.insert_failed", {
+      sessionId,
+      taskId: task.id,
+      error: error instanceof Error ? error.message : String(error)
+    });
+  }
+  // When the client asks to also show the reply in the main transcript,
+  // mirror only the user's message (not the agent's threaded response) into
+  // the main chat as an un-threaded user_text block. Best-effort like the
+  // thread block above.
+  if (input.alsoToMain) {
+    try {
+      insertChatBlock(config.instance, {
+        kind: "user_text",
+        sessionId,
+        text: content,
+        taskId: task.id,
+        runId: run.id,
+        agentId: liveSession.agentId ?? null,
+        ...(images.length > 0 ? { images } : {}),
+        ...(audio ? { audio } : {})
+      });
+    } catch (error) {
+      appendLog(config.instance, "chat.user_block.insert_failed", {
+        sessionId,
+        taskId: task.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return { sessionId, threadId, runId: run.id, taskId: task.id, status: task.status };
 }
 
 export async function syncChatTaskResult(config: RuntimeConfig, sessionId: string, taskId: string) {

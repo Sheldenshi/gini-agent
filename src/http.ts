@@ -11,6 +11,9 @@ import {
   getDevice,
   listChatBlocks,
   listChatBlocksAfter,
+  listThreadBlocks,
+  summarizeThreads,
+  summarizeThreadsForInstance,
   markRead,
   markUnread,
   mutateState,
@@ -78,7 +81,7 @@ import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueN
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
-import { createChat, deleteChat, getChatSession, listChatSessions, renameChat, submitChatMessage, syncChatTaskResult } from "./execution/chat";
+import { createChat, deleteChat, getChatSession, getOrCreateAgentChat, listChatSessions, renameChat, submitChatMessage, submitThreadReply, syncChatTaskResult } from "./execution/chat";
 import { sttStatus } from "./stt";
 import { resumeChatTask } from "./execution/chat-task";
 import { persistConnectOutcome, safeResume } from "./execution/safe-resume";
@@ -241,6 +244,10 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["DELETE", /^\/api\/chat\/([^/]+)$/, async (_request, params) => { await deleteChat(config, params[0]); return json({ ok: true }); }],
     ["PATCH", /^\/api\/chat\/([^/]+)$/, async (request, params) => json(await renameChat(config, params[0], await body(request)))],
     ["POST", /^\/api\/chat\/([^/]+)\/messages$/, async (request, params) => json(await submitChatMessage(config, params[0], await body(request)), 201)],
+    // Resolves (or lazily creates) the single canonical chat session for an
+    // agent — the one-chat-per-agent IA. Stable across calls for the same
+    // agent id.
+    ["GET", /^\/api\/agents\/([^/]+)\/chat$/, async (_request, params) => json(await getOrCreateAgentChat(config.instance, params[0]))],
     // File upload. Accepts multipart/form-data with a `file` part. The bytes
     // are stored on disk under ~/.gini/instances/<instance>/uploads/<id>.<ext>
     // and the response carries the upload ref the client attaches to the
@@ -440,6 +447,47 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         return json({ error: `Chat session not found: ${sessionId}` }, 404);
       }
       return json(listChatBlocks(config.instance, sessionId));
+    }],
+    // Thread endpoints (Phase 0c). A thread is a span of chat_blocks inside
+    // the agent's single session, tagged thread_id and rooted at the
+    // main-chat assistant block it branched from. All validate the session
+    // exists so a stale link 404s rather than returning an empty list.
+    ["GET", /^\/api\/chat\/([^/]+)\/threads$/, (_request, params) => {
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      return json(summarizeThreads(config.instance, sessionId));
+    }],
+    ["GET", /^\/api\/chat\/([^/]+)\/threads\/([^/]+)\/blocks$/, (_request, params) => {
+      const sessionId = params[0];
+      const state = readState(config.instance);
+      if (!state.chatSessions.some((s) => s.id === sessionId)) {
+        return json({ error: `Chat session not found: ${sessionId}` }, 404);
+      }
+      return json(listThreadBlocks(config.instance, sessionId, params[1]));
+    }],
+    ["POST", /^\/api\/chat\/([^/]+)\/threads\/([^/]+)\/messages$/, async (request, params) => json(await submitThreadReply(config, params[0], params[1], await body(request)), 201)],
+    // Cross-agent thread inbox: every thread across all canonical agent
+    // chats, enriched with the owning agent's display name, newest reply
+    // first. `?filter=all|unread` is accepted but never filtered server-side
+    // — unread is computed client-side (web tracks read-state in
+    // localStorage; server-side read-state is per-device/mobile only), so
+    // the server always returns the full list and the client hides the read
+    // ones for filter=unread.
+    ["GET", /^\/api\/threads$/, (_request) => {
+      const state = readState(config.instance);
+      const agentSessions = state.chatSessions.filter((s) => s.kind === "agent");
+      const sessionIds = agentSessions.map((s) => s.id);
+      const agentNameById = new Map(state.agents.map((a) => [a.id, a.name]));
+      const summaries = summarizeThreadsForInstance(config.instance, sessionIds)
+        .map((summary) => ({
+          ...summary,
+          agentName: summary.agentId ? agentNameById.get(summary.agentId) ?? summary.agentId : undefined
+        }))
+        .sort((a, b) => b.lastReplyAt.localeCompare(a.lastReplyAt));
+      return json(summaries);
     }],
     ["GET", /^\/api\/chat\/([^/]+)\/stream$/, async (request, params) => {
       // Resolve the credential before opening the SSE stream so the

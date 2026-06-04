@@ -482,6 +482,10 @@ export interface ThreadSummary {
   lastReplyAt: string;
   // Truncated text of the most recent text-bearing block in the thread.
   lastReplyPreview?: string;
+  // Author of the most recent text-bearing block in the thread, so the
+  // inbox can label who replied last. `user_text` ⇒ "user", otherwise
+  // "agent". Absent when the thread has no text-bearing block yet.
+  lastReplyAuthor?: "user" | "agent";
 }
 
 export interface RuntimeState {

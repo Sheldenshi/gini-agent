@@ -856,8 +856,8 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
           .get(row.parent_block_id)
       : null;
     const lastReplyRow = db
-      .query<{ payload_json: string }, [string, string]>(
-        `SELECT payload_json FROM chat_blocks
+      .query<{ payload_json: string; kind: string }, [string, string]>(
+        `SELECT payload_json, kind FROM chat_blocks
          WHERE session_id = ? AND thread_id = ? AND kind IN ('user_text', 'assistant_text')
          ORDER BY ordinal DESC
          LIMIT 1`
@@ -865,6 +865,11 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       .get(row.session_id, row.thread_id);
     const rootPreview = rootRow ? truncatePreview(textFromPayload(rootRow.payload_json)) : "";
     const lastReplyPreview = lastReplyRow ? truncatePreview(textFromPayload(lastReplyRow.payload_json)) : "";
+    const lastReplyAuthor = lastReplyRow
+      ? lastReplyRow.kind === "user_text"
+        ? "user"
+        : "agent"
+      : undefined;
     return {
       threadId: row.thread_id,
       sessionId: row.session_id,
@@ -873,7 +878,8 @@ function buildThreadSummaries(db: ReturnType<typeof getMemoryDb>, rows: ThreadAg
       ...(rootPreview.length > 0 ? { rootPreview } : {}),
       replyCount: row.reply_count,
       lastReplyAt: row.last_reply_at,
-      ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {})
+      ...(lastReplyPreview.length > 0 ? { lastReplyPreview } : {}),
+      ...(lastReplyAuthor ? { lastReplyAuthor } : {})
     };
   });
 }
