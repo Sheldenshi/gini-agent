@@ -150,7 +150,13 @@ export default function PairScreen() {
       clientRef.current = client;
       try {
         const handshake = await client.create();
-        if (genRef.current !== myGen) return;
+        if (genRef.current !== myGen) {
+          // Superseded WHILE create() was in flight: the request was never stored
+          // in requestRef, so cancelActiveRequest can't reach it — best-effort
+          // cancel it directly so it doesn't linger pending server-side.
+          void client.cancel(handshake.id, handshake.bindSecret).catch(() => {});
+          return;
+        }
         requestRef.current = { id: handshake.id, secret: handshake.bindSecret };
         setCode(handshake.code);
         setPhase("pending");
