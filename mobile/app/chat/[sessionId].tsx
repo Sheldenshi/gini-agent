@@ -22,21 +22,29 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
+import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
 import { BlockToolCallsCollapsed } from "@/src/components/chat/BlockToolCallsCollapsed";
 import { GeneratedFilesCard } from "@/src/components/chat/GeneratedFilesCard";
+import { ThreadRepliesChip } from "@/src/components/chat/ThreadChip";
 import { VoiceRecorder, type VoiceRef } from "@/src/components/chat/VoiceRecorder";
+import { chatListTime, relativeTime } from "@/src/format";
 import { groupExchanges, type ChatRenderItem } from "@/src/group-exchanges";
 import { getCachedDeviceToken, refreshBadge, registerForPushAsync } from "@/src/push";
 import {
   isTaskInFlight,
+  useAgents,
   useCancelTask,
   useChatStream,
+  useJobs,
   useSendMessage,
+  useThreads,
   useVoiceStatus
 } from "@/src/queries";
 import { family, theme } from "@/src/theme";
-import type { ChatBlock } from "@/src/types";
+import type { ChatBlock, JobRecord, ThreadSummary } from "@/src/types";
+
+type ChatTab = "messages" | "threads" | "jobs";
 
 interface PendingAttachment {
   localId: string;
@@ -86,13 +94,6 @@ function describeAsset(asset: ImagePicker.ImagePickerAsset): {
   return { filename, mimeType: asset.mimeType ?? mimeFromExt };
 }
 
-// Placeholder titles the runtime stamps on a freshly created session
-// before the auto-rename runs. Mirrors DEFAULT_CHAT_TITLES in
-// src/execution/chat.ts. When the session record carries one of these,
-// the header falls back to the first user_text excerpt instead — a
-// stable, conversation-derived label is more useful than "New chat" in
-// the gap between the user's first send and the auto-rename completing.
-const DEFAULT_TITLE_FALLBACKS = new Set<string>(["Untitled chat", "New chat"]);
 const TERMINAL_PHASE_LABELS = new Set<string>(["Completed", "Cancelled", "Failed"]);
 
 function findInFlightTaskId(blocks: ChatBlock[]): string | null {
@@ -112,68 +113,69 @@ function findInFlightTaskId(blocks: ChatBlock[]): string | null {
   return null;
 }
 
-// Three sections: a header with back arrow + centered title, the
-// scrolling conversation, and the input bar (pill + circular send
-// button). All chrome lives in this screen — the native stack header
-// is hidden so the iOS-style centered title and equal-width edge spacers
-// land exactly per the design.
+// Single-agent chat: an agent header, a Messages / Threads / Jobs tab
+// bar, and the active tab's content. Messages reuses the existing block
+// pipeline (filtered to the main chat — threaded blocks live in the
+// Thread View) and attaches inline thread chips to the assistant blocks
+// that host a thread. Threads lists the session's threads; Jobs lists
+// the agent's recurring jobs. The composer stays mounted under every tab.
 export default function ChatDetailScreen() {
   const { sessionId } = useLocalSearchParams<{ sessionId: string }>();
   const stream = useChatStream(sessionId ?? null);
+  const threads = useThreads(sessionId ?? null);
   const send = useSendMessage(sessionId ?? null);
   const voice = useVoiceStatus();
   const cancel = useCancelTask();
+  const agents = useAgents();
   const qc = useQueryClient();
 
+  const [tab, setTab] = useState<ChatTab>("messages");
   const [text, setText] = useState("");
   const [images, setImages] = useState<PendingAttachment[]>([]);
   const [attachMenuVisible, setAttachMenuVisible] = useState(false);
-  // True from the moment a voice message is posted until the gateway
-  // finishes transcribing it. Drives the inline pending bubble below the
-  // thread; on the very first voice message the local whisper model still
-  // has to download, so the bubble's label switches to a setup notice.
   const [voicePending, setVoicePending] = useState(false);
-  // True while the recorder is recording or its WAV is still uploading.
-  // Keeps the trailing control on the recorder (never the send arrow) so it
-  // can't unmount mid-upload, and blocks a typed/return-key send until the
-  // voice op finishes — otherwise a voice message could post around a
-  // separate text send.
   const [voiceBusy, setVoiceBusy] = useState(false);
   const scrollRef = useRef<ScrollView | null>(null);
-
-  // Tracks whether the ScrollView is currently pinned near the bottom.
-  // Without this, every streaming delta would yank the user back down,
-  // making it impossible to read older content while the model writes.
   const pinnedToBottomRef = useRef<boolean>(true);
 
-  // 401 → setup. Effect-driven so all later hooks still run on the
-  // unauthorized render (Rules of Hooks).
   const unauthorized =
     stream.error instanceof ApiError && stream.error.status === 401;
   useEffect(() => {
     if (unauthorized) router.replace("/setup");
   }, [unauthorized]);
 
-  // Request APNs permission + register the device token the first time
-  // the user lands on a chat detail screen. Asking here (vs. on app
-  // launch) trades a few seconds of latency for noticeably higher
-  // grant rates — the user is already invested in an actual
-  // conversation, so the prompt reads as "Gini wants to let you know
-  // when something needs your call" instead of unexplained chrome.
-  // The module is idempotent across remounts and gates iOS-only
-  // internally, so calling it unconditionally here is fine.
   useEffect(() => {
     void registerForPushAsync();
   }, []);
 
   const list = useMemo<ChatBlock[]>(() => stream.blocks ?? [], [stream.blocks]);
 
+  // Resolve the owning agent so the header shows the right name + avatar.
+  const agent = useMemo(() => {
+    const agentId = stream.session?.agentId;
+    if (!agentId) return undefined;
+    return agents.data?.agents.find((a) => a.id === agentId);
+  }, [agents.data, stream.session]);
+  const agentName = agent?.name ?? stream.session?.title?.trim() ?? "Chat";
+  const agentOnline = agent?.status === "ready" || agent?.status === "active";
+
+  // The Jobs tab is per-agent; gate the fetch on the resolved agent id so
+  // it doesn't run before the session record loads.
+  const jobs = useJobs(agent?.id ?? null);
+
+  const threadSummaries = threads.data ?? [];
+  // Index threads by the main-chat block they branched from so the
+  // Messages tab can attach a "N replies" chip under that assistant
+  // block. parentBlockId is the assistant_text the thread roots at.
+  const threadByParentBlock = useMemo(() => {
+    const map = new Map<string, ThreadSummary>();
+    for (const t of threadSummaries) {
+      if (t.parentBlockId) map.set(t.parentBlockId, t);
+    }
+    return map;
+  }, [threadSummaries]);
+
   // Mark the chat as read once we know which block id is latest.
-  // Debounced by `lastReadBlockIdRef` — we only POST when the tail
-  // block id changes, so streaming assistant_text deltas (which reuse
-  // the same id but advance updatedAt) don't fire a request per token.
-  // The badge refetch chases the write so the icon dot clears
-  // immediately.
   const lastReadBlockIdRef = useRef<string | null>(null);
   useEffect(() => {
     if (!sessionId) return;
@@ -181,10 +183,6 @@ export default function ChatDetailScreen() {
     const latestId = list[list.length - 1]!.id;
     if (lastReadBlockIdRef.current === latestId) return;
     lastReadBlockIdRef.current = latestId;
-    // Read-state + badge are per-device on the gateway; the web target
-    // (and any client that hasn't acquired an APNs token yet) has no
-    // X-Device-Token header to send, so the call would just 400. Skip
-    // the round-trip entirely until a token is cached.
     if (!getCachedDeviceToken()) return;
     void (async () => {
       try {
@@ -193,22 +191,14 @@ export default function ChatDetailScreen() {
           body: JSON.stringify({ lastReadBlockId: latestId })
         });
         await refreshBadge();
-        // Drop the per-session unread cache so the chat list's badge
-        // for this row clears on the next render instead of waiting
-        // for the 3s poll.
         qc.invalidateQueries({ queryKey: ["unread"] });
       } catch {
-        // Best-effort — read state is rebuilt on the next navigation,
-        // and refreshBadge has its own swallow. A failure here only
-        // delays the badge clearing until the next event.
+        // Best-effort — read state is rebuilt on the next navigation.
       }
     })();
   }, [list, sessionId, qc]);
 
-  // Phase blocks are transient indicators — only render the latest one,
-  // and only while it's still active (non-terminal). Historical phase
-  // markers in the persisted log would otherwise show "Thinking" /
-  // "Completed" as permanent transcript items, which is noise.
+  // Phase blocks are transient — only render the latest active one.
   const visible = useMemo<ChatBlock[]>(() => {
     return list.filter((b, i) => {
       if (b.kind !== "phase") return true;
@@ -222,9 +212,6 @@ export default function ChatDetailScreen() {
     });
   }, [list]);
 
-  // callId → tool_result lookup. The chat detail uses this so each
-  // tool_call row can pull its own paired result for the expand-on-tap
-  // affordance. tool_result blocks themselves never render standalone.
   const toolResultsByCallId = useMemo(() => {
     const map = new Map<string, Extract<ChatBlock, { kind: "tool_result" }>>();
     for (const b of list) {
@@ -233,47 +220,14 @@ export default function ChatDetailScreen() {
     return map;
   }, [list]);
 
-  // Once an exchange (user_text → final assistant_text) has finished
-  // streaming, fold every tool_call inside it into one collapsed row
-  // so the transcript shows the question and the answer without a
-  // wall of intermediate tool steps. In-flight exchanges stay inline.
   const renderItems = useMemo<ChatRenderItem[]>(
     () => groupExchanges(visible),
     [visible]
   );
 
-  // Title source of truth is the session record — the gateway seeds it
-  // in the initial REST fetch (in parallel with /blocks) and pushes
-  // renames over the same /stream SSE connection thereafter. Until the
-  // session record has actually loaded, the header stays on "Chat":
-  // falling back to the first user_text excerpt during the loading
-  // window would flash a wrong-looking title and then swap to the real
-  // one a frame later, which is the bug this hook was rewritten to
-  // avoid. Once the session is loaded and its title is a default
-  // ("New chat" / "Untitled chat"), THEN the first user_text excerpt
-  // takes over until the runtime's auto-rename emits the real title.
-  const headerTitle = useMemo(() => {
-    const session = stream.session;
-    if (!session) return "Chat";
-    const title = session.title?.trim();
-    if (title && !DEFAULT_TITLE_FALLBACKS.has(title)) {
-      return title.length > 40 ? `${title.slice(0, 40)}…` : title;
-    }
-    const firstUserText = list.find((b) => b.kind === "user_text");
-    if (firstUserText && firstUserText.kind === "user_text") {
-      const trimmed = firstUserText.text.trim();
-      if (trimmed) return trimmed.length > 40 ? `${trimmed.slice(0, 40)}…` : trimmed;
-    }
-    return "Chat";
-  }, [list, stream.session]);
-
   const inFlight = useMemo(() => isTaskInFlight(list), [list]);
   const inFlightTaskId = useMemo(() => findInFlightTaskId(list), [list]);
 
-  // The most recent assistant_text block's updatedAt advances on every
-  // streaming delta. Including it in the scroll dep array means the
-  // ScrollView pins to the bottom as text accretes mid-stream, not just
-  // on block count change.
   const lastAssistantUpdatedAt = useMemo(() => {
     for (let i = list.length - 1; i >= 0; i -= 1) {
       const b = list[i]!;
@@ -282,23 +236,18 @@ export default function ChatDetailScreen() {
     return "";
   }, [list]);
 
-  // Auto-scroll to bottom on new block arrival and on streaming text
-  // accretion. The 50ms defer lets layout settle so the new content is
-  // measured before the scroll request lands. Skipped when the user has
-  // scrolled up so streaming deltas don't fight their reading position.
-  // Re-check the pin ref inside the timeout too — the user can begin
-  // scrolling up during the 50ms window, after the effect already passed
-  // its own guard.
+  // Auto-scroll only on the Messages tab (the other tabs are short lists
+  // that don't stream). Skipped when the user has scrolled up.
   useEffect(() => {
+    if (tab !== "messages") return;
     if (!pinnedToBottomRef.current) return;
     const id = setTimeout(() => {
       if (!pinnedToBottomRef.current) return;
       scrollRef.current?.scrollToEnd({ animated: true });
     }, 50);
     return () => clearTimeout(id);
-  }, [list.length, sessionId, lastAssistantUpdatedAt, voicePending]);
+  }, [list.length, sessionId, lastAssistantUpdatedAt, voicePending, tab]);
 
-  // Switching sessions starts a fresh transcript pinned to the bottom.
   useEffect(() => {
     pinnedToBottomRef.current = true;
   }, [sessionId]);
@@ -315,12 +264,7 @@ export default function ChatDetailScreen() {
   const canStop = Boolean(inFlightTaskId) && !cancel.isPending;
 
   const submit = () => {
-    // Hardware-keyboard onSubmitEditing can fire mid-task; `showSendBusy`
-    // also covers in-flight assistant work, not just the mutation's own
-    // pending state.
     if (sendDisabled) return;
-    // The user just posted — they want to see the reply, even if they
-    // had scrolled up earlier. Re-pin before the optimistic block lands.
     pinnedToBottomRef.current = true;
     send.mutate(
       { content: trimmed, images: readyImages },
@@ -333,10 +277,6 @@ export default function ChatDetailScreen() {
     );
   };
 
-  // Voice messages post with empty content and the uploaded audio ref;
-  // the gateway transcribes the WAV and uses the transcript as the
-  // message text. Re-pin to the bottom so the user sees the reply, the
-  // same as a typed send.
   const sendVoice = (audio: VoiceRef): void => {
     if (!sessionId) return;
     pinnedToBottomRef.current = true;
@@ -344,9 +284,6 @@ export default function ChatDetailScreen() {
     send.mutate(
       { content: "", audio },
       {
-        // Transcription is synchronous on the gateway and the first-run
-        // model download can run long enough that a quick tunnel times
-        // out — surface the failure instead of leaving the bubble spinning.
         onError: (err) => {
           Alert.alert("Voice message failed", err.message);
         },
@@ -366,10 +303,6 @@ export default function ChatDetailScreen() {
     });
   };
 
-  // Each picker asset gets a local id so the tray entry can be replaced
-  // in place when its upload finishes (or fails), and removed by the
-  // user before send. The preview uri the picker returns is a stable
-  // local file:// path — safe to render in <Image> without copying.
   const beginUpload = async (asset: ImagePicker.ImagePickerAsset): Promise<void> => {
     const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const { filename, mimeType } = describeAsset(asset);
@@ -405,25 +338,12 @@ export default function ChatDetailScreen() {
     }
   };
 
-  // Re-entrancy guard for the document picker. expo-document-picker rejects
-  // with "Different document picking in progress" if getDocumentAsync is
-  // called while a prior call is still settling — which happens when the
-  // first present stalls behind the dismissing attachment sheet.
   const pickingFileRef = useRef(false);
 
-  // Files tile: the OS document picker hands back arbitrary files (PDF,
-  // CSV, logs, code). Each is uploaded through the same MIME-agnostic
-  // /api/uploads path images use; the tray renders a file chip while it
-  // uploads and until send. A file that happens to be an image is tagged
-  // "image" so it still gets a thumbnail.
   const pickFile = async (): Promise<void> => {
     if (pickingFileRef.current) return;
     pickingFileRef.current = true;
     try {
-      // Let the attachment sheet's <Modal> finish tearing down before the
-      // picker's native VC presents. Presenting while the modal is still
-      // dismissing is the iOS "present while dismissing" hazard: the picker
-      // never appears and the next tap rejects with "already in progress".
       await new Promise((resolve) => setTimeout(resolve, 200));
       const result = await DocumentPicker.getDocumentAsync({
         multiple: true,
@@ -432,8 +352,6 @@ export default function ChatDetailScreen() {
       if (result.canceled) return;
       for (const asset of result.assets) void beginFileUpload(asset);
     } catch (err) {
-      // Surface a tap that couldn't open the picker as a calm alert instead
-      // of an uncaught promise rejection (the red error overlay).
       Alert.alert("Couldn't open Files", err instanceof Error ? err.message : String(err));
     } finally {
       pickingFileRef.current = false;
@@ -486,9 +404,6 @@ export default function ChatDetailScreen() {
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ["images"],
       allowsMultipleSelection: true,
-      // Keep the upload reasonably small; the server has no explicit
-      // cap but transferring full 12MP shots over cellular is wasteful
-      // when the model only consumes ~1024px on the long edge anyway.
       quality: 0.85
     });
     if (result.canceled) return;
@@ -527,114 +442,159 @@ export default function ChatDetailScreen() {
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
       <Stack.Screen options={{ headerShown: false }} />
 
-      {/* Header — back arrow on the left, centered title, a transparent
-          spacer on the right so the title's `textAlign: center` lines up
-          visually even though the right edge has no icon. */}
+      {/* Agent header — back arrow, avatar, name + status, search/more. */}
       <View style={styles.header}>
         <TouchableOpacity
           onPress={() => router.back()}
           hitSlop={8}
-          style={styles.headerIconButton}
+          style={styles.headerBack}
           accessibilityRole="button"
           accessibilityLabel="Back"
         >
-          <Feather name="arrow-left" size={24} color={theme.text} />
+          <Feather name="chevron-left" size={26} color={theme.text} />
         </TouchableOpacity>
-        <Text style={styles.headerTitle} numberOfLines={1}>
-          {headerTitle}
-        </Text>
+        <AgentAvatar name={agentName} size={38} />
+        <View style={styles.headerText}>
+          <Text style={styles.headerName} numberOfLines={1}>
+            {agentName}
+          </Text>
+          <View style={styles.headerStatusRow}>
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: agentOnline ? "#34C759" : "#C7C7CC" }
+              ]}
+            />
+            <Text style={styles.headerStatus}>{agentOnline ? "Ready" : "Idle"}</Text>
+          </View>
+        </View>
         <View style={styles.headerSpacer} />
+      </View>
+
+      {/* Tab bar — Messages / Threads (count) / Jobs (count). */}
+      <View style={styles.tabBar}>
+        <TabButton
+          label="Messages"
+          active={tab === "messages"}
+          onPress={() => setTab("messages")}
+        />
+        <TabButton
+          label="Threads"
+          active={tab === "threads"}
+          count={threadSummaries.length}
+          onPress={() => setTab("threads")}
+        />
+        <TabButton
+          label="Jobs"
+          active={tab === "jobs"}
+          count={jobs.data?.length ?? 0}
+          onPress={() => setTab("jobs")}
+        />
       </View>
 
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
-        // No vertical offset: the SafeAreaView is this screen's root view
-        // (the native stack header is hidden), so KeyboardAvoidingView's
-        // own onLayout frame is already in screen coordinates and accounts
-        // for the custom header + top inset. Any non-zero offset here is
-        // pure over-padding and leaves a gap between the composer and the
-        // keyboard.
         keyboardVerticalOffset={0}
         style={styles.flex}
       >
-        {stream.isPending && !stream.blocks ? (
-          <View style={styles.center}>
-            <ActivityIndicator color={theme.muted} />
-          </View>
-        ) : (
-          <ScrollView
-            ref={scrollRef}
-            contentContainerStyle={styles.messages}
-            keyboardShouldPersistTaps="handled"
-            // Dragging the transcript dismisses the keyboard so the user
-            // can read the conversation or recover screen space without
-            // sending. on-drag (not interactive) so scrolling up to older
-            // messages dismisses too, not just a downward drag toward the
-            // keyboard. Taps on non-interactive content still dismiss via
-            // keyboardShouldPersistTaps; taps on buttons stay handled.
-            keyboardDismissMode="on-drag"
-            scrollEventThrottle={16}
-            onScroll={(e) => {
-              const { contentOffset, contentSize, layoutMeasurement } =
-                e.nativeEvent;
-              const distanceFromBottom =
-                contentSize.height -
-                (contentOffset.y + layoutMeasurement.height);
-              pinnedToBottomRef.current = distanceFromBottom < 40;
-            }}
-          >
-            {visible.length > 0 ? (
-              renderItems.map((item) =>
-                item.kind === "tool_group" ? (
-                  <BlockToolCallsCollapsed
-                    key={item.id}
-                    calls={item.calls}
-                    resultsByCallId={toolResultsByCallId}
-                  />
-                ) : item.kind === "file_artifact" ? (
-                  <GeneratedFilesCard key={item.id} files={item.files} />
-                ) : (
-                  <BlockRenderer
-                    key={item.block.id}
-                    block={item.block}
-                    toolResult={
-                      item.block.kind === "tool_call"
-                        ? toolResultsByCallId.get(item.block.callId)
-                        : undefined
-                    }
-                  />
-                )
-              )
-            ) : !voicePending ? (
-              <View style={styles.emptyChat}>
-                <Text style={styles.emptyChatText}>What can I help with?</Text>
-              </View>
-            ) : null}
-            {/* Inline pending bubble while a voice message transcribes. On
-                the first voice message the local whisper model still needs
-                its one-time download, so the label warns that setup will
-                take a moment; afterwards it's just "Transcribing…". */}
-            {voicePending ? (
-              <View style={styles.voicePendingRow}>
-                <View style={styles.voicePendingBubble}>
-                  <ActivityIndicator color={theme.muted} size="small" />
-                  <Text style={styles.voicePendingText}>
-                    {voice.data?.ready === false
-                      ? "Setting up voice messages — first time only, this can take a minute."
-                      : "Transcribing…"}
-                  </Text>
+        {tab === "messages" ? (
+          stream.isPending && !stream.blocks ? (
+            <View style={styles.center}>
+              <ActivityIndicator color={theme.muted} />
+            </View>
+          ) : (
+            <ScrollView
+              ref={scrollRef}
+              contentContainerStyle={styles.messages}
+              keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
+              scrollEventThrottle={16}
+              onScroll={(e) => {
+                const { contentOffset, contentSize, layoutMeasurement } =
+                  e.nativeEvent;
+                const distanceFromBottom =
+                  contentSize.height -
+                  (contentOffset.y + layoutMeasurement.height);
+                pinnedToBottomRef.current = distanceFromBottom < 40;
+              }}
+            >
+              {visible.length > 0 ? (
+                renderItems.map((item) => {
+                  if (item.kind === "tool_group") {
+                    return (
+                      <BlockToolCallsCollapsed
+                        key={item.id}
+                        calls={item.calls}
+                        resultsByCallId={toolResultsByCallId}
+                      />
+                    );
+                  }
+                  if (item.kind === "file_artifact") {
+                    return <GeneratedFilesCard key={item.id} files={item.files} />;
+                  }
+                  // An assistant_text block can host a thread; render the
+                  // block then the inline "N replies" chip beneath it.
+                  const thread =
+                    item.block.kind === "assistant_text"
+                      ? threadByParentBlock.get(item.block.id)
+                      : undefined;
+                  return (
+                    <View key={item.block.id}>
+                      <BlockRenderer
+                        block={item.block}
+                        toolResult={
+                          item.block.kind === "tool_call"
+                            ? toolResultsByCallId.get(item.block.callId)
+                            : undefined
+                        }
+                      />
+                      {thread ? (
+                        <View style={styles.threadChipWrap}>
+                          <ThreadRepliesChip
+                            replyCount={thread.replyCount}
+                            lastReplyAt={thread.lastReplyAt}
+                            onPress={() =>
+                              router.push(
+                                `/chat/${sessionId}/thread/${thread.threadId}`
+                              )
+                            }
+                          />
+                        </View>
+                      ) : null}
+                    </View>
+                  );
+                })
+              ) : !voicePending ? (
+                <View style={styles.emptyChat}>
+                  <Text style={styles.emptyChatText}>What can I help with?</Text>
                 </View>
-              </View>
-            ) : null}
-          </ScrollView>
+              ) : null}
+              {voicePending ? (
+                <View style={styles.voicePendingRow}>
+                  <View style={styles.voicePendingBubble}>
+                    <ActivityIndicator color={theme.muted} size="small" />
+                    <Text style={styles.voicePendingText}>
+                      {voice.data?.ready === false
+                        ? "Setting up voice messages — first time only, this can take a minute."
+                        : "Transcribing…"}
+                    </Text>
+                  </View>
+                </View>
+              ) : null}
+            </ScrollView>
+          )
+        ) : tab === "threads" ? (
+          <ThreadsTab
+            sessionId={sessionId ?? null}
+            threads={threadSummaries}
+            loading={threads.isLoading}
+          />
+        ) : (
+          <JobsTab jobs={jobs.data ?? []} loading={jobs.isLoading} />
         )}
 
-        {/* Input bar — pill input with a leading "+" affordance that
-            opens an attach-photo action sheet, and a navy circular send
-            button. The pill sits inside a white surface bar with a top
-            hairline so the input feels anchored to the bottom edge.
-            Pending image attachments render as a horizontal tray above
-            the pill while they upload and until send. */}
+        {/* Composer — shared across tabs; sending always posts to the
+            main chat. */}
         <View style={styles.inputBar}>
           {images.length > 0 ? (
             <ScrollView
@@ -718,7 +678,7 @@ export default function ChatDetailScreen() {
             <TextInput
               value={text}
               onChangeText={setText}
-              placeholder="Message Gini..."
+              placeholder={`Message ${agentName}…`}
               placeholderTextColor={theme.inputPlaceholder}
               multiline
               editable={!!sessionId}
@@ -727,14 +687,6 @@ export default function ChatDetailScreen() {
               style={styles.inputText}
               accessibilityLabel="Message input"
             />
-            {/* Trailing control: while a task is in flight, show the Stop
-                button (cancels the run). Otherwise mirror Telegram/iMessage —
-                the send arrow appears once there's text or a ready image (or
-                on non-iOS, where the recorder can't emit a decodable WAV),
-                and an empty iOS composer shows the press-and-hold mic. While a
-                voice take is in flight we keep the recorder mounted so its
-                upload can't resolve from an unmounted component and race a
-                text send. */}
             {canStop ? (
               <Pressable
                 onPress={stopTask}
@@ -793,45 +745,237 @@ export default function ChatDetailScreen() {
   );
 }
 
+function TabButton({
+  label,
+  active,
+  count,
+  onPress
+}: {
+  label: string;
+  active: boolean;
+  count?: number;
+  onPress: () => void;
+}) {
+  return (
+    <TouchableOpacity
+      onPress={onPress}
+      activeOpacity={0.7}
+      style={styles.tab}
+      accessibilityRole="tab"
+      accessibilityState={{ selected: active }}
+      accessibilityLabel={label}
+    >
+      <View style={[styles.tabRow, active && styles.tabRowActive]}>
+        <Text style={[styles.tabLabel, active && styles.tabLabelActive]}>{label}</Text>
+        {count && count > 0 ? (
+          <View style={styles.tabCount}>
+            <Text style={styles.tabCountText}>{count}</Text>
+          </View>
+        ) : null}
+      </View>
+    </TouchableOpacity>
+  );
+}
+
+// Threads tab — a list of the session's threads. Each row opens the
+// Slack-style Thread View.
+function ThreadsTab({
+  sessionId,
+  threads,
+  loading
+}: {
+  sessionId: string | null;
+  threads: ThreadSummary[];
+  loading: boolean;
+}) {
+  if (loading && threads.length === 0) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator color={theme.muted} />
+      </View>
+    );
+  }
+  if (threads.length === 0) {
+    return (
+      <View style={styles.tabEmpty}>
+        <Feather name="message-square" size={28} color={theme.placeholder} />
+        <Text style={styles.tabEmptyText}>No threads yet</Text>
+        <Text style={styles.tabEmptySub}>
+          Threads branch off the agent&apos;s replies for deeper back-and-forth.
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <ScrollView contentContainerStyle={styles.tabListContent}>
+      {threads.map((thread) => (
+        <TouchableOpacity
+          key={thread.threadId}
+          onPress={() => router.push(`/chat/${sessionId}/thread/${thread.threadId}`)}
+          activeOpacity={0.7}
+          style={styles.threadRow}
+          accessibilityRole="button"
+          accessibilityLabel={`Open thread, ${thread.replyCount} replies`}
+        >
+          <Text style={styles.threadRowPreview} numberOfLines={2}>
+            {thread.rootPreview?.trim() || thread.lastReplyPreview?.trim() || "Thread"}
+          </Text>
+          <View style={styles.threadRowFooter}>
+            <Text style={styles.threadRowReplies}>
+              {thread.replyCount} {thread.replyCount === 1 ? "reply" : "replies"}
+            </Text>
+            <Text style={styles.threadRowSep}>·</Text>
+            <Text style={styles.threadRowLast}>
+              last reply {relativeTime(thread.lastReplyAt)}
+            </Text>
+          </View>
+        </TouchableOpacity>
+      ))}
+    </ScrollView>
+  );
+}
+
+// Jobs tab — the agent's recurring jobs, mirroring the channel rows on
+// the Channels screen.
+function JobsTab({ jobs, loading }: { jobs: JobRecord[]; loading: boolean }) {
+  if (loading && jobs.length === 0) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator color={theme.muted} />
+      </View>
+    );
+  }
+  if (jobs.length === 0) {
+    return (
+      <View style={styles.tabEmpty}>
+        <Feather name="clock" size={28} color={theme.placeholder} />
+        <Text style={styles.tabEmptyText}>No jobs yet</Text>
+        <Text style={styles.tabEmptySub}>
+          Recurring jobs run on a schedule and deliver to a channel.
+        </Text>
+      </View>
+    );
+  }
+  return (
+    <ScrollView contentContainerStyle={styles.tabListContent}>
+      {jobs.map((job) => (
+        <View key={job.id} style={styles.jobRow}>
+          <View style={styles.jobIcon}>
+            <Feather name="clock" size={18} color={theme.placeholder} />
+          </View>
+          <View style={styles.jobBody}>
+            <Text style={styles.jobName} numberOfLines={1}>
+              {job.name}
+            </Text>
+            <View style={styles.jobSchedule}>
+              <Feather name="repeat" size={11} color="#B0B0B6" />
+              <Text style={styles.jobCadence} numberOfLines={1}>
+                {jobCadence(job)}
+              </Text>
+            </View>
+          </View>
+          <Text style={styles.jobNext}>
+            {job.nextRunAt ? chatListTime(job.nextRunAt) : ""}
+          </Text>
+        </View>
+      ))}
+    </ScrollView>
+  );
+}
+
+function jobCadence(job: JobRecord): string {
+  if (job.cronExpression) return job.cronExpression;
+  if (typeof job.intervalSeconds === "number" && job.intervalSeconds > 0) {
+    const s = job.intervalSeconds;
+    if (s % 86400 === 0) return `Every ${s / 86400}d`;
+    if (s % 3600 === 0) return `Every ${s / 3600}h`;
+    if (s % 60 === 0) return `Every ${s / 60}m`;
+    return `Every ${s}s`;
+  }
+  return "Recurring";
+}
+
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: theme.bg },
   flex: { flex: 1 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
 
-  // Header. Equal-width edge boxes (icon + spacer) so the centered
-  // title sits geometrically in the middle of the row.
+  // Agent header.
   header: {
-    height: 64,
     flexDirection: "row",
     alignItems: "center",
+    gap: 10,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    backgroundColor: theme.bg,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border
+  },
+  headerBack: { width: 28, alignItems: "flex-start", justifyContent: "center" },
+  headerText: { flex: 1, gap: 3 },
+  headerName: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 17
+  },
+  headerStatusRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  statusDot: { width: 7, height: 7, borderRadius: 3.5 },
+  headerStatus: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
+  },
+  headerSpacer: { width: 4 },
+
+  // Tab bar.
+  tabBar: {
+    flexDirection: "row",
+    gap: 6,
     paddingHorizontal: 16,
     backgroundColor: theme.bg,
     borderBottomWidth: 1,
     borderBottomColor: theme.border
   },
-  headerIconButton: {
-    width: 36,
-    height: 36,
+  tab: { alignItems: "center" },
+  tabRow: {
+    flexDirection: "row",
     alignItems: "center",
-    justifyContent: "center"
+    gap: 6,
+    paddingVertical: 14,
+    paddingHorizontal: 4,
+    borderBottomWidth: 2,
+    borderBottomColor: "transparent"
   },
-  headerSpacer: { width: 36, height: 36 },
-  headerTitle: {
-    flex: 1,
-    textAlign: "center",
+  tabRowActive: { borderBottomColor: theme.text },
+  tabLabel: {
+    color: theme.muted,
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 14
+  },
+  tabLabelActive: {
     color: theme.text,
+    fontFamily: family("HankenGrotesk", 700)
+  },
+  tabCount: {
+    backgroundColor: "#EAEAEA",
+    borderRadius: 10,
+    paddingHorizontal: 7,
+    paddingVertical: 1
+  },
+  tabCountText: {
+    color: "#5A5A5A",
     fontFamily: family("HankenGrotesk", 700),
-    fontSize: 19
+    fontSize: 11
   },
 
-  // Conversation — vertical block stream with consistent gap and outer
-  // padding. The block components own their own bubble geometry.
+  // Messages.
   messages: {
     padding: 16,
     paddingTop: 18,
     paddingBottom: 24,
     gap: 16
   },
+  threadChipWrap: { marginTop: 8 },
   emptyChat: {
     flex: 1,
     minHeight: 240,
@@ -844,9 +988,97 @@ const styles = StyleSheet.create({
     fontSize: 18
   },
 
-  // Input bar — sits at the bottom of the screen above the home
-  // indicator (consumed by the SafeAreaView). White with a top
-  // hairline; the pill itself is height 56 with a 28 corner radius.
+  // Threads / Jobs tab shared list.
+  tabListContent: { paddingVertical: 4 },
+  tabEmpty: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 32,
+    gap: 10
+  },
+  tabEmptyText: {
+    color: theme.text,
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 17
+  },
+  tabEmptySub: {
+    color: theme.subtle,
+    fontFamily: family("HankenGrotesk", 400),
+    fontSize: 14,
+    textAlign: "center",
+    lineHeight: 20
+  },
+
+  // Thread list row.
+  threadRow: {
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    gap: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: theme.border
+  },
+  threadRowPreview: {
+    color: "#2A2A2C",
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 15,
+    lineHeight: 21
+  },
+  threadRowFooter: { flexDirection: "row", alignItems: "center", gap: 6 },
+  threadRowReplies: {
+    color: "#2F6BFF",
+    fontFamily: family("HankenGrotesk", 700),
+    fontSize: 13
+  },
+  threadRowSep: {
+    color: "#AEBBE8",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 12
+  },
+  threadRowLast: {
+    color: "#7A86A8",
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12
+  },
+
+  // Job list row.
+  jobRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "#F2F2F2"
+  },
+  jobIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 11,
+    backgroundColor: "#F2F2F2",
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  jobBody: { flex: 1, gap: 2 },
+  jobName: {
+    color: "#3A3A3A",
+    fontFamily: family("HankenGrotesk", 600),
+    fontSize: 15
+  },
+  jobSchedule: { flexDirection: "row", alignItems: "center", gap: 5 },
+  jobCadence: {
+    flex: 1,
+    color: theme.placeholder,
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12
+  },
+  jobNext: {
+    color: "#B6B6BC",
+    fontFamily: family("HankenGrotesk", 500),
+    fontSize: 12
+  },
+
+  // Composer (unchanged geometry from the prior chat detail).
   inputBar: {
     paddingHorizontal: 16,
     paddingTop: 14,
@@ -874,14 +1106,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  thumbTray: {
-    marginBottom: 10,
-    maxHeight: 76
-  },
-  thumbTrayContent: {
-    gap: 8,
-    paddingRight: 4
-  },
+  thumbTray: { marginBottom: 10, maxHeight: 76 },
+  thumbTrayContent: { gap: 8, paddingRight: 4 },
   thumb: {
     width: 64,
     height: 64,
@@ -892,13 +1118,8 @@ const styles = StyleSheet.create({
     borderColor: theme.inputBorder,
     position: "relative"
   },
-  thumbError: {
-    borderColor: theme.danger
-  },
-  thumbImage: {
-    width: "100%",
-    height: "100%"
-  },
+  thumbError: { borderColor: theme.danger },
+  thumbImage: { width: "100%", height: "100%" },
   thumbOverlay: {
     position: "absolute",
     top: 0,
@@ -920,10 +1141,6 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center"
   },
-  // Non-image attachment chip — a wider rounded box (vs the square image
-  // thumb) with a file icon, the filename, and a formatted size. Shares
-  // the same height as the image thumb so a mixed tray stays aligned, and
-  // reuses thumbOverlay / thumbRemove for the uploading + remove states.
   fileChip: {
     flexDirection: "row",
     alignItems: "center",
@@ -937,9 +1154,7 @@ const styles = StyleSheet.create({
     borderColor: theme.inputBorder,
     position: "relative"
   },
-  fileChipBody: {
-    flex: 1
-  },
+  fileChipBody: { flex: 1 },
   fileChipName: {
     color: theme.text,
     fontFamily: family("HankenGrotesk", 600),
@@ -957,8 +1172,6 @@ const styles = StyleSheet.create({
     fontFamily: family("HankenGrotesk", 500),
     fontSize: 17,
     paddingVertical: 8,
-    // Cap the multiline input height so a long paste doesn't push the
-    // composer up over the conversation.
     maxHeight: 120
   },
   sendButton: {
@@ -972,13 +1185,7 @@ const styles = StyleSheet.create({
   sendButtonDisabled: { backgroundColor: theme.buttonDisabled },
   stopButton: { backgroundColor: theme.danger },
 
-  // Right-aligned pending indicator for an in-flight voice message.
-  // Mirrors the user-bubble row alignment but uses a muted gray surface
-  // (not the near-black user bubble) so it reads as transient status.
-  voicePendingRow: {
-    alignSelf: "flex-end",
-    maxWidth: "80%"
-  },
+  voicePendingRow: { alignSelf: "flex-end", maxWidth: "80%" },
   voicePendingBubble: {
     flexDirection: "row",
     alignItems: "center",
