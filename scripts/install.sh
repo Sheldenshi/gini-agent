@@ -352,6 +352,30 @@ read_web_port() {
   printf ''
 }
 
+# Read the gateway (runtime) port for an instance from
+# ~/.gini/instances/<inst>/runtime.port (written by the runtime at boot,
+# src/server.ts). The gateway is the single operator front — its origin is what
+# the post-install browser should open. Returns the port or empty on timeout.
+read_runtime_port() {
+  local instance="$1"
+  local port_file="$HOME/.gini/instances/$instance/runtime.port"
+  local timeout=$INSTALL_READ_WEB_PORT_TIMEOUT_S
+  local i=0
+  while [ $i -lt $timeout ]; do
+    if [ -f "$port_file" ]; then
+      local port
+      port="$(tr -d '[:space:]' <"$port_file" 2>/dev/null || true)"
+      if [ -n "$port" ]; then
+        printf '%s' "$port"
+        return
+      fi
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  printf ''
+}
+
 # Wait up to INSTALL_WAIT_HEALTHZ_TIMEOUT_S seconds for the web app to
 # respond at /api/runtime/__healthz on the actual web port for the given
 # instance. The port is discovered from ~/.gini/instances/<inst>/web.port
@@ -391,17 +415,32 @@ open_setup_in_browser() {
     return
   fi
   info "Waiting for the Gini webapp to come up..."
-  local web_url
-  web_url="$(wait_for_web_healthz "$DEFAULT_INSTANCE")"
-  if [ -z "$web_url" ]; then
-    info "Webapp didn't respond within 120s. After install completes, run 'gini status' to find the web port and open <web_url>/setup in your browser."
+  # Liveness gate: the inner Next web child has compiled and is serving
+  # /api/runtime/__healthz (the slow part — a cold Next build). We probe the
+  # inner port here, but hand the operator the GATEWAY origin below.
+  if [ -z "$(wait_for_web_healthz "$DEFAULT_INSTANCE")" ]; then
+    info "Webapp didn't respond within 120s. After install completes, run 'gini status' and open the printed gateway URL with /setup in your browser."
     return
   fi
+  # Open the GATEWAY origin, not the inner Next port: the gateway is the single
+  # operator front and the only origin that serves the native /api/* surface
+  # (device pairing, tunnel). The inner port serves /setup too, but landing
+  # there leaves pairing/tunnel unreachable. This matches operatorWebUrl
+  # (src/cli/process.ts: http://localhost:<gateway port>), which `gini status`
+  # and the start banner advertise. The inner web is already up (probed above),
+  # so its parent gateway — and runtime.port — are present.
+  local gateway_port
+  gateway_port="$(read_runtime_port "$DEFAULT_INSTANCE")"
+  if [ -z "$gateway_port" ]; then
+    info "Couldn't read the gateway port. After install completes, run 'gini status' and open the printed gateway URL with /setup in your browser."
+    return
+  fi
+  local gateway_url="http://localhost:$gateway_port"
   # `open` works in both interactive and non-interactive (piped) sessions
   # on macOS. We fire and ignore errors — even if it fails (e.g. no GUI
   # session), we still print the URL.
-  open "$web_url/setup" >/dev/null 2>&1 || true
-  step "Opened $web_url/setup in your browser"
+  open "$gateway_url/setup" >/dev/null 2>&1 || true
+  step "Opened $gateway_url/setup in your browser"
 }
 
 print_done() {

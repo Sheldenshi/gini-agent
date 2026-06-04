@@ -3,11 +3,14 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PairedDevice, RuntimeConfig } from "../types";
+import { mutateState, readState } from "../state";
+import { hashSecret } from "../state/security";
 import {
   approvePairing,
   cancelPairing,
   claimPairingSession,
   listPairingRequests,
+  pollPairingStatus,
   redactDevice,
   rejectPairing,
   requestPairing,
@@ -85,6 +88,42 @@ describe("governance pairing wrappers", () => {
     const config = testConfig("gov-resolve-undef");
     expect(resolveSessionFromCookie(config, undefined)).toBeUndefined();
     expect(resolveSessionFromCookie(config, "gini_device_unknown")).toBeUndefined();
+  });
+
+  test("pollPairingStatus reads status and enforces the binding secret", async () => {
+    const config = testConfig("gov-poll");
+    const request = await open(config);
+    expect(pollPairingStatus(config, request.id, SECRET)).toEqual({ ok: true, status: "pending" });
+    expect(pollPairingStatus(config, request.id, "wrong-secret")).toEqual({ ok: false, reason: "bind_mismatch" });
+    expect(pollPairingStatus(config, "preq_missing", SECRET)).toEqual({ ok: false, reason: "not_found" });
+  });
+
+  test("pollPairingStatus reports expiry without persisting (read-only hot path)", async () => {
+    const config = testConfig("gov-poll-readonly");
+    // Inject a row whose deadline is already in the past (createPairingRequest
+    // clamps ttl >= 60s, so it can't mint an already-expired one directly).
+    const past = "2000-01-01T00:00:00.000Z";
+    await mutateState(config.instance, (state) => {
+      state.pairingRequests.unshift({
+        id: "preq_expired",
+        instance: config.instance,
+        code: "123-456",
+        bindHash: hashSecret(SECRET),
+        status: "pending",
+        deviceName: "Safari · iPhone",
+        userAgent: "ua",
+        relayHost: "sub.gini-relay.lilaclabs.ai",
+        createdAt: past,
+        expiresAt: past
+      });
+    });
+    // Effective status is "expired" even though the stored row is still "pending".
+    expect(pollPairingStatus(config, "preq_expired", SECRET)).toEqual({ ok: true, status: "expired" });
+    // The poll went through readState, not mutateState — so it never persisted
+    // the expiry flip. The on-disk row is untouched (still "pending"); the flip
+    // is deferred to the next genuine mutation.
+    const onDisk = readState(config.instance).pairingRequests.find((r) => r.id === "preq_expired");
+    expect(onDisk?.status).toBe("pending");
   });
 
   test("touchPairedSession bumps last-seen for a live session", async () => {

@@ -66,9 +66,11 @@ claim, which is hashed.
 
 ## Trust tiers of the pairing routes
 
-The pairing API lives on the native `/api/pairing/*` surface, special-cased
-BEFORE the bearer gate so each route enforces its own rule from the **true
-inbound Host/Origin** (the gateway sees the real first hop):
+The device-pairing routes live on the native `/api/pairing/*` surface and are
+special-cased inside `handlePairingRoutes` **before** the bearer gate, so each
+enforces its own rule from the **true inbound Host/Origin** (the gateway sees the
+real first hop). The two legacy *code* routes are gated differently — see the
+notes under the table.
 
 | Method | Path | Auth |
 |---|---|---|
@@ -76,15 +78,21 @@ inbound Host/Origin** (the gateway sees the real first hop):
 | GET | `/api/pairing/request/:id` | Public, `gini_pair` required |
 | POST | `/api/pairing/request/:id/claim` | Public, `gini_pair`-bound; sets `gini_session` |
 | POST | `/api/pairing/request/:id/cancel` | Public, `gini_pair`-bound |
-| GET | `/api/pairing/requests` | Admin (see "Relay sessions mirror loopback") |
-| POST | `/api/pairing/requests/:id/approve` | Admin |
-| POST | `/api/pairing/requests/:id/reject` | Admin |
-| POST | `/api/pairing` (legacy code create) | Admin |
+| GET | `/api/pairing/requests` | Admin (loopback Host OR `gini_session`; see "Relay sessions mirror loopback") |
+| POST | `/api/pairing/requests/:id/approve` | Admin (loopback Host OR `gini_session`) |
+| POST | `/api/pairing/requests/:id/reject` | Admin (loopback Host OR `gini_session`) |
+| POST | `/api/pairing` (legacy code create) | Bearer (native owner-bearer `authorized()` gate); a paired session reaches it via the BFF |
 | POST | `/api/pairing/claim` (legacy code claim) | Public, rate-limited (brute-force throttle) |
 
-All pairing routes additionally pass through `webBoundRequestAllowed` for
-host/origin/CSRF trust. The WS upgrade path (`src/server.ts`) mirrors the same
-relay session gate.
+The "Admin" rows are the loopback-OR-`gini_session` mirror gate enforced in
+`handlePairingRoutes`; the legacy *create* row is **not** that gate — it is an
+ordinary owner-bearer route reached *after* the bearer gate (a paired session
+hits it through the BFF's server-side owner bearer, hence the converging
+outcome). Only the device-pairing routes (`request`, `request/:id*`,
+`requests*`) additionally pass through `webBoundRequestAllowed` for
+host/origin/CSRF trust; the two legacy routes do not (`POST /api/pairing` is
+bearer-gated, `POST /api/pairing/claim` is public + rate-limited only). The WS
+upgrade path (`src/server.ts`) mirrors the same relay session gate.
 
 ## Relay sessions mirror loopback (DELIBERATE — do not "harden" this away)
 

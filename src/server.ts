@@ -197,6 +197,12 @@ const server = Bun.serve({
           && !resolveSessionFromCookie(config, cookieValue(request, SESSION_COOKIE))) {
         return new Response("Unauthorized", { status: 401 });
       }
+      // The session is validated once here, at upgrade — there is deliberately no
+      // mid-stream re-validation/teardown on revocation (unlike the SSE path,
+      // which aborts on revoke). That asymmetry is safe because the ONLY WS that
+      // rides the relay is non-privileged Next HMR; all live application data
+      // (chat, events) flows over SSE, which IS torn down. Add WS re-validation
+      // only if a future app/runtime WebSocket ever carries privileged data.
       return proxyWebSocketUpgrade(request, server, config);
     }
     return httpHandler(request);

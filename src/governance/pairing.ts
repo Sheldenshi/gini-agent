@@ -113,8 +113,16 @@ export async function listPairingRequests(config: RuntimeConfig) {
 
 // Bind-checked status poll for the requesting device. Requires the gini_pair
 // binding secret so a known request id + an unrelated cookie can't read status.
-export async function pollPairingStatus(config: RuntimeConfig, id: string, bindSecret: string) {
-  return mutateState(config.instance, (state) => pollPairingRequest(state, id, bindSecret));
+// Read-only (readState, no lock/write): this is the device's hot poll
+// (POLL_INTERVAL_MS = 2000 in web/src/app/pair/page.tsx) on a public,
+// unauthenticated endpoint, so going through mutateState would serialize a
+// full-state disk write per poll — an availability hazard a scripted client
+// could amplify. pollPairingRequest's lazy expiry sweep runs against the
+// discarded read copy, so the effective "expired" status is still reported
+// correctly; the flip is persisted by the next genuine mutation. Mirrors the
+// read-only resolveSessionFromCookie gate. See ADR device-pairing-auth.md.
+export function pollPairingStatus(config: RuntimeConfig, id: string, bindSecret: string) {
+  return pollPairingRequest(readState(config.instance), id, bindSecret);
 }
 
 export async function approvePairing(config: RuntimeConfig, id: string) {

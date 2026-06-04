@@ -681,6 +681,16 @@ export function revokeDevice(state: RuntimeState, deviceId: string): PairedDevic
     },
     { system: true }
   );
+  // A "pairing" tick so EVERY admin client's Active Sessions list refreshes the
+  // moment a session is revoked — RuntimeStreamBridge maps kind:"pairing" to the
+  // ["devices"] query. The audit row alone surfaces as kind:"runtime" (mapped to
+  // ["status"]), so without this a second open Settings tab would show the
+  // revoked session as active until it refetched. Matches claim/approve/reject.
+  appendEvent(
+    state,
+    { kind: "pairing", action: "resolved", target: device.id, risk: "low", summary: `Device revoked: ${device.name}` },
+    { system: true }
+  );
   return device;
 }
 

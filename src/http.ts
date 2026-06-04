@@ -1684,8 +1684,13 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
           : new Response(null, { status: 302, headers: { location: "/pair" } });
       }
       // Refresh last-seen on full page loads only (not every asset) so the
-      // Active Sessions list stays current without per-request writes.
-      if (request.headers.get("sec-fetch-dest") === "document") void touchPairedSession(config, sessionToken);
+      // Active Sessions list stays current without per-request writes. Swallow
+      // failures: this is a best-effort bookkeeping write, and an unhandled
+      // rejection here (e.g. a transient writeState ENOSPC/EROFS) would reach the
+      // global unhandledRejection handler, which exits the gateway process.
+      if (request.headers.get("sec-fetch-dest") === "document") {
+        void touchPairedSession(config, sessionToken).catch(() => {});
+      }
       // Carry the validated token into proxyWeb so a long-lived SSE stream can be
       // re-validated and torn down if this session is revoked mid-stream — the
       // gate only runs once per connection, so without this an open event stream
@@ -2461,7 +2466,7 @@ async function handlePairingRoutes(request: Request, url: URL, config: RuntimeCo
   if (method === "GET" && poll) {
     const bindSecret = cookieValue(request, PAIR_BIND_COOKIE);
     if (!bindSecret) return json({ error: "Unauthorized" }, 401);
-    const result = await pollPairingStatus(config, poll[1]!, bindSecret);
+    const result = pollPairingStatus(config, poll[1]!, bindSecret);
     if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
     return json({ status: result.status });
   }

@@ -16,6 +16,7 @@ import {
   pollPairingRequest,
   redactPairingRequest,
   rejectPairingRequest,
+  revokeDevice,
   touchSessionLastSeen
 } from "./records";
 
@@ -437,6 +438,23 @@ describe("claimPairingRequest events", () => {
     expect(state.events[0]?.kind).toBe("pairing");
     expect(state.events[0]?.action).toBe("resolved");
     expect(state.events[0]?.target).toBe(request.id);
+  });
+});
+
+describe("revokeDevice events", () => {
+  test("emits a pairing tick so every admin client refreshes Active Sessions", () => {
+    const state = createEmptyState("sandbox");
+    const request = makeRequest(state);
+    approvePairingRequest(state, request.id);
+    expect(claimPairingRequest(state, request.id, SECRET).ok).toBe(true);
+    const device = state.devices[0]!;
+    revokeDevice(state, device.id);
+    // The most recent appended event is the revoke's pairing tick — the same
+    // kind:"pairing" the web SSE bridge maps to the ["devices"] query, so other
+    // admin tabs drop the revoked session from Active Sessions without a refetch.
+    expect(state.events[0]?.kind).toBe("pairing");
+    expect(state.events[0]?.action).toBe("resolved");
+    expect(state.events[0]?.target).toBe(device.id);
   });
 });
 
