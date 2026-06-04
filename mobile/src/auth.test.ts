@@ -15,10 +15,18 @@ mock.module("@react-native-async-storage/async-storage", () => ({
   }
 }));
 
+// Stub the push module that saveCredentials lazy-requires on a credential swap,
+// so the reset-on-swap behavior is observable without loading react-native.
+const resetPushSpy = mock(() => {});
+mock.module("./push", () => ({
+  resetRegistrationForCredentialSwap: resetPushSpy
+}));
+
 import {
   isLocalGatewayHost,
   normalizeBaseUrl,
-  PUBLIC_HTTP_REJECTION
+  PUBLIC_HTTP_REJECTION,
+  saveCredentials
 } from "./auth";
 
 describe("isLocalGatewayHost", () => {
@@ -156,5 +164,33 @@ describe("normalizeBaseUrl", () => {
     expect(normalizeBaseUrl("https://example.com/path?token=leaked#frag")).toBe(
       "https://example.com"
     );
+  });
+});
+
+describe("saveCredentials push-registration reset on swap", () => {
+  test("resets push on a credential swap, not on a same-identity re-save", async () => {
+    resetPushSpy.mockClear();
+    // First save (cache empty) → counts as a swap → reset re-arms registration.
+    await saveCredentials({ baseUrl: "https://a.gini-relay.lilaclabs.ai", token: "tok1" });
+    expect(resetPushSpy).toHaveBeenCalledTimes(1);
+    // Re-saving the SAME identity must NOT reset (avoids needless re-registration).
+    await saveCredentials({ baseUrl: "https://a.gini-relay.lilaclabs.ai", token: "tok1" });
+    expect(resetPushSpy).toHaveBeenCalledTimes(1);
+    // A different host → swap → reset.
+    await saveCredentials({ baseUrl: "https://b.gini-relay.lilaclabs.ai", token: "tok1" });
+    expect(resetPushSpy).toHaveBeenCalledTimes(2);
+    // A different token on the same host → swap → reset.
+    await saveCredentials({ baseUrl: "https://b.gini-relay.lilaclabs.ai", token: "tok2" });
+    expect(resetPushSpy).toHaveBeenCalledTimes(3);
+  });
+
+  test("a push reset failure does not break saveCredentials", async () => {
+    resetPushSpy.mockClear();
+    resetPushSpy.mockImplementationOnce(() => {
+      throw new Error("push unavailable");
+    });
+    // A new identity triggers the reset, which throws; saveCredentials must still resolve.
+    await saveCredentials({ baseUrl: "https://c.gini-relay.lilaclabs.ai", token: "tok3" });
+    expect(resetPushSpy).toHaveBeenCalledTimes(1);
   });
 });

@@ -270,31 +270,35 @@ export default function PairScreen() {
     void start(origin);
   }, [linkInput, start]);
 
-  const cancel = useCallback(async () => {
-    // Bump the generation so any in-flight poll/claim from this attempt bails.
-    const myGen = ++genRef.current;
-    stopPolling();
+  const cancel = useCallback(() => {
+    // Move to the terminal state and drop the refs SYNCHRONOUSLY, before the
+    // network round-trip: instant cancelled feedback, and no queued transition can
+    // claim once the generation is bumped and the refs are gone. The server cancel
+    // is best-effort (the request may already be terminal).
     const client = clientRef.current;
     const request = requestRef.current;
-    if (client && request) {
-      try {
-        await client.cancel(request.id, request.secret);
-      } catch {
-        // Already terminal server-side — we surface the cancelled state anyway.
-      }
-    }
-    // Match the gen discipline of every other post-await write: if a new attempt
-    // started during the cancel round-trip, don't clobber it back to "cancelled".
-    if (genRef.current !== myGen) return;
+    genRef.current += 1;
+    stopPolling();
+    clientRef.current = null;
+    requestRef.current = null;
     setPhase("cancelled");
+    if (client && request) {
+      void client.cancel(request.id, request.secret).catch(() => {});
+    }
   }, [stopPolling]);
 
   const retry = useCallback(() => {
     // A manual entry returns to the editable input (the typed link is preserved)
     // so a well-formed-but-wrong link can be corrected instead of retried forever.
-    // A deep-link entry has no input to return to, so it re-runs the same origin.
     if (!relayParam) {
       setPhase("input");
+      return;
+    }
+    // Re-apply the gateway-switch gate so "Not now" → "Try again" can't bypass the
+    // confirmation when the link's host differs from the stored gateway.
+    if (isGatewaySwitch(readCachedCredentials()?.baseUrl, relayParam)) {
+      setPendingOrigin(relayParam);
+      setPhase("confirm");
       return;
     }
     void start(relayParam);
@@ -375,7 +379,7 @@ export default function PairScreen() {
 
               <StatusRow phase={phase} error={error} />
 
-              <Controls phase={phase} onRetry={retry} onCancel={() => void cancel()} />
+              <Controls phase={phase} onRetry={retry} onCancel={cancel} />
             </>
           )}
         </ScrollView>

@@ -136,8 +136,33 @@ export async function saveCredentials(creds: AuthCredentials): Promise<void> {
     baseUrl: normalizeBaseUrl(creds.baseUrl),
     token: creds.token.trim()
   };
+  // Detect a real credential SWAP (vs re-saving the same identity) before the
+  // broadcast updates `cached`, so we only reset push when the gateway/token
+  // actually changed.
+  const changed =
+    !cached || cached.baseUrl !== normalized.baseUrl || cached.token !== normalized.token;
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
   broadcast(normalized);
+  // On a swap (e.g. pairing a new relay gateway, or a new manual token), re-arm
+  // push registration so the device re-registers its APNs token against the NEW
+  // gateway. Without this the in-process "already registered" guard in push.ts
+  // would suppress re-registration and the new gateway would never receive a
+  // device token (badge/approval pushes silently break).
+  if (changed) resetPushRegistrationForSwap();
+}
+
+// Re-arm push registration after a credential swap. Lazy `require` (mirroring
+// tryDeregisterCachedDevice) keeps the auth → push import graph acyclic and lets
+// non-RN test/web bundles that never load push.ts skip this path entirely.
+function resetPushRegistrationForSwap(): void {
+  try {
+    const pushModule = require("./push") as {
+      resetRegistrationForCredentialSwap?: () => void;
+    };
+    pushModule.resetRegistrationForCredentialSwap?.();
+  } catch {
+    // require("./push") can throw in non-RN envs — best effort.
+  }
 }
 
 export async function clearCredentials(): Promise<void> {

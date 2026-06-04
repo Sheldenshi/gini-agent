@@ -64,6 +64,13 @@ link hasn't resolved yet. See ADR
 [device-pairing-auth.md](../docs/adr/device-pairing-auth.md) ("Native
 pairing client").
 
+A relay-paired session is a finite-lifetime credential (it inherits the
+relay session TTL, 30 days), so the app re-prompts for pairing once it
+expires — re-open the link to re-pair (a same-host re-pair skips the
+confirmation). The manual token from `gini status` does not expire.
+Opening a link for a *different* gateway than the one you're connected to
+asks you to confirm the switch first.
+
 ## Behavior
 
 - **Agents** is the home screen. Tapping an agent activates it on the
