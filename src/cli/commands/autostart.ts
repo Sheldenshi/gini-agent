@@ -14,6 +14,7 @@
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import type { CliContext } from "../context";
+import { parseInstance } from "../../paths";
 import { print } from "../output";
 import { flagValue } from "../args";
 import {
@@ -137,7 +138,13 @@ export async function autostart(ctx: CliContext): Promise<void> {
     return;
   }
 
-  const instance = ctx.config.instance;
+  // Resolve the instance NAME without materializing its state. Reading
+  // `ctx.config` would call loadConfig(), which scaffolds the full instance
+  // dir (config.json with a fresh token/port, logs, skills, …) as a side
+  // effect. autostart only operates on launchd services keyed by name and
+  // never reads config values, so a stray `autostart status|kick|disable
+  // --instance <typo>` must not conjure a phantom instance on disk.
+  const instance = parseInstance(ctx.rawArgs);
   // `--test-root <dir>` opts the resulting plists into a scratch state-root
   // (and matching log-root if specified). Used by GINI_AUTOSTART_E2E tests
   // so they can run against a private state dir without touching the

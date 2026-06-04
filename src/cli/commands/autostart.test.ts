@@ -9,7 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { labelForKind, plistPathFor, serviceTarget, type LaunchctlResult } from "../autostart";
 import { stopViaBootout } from "./autostart";
@@ -53,13 +53,27 @@ describe("gini autostart usage and platform gate", () => {
 
   // `kick` on a non-existent service must return a non-zero exit code (not
   // just ok:false in the JSON) so install.sh's `if … then` shell guard sees
-  // the failure.
-  test("kick on a not-loaded instance returns non-zero exit", () => {
+  // the failure. We scope it to a scratch state-root and assert kick does NOT
+  // scaffold the instance there: autostart resolves the instance name without
+  // reading config, so a kick against a never-enabled instance must leave no
+  // phantom dir behind (a regression would silently litter ~/.gini/instances).
+  test("kick on a not-loaded instance returns non-zero exit and scaffolds nothing", () => {
     if (process.platform !== "darwin") return; // platform gate prints macOS-only
-    const result = runCli(["autostart", "kick", "--instance", `kick-nonexistent-${tag()}`], {});
-    expect(result.status).not.toBe(0);
-    const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
-    expect(parsed.ok).toBe(false);
+    const instance = `kick-nonexistent-${tag()}`;
+    const scratch = makeScratch("kick");
+    try {
+      const result = runCli(
+        ["autostart", "kick", "--instance", instance, "--state-root", scratch.stateRoot, "--log-root", scratch.logRoot],
+        {}
+      );
+      expect(result.status).not.toBe(0);
+      const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+      expect(parsed.ok).toBe(false);
+      expect(existsSync(join(scratch.stateRoot, "instances", instance))).toBe(false);
+    } finally {
+      rmSync(scratch.stateRoot, { recursive: true, force: true });
+      rmSync(scratch.logRoot, { recursive: true, force: true });
+    }
   });
 });
 
