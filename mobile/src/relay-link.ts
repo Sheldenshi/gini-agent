@@ -16,6 +16,30 @@ export function isRelayHost(host: string): boolean {
   return lower === RELAY_DOMAIN || lower.endsWith(`.${RELAY_DOMAIN}`);
 }
 
+// Hosts the device-pairing handshake can run against. Mirrors the gateway's
+// native-pairing gate (relay OR loopback): pairing exists for the relay, where
+// copying a bearer token to the phone is hard. A gateway on the local network is
+// reached with the bearer token on the setup screen instead, so a LAN URL is not
+// pairable here — guiding the user to that is clearer than a server 403.
+export function isPairableHost(host: string): boolean {
+  if (isRelayHost(host)) return true;
+  const lower = host.toLowerCase();
+  // Strip the port without mangling IPv6: a bracketed `[::1]:port` keeps `[::1]`;
+  // a bare IPv6 `::1` (multiple colons, no brackets) is left intact; a plain
+  // `host:port` (single colon) drops the port.
+  const hostname = lower.startsWith("[")
+    ? lower.slice(0, lower.indexOf("]") + 1)
+    : lower.includes(":") && lower.indexOf(":") === lower.lastIndexOf(":")
+      ? lower.slice(0, lower.indexOf(":"))
+      : lower;
+  return (
+    hostname === "localhost"
+    || hostname === "127.0.0.1"
+    || hostname === "::1"
+    || hostname === "[::1]"
+  );
+}
+
 // Map an incoming deep-link URL to an in-app route. An https link to a relay
 // host becomes `/pair?relay=<https origin>` so the pair screen knows which
 // gateway to pair with (the host identifies the gateway; the link's own path is

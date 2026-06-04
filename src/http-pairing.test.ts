@@ -794,6 +794,21 @@ describe("pairing routes — native client (mobile)", () => {
     const { claimed } = await pairedSession("pair-native-nobodytoken");
     expect((await claimed.json()).token).toBeUndefined();
   });
+
+  test("a request with an Origin is never native even with the opt-in and no Sec-Fetch", async () => {
+    // A pre-Fetch-Metadata browser (e.g. Safari < 16.4 / an iOS-15 WebView) sends
+    // no Sec-Fetch but DOES send Origin on a POST. It must NOT be classified
+    // native — otherwise an XSS on /pair could exfiltrate the in-body secret.
+    const { handler } = makeHandler("pair-native-originguard");
+    const relay = RELAY("pair-native-originguard");
+    const res = await pair(handler, "/api/pairing/request", {
+      method: "POST", host: relay, origin: `https://${relay}`, pairClient: "native", body: {}
+    });
+    expect(res.status).toBe(201); // passes webBoundRequestAllowed as a same-origin browser POST
+    // ...but it's the browser shape: the binding secret is cookie-only, not in the body.
+    expect((await res.json()).bindSecret).toBeUndefined();
+    expect(setCookieValue(res, "gini_pair")).toBeTruthy();
+  });
 });
 
 describe("apple-app-site-association", () => {

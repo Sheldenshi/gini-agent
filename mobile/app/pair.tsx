@@ -13,6 +13,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { normalizeBaseUrl, saveCredentials } from "@/src/auth";
 import { createPairingClient, PairingError, type PairingClient } from "@/src/pairing";
+import { isPairableHost } from "@/src/relay-link";
 import { family, theme } from "@/src/theme";
 
 // The device-side pairing screen — the mirror of web/src/app/pair/page.tsx for
@@ -57,8 +58,10 @@ export default function PairScreen() {
   // superseded attempt (e.g. cancel → retry while a poll is mid-flight) can never
   // clobber the current attempt's state or pair with mismatched refs.
   const genRef = useRef(0);
-  // Exactly-once mount guard (Expo Router can re-run effects).
-  const startedRef = useRef(false);
+  // The relay origin auto-start has already fired for. Tracking the value (not a
+  // boolean) means a second deep link to a DIFFERENT relay while mounted restarts
+  // the handshake against it, while a re-fire for the same relay stays once-only.
+  const startedRef = useRef<string | null>(null);
 
   const stopPolling = useCallback(() => {
     if (pollRef.current !== null) {
@@ -107,8 +110,8 @@ export default function PairScreen() {
   // Auto-start when a relay origin arrived via the deep link. Guarded so it runs
   // once even if the effect re-fires.
   useEffect(() => {
-    if (!relayParam || startedRef.current) return;
-    startedRef.current = true;
+    if (!relayParam || startedRef.current === relayParam) return;
+    startedRef.current = relayParam;
     void start(relayParam);
   }, [relayParam, start]);
 
@@ -193,6 +196,14 @@ export default function PairScreen() {
       origin = normalizeBaseUrl(linkInput);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Enter a valid Gini link.");
+      return;
+    }
+    // Pairing runs only against a relay link (or loopback in dev) — the gateway's
+    // native gate refuses LAN hosts. Guide the user instead of letting create 403.
+    if (!isPairableHost(new URL(origin).host)) {
+      setError(
+        "Pairing needs a Gini relay link (…gini-relay.lilaclabs.ai). For a gateway on your own network, use its bearer token on the previous screen."
+      );
       return;
     }
     void start(origin);

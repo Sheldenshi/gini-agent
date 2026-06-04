@@ -36,9 +36,9 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 │   Next.js     │                  │  Expo mobile    │                  │   CLI          │
 │   BFF + UI    │                  │  app            │                  │   scripts      │
 │               │                  │                 │                  │   MCP clients  │
-│   one per     │                  │  user pastes    │                  │                │
-│   instance    │                  │  URL + token,   │                  │  direct API    │
-│   localhost   │                  │  AsyncStorage   │                  │  client        │
+│   one per     │                  │  pair via relay │                  │                │
+│   instance    │                  │  link or paste  │                  │  direct API    │
+│   localhost   │                  │  URL + token    │                  │  client        │
 └───────┬───────┘                  └─────────────────┘                  └────────────────┘
         │
         │ HTML / JS / SSE

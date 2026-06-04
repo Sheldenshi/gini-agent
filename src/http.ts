@@ -2419,6 +2419,13 @@ function isNativePairingClient(request: Request, host: string): boolean {
   ) {
     return false;
   }
+  // Also require no Origin. Sec-Fetch absence alone is not enough: a pre-16.4
+  // Safari or an iOS-15 WKWebView/SFSafariViewController sends NO Sec-Fetch yet
+  // DOES send Origin on an unsafe POST (Origin-on-same-origin-POST shipped years
+  // before Fetch Metadata), so such a browser could otherwise forge native mode
+  // and an XSS on /pair could exfiltrate the in-body secret/token. The native
+  // client (Expo/RN fetch) sends no Origin, so this never affects it.
+  if (request.headers.has("origin")) return false;
   return isRelayHost(host) || isLoopbackHost(host);
 }
 

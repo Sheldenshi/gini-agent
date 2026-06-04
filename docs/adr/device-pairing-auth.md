@@ -190,14 +190,21 @@ A **verified native client** is therefore exempted, gated by
 
 - the explicit opt-in header `X-Gini-Pair-Client: native`, **and**
 - the **absence of every `Sec-Fetch-*` header**, **and**
+- the **absence of an `Origin` header**, **and**
 - a trusted front (relay or loopback Host).
 
-The `Sec-Fetch-*` absence is the security anchor: browsers always send those on
+`Sec-Fetch-*` absence is the primary anchor: modern browsers always send those on
 `fetch`/XHR and page JS **cannot set or strip them** (forbidden header names), so
-their absence cannot be forged from a browser — an XSS on `/pair` can never make
-the gateway treat the page as native. The opt-in header additionally excludes a
-hypothetical pre-`Sec-Fetch` browser that merely lacks the headers. This single
-predicate authorises all three native deviations:
+their absence cannot be forged from a current browser. But Fetch Metadata only
+shipped in Safari 16.4 (March 2023), so a pre-16.4 Safari or an iOS-15
+WKWebView/SFSafariViewController sends NO `Sec-Fetch-*` yet still sends `Origin`
+on an unsafe POST (Origin-on-same-origin-POST predates Fetch Metadata by years).
+Requiring `Origin` to also be absent closes that gap: every such browser emits
+`Origin`, while the native client (Expo/React Native fetch, which sets no
+`Origin`) does not — so an XSS on `/pair` in any browser, old or new, can never
+make the gateway treat the page as native and leak the in-body secret/token. The
+opt-in header is the explicit-intent signal. Together this predicate authorises
+all three native deviations:
 
 - **CSRF exemption.** A native (no-Origin) `POST` to the device routes is allowed
   even though `webBoundRequestAllowed` returns false — a non-browser is not a

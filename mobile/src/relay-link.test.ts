@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isRelayHost, RELAY_DOMAIN, relayPairingRedirect } from "./relay-link";
+import { isPairableHost, isRelayHost, RELAY_DOMAIN, relayPairingRedirect } from "./relay-link";
 
 describe("isRelayHost", () => {
   test.each([
@@ -12,6 +12,24 @@ describe("isRelayHost", () => {
     ["", false]
   ])("%p -> %p", (host, expected) => {
     expect(isRelayHost(host)).toBe(expected);
+  });
+});
+
+describe("isPairableHost", () => {
+  test.each([
+    [`abc.${RELAY_DOMAIN}`, true],
+    [RELAY_DOMAIN, true],
+    ["localhost", true],
+    ["localhost:8081", true],
+    ["127.0.0.1", true],
+    ["127.0.0.1:7351", true],
+    ["::1", true],
+    ["[::1]:7351", true],
+    ["192.168.1.42:7337", false], // LAN host — reachable via token paste, not pairing
+    ["10.0.0.5", false],
+    ["example.com", false]
+  ])("%p -> %p", (host, expected) => {
+    expect(isPairableHost(host)).toBe(expected);
   });
 });
 
