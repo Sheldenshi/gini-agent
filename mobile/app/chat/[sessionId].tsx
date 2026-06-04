@@ -405,18 +405,39 @@ export default function ChatDetailScreen() {
     }
   };
 
+  // Re-entrancy guard for the document picker. expo-document-picker rejects
+  // with "Different document picking in progress" if getDocumentAsync is
+  // called while a prior call is still settling — which happens when the
+  // first present stalls behind the dismissing attachment sheet.
+  const pickingFileRef = useRef(false);
+
   // Files tile: the OS document picker hands back arbitrary files (PDF,
   // CSV, logs, code). Each is uploaded through the same MIME-agnostic
   // /api/uploads path images use; the tray renders a file chip while it
   // uploads and until send. A file that happens to be an image is tagged
   // "image" so it still gets a thumbnail.
   const pickFile = async (): Promise<void> => {
-    const result = await DocumentPicker.getDocumentAsync({
-      multiple: true,
-      copyToCacheDirectory: true
-    });
-    if (result.canceled) return;
-    for (const asset of result.assets) void beginFileUpload(asset);
+    if (pickingFileRef.current) return;
+    pickingFileRef.current = true;
+    try {
+      // Let the attachment sheet's <Modal> finish tearing down before the
+      // picker's native VC presents. Presenting while the modal is still
+      // dismissing is the iOS "present while dismissing" hazard: the picker
+      // never appears and the next tap rejects with "already in progress".
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const result = await DocumentPicker.getDocumentAsync({
+        multiple: true,
+        copyToCacheDirectory: true
+      });
+      if (result.canceled) return;
+      for (const asset of result.assets) void beginFileUpload(asset);
+    } catch (err) {
+      // Surface a tap that couldn't open the picker as a calm alert instead
+      // of an uncaught promise rejection (the red error overlay).
+      Alert.alert("Couldn't open Files", err instanceof Error ? err.message : String(err));
+    } finally {
+      pickingFileRef.current = false;
+    }
   };
 
   const beginFileUpload = async (
