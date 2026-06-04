@@ -23,11 +23,11 @@ Gini drives this in chat; you only act at the browser steps.
 
 Your original request then resumes automatically.
 
-## First-time Google Cloud users
+## First-time Google Cloud users — no credit card needed
 
-If you've never opened Google Cloud before, the project step (4) stops with **"Callers must accept Terms of Service."** Your Google login works, but the account has never initialized Google Cloud.
+You don't need a paid Google Workspace or a credit card. The Workspace APIs are free, so the project Gini creates for you has no billing attached. If you've never opened Google Cloud, its console pushes a prominent *"Start your free trial — add a card"* banner during the OAuth-client step (Step 5) — **ignore it.** You can configure the consent screen and create the OAuth client without starting the trial or entering any payment method.
 
-To fix it, open **<https://console.cloud.google.com/>**, pick your country, and accept the Terms of Service. **This is free** — you do **not** need to start the free trial or add a credit card, even though Google offers that prominently. Once you've accepted, tell Gini **done** and it continues.
+The only places you touch the browser are Step 5 (the OAuth consent screen and client) and the two sign-in pop-ups. Project creation and API enablement happen automatically — on a brand-new account too.
 
 ## Work or school accounts
 
@@ -46,7 +46,7 @@ Once setup finishes, just ask — "what's on my calendar today?", "share that do
 
 ## Troubleshooting
 
-- **"Callers must accept Terms of Service"** — first-time Cloud account; accept the terms in the console (see above). Free, no card.
+- **"Callers must accept Terms of Service"** (rare) — open <https://console.cloud.google.com/> once, accept the free terms (no card), then ask Gini to retry.
 - **"You do not have permission to create projects"** — managed-account restriction; use an existing project or a personal account (see above).
 - **Rate-limited project creation** — Google caps how many projects you can create in a short window; wait ~10 minutes and retry, or point Gini at an existing project.
 - **"invalid_client" at the consent step** — the Client ID or Secret was mistyped; redo the Connect form.

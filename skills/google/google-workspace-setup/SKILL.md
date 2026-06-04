@@ -5,7 +5,7 @@ license: MIT
 compatibility: "macOS and Linux. Requires Homebrew (or another package manager) and a Google account."
 metadata:
   gini:
-    version: 3.6.0
+    version: 3.7.0
     author: Gini
     platforms: [macos, linux]
     prerequisites:
@@ -20,9 +20,11 @@ The OAuth client lives in the user's own GCP project. The Client ID and Client S
 
 This skill is idempotent — re-running it re-verifies the install and lets the user widen scopes.
 
+**Provisioning vs signing in.** The work splits in two: **provisioning** (install, `gcloud auth login`, project, APIs, `request_connector`) runs **once**, ever; **signing in** (`gws auth login`) runs again whenever the user's `gws` session expires. `gcloud` is *only* ever needed for provisioning — never for a re-auth. Step 0 decides which case you're in.
+
 ## The Flow
 
-This is the **exact sequence** the user wants. Do not branch into shortcuts, do not pre-ask whether they have an existing OAuth client, do not list completed actions retrospectively. Status messages are action-oriented: what the user must do *next*.
+This is the **exact first-time sequence** (Step 0 short-circuits the re-auth case before you reach it). Within the first-time flow do not branch into shortcuts, do not pre-ask whether they have an existing OAuth client, do not list completed actions retrospectively. Status messages are action-oriented: what the user must do *next*.
 
 1. The user asks Gini to do a Workspace thing (read mail, check calendar, share a Drive file, etc.).
 2. Confirm setup with the user.
@@ -32,6 +34,13 @@ This is the **exact sequence** the user wants. Do not branch into shortcuts, do 
 6. Send a single chat bubble with the last-step instructions (two Cloud Console URLs) and call `request_connector` — the inline form renders below the bubble.
 7. After the user pastes the credentials and clicks **Save**, run `gws auth login`, which pops up the user's default browser for OAuth consent.
 8. After they sign in, the original ask resumes.
+
+## Step 0 — First-time or re-auth?
+
+Before anything else, call `list_connectors` and look for a connector named `google-workspace-oauth`.
+
+- **It exists** → the OAuth client is already provisioned and only the user's `gws` session expired. This is a **re-auth**, not setup. Ask once ("Your Google sign-in expired — want me to sign you back in?") and on yes go **straight to Step 6** (`gws auth login`), then Step 8 (smoke test). Do **not** run `gcloud`, create a project, or call `request_connector` — provisioning already happened and none of it is needed again. (Edge case: if `gws` is not on `$PATH`, run Step 2's install first, then Step 6. If `gws auth login` fails with `invalid_client`, the stored client is broken — fall through to the full first-time flow to re-provision it.)
+- **It does not exist** → true first-time setup. Continue to Step 1.
 
 ## Step 1 — Confirm setup
 
@@ -136,12 +145,6 @@ gcloud projects create gini-workspace-<suffix> --name="Gini Workspace"
 If even that ID is taken AND no DELETE_REQUESTED match was found in 4b (rare — only when a different user with the same email local-part already claimed it globally), append a 4-char random tiebreaker. `<PROJECT_ID>` is whichever ID succeeded.
 
 If `gcloud projects create` errors with `RATE_LIMIT_EXCEEDED` for `cloudresourcemanager.googleapis.com.write_requests`, the user has burned through Google's per-account project-create quota (usually from repeated testing). Surface the error verbatim and ask: "Google is rate-limiting project creates; the quota typically clears in ~10 minutes. Want to wait and retry, or do you have an existing Cloud project I can use? Reply with a project ID or 'wait'." Do not loop the create call.
-
-**First-time Google Cloud accounts.** If `gcloud projects create` errors with `FAILED_PRECONDITION` and a message like `Callers must accept Terms of Service`, the signed-in account has a working Google login but has never initialized Google Cloud, so it hasn't accepted the Cloud Terms of Service. There is no CLI command to accept them — it happens once in the browser, and it is **free**: the Workspace APIs don't require billing, so the user does **not** need to start the free trial or put a card on file (Google's console pushes that trial prominently, but we don't need it). Send one chat bubble and wait for a reply:
-
-> **One-time setup.** Open https://console.cloud.google.com/, pick your country, and accept the Terms of Service. You do **not** need to start the free trial or add a credit card — the Google Workspace APIs are free. Reply **done** once you've accepted.
-
-When the user replies, re-run the same `gcloud projects create`. Do not loop the create before they confirm, and never try to accept the terms on their behalf.
 
 **Organization-restricted accounts.** If create instead errors with `PERMISSION_DENIED` and a message like `You do not have permission to create projects`, the account belongs to an organization (common on managed `@company` Google Workspace accounts) whose policy reserves project creation for admins. Accepting the Terms of Service will not change this. Surface the error verbatim and ask: "Your Google account can't create Cloud projects — your Workspace admin restricts that. Reply with an existing Cloud project ID I should use, or set Gini up with a personal @gmail.com account instead." Take a project ID as the new `<PROJECT_ID>` and resume from `projects describe` in 4d.
 
@@ -329,7 +332,7 @@ If that returns JSON without an auth error, the setup is complete. Resume the us
 
 ## Rules
 
-1. Walk this skill end-to-end the first time. Do not skip to `request_connector` or `gws auth login` without the install + project + APIs in place.
+1. Walk this skill end-to-end on **first-time** setup. Do not skip to `request_connector` or `gws auth login` without the install + project + APIs in place. The one exception is the **re-auth** path (Step 0): when the `google-workspace-oauth` connector already exists, `gws auth login` alone is the whole job — `gcloud`, project creation, and `request_connector` are provisioning-only and must not re-run.
 2. **Sign-in is a human-in-the-loop step.** Never attempt to type the user's email or password. `gcloud auth login` and `gws auth login` both open the default browser — wait for the command to return.
 3. **Capture credentials through the inline form, not files.** Always use `request_connector { provider: "google-oauth-desktop" }`. Never ask the user for a path to `client_secret.json`, never write a JSON file under `~/.config/gws/`, and never `cat` or echo the credentials back into chat.
 4. **Enable all seven Workspace APIs in Step 4 regardless of which product triggered setup.** One `gcloud services enable` call covers them all; this lets the user pivot to another product later without re-running setup.
