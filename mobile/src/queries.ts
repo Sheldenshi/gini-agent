@@ -14,8 +14,11 @@ import type {
   AgentsResponse,
   ChatBlock,
   ChatSession,
+  InboxThreadSummary,
+  JobRecord,
   RuntimeStatus,
-  Task
+  Task,
+  ThreadSummary
 } from "./types";
 
 // Web parity: chat task statuses where partial text is no longer arriving.
@@ -137,6 +140,51 @@ export function useChats(agentId: string | null) {
   });
 }
 
+// The single canonical chat session for an agent (one-chat-per-agent IA).
+// GET /api/agents/:id/chat lazily resolves or creates it, so the result
+// is stable across calls for the same agent. The Channels list taps the
+// agent row → this resolves the session id → push /chat/[sessionId].
+export function useAgentChat(agentId: string | null) {
+  return useQuery<ChatSession>({
+    queryKey: ["agent-chat", agentId],
+    queryFn: () => api<ChatSession>(`/agents/${encodeURIComponent(agentId ?? "")}/chat`),
+    enabled: Boolean(agentId),
+    // The resolver is idempotent and the title/preview can change as the
+    // agent talks; a slow poll keeps the Channels row preview fresh.
+    refetchInterval: 30_000
+  });
+}
+
+// All recurring-job channels for the instance. These are the chat
+// sessions tagged `kind: "channel"` (always also `origin: "job"`) — the
+// Channels screen renders them under "Recurring Jobs". Sorted newest
+// activity first so the most recently fired channel floats to the top.
+export function useChannels() {
+  return useQuery<ChatSession[], Error, ChatSession[]>({
+    queryKey: ["channels"],
+    queryFn: () => api<ChatSession[]>("/chat"),
+    refetchInterval: 30_000,
+    select: (sessions) =>
+      sessions
+        .filter((s) => s.kind === "channel" || s.origin === "job")
+        .sort((a, b) =>
+          (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt)
+        )
+  });
+}
+
+// Job records for the active agent. The Channels screen pairs each job
+// with its delivery channel (job.chatSessionId) so the "Recurring Jobs"
+// rows can show the schedule + next-run alongside the channel session.
+export function useJobs(agentId: string | null) {
+  return useQuery<JobRecord[]>({
+    queryKey: ["jobs", agentId],
+    queryFn: () => api<JobRecord[]>(`/jobs?agentId=${encodeURIComponent(agentId ?? "")}`),
+    enabled: Boolean(agentId),
+    refetchInterval: 30_000
+  });
+}
+
 // Phase labels that mean "no task in flight". Anything else (Thinking,
 // Working: <tool>, Waiting for approval, …) keeps the in-flight flag
 // raised so the polling cadence stays brisk and the composer's busy
@@ -233,7 +281,20 @@ export function isTaskInFlight(blocks: ChatBlock[]): boolean {
 // derivation, no normalization; the renderer is exhaustive over the
 // block discriminated union, and the session field is just the wire
 // shape from the gateway.
-export function useChatStream(sessionId: string | null): {
+//
+// `threadId` routes blocks by thread membership without an API-shape
+// change — the gateway streams every block for the session over one
+// /stream connection, each tagged with an optional `threadId`:
+//   - `threadId == null` (main chat): seed from /blocks and keep only
+//     blocks with no `threadId` so threaded replies stay out of the
+//     main transcript.
+//   - `threadId` set (Thread View): seed from /threads/:id/blocks and
+//     keep only blocks whose `threadId` matches, so the thread stream
+//     updates live off the same SSE the main chat uses.
+export function useChatStream(
+  sessionId: string | null,
+  threadId?: string | null
+): {
   blocks: ChatBlock[] | undefined;
   session: ChatSession | undefined;
   isPending: boolean;
@@ -322,6 +383,18 @@ export function useChatStream(sessionId: string | null): {
     const upsert = (block: ChatBlock, wireEventId: string | null): void => {
       if (dataRef.current.forSessionId !== sessionId) return;
       if (block.sessionId !== sessionId) return;
+      // Route by thread membership. The SSE carries every block for the
+      // session; the main chat (threadId == null) drops blocks tagged
+      // with a thread, and a Thread View keeps only its own thread's
+      // blocks. The wire cursor still advances on dropped frames below.
+      const blockThread = block.threadId ?? null;
+      const wantThread = threadId ?? null;
+      if (blockThread !== wantThread) {
+        // Keep the resume cursor moving so a reconnect doesn't replay
+        // blocks we've already seen-and-skipped for the other view.
+        if (wireEventId) lastSeenIdRef.current = wireEventId;
+        return;
+      }
       const current = dataRef.current.blocks ?? [];
       const idx = current.findIndex((b) => b.id === block.id);
       const next =
@@ -465,10 +538,21 @@ export function useChatStream(sessionId: string | null): {
     // any duplicates.
     (async () => {
       try {
-        const [blocks, session] = await Promise.all([
-          api<ChatBlock[]>(`/chat/${sessionId}/blocks`),
+        // A Thread View seeds only its thread's persisted blocks; the
+        // main chat seeds the full /blocks list and the upsert filter
+        // drops any threaded rows on merge.
+        const blocksPath = threadId
+          ? `/chat/${sessionId}/threads/${threadId}/blocks`
+          : `/chat/${sessionId}/blocks`;
+        const [rawBlocks, session] = await Promise.all([
+          api<ChatBlock[]>(blocksPath),
           api<ChatSession>(`/chat/${sessionId}`)
         ]);
+        // For the main chat the seed endpoint returns every block, so
+        // strip threaded rows here to match the SSE upsert filter.
+        const blocks = threadId
+          ? rawBlocks
+          : rawBlocks.filter((b) => (b.threadId ?? null) === null);
         if (cancelled) return;
         // Merge by id rather than overwrite. If the AppState handler or
         // any other path opened a stream while the seed was in flight,
@@ -534,7 +618,7 @@ export function useChatStream(sessionId: string | null): {
       closeStream();
       if (appStateSub) appStateSub.remove();
     };
-  }, [sessionId]);
+  }, [sessionId, threadId]);
 
   // Gate the rendered value on the loaded-for sessionId. Between the
   // moment `sessionId` flips (chat A → chat B) and the reset effect
@@ -550,6 +634,72 @@ export function useChatStream(sessionId: string | null): {
     Boolean(sessionId) && (!matches || state.blocks === undefined);
 
   return { blocks, session, isPending, error };
+}
+
+// Thread summaries for one session — one row per distinct thread, used by
+// the chat's Threads tab and to attach inline "N replies" chips to the
+// main-chat assistant blocks they branched from. Polls so a reply landing
+// on another device bumps the count.
+export function useThreads(sessionId: string | null) {
+  return useQuery<ThreadSummary[]>({
+    queryKey: ["threads", sessionId],
+    queryFn: () => api<ThreadSummary[]>(`/chat/${sessionId}/threads`),
+    enabled: Boolean(sessionId),
+    refetchInterval: 5000
+  });
+}
+
+// Cross-agent thread inbox (GET /api/threads). The gateway returns the
+// full list newest-first with the owning agent's name joined in; the
+// `unread` filter is applied client-side (server read-state is
+// per-device, so the server can't pre-filter reliably). For now we pass
+// the filter through to the query key for cache separation and let the
+// caller decide what "unread" means against its local badge state.
+export function useThreadsInbox(filter: "all" | "unread") {
+  return useQuery<InboxThreadSummary[]>({
+    queryKey: ["threads-inbox", filter],
+    queryFn: () => api<InboxThreadSummary[]>(`/threads?filter=${filter}`),
+    refetchInterval: 5000
+  });
+}
+
+export interface ThreadReplyInput {
+  content: string;
+  images?: UploadRef[];
+  audio?: { id: string; mimeType: string; size: number; durationMs?: number };
+  // When true the gateway also mirrors the reply (and the agent's
+  // response) into the main chat — wired to the composer's "Also send to
+  // main chat" checkbox.
+  alsoToMain?: boolean;
+}
+
+// POST a reply into an existing thread. The gateway threads the whole
+// resulting turn (decision E: a user reply in a thread wins, the response
+// stays in the thread). Invalidates the per-session thread summaries so
+// the inline chip's reply count refreshes promptly.
+export function useReplyToThread(sessionId: string | null, threadId: string | null) {
+  const qc = useQueryClient();
+  return useMutation<
+    { sessionId: string; threadId: string; runId: string; taskId: string; status: string },
+    Error,
+    ThreadReplyInput
+  >({
+    mutationFn: ({ content, images, audio, alsoToMain }: ThreadReplyInput) => {
+      if (!sessionId || !threadId) throw new Error("No thread selected");
+      const payload: Record<string, unknown> = { content };
+      if (images && images.length > 0) payload.images = images;
+      if (audio) payload.audio = audio;
+      if (alsoToMain) payload.alsoToMain = true;
+      return api(`/chat/${sessionId}/threads/${threadId}/messages`, {
+        method: "POST",
+        body: JSON.stringify(payload)
+      });
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["threads", sessionId] });
+      qc.invalidateQueries({ queryKey: ["threads-inbox"] });
+    }
+  });
 }
 
 // POST /api/chat always creates the chat under the runtime's currently
