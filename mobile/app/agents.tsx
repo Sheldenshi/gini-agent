@@ -20,6 +20,7 @@ import ReanimatedSwipeable, {
 } from "react-native-gesture-handler/ReanimatedSwipeable";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { ApiError } from "@/src/api";
+import { clearCredentials } from "@/src/auth";
 import { chatListTime } from "@/src/format";
 import {
   useAgents,
@@ -62,7 +63,13 @@ export default function AgentsScreen() {
   const unauthorized =
     agents.error instanceof ApiError && agents.error.status === 401;
   useEffect(() => {
-    if (unauthorized) router.replace("/setup");
+    // A 401 means the stored token is dead (revoked/expired). Drop it before
+    // redirecting so the next cold start goes straight to /setup instead of
+    // optimistically routing here, 401-ing, and bouncing — the cold-start flash.
+    if (unauthorized) {
+      void clearCredentials();
+      router.replace("/setup");
+    }
   }, [unauthorized]);
 
   const data = agents.data;
@@ -107,7 +114,10 @@ export default function AgentsScreen() {
   const chatsUnauthorized =
     chats.error instanceof ApiError && chats.error.status === 401;
   useEffect(() => {
-    if (chatsUnauthorized) router.replace("/setup");
+    if (chatsUnauthorized) {
+      void clearCredentials();
+      router.replace("/setup");
+    }
   }, [chatsUnauthorized]);
 
   const orderedChats = useMemo<ChatSession[]>(() => {
