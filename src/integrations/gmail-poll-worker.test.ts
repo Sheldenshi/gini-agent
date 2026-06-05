@@ -412,7 +412,9 @@ describe("runGmailPollTick", () => {
     let triggered = 0;
     // A first-run bare watch on an enormous unread inbox: the window is
     // truncated (page cap hit) and only the newest page-cap worth is listed.
-    // Seeding must NOT enumerate the backlog — one get for the newest id only.
+    // Seeding must NOT enumerate the backlog — it fetches the newest id, then
+    // probes only contiguous same-second siblings (one extra get finds the
+    // older tail's different second and stops). No full-backlog enumeration.
     let getCount = 0;
     const newest = "huge-newest";
     const deps: GmailPollDeps = {
@@ -429,7 +431,10 @@ describe("runGmailPollTick", () => {
         if (joined.includes("messages get")) {
           getCount += 1;
           const id = getArgId(joined)!;
-          return metadataResponse({ id, internalDate: "8000", from: "alice@x.com", subject: "s" });
+          // The newest sits in second 8; the tail is an older second so the
+          // same-second sibling scan stops after the first tail probe.
+          const internalDate = id === newest ? "8000" : "7000";
+          return metadataResponse({ id, internalDate, from: "alice@x.com", subject: "s" });
         }
         return PREAMBLE + "{}";
       }
@@ -439,8 +444,9 @@ describe("runGmailPollTick", () => {
     // (0 turns), not the notice path.
     expect(report.seeded).toBe(1);
     expect(triggered).toBe(0);
-    // Exactly one metadata fetch — the newest id, no backlog enumeration.
-    expect(getCount).toBe(1);
+    // Two metadata fetches: the newest plus one older-tail probe that finds a
+    // different second and stops — bounded, not a full backlog enumeration.
+    expect(getCount).toBe(2);
     const live = readState(config.instance).emailWatchers.find((w) => w.id === watcher.id);
     expect(live?.lastSeenInternalDate).toBe("8000");
     expect(isEmailSeen(config.instance, watcher.id, newest)).toBe(true);
@@ -677,6 +683,146 @@ describe("runGmailPollTick", () => {
     const r2 = await runGmailPollTick(config, deps);
     expect(r2.triggered).toBe(0);
     expect(prompts).toHaveLength(0);
+  });
+
+  test("truncated window with a bad newest metadata-get still advances the cursor and notices at most once", async () => {
+    const config = buildConfig("worker-truncated-badget");
+    const watcher = await seedWatcher(config, "alice@x.com");
+    await runGmailPollTick(config, stubSpawn([], {}));
+    const { updateEmailWatcher } = await import("../state");
+    await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
+
+    // A persistently truncated window whose newest id never changes and whose
+    // metadata-get returns {} (no internalDate) — models a transient bad read
+    // that, without the fallback, would leave the cursor stuck and re-fire the
+    // notice every tick. The stub deliberately ignores `after:` so the same
+    // window re-lists, isolating the gate + cursor-fallback as the fix.
+    const newestId = "stuck-newest";
+    const deps: GmailPollDeps = {
+      sessionStatus: async () => ({ installed: true, clientConfigured: true, signedIn: true, message: "ok" }),
+      resolveSelfEmail: async () => "me@example.com",
+      gwsSpawn: async (args: string[]) => {
+        const joined = args.join(" ");
+        if (joined.includes("messages list")) {
+          const tail = Array.from({ length: 20 }, (_, i) => [`s${i}`]);
+          return pagedListResponse([[newestId], ...tail], true);
+        }
+        if (joined.includes("messages get")) return PREAMBLE + "{}"; // no internalDate
+        return PREAMBLE + "{}";
+      }
+    };
+    const prompts: string[] = [];
+    const spawnTurn = async (_w: EmailWatcherRecord, prompt: string) => { prompts.push(prompt); };
+
+    // Tick 1: notice fires once; cursor advances via the Date.now() fallback.
+    const r1 = await runGmailPollTick(config, { ...deps, spawnTurn });
+    expect(r1.triggered).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain("[automated email-watch notice]");
+    const afterT1 = readState(config.instance).emailWatchers.find((w) => w.id === watcher.id);
+    expect(Number(afterT1?.lastSeenInternalDate)).toBeGreaterThan(1000); // cursor moved off the stuck "1000"
+
+    // Tick 2: the SAME truncated window with the SAME newest id => the gate
+    // (newest already seen) suppresses a second notice. No spam.
+    prompts.length = 0;
+    const r2 = await runGmailPollTick(config, { ...deps, spawnTurn });
+    expect(r2.triggered).toBe(0);
+    expect(prompts).toHaveLength(0);
+  });
+
+  test("two consecutive truncated ticks at the same newest id notice at most once", async () => {
+    const config = buildConfig("worker-truncated-samenewest");
+    const watcher = await seedWatcher(config, "alice@x.com");
+    await runGmailPollTick(config, stubSpawn([], {}));
+    const { updateEmailWatcher } = await import("../state");
+    await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
+
+    // Truncated window, newest id stable across ticks, with a VALID internalDate
+    // this time. The stub ignores `after:` so the same window re-lists, so the
+    // only thing keeping tick 2 silent is the isEmailSeen gate.
+    const newestId = "valid-newest";
+    const deps: GmailPollDeps = {
+      sessionStatus: async () => ({ installed: true, clientConfigured: true, signedIn: true, message: "ok" }),
+      resolveSelfEmail: async () => "me@example.com",
+      gwsSpawn: async (args: string[]) => {
+        const joined = args.join(" ");
+        if (joined.includes("messages list")) {
+          const tail = Array.from({ length: 20 }, (_, i) => [`v${i}`]);
+          return pagedListResponse([[newestId], ...tail], true);
+        }
+        if (joined.includes("messages get")) {
+          const id = getArgId(joined)!;
+          return metadataResponse({ id, internalDate: "13000", from: "alice@x.com", subject: "s" });
+        }
+        return PREAMBLE + "{}";
+      }
+    };
+    let notices = 0;
+    const spawnTurn = async () => { notices += 1; };
+
+    await runGmailPollTick(config, { ...deps, spawnTurn });
+    await runGmailPollTick(config, { ...deps, spawnTurn });
+    expect(notices).toBe(1);
+    expect(isEmailSeen(config.instance, watcher.id, newestId)).toBe(true);
+  });
+
+  test("seeding marks same-second siblings so the inclusive after: boundary does not re-draft them", async () => {
+    const config = buildConfig("worker-seed-samesecond");
+    const watcher = await seedWatcher(config, "alice@x.com");
+
+    // Two pre-existing messages in the SAME epoch second (1780000000xxx ms both
+    // floor to second 1780000000): newest s-new, sibling s-sib. A third older
+    // message s-old in a different second.
+    const corpus: EmailMetadata[] = [
+      { id: "s-new", internalDate: "1780000000900", from: "Alice <alice@x.com>", subject: "newest" },
+      { id: "s-sib", internalDate: "1780000000100", from: "Alice <alice@x.com>", subject: "sibling" },
+      { id: "s-old", internalDate: "1779999000000", from: "Alice <alice@x.com>", subject: "old" }
+    ];
+    // Inclusive-after stub: `after:N` lists messages whose floored second is
+    // >= N (Gmail's real inclusive boundary), newest-first. This is what re-lists
+    // the same-second sibling on the first steady tick.
+    const byId: Record<string, EmailMetadata> = {};
+    for (const m of corpus) byId[m.id] = m;
+    const inclusiveAfterStub: GmailPollDeps = {
+      sessionStatus: async () => ({ installed: true, clientConfigured: true, signedIn: true, message: "ok" }),
+      resolveSelfEmail: async () => "me@example.com",
+      gwsSpawn: async (args: string[]) => {
+        const joined = args.join(" ");
+        if (joined.includes("messages list")) {
+          const afterMatch = joined.match(/after:(\d+)/);
+          const afterSec = afterMatch ? Number(afterMatch[1]) : 0;
+          const matched = corpus
+            .filter((m) => !afterMatch || Math.floor(Number(m.internalDate) / 1000) >= afterSec)
+            .sort((a, b) => Number(b.internalDate) - Number(a.internalDate));
+          return listResponse(matched.map((m) => m.id));
+        }
+        if (joined.includes("messages get")) {
+          const hit = getArgId(joined);
+          return hit && byId[hit] ? metadataResponse(byId[hit]) : PREAMBLE + "{}";
+        }
+        return PREAMBLE + "{}";
+      }
+    };
+
+    let triggered = 0;
+    const spawnTurn = async () => { triggered += 1; };
+
+    // Seed: baseline at s-new and mark the same-second sibling s-sib seen too.
+    const seed = await runGmailPollTick(config, { ...inclusiveAfterStub, spawnTurn });
+    expect(seed.seeded).toBe(1);
+    expect(triggered).toBe(0);
+    expect(isEmailSeen(config.instance, watcher.id, "s-new")).toBe(true);
+    expect(isEmailSeen(config.instance, watcher.id, "s-sib")).toBe(true);
+    // The older different-second message is NOT pre-marked (out of band).
+    expect(isEmailSeen(config.instance, watcher.id, "s-old")).toBe(false);
+    const live = readState(config.instance).emailWatchers.find((w) => w.id === watcher.id);
+    expect(live?.lastSeenInternalDate).toBe("1780000000900");
+
+    // Steady tick: `after:` is inclusive of the boundary second, so s-sib is
+    // re-listed — but it's already seen, so it does NOT wake a draft turn.
+    const r = await runGmailPollTick(config, { ...inclusiveAfterStub, spawnTurn });
+    expect(r.triggered).toBe(0);
+    expect(triggered).toBe(0);
   });
 
   test("a throwing spawnTurn flips status to error AND the id re-triggers on a later healthy tick", async () => {

@@ -378,10 +378,11 @@ async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number
 //
 //  1. SEEDING (no lastSeenInternalDate): BASELINE only. Take the newest listed
 //     id (Gmail lists newest-first => window.ids[0]), fetch ITS internalDate,
-//     set the cursor there, markSeen just that boundary id, and wake NO turn.
-//     Pre-existing mail older than the baseline is excluded by `after:` forever
-//     — the correct behavior (never draft a backlog), regardless of inbox size.
-//     No enumeration, so inbox size / page truncation is irrelevant here.
+//     set the cursor there, markSeen that boundary id plus any sibling sharing
+//     its exact epoch second (Gmail's `after:` is inclusive of the boundary
+//     second), and wake NO turn. Pre-existing mail older than the baseline is
+//     excluded by `after:` forever — the correct behavior (never draft a
+//     backlog), regardless of inbox size.
 //
 //  2. STEADY-STATE, window NOT truncated (fully enumerated, <= the page cap):
 //     drain OLDEST-FIRST, cap the TURNS woken at MAX_MESSAGES_PER_TICK, advance
@@ -428,6 +429,20 @@ async function processWatcher(
       // it only matters as a fallback if the newest message has no internalDate.
       cursor = String(internalDate > 0 ? internalDate : Date.now());
       markEmailSeen(config.instance, watcher.id, newest);
+      // Gmail's `after:<sec>` is INCLUSIVE of the boundary second, so any other
+      // pre-existing message sharing the newest's exact second is re-listed on
+      // the first steady tick. markSeen each such sibling now (they're already
+      // on this first listed page, newest-first) so they aren't drafted as
+      // "new" pre-existing mail.
+      if (internalDate > 0) {
+        const newestSec = Math.floor(internalDate / 1000);
+        for (let i = 1; i < window.ids.length; i++) {
+          const sib = window.ids[i]!;
+          const sibDate = await fetchInternalDate(gwsSpawn, sib);
+          if (sibDate <= 0 || Math.floor(sibDate / 1000) !== newestSec) break;
+          markEmailSeen(config.instance, watcher.id, sib);
+        }
+      }
     } else {
       cursor = String(Date.now());
     }
@@ -447,24 +462,36 @@ async function processWatcher(
   if (window.pageLimitHit) {
     const newest = window.ids[0];
     let cursor: string | undefined;
+    let triggered = 0;
     if (newest) {
       const internalDate = await fetchInternalDate(gwsSpawn, newest);
-      if (internalDate > 0) cursor = String(internalDate);
+      // Always advance the cursor (mirror seeding's fallback): if a transient
+      // bad metadata-get returns no internalDate, fall back to now() so the
+      // cursor can't get stuck and re-fire the notice every tick.
+      cursor = String(internalDate > 0 ? internalDate : Date.now());
+      // Fire the notice at most once per backlog episode: only when the newest
+      // boundary id wasn't already seen. Checked BEFORE markSeen so a later
+      // tick at the same newest id (e.g. the cursor didn't outrun it) stays
+      // silent. With the always-advancing cursor + this gate there's no spam.
+      const noticeNeeded = !isEmailSeen(config.instance, watcher.id, newest);
       markEmailSeen(config.instance, watcher.id, newest);
+      if (noticeNeeded) {
+        await spawnTurn(watcher, buildBacklogNoticePrompt(watcher));
+        triggered = 1;
+      }
     }
     appendLog(config.instance, "email.watch.page_limit", {
       watcherId: watcher.id,
       listed: window.ids.length,
       pageLimit: WINDOW_PAGE_LIMIT
     });
-    await spawnTurn(watcher, buildBacklogNoticePrompt(watcher));
     await updateEmailWatcher(config, watcher.id, {
       ...(cursor ? { lastSeenInternalDate: cursor } : {}),
       lastPolledAt: now(),
       status: "ok",
       lastError: undefined
     });
-    return { triggered: 1, seeded: false };
+    return { triggered, seeded: false };
   }
 
   // Regime 2: fully-enumerated steady-state window. Gmail returns newest-first;
