@@ -99,6 +99,13 @@ export default function ThreadsInboxPage() {
           sessionId={openThread.sessionId}
           thread={openThread}
           agentName={openThread.agentName ?? "Agent"}
+          // Seed the message-row avatars on the agent id (like the sidebar)
+          // so the colored initial matches everywhere, not the name fallback.
+          agent={
+            openThread.agentId
+              ? { id: openThread.agentId, name: openThread.agentName ?? "Agent" }
+              : undefined
+          }
           onClose={() => setOpenThread(null)}
         />
       ) : null}
