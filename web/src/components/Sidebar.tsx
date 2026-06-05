@@ -297,9 +297,10 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         </div>
       </ScrollArea>
 
-      <div className="border-t border-[#1C1C1E] px-3 pb-2 pt-3">
+      <div className="px-3 pb-2 pt-3">
         <TunnelMenu />
       </div>
+      <div className="h-px bg-[#1C1C1E]" />
       <UpdateReminder />
       <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
