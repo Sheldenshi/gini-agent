@@ -110,6 +110,12 @@ import { resolveEffectiveContext } from "./effective-context";
 // per-instance via `config.agent.maxIterations` in `~/.gini/instances/<inst>/config.json`.
 const MAX_LOOP_ITERATIONS = 90;
 
+// Loop-breaker: how many consecutive iterations of the IDENTICAL tool call(s)
+// yielding the IDENTICAL result(s) we tolerate before deciding the model is
+// stuck (e.g. a guard that keeps refusing the same cold call) and routing to
+// the graceful tool-less summary exit instead of grinding to MAX_LOOP_ITERATIONS.
+const MAX_IDENTICAL_TOOL_REPEATS = 3;
+
 // Resolve the effective iteration cap from config, falling back to the
 // default when the user hasn't set one or set an invalid value. Validation
 // is intentionally minimal — positive integer or fall back. We log a single
@@ -1142,7 +1148,7 @@ export function buildSkillScriptsBlock(state: RuntimeState, visibleSkillNames: S
 function buildDeferredToolsBlock(index: Array<{ name: string; summary: string }>): string {
   if (index.length === 0) return "";
   return [
-    "Tools available on demand (NOT yet loaded). These are real tools you can use, but their definitions aren't loaded yet. To use one, FIRST call load_tools with its exact name(s) (e.g. load_tools({\"names\":[\"browser_navigate\"]})); from the next turn on you call the tool directly by name. Don't guess a tool's arguments before loading it.",
+    "Tools available on demand (NOT yet loaded). These are real tools you can use, but their definitions aren't loaded yet. To use one, FIRST call load_tools with its exact name(s) (e.g. load_tools({\"names\":[\"browser_snapshot\"]})); from the next turn on you call the tool directly by name. Don't guess a tool's arguments before loading it.",
     ...index.map((t) => `- ${t.name} — ${t.summary}`)
   ].join("\n");
 }
@@ -1346,6 +1352,13 @@ async function runLoop(
   // the only iteration that can carry a leading `<route>` directive. Visible
   // to finalizeTurnRoute, which runs after the per-iteration assignment.
   let isFirstModelCall = false;
+
+  // Loop-breaker bookkeeping: detect the model repeating the identical tool
+  // call(s) and getting the identical result(s) several iterations in a row.
+  // `brokeOnRepeat` steers the post-loop summary exit toward the right wording.
+  let lastIterationSignature: string | undefined;
+  let identicalRunLength = 0;
+  let brokeOnRepeat = false;
 
   while (iterations < cap) {
     iterations += 1;
@@ -2062,19 +2075,50 @@ async function runLoop(
       return paused;
     }
 
+    // Loop-breaker: this iteration is all-sync and will loop again. Signature
+    // the tool call(s) by tool_call_id (don't assume index alignment) plus
+    // their results, and bail to the graceful summary exit if the model has
+    // repeated the IDENTICAL call(s) with the IDENTICAL result(s) too many
+    // times in a row — a guard or tool that keeps refusing the same input.
+    const resultById = new Map(toolResultMessages.map((m) => [m.tool_call_id, m.content]));
+    const iterationSignature = JSON.stringify(
+      result.toolCalls.map((c) => [c.function.name, c.function.arguments, resultById.get(c.id) ?? null])
+    );
+    if (iterationSignature === lastIterationSignature) {
+      identicalRunLength += 1;
+    } else {
+      identicalRunLength = 1;
+      lastIterationSignature = iterationSignature;
+    }
+    if (identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS) {
+      brokeOnRepeat = true;
+      appendTrace(config.instance, taskId, {
+        type: "warning",
+        message: `Stopped after ${identicalRunLength} identical consecutive tool iterations (loop-breaker).`,
+        data: { iterations, toolNames: result.toolCalls.map((c) => c.function.name) }
+      });
+      break;
+    }
+
     // All sync — keep looping.
   }
 
-  // Hit the iteration cap. Instead of failing outright, give the model one
-  // last turn with NO tools available and an explicit instruction to write
+  // Loop ended without a final answer — either the iteration cap or the
+  // identical-repeat loop-breaker. Instead of failing outright, give the model
+  // one last turn with NO tools available and an explicit instruction to write
   // a final answer summarizing what it learned and what it couldn't finish.
   // The summary call's cost is recorded on the task just like any other
   // model call. If the summary call itself fails (provider error, etc.),
   // fall back to the legacy failure path so we don't lose the user's work.
-  const summaryInstruction =
-    `You have reached the maximum number of tool-calling iterations (${cap}). ` +
-    `No further tools are available. Please write a final answer summarizing ` +
-    `what you have learned so far and what you were unable to complete.`;
+  const summaryInstruction = brokeOnRepeat
+    ? `You repeated the same tool call(s) with identical arguments and received ` +
+      `the identical result each time, which means that path is blocked. No ` +
+      `further tools are available now. Write a final answer for the user: ` +
+      `explain what you were able to determine, what is blocking you (e.g. a ` +
+      `sign-in or tool that keeps refusing), and what they could do next.`
+    : `You have reached the maximum number of tool-calling iterations (${cap}). ` +
+      `No further tools are available. Please write a final answer summarizing ` +
+      `what you have learned so far and what you were unable to complete.`;
   const summaryMessages: ToolCallingMessage[] = [
     ...workingMessages,
     { role: "user", content: summaryInstruction }
@@ -2106,7 +2150,9 @@ async function runLoop(
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "completed";
-      item.currentStep = `Completed (iteration cap reached: ${cap})`;
+      item.currentStep = brokeOnRepeat
+        ? "Completed (stopped: repeated identical tool calls)"
+        : `Completed (iteration cap reached: ${cap})`;
       item.summary = finalText;
       item.cost = accumulatedCost;
       item.partialSummary = undefined;
@@ -2122,13 +2168,20 @@ async function runLoop(
     if (exhausted.status === "completed") {
       const block = emitAssistantTextStart(emitCtx, finalText);
       if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
-      emitSystemNote(emitCtx, `Iteration cap reached (${cap}). Returning best-effort summary.`);
+      emitSystemNote(
+        emitCtx,
+        brokeOnRepeat
+          ? "Stopped after repeated identical tool calls. Returning best-effort summary."
+          : `Iteration cap reached (${cap}). Returning best-effort summary.`
+      );
       emitPhase(emitCtx, "Completed");
     }
     appendTrace(config.instance, taskId, {
       type: "warning",
-      message: `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
-      data: { iterations: cap }
+      message: brokeOnRepeat
+        ? "Loop-breaker stopped repeated identical tool calls; produced summary in tool-less final turn."
+        : `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
+      data: { iterations }
     });
     appendTrace(config.instance, taskId, {
       type: "model",
@@ -2169,7 +2222,11 @@ async function runLoop(
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "failed";
       item.currentStep = "Failed";
-      item.error = authProvider ? message : `Chat task exceeded ${cap} model iterations.`;
+      item.error = authProvider
+        ? message
+        : brokeOnRepeat
+          ? "Chat task stopped after repeated identical tool calls."
+          : `Chat task exceeded ${cap} model iterations.`;
       if (authProvider) item.authErrorProvider = authProvider;
       // Preserve the accumulated cost from the loop so the audit row
       // reflects all model calls leading up to the failed summary turn.
@@ -2179,7 +2236,7 @@ async function runLoop(
       item.updatedAt = now();
       return item;
     });
-    // Cap-reached fail path: emit a system_note so the chat thread has
+    // Summary-call fail path: emit a system_note so the chat thread has
     // an explicit marker rather than just trailing off after the last
     // assistant_text. Phase blocks track currentStep; the system_note
     // captures the error condition.
@@ -2187,13 +2244,20 @@ async function runLoop(
       const note = providerAuthNote(authProvider, message);
       emitSystemNote(emitCtx, note.text, note.authError);
     } else {
-      emitSystemNote(emitCtx, `Iteration cap reached (${cap}) and summary call failed: ${message}`);
+      emitSystemNote(
+        emitCtx,
+        brokeOnRepeat
+          ? `Stopped after repeated identical tool calls and summary call failed: ${message}`
+          : `Iteration cap reached (${cap}) and summary call failed: ${message}`
+      );
     }
     emitPhase(emitCtx, "Failed");
     appendTrace(config.instance, taskId, {
       type: "error",
-      message: "Chat task hit iteration cap and tool-less summary call failed",
-      data: { iterations: cap, summaryError: message }
+      message: brokeOnRepeat
+        ? "Chat task stopped on repeated identical tool calls and tool-less summary call failed"
+        : "Chat task hit iteration cap and tool-less summary call failed",
+      data: { iterations, summaryError: message }
     });
     await updateRunFromTask(config, exhausted);
     await syncSubagentFromTask(config, exhausted);

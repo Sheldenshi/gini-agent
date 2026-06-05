@@ -32,9 +32,9 @@ The split makes the line structural: the type discriminates how a row is created
 - `memory.activate`, `skill.enable`, `connector.enable`
 
 `SetupRequest` (user-actor):
-- `browser.connect` — user opens a managed browser to sign in.
+- `browser.connect` — user opens a managed browser to sign in. Has a navigate-first precondition: the dispatcher refuses a cold call (no page open) with a "call `browser_navigate` first" nudge instead of minting an approval, so an ordinary browse-the-web request never pops a Connect card. The escalation is reserved for a navigation that genuinely lands on a sign-in / auth wall. Connect cards are also capped per wall (a first prompt plus one retry): once two Connect cards exist for the same host in the task, a further call returns a "you're blocked on signing in" nudge instead of minting another card — without this, an agent that can't get past a persisting sign-in wall re-issues `browser_connect` every iteration and spams the user with identical cards. The headless reconnect (the setup skill re-opening invisibly after `browser_close`) is exempt because it has no live session by design.
 - `connector.request` — user enters provider credentials via the connect dialog.
-- `browser.fill_secret` — user types a credential into a form field. Even though the underlying action is high-risk credential routing, the user is the actor (they type), the trust anchor is a non-spoofable page URL, and `/approve` always rejected this action because the credential value must arrive in a request body. Structurally identical to `connector.request`.
+- `browser.fill_secret` — user types a credential into a form field. Even though the underlying action is high-risk credential routing, the user is the actor (they type), the trust anchor is a non-spoofable page URL, and `/approve` always rejected this action because the credential value must arrive in a request body. Structurally identical to `connector.request`. Shares the same navigate-first precondition as `browser.connect`.
 
 A new tool author chooses by asking: when this row resolves, who pushed the button — the agent (after user consent) or the user (after performing the step)?
 

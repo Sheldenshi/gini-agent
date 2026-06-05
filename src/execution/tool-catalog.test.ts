@@ -29,10 +29,10 @@ import {
 import { defaultToolsets } from "../state/defaults";
 import type { RuntimeState, ToolsetRecord } from "../types";
 
-// The 16 browser tools that are deferred (the cluster minus the two always-on
-// escalation/onboarding meta-tools browser_fill_secrets and browser_connect).
+// The 15 browser tools that are deferred (the cluster minus the always-on
+// browser_navigate plus the escalation/onboarding meta-tools
+// browser_fill_secrets and browser_connect).
 const DEFERRED_BROWSER = [
-  "browser_navigate",
   "browser_snapshot",
   "browser_click",
   "browser_type",
@@ -375,15 +375,16 @@ describe("deferred tools", () => {
   // kill switch).
   const fullState = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z"));
 
-  test("the 16 browser tools are deferred; load_tools, browser_connect, browser_fill_secrets are core", () => {
+  test("the 15 browser tools are deferred; load_tools, browser_navigate, browser_connect, browser_fill_secrets are core", () => {
     const catalog = buildToolCatalog(fullState);
     for (const name of DEFERRED_BROWSER) {
       const tool = catalog.find((t) => t.function.name === name);
       expect(tool).toBeDefined();
       expect(tool?.deferred).toBe(true);
     }
-    // The escalation/onboarding meta-tools and the loader stay core.
-    for (const name of ["load_tools", "browser_connect", "browser_fill_secrets"]) {
+    // browser_navigate, the escalation/onboarding meta-tools, and the loader
+    // stay core.
+    for (const name of ["load_tools", "browser_navigate", "browser_connect", "browser_fill_secrets"]) {
       const tool = catalog.find((t) => t.function.name === name);
       expect(tool).toBeDefined();
       expect(tool?.deferred).not.toBe(true);
@@ -398,7 +399,7 @@ describe("deferred tools", () => {
       expect(names.has(name)).toBe(false);
     }
     // Core tools survive an empty loaded set.
-    for (const name of ["load_tools", "browser_connect", "browser_fill_secrets", "file_read"]) {
+    for (const name of ["load_tools", "browser_navigate", "browser_connect", "browser_fill_secrets", "file_read"]) {
       expect(names.has(name)).toBe(true);
     }
     // No deferred tool leaks into the empty-loaded provider array.
@@ -425,19 +426,19 @@ describe("deferred tools", () => {
 
   test("applyDeferralFilter includes a deferred tool once it is loaded", () => {
     const catalog = buildToolCatalog(fullState);
-    const filtered = applyDeferralFilter(catalog, new Set(["browser_navigate"]));
+    const filtered = applyDeferralFilter(catalog, new Set(["browser_snapshot"]));
     const names = new Set(filtered.map((t) => t.function.name));
-    expect(names.has("browser_navigate")).toBe(true);
+    expect(names.has("browser_snapshot")).toBe(true);
     // Sibling deferred tools that weren't loaded stay hidden.
     expect(names.has("browser_click")).toBe(false);
   });
 
   test("toProviderTools strips deferred/indexSummary annotations", () => {
     const catalog = buildToolCatalog(fullState);
-    const navigate = catalog.find((t) => t.function.name === "browser_navigate")!;
-    expect(navigate.deferred).toBe(true);
-    expect(navigate.indexSummary).toBeDefined();
-    const provider = toProviderTools([navigate]);
+    const snapshot = catalog.find((t) => t.function.name === "browser_snapshot")!;
+    expect(snapshot.deferred).toBe(true);
+    expect(snapshot.indexSummary).toBeDefined();
+    const provider = toProviderTools([snapshot]);
     const spec = provider[0] as unknown as Record<string, unknown>;
     expect("deferred" in spec).toBe(false);
     expect("indexSummary" in spec).toBe(false);
@@ -460,29 +461,30 @@ describe("deferred tools", () => {
       expect(entry.summary.length).toBeGreaterThan(0);
     }
     // A loaded tool drops out of the index.
-    const indexAfter = deferredToolIndex(catalog, new Set(["browser_navigate"]));
-    expect(indexAfter.some((e) => e.name === "browser_navigate")).toBe(false);
+    const indexAfter = deferredToolIndex(catalog, new Set(["browser_snapshot"]));
+    expect(indexAfter.some((e) => e.name === "browser_snapshot")).toBe(false);
   });
 
   test("resolveLoadableTools partitions deferred (loadable) from unknown/core names", () => {
     const catalog = buildToolCatalog(fullState);
     const { loaded, unknown } = resolveLoadableTools(catalog, [
-      "browser_navigate",
+      "browser_snapshot",
+      "browser_navigate", // now core → not loadable
       "file_read", // core → not loadable
       "nonsense_tool" // not in catalog
     ]);
-    expect(loaded).toEqual(["browser_navigate"]);
-    expect(unknown.sort()).toEqual(["file_read", "nonsense_tool"].sort());
+    expect(loaded).toEqual(["browser_snapshot"]);
+    expect(unknown.sort()).toEqual(["browser_navigate", "file_read", "nonsense_tool"].sort());
   });
 
   test("handleLoadTools loads deferred tools and reports newlyLoaded + alreadyLoaded + unknown", () => {
     const catalog = buildToolCatalog(fullState);
     const first = handleLoadTools(
-      JSON.stringify({ names: ["browser_navigate", "browser_snapshot"] }),
+      JSON.stringify({ names: ["browser_snapshot", "browser_click"] }),
       catalog,
       new Set()
     );
-    expect(first.newlyLoaded.sort()).toEqual(["browser_navigate", "browser_snapshot"].sort());
+    expect(first.newlyLoaded.sort()).toEqual(["browser_click", "browser_snapshot"].sort());
     const firstEnvelope = JSON.parse(first.result) as {
       ok: boolean;
       loaded: string[];
@@ -491,26 +493,26 @@ describe("deferred tools", () => {
       note: string;
     };
     expect(firstEnvelope.ok).toBe(true);
-    expect(firstEnvelope.loaded.sort()).toEqual(["browser_navigate", "browser_snapshot"].sort());
+    expect(firstEnvelope.loaded.sort()).toEqual(["browser_click", "browser_snapshot"].sort());
     expect(firstEnvelope.alreadyLoaded).toEqual([]);
     expect(firstEnvelope.note).toContain("callable directly");
 
     // Re-loading an already-loaded tool: it lands in alreadyLoaded, not
     // newlyLoaded.
     const second = handleLoadTools(
-      JSON.stringify({ names: ["browser_navigate"] }),
+      JSON.stringify({ names: ["browser_snapshot"] }),
       catalog,
-      new Set(["browser_navigate"])
+      new Set(["browser_snapshot"])
     );
     expect(second.newlyLoaded).toEqual([]);
     const secondEnvelope = JSON.parse(second.result) as { alreadyLoaded: string[] };
-    expect(secondEnvelope.alreadyLoaded).toEqual(["browser_navigate"]);
+    expect(secondEnvelope.alreadyLoaded).toEqual(["browser_snapshot"]);
   });
 
   test("handleLoadTools surfaces unknown names with didYouMean suggestions", () => {
     const catalog = buildToolCatalog(fullState);
     const { result, newlyLoaded } = handleLoadTools(
-      JSON.stringify({ names: ["browser_navigat"] }), // typo
+      JSON.stringify({ names: ["browser_snapsho"] }), // typo
       catalog,
       new Set()
     );
@@ -519,8 +521,8 @@ describe("deferred tools", () => {
       unknown: string[];
       didYouMean?: Record<string, string[]>;
     };
-    expect(envelope.unknown).toEqual(["browser_navigat"]);
-    expect(envelope.didYouMean?.["browser_navigat"]).toContain("browser_navigate");
+    expect(envelope.unknown).toEqual(["browser_snapsho"]);
+    expect(envelope.didYouMean?.["browser_snapsho"]).toContain("browser_snapshot");
   });
 
   test("handleLoadTools tolerates malformed args without throwing", () => {

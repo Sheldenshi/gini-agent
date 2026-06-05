@@ -65,8 +65,15 @@ through the same loop. So the loop comes first.
   `executeApprovedAction` runs the side effect, then calls
   `resumeChatTask(config, taskId, toolCallId, result)` for chat-task
   approvals. The loop continues from the next iteration.
-- The loop cap is 8 iterations (counted across pauses). Hitting it
-  marks the task `failed` with a clear error.
+- The loop cap is `MAX_LOOP_ITERATIONS` (90 by default, overridable per
+  instance via `config.agent.maxIterations`, counted across pauses).
+  Hitting it gives the model one final tool-less turn to summarize what it
+  learned and what it could not finish, then marks the task `completed`.
+- A tighter loop-breaker trips earlier when the model repeats the identical
+  tool call(s) and gets the identical result `MAX_IDENTICAL_TOOL_REPEATS`
+  (3) times in a row: it routes into that same final-summary exit, so a stuck
+  retry loop (e.g. a tool that keeps refusing) ends with a useful answer
+  instead of spinning to the cap.
 - All tool dispatches still write `audit` and `trace` records — same
   shape as the legacy path, with `(chat-task)` suffixes in trace
   messages so the timeline is unambiguous.

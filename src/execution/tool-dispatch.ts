@@ -287,6 +287,65 @@ export async function dispatchToolCall(
       // visible browser, signs in, then clicks Connect. There is no
       // "auto-approve" path — the user has to perform the action — so
       // bypass pendingOrAuto and always return the pending approval id.
+      //
+      // Navigate-first precondition (same contract as browser_fill_secrets):
+      // browser_connect's only job is to clear a sign-in / auth wall the agent
+      // ALREADY hit by navigating. Calling it cold — before any browser_navigate
+      // — is a misuse that would pop a spurious "Connect" card at the user for
+      // what is really an ordinary browse-the-web request. Refuse the cold call
+      // and steer the agent to browse headless first; it then only escalates to
+      // a Connect prompt when a navigation genuinely lands on a sign-in wall.
+      // Validate the reason first so a missing reason fails identically
+      // regardless of browser state.
+      requireString(args, "reason");
+      // Exempt an explicit headless:true reconnect: the setup skill re-opens
+      // the browser invisibly AFTER browser_close (post sign-in), so it has no
+      // live session by design. The cold-call misuse is always headless-unset.
+      const headlessReconnect = args.headless === true;
+      // "Open page" means a live session on a real http(s) URL — the same
+      // notion browser_fill_secrets uses. sanitizeUrlForAuditTarget returns
+      // undefined when there's no session, the page is about:blank, or the
+      // scheme isn't http(s) (chrome://, data:, …) — none of which can host a
+      // sign-in wall to clear.
+      const hasOpenPage = sanitizeUrlForAuditTarget(peekCurrentBrowserUrl(taskId)) !== undefined;
+      if (!headlessReconnect && !hasOpenPage) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "browser_connect only clears a sign-in or auth wall you have already hit. No browser page is open yet — call browser_navigate (headless) to open the page first, and call browser_connect only if that navigation lands on a login, OAuth, or 401/403 wall."
+          })
+        };
+      }
+      // Loop guard: cap Connect cards per sign-in wall (host) per task. The
+      // first card pauses the task for the user; minting it always resolves
+      // before a second connect can be dispatched, so a binary "already asked"
+      // check would block every legitimate later wall on the same host. Instead
+      // allow a first prompt plus one retry — covers a mistyped credential or a
+      // genuinely different wall on the same host later in the task — and refuse
+      // the 3rd+, where re-prompting just spams identical cards because signing
+      // in evidently isn't clearing the wall. The host key is intentionally
+      // coarse: the count cap tolerates host/redirect churn (OAuth/IdP
+      // redirects get their own host bucket; two walls on one host share a
+      // bucket, but the cap of 2 softens that).
+      const wall = connectWallHost(resolveConnectUrl(args, taskId));
+      const cardsForWall = readState(config.instance).setupRequests.filter(
+        (r) =>
+          r.taskId === taskId &&
+          r.action === "browser.connect" &&
+          connectWallHost(typeof r.payload?.url === "string" ? r.payload.url : undefined) === wall
+      ).length;
+      if (cardsForWall >= MAX_CONNECT_CARDS_PER_WALL) {
+        return {
+          kind: "sync",
+          result: JSON.stringify({
+            ok: false,
+            error:
+              "You've already surfaced a Connect card for this site twice in this task and the sign-in wall hasn't cleared. Do NOT call browser_connect again for this site. If you can finish without signing in, continue; otherwise stop and tell the user you're blocked on signing in to this site."
+          })
+        };
+      }
       const approvalId = await requestBrowserConnect(config, taskId, toolCallId, args);
       return { kind: "pending", approvalId };
     }
@@ -2712,6 +2771,33 @@ async function requestBrowserUpload(
   });
 }
 
+// At most this many Connect cards per sign-in wall (host) per task. One prompt
+// plus a retry is legitimate (mistyped credential, or a genuinely different
+// wall on the same host later in the task); beyond that, re-prompting just spams
+// identical cards because signing in evidently isn't clearing the wall.
+const MAX_CONNECT_CARDS_PER_WALL = 2;
+
+// The page a browser_connect call targets: the explicit `url` arg if the
+// model supplied one, else the live page the agent is sitting on. Used both as
+// the visible-Chrome landing URL and as the dedupe key for the loop guard, so
+// the two always agree on what wall is being cleared.
+function resolveConnectUrl(args: Record<string, unknown>, taskId: string): string | undefined {
+  const urlArg = typeof args.url === "string" ? args.url.trim() : "";
+  return urlArg.length > 0 ? urlArg : peekCurrentBrowserUrl(taskId);
+}
+
+// Host of a connect target, used to dedupe repeated Connect cards within a
+// task so query/path churn on the same site doesn't read as a new wall.
+// Returns "" when no URL resolves (all such calls share one bucket).
+function connectWallHost(url: string | undefined): string {
+  if (!url) return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
+}
+
 // Approval-gated browser_connect. Spawns a visible managed Chrome
 // after user consent. The reason flows onto the approval row's
 // evidence so the UI can render a friendlier label ("Open a browser
@@ -2733,13 +2819,14 @@ async function requestBrowserConnect(
   // executor in agent.ts can pass it through to connectBrowser when the
   // user approves.
   const headless = args.headless === true;
-  // Optional target URL — the page the agent was trying to reach. When the
-  // user clicks "Connect" the open-browser endpoint launches visible Chrome
-  // and navigates here directly, so the user lands on the sign-in form
-  // instead of an empty about:blank. Validated minimally; safetyCheck runs
-  // server-side in the open-browser endpoint before navigation.
-  const urlArg = typeof args.url === "string" ? args.url.trim() : "";
-  const url = urlArg.length > 0 ? urlArg : undefined;
+  // Target URL — the page the agent was trying to reach. When the user clicks
+  // "Connect" the open-browser endpoint launches visible Chrome and navigates
+  // here directly, so the user lands on the sign-in form instead of an empty
+  // about:blank. Falls back to the live page URL when the model omits `url`,
+  // which also keeps the loop-guard dedupe key consistent with the dispatch.
+  // Validated minimally; safetyCheck runs server-side in the open-browser
+  // endpoint before navigation.
+  const url = resolveConnectUrl(args, taskId);
   return mutateState(config.instance, (state: RuntimeState) => {
     const item = findTask(state, taskId);
     if (isTerminalTaskStatus(item.status)) {

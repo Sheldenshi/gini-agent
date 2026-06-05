@@ -254,14 +254,14 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     type: "function",
     function: {
       name: "load_tools",
-      description: "Load the full schemas for one or more tools listed in the 'Tools available on demand' section of your system prompt so you can call them. Pass their EXACT names. After this returns, call each loaded tool directly by name on a later turn — do NOT pass its arguments to load_tools. Example: load_tools({\"names\":[\"browser_navigate\"]}).",
+      description: "Load the full schemas for one or more tools listed in the 'Tools available on demand' section of your system prompt so you can call them. Pass their EXACT names. After this returns, call each loaded tool directly by name on a later turn — do NOT pass its arguments to load_tools. Example: load_tools({\"names\":[\"browser_snapshot\"]}).",
       parameters: {
         type: "object",
         properties: {
           names: {
             type: "array",
             items: { type: "string" },
-            description: "Exact names of the on-demand tools to load (e.g. ['browser_navigate', 'browser_snapshot'])."
+            description: "Exact names of the on-demand tools to load (e.g. ['browser_snapshot', 'browser_click'])."
           }
         },
         required: ["names"]
@@ -294,8 +294,6 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   {
     toolset: "browser",
     displayLabel: "Open page",
-    deferred: true,
-    indexSummary: "Open a URL in a headless browser and get an accessibility snapshot to click/type into. Load this first when starting any browser task.",
     type: "function",
     function: {
       name: "browser_navigate",
@@ -567,16 +565,16 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
   },
   {
     toolset: "browser",
-    displayLabel: "See page",
+    displayLabel: "Connect browser to sign in",
     type: "function",
     function: {
       name: "browser_connect",
-      description: "Surface a Connect button in chat so the user can sign in to a third-party service in a visible Chrome window. ONLY call this when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. It is NEVER a first step and must NOT be called proactively or before navigating: always navigate with browser_navigate first, and reach for this only if that page genuinely requires sign-in. For ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the browser switches to headless and the agent continues with the persisted session. Always pass `url`: the page the agent was trying to reach (so the visible Chrome opens directly on the sign-in form).",
+      description: "Surface a Connect button in chat so the user can sign in to a third-party service in a visible Chrome window. ONLY call this when a navigation you ALREADY made hit a sign-in roadblock — a login screen, OAuth / identity-provider redirect, 401/403, or \"please sign in\" interstitial that actually blocks the page you need. It is NEVER a first step and must NOT be called proactively or before navigating: always navigate with browser_navigate first, and reach for this only if that page genuinely requires sign-in. For ordinary browsing that does not hit a sign-in wall, keep using browser_navigate (headless) — no connection or approval is needed, so do not ask the user to connect. When you DO hit a sign-in wall, don't report it as a blocker — call this tool. The user clicks Connect, signs in once, clicks \"I've signed in\", then the browser switches to headless and the agent continues with the persisted session. Pass `url` = the page you ALREADY navigated to and were blocked at by the sign-in wall, so the visible Chrome reopens that exact page for sign-in and the agent retries it afterward. This tool does NOT reach a page you haven't navigated to — use browser_navigate for that.",
       parameters: {
         type: "object",
         properties: {
           reason: { type: "string", description: "One short user-facing sentence shown in the approval card (e.g. 'Sign in to Amazon to manage your Audible subscription')." },
-          url: { type: "string", description: "Absolute http(s) URL the agent was trying to reach. The visible Chrome opens directly on this page so the user lands on the sign-in form, and the agent retries this URL after sign-in." },
+          url: { type: "string", description: "Absolute http(s) URL of the page you already navigated to and were blocked at by a sign-in wall. The visible Chrome reopens this exact page for sign-in, and the agent retries it afterward. Not a way to open a page you haven't navigated to — use browser_navigate for that." },
           headless: { type: "boolean", description: "Reserved for the legacy auto-approve path. Leave unset in normal use — the two-stage Connect / \"I've signed in\" flow handles the headed→headless transition automatically.", default: false }
         },
         required: ["reason"]

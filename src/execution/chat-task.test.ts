@@ -632,16 +632,17 @@ describe("chat-task loop", () => {
   // that text. A warning trace should record the cap hit.
   test("hits the configurable iteration cap and completes with a tool-less summary", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
-    const fixturePath = join(workspaceRoot, "hello.md");
-    writeFileSync(fixturePath, "Hello, world!");
     const config = buildConfig(workspaceRoot, "chat-task-cap-graceful");
     config.agent = { maxIterations: 3 };
     const provider = normalizeProvider(config.provider);
 
-    // Three iterations of tool calls — one per loop pass — that all just
-    // re-read the same file. The loop guard is `iterations < cap` so cap=3
-    // means three model turns are consumed before exhaustion.
+    // Three iterations of tool calls — one per loop pass — each reading a
+    // DISTINCT file so the per-iteration signatures differ and the
+    // identical-repeat loop-breaker does not pre-empt the genuine cap path.
+    // The loop guard is `iterations < cap` so cap=3 means three model turns
+    // are consumed before exhaustion.
     for (let i = 0; i < 3; i++) {
+      writeFileSync(join(workspaceRoot, `hello${i}.md`), `Hello, world! (${i})`);
       setEchoToolCallingResponse({
         provider,
         text: "",
@@ -649,7 +650,7 @@ describe("chat-task loop", () => {
           {
             id: `call_loop_${i}`,
             type: "function",
-            function: { name: "file_read", arguments: JSON.stringify({ path: "hello.md" }) }
+            function: { name: "file_read", arguments: JSON.stringify({ path: `hello${i}.md` }) }
           }
         ],
         finishReason: "tool_calls"
@@ -658,7 +659,7 @@ describe("chat-task loop", () => {
     // Tool-less summary turn — what the exhaustion path should consume.
     setEchoToolCallingResponse({
       provider,
-      text: "Cap reached. I read the same file three times but never produced a final answer.",
+      text: "Cap reached. I read three files but never produced a final answer.",
       toolCalls: [],
       finishReason: "stop"
     });
@@ -668,7 +669,7 @@ describe("chat-task loop", () => {
 
     expect(finished.status).toBe("completed");
     expect(finished.summary).toBe(
-      "Cap reached. I read the same file three times but never produced a final answer."
+      "Cap reached. I read three files but never produced a final answer."
     );
     expect(finished.currentStep).toBe("Completed (iteration cap reached: 3)");
     expect(finished.error).toBeUndefined();
@@ -679,6 +680,76 @@ describe("chat-task loop", () => {
     const warning = traces.find((t) => t.type === "warning" && /Iteration cap \(3\)/.test(t.message));
     expect(warning).toBeDefined();
     expect((warning?.data as Record<string, unknown> | undefined)?.iterations).toBe(3);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Loop-breaker (identical-repeat). A model that emits the IDENTICAL tool
+  // call and gets the IDENTICAL result several iterations in a row is stuck;
+  // the loop must stop at MAX_IDENTICAL_TOOL_REPEATS (3) — well before the
+  // 90-iteration cap — and route to the same graceful tool-less summary exit.
+  // We drive a cold browser_connect (no page open → deterministic ok:false
+  // guard refusal every turn) to reproduce the real stuck-loop scenario.
+  test("stops at the identical-repeat loop-breaker and completes via a tool-less summary", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-loop-breaker");
+    const provider = normalizeProvider(config.provider);
+
+    // Three identical iterations: same cold browser_connect args, same guard
+    // refusal each time. The third pass trips the loop-breaker (runLength 3).
+    for (let i = 0; i < 3; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_repeat_${i}`,
+            type: "function",
+            function: {
+              name: "browser_connect",
+              arguments: JSON.stringify({ reason: "Sign in to Example", url: "https://example.com/login" })
+            }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn — what the loop-breaker exit should consume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "That sign-in path keeps refusing. Try connecting the service from settings, then ask again.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "sign in to example", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(
+      "That sign-in path keeps refusing. Try connecting the service from settings, then ask again."
+    );
+    expect(finished.currentStep).toBe("Completed (stopped: repeated identical tool calls)");
+    expect(finished.error).toBeUndefined();
+
+    // Exactly four model calls: three repeated tool turns + one tool-less
+    // summary — proving we stopped at the loop-breaker, not the 90-cap.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(4);
+    // The final summary turn is the tool-less exit: its last message is the
+    // repeat-specific summary instruction asking for a final answer.
+    const summaryTurn = calls[3]!;
+    const lastMessage = summaryTurn[summaryTurn.length - 1]!;
+    expect(lastMessage.role).toBe("user");
+    expect(String(lastMessage.content)).toContain("repeated the same tool call");
+
+    // Trace records the loop-breaker stop.
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const breaker = traces.find(
+      (t) => t.type === "warning" && /identical consecutive tool iterations/.test(t.message)
+    );
+    expect(breaker).toBeDefined();
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -2231,14 +2302,14 @@ describe("chat-task loop", () => {
     const config = buildConfig(workspaceRoot, "chat-task-deferred-load");
     const provider = normalizeProvider(config.provider);
 
-    // Turn 1: load the browser_navigate schema via load_tools. (We stop at the
+    // Turn 1: load the browser_snapshot schema via load_tools. (We stop at the
     // load round-trip rather than driving a real browser — the load branch is
     // what this test pins; the browser dispatch itself is exercised live.)
     setEchoToolCallingResponse({
       provider,
       text: "",
       toolCalls: [
-        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } }
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_snapshot"] }) } }
       ],
       finishReason: "tool_calls"
     });
@@ -2260,10 +2331,10 @@ describe("chat-task loop", () => {
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(2);
     // First model call: system prompt advertises the on-demand index with
-    // browser_navigate by name.
+    // browser_snapshot by name.
     const firstSystem = String(calls[0]!.find((m) => m.role === "system")?.content ?? "");
     expect(firstSystem).toContain("Tools available on demand");
-    expect(firstSystem).toContain("browser_navigate");
+    expect(firstSystem).toContain("browser_snapshot");
 
     // After the load, the second model call's message history carries the
     // load_tools tool result confirming the tool is now callable.
@@ -2277,7 +2348,7 @@ describe("chat-task loop", () => {
       loaded: string[];
     };
     expect(envelope.ok).toBe(true);
-    expect(envelope.loaded).toContain("browser_navigate");
+    expect(envelope.loaded).toContain("browser_snapshot");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -2303,11 +2374,11 @@ describe("chat-task loop", () => {
     }
     expect(threw).toBe(true);
 
-    // browser_navigate is a known deferred tool. The guard helper classifies
+    // browser_snapshot is a known deferred tool. The guard helper classifies
     // it as deferred so a not-yet-loaded reference reaching the dispatcher's
     // default case would return the recoverable load_tools nudge rather than
     // throwing Unknown tool.
-    expect(isDeferredToolName("browser_navigate")).toBe(true);
+    expect(isDeferredToolName("browser_snapshot")).toBe(true);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -2392,21 +2463,21 @@ describe("chat-task loop", () => {
 
   // Loop gate, never-loaded case: the model emits a deferred tool it never
   // loaded. The chat-task loop gate (NOT the dispatcher's default-case
-  // backstop, which browser_navigate never reaches — it has its own dispatch
+  // backstop, which browser_snapshot never reaches — it has its own dispatch
   // case) must block execution and feed back a "not loaded yet" nudge, and the
-  // loop must continue to a final answer. We assert NO browser.navigate audit
+  // loop must continue to a final answer. We assert NO browser.snapshot audit
   // row exists (proving the thunk never ran).
   test("loop gate blocks a deferred tool the model never loaded and nudges toward load_tools", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-deferred-unloaded");
     const provider = normalizeProvider(config.provider);
 
-    // Turn 1: jump straight to browser_navigate without loading it first.
+    // Turn 1: jump straight to browser_snapshot without loading it first.
     setEchoToolCallingResponse({
       provider,
       text: "",
       toolCalls: [
-        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+        { id: "call_snap", type: "function", function: { name: "browser_snapshot", arguments: "{}" } }
       ],
       finishReason: "tool_calls"
     });
@@ -2418,18 +2489,18 @@ describe("chat-task loop", () => {
       finishReason: "stop"
     });
 
-    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const task = await submitTask(config, "snapshot the page", { mode: "chat" });
     const finished = await waitForTerminal(config, task.id, 10000);
     expect(finished.status).toBe("completed");
     expect(finished.summary).toBe("Understood — I'll load the browser tools first next time.");
 
     const state = readState(config.instance);
-    // The browser thunk never ran: no browser.navigate audit row.
-    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
-    expect(navAudits).toHaveLength(0);
+    // The browser thunk never ran: no browser.snapshot audit row.
+    const snapAudits = state.audit.filter((a) => a.action === "browser.snapshot" && a.taskId === task.id);
+    expect(snapAudits).toHaveLength(0);
 
     // The second model turn's history carries the "not loaded yet" nudge as the
-    // tool result for the unloaded browser_navigate call.
+    // tool result for the unloaded browser_snapshot call.
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(2);
     const nudge = calls[1]!.find(
@@ -2438,29 +2509,29 @@ describe("chat-task loop", () => {
     expect(nudge).toBeDefined();
     const envelope = JSON.parse(String((nudge as { content: string }).content)) as { ok: boolean; error: string };
     expect(envelope.ok).toBe(false);
-    expect(envelope.error).toContain("browser_navigate");
+    expect(envelope.error).toContain("browser_snapshot");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
 
   // Loop gate, same-batch case: the model emits load_tools AND the tool it just
-  // loaded in ONE tool_calls array. The provider generated browser_navigate
+  // loaded in ONE tool_calls array. The provider generated browser_snapshot
   // without ever having its schema (it wasn't in the tools array that turn), so
   // the loaded set as it stood at turn start does NOT contain it — the gate
-  // must block browser_navigate this turn while load_tools still succeeds. A
-  // subsequent turn can then call browser_navigate for real (now loadable).
+  // must block browser_snapshot this turn while load_tools still succeeds. A
+  // subsequent turn can then call browser_snapshot for real (now loadable).
   test("loop gate blocks a same-batch load+call but lets the tool through on the next turn", async () => {
     const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
     const config = buildConfig(workspaceRoot, "chat-task-deferred-samebatch");
     const provider = normalizeProvider(config.provider);
 
-    // Turn 1: load_tools(browser_navigate) AND browser_navigate(...) together.
+    // Turn 1: load_tools(browser_snapshot) AND browser_snapshot(...) together.
     setEchoToolCallingResponse({
       provider,
       text: "",
       toolCalls: [
-        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_navigate"] }) } },
-        { id: "call_nav", type: "function", function: { name: "browser_navigate", arguments: JSON.stringify({ url: "https://example.com" }) } }
+        { id: "call_load", type: "function", function: { name: "load_tools", arguments: JSON.stringify({ names: ["browser_snapshot"] }) } },
+        { id: "call_snap", type: "function", function: { name: "browser_snapshot", arguments: "{}" } }
       ],
       finishReason: "tool_calls"
     });
@@ -2469,19 +2540,19 @@ describe("chat-task loop", () => {
     // gated while load_tools succeeded).
     setEchoToolCallingResponse({
       provider,
-      text: "Browser tools loaded; ready to navigate.",
+      text: "Browser tools loaded; ready to snapshot.",
       toolCalls: [],
       finishReason: "stop"
     });
 
-    const task = await submitTask(config, "open example.com", { mode: "chat" });
+    const task = await submitTask(config, "snapshot the page", { mode: "chat" });
     const finished = await waitForTerminal(config, task.id, 10000);
     expect(finished.status).toBe("completed");
 
     const state = readState(config.instance);
-    // browser_navigate was NOT executed this turn — no browser.navigate audit.
-    const navAudits = state.audit.filter((a) => a.action === "browser.navigate" && a.taskId === task.id);
-    expect(navAudits).toHaveLength(0);
+    // browser_snapshot was NOT executed this turn — no browser.snapshot audit.
+    const snapAudits = state.audit.filter((a) => a.action === "browser.snapshot" && a.taskId === task.id);
+    expect(snapAudits).toHaveLength(0);
 
     const calls = getEchoToolCallingCalls();
     expect(calls.length).toBe(2);
@@ -2491,11 +2562,11 @@ describe("chat-task loop", () => {
       (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("callable directly")
     );
     expect(loadResult).toBeDefined();
-    // browser_navigate got the "not loaded yet" nudge this turn.
-    const navResult = secondTurn.find(
+    // browser_snapshot got the "not loaded yet" nudge this turn.
+    const snapResult = secondTurn.find(
       (m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("not loaded yet")
     );
-    expect(navResult).toBeDefined();
+    expect(snapResult).toBeDefined();
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

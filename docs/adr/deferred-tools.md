@@ -73,9 +73,13 @@ self-descriptively.
 
 ## Currently Deferred
 
-- The browser cluster — 16 of 18 tools. `browser_fill_secrets` and
-  `browser_connect` stay core: they are escalation / onboarding meta-tools that
-  must be reachable before the cluster is loaded (a sign-in wall mid-task).
+- The browser cluster — 15 of 18 tools. `browser_navigate`,
+  `browser_fill_secrets`, and `browser_connect` stay core. `browser_fill_secrets`
+  and `browser_connect` are escalation / onboarding meta-tools that must be
+  reachable before the cluster is loaded (a sign-in wall mid-task).
+  `browser_navigate` is core because `browser_connect`'s navigate-first guard
+  refuses a cold connect and steers the agent to navigate first — so navigate
+  must be directly callable for that steer to be satisfiable in one step.
 - The self-config tools (ADR self-config-registry.md).
 
 Messaging-lifecycle, jobs, skill-lifecycle, identity-edit, and `mcp_call` tools

@@ -2134,6 +2134,12 @@ describe("dispatchToolCall(browser_connect)", () => {
     };
   }
 
+  afterEach(() => {
+    // Drop any fake session a test installed so the navigate-first
+    // precondition can't leak across tests.
+    browserTest.clearFakeSessionsForTest();
+  });
+
   test("returns kind:'pending' with an approval row at risk 'medium' and action 'browser.connect'", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
@@ -2142,6 +2148,12 @@ describe("dispatchToolCall(browser_connect)", () => {
       const task = createTask(state.instance, "connect test", undefined, undefined, undefined, undefined);
       upsertTask(state, task);
       return task.id;
+    });
+    // browser_connect now requires an already-open page (it only clears a
+    // sign-in wall the agent already hit), so seed a live session.
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://console.cloud.google.com/welcome",
+      close: () => Promise.resolve()
     });
 
     const result = await dispatchToolCall(
@@ -2194,6 +2206,197 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
+  // Navigate-first precondition: a cold browser_connect (no page open yet) is
+  // a misuse — the agent should browse headless first and only escalate to a
+  // Connect prompt when a navigation hits a sign-in wall. The dispatch must
+  // refuse it WITHOUT minting an approval, so the user is never prompted to
+  // connect for an ordinary browse-the-web request.
+  test("refuses a cold call when no browser page is open, without minting an approval", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-cold");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect cold", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+
+    // No browser_navigate has run, so there is no live session / open page.
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_cold_1",
+      JSON.stringify({ reason: "Search hotel prices in Los Angeles" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("browser_navigate");
+
+    // The user must not be prompted — no approval row may exist.
+    const state = readState(config.instance);
+    expect(state.setupRequests.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // Loop guard: a task caps Connect cards per sign-in wall. A first prompt plus
+  // one retry is legitimate (mistyped credential, or a genuinely different wall
+  // on the same host later in the task), so two cards mint; the third call for
+  // the same site is refused with a sync result instead of spamming a third
+  // identical card.
+  test("caps Connect cards per sign-in wall and refuses beyond the cap", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-loop");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect loop", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://www.aircanada.com/login",
+      close: () => Promise.resolve()
+    });
+    const connectCards = () =>
+      readState(config.instance).setupRequests.filter(
+        (a) => a.taskId === taskId && a.action === "browser.connect"
+      ).length;
+
+    // First call: a real Connect card (pending approval).
+    const first = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_1",
+      JSON.stringify({ reason: "Sign in to Air Canada" })
+    );
+    expect(first.kind).toBe("pending");
+    expect(connectCards()).toBe(1);
+
+    // Second call for the same site: still allowed (a retry is legitimate).
+    const second = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_2",
+      JSON.stringify({ reason: "Sign in to Air Canada" })
+    );
+    expect(second.kind).toBe("pending");
+    expect(connectCards()).toBe(2);
+
+    // Third call for the same site: refused, no new card.
+    const third = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_3",
+      JSON.stringify({ reason: "Sign in to Air Canada" })
+    );
+    expect(third.kind).toBe("sync");
+    if (third.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(third.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toMatch(/twice in this task|blocked on signing in/i);
+    // Still exactly two cards — the loop did not spam a third approval.
+    expect(connectCards()).toBe(2);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // The cap is per host: hitting it for one site must not block a connect for a
+  // different site. Pass distinct `url` args so the resolved hosts differ; the
+  // second host still mints a card even after the first host reached the cap.
+  test("counts Connect cards per host independently", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-perhost");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect per-host", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://www.aircanada.com/login",
+      close: () => Promise.resolve()
+    });
+
+    // Drive host A to the cap (two cards), then refuse a third.
+    const a1 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_a1",
+      JSON.stringify({ reason: "Sign in to Air Canada", url: "https://www.aircanada.com/login" })
+    );
+    expect(a1.kind).toBe("pending");
+    const a2 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_a2",
+      JSON.stringify({ reason: "Sign in to Air Canada", url: "https://www.aircanada.com/login" })
+    );
+    expect(a2.kind).toBe("pending");
+    const a3 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_a3",
+      JSON.stringify({ reason: "Sign in to Air Canada", url: "https://www.aircanada.com/login" })
+    );
+    expect(a3.kind).toBe("sync");
+
+    // A different host is independent — it still mints its first card.
+    const b1 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_b1",
+      JSON.stringify({ reason: "Sign in to United", url: "https://www.united.com/login" })
+    );
+    expect(b1.kind).toBe("pending");
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // A session can exist but still sit on about:blank (or another non-http(s)
+  // page) when nothing real has been navigated to yet. That can't host a
+  // sign-in wall, so the navigate-first guard must still refuse — same as a
+  // missing session.
+  test("refuses when the only session is on about:blank", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-blank");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect blank", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "about:blank",
+      close: () => Promise.resolve()
+    });
+
+    const result = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_connect_blank_1",
+      JSON.stringify({ reason: "Sign in somewhere" })
+    );
+    expect(result.kind).toBe("sync");
+    if (result.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(result.result) as { ok: boolean; error: string };
+    expect(parsed.ok).toBe(false);
+    expect(parsed.error).toContain("browser_navigate");
+    expect(readState(config.instance).setupRequests.length).toBe(0);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
   // End-to-end coverage of the dispatch → approval → executor path. The
   // dispatch must surface a pending approval; once the user approves
   // (here via decideApproval, the same code path /approvals/<id>/approve
@@ -2209,6 +2412,13 @@ describe("dispatchToolCall(browser_connect)", () => {
       const task = createTask(state.instance, "connect approve", undefined, undefined, undefined, undefined);
       upsertTask(state, task);
       return task.id;
+    });
+    // browser_connect requires an already-open page; seed a live session so
+    // the dispatch passes its navigate-first precondition before exercising
+    // the approval → executor path.
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://console.cloud.google.com/welcome",
+      close: () => Promise.resolve()
     });
 
     // Seed an existing cdp-mode record so the strict-managed path has
