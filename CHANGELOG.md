@@ -4,6 +4,10 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+### Added
+
+- Add a people-CRM contacts store: import a LinkedIn `Connections.csv`/XLSX export (or any roster file) into a structured, exhaustively-queryable database, then find/count people by company, title, location, or free text; save and update people from chat; and map person-to-person relationships including mutual connections. Available as `contacts_*` agent tools, `/api/contacts*` routes, and a `gini contacts` CLI. See [People-CRM Contacts Store](docs/adr/people-crm-store.md).
+
 ## [0.2.0] - 2026-06-02
 
 ### Added
