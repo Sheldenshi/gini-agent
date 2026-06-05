@@ -12,7 +12,7 @@
     "gini": "bun run src/cli.ts",
     "server": "bun run src/server.ts",
     "smoke": "bun run src/cli.ts smoke",
-    "test": "bun test --parallel ./src ./mobile/src ./mobile/plugins",
+    "test": "bun test --parallel ./src ./skills ./mobile/src ./mobile/plugins",
     "posttest": "bun --cwd=web test --isolate",
     "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit && cd ../mobile && bunx tsc --noEmit",
     "web:dev": "cd web && bun run dev",
