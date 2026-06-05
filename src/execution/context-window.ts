@@ -1,7 +1,5 @@
 import type { ToolCallingMessage, MessageContentPart } from "../provider";
 
-export const DEFAULT_PRIOR_CONTEXT_TOKEN_BUDGET = 24_000;
-
 export const PRIOR_HISTORY_ELISION_NOTE =
   "Earlier chat history is outside the current model context. The full chat history is still stored. If an older detail matters, use recall_memory for durable facts or search_history for exact past chat, task, or tool snippets before answering.";
 

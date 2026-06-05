@@ -33,6 +33,7 @@ import {
   readState
 } from "../state";
 import { echoEmbed } from "../embeddings";
+import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
 import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
@@ -788,6 +789,43 @@ describe("chat-task loop", () => {
     );
     expect(warning).toBeDefined();
     expect((warning?.data as Record<string, unknown> | undefined)?.defaultCap).toBe(90);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("invalid agent.priorContextTokens falls back to the provider-derived default", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-prior-context-invalid");
+    (config as unknown as { agent: { priorContextTokens: number } }).agent = { priorContextTokens: 0 };
+    const provider = normalizeProvider(config.provider);
+    const expectedDefault = resolveDefaultPriorContextTokenBudget(provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Direct answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "say something", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe("Direct answer.");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const warning = traces.find(
+      (t) => t.type === "warning" && /agent\.priorContextTokens/i.test(String(t.data?.reason ?? ""))
+    );
+    expect(warning).toBeDefined();
+    expect((warning?.data as Record<string, unknown> | undefined)?.defaultBudget).toBe(expectedDefault);
+
+    const contextTrace = traces.find(
+      (t) => t.type === "model" && t.message === "chat-task system context built"
+    );
+    expect((contextTrace?.data as Record<string, unknown> | undefined)?.priorContextTokenBudget)
+      .toBe(expectedDefault);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

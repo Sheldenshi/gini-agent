@@ -135,8 +135,10 @@ budget for normal work.
 
 Prior chat history replay is also bounded. The full chat remains stored,
 but each new chat-task prompt packs prior rows under `agent.priorContextTokens`
-(default: 24000 approximate tokens) before the current turn. Older omitted
-rows are still available through Hindsight recall and exact `search_history`.
+before the current turn. When unset, the default is 65% of the effective
+provider/model context window; unknown routed or local models fall back to a
+conservative 32K window. Older omitted rows are still available through
+Hindsight recall and exact `search_history`.
 
 When the cap is hit the loop does NOT fail. Instead it makes one final
 tool-less model call asking for a summary of what was learned and what
@@ -153,14 +155,15 @@ To override the cap for a single instance, edit
   "...": "...",
   "agent": {
     "maxIterations": 150,
-    "priorContextTokens": 24000
+    "priorContextTokens": 50000
   }
 }
 ```
 
 `maxIterations` and `priorContextTokens` must be positive integers.
-Invalid values (zero, negative, non-numeric) fall back to the built-in
-defaults and emit a warning trace on the next task. The runtime reads
+Invalid values (zero, negative, non-numeric) fall back to their defaults
+(`maxIterations` is built-in; `priorContextTokens` is provider-derived) and
+emit a warning trace on the next task. The runtime reads
 `config.json` once at server start and holds `RuntimeConfig` in memory,
 so edits don't take effect until you restart `gini run` (stop the tmux
 session and re-issue the command).

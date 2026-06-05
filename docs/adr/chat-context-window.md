@@ -9,7 +9,7 @@
 Gini keeps complete chat history durable, but the model prompt receives a bounded replay tail:
 
 - The JSON `chatMessages` list, SQLite `chat_blocks`, traces, audits, runs, and Hindsight memory remain append-only durable history. Context packing never deletes or rewrites them.
-- `runChatTask` rebuilds prior transcript rows, then packs them under `config.agent.priorContextTokens` before the ephemeral identity/memory tail and current user message. The default prior-history budget is 24,000 approximate tokens.
+- `runChatTask` rebuilds prior transcript rows, then packs them under `config.agent.priorContextTokens` before the ephemeral identity/memory tail and current user message. When unset, the default prior-history budget is 65% of the effective provider/model context window; unknown routed or local models fall back to a conservative 32K window.
 - Packing walks from newest to oldest and preserves chronological order among retained rows. Assistant `tool_calls` rows are atomic with their paired `role:"tool"` results so provider replay never sees orphan tool messages or unanswered calls.
 - For thread replies, rows from the active thread and main chat are preferred before unrelated thread rows. Main-chat turns prefer main-chat rows before thread rows. Legacy rows without thread metadata are treated as main-chat context.
 - When any prior rows are omitted, the prompt gets a fixed `role:"user"` elision note telling the model that older history is still stored and should be retrieved with `recall_memory` or `search_history` when needed.

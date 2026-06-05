@@ -38,7 +38,7 @@ import {
   type ToolCall
 } from "../provider";
 import { uploadDataUrl, uploadStat, sanitizeFilename, readUpload } from "../state/uploads";
-import { resolveProviderModality, type ProviderModality } from "../provider-capabilities";
+import { resolveDefaultPriorContextTokenBudget, resolveProviderModality, type ProviderModality } from "../provider-capabilities";
 import { materializeUpload } from "../capabilities/attachments-materialize-core";
 import { classifyFormat, extractText } from "../capabilities/attachment-extract";
 import {
@@ -61,6 +61,7 @@ import type {
   IdentitySnapshotRecord,
   JobRecord,
   PendingToolCall,
+  ProviderConfig,
   RuntimeConfig,
   RuntimeState,
   SkillRecord,
@@ -105,7 +106,6 @@ import { isSkillActive } from "../integrations/connectors";
 import { getProvider, providerForCredentialName } from "../integrations/connectors/registry";
 import { resolveEffectiveContext } from "./effective-context";
 import {
-  DEFAULT_PRIOR_CONTEXT_TOKEN_BUDGET,
   packPriorContext,
   type ContextReplayMessage,
   type PriorContextPackResult
@@ -140,16 +140,21 @@ function resolveIterationCap(config: RuntimeConfig): { cap: number; warnReason?:
   return { cap: raw };
 }
 
-function resolvePriorContextBudget(config: RuntimeConfig): { budget: number; warnReason?: string } {
+function resolvePriorContextBudget(
+  config: RuntimeConfig,
+  provider: ProviderConfig
+): { budget: number; defaultBudget: number; warnReason?: string } {
+  const defaultBudget = resolveDefaultPriorContextTokenBudget(provider);
   const raw = config.agent?.priorContextTokens;
-  if (raw === undefined) return { budget: DEFAULT_PRIOR_CONTEXT_TOKEN_BUDGET };
+  if (raw === undefined) return { budget: defaultBudget, defaultBudget };
   if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
     return {
-      budget: DEFAULT_PRIOR_CONTEXT_TOKEN_BUDGET,
-      warnReason: `agent.priorContextTokens must be a positive integer; got ${JSON.stringify(raw)}. Using default ${DEFAULT_PRIOR_CONTEXT_TOKEN_BUDGET}.`
+      budget: defaultBudget,
+      defaultBudget,
+      warnReason: `agent.priorContextTokens must be a positive integer; got ${JSON.stringify(raw)}. Using default ${defaultBudget}.`
     };
   }
-  return { budget: raw };
+  return { budget: raw, defaultBudget };
 }
 
 // Add an incremental cost record (from a single model call) into a running
@@ -472,12 +477,12 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   // the model has multi-turn context. Full history stays durable; the replay
   // tail is packed under a soft token budget so a single agent chat can grow
   // indefinitely without forcing every turn to carry the whole transcript.
-  const priorBudget = resolvePriorContextBudget(config);
+  const priorBudget = resolvePriorContextBudget(config, effectiveForAgent.provider);
   if (priorBudget.warnReason) {
     appendTrace(config.instance, taskId, {
       type: "warning",
       message: "Invalid agent.priorContextTokens config; using default.",
-      data: { reason: priorBudget.warnReason, defaultBudget: DEFAULT_PRIOR_CONTEXT_TOKEN_BUDGET }
+      data: { reason: priorBudget.warnReason, defaultBudget: priorBudget.defaultBudget }
     });
   }
   const priorPack = await priorChatMessages(config, task, modality, priorBudget.budget);

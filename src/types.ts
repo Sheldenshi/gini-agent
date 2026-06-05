@@ -271,7 +271,7 @@ export interface RuntimeConfig {
   // Power-user agent budget knobs. Lives under a nested `agent` namespace so
   // future budgets (token cap, wall-clock cap, etc.) can hang off the same
   // object without further config-shape churn. Validated leniently at the
-  // call site — an invalid value falls back to the built-in default.
+  // call site — an invalid value falls back to that knob's default.
   agent?: {
     // Hard cap on chat-task loop iterations (model -> tool -> model cycles).
     // When the cap is hit the loop gracefully produces a tool-less final
@@ -281,7 +281,7 @@ export interface RuntimeConfig {
     // Soft cap for prior chat history replayed into a new chat-task prompt.
     // The full chat remains stored; this bounds only the provider-bound
     // transcript tail. Must be a positive integer; any non-conforming value
-    // falls back to the built-in default.
+    // falls back to the provider-derived default.
     priorContextTokens?: number;
   };
   // Cache warmer interval in minutes. 0 / undefined disables the warmer.
