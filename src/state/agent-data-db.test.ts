@@ -77,6 +77,15 @@ describe("agent-data-db", () => {
     expect(dbQuery(inst, A, "SELECT 1 AS one;").rows[0]!.one).toBe(1);
   });
 
+  test("a write smuggled behind a CTE (WITH … INSERT) is rejected by the read-only connection", () => {
+    const inst = "add-cte-write";
+    dbExecute(inst, A, "CREATE TABLE t (n INTEGER)");
+    dbExecute(inst, A, "INSERT INTO t VALUES (1)");
+    // Begins with WITH (passes the prefix regex) but mutates — must still fail.
+    expect(() => dbQuery(inst, A, "WITH c(x) AS (SELECT 2) INSERT INTO t(n) SELECT x FROM c")).toThrow(AgentDataError);
+    expect(dbQuery(inst, A, "SELECT COUNT(*) AS n FROM t").rows[0]!.n).toBe(1); // unchanged
+  });
+
   test("caps result rows and flags truncation", () => {
     const inst = "add-cap";
     dbExecute(inst, A, "CREATE TABLE big (n INTEGER)");

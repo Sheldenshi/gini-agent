@@ -50,7 +50,13 @@ export const TOOL_RISK: ReadonlyMap<string, RiskLevel> = new Map<string, RiskLev
   // Mirrors the high classification ACTION_RISK gives to
   // browser.fill_secret. The catalog tool name is the
   // underscore-separated form.
-  ["browser_fill_secrets", "high"]
+  ["browser_fill_secrets", "high"],
+  // The agent-database write tool. Its name trips the "exec" substring
+  // heuristic below, but it's a no-approval write to the agent's OWN isolated
+  // sandbox DB (ADR agent-database.md) — like a memory write, not an external
+  // side effect. Pin it low so the ToolRecord risk and the audit
+  // (recordLowRiskAudit) agree. The toolset registers it as "db.execute".
+  ["db.execute", "low"]
   // The self-config direct tools (get_self, list_*, set_provider, use_agent,
   // create_agent, rename_agent) are not listed here: none of their names
   // trip the substring heuristic below, so they correctly seed as "low" at

@@ -37,7 +37,7 @@ db_import  path="uploads/<id>/Connections.csv"  table="contacts"
 
 ## Querying the network (always exhaustive)
 
-Use `db_query` — it returns every matching row. `company` matching should be case-insensitive:
+Use `db_query` — it returns every matching row. Each call runs ONE statement: pass each SQL below to its own `db_query` (reads) or `db_execute` (writes) call. `company` matching should be case-insensitive:
 
 ```sql
 -- Everyone at Google (complete list, not a sample)
@@ -57,38 +57,46 @@ If a result comes back `truncated`, add `LIMIT`/`OFFSET` to page, or aggregate w
 
 ## Tracking who a person is
 
-When the user tells you about someone, write structured fields — find the row by name (or `url` if known) and update it, or insert a new person:
+When the user tells you about someone, write structured fields — find the row by name (or `url` if known) and update it, or insert a new person. Each statement is a separate `db_execute` call:
 
 ```sql
--- Update an existing connection
+-- db_execute: update an existing connection
 UPDATE contacts SET company = 'Stripe', position = 'Head of Eng', location = 'Berlin'
-WHERE first_name = 'Sara' AND last_name = 'Lindqvist';
-
--- Add someone not from the import (add a notes column once if you want free-text color)
-db_execute "ALTER TABLE contacts ADD COLUMN notes TEXT"   -- one-time, ignore error if it exists
+WHERE first_name = 'Sara' AND last_name = 'Lindqvist'
+```
+```sql
+-- db_execute (one-time): add a notes column for free-text color; ignore the error if it already exists
+ALTER TABLE contacts ADD COLUMN notes TEXT
+```
+```sql
+-- db_execute: add someone who wasn't in the import
 INSERT INTO contacts (first_name, last_name, company, position, notes)
-VALUES ('Tom', 'Greco', 'Acme', 'Founder', 'Met at a conference; strong in fintech.');
+VALUES ('Tom', 'Greco', 'Acme', 'Founder', 'Met at a conference; strong in fintech.')
 ```
 
 If the name matches more than one row, show the user the candidates and ask which one before updating.
 
 ## Relationships (who knows whom)
 
-LinkedIn exports don't include who your connections know each other — that comes from the user. Keep edges in their own table and answer graph questions with a JOIN:
+LinkedIn exports don't include who your connections know each other — that comes from the user. Keep edges in their own table and answer graph questions with a JOIN. Run each statement as a separate call (`db_execute` for the first two, `db_query` for the reads):
 
 ```sql
-db_execute "CREATE TABLE IF NOT EXISTS relations (a TEXT, b TEXT, kind TEXT, note TEXT)"
-
--- "Maya and Sam worked together at Amazon"
-INSERT INTO relations (a, b, kind, note) VALUES ('Maya Park', 'Sam Bauer', 'colleague', 'Amazon');
-
--- Who is connected to Maya?
+-- db_execute: create the edges table once
+CREATE TABLE IF NOT EXISTS relations (a TEXT, b TEXT, kind TEXT, note TEXT)
+```
+```sql
+-- db_execute: "Maya and Sam worked together at Amazon"
+INSERT INTO relations (a, b, kind, note) VALUES ('Maya Park', 'Sam Bauer', 'colleague', 'Amazon')
+```
+```sql
+-- db_query: who is connected to Maya?
 SELECT b AS other, kind, note FROM relations WHERE a = 'Maya Park'
-UNION SELECT a, kind, note FROM relations WHERE b = 'Maya Park';
-
--- Mutual connections of two people (who could intro them to each other)
+UNION SELECT a, kind, note FROM relations WHERE b = 'Maya Park'
+```
+```sql
+-- db_query: mutual connections of two people (who could intro them)
 SELECT r1.b AS mutual FROM relations r1 JOIN relations r2 ON r1.b = r2.b
-WHERE r1.a = 'Sam Bauer' AND r2.a = 'Carlos Lindgren';
+WHERE r1.a = 'Sam Bauer' AND r2.a = 'Carlos Lindgren'
 ```
 
 (Use full names consistently, or store each person's `contacts` rowid in `relations` for exactness.)

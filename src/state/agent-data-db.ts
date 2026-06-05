@@ -24,6 +24,10 @@ import { instanceRoot } from "../paths";
 export const MAX_RESULT_ROWS = 1000;
 
 const cache = new Map<string, Database>();
+// Separate read-only handles back db_query. Enforcing read-only at the SQLite
+// connection (not just a regex) closes write vectors a prefix check can miss —
+// e.g. `WITH t AS (…) INSERT …`, which begins with WITH yet mutates.
+const readonlyCache = new Map<string, Database>();
 
 function sanitizeAgentId(agentId: string): string {
   const safe = agentId.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -47,18 +51,39 @@ export function getAgentDataDb(instance: Instance, agentId: string): Database {
   return db;
 }
 
+// A read-only connection to the same per-agent file, opened lazily after the
+// write handle has created the file. Used only by dbQuery.
+function getAgentDataDbReadonly(instance: Instance, agentId: string): Database {
+  const key = `${instance}:${agentId}`;
+  const cached = readonlyCache.get(key);
+  if (cached) return cached;
+  getAgentDataDb(instance, agentId); // ensure the file (and WAL) exist
+  const db = new Database(agentDataDbPath(instance, agentId), { readonly: true });
+  readonlyCache.set(key, db);
+  return db;
+}
+
 export function closeAgentDataDb(instance: Instance, agentId: string): void {
   const key = `${instance}:${agentId}`;
-  const db = cache.get(key);
-  if (!db) return;
-  try { db.close(); } catch { /* already closed */ }
-  cache.delete(key);
+  for (const map of [cache, readonlyCache]) {
+    const db = map.get(key);
+    if (db) {
+      try { db.close(); } catch { /* already closed */ }
+      map.delete(key);
+    }
+  }
 }
 
 export function closeAllAgentDataDbs(): void {
-  for (const [key, db] of cache) {
-    try { db.close(); } catch { /* already closed */ }
-    cache.delete(key);
+  for (const map of [cache, readonlyCache]) {
+    // Snapshot keys first — deleting from a Map mid-iteration can skip entries.
+    for (const key of [...map.keys()]) {
+      const db = map.get(key);
+      if (db) {
+        try { db.close(); } catch { /* already closed */ }
+      }
+      map.delete(key);
+    }
   }
 }
 
@@ -92,12 +117,35 @@ function assertNoEscape(sql: string): void {
   }
 }
 
-// Drop a single trailing semicolon, then reject if any statement separator
+// True when `sql` holds more than one statement: a `;` outside any string
+// literal with non-whitespace after it. Quote-aware so a literal semicolon
+// (e.g. INSERT … VALUES (';')) is NOT mistaken for a separator.
+function hasStatementSeparator(sql: string): boolean {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i];
+    if (inSingle) {
+      if (c === "'") { if (sql[i + 1] === "'") { i++; continue; } inSingle = false; }
+      continue;
+    }
+    if (inDouble) {
+      if (c === '"') { if (sql[i + 1] === '"') { i++; continue; } inDouble = false; }
+      continue;
+    }
+    if (c === "'") { inSingle = true; continue; }
+    if (c === '"') { inDouble = true; continue; }
+    if (c === ";" && sql.slice(i + 1).trim().length > 0) return true;
+  }
+  return false;
+}
+
+// Drop a single trailing semicolon, then reject if a real statement separator
 // remains — db_query and db_execute each run ONE statement so a query can't
 // smuggle a second (write) statement past the read-only gate.
 function singleStatement(sql: string): string {
   const trimmed = sql.trim().replace(/;\s*$/, "");
-  if (trimmed.includes(";")) {
+  if (hasStatementSeparator(trimmed)) {
     throw new AgentDataError("Only one SQL statement per call. Split multiple statements into separate calls.");
   }
   return trimmed;
@@ -116,7 +164,9 @@ export function dbQuery(
   if (!/^\s*(select|with|pragma\s+table_info|pragma\s+table_list)\b/i.test(stmt)) {
     throw new AgentDataError("db_query is read-only — it accepts SELECT / WITH. Use db_execute for writes or DDL.");
   }
-  const db = getAgentDataDb(instance, agentId);
+  // Run on the read-only connection so even a write smuggled behind a CTE
+  // (WITH … INSERT) fails at the engine rather than relying on the regex.
+  const db = getAgentDataDbReadonly(instance, agentId);
   let all: Array<Record<string, unknown>>;
   try {
     all = db.query(stmt).all(...(params as never[])) as Array<Record<string, unknown>>;
