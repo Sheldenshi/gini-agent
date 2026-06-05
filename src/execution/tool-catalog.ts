@@ -292,6 +292,23 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
+    // Read-only clock. CORE and always-on (never deferred): "what time is it"
+    // must never fail because a toolset is off, and unlike terminal `date` this
+    // carries no approval/audit weight (terminal_exec is high-risk → gated). The
+    // system prefix already states today's DATE at day granularity (cache-stable);
+    // this tool supplies the precise wall-clock TIME on demand, which can't live
+    // in the cached prefix because it changes every minute. See ADR
+    // stable-system-prefix.md.
+    toolset: "core",
+    displayLabel: "Current time",
+    type: "function",
+    function: {
+      name: "get_current_time",
+      description: "Return the current wall-clock date and time (local timezone, plus UTC). Read-only, no side effects. Use whenever you need the exact current time — answering 'what time is it', computing a relative time like 'in 30 minutes', or timestamping something. The system prompt already gives today's date; call this for the precise time of day.",
+      parameters: { type: "object", properties: {} }
+    }
+  },
+  {
     toolset: "browser",
     displayLabel: "Open page",
     type: "function",
@@ -1798,6 +1815,11 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // deferred; the agent needs it on every turn to branch multi-turn work
     // into a thread regardless of which toolsets are enabled.
     if (tool.function.name === "start_thread") return true;
+    // get_current_time is the always-on read-only clock. Like load_tools /
+    // start_thread it lives on `core` (not a legacy default toolset); the model
+    // must be able to answer "what time is it" on any instance regardless of
+    // which toolsets are enabled, and it has no side effects to gate.
+    if (tool.function.name === "get_current_time") return true;
     // Always expose read_skill so the model can load any enabled skill the
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh

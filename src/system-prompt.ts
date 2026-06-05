@@ -227,6 +227,54 @@ export function renderEphemeralContext(emittedIdentity?: string, recalledContext
   return parts.join("\n\n");
 }
 
+// Date-only line for the byte-stable system prefix (message 0). DATE
+// granularity — not a timestamp — is the load-bearing choice: it keeps
+// message 0 byte-identical across every turn within a local calendar day,
+// so the automatic prefix cache stays warm; it rolls at most once per day.
+// Anchoring the model on the real date stops it hallucinating the year from
+// its training cutoff (the most common, silent failure). Precise wall-clock
+// time is deliberately NOT here — it changes every minute and would bust the
+// day-stable prefix — so the get_current_time tool serves it on demand.
+// See ADR stable-system-prefix.md.
+export function buildCurrentDateBlock(now: Date, timeZone: string): string {
+  const date = now.toLocaleDateString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone
+  });
+  return `Current date: ${date} (${timeZone}). For the exact current wall-clock time, call get_current_time.`;
+}
+
+// Structured, unambiguous current-time string returned by the
+// get_current_time tool. Leads with the user's local wall clock (what
+// "what time is it" asks for) and appends the absolute UTC ISO for a
+// machine-precise, timezone-independent reference.
+export function buildCurrentTimeResult(now: Date, timeZone: string): string {
+  const human = now.toLocaleString("en-US", {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZoneName: "short",
+    timeZone
+  });
+  return `${human} (${timeZone}). UTC: ${now.toISOString()}`;
+}
+
+// Resolve the runtime's IANA timezone (e.g. "America/Los_Angeles"). The
+// gateway runs on the user's machine, so this is the user's wall-clock zone.
+// Single-sourced so the cacheable date block and the get_current_time tool
+// always agree on the zone. Falls back to UTC if the runtime returns nothing
+// (the spec requires a canonical name, so this guard is belt-and-suspenders).
+export function resolveLocalTimeZone(): string {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
 function describeToolsets(toolsets: string[]): string {
   return toolsets.length > 0 ? toolsets.join(", ") : "(none)";
 }

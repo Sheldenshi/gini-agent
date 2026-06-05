@@ -35,6 +35,7 @@ import { resolveApprovalPolicy, type PolicyAction } from "./policy";
 import { createScheduledJob, listJobs, removeJob, runJobNow, updateJob, updateJobStatus } from "../jobs";
 import { findSelfOperation } from "./self-registry";
 import { isDeferredToolName } from "./tool-catalog";
+import { buildCurrentTimeResult, resolveLocalTimeZone } from "../system-prompt";
 import { recall } from "../memory";
 import {
   dedupeAppendLines,
@@ -141,6 +142,13 @@ export async function dispatchToolCall(
       return { kind: "sync", result: await fileSearch(config, taskId, args) };
     case "web_fetch":
       return { kind: "sync", result: await webFetchTool(config, taskId, args) };
+    case "get_current_time":
+      // Pure read of the runtime clock — no state, no side effects, no approval.
+      // Same tz resolution as the cacheable date block (shared helper).
+      return {
+        kind: "sync",
+        result: buildCurrentTimeResult(new Date(), resolveLocalTimeZone())
+      };
     case "web_search":
       return { kind: "sync", result: await webSearchTool(config, taskId, args) };
     case "read_skill":

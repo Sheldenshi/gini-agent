@@ -88,6 +88,9 @@ const ALWAYS_ON = new Set([
   // The agent-decided threading control tool. Toolset "core"; always-on so
   // the model can branch any turn into a thread. Never deferred itself.
   "start_thread",
+  // Always-on read-only clock on the `core` toolset (not in defaults); the
+  // model must be able to answer "what time is it" regardless of toolset state.
+  "get_current_time",
   "read_skill",
   "spawn_subagent",
   "create_job",

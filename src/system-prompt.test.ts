@@ -12,6 +12,8 @@ import {
   USER_SOFT_CAP_CHARS,
   __resetDefaultGiniInstructionsCacheForTest,
   buildAgentSystemContext,
+  buildCurrentDateBlock,
+  buildCurrentTimeResult,
   decideIdentityEmission,
   getDefaultGiniInstructions,
   identityBudgetState,
@@ -273,6 +275,33 @@ describe("renderEphemeralContext", () => {
   test("returns an empty string when both pieces are empty", () => {
     expect(renderEphemeralContext(undefined, undefined)).toBe("");
     expect(renderEphemeralContext("", "   ")).toBe("");
+  });
+});
+
+describe("current date/time helpers", () => {
+  // A fixed instant: 2026-06-05T01:23:45Z = 2026-06-04 18:23:45 in America/Los_Angeles (PDT, UTC-7).
+  const instant = new Date("2026-06-05T01:23:45.000Z");
+  const tz = "America/Los_Angeles";
+
+  test("buildCurrentDateBlock renders date-only with timezone and points at the tool", () => {
+    const out = buildCurrentDateBlock(instant, tz);
+    expect(out).toBe(
+      "Current date: Thursday, June 4, 2026 (America/Los_Angeles). For the exact current wall-clock time, call get_current_time."
+    );
+    // Date granularity only — no clock time leaks into the cacheable prefix line.
+    expect(out).not.toMatch(/\d{1,2}:\d{2}/);
+  });
+
+  test("buildCurrentTimeResult leads with local wall clock and appends UTC ISO", () => {
+    const out = buildCurrentTimeResult(instant, tz);
+    expect(out).toContain("Thursday, June 4, 2026");
+    // Localized separator before AM/PM and the tz abbreviation spelling vary by
+    // ICU build, so pin robust substrings rather than an exact full string.
+    expect(out).toMatch(/6:23:45/);
+    expect(out).toContain("PM");
+    expect(out).toMatch(/PDT|GMT-7|GMT-07/);
+    expect(out).toContain("America/Los_Angeles");
+    expect(out).toContain("UTC: 2026-06-05T01:23:45.000Z");
   });
 });
 

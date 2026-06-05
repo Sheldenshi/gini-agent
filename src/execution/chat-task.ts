@@ -46,6 +46,8 @@ import {
   USER_SOFT_CAP_CHARS,
   buildAgentSystemContext,
   buildBoundJobsBlock,
+  buildCurrentDateBlock,
+  resolveLocalTimeZone,
   decideIdentityEmission,
   identityBudgetState,
   renderEphemeralContext,
@@ -427,7 +429,15 @@ export async function runChatTask(config: RuntimeConfig, taskId: string): Promis
   const alreadyLoaded = new Set<string>(task.loadedTools ?? []);
   if (subagent) seedSubagentDeferred(deferredCatalog, subagent, alreadyLoaded);
   const deferredBlock = buildDeferredToolsBlock(deferredToolIndex(deferredCatalog, alreadyLoaded));
-  const sections = [baseSystem];
+  // Stamp today's date (date granularity, local timezone) into the byte-stable
+  // system prefix. Date-only keeps message 0 byte-identical across turns within
+  // a calendar day so the prefix cache stays warm; precise time lives in the
+  // get_current_time tool. Covers subagents too (they share this sections array).
+  // See ADR stable-system-prefix.md.
+  const sections = [
+    baseSystem,
+    buildCurrentDateBlock(new Date(), resolveLocalTimeZone())
+  ];
   if (skillsBlock) sections.push(skillsBlock);
   if (inactiveSkillsBlock) sections.push(inactiveSkillsBlock);
   if (mcpServersBlock) sections.push(mcpServersBlock);

@@ -1605,3 +1605,16 @@ describe("web_search dispatch", () => {
     expect(err.displaySeverity).toBe("info");
   });
 });
+
+describe("get_current_time dispatch", () => {
+  test("get_current_time returns the current wall-clock time with a UTC ISO", async () => {
+    const instance = `get-time-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance);
+    const taskId = await newTask(config);
+    const res = await dispatchToolCall(config, taskId, "get_current_time", "call_time", "{}");
+    expect(res.kind).toBe("sync");
+    if (res.kind !== "sync") throw new Error("expected sync");
+    expect(res.result).toMatch(/UTC: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    expect(res.result).toMatch(/\b20\d{2}\b/); // a real year, not a guess
+  });
+});
