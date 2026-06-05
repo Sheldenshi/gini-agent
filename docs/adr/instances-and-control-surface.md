@@ -40,7 +40,8 @@ Pinning `default` to fixed memorable ports lets `gini start` produce a stable UR
   clean `exit 0` from an auto-update self-restart), so `gini stop`
   unloads them via `launchctl bootout` rather than relying on a clean
   exit. The watchdog covers the gaps KeepAlive can't — a
-  wedged-but-alive process and a launchd-deferred respawn. Provider
+  wedged-but-alive process, a launchd-deferred respawn, and a deregistered
+  core service it re-bootstraps via `autostart enable`. Provider
   secrets from `~/.gini/secrets.env` are merged into the gateway plist's
   `EnvironmentVariables` only — the web BFF never invokes a provider
   directly, so it gets none. Subcommands `gini autostart

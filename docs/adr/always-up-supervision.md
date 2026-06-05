@@ -44,11 +44,19 @@ The model rests on four pieces:
   the gateway (`/api/status`, where any HTTP response — including a 401 —
   proves the process is answering) and the web child
   (`/api/runtime/__healthz`, verified to be *our* `gini-web` on the
-  matching instance), and `launchctl kickstart -k`s whichever is dead or
-  hung. This covers the two gaps pure KeepAlive cannot: a
-  hung-but-alive process (KeepAlive only reacts to exit) and a clean exit
-  that launchd defers respawning (observed on macOS 26, where auto-respawn
-  after a SIGKILL frequently pends indefinitely).
+  matching instance), and revives whichever is down: a service launchd
+  still has registered is `launchctl kickstart -k`ed, while a *core*
+  service launchd has **deregistered** is re-bootstrapped via `autostart
+  enable` (kickstart is a no-op on a label launchd no longer knows, and
+  KeepAlive can't respawn a service that isn't registered). This covers the
+  three gaps pure KeepAlive cannot: a hung-but-alive process (KeepAlive only
+  reacts to exit); a clean exit that launchd defers respawning (observed on
+  macOS 26, where auto-respawn after a SIGKILL frequently pends
+  indefinitely); and a deregistered service — e.g. a plist reload whose
+  `bootout` succeeded but whose `bootstrap` lost the launchd I/O-error race —
+  which would otherwise stay down with nothing to revive it. Re-bootstrap
+  only fires under launchd supervision, so a manual foreground `gini
+  watchdog` never creates plists.
 
 Installed plists are reconciled to the current template on startup, so a
 runtime version update propagates supervision-template changes to *existing*
