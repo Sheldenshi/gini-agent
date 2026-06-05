@@ -76,6 +76,24 @@ export type {
   UpdateBankInput
 } from "./memory-db";
 export {
+  getContact,
+  findContactByUrl,
+  findContactByEmail,
+  findContactsByName,
+  insertContact,
+  updateContact,
+  upsertContactByKey,
+  queryContacts,
+  countContacts,
+  countAllContacts,
+  companyBreakdown,
+  deleteContact,
+  upsertRelation,
+  relationsFor,
+  mutualConnections
+} from "./contacts-db";
+export type { Contact, ContactInput, ContactQuery, ContactRelation } from "./contacts-db";
+export {
   storeUpload,
   readUpload,
   uploadDataUrl,

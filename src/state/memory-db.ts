@@ -57,7 +57,15 @@ import { id, now } from "./ids";
 // columns through CREATE TABLE; existing installs add them via additive
 // ensureColumn calls. The (session_id, thread_id, ordinal) index covers
 // thread playback; the existing UNIQUE(session_id, ordinal) is untouched.
-export const MEMORY_SCHEMA_VERSION = 9;
+//
+// Bumped to 10 for the people-CRM contacts store (ADR people-crm-store.md):
+// adds `contacts` and `contact_relations` tables used by
+// src/state/contacts-db.ts. These are a structured, exhaustively-queryable
+// record store deliberately kept SEPARATE from the ranked/top-K Hindsight
+// memory in the same DB — contact rows are filtered with plain SQL WHERE and
+// returned in full (cursor-paginated), never reranked or token-budget-capped.
+// Scoped by agent_id to match the per-agent memory namespace.
+export const MEMORY_SCHEMA_VERSION = 10;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -450,6 +458,64 @@ function applyMigrations(db: Database): void {
   // every cursor and over-counting unread badges across the install
   // base on first launch.
   ensureChatReadStateDeviceTokenSchema(db);
+
+  // Step 7 — people-CRM contacts store (schema version 10). See ADR
+  // people-crm-store.md. Two tables, both scoped by agent_id (the per-agent
+  // memory namespace), living alongside Hindsight in the same memory.db but
+  // serving the opposite access pattern: exhaustive structured queries
+  // (WHERE / COUNT / return-all), never ranked recall. `linkedin_url` is the
+  // stable dedup identity key; the partial UNIQUE index enforces one row per
+  // (agent, profile URL) while leaving rows without a URL unconstrained
+  // (LinkedIn exports often omit it). Column indexes on the common filter
+  // axes (company, location, last_name) keep "all people at X" a fast index
+  // scan rather than a table scan. Free-text "find" falls back to LIKE over
+  // the same columns — exhaustive substring match, no top-K. metadata holds
+  // open attributes; promote one to a column when it needs to be filtered on.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT,
+      full_name TEXT NOT NULL,
+      first_name TEXT,
+      last_name TEXT,
+      company TEXT,
+      title TEXT,
+      location TEXT,
+      email TEXT,
+      linkedin_url TEXT,
+      connected_at TEXT,
+      source TEXT NOT NULL DEFAULT 'manual',
+      notes TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contacts_agent ON contacts(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_contacts_agent_company ON contacts(agent_id, company);
+    CREATE INDEX IF NOT EXISTS idx_contacts_agent_location ON contacts(agent_id, location);
+    CREATE INDEX IF NOT EXISTS idx_contacts_agent_lastname ON contacts(agent_id, last_name);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_agent_linkedin
+      ON contacts(agent_id, linkedin_url)
+      WHERE linkedin_url IS NOT NULL AND linkedin_url <> '';
+
+    -- Person-to-person edges: "people I know who also know each other".
+    -- LinkedIn exports carry no 2nd-degree data, so edges come from the user
+    -- ("Alice and Bob worked together") or agent inference. Both endpoints
+    -- reference contacts; ON DELETE CASCADE drops dangling edges. The
+    -- to_contact_id index covers reverse traversal (who points at X).
+    CREATE TABLE IF NOT EXISTS contact_relations (
+      agent_id TEXT,
+      from_contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+      to_contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+      relation_type TEXT NOT NULL DEFAULT 'knows',
+      note TEXT,
+      source TEXT,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (from_contact_id, to_contact_id, relation_type)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_relations_to ON contact_relations(to_contact_id);
+    CREATE INDEX IF NOT EXISTS idx_contact_relations_agent ON contact_relations(agent_id);
+  `);
 
   db.run(
     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
