@@ -145,9 +145,20 @@ function unquote(s: string): string {
   return s;
 }
 
+// How many leading lines a stripped frontmatter block consumed, so
+// body-relative link line numbers can be reported file-relative.
+function frontmatterOffset(text: string, body: string): number {
+  return text.replace(/\r\n/g, "\n").split("\n").length - body.split("\n").length;
+}
+
 // Extract [[wikilinks]] with line numbers. Handles [[Target]],
 // [[Target|alias]], [[Target#section]]. Ignores links inside fenced code.
-function extractLinks(body: string): Array<{ targetRaw: string; targetSlug: string; line: number }> {
+// `lineOffset` is added to each line so a body parsed after a stripped
+// frontmatter block still reports file-relative line numbers.
+function extractLinks(
+  body: string,
+  lineOffset = 0
+): Array<{ targetRaw: string; targetSlug: string; line: number }> {
   const links: Array<{ targetRaw: string; targetSlug: string; line: number }> = [];
   const lines = body.split("\n");
   let inFence = false;
@@ -168,7 +179,7 @@ function extractLinks(body: string): Array<{ targetRaw: string; targetSlug: stri
       if (hash >= 0) target = target.slice(0, hash);
       target = target.trim();
       if (!target) continue;
-      links.push({ targetRaw: target, targetSlug: slugify(target), line: i + 1 });
+      links.push({ targetRaw: target, targetSlug: slugify(target), line: i + 1 + lineOffset });
     }
   }
   return links;
@@ -249,7 +260,7 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
     if (lowerName === "index.md") {
       hasIndex = true;
       const { body } = splitFrontmatter(text);
-      indexLinks = extractLinks(body);
+      indexLinks = extractLinks(body, frontmatterOffset(text, body));
       continue;
     }
     if (SPECIAL_FILES.has(lowerName) && !rel.includes(sep)) continue; // log.md, readme.md at root
@@ -262,7 +273,7 @@ export function lintWiki(wikiRoot: string, rootLabel: string, opts: LintOptions 
       filename: basename(file),
       fm: fm === null ? null : parseFrontmatter(fm),
       bodyLines: body.split("\n").length,
-      links: extractLinks(body)
+      links: extractLinks(body, frontmatterOffset(text, body))
     });
   }
 

@@ -94,6 +94,45 @@ describe("lintWiki: link integrity", () => {
       expect(r.counts.brokenLinks).toBe(1);
       expect(r.brokenLinks[0]!.target).toBe("ghost-page");
       expect(r.brokenLinks[0]!.from).toBe(join("pages", "alpha.md"));
+      // line is file-relative (frontmatter offset included), not body-relative.
+      // alpha.md: 8 frontmatter lines, then "# Alpha", blank, "Body.", blank,
+      // "## Links", "- [[beta]]", "- [[ghost-page]]" → ghost on file line 15.
+      expect(r.brokenLinks[0]!.line).toBe(15);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores [[links]] inside fenced code blocks", () => {
+    const root = tempWiki();
+    try {
+      write(root, "index.md", "# Index\n\n- [[alpha]]\n- [[beta]]\n");
+      write(
+        root,
+        "pages/alpha.md",
+        [
+          "---",
+          "title: Alpha",
+          "created: 2026-01-01",
+          "updated: 2026-01-01",
+          "type: entity",
+          "tags: [models]",
+          "sources: [raw/x.md]",
+          "---",
+          "",
+          "# Alpha",
+          "",
+          "Links: [[beta]] and [[index]].",
+          "",
+          "```",
+          "this [[ghost-in-code]] must not count as a link",
+          "```",
+          ""
+        ].join("\n")
+      );
+      write(root, "pages/beta.md", page({ title: "Beta", links: ["alpha", "index"] }));
+      const r = lintWiki(root, "wiki");
+      expect(r.counts.brokenLinks).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
