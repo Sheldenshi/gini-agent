@@ -1232,6 +1232,12 @@ export interface EmailWatcherRecord {
   lastSeenInternalDate?: string;
   // Dedicated chat session the woken turn posts its proposed reply into.
   chatSessionId?: string;
+  // Backing scheduled job that drives this watcher (interval-driven cron job
+  // with a `gmail-delta` preRunHook bound to `chatSessionId`). The job is the
+  // scheduler; the watcher is the durable detection identity. Optional only for
+  // legacy/hand-edited rows; the startup backfill provisions a job for any
+  // enabled watcher missing a resolvable jobId. See ADR job-pre-run-hooks.md.
+  jobId?: string;
   enabled: boolean;
   status: EmailWatcherStatus;
   // Scrubbed last-error message when status === "error".
@@ -1460,6 +1466,25 @@ export interface SkillVersion {
   requiredPermissions: string[];
 }
 
+// Pre-LLM job hook config (ADR job-pre-run-hooks.md). When set on a JobRecord,
+// the scheduler runs this hook AFTER the run is claimed but BEFORE any model
+// turn. The hook resolves a TRUSTED in-tree handler by `handlerId` from the
+// registry at run time and feeds it the declarative `config` DATA — the model /
+// user never supplies executable code, only a registry key + data.
+export interface JobPreRunHookConfig {
+  // Registry id of a trusted in-tree handler. v1: "gmail-delta". Rejected at
+  // job-create time and treated as an error at run time when not in the
+  // registry.
+  handlerId: string;
+  // Declarative, handler-specific configuration validated by the handler.
+  // For gmail-delta: { watcherId: string }.
+  config: Record<string, unknown>;
+  // Per-hook wall-clock budget. Defaults to PRE_RUN_HOOK_DEFAULT_TIMEOUT_MS
+  // (30s) — the pre-LLM path is on the critical path to the model, so it gets
+  // Claude Code's tight UserPromptSubmit budget, not the 600s job budget.
+  timeoutMs?: number;
+}
+
 export interface JobRecord {
   id: string;
   instance: Instance;
@@ -1469,6 +1494,11 @@ export interface JobRecord {
   name: string;
   prompt: string;
   script?: string;
+  // Pre-LLM hook. When set, runDueJobs/runJobNow run this BEFORE dispatching
+  // the model turn. Its typed result either short-circuits the run (no model
+  // turn), injects fenced untrusted context into the drafting turn, or fails
+  // the run. See ADR job-pre-run-hooks.md.
+  preRunHook?: JobPreRunHookConfig;
   // Interval-driven schedule. Optional — cron-driven jobs (cronExpression
   // set) carry no intervalSeconds at all. Exactly one of (intervalSeconds,
   // cronExpression) is the active driver per job. The pair is validated

@@ -1,36 +1,33 @@
-// Gmail poll worker — the thin deterministic detection floor of the
-// email-watch feature (ADR email-watch.md).
+// Gmail delta engine — the thin deterministic detection floor of the
+// email-watch feature (ADR email-watch.md, ADR job-pre-run-hooks.md).
 //
-// One tick polls `gws` for new matching message ids per enabled watcher,
-// dedups against the email_seen store, applies a deterministic safety
-// floor (drop automated senders + self), and on each surviving NEW match
-// wakes an agent turn (submitTask mode:"chat") in the watcher's dedicated
-// chat session. The woken agent reads the full message + composes/sends a
-// reply via the EXISTING google-gmail skill — this worker reads ONLY
-// metadata (From/Subject/Date/snippet) and never message bodies.
+// `processWatcher` polls `gws` for new matching message ids for ONE watcher,
+// dedups against the email_seen store, applies a deterministic safety floor
+// (drop automated senders + self), and COLLECTS a fenced draft prompt per
+// surviving NEW match (returning them to the caller) — it reads ONLY metadata
+// (From/Subject/Date/snippet), never message bodies. The `gmail-delta` pre-run
+// hook (src/jobs/hooks/gmail-delta.ts) drives it: zero collected prompts =>
+// short-circuit (no model turn); one or more => the drafting turn runs with the
+// fenced matches injected as context.
 //
-// Modeled on src/jobs/connector-reprobe.ts (cheap periodic maintenance the
-// runtime owns directly, no model turn when there's nothing new) and the
-// messaging pollers (watermark dedup + submitTask-per-new-item + error/
-// disable handling). The gws subprocess boundary is injectable so unit
-// tests stub it without spawning a child.
+// The gws subprocess boundary is injectable so unit tests stub it without
+// spawning a child.
 
 import { spawn } from "bun";
 import { createHash } from "node:crypto";
 import type { EmailWatcherRecord, RuntimeConfig } from "../types";
-import { appendLog, markEmailSeen, isEmailSeen, mutateState, now, readState, updateEmailWatcher } from "../state";
-import { gwsSessionStatus, type GwsSessionStatus } from "./connectors/gws-session";
-import { submitTask } from "../agent";
+import { appendLog, markEmailSeen, isEmailSeen, now, updateEmailWatcher } from "../state";
 
 // Bound the gws spawn. A `messages list` / `messages get` is a single Gmail
 // API round-trip — sub-second in practice. Cap it so a wedged child, a slow
 // `zsh -lc` profile, or a token-refresh network stall can't pin the tick.
 const SPAWN_TIMEOUT_MS = 15_000;
 
-// Cap the TURNS woken per watcher per tick. A fully-enumerated (non-truncated)
-// window is drained oldest-first, but only up to this many agent turns in a
-// single tick; the rest drain over successive ticks as the cursor advances.
-// Caps the catch-up burst so one watcher can't wake hundreds of turns at once.
+// Cap the draft prompts collected per watcher per tick. A fully-enumerated
+// (non-truncated) window is drained oldest-first, but only up to this many
+// matches in a single tick; the rest drain over successive ticks as the cursor
+// advances. Caps the catch-up burst so one tick can't inject hundreds of fenced
+// matches into a single drafting turn.
 const MAX_MESSAGES_PER_TICK = 25;
 
 // Per-page result size for the paginated window list. Combined with
@@ -42,9 +39,9 @@ const WINDOW_PAGE_SIZE = 100;
 // Max pages `--page-all` walks per tick. gws stops after this many pages even
 // if more remain (the last page then still carries a nextPageToken). When this
 // cap is hit the window can't be enumerated oldest-first (the older tail isn't
-// listed), so the worker baselines past it with a single notice turn rather
-// than draining — see processWatcher. We log when the cap is hit. Exported so
-// the truncated-window test can build a page-cap-hit response in sync.
+// listed), so processWatcher baselines past it with a single notice prompt
+// rather than draining. We log when the cap is hit. Exported so the
+// truncated-window test can build a page-cap-hit response in sync.
 export const WINDOW_PAGE_LIMIT = 10;
 
 // Metadata the worker reads for the safety floor + the woken-turn prompt.
@@ -63,29 +60,11 @@ export interface EmailMetadata {
 // Tests pass a stub to avoid spawning a child.
 export type GwsSpawn = (args: string[]) => Promise<string>;
 
-export interface GmailPollDeps {
-  gwsSpawn?: GwsSpawn;
-  sessionStatus?: () => Promise<GwsSessionStatus>;
-  // Test seam: override "me" resolution so a stub never shells getProfile.
-  resolveSelfEmail?: () => Promise<string | undefined>;
-  // Test seam: override the turn-spawn so unit tests can assert "triggered
-  // exactly once" without spawning a real model turn. Production leaves it
-  // unset and the worker calls submitTask directly.
-  spawnTurn?: (watcher: EmailWatcherRecord, prompt: string) => Promise<void>;
-}
-
-export interface GmailPollReport {
-  considered: number;
-  polled: number;
-  triggered: number;
-  seeded: number;
-}
-
 // Default gws spawn: `zsh -lc "gws ..."`, stdin ignored, kill-on-timeout,
 // inheriting process.env — the exact shape gws-session.ts uses for
 // `gws auth status`. The args are joined with spaces; callers single-quote
 // the JSON --params themselves (see buildListArgs / buildGetArgs).
-async function defaultGwsSpawn(args: string[]): Promise<string> {
+export async function defaultGwsSpawn(args: string[]): Promise<string> {
   const proc = spawn(["zsh", "-lc", `gws ${args.join(" ")}`], {
     stdin: "ignore",
     stdout: "pipe",
@@ -352,7 +331,7 @@ export function buildBacklogNoticePrompt(watcher: EmailWatcherRecord): string {
 // the self-message drop. Best-effort: returns undefined on any failure so a
 // missing profile just disables the self-drop (the automated-sender drop and
 // the watcher's own `from:` query still bound what reaches a turn).
-async function resolveSelfEmail(gwsSpawn: GwsSpawn): Promise<string | undefined> {
+export async function resolveSelfEmail(gwsSpawn: GwsSpawn): Promise<string | undefined> {
   try {
     const out = await gwsSpawn(["gmail", "users", "getProfile", "--params", jsonParam({ userId: "me" })]);
     const doc = parseGwsJson(out);
@@ -372,39 +351,40 @@ async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number
   return Number.isFinite(internalDate) && internalDate > 0 ? internalDate : 0;
 }
 
-// Process one watcher. Three regimes, all governed by the fact that the `after:`
-// watermark only ever moves FORWARD (to newer mail): you can never reach an
-// older, un-listed tail by advancing it, so a path that needs the tail is wrong.
+// Process one watcher. Returns the draft prompts the caller should inject into
+// the drafting turn (empty => the caller short-circuits with no model turn).
+// Three regimes, all governed by the fact that the `after:` watermark only ever
+// moves FORWARD (to newer mail): you can never reach an older, un-listed tail by
+// advancing it, so a path that needs the tail is wrong.
 //
 //  1. SEEDING (no lastSeenInternalDate): BASELINE only. Take the newest listed
 //     id (Gmail lists newest-first => window.ids[0]), fetch ITS internalDate,
 //     set the cursor there, markSeen that boundary id plus any sibling sharing
 //     its exact epoch second (Gmail's `after:` is inclusive of the boundary
-//     second), and wake NO turn. Pre-existing mail older than the baseline is
-//     excluded by `after:` forever — the correct behavior (never draft a
+//     second), and collect NO prompt. Pre-existing mail older than the baseline
+//     is excluded by `after:` forever — the correct behavior (never draft a
 //     backlog), regardless of inbox size.
 //
 //  2. STEADY-STATE, window NOT truncated (fully enumerated, <= the page cap):
-//     drain OLDEST-FIRST, cap the TURNS woken at MAX_MESSAGES_PER_TICK, advance
-//     the cursor ONCE to the LAST CONSUMED item's internalDate. A >cap backlog
-//     drains over successive ticks without ever stepping past an un-consumed
-//     match. Crash safety is the email_seen store (markSeen committed per item),
-//     not the cursor — a crash mid-batch re-lists the window and dedup skips
-//     whatever was already handled.
+//     drain OLDEST-FIRST, cap the matches collected at MAX_MESSAGES_PER_TICK,
+//     advance the cursor ONCE to the LAST CONSUMED item's internalDate. A >cap
+//     backlog drains over successive ticks without ever stepping past an
+//     un-consumed match. Crash safety is the email_seen store (markSeen
+//     committed per item), not the cursor — a crash mid-batch re-lists the
+//     window and dedup skips whatever was already handled.
 //
 //  3. STEADY-STATE, window TRUNCATED (pageLimitHit: > the page cap of genuinely
 //     -new matches, only reachable after downtime + high volume): the older
 //     tail isn't listed, so oldest-first draining would silently skip it. Don't
 //     draft the backlog and don't skip it silently — jump the cursor to the
-//     NEWEST, markSeen that boundary id, and wake exactly ONE notice turn so the
-//     user is told a backlog accumulated.
-async function processWatcher(
+//     NEWEST, markSeen that boundary id, and collect exactly ONE notice prompt
+//     so the user is told a backlog accumulated.
+export async function processWatcher(
   config: RuntimeConfig,
   watcher: EmailWatcherRecord,
   gwsSpawn: GwsSpawn,
-  selfEmail: string | undefined,
-  spawnTurn: (watcher: EmailWatcherRecord, prompt: string) => Promise<void>
-): Promise<{ triggered: number; seeded: boolean }> {
+  selfEmail: string | undefined
+): Promise<{ prompts: string[]; seeded: boolean }> {
   // Bound the query with `after:<epochSec>` once we have a watermark so we
   // don't re-list the whole unread history every tick. Gmail's `after:`
   // takes epoch seconds.
@@ -452,7 +432,7 @@ async function processWatcher(
       status: "ok",
       lastError: undefined
     });
-    return { triggered: 0, seeded: true };
+    return { prompts: [], seeded: true };
   }
 
   // Regime 3: TRUNCATED steady-state window — the older tail isn't listed, so a
@@ -462,7 +442,7 @@ async function processWatcher(
   if (window.pageLimitHit) {
     const newest = window.ids[0];
     let cursor: string | undefined;
-    let triggered = 0;
+    const prompts: string[] = [];
     if (newest) {
       const internalDate = await fetchInternalDate(gwsSpawn, newest);
       // Always advance the cursor (mirror seeding's fallback): if a transient
@@ -476,8 +456,7 @@ async function processWatcher(
       const noticeNeeded = !isEmailSeen(config.instance, watcher.id, newest);
       markEmailSeen(config.instance, watcher.id, newest);
       if (noticeNeeded) {
-        await spawnTurn(watcher, buildBacklogNoticePrompt(watcher));
-        triggered = 1;
+        prompts.push(buildBacklogNoticePrompt(watcher));
       }
     }
     appendLog(config.instance, "email.watch.page_limit", {
@@ -491,7 +470,7 @@ async function processWatcher(
       status: "ok",
       lastError: undefined
     });
-    return { triggered, seeded: false };
+    return { prompts, seeded: false };
   }
 
   // Regime 2: fully-enumerated steady-state window. Gmail returns newest-first;
@@ -499,21 +478,21 @@ async function processWatcher(
   // older, un-consumed match.
   const ids = window.ids.slice().reverse();
 
-  // The internalDate of the LAST item we consumed (woke a turn for, or dropped).
-  // The cursor advances to exactly this at the end — never past an item we
-  // stopped before.
+  // The internalDate of the LAST item we consumed (collected a prompt for, or
+  // dropped). The cursor advances to exactly this at the end — never past an
+  // item we stopped before.
   let lastConsumedInternalDate = 0;
-  let triggered = 0;
+  const prompts: string[] = [];
 
   for (const id of ids) {
     // Already handled in a prior tick — skip without re-fetching metadata. It's
     // behind the current watermark, so it doesn't move lastConsumedInternalDate.
     if (isEmailSeen(config.instance, watcher.id, id)) continue;
 
-    // Turn cap reached: STOP consuming. Leave the remaining (older-than-rest,
+    // Match cap reached: STOP consuming. Leave the remaining (older-than-rest,
     // but newer-than-cursor) matches for the next tick — the cursor will sit at
     // the last consumed item, so `after:` re-lists from there.
-    if (triggered >= MAX_MESSAGES_PER_TICK) {
+    if (prompts.length >= MAX_MESSAGES_PER_TICK) {
       appendLog(config.instance, "email.watch.turn_cap", {
         watcherId: watcher.id,
         cap: MAX_MESSAGES_PER_TICK
@@ -538,12 +517,13 @@ async function processWatcher(
       continue;
     }
 
-    // Surviving match: wake an agent turn in the watcher's dedicated chat
-    // session, then markSeen (committed per item) so a crash mid-batch never
-    // replays it. The cursor is advanced once at the end, not here.
-    const prompt = buildWatchPrompt(watcher, meta);
-    await spawnTurn(watcher, prompt);
-    triggered += 1;
+    // Surviving match: collect the fenced draft prompt, then markSeen
+    // (committed per item) so a crash mid-batch never replays it. The cursor is
+    // advanced once at the end, not here. The handler converts these prompts
+    // into the drafting turn's injected context; the markSeen-after-collect
+    // order preserves the at-least-once-on-failure delivery contract (a hook
+    // throw before finalize leaves the item un-cursored for the next tick).
+    prompts.push(buildWatchPrompt(watcher, meta));
     markEmailSeen(config.instance, watcher.id, id);
     if (Number.isFinite(internalDate) && internalDate > lastConsumedInternalDate) {
       lastConsumedInternalDate = internalDate;
@@ -562,71 +542,7 @@ async function processWatcher(
     lastError: undefined
   });
 
-  return { triggered, seeded: false };
-}
-
-// One full poll tick across every enabled watcher. Self-contained and
-// best-effort per watcher: a single watcher's gws failure marks THAT watcher
-// `error` and continues, so one bad query can't starve the rest. When the
-// gws session is signed out, flip enabled watchers to `needs_auth` and skip
-// (no spam) — the next tick retries once the user re-auths.
-export async function runGmailPollTick(
-  config: RuntimeConfig,
-  deps: GmailPollDeps = {}
-): Promise<GmailPollReport> {
-  const gwsSpawn = deps.gwsSpawn ?? defaultGwsSpawn;
-  const report: GmailPollReport = { considered: 0, polled: 0, triggered: 0, seeded: 0 };
-
-  const enabled = readState(config.instance).emailWatchers.filter((w) => w.enabled);
-  if (enabled.length === 0) return report;
-
-  const status = await (deps.sessionStatus ?? gwsSessionStatus)();
-  if (!status.signedIn) {
-    for (const watcher of enabled) {
-      report.considered += 1;
-      if (watcher.status !== "needs_auth") {
-        await updateEmailWatcher(config, watcher.id, { status: "needs_auth" });
-      }
-    }
-    return report;
-  }
-
-  const selfEmail = await (deps.resolveSelfEmail ?? (() => resolveSelfEmail(gwsSpawn)))();
-  const spawnTurn = deps.spawnTurn ?? ((watcher: EmailWatcherRecord, prompt: string) =>
-    submitTask(config, prompt, {
-      mode: "chat",
-      agentId: watcher.agentId,
-      chatSessionId: watcher.chatSessionId
-    }).then(() => undefined));
-
-  // We snapshot `enabled` once at the top of the tick. A watcher removed
-  // mid-tick (concurrent `remove`) may therefore still spawn one turn and
-  // leave a few harmless email_seen rows; F4's deleteEmailSeenForWatcher
-  // cleans the rows up, and the orphan turn lands in an already-deleted
-  // session, which the chat path tolerates.
-  for (const watcher of enabled) {
-    report.considered += 1;
-    try {
-      const result = await processWatcher(config, watcher, gwsSpawn, selfEmail, spawnTurn);
-      report.polled += 1;
-      report.triggered += result.triggered;
-      if (result.seeded) report.seeded += 1;
-    } catch (error) {
-      const message = sanitizeWatcherError(error);
-      appendLog(config.instance, "email.watch.error", { watcherId: watcher.id, error: message });
-      await mutateState(config.instance, (state) => {
-        const live = state.emailWatchers.find((w) => w.id === watcher.id);
-        if (!live) return;
-        // Don't stamp error over a deliberate disable that raced this tick.
-        if (!live.enabled) return;
-        live.status = "error";
-        live.lastError = message;
-        live.lastPolledAt = now();
-        live.updatedAt = now();
-      });
-    }
-  }
-  return report;
+  return { prompts, seeded: false };
 }
 
 // Scrub absolute filesystem paths (gws config / credential paths can appear
@@ -634,7 +550,7 @@ export async function runGmailPollTick(
 // state. Keeps the encrypted-store layout out of state.json. The first pass
 // redacts credential-suffixed paths; the second redacts any home-rooted path
 // (e.g. an extension-less ~/.config/gws/keyring) the suffix pass would miss.
-function sanitizeWatcherError(error: unknown): string {
+export function sanitizeWatcherError(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error);
   return raw
     .replace(/\/[^\s'"]*\.(?:json|enc)\b/g, "<path>")
