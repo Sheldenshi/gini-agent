@@ -60,6 +60,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     activeAgentId: "agent_default",
     relays: [],
     notifications: [],
+    emailWatchers: [],
     events: [],
     jobRuns: [],
     chatSessions: [],
@@ -1243,6 +1244,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   dropDeadMemoryImprovements(state);
   state.relays ??= [];
   state.notifications ??= [];
+  state.emailWatchers ??= [];
   state.events ??= [];
   state.jobRuns ??= [];
   state.chatSessions ??= [];

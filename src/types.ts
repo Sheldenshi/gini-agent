@@ -570,6 +570,7 @@ export interface RuntimeState {
   activeAgentId?: string;
   relays: RelayRecord[];
   notifications: NotificationRecord[];
+  emailWatchers: EmailWatcherRecord[];
   events: RuntimeEvent[];
   jobRuns: JobRunRecord[];
   chatSessions: ChatSessionRecord[];
@@ -1195,6 +1196,49 @@ export interface NotificationRecord {
   updatedAt: string;
   sentAt?: string;
   error?: string;
+}
+
+// Status of an email watcher. "ok" = polling normally; "error" = the last
+// poll failed (lastError carries a scrubbed message); "needs_auth" = the
+// `gws` session is signed out, so we skip polling until the user re-auths.
+export type EmailWatcherStatus = "ok" | "error" | "needs_auth";
+
+// A durable per-(account, sender-query) email watcher. The gmail poll
+// worker reads each enabled watcher, polls `gws` for new matching message
+// ids, and wakes an agent turn in the watcher's dedicated chat session on
+// each new match. The data model is multi-account-SHAPED (provider +
+// accountEmail + credentialName) but v1 watches the single signed-in `gws`
+// identity. See ADR email-watch.md.
+export interface EmailWatcherRecord {
+  id: string;
+  instance: Instance;
+  // Owning agent — the woken turn runs under this agent so its inbox and
+  // memory attribution stay isolated. Optional only for legacy/hand-edited
+  // rows; create always stamps it.
+  agentId?: string;
+  provider: "gmail";
+  // The watched account's address. v1 watches the single signed-in `gws`
+  // identity; recorded for the multi-account future.
+  accountEmail?: string;
+  // Forward-looking per-account credential handle. Unused in v1 (gws holds
+  // one identity); recorded so the multi-account phase has a stable key.
+  credentialName?: string;
+  // Gmail search query the worker polls (e.g. "from:alice@x.com is:unread").
+  query: string;
+  // Optional Gmail label ids to scope the query. Unused in v1.
+  labelIds?: string[];
+  // Watermark: the internalDate (epoch ms, as a string) of the newest
+  // message we've processed. Undefined until the first seeding poll runs.
+  lastSeenInternalDate?: string;
+  // Dedicated chat session the woken turn posts its proposed reply into.
+  chatSessionId?: string;
+  enabled: boolean;
+  status: EmailWatcherStatus;
+  // Scrubbed last-error message when status === "error".
+  lastError?: string;
+  lastPolledAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface AuditEvent {

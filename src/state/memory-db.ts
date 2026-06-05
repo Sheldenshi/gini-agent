@@ -57,7 +57,13 @@ import { id, now } from "./ids";
 // columns through CREATE TABLE; existing installs add them via additive
 // ensureColumn calls. The (session_id, thread_id, ordinal) index covers
 // thread playback; the existing UNIQUE(session_id, ordinal) is untouched.
-export const MEMORY_SCHEMA_VERSION = 9;
+//
+// Bumped to 10 for the email-watch dedup store: adds the `email_seen`
+// table used by src/integrations/gmail-poll-worker.ts to dedup matching
+// message ids per watcher. Keyed by (instance, watcher_id, message_id) so
+// a crash mid-batch never replays an already-processed email. See ADR
+// email-watch.md.
+export const MEMORY_SCHEMA_VERSION = 10;
 export const DEFAULT_BANK_ID = "bank_default";
 
 // Builds a deterministic per-agent bank id from an agent id. Used by
@@ -450,6 +456,22 @@ function applyMigrations(db: Database): void {
   // every cursor and over-counting unread badges across the install
   // base on first launch.
   ensureChatReadStateDeviceTokenSchema(db);
+
+  // Step 7 — email_seen table (schema version 10). Per-watcher dedup store
+  // for the gmail poll worker (ADR email-watch.md). The composite primary
+  // key (instance, watcher_id, message_id) makes markSeen idempotent and
+  // lets the worker skip messages it already turned into agent turns even
+  // across a crash mid-batch. seen_at is epoch ms.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS email_seen (
+      instance TEXT NOT NULL,
+      watcher_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      seen_at INTEGER NOT NULL,
+      PRIMARY KEY (instance, watcher_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_seen_watcher ON email_seen(instance, watcher_id);
+  `);
 
   db.run(
     "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
@@ -1129,6 +1151,33 @@ export function countByNetwork(instance: Instance): NetworkCounts {
     .all();
   for (const row of rows) counts[row.network] = row.c;
   return counts;
+}
+
+// --------------------------------------------------------------------------
+// Email-watch dedup helpers (ADR email-watch.md)
+// --------------------------------------------------------------------------
+
+// Record a message id as processed for a watcher. Idempotent via the
+// composite PK — re-marking the same (instance, watcher, message) is a
+// silent no-op. Called per item by the poll worker so a crash mid-batch
+// never replays an already-handled email.
+export function markEmailSeen(instance: Instance, watcherId: string, messageId: string): void {
+  const db = getMemoryDb(instance);
+  db.run(
+    "INSERT OR IGNORE INTO email_seen (instance, watcher_id, message_id, seen_at) VALUES (?, ?, ?, ?)",
+    [instance, watcherId, messageId, Date.now()]
+  );
+}
+
+// True when this watcher has already processed the message id.
+export function isEmailSeen(instance: Instance, watcherId: string, messageId: string): boolean {
+  const db = getMemoryDb(instance);
+  const row = db
+    .query<{ c: number }, [string, string, string]>(
+      "SELECT COUNT(*) AS c FROM email_seen WHERE instance = ? AND watcher_id = ? AND message_id = ?"
+    )
+    .get(instance, watcherId, messageId);
+  return (row?.c ?? 0) > 0;
 }
 
 // --------------------------------------------------------------------------

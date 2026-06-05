@@ -85,6 +85,7 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     activeAgentId: undefined,
     relays: [],
     notifications: [],
+    emailWatchers: [],
     events: [],
     jobRuns: [],
     chatSessions: [],

@@ -185,3 +185,14 @@ export {
   activateAgent,
   updateConnectorHealth
 } from "./records";
+export {
+  createEmailWatcher,
+  listEmailWatchers,
+  getEmailWatcher,
+  updateEmailWatcher,
+  removeEmailWatcher
+} from "./email-watchers";
+export {
+  markEmailSeen,
+  isEmailSeen
+} from "./memory-db";
