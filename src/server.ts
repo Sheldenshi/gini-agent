@@ -98,10 +98,10 @@ await reconcileTunnelOnStartup(config).catch((error) => {
 // Reconcile the installed launchd plists against the current supervision
 // template. For a launchd-managed instance whose on-disk plist predates a
 // supervision-template change (e.g. a runtime version update that altered the
-// plist shape), this rewrites the plist files and dispatches a detached
-// `gini autostart enable` whose bootout relaunches us from the corrected
-// plist — so a version update propagates supervision changes to EXISTING
-// installs, not just fresh ones. No-op when up to date or when there's no
+// plist shape), this dispatches a detached `gini autostart enable` that
+// regenerates the plists and reloads them — its bootout relaunches us from the
+// regenerated plist — so a version update propagates supervision changes to
+// EXISTING installs, not just fresh ones. No-op when up to date or when there's no
 // managed plist (foreground / `gini run` / conductor). The .catch preserves
 // the never-crash-boot guarantee. See ADR always-up-supervision.md.
 await reconcileAutostartPlistOnStartup(config).catch((error) => {

@@ -65,15 +65,21 @@ false-positive reconcile loop. At gateway startup
 compares the stamp the current code would generate against the stamp baked into
 each on-disk plist (gateway/web/watchdog). When everything matches it is a
 silent no-op; it is also skipped entirely when no managed gateway plist exists
-(foreground / `gini run` / conductor). On drift it rewrites the plist files
-(write-only, so a failed relaunch still self-heals at the next reboot) and
-spawns a detached `gini autostart enable` whose `bootout` terminates this
-gateway and re-bootstraps it from the corrected plist. It never self-SIGTERMs
-or exits — under always-respawn KeepAlive a clean exit would be respawned and
-race the detached enable, so letting the child's bootout do the killing avoids
-that race. The deterministic stamp guarantees convergence (after a reconcile
-the on-disk plist equals what the code generates, so the next boot no-ops), and
-a once-per-process latch backs that up.
+(foreground / `gini run` / conductor). On drift it spawns a detached `gini
+autostart enable` — which regenerates the plist files AND reloads them
+(bootout+bootstrap) — whose `bootout` terminates this gateway and re-bootstraps
+it from the regenerated plist. It never self-SIGTERMs or exits — under
+always-respawn KeepAlive a clean exit would be respawned and race the detached
+enable, so letting the child's bootout do the killing avoids that race. The
+reconcile deliberately does NOT pre-write the on-disk plist: writing disk alone
+does not reload launchd (it keeps the def it loaded until a bootout+bootstrap),
+and stamping the file before that reload actually happened would mask drift — a
+matching stamp on the next boot — even if the relaunch had failed. Leaving the
+file untouched keeps a failed relaunch's stamp mismatched, so the reconcile
+re-fires on the next gateway (re)start until the reload truly succeeds. The
+deterministic stamp guarantees convergence (after a successful reconcile the
+on-disk plist equals what the code generates, so the next boot no-ops), and a
+once-per-process latch backs that up.
 
 The reload itself never double-binds the port. `enable` awaits
 `waitForPortFree` (`src/cli/process.ts`) on a port-binding kind's port after a
@@ -177,9 +183,10 @@ launchd instances so foreground/conductor/tmux runs are unaffected.
   periodic scheduling shape).
 - On startup, an instance with a managed gateway plist whose stamps all match
   the current template takes no reconcile action; an instance with a missing or
-  mismatched stamp has its plist files rewritten and a detached `gini autostart
-  enable` dispatched exactly once per process; an instance with no managed
-  gateway plist is skipped entirely.
+  mismatched stamp dispatches a detached `gini autostart enable` exactly once
+  per process and leaves the on-disk plist untouched (that enable regenerates +
+  reloads it, so a failed relaunch keeps the drift detectable for the next
+  start); an instance with no managed gateway plist is skipped entirely.
 - `gini autostart enable` awaits the port becoming free after a `bootout` of
   the gateway/web before re-bootstrapping, so a reload (including the
   detached reconcile/refresh relaunch) never hits EADDRINUSE; the watchdog

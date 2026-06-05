@@ -15,13 +15,21 @@
 // generate (computePlistStamp over the stable supervision subset) and
 // compares it to the stamp baked into the on-disk plist (readPlistStamp). If
 // they all match it returns immediately — the fast, silent common path. On
-// drift it rewrites the plist FILES on disk to current (so even a failed
-// relaunch self-heals at the next reboot) and spawns a DETACHED `gini
-// autostart enable` whose bootout terminates THIS gateway and re-bootstraps
-// it from the corrected plist. We deliberately do NOT self-SIGTERM or exit —
-// under always-respawn KeepAlive a clean exit would be re-spawned by launchd
-// and race the detached enable; letting the child's bootout kill us avoids
-// that race entirely.
+// drift it spawns a DETACHED `gini autostart enable`, which regenerates the
+// plist files AND reloads them (bootout+bootstrap): the bootout terminates
+// THIS gateway and re-bootstraps it from the regenerated plist. We deliberately
+// do NOT self-SIGTERM or exit — under always-respawn KeepAlive a clean exit
+// would be re-spawned by launchd and race the detached enable; letting the
+// child's bootout kill us avoids that race entirely.
+//
+// We also deliberately do NOT pre-write the plist files here. Writing disk
+// alone doesn't reload launchd — it keeps running the def it loaded until a
+// bootout+bootstrap — and stamping the file BEFORE the reload actually happens
+// would mask drift: the next boot's stamp check would match and never retry,
+// even though the stale def is still loaded (e.g. if the detached enable
+// failed to spawn or to bootout). Leaving the on-disk plist untouched means a
+// failed relaunch keeps the stamp mismatched, so the reconcile re-fires on the
+// next gateway (re)start until the reload truly succeeds.
 //
 // See ADR always-up-supervision.md.
 
@@ -32,7 +40,6 @@ import {
   plistPathFor,
   platformIsSupported,
   supervisedServices,
-  writePlist,
   stampForGeneratedPlist,
   readPlistStamp,
   type PlistKind,
@@ -116,29 +123,13 @@ function reconcileInner(config: RuntimeConfig, options: ReconcileOptions): boole
   // Latch BEFORE acting so a re-entrant call can't double-fire.
   reconcileFiredThisProcess = true;
 
-  // (a) Rewrite the plist FILES on disk to current. Write-only — even if the
-  // relaunch below fails, the next reboot's RunAtLoad reads the corrected
-  // plist and self-heals. The StandardOut/ErrPath are NOT part of the stamp
-  // (deliberately excluded), so the exact log path here doesn't affect
-  // convergence; the detached `enable` re-derives them when it rewrites. We
-  // point them at the instance's canonical log dir.
-  const logRoot = logDir(instance);
-  for (const svc of services) {
-    writePlist({
-      instance,
-      kind: svc.kind,
-      spec: svc.spec,
-      stdoutPath: join(logRoot, svc.stdoutLogFilename),
-      stderrPath: join(logRoot, svc.stderrLogFilename),
-      ...(svc.startIntervalSeconds !== undefined ? { startIntervalSeconds: svc.startIntervalSeconds } : {})
-    });
-  }
-
-  // (b) Spawn a DETACHED `gini autostart enable` for ALL kinds. Its bootout
-  // terminates THIS gateway and re-bootstraps it from the corrected plist
-  // (the port-free wait inside enable keeps the handoff from double-binding).
-  // We never self-SIGTERM or exit — letting the child's bootout kill us
-  // sidesteps the always-respawn KeepAlive race.
+  // Spawn a DETACHED `gini autostart enable` for ALL kinds and let IT own the
+  // regenerate + reload. Its bootout terminates THIS gateway and re-bootstraps
+  // it from the regenerated plist (the port-free wait inside enable keeps the
+  // handoff from double-binding). We never self-SIGTERM or exit — letting the
+  // child's bootout kill us sidesteps the always-respawn KeepAlive race. We do
+  // not touch the on-disk plist here (see the module header): a failed relaunch
+  // must keep the stamp mismatched so the next gateway start retries.
   const dispatched = spawnDetachedEnable(instance, options.spawnImpl);
 
   try {

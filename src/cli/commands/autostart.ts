@@ -508,7 +508,16 @@ export async function enable(options: EnableOptions): Promise<EnableResult> {
       // (a bootout happened); a fresh enable never had a binder.
       const port = portForKind(instance, svc.kind);
       if (port !== null) {
-        await deps.waitForPortFree(port);
+        const freed = await deps.waitForPortFree(port);
+        if (!freed) {
+          // The port never freed within the wait. We bootstrap anyway (the
+          // wait is best-effort), but surface it so a resulting EADDRINUSE is
+          // diagnosable rather than silent — a still-bound port here usually
+          // means an orphaned process holds it outside launchd's control.
+          process.stderr.write(
+            `autostart: ${svc.kind} port ${port} still bound after waiting; bootstrapping anyway\n`
+          );
+        }
       }
     }
 

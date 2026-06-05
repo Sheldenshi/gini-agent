@@ -6,9 +6,12 @@
 // launches) and a scratch HOME/state/log root (so plist writes and log files
 // land in a throwaway dir, never the developer's ~/Library/LaunchAgents):
 //
-//   - no managed plist on disk      → no-op (no spawn, no write)
+//   - no managed plist on disk      → no-op (no spawn)
 //   - all stamps match              → no-op (spawn recorder not called)
-//   - a missing/mismatched stamp    → rewrites the plist files AND spawns once
+//   - a missing/mismatched stamp    → spawns enable once, leaving the on-disk
+//                                      plist UNTOUCHED (the detached enable owns
+//                                      the regenerate+reload; pre-stamping the
+//                                      file would mask drift if the relaunch failed)
 //   - a second call in-process      → guarded no-op (once-per-process latch)
 //
 // macOS only: the gating is `process.platform === "darwin"`, so on other
@@ -121,7 +124,7 @@ function writeCurrentPlists(instance: string): void {
     expect(rec.calls.length).toBe(0);
   });
 
-  test("a drifted (stale-stamp) gateway plist → rewrites files AND spawns enable once", async () => {
+  test("a drifted (stale-stamp) gateway plist → spawns enable once, leaving the file untouched", async () => {
     writeCurrentPlists(instance);
     // Corrupt the gateway plist's stamp to simulate a stale install: replace
     // the baked stamp value with a bogus one. The reconcile must see drift.
@@ -138,8 +141,11 @@ function writeCurrentPlists(instance: string): void {
     const dispatched = await reconcileAutostartPlistOnStartup(config, { spawnImpl: rec.spawnImpl });
     expect(dispatched).toBe(true);
 
-    // The gateway plist file was rewritten back to the current stamp.
-    expect(readPlistStamp(gatewayPath)).not.toBe("staleaaaaaaa");
+    // The reconcile must NOT pre-write/pre-stamp the on-disk plist — that's the
+    // detached enable's job. Pre-stamping before the reload happened would mask
+    // drift (a matching stamp next boot) if the relaunch failed. So the file
+    // still carries the stale stamp; only the real `enable` would rewrite it.
+    expect(readPlistStamp(gatewayPath)).toBe("staleaaaaaaa");
 
     // Exactly one detached `gini autostart enable --instance <instance>`.
     expect(rec.calls.length).toBe(1);
@@ -164,8 +170,10 @@ function writeCurrentPlists(instance: string): void {
     const dispatched = await reconcileAutostartPlistOnStartup(config, { spawnImpl: rec.spawnImpl });
     expect(dispatched).toBe(true);
     expect(rec.calls.length).toBe(1);
-    // The reconcile rewrote the gateway plist to a real, stamped one.
-    expect(readPlistStamp(gatewayPath)).toMatch(/^[0-9a-f]{12}$/);
+    // The reconcile leaves the on-disk plist untouched (still stamp-less) —
+    // the detached enable owns the regenerate+reload, so a failed relaunch
+    // keeps the drift detectable for the next gateway start.
+    expect(readPlistStamp(gatewayPath)).toBeNull();
   });
 
   test("second call in the same process is a guarded no-op", async () => {
