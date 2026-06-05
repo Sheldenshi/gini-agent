@@ -30,6 +30,8 @@ an always-on catalog entry costs prompt tokens every turn and enlarges the flat
 tool surface that degrades model tool-selection. The deferred-tools mechanism
 (ADR deferred-tools.md) removes that cost — self tools surface by name and load
 on demand — so the remaining decision is the SHAPE of the self surface.
+`list_skills` is the exception: it stays always-on because capped skill prompt
+blocks depend on it as the discovery path for omitted skills and scripts.
 
 Two priors informed the shape:
 
@@ -127,7 +129,8 @@ operations, add their catalog entries (deferred), and tag their risk.
   deferred catalog entry (toolset `self`, `deferred: true`, `function.
   parameters` mirroring the op's schema) plus a dispatch case routed through
   `dispatchSelfOp`. The on-demand index and the gini self-skill breadcrumb
-  surface it automatically.
+  surface it automatically. Use the always-on `list_skills` exception only for
+  skill discovery paths that are needed before deferred tools are loaded.
 - Keep `self-registry.ts` a leaf. A handler that needs a helper which
   transitively imports `agent.ts` must inline it or import from a neutral
   module — an import cycle through the registry breaks the build.

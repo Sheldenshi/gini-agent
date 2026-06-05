@@ -36,7 +36,7 @@ import { echoEmbed } from "../embeddings";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
+import { buildAgentIdentity, buildEnabledSkillsBlock, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -824,8 +824,49 @@ describe("chat-task loop", () => {
     const contextTrace = traces.find(
       (t) => t.type === "model" && t.message === "chat-task system context built"
     );
-    expect((contextTrace?.data as Record<string, unknown> | undefined)?.priorContextTokenBudget)
-      .toBe(expectedDefault);
+    const contextData = contextTrace?.data as Record<string, unknown> | undefined;
+    expect(contextData?.priorContextTokenDefault).toBe(expectedDefault);
+    expect(contextData?.priorContextTokenRequested).toBe(expectedDefault);
+    expect(typeof contextData?.priorContextTokenAvailable).toBe("number");
+    expect(contextData?.priorContextTokenBudget as number).toBeLessThanOrEqual(expectedDefault);
+    expect(contextData?.priorContextTokenBudget as number)
+      .toBeLessThanOrEqual(contextData?.priorContextTokenAvailable as number);
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("oversized agent.priorContextTokens override is clamped to available provider context", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-prior-context-clamp");
+    config.agent = { priorContextTokens: 1_000_000 };
+    const provider = normalizeProvider(config.provider);
+
+    setEchoToolCallingResponse({
+      provider,
+      text: "Direct answer.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "say something", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id);
+
+    expect(finished.status).toBe("completed");
+
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const warning = traces.find(
+      (t) => t.type === "warning" && /exceeds available provider context/i.test(t.message)
+    );
+    expect(warning).toBeDefined();
+
+    const contextTrace = traces.find(
+      (t) => t.type === "model" && t.message === "chat-task system context built"
+    );
+    const contextData = contextTrace?.data as Record<string, unknown> | undefined;
+    expect(contextData?.priorContextTokenRequested).toBe(1_000_000);
+    expect(contextData?.priorContextTokenBudget as number)
+      .toBeLessThanOrEqual(contextData?.priorContextTokenAvailable as number);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });
@@ -2869,6 +2910,50 @@ describe("buildAgentIdentity", () => {
   });
 });
 
+describe("buildEnabledSkillsBlock", () => {
+  function skill(name: string, description = `${name} description`, status: SkillRecord["status"] = "enabled"): SkillRecord {
+    return {
+      id: `skill_${name}`,
+      instance: "test",
+      name,
+      description,
+      trigger: "",
+      steps: [],
+      requiredTools: [],
+      requiredPermissions: [],
+      status,
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      tests: [],
+      successCount: 0,
+      failureCount: 0,
+      previousVersions: [],
+      body: "",
+      source: "bundled",
+      manifestPath: `/skills/${name}/SKILL.md`
+    };
+  }
+
+  test("lists active skill descriptions and points to list_skills/read_skill", () => {
+    const block = buildEnabledSkillsBlock([skill("linear", "Linear issues"), skill("disabled", "Hidden", "disabled")]);
+    expect(block).toContain("call list_skills");
+    expect(block).toContain("call read_skill");
+    expect(block).toContain("- linear: Linear issues");
+    expect(block).not.toContain("disabled");
+  });
+
+  test("caps the inline skill list and leaves a discovery hint", () => {
+    const skills = Array.from({ length: 45 }, (_, i) => skill(`skill-${String(i).padStart(2, "0")}`));
+    const block = buildEnabledSkillsBlock(skills);
+    expect(block).toContain("- skill-00: skill-00 description");
+    expect(block).toContain("- skill-39: skill-39 description");
+    expect(block).not.toContain("- skill-40: skill-40 description");
+    expect(block).toContain("5 more skills not shown");
+    expect(block).toContain("nameContains/status filters");
+  });
+});
+
 describe("buildInactiveSkillsBlock", () => {
   // Minimal SkillRecord factory. Only the fields the block builder
   // reads (name, description, status, requiredCredentials, source) carry
@@ -3245,11 +3330,27 @@ describe("buildSkillScriptsBlock", () => {
     const block = buildSkillScriptsBlock(state, new Set(["aaa", "bbb"]));
     expect(block).toBe(
       [
-        "Skill scripts (invoke with skill_run, never re-implement in terminal_exec):",
+        "Skill scripts (invoke with skill_run, never re-implement in terminal_exec; call list_skills/read_skill for omitted skills):",
         "- aaa: one, two",
         "- bbb: alpha"
       ].join("\n")
     );
+  });
+
+  test("caps the inline skill script list and leaves a discovery hint", () => {
+    const state = createEmptyState("test");
+    const names = new Set<string>();
+    for (let i = 0; i < 45; i++) {
+      const name = `skill-${String(i).padStart(2, "0")}`;
+      names.add(name);
+      seedSkill(state, name, ["run.ts"]);
+    }
+    const block = buildSkillScriptsBlock(state, names);
+    expect(block).toContain("- skill-00: run");
+    expect(block).toContain("- skill-39: run");
+    expect(block).not.toContain("- skill-40: run");
+    expect(block).toContain("5 more skill script entries not shown");
+    expect(block).toContain("call list_skills");
   });
 
   test("omits skills that are enabled but not visible (inactive connector)", () => {

@@ -29,6 +29,8 @@ describe("prior context packing", () => {
     expect(packed.elisionInserted).toBe(true);
     expect(packed.omittedMessages).toBeGreaterThan(0);
     expect(packed.messages[0]).toEqual({ role: "user", content: PRIOR_HISTORY_ELISION_NOTE });
+    expect(PRIOR_HISTORY_ELISION_NOTE).toContain("Tool-call/result pairs");
+    expect(PRIOR_HISTORY_ELISION_NOTE).toContain("read_skill");
     const text = packed.messages.map((m) => String(m.content ?? "")).join("\n");
     expect(text).not.toContain("old xxx");
     expect(text).toContain("recent question");

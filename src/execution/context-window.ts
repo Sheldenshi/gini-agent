@@ -1,7 +1,7 @@
 import type { ToolCallingMessage, MessageContentPart } from "../provider";
 
 export const PRIOR_HISTORY_ELISION_NOTE =
-  "Earlier chat history is outside the current model context. The full chat history is still stored. If an older detail matters, use recall_memory for durable facts or search_history for exact past chat, task, or tool snippets before answering.";
+  "Earlier chat history is outside the current model context. The full chat history is still stored. Tool-call/result pairs are omitted together when they do not fit. If an older detail matters, use recall_memory for durable facts, search_history for exact past chat/task/tool snippets, or read_skill again if omitted skill instructions matter before answering.";
 
 export interface ContextReplayMessage {
   message: ToolCallingMessage;
@@ -120,7 +120,7 @@ function toGroup(index: number, messages: ContextReplayMessage[]): MessageGroup 
   return {
     index,
     messages,
-    tokenCost: messages.reduce((sum, entry) => sum + estimateMessageTokens(entry.message), 0),
+    tokenCost: messages.reduce((sum, entry) => sum + estimateToolCallingMessageTokens(entry.message), 0),
     priority: 0
   };
 }
@@ -137,7 +137,7 @@ function toolCallIdsFor(message: ToolCallingMessage): string[] {
   return (message.tool_calls ?? []).map((call) => call.id).filter(Boolean);
 }
 
-function estimateMessageTokens(message: ToolCallingMessage): number {
+export function estimateToolCallingMessageTokens(message: ToolCallingMessage): number {
   let tokens = 4; // role + envelope overhead
   tokens += estimateContentTokens(message.content);
   if (message.name) tokens += approxTokens(message.name);
@@ -146,6 +146,14 @@ function estimateMessageTokens(message: ToolCallingMessage): number {
     tokens += approxTokens(JSON.stringify(message.tool_calls));
   }
   return Math.max(1, tokens);
+}
+
+export function estimateToolCallingMessagesTokens(messages: ToolCallingMessage[]): number {
+  return messages.reduce((sum, message) => sum + estimateToolCallingMessageTokens(message), 0);
+}
+
+export function estimateTextTokens(text: string): number {
+  return approxTokens(text);
 }
 
 function estimateContentTokens(content: ToolCallingMessage["content"]): number {

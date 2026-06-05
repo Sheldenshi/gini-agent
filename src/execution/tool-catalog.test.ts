@@ -129,6 +129,7 @@ const ALWAYS_ON = new Set([
   "request_remove_messaging_bridge",
   "cancel_task",
   "install_skill",
+  "list_skills",
   "enable_skill",
   "disable_skill",
   // Identity-file edit tools live under the "identity" toolset which is
@@ -149,7 +150,6 @@ const SELF_TOOLS = [
   "get_self",
   "list_providers",
   "list_agents",
-  "list_skills",
   "list_mcp_servers",
   "list_connectors",
   "set_provider",
@@ -240,14 +240,14 @@ describe("buildToolCatalog", () => {
   });
 
   test("core meta-tools remain visible regardless of toolset state", () => {
-    // cancel_task, install_skill, enable_skill, disable_skill have no
+    // cancel_task, list_skills, install_skill, enable_skill, disable_skill have no
     // separate toolset to gate them — they ride alongside spawn_subagent
     // and read_skill and stay always-on.
     const stateEmpty = stateWithToolsets([]);
     const stateAllDisabled = stateWithToolsets(defaultToolsets("test", "2026-01-01T00:00:00.000Z").map((t) => ({ ...t, status: "disabled" as const })));
     for (const state of [stateEmpty, stateAllDisabled]) {
       const names = new Set(buildToolCatalog(state).map((t) => t.function.name));
-      for (const tool of ["cancel_task", "install_skill", "enable_skill", "disable_skill"]) {
+      for (const tool of ["cancel_task", "list_skills", "install_skill", "enable_skill", "disable_skill"]) {
         expect(names.has(tool)).toBe(true);
       }
     }

@@ -1,13 +1,15 @@
 // Self-config / self-introspection operation registry.
 //
-// Each self-config capability is exposed to the chat-task agent loop as a
-// DIRECT deferred tool (see tool-catalog.ts): its name + one-line summary
-// surface in the system-prompt on-demand index, and the model loads the
-// schema via load_tools before calling the tool by name. This registry stays
-// the single source of truth for the OPERATION BEHAVIOR — the catalog entry
-// carries the schema/description the model sees, while the handler + tag +
-// audit live here. Keeping the live full-schema tool count low (which weak
-// local providers need) is now the deferral mechanism's job, not a facade's.
+// Most self-config capabilities are exposed to the chat-task agent loop as
+// DIRECT deferred tools (see tool-catalog.ts): their names + one-line
+// summaries surface in the system-prompt on-demand index, and the model loads
+// a schema via load_tools before calling the tool by name. `list_skills` is
+// an always-on exception because capped skill prompt blocks use it as their
+// discovery fallback. This registry stays the single source of truth for the
+// OPERATION BEHAVIOR — the catalog entry carries the schema/description the
+// model sees, while the handler + tag + audit live here. Keeping the live
+// full-schema tool count low (which weak local providers need) is now the
+// deferral mechanism's job, not a facade's.
 //
 // Each SelfOperation is the single source of truth for one capability: its
 // summary, its tag (query => sync read; mutate => routed through the approval
@@ -28,6 +30,7 @@ import { providerCatalogWithStatus } from "../provider";
 import { setSetupProvider, removeSetupProvider } from "../runtime/setup-api";
 import { listAgents, useAgent as useAgentCapability, createAgent as createAgentCapability, renameAgent as renameAgentCapability, deleteAgent } from "../capabilities/agents";
 import { listSkills, rollbackSkill, testSkill } from "../capabilities/skills";
+import { listEnabledSkillScripts } from "../capabilities/skill-scripts";
 import { listToolsets, setToolsetStatus } from "../capabilities/toolsets";
 import { addMcpServer, removeMcpServer } from "../integrations/mcp";
 import { deleteConnector, updateConnector } from "../integrations/connectors";
@@ -187,6 +190,7 @@ async function listSkillsOp(
   const statusFilter = typeof args.status === "string" && args.status !== "all" ? args.status : undefined;
   const nameContains = typeof args.nameContains === "string" ? args.nameContains.toLowerCase() : undefined;
   const all = listSkills(config);
+  const scriptsBySkill = new Map(listEnabledSkillScripts(readState(config.instance)).map((entry) => [entry.skill, entry.scripts]));
   const filtered = all.filter((skill) => {
     if (statusFilter && skill.status !== statusFilter) return false;
     if (nameContains && !skill.name.toLowerCase().includes(nameContains)) return false;
@@ -199,6 +203,7 @@ async function listSkillsOp(
     status: skill.status,
     trigger: skill.trigger ?? "",
     description: skill.description ?? "",
+    scripts: scriptsBySkill.get(skill.name) ?? [],
     manifestPath: skill.manifestPath ?? null
   }));
   appendTrace(config.instance, taskId, {
@@ -862,7 +867,7 @@ export const SELF_OPERATIONS: SelfOperation[] = [
   },
   {
     name: "list_skills",
-    summary: "Installed skills with id, name, category, status, and trigger phrase. Filter by status or nameContains.",
+    summary: "Installed skills with id, name, category, status, trigger phrase, and script names. Filter by status or nameContains.",
     tag: "query",
     schema: {
       type: "object",

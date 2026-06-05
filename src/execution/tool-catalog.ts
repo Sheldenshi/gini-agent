@@ -1362,14 +1362,13 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
     }
   },
   {
-    toolset: "self",
+    toolset: "skills",
     displayLabel: "List skills",
-    deferred: true,
-    indexSummary: "Installed skills with id, name, category, status, and trigger phrase. Filter by status or nameContains.",
+    indexSummary: "Installed skills with id, name, category, status, trigger phrase, and script names. Filter by status or nameContains.",
     type: "function",
     function: {
       name: "list_skills",
-      description: "List installed skills with id, name, category, status, and trigger phrase. Read-only. Filter by `status` or `nameContains`.",
+      description: "List installed skills with id, name, category, status, trigger phrase, and script names. Read-only. Filter by `status` or `nameContains`.",
       parameters: {
         type: "object",
         properties: {
@@ -1794,7 +1793,7 @@ export function allTools(): ToolCatalogTool[] {
 // names). When set, it intersects with the enabled-toolset filter — a tool
 // passes only if its owning toolset is BOTH globally enabled AND in the
 // agent's whitelist. Always-on tools bypass both filters: web_fetch,
-// read_skill, spawn_subagent, the scheduled-job surface (create_job,
+// list_skills, read_skill, spawn_subagent, the scheduled-job surface (create_job,
 // list_jobs, update_job, delete_job, run_job), mcp_call, request_connector,
 // and the core agent-capability meta-tools that have no separate toolset
 // to gate them (cancel_task — sibling to spawn_subagent; install_skill /
@@ -1824,6 +1823,7 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     // system prompt advertises. The "skills" toolset isn't part of the
     // legacy default toolsets; gating it on enable would mean a fresh
     // instance can't follow its own skill prompt without a toolset toggle.
+    if (tool.function.name === "list_skills") return true;
     if (tool.function.name === "read_skill") return true;
     // Always expose spawn_subagent. Like read_skill it's a runtime
     // capability not tied to a legacy default toolset row, and gating it
@@ -1930,9 +1930,9 @@ export function buildToolCatalog(state: RuntimeState, agentToolsetFilter?: Set<s
     if (tool.function.name === "edit_soul") return true;
     if (tool.function.name === "edit_user_profile") return true;
     // Self-knowledge surface. The self-config / introspection tools
-    // (get_self, the list_* readers, and the mutate ops like set_provider /
-    // use_agent / set_approval_mode) are direct deferred tools on the "self"
-    // toolset, which is not a legacy default;
+    // (get_self, self-list readers other than always-on list_skills, and the
+    // mutate ops like set_provider / use_agent / set_approval_mode) are direct
+    // deferred tools on the "self" toolset, which is not a legacy default;
     // gating on enable would mean a fresh instance couldn't answer "what
     // model are you using" or "switch to deepseek" — the exact asks the
     // surface exists for. They pass gating here; deferral (applied later by

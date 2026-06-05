@@ -9,10 +9,10 @@
 Gini keeps complete chat history durable, but the model prompt receives a bounded replay tail:
 
 - The JSON `chatMessages` list, SQLite `chat_blocks`, traces, audits, runs, and Hindsight memory remain append-only durable history. Context packing never deletes or rewrites them.
-- `runChatTask` rebuilds prior transcript rows, then packs them under `config.agent.priorContextTokens` before the ephemeral identity/memory tail and current user message. When unset, the default prior-history budget is 65% of the effective provider/model context window; unknown routed or local models fall back to a conservative 32K window.
+- `runChatTask` rebuilds prior transcript rows, then packs them under `config.agent.priorContextTokens` before the ephemeral identity/memory tail and current user message. When unset, the default prior-history budget is 65% of the effective provider/model context window; unknown routed or local models fall back to a conservative 32K window. The effective replay budget is then capped to the room left after the live system prompt, current turn, tool schemas, and a response reserve.
 - Packing walks from newest to oldest and preserves chronological order among retained rows. Assistant `tool_calls` rows are atomic with their paired `role:"tool"` results so provider replay never sees orphan tool messages or unanswered calls.
 - For thread replies, rows from the active thread and main chat are preferred before unrelated thread rows. Main-chat turns prefer main-chat rows before thread rows. Legacy rows without thread metadata are treated as main-chat context.
-- When any prior rows are omitted, the prompt gets a fixed `role:"user"` elision note telling the model that older history is still stored and should be retrieved with `recall_memory` or `search_history` when needed.
+- When any prior rows are omitted, the prompt gets a fixed `role:"user"` elision note telling the model that older history is still stored, that tool-call/result pairs are omitted together, and that it should use `recall_memory`, `search_history`, or `read_skill` again when needed.
 - `ChatMessageRecord` now carries optional `threadId` / `parentBlockId` for provider replay. ChatBlock remains the UI source of truth; the JSON fields exist so the packer can prioritize the active thread.
 
 This is not summarizing compaction. It is bounded replay plus retrieval. Durable recall continues through automatic Hindsight retain, automatic per-turn recall, explicit `recall_memory`, and exact substring `search_history`.

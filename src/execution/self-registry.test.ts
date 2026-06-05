@@ -11,7 +11,7 @@
 // {name, args} envelope) — that is the contract this file pins.
 
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createChatSession, createTask, mutateState, readState, upsertTask } from "../state";
@@ -171,6 +171,32 @@ describe("direct self tools — query", () => {
   test("list_skills takes its filter args at top level (no {name,args} envelope)", async () => {
     const instance = `self-skills-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance);
+    const skillDir = join(ROOT, instance, "skills", "scripted");
+    mkdirSync(join(skillDir, "scripts"), { recursive: true });
+    writeFileSync(join(skillDir, "scripts", "run.ts"), "console.log('{}')");
+    await mutateState(config.instance, (state) => {
+      state.skills.push({
+        id: "skill_scripted",
+        instance: config.instance,
+        name: "scripted",
+        description: "Scripted skill",
+        trigger: "",
+        steps: [],
+        requiredTools: [],
+        requiredPermissions: [],
+        status: "enabled",
+        version: 1,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        tests: [],
+        successCount: 0,
+        failureCount: 0,
+        previousVersions: [],
+        body: "",
+        source: "user",
+        manifestPath: join(skillDir, "SKILL.md")
+      });
+    });
     const taskId = await newTask(config);
     // Top-level args, NOT nested under `args`.
     const result = await dispatchToolCall(
@@ -182,9 +208,10 @@ describe("direct self tools — query", () => {
     );
     expect(result.kind).toBe("sync");
     if (result.kind === "sync") {
-      const parsed = JSON.parse(result.result) as { ok: boolean; skills: unknown[] };
+      const parsed = JSON.parse(result.result) as { ok: boolean; skills: Array<{ name: string; scripts?: string[] }> };
       expect(parsed.ok).toBe(true);
       expect(Array.isArray(parsed.skills)).toBe(true);
+      expect(parsed.skills.find((skill) => skill.name === "scripted")?.scripts).toEqual(["run"]);
     }
   });
 });
