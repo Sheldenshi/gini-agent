@@ -318,25 +318,31 @@ export async function dispatchToolCall(
           })
         };
       }
-      // Loop guard: surface a Connect card at most once per sign-in wall in a
-      // task. The first call pauses the task for the user; if the model calls
-      // connect AGAIN for the same site, the user either hasn't signed in yet
-      // or signing in didn't clear the wall — re-prompting just spams identical
-      // cards (the runaway loop). Stop and tell the model to wait instead.
+      // Loop guard: cap Connect cards per sign-in wall (host) per task. The
+      // first card pauses the task for the user; minting it always resolves
+      // before a second connect can be dispatched, so a binary "already asked"
+      // check would block every legitimate later wall on the same host. Instead
+      // allow a first prompt plus one retry — covers a mistyped credential or a
+      // genuinely different wall on the same host later in the task — and refuse
+      // the 3rd+, where re-prompting just spams identical cards because signing
+      // in evidently isn't clearing the wall. The host key is intentionally
+      // coarse: the count cap tolerates host/redirect churn (OAuth/IdP
+      // redirects get their own host bucket; two walls on one host share a
+      // bucket, but the cap of 2 softens that).
       const wall = connectWallHost(resolveConnectUrl(args, taskId));
-      const alreadyAsked = readState(config.instance).setupRequests.some(
+      const cardsForWall = readState(config.instance).setupRequests.filter(
         (r) =>
           r.taskId === taskId &&
           r.action === "browser.connect" &&
           connectWallHost(typeof r.payload?.url === "string" ? r.payload.url : undefined) === wall
-      );
-      if (alreadyAsked) {
+      ).length;
+      if (cardsForWall >= MAX_CONNECT_CARDS_PER_WALL) {
         return {
           kind: "sync",
           result: JSON.stringify({
             ok: false,
             error:
-              "A Connect card for this site was already shown in this task. Do NOT call browser_connect again — stop and wait for the user to sign in; the task resumes automatically once they do. If the page is already signed in or you can finish without signing in, just continue; otherwise tell the user you're waiting on their sign-in."
+              "You've already surfaced a Connect card for this site twice in this task and the sign-in wall hasn't cleared. Do NOT call browser_connect again for this site. If you can finish without signing in, continue; otherwise stop and tell the user you're blocked on signing in to this site."
           })
         };
       }
@@ -2764,6 +2770,12 @@ async function requestBrowserUpload(
     return approval.id;
   });
 }
+
+// At most this many Connect cards per sign-in wall (host) per task. One prompt
+// plus a retry is legitimate (mistyped credential, or a genuinely different
+// wall on the same host later in the task); beyond that, re-prompting just spams
+// identical cards because signing in evidently isn't clearing the wall.
+const MAX_CONNECT_CARDS_PER_WALL = 2;
 
 // The page a browser_connect call targets: the explicit `url` arg if the
 // model supplied one, else the live page the agent is sitting on. Used both as

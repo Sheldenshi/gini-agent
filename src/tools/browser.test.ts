@@ -2242,12 +2242,12 @@ describe("dispatchToolCall(browser_connect)", () => {
     rmSync(ROOT, { recursive: true, force: true });
   });
 
-  // Loop guard: a task surfaces a Connect card at most once per sign-in wall.
-  // The first call pauses the task for the user; a second browser_connect for
-  // the same site must NOT mint another card (the runaway-loop the user hit) —
-  // it returns a sync "stop and wait" result so the agent pauses instead of
-  // spamming identical approval cards.
-  test("refuses a second browser_connect for the same site without minting another card", async () => {
+  // Loop guard: a task caps Connect cards per sign-in wall. A first prompt plus
+  // one retry is legitimate (mistyped credential, or a genuinely different wall
+  // on the same host later in the task), so two cards mint; the third call for
+  // the same site is refused with a sync result instead of spamming a third
+  // identical card.
+  test("caps Connect cards per sign-in wall and refuses beyond the cap", async () => {
     rmSync(ROOT, { recursive: true, force: true });
     mkdirSync(WORKSPACE, { recursive: true });
     const config = dispatchConfig("browser-connect-dispatch-loop");
@@ -2276,7 +2276,7 @@ describe("dispatchToolCall(browser_connect)", () => {
     expect(first.kind).toBe("pending");
     expect(connectCards()).toBe(1);
 
-    // Second call for the same site: refused, no new card.
+    // Second call for the same site: still allowed (a retry is legitimate).
     const second = await dispatchToolCall(
       config,
       taskId,
@@ -2284,13 +2284,80 @@ describe("dispatchToolCall(browser_connect)", () => {
       "call_loop_2",
       JSON.stringify({ reason: "Sign in to Air Canada" })
     );
-    expect(second.kind).toBe("sync");
-    if (second.kind !== "sync") throw new Error("unreachable");
-    const parsed = JSON.parse(second.result) as { ok: boolean; error: string };
+    expect(second.kind).toBe("pending");
+    expect(connectCards()).toBe(2);
+
+    // Third call for the same site: refused, no new card.
+    const third = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_loop_3",
+      JSON.stringify({ reason: "Sign in to Air Canada" })
+    );
+    expect(third.kind).toBe("sync");
+    if (third.kind !== "sync") throw new Error("unreachable");
+    const parsed = JSON.parse(third.result) as { ok: boolean; error: string };
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toMatch(/already shown|wait for the user/i);
-    // Still exactly one card — the loop did not spam approvals.
-    expect(connectCards()).toBe(1);
+    expect(parsed.error).toMatch(/twice in this task|blocked on signing in/i);
+    // Still exactly two cards — the loop did not spam a third approval.
+    expect(connectCards()).toBe(2);
+
+    rmSync(ROOT, { recursive: true, force: true });
+  });
+
+  // The cap is per host: hitting it for one site must not block a connect for a
+  // different site. Pass distinct `url` args so the resolved hosts differ; the
+  // second host still mints a card even after the first host reached the cap.
+  test("counts Connect cards per host independently", async () => {
+    rmSync(ROOT, { recursive: true, force: true });
+    mkdirSync(WORKSPACE, { recursive: true });
+    const config = dispatchConfig("browser-connect-dispatch-perhost");
+    const taskId = await mutateState(config.instance, (state) => {
+      const task = createTask(state.instance, "connect per-host", undefined, undefined, undefined, undefined);
+      upsertTask(state, task);
+      return task.id;
+    });
+    browserTest.installFakeSessionWithPageForTest(taskId, {
+      url: () => "https://www.aircanada.com/login",
+      close: () => Promise.resolve()
+    });
+
+    // Drive host A to the cap (two cards), then refuse a third.
+    const a1 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_a1",
+      JSON.stringify({ reason: "Sign in to Air Canada", url: "https://www.aircanada.com/login" })
+    );
+    expect(a1.kind).toBe("pending");
+    const a2 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_a2",
+      JSON.stringify({ reason: "Sign in to Air Canada", url: "https://www.aircanada.com/login" })
+    );
+    expect(a2.kind).toBe("pending");
+    const a3 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_a3",
+      JSON.stringify({ reason: "Sign in to Air Canada", url: "https://www.aircanada.com/login" })
+    );
+    expect(a3.kind).toBe("sync");
+
+    // A different host is independent — it still mints its first card.
+    const b1 = await dispatchToolCall(
+      config,
+      taskId,
+      "browser_connect",
+      "call_perhost_b1",
+      JSON.stringify({ reason: "Sign in to United", url: "https://www.united.com/login" })
+    );
+    expect(b1.kind).toBe("pending");
 
     rmSync(ROOT, { recursive: true, force: true });
   });
