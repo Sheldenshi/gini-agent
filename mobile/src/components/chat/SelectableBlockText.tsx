@@ -24,11 +24,20 @@ import {
 // Per-paragraph TextInputs means selection can't span across paragraphs
 // — that is a deliberate trade-off vs. losing markdown rendering or
 // shipping a native module.
+//
+// `containsLink` opts a block out of the iOS TextInput path. A multiline
+// TextInput (UITextView) owns its own touch handling and never forwards taps
+// to a nested `<Text onPress>`, so a markdown link inside one renders styled
+// but inert. When the block holds a link we fall back to `<Text selectable>`
+// so the link's onPress is reachable — at the cost of whole-block-only copy
+// (no drag handles) for that one block, which is the lesser evil vs. a dead
+// link.
 export const SelectableBlockText = forwardRef<unknown, {
   style?: StyleProp<TextStyle>;
   children?: ReactNode;
-}>(function SelectableBlockText({ style, children }, _ref) {
-  if (Platform.OS === "ios") {
+  containsLink?: boolean;
+}>(function SelectableBlockText({ style, children, containsLink = false }, _ref) {
+  if (Platform.OS === "ios" && !containsLink) {
     return (
       <TextInput
         multiline

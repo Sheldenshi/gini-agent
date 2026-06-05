@@ -5,7 +5,13 @@ import { family, theme } from "@/src/theme";
 import type { AssistantTextBlock } from "@/src/types";
 import { SelectableBlockText } from "./SelectableBlockText";
 
-type MarkdownNode = { key: string; content: string; attributes?: { href?: string } };
+type MarkdownNode = {
+  key: string;
+  type?: string;
+  content: string;
+  attributes?: { href?: string };
+  children?: MarkdownNode[];
+};
 type MarkdownStylesMap = Record<string, object>;
 type RuleArgs = [
   node: MarkdownNode,
@@ -40,6 +46,7 @@ export function BlockAssistantText({ block }: { block: AssistantTextBlock }) {
           style={markdownStyles}
           markdownit={markdownIt}
           rules={markdownRules}
+          onLinkPress={isWebUrl}
         >
           {block.text}
         </Markdown>
@@ -116,6 +123,27 @@ const blockTextStyles = StyleSheet.create({
     marginBottom: 4
   }
 });
+// Walk an AST node's subtree for an inline `link`. markdown-it (with
+// `linkify`) emits `link_open`/`link_close` tokens that the library
+// collapses to a node of type `link`, covering both `[label](url)` and
+// bare autolinked URLs. A block-level `blocklink` (a link wrapping block
+// content such as an image) keeps the library's own touchable wrapper, so
+// it neither needs nor wants the Text fallback and is excluded here.
+function hasLinkDescendant(node: MarkdownNode): boolean {
+  if (node.type === "link") return true;
+  return node.children?.some(hasLinkDescendant) ?? false;
+}
+
+// Only hand http(s) URLs to the OS opener. A markdown href comes from
+// assistant output, so an unguarded open would also fire `tel:`, `sms:`,
+// `mailto:`, `file:`, and arbitrary app deep links. Used both by the inline
+// `link` rule's onPress and as `<Markdown onLinkPress>`, which gates the
+// library's default link/blocklink openers (e.g. a linked image): return
+// true to allow the open, false to leave it inert (still rendered).
+function isWebUrl(href: string): boolean {
+  return /^https?:\/\//i.test(href);
+}
+
 // Block-level renderers wrap inline children in a single selectable
 // block. On iOS that's a `TextInput multiline editable={false}` (the
 // only RN primitive that exposes the loupe + drag handles for partial
@@ -124,10 +152,18 @@ const blockTextStyles = StyleSheet.create({
 // outer wrapper coalesces the library's per-token inline children into
 // one text run so RN's text engine can wrap URLs and long lines
 // cleanly (see comment above).
+//
+// A block that contains a link is flagged so SelectableBlockText skips
+// the iOS TextInput wrapper — a TextInput swallows taps before they reach
+// the link's nested `<Text onPress>`, leaving the link visible but dead.
 const renderAsText =
   (style: object): RenderRule =>
   (node, children) => (
-    <SelectableBlockText key={node.key} style={style}>
+    <SelectableBlockText
+      key={node.key}
+      style={style}
+      containsLink={hasLinkDescendant(node)}
+    >
       {children}
     </SelectableBlockText>
   );
@@ -181,7 +217,9 @@ export const markdownRules: Record<string, RenderRule> = {
         key={node.key}
         style={styles.link}
         selectable
-        onPress={href ? () => void Linking.openURL(href) : undefined}
+        onPress={
+          href && isWebUrl(href) ? () => void Linking.openURL(href) : undefined
+        }
       >
         {children}
       </Text>
