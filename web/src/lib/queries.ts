@@ -171,7 +171,14 @@ export function useConnectors() {
   return useQuery<ConnectorRecord[]>({
     queryKey: ["connectors"],
     queryFn: () => api<ConnectorRecord[]>("/connectors"),
-    refetchInterval: 60_000
+    // Poll fast only while a connector is provisioned but signed out — the
+    // window where the user is completing OAuth and wants the row to flip to
+    // connected promptly. Otherwise idle at 60s. (Server caches the underlying
+    // gws auth status ~15s, so this won't spawn gws on every tick.)
+    refetchInterval: (query) =>
+      query.state.data?.some((c) => c.session?.clientConfigured && !c.session.signedIn)
+        ? 5_000
+        : 60_000
   });
 }
 

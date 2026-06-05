@@ -6,9 +6,12 @@ import type { ConnectorRecord, SkillRecord } from "@runtime/types";
 import type { ProviderDescriptor } from "@/lib/queries";
 
 export type Activation = {
-  // "via Google Workspace setup" (label text varies by setup skill) is a
-  // muted deferral: the skill's real status lives on the setup card it
-  // points to, so we don't show its own active/needs-setup here.
+  // "via <setup> setup" (label text varies by setup skill) is a deferral: the
+  // skill's status TEXT lives on the setup card it points to, so we don't
+  // repeat active/needs-setup wording on every dependent row. The pill's TONE
+  // still mirrors that card's sign-in liveness — green when signed in, amber
+  // when the session expired, muted before setup — so signing in visibly
+  // changes these rows instead of leaving them permanently grey.
   label: "active" | "needs setup" | "needs sign-in" | "disabled" | "unsupported" | string;
   tone: "ok" | "warn" | "neutral" | "danger";
 };
@@ -70,7 +73,16 @@ export function deriveActivation(
       providerByCredentialName.get(credentialName);
     const setupSkillName = provider?.setupSkill;
     if (setupSkillName && setupSkillName !== skill.name) {
-      return { label: `via ${setupSkillLabelFor(setupSkillName)}`, tone: "neutral" };
+      // Tone mirrors the setup connector's sign-in liveness (same `session`
+      // the setup card reads) so these rows turn green on sign-in, amber when
+      // the session expires, and stay muted before setup.
+      const session = matches.find((c) => c.status === "configured")?.session;
+      const tone: Activation["tone"] = session?.signedIn
+        ? "ok"
+        : session?.clientConfigured
+        ? "warn"
+        : "neutral";
+      return { label: `via ${setupSkillLabelFor(setupSkillName)}`, tone };
     }
   }
 

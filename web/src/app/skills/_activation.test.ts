@@ -1,7 +1,8 @@
 // Pure-JS tests (no React/DOM) for the Skills-page activation logic. The
 // new branches under test: the setup skill's pill reflects gws sign-in
 // liveness (session), and a service skill that depends on a setup-skill
-// provider's credential renders a muted deferral pill.
+// provider's credential renders a deferral pill whose tone mirrors that
+// same liveness.
 
 import { describe, expect, test } from "bun:test";
 import type { ConnectorRecord, SkillRecord } from "@runtime/types";
@@ -124,17 +125,26 @@ describe("deriveActivation: service skill defers to the setup skill", () => {
     requiredCredentials: ["google-workspace-oauth"]
   });
 
-  test("renders a muted deferral pill instead of its own active/needs-setup", () => {
-    // Even with a healthy connector, the service skill does not claim its own
-    // active — the truthful status lives on the setup card.
+  // The label always defers (status text lives on the setup card), but the
+  // pill's TONE mirrors the setup connector's sign-in liveness so signing in
+  // visibly changes the row.
+  test("signed in → green deferral (ok), not its own standalone active", () => {
     const conn = connector({ session: { installed: true, clientConfigured: true, signedIn: true, message: "Signed in to Google" } });
     expect(activationFor(serviceSkill, [conn])).toEqual({
       label: "via Google Workspace setup",
-      tone: "neutral"
+      tone: "ok"
     });
   });
 
-  test("defers even when no connector record exists yet (routes by credential name)", () => {
+  test("session expired → amber deferral (warn)", () => {
+    const conn = connector({ session: { installed: true, clientConfigured: true, signedIn: false, message: "Google sign-in expired — re-auth needed" } });
+    expect(activationFor(serviceSkill, [conn])).toEqual({
+      label: "via Google Workspace setup",
+      tone: "warn"
+    });
+  });
+
+  test("defers (muted) even when no connector record exists yet (routes by credential name)", () => {
     expect(activationFor(serviceSkill, [])).toEqual({
       label: "via Google Workspace setup",
       tone: "neutral"
