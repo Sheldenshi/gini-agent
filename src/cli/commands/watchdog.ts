@@ -27,8 +27,9 @@ import { arch, platform } from "node:os";
 import { join } from "node:path";
 import type { CliContext } from "../context";
 import { logDir, runtimePortPath, webPortPath } from "../../paths";
-import { kickstart, supervisor, type LaunchctlResult, type PlistKind } from "../../integrations/launchd";
+import { isLoaded, kickstart, supervisor, type LaunchctlResult, type PlistKind } from "../../integrations/launchd";
 import { isSupervisedWebChild } from "../../runtime/health-probe";
+import { enable } from "./autostart";
 import { secretsEnvPath } from "../../state/secrets-env";
 import { appendLog } from "../../state/trace";
 import {
@@ -55,6 +56,13 @@ export interface WatchdogDeps {
   // Force a launchctl `kickstart -k` of the given service kind. Defaults to
   // the real kickstart shellout.
   kickstartImpl?: (instance: string, kind: PlistKind) => LaunchctlResult;
+  // Report whether launchd still has the service registered. Defaults to
+  // isLoaded. When false, the service is deregistered and kickstart can't
+  // revive it — we re-bootstrap instead.
+  isLoadedImpl?: (instance: string, kind: PlistKind) => boolean;
+  // Re-bootstrap (re-enable) a deregistered service. Defaults to a wrapper
+  // around `autostart enable`. Resolves true when the re-enable succeeded.
+  reenableImpl?: (instance: string, kind: PlistKind) => Promise<boolean>;
   // Report whether we're under launchd. Defaults to supervisor(). Stamped onto
   // the queued report so the restart-ask can gate on supervision later.
   supervisorImpl?: () => "launchd" | null;
@@ -123,6 +131,9 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
   const probeRuntime = deps.probeRuntime ?? defaultProbeRuntime;
   const probeWeb = deps.probeWeb ?? isSupervisedWebChild;
   const kickstartImpl = deps.kickstartImpl ?? kickstart;
+  const isLoadedImpl = deps.isLoadedImpl ?? isLoaded;
+  const reenableImpl =
+    deps.reenableImpl ?? (async (inst: string, kind: PlistKind) => (await enable({ instance: inst, kinds: [kind] })).ok);
   const supervisorImpl = deps.supervisorImpl ?? supervisor;
   const clock = deps.clock ?? (() => new Date());
 
@@ -134,6 +145,32 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
       kickstartImpl(instance, kind);
     } catch {
       // Best-effort revive; a failed kickstart is retried next tick.
+    }
+  };
+
+  // Revive a down core service and return the action string.
+  //
+  // If launchd still has the service registered, a `kickstart -k` forces a
+  // stop+start (registered-but-dead/hung is the common case). But kickstart
+  // NO-OPS on a service launchd has deregistered ("Could not find service"),
+  // and KeepAlive can't respawn a service it no longer knows about — so a
+  // deregistered service stays down forever. That happens when an
+  // `autostart enable` boots the old service out successfully but its
+  // re-bootstrap loses the launchd "Input/output error" race (e.g. during a
+  // self-update with concurrent launchctl churn). For that case we
+  // re-bootstrap via `autostart enable`, but only under launchd: a manual
+  // foreground `gini watchdog` must not start creating launchd plists. A
+  // failed/throwing re-enable is swallowed and retried on the next tick.
+  const reviveService = async (kind: PlistKind): Promise<string> => {
+    if (isLoadedImpl(instance, kind)) {
+      safeKickstart(kind);
+      return `kickstart:${kind}`;
+    }
+    if (supervisorImpl() !== "launchd") return `down:${kind}`;
+    try {
+      return (await reenableImpl(instance, kind)) ? `reenable:${kind}` : `reenable-failed:${kind}`;
+    } catch {
+      return `reenable-failed:${kind}`;
     }
   };
 
@@ -162,8 +199,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
     // queues a report via the runtime crash handler, and a hung-but-not-crashed
     // runtime has no error to attribute.
     if (!runtimeOk) {
-      safeKickstart("gateway");
-      actions.push("kickstart:gateway");
+      actions.push(await reviveService("gateway"));
     }
 
     // A web crash report is only warranted for a GENUINE web-specific failure:
@@ -206,8 +242,7 @@ export async function watchdog(ctx: CliContext, deps: WatchdogDeps = {}): Promis
           // Building/writing the report must never stop us from reviving web.
         }
       }
-      safeKickstart("web");
-      actions.push("kickstart:web");
+      actions.push(await reviveService("web"));
     }
 
     // Best-effort log line; a logging failure must not flip the tick's exit.

@@ -8,6 +8,8 @@
 //   - web down while runtime healthy -> web kickstart + a pending web report
 //   - runtime hung -> gateway kickstart, no web report
 //   - missing port files -> treated as down (kickstart fired), no report, exit 0
+//   - a deregistered core service -> re-bootstrap (enable) instead of kickstart,
+//     only under launchd; a failed/throwing re-enable is swallowed, exit 0
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -73,6 +75,7 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
+      isLoadedImpl: () => true,
       supervisorImpl: () => "launchd"
     });
     expect(kicks.length).toBe(0);
@@ -90,6 +93,7 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
+      isLoadedImpl: () => true,
       supervisorImpl: () => "launchd"
     });
     // Web revived, gateway untouched.
@@ -113,6 +117,7 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
+      isLoadedImpl: () => true,
       supervisorImpl: () => "launchd"
     });
     expect(kicks.map((k) => k.kind)).toEqual(["gateway"]);
@@ -142,6 +147,7 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
+      isLoadedImpl: () => true,
       supervisorImpl: () => "launchd"
     });
     // With no recorded port, there's nothing to probe — both are down and
@@ -166,6 +172,7 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
+      isLoadedImpl: () => true,
       supervisorImpl: () => "launchd"
     });
     // Both kicked, but no web crash report queued.
@@ -184,6 +191,7 @@ describe("watchdog", () => {
       kickstartImpl: () => {
         throw new Error("launchctl blew up");
       },
+      isLoadedImpl: () => true,
       supervisorImpl: () => "launchd"
     });
     expect(process.exitCode).toBe(0);
@@ -201,6 +209,7 @@ describe("watchdog", () => {
         },
         probeWeb: async () => true,
         kickstartImpl: () => okLaunchctl,
+        isLoadedImpl: () => true,
         supervisorImpl: () => "launchd"
       })
     ).resolves.toBeUndefined();
@@ -217,6 +226,9 @@ describe("watchdog", () => {
         kicks.push({ instance, kind });
         return okLaunchctl;
       },
+      // Registered but dead -> kickstart path (this test asserts the report
+      // queuing under supervisor: null, not the deregistered re-enable path).
+      isLoadedImpl: () => true,
       // Not launchd: capture is unconditional now; the consent gate lives in
       // crash-recovery. The report carries supervisor: null.
       supervisorImpl: () => null
@@ -225,6 +237,91 @@ describe("watchdog", () => {
     const pending = listPendingReports();
     expect(pending.length).toBe(1);
     expect(pending[0]!.report.supervisor).toBeNull();
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("runtime down + gateway DEREGISTERED -> re-bootstrap (enable), no kickstart, exit 0", async () => {
+    writePorts();
+    const kicks: Array<{ instance: string; kind: PlistKind }> = [];
+    const reenables: Array<{ instance: string; kind: PlistKind }> = [];
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (instance, kind) => {
+        kicks.push({ instance, kind });
+        return okLaunchctl;
+      },
+      // launchd has deregistered the gateway: kickstart would no-op, so the
+      // watchdog re-bootstraps it via enable instead.
+      isLoadedImpl: () => false,
+      reenableImpl: async (instance, kind) => {
+        reenables.push({ instance, kind });
+        return true;
+      },
+      supervisorImpl: () => "launchd"
+    });
+    expect(kicks.length).toBe(0);
+    expect(reenables).toEqual([{ instance: INSTANCE, kind: "gateway" }]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("re-bootstrap that returns false -> exit 0, retried next tick (no throw)", async () => {
+    writePorts();
+    const reenables: Array<{ instance: string; kind: PlistKind }> = [];
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: () => okLaunchctl,
+      isLoadedImpl: () => false,
+      reenableImpl: async (instance, kind) => {
+        reenables.push({ instance, kind });
+        return false;
+      },
+      supervisorImpl: () => "launchd"
+    });
+    expect(reenables).toEqual([{ instance: INSTANCE, kind: "gateway" }]);
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("re-bootstrap that throws -> swallowed, exit 0 (tick never propagates)", async () => {
+    writePorts();
+    await expect(
+      watchdog(ctxFor(), {
+        probeRuntime: async () => false,
+        probeWeb: async () => true,
+        kickstartImpl: () => okLaunchctl,
+        isLoadedImpl: () => false,
+        reenableImpl: async () => {
+          throw new Error("enable blew up");
+        },
+        supervisorImpl: () => "launchd"
+      })
+    ).resolves.toBeUndefined();
+    expect(process.exitCode).toBe(0);
+  });
+
+  test("deregistered but NOT under launchd -> no re-enable, no kickstart, exit 0", async () => {
+    writePorts();
+    const kicks: Array<{ instance: string; kind: PlistKind }> = [];
+    const reenables: Array<{ instance: string; kind: PlistKind }> = [];
+    await watchdog(ctxFor(), {
+      probeRuntime: async () => false,
+      probeWeb: async () => true,
+      kickstartImpl: (instance, kind) => {
+        kicks.push({ instance, kind });
+        return okLaunchctl;
+      },
+      isLoadedImpl: () => false,
+      reenableImpl: async (instance, kind) => {
+        reenables.push({ instance, kind });
+        return true;
+      },
+      // A manual foreground `gini watchdog` (not under launchd) must not start
+      // creating launchd plists — the deregistered service is left alone.
+      supervisorImpl: () => null
+    });
+    expect(kicks.length).toBe(0);
+    expect(reenables.length).toBe(0);
     expect(process.exitCode).toBe(0);
   });
 });
