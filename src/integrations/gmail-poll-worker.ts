@@ -262,14 +262,24 @@ export function shouldDropMessage(meta: EmailMetadata, selfEmail?: string): bool
   return false;
 }
 
-// Strip any fence-sentinel substring from an untrusted field and collapse
-// CR/LF so a hostile value can't forge the fence close marker or inject a new
-// line that reads as a fresh instruction. Used belt-and-suspenders alongside
-// the JSON-encoding below.
+// Belt-and-suspenders scrub of an untrusted field. The PRIMARY defense is the
+// JSON encoding in buildWatchPrompt (it keeps every field on one physical line
+// and escapes quotes/markers), so a sentinel that survives this scrub still
+// can't break out of the data container. This pass additionally strips
+// fence-sentinel substrings and collapses CR/LF so the field reads as inert.
+//
+// The strip LOOPS to a fixpoint: a single pass lets a nested payload re-form a
+// sentinel (e.g. `END_UNT<sentinel>RUSTED…` rejoining after the inner removal),
+// so we re-run until the regex no longer matches.
 function sanitizeFenceField(value: string): string {
-  return value
-    .replace(/UNTRUSTED_EMAIL_METADATA|END_UNTRUSTED_EMAIL_METADATA/gi, "")
-    .replace(/[\r\n]+/g, " ");
+  const sentinel = /UNTRUSTED_EMAIL_METADATA|END_UNTRUSTED_EMAIL_METADATA/gi;
+  let out = value;
+  let prev: string;
+  do {
+    prev = out;
+    out = out.replace(sentinel, "");
+  } while (out !== prev);
+  return out.replace(/[\r\n]+/g, " ");
 }
 
 // Derive a deterministic per-message nonce from the message id so the fence
@@ -286,10 +296,13 @@ function fenceNonce(messageId: string): string {
 // don't send unless asked, [SILENT] sentinel) live OUTSIDE the fence.
 //
 // Hardening (the metadata is attacker-controlled):
-//   - the untrusted fields are emitted as a single JSON object, so quotes,
-//     newlines, and marker-like bytes are escaped and can't break the container;
-//   - each field is additionally stripped of fence-sentinel substrings + has
-//     CR/LF collapsed before encoding;
+//   - PRIMARY: the untrusted fields are emitted as a single JSON object, so
+//     quotes, newlines, and marker-like bytes are escaped and the whole payload
+//     stays on one physical line — it cannot break the container even if a
+//     sentinel-like substring survives;
+//   - belt-and-suspenders: each field is also stripped of fence-sentinel
+//     substrings (looped to a fixpoint, so a nested rejoin can't re-form one)
+//     and has CR/LF collapsed before encoding;
 //   - the fence delimiter carries a per-message nonce derived from the id, so
 //     the close token can't be guessed and forged from inside the data.
 export function buildWatchPrompt(watcher: EmailWatcherRecord, meta: EmailMetadata): string {
