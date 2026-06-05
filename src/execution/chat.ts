@@ -408,6 +408,8 @@ export async function submitChatMessage(config: RuntimeConfig, sessionId: string
       content,
       taskId: task.id,
       runId: run.id,
+      ...(task.threadId ? { threadId: task.threadId } : {}),
+      ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {}),
       ...(images.length > 0 ? { images } : {}),
       ...(audio ? { audio } : {})
     });
@@ -507,6 +509,8 @@ export async function submitThreadReply(
       content,
       taskId: task.id,
       runId: run.id,
+      threadId,
+      parentBlockId,
       ...(images.length > 0 ? { images } : {}),
       ...(audio ? { audio } : {})
     });
@@ -638,7 +642,15 @@ export async function syncChatTaskResult(config: RuntimeConfig, sessionId: strin
             providerReauth(task.authErrorProvider)
           )
         : task.error ?? task.currentStep ?? `Task is ${task.status}.`;
-    const message = createChatMessage(state, { sessionId, role: "assistant", content, taskId, runId: task.runId });
+    const message = createChatMessage(state, {
+      sessionId,
+      role: "assistant",
+      content,
+      taskId,
+      runId: task.runId,
+      ...(task.threadId ? { threadId: task.threadId } : {}),
+      ...(task.parentBlockId ? { parentBlockId: task.parentBlockId } : {})
+    });
     if (task.runId) {
       const run = state.runs.find((item) => item.id === task.runId);
       if (run) {

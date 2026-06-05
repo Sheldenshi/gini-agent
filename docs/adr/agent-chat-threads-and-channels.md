@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-06-03
-- **See also:** [ChatBlock Protocol](./chat-block-protocol.md), [Agents Replace Profiles And Drive Runtime Behavior](./agents-replace-profiles.md), [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Mobile Push Notifications](./mobile-push-notifications.md)
+- **See also:** [ChatBlock Protocol](./chat-block-protocol.md), [Agents Replace Profiles And Drive Runtime Behavior](./agents-replace-profiles.md), [Agent Loop With Native Tool Calling](./agent-loop-tool-calling.md), [Bounded Chat Context Window](./chat-context-window.md), [Mobile Push Notifications](./mobile-push-notifications.md)
 
 ## Decision
 
@@ -30,8 +30,9 @@ the session list:
 
 This is additive to the persistence layer: `memory.db` schema bumps
 8 → 9 with two nullable columns on `chat_blocks` (`thread_id`,
-`parent_block_id`) plus one index. The ChatBlock protocol — block
-shapes, the SSE stream, `Last-Event-ID` resume, the
+`parent_block_id`) plus one index, and `ChatMessageRecord` carries
+optional `threadId` / `parentBlockId` for provider replay. The ChatBlock
+protocol — block shapes, the SSE stream, `Last-Event-ID` resume, the
 `UNIQUE (session_id, ordinal)` invariant — is unchanged.
 
 ## Context
@@ -115,6 +116,13 @@ the recreate branch.
 `upsertAssistantTextBlock` / `updateToolCallBlock` carry the columns
 forward (`SELECT *`), so streaming deltas and tool-status flips preserve
 thread membership with no extra arguments.
+
+`ChatMessageRecord` also carries optional `threadId?` / `parentBlockId?`
+on user, assistant, approval-reason, and tool-transcript rows created
+after this change. These fields do not drive UI rendering; they let the
+chat-task prompt packer prefer the active thread plus main chat before
+unrelated thread side conversations (see ADR chat-context-window.md).
+Legacy rows omit them and are treated as main-chat context.
 
 ### Thread read helpers
 

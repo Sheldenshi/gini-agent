@@ -133,6 +133,11 @@ model call plus any tool dispatches that follow). Most tasks finish well
 under 10 iterations; the cap exists as a safety bound, not a meaningful
 budget for normal work.
 
+Prior chat history replay is also bounded. The full chat remains stored,
+but each new chat-task prompt packs prior rows under `agent.priorContextTokens`
+(default: 24000 approximate tokens) before the current turn. Older omitted
+rows are still available through Hindsight recall and exact `search_history`.
+
 When the cap is hit the loop does NOT fail. Instead it makes one final
 tool-less model call asking for a summary of what was learned and what
 remained undone, and completes the task with that text. A warning trace
@@ -147,16 +152,18 @@ To override the cap for a single instance, edit
   "port": 7337,
   "...": "...",
   "agent": {
-    "maxIterations": 150
+    "maxIterations": 150,
+    "priorContextTokens": 24000
   }
 }
 ```
 
-`maxIterations` must be a positive integer. Invalid values (zero, negative,
-non-numeric) fall back to the built-in default and emit a warning trace on
-the next task. The runtime reads `config.json` once at server start and
-holds `RuntimeConfig` in memory, so edits don't take effect until you
-restart `gini run` (stop the tmux session and re-issue the command).
+`maxIterations` and `priorContextTokens` must be positive integers.
+Invalid values (zero, negative, non-numeric) fall back to the built-in
+defaults and emit a warning trace on the next task. The runtime reads
+`config.json` once at server start and holds `RuntimeConfig` in memory,
+so edits don't take effect until you restart `gini run` (stop the tmux
+session and re-issue the command).
 
 ## Approval Settings
 

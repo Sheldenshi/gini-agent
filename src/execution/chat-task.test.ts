@@ -19,6 +19,7 @@ import {
 import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
 import {
   bankIdForAgent,
+  createChatMessage,
   createChatSession,
   createEmptyState,
   createRun,
@@ -1519,6 +1520,67 @@ describe("chat-task loop", () => {
     for (const m of stored) {
       expect(String(m.content ?? "")).not.toContain("Your runtime identity:");
     }
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  test("packs prior chat history for the provider without deleting stored history", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-prior-context-pack", {
+      agent: { priorContextTokens: 80 }
+    });
+    const provider = normalizeProvider(config.provider);
+    const sessionId = await mutateState(config.instance, (state) => {
+      const session = createChatSession(state, "Packed history");
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "user",
+        content: `old secret should not be replayed ${"x".repeat(500)}`
+      });
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "assistant",
+        content: `old answer should not be replayed ${"y".repeat(500)}`
+      });
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "user",
+        content: "recent anchor question"
+      });
+      createChatMessage(state, {
+        sessionId: session.id,
+        role: "assistant",
+        content: "recent anchor answer"
+      });
+      return session.id;
+    });
+
+    const runId = await mutateState(config.instance, (state) => {
+      const run = createRun(state, {
+        kind: "conversation_turn",
+        title: "Packed turn",
+        input: "current",
+        conversationId: sessionId
+      });
+      return run.id;
+    });
+
+    setEchoToolCallingResponse({ provider, text: "Done.", toolCalls: [], finishReason: "stop" });
+    const task = await submitTask(config, "current question", { mode: "chat", runId });
+    const finished = await waitForTerminal(config, task.id);
+    expect(finished.status).toBe("completed");
+
+    const firstCall = getEchoToolCallingCalls()[0]!;
+    const providerText = firstCall.map((m) => String(m.content ?? "")).join("\n");
+    expect(providerText).toContain("Earlier chat history is outside the current model context.");
+    expect(providerText).toContain("recent anchor question");
+    expect(providerText).toContain("recent anchor answer");
+    expect(providerText).not.toContain("old secret should not be replayed");
+    expect(providerText).not.toContain("old answer should not be replayed");
+
+    const storedText = readState(config.instance).chatMessages.map((m) => m.content).join("\n");
+    expect(storedText).toContain("old secret should not be replayed");
+    expect(storedText).toContain("old answer should not be replayed");
 
     rmSync(workspaceRoot, { recursive: true, force: true });
   });

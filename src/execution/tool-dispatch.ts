@@ -2646,7 +2646,9 @@ async function requestSkillConnectorGrant(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3383,7 +3385,9 @@ async function requestConnectorTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3581,7 +3585,9 @@ async function browserFillSecretsTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3719,7 +3725,9 @@ async function requestMessagingBridgeTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -3876,7 +3884,9 @@ async function mintPairingApproval(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {
@@ -4435,7 +4445,9 @@ async function requestRemoveMessagingBridgeTool(
         content: reason,
         taskId: item.id,
         runId: item.runId,
-        kind: "approval_reason"
+        kind: "approval_reason",
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.parentBlockId ? { parentBlockId: item.parentBlockId } : {})
       });
     }
     appendTrace(config.instance, item.id, {

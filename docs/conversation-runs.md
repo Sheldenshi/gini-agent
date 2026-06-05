@@ -21,6 +21,14 @@ Gini handles this by keeping chat as the interaction layer and creating durable 
 
 Chat turns can create `conversation_turn` runs with plan steps and linked compatibility tasks. This preserves the seamless chat feel while keeping observability, approvals, retry, jobs, traces, and audit available.
 
+Chat history and model context are deliberately separate. Gini keeps the
+complete conversation durable, including thread blocks, tool transcripts,
+runs, traces, audit rows, and Hindsight memory. Each chat-task prompt gets a
+bounded prior-history replay tail instead of the whole transcript once the
+chat grows large; older exact details remain retrievable through
+`search_history`, and durable facts remain retrievable through automatic
+recall / `recall_memory` (see [Bounded Chat Context Window](./adr/chat-context-window.md)).
+
 ## Flow
 
 ```text
