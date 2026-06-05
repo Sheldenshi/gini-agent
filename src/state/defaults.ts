@@ -92,6 +92,24 @@ export function defaultToolsets(instance: Instance, at: string): ToolsetRecord[]
       updatedAt: at
     },
     {
+      id: "toolset_contacts",
+      instance,
+      name: "contacts",
+      description: "People-CRM: import a contacts file and run exhaustive structured queries over the user's network (find/count people by company/title/location, save people, map relationships). Distinct from memory recall — contacts queries return every match, not a ranked sample.",
+      status: "enabled",
+      toolNames: [
+        "contacts.import",
+        "contacts.query",
+        "contacts.count",
+        "contacts.upsert",
+        "contacts.relate",
+        "contacts.relations"
+      ],
+      scopes: ["task", "job", "skill", "subagent"],
+      createdAt: at,
+      updatedAt: at
+    },
+    {
       id: "toolset_browser",
       instance,
       name: "browser",
@@ -164,7 +182,8 @@ export const DEFAULT_AGENT_TOOLSETS: readonly string[] = [
   "messaging",
   "mcp",
   "browser",
-  "web_search"
+  "web_search",
+  "contacts"
 ];
 
 export function defaultAgent(instance: Instance, at: string): AgentRecord {
