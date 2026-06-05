@@ -1,13 +1,12 @@
-// Unit tests for the knowledge-base wiki integrity engine
-// (skills/knowledge/knowledge-base/scripts/lint.ts). Imports the pure
-// lintWiki() export (the script guards its CLI main with import.meta.main,
-// so importing it here does not execute the CLI path). Each test builds a
-// throwaway wiki under a unique temp dir.
+// Unit tests for the knowledge-base wiki integrity engine (../lint.ts).
+// Imports the pure lintWiki() export (the script guards its CLI main with
+// import.meta.main, so importing it here does not execute the CLI path).
+// Each test builds a throwaway wiki under a unique temp dir.
 import { describe, expect, test } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { lintWiki } from "../../skills/knowledge/knowledge-base/scripts/lint";
+import { lintWiki } from "../lint";
 
 function tempWiki(): string {
   return mkdtempSync(join(tmpdir(), "gini-wiki-lint-"));

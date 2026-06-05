@@ -28,6 +28,7 @@ Keep ADRs current when architecture changes.
 - Browser code must not receive gateway bearer tokens; token injection stays server-side in the Next.js BFF.
 - Side-effecting tools must preserve approval, audit, and trace behavior.
 - Instance-aware paths, ports, logs, and state must remain isolated.
+- Skill scripts (`skills/**/scripts/*.ts`) are first-class code: typechecked via the root `tsconfig` and run by `bun run test` (which spans `./skills`). Put a script's tests in `<skill>/scripts/__tests__/` — never directly in `scripts/`, which the loader advertises as runnable scripts — and keep scripts self-contained (no `src/` imports) so the skill stays portable; export a pure function and import it from the test when you need coverage.
 
 ## Branches
 
