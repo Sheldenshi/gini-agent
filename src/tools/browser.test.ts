@@ -2814,7 +2814,13 @@ describe("hostnameIsLoopback", () => {
       "LocalHost",
       "app.localhost",
       "localhost.",
-      "127.0.0.1."
+      "127.0.0.1.",
+      // IPv4-mapped / compat IPv6 hex forms of 127.0.0.1 (how browsers
+      // normalize [::ffff:127.0.0.1] / [::127.0.0.1]).
+      "::ffff:7f00:1",
+      "[::ffff:7f00:1]",
+      "::7f00:1",
+      "[::7f00:1]"
     ]) {
       expect(hostnameIsLoopback(h)).toBe(true);
     }
@@ -2827,7 +2833,11 @@ describe("hostnameIsLoopback", () => {
       "notlocalhost",
       "10.0.0.1",
       "169.254.169.254",
-      "1.2.3.4"
+      "1.2.3.4",
+      // IPv4-mapped IPv6 of a public IP (8.8.8.8) and a link-local IP
+      // (169.254.169.254) — neither is loopback.
+      "::ffff:808:808",
+      "::ffff:a9fe:a9fe"
     ]) {
       expect(hostnameIsLoopback(h)).toBe(false);
     }
@@ -2973,6 +2983,29 @@ describe("browserConsole loopback guard", () => {
     }
   });
 
+  test("in-page assertion catches the IPv4-mapped IPv6 loopback form", async () => {
+    const savedLocation = (globalThis as { location?: unknown }).location;
+    // Chromium normalizes a navigation to [::ffff:127.0.0.1] to this host.
+    (globalThis as { location?: unknown }).location = { hostname: "[::ffff:7f00:1]" };
+    try {
+      browserTest.installFakeSessionWithPageForTest("console-mapped", {
+        url: () => "https://example.com/",
+        on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+        goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
+        evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
+      });
+      const out = JSON.parse(
+        await browserConsole("console-mapped", { expression: "(globalThis.__ranMapped = true)" })
+      ) as { evalResult: unknown; evalError: string | null };
+      expect(out.evalError).toContain("loopback origin");
+      expect(out.evalResult).toBeNull();
+      expect((globalThis as { __ranMapped?: boolean }).__ranMapped).toBeUndefined();
+    } finally {
+      (globalThis as { location?: unknown }).location = savedLocation;
+      delete (globalThis as { __ranMapped?: boolean }).__ranMapped;
+    }
+  });
+
   test("runs the expression normally on a public origin", async () => {
     const savedLocation = (globalThis as { location?: unknown }).location;
     (globalThis as { location?: unknown }).location = { hostname: "example.com" };
@@ -2992,6 +3025,43 @@ describe("browserConsole loopback guard", () => {
       expect(out.success).toBe(true);
       expect(out.evalError).toBeNull();
       expect(out.evalResult).toBe(42);
+    } finally {
+      (globalThis as { location?: unknown }).location = savedLocation;
+    }
+  });
+
+  // If a navigation commits *during* the eval so the page is on a loopback
+  // origin by the time the call returns, the result must be withheld — the
+  // loopback URL and the control-plane page's console output must not leak
+  // back to the agent even though the write was already blocked.
+  test("withholds console state if the page committed to loopback during the eval", async () => {
+    const savedLocation = (globalThis as { location?: unknown }).location;
+    (globalThis as { location?: unknown }).location = { hostname: "example.com" };
+    let urlCalls = 0;
+    let gotoTarget: string | undefined;
+    try {
+      browserTest.installFakeSessionWithPageForTest("console-postrace", {
+        // Benign on the pre-check read; loopback on every read after the eval.
+        url: () => (++urlCalls === 1 ? "https://example.com/" : "http://127.0.0.1:7373/api/runtime/whoami"),
+        on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+        goto: (async (u: string) => {
+          gotoTarget = u;
+          return null;
+        }) as unknown as import("playwright-core").Page["goto"],
+        evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
+      });
+      const out = JSON.parse(await browserConsole("console-postrace", { expression: "1 + 1" })) as {
+        success: boolean;
+        error?: string;
+        url?: string;
+        messages?: unknown;
+      };
+      expect(out.success).toBe(false);
+      expect(out.error).toContain("loopback");
+      // The loopback URL and any captured console messages must be withheld.
+      expect(out.url).toBeUndefined();
+      expect(out.messages).toBeUndefined();
+      expect(gotoTarget).toBe("about:blank");
     } finally {
       (globalThis as { location?: unknown }).location = savedLocation;
     }

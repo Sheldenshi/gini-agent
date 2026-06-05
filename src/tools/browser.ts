@@ -927,15 +927,31 @@ function isBlockedIpv6(host: string): string | undefined {
 const LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "0.0.0.0", "localhost", "::1"];
 
 // True when `hostname` denotes a loopback origin: an exact LOOPBACK_HOSTS
-// entry, anything in 127.0.0.0/8, or a name under the `.localhost` TLD.
-// Strips IPv6 brackets and a trailing root dot and lowercases first, so
-// bracketed / fully-qualified / mixed-case forms classify the same as
-// their bare form. Exported so the predicate is unit-testable on its own;
-// the same three rules are mirrored inline in browser_console's in-page
-// guard, which can't import module code into the page context.
+// entry, anything in 127.0.0.0/8, a name under the `.localhost` TLD, or an
+// IPv4-mapped / IPv4-compat IPv6 form whose embedded IPv4 is loopback
+// (browsers normalize [::ffff:127.0.0.1] / [::127.0.0.1] to the hex forms
+// [::ffff:7f00:1] / [::7f00:1]). Strips IPv6 brackets and a trailing root
+// dot and lowercases first, so bracketed / fully-qualified / mixed-case
+// forms classify the same as their bare form. Exported so the predicate is
+// unit-testable on its own; the same rules are mirrored inline in
+// browser_console's in-page guard, which can't import module code into the
+// page context.
 export function hostnameIsLoopback(hostname: string): boolean {
   const h = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
-  return LOOPBACK_HOSTS.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost");
+  if (LOOPBACK_HOSTS.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost")) {
+    return true;
+  }
+  // Decode the trailing 32 bits of an IPv4-mapped/compat IPv6 hex form to a
+  // dotted quad and re-test — matches safetyCheck's decodeIpv4Mapped so the
+  // hex spellings the browser produces still classify as loopback.
+  const mapped = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(h);
+  if (mapped) {
+    const hi = parseInt(mapped[1]!, 16);
+    const lo = parseInt(mapped[2]!, 16);
+    const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+    return LOOPBACK_HOSTS.includes(v4) || /^127\./.test(v4);
+  }
+  return false;
 }
 
 // Exported for direct unit testing in src/tools/browser.test.ts.
@@ -2051,11 +2067,21 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
               // expression on a loopback document with a same-origin path
               // to the bearer-injecting BFF. Re-checking here, where there
               // is no gap between check and use, closes that race. Mirrors
-              // hostnameIsLoopback's three rules — the host set arrives as
-              // data; the 127.0.0.0/8 and .localhost predicates are inlined
-              // because page code can't import module helpers.
+              // hostnameIsLoopback — the host set arrives as data; the
+              // 127.0.0.0/8, .localhost, and IPv4-mapped/compat IPv6 decode
+              // are inlined because page code can't import module helpers.
               const h = location.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
-              if (loopbackHosts.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost")) {
+              let loop = loopbackHosts.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost");
+              if (!loop) {
+                const m = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(h);
+                if (m) {
+                  const hi = parseInt(m[1]!, 16);
+                  const lo = parseInt(m[2]!, 16);
+                  const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+                  loop = loopbackHosts.includes(v4) || /^127\./.test(v4);
+                }
+              }
+              if (loop) {
                 throw new Error(`Blocked: ${h} is a loopback origin; the agent's browser may not execute JS here.`);
               }
               // eslint-disable-next-line no-new-func
@@ -2066,6 +2092,16 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
         } catch (error) {
           evalError = error instanceof Error ? error.message : String(error);
         }
+      }
+      // The eval can navigate the page, and a navigation kicked off earlier
+      // can commit during it — the race the in-page assertion blocks
+      // *execution* for. If the page is now on a loopback origin, refuse hard
+      // and bounce rather than returning session.page.url() (the loopback URL)
+      // or messages (console output the control-plane document emitted): the
+      // write is already blocked, but returning that state would still leak it.
+      const postEvalBlock = await assertNotLoopbackPage(session.page);
+      if (postEvalBlock) {
+        return fail(`${postEvalBlock} (refusing to return console state from a loopback control-plane page)`);
       }
       const messages = consoleLogs.get(taskId) ?? [];
       // Redact data-gini-secret values from anywhere they could
