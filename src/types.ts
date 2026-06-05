@@ -1542,6 +1542,12 @@ export interface ConnectorRecord {
     installed: boolean;
     clientConfigured: boolean;
     signedIn: boolean;
+    // Per-service grant derived from the session's OAuth scopes, keyed by the
+    // google-* skill suffix (calendar, gmail, drive, docs, sheets, forms,
+    // meet). A user who consents to only some services on Google's screen is
+    // signedIn:true but has only those keys true — so dependent rows reflect
+    // their own scope instead of all lighting up.
+    services?: Record<string, boolean>;
     message: string;
   };
 }

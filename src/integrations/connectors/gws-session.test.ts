@@ -7,15 +7,41 @@ import { parseGwsAuthStatus } from "./gws-session";
 // client_config_exists===true, and the human message for each state.
 
 describe("parseGwsAuthStatus", () => {
-  test("signed in when token_valid is true", () => {
+  test("signed in when token_valid is true; scopes map to per-service grants", () => {
     const status = parseGwsAuthStatus(
-      JSON.stringify({ client_config_exists: true, token_valid: true, has_refresh_token: true })
+      JSON.stringify({
+        client_config_exists: true,
+        token_valid: true,
+        has_refresh_token: true,
+        scopes: [
+          "https://www.googleapis.com/auth/calendar",
+          "https://www.googleapis.com/auth/gmail.modify"
+        ]
+      })
     );
     expect(status).toEqual({
       installed: true,
       clientConfigured: true,
       signedIn: true,
+      services: { calendar: true, gmail: true, drive: false, docs: false, sheets: false, forms: false, meet: false },
       message: "Signed in to Google"
+    });
+  });
+
+  test("docs/sheets/meet resolve from their Google scope names", () => {
+    const status = parseGwsAuthStatus(
+      JSON.stringify({
+        client_config_exists: true,
+        token_valid: true,
+        scopes: [
+          "https://www.googleapis.com/auth/documents",
+          "https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/meetings.space.created"
+        ]
+      })
+    );
+    expect(status.services).toEqual({
+      calendar: false, gmail: false, drive: false, docs: true, sheets: true, forms: false, meet: true
     });
   });
 
@@ -43,6 +69,7 @@ describe("parseGwsAuthStatus", () => {
       installed: true,
       clientConfigured: false,
       signedIn: false,
+      services: { calendar: false, gmail: false, drive: false, docs: false, sheets: false, forms: false, meet: false },
       message: "Google sign-in needed"
     });
   });
@@ -53,6 +80,7 @@ describe("parseGwsAuthStatus", () => {
       installed: false,
       clientConfigured: false,
       signedIn: false,
+      services: { calendar: false, gmail: false, drive: false, docs: false, sheets: false, forms: false, meet: false },
       message: "gws not installed"
     });
   });
