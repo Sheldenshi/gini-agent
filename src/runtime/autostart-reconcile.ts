@@ -15,12 +15,29 @@
 // generate (computePlistStamp over the stable supervision subset) and
 // compares it to the stamp baked into the on-disk plist (readPlistStamp). If
 // they all match it returns immediately — the fast, silent common path. On
-// drift it spawns a DETACHED `gini autostart enable`, which regenerates the
-// plist files AND reloads them (bootout+bootstrap): the bootout terminates
-// THIS gateway and re-bootstraps it from the regenerated plist. We deliberately
+// drift it schedules a DETACHED `gini autostart enable` (which regenerates the
+// plist files AND reloads them via bootout+bootstrap: the bootout terminates
+// THIS gateway and re-bootstraps it from the regenerated plist). We deliberately
 // do NOT self-SIGTERM or exit — under always-respawn KeepAlive a clean exit
 // would be re-spawned by launchd and race the detached enable; letting the
 // child's bootout kill us avoids that race entirely.
+//
+// The reload is DEFERRED by a stabilization delay rather than dispatched the
+// instant drift is seen. A startup reconcile most often runs right after a
+// self-update has respawned this gateway: a client (the web UpdateReminder)
+// is polling /api/status for the new SHA, and the gateway must stay reachable
+// through that window or the client surfaces a "hasn't reported back" prompt.
+// Tearing the gateway down immediately to reload the plist would blank it out
+// during exactly that poll. Worse, bootout+bootstrap against a service launchd
+// only just respawned (amid concurrent supervision churn) can fail with
+// `Bootstrap failed: 5: Input/output error` and leave the service deregistered.
+// So we wait out a delay that comfortably exceeds the client's poll window,
+// letting launchd settle, before kicking the reload — by then the gateway has
+// reported the new SHA and the reload runs as a single, race-free operation.
+// The timer is in-process and unref'd: if this gateway is replaced first (a
+// later update, a crash, a manual reload) the timer dies with the process, so
+// the reload only ever fires once the gateway has been stable for the full
+// delay, and the next gateway start re-schedules from scratch.
 //
 // We also deliberately do NOT pre-write the plist files here. Writing disk
 // alone doesn't reload launchd — it keeps running the def it loaded until a
@@ -49,6 +66,12 @@ import { logDir, projectRoot } from "../paths";
 import { appendLog } from "../state";
 import type { RuntimeConfig } from "../types";
 
+// How long to wait after detecting drift before kicking the detached reload.
+// Must comfortably exceed the web UpdateReminder's 30s "hasn't reported back"
+// status-poll window so a freshly self-updated gateway stays reachable long
+// enough to report the new SHA before its plist reload tears it down.
+export const RECONCILE_RELOAD_DELAY_MS = 60_000;
+
 // Once-per-process guard. The deterministic stamp already guarantees
 // convergence (after a reconcile the on-disk plist == what the code
 // generates, so the next boot no-ops), but a per-process latch makes it
@@ -65,11 +88,27 @@ export interface ReconcileOptions {
   // child_process.spawn so unit tests can assert the detached relaunch
   // without launching anything. Production callers omit it.
   spawnImpl?: typeof spawn;
+  // Test seam: inject the timer that defers the reload so unit tests can
+  // capture (or immediately invoke) the scheduled callback instead of waiting
+  // out the real delay. Defaults to an unref'd setTimeout.
+  schedule?: (fn: () => void, ms: number) => void;
+  // Stabilization delay before the deferred reload fires. Defaults to
+  // RECONCILE_RELOAD_DELAY_MS; tests override it to keep cases fast.
+  delayMs?: number;
+}
+
+// Default deferral: an in-process, unref'd timer so the reload neither blocks
+// boot nor keeps the process alive on its own. If the gateway is replaced
+// before it fires, the timer dies with the process and the next start
+// re-schedules.
+function defaultSchedule(fn: () => void, ms: number): void {
+  const t = setTimeout(fn, ms);
+  if (typeof t.unref === "function") t.unref();
 }
 
 // Reconcile this instance's installed launchd plists to the current
 // supervision template. Never throws (the boot path must stay never-crash);
-// returns whether a drift relaunch was dispatched (mostly for tests).
+// returns whether a drift reload was scheduled (mostly for tests).
 export async function reconcileAutostartPlistOnStartup(
   config: RuntimeConfig,
   options: ReconcileOptions = {}
@@ -123,25 +162,35 @@ function reconcileInner(config: RuntimeConfig, options: ReconcileOptions): boole
   // Latch BEFORE acting so a re-entrant call can't double-fire.
   reconcileFiredThisProcess = true;
 
-  // Spawn a DETACHED `gini autostart enable` for ALL kinds and let IT own the
-  // regenerate + reload. Its bootout terminates THIS gateway and re-bootstraps
-  // it from the regenerated plist (the port-free wait inside enable keeps the
-  // handoff from double-binding). We never self-SIGTERM or exit — letting the
-  // child's bootout kill us sidesteps the always-respawn KeepAlive race. We do
+  // DEFER the detached `gini autostart enable` by a stabilization delay rather
+  // than dispatching it now. A startup reconcile usually runs right after a
+  // self-update respawned this gateway, while a client polls /api/status for
+  // the new SHA; reloading the plist immediately would bootout this gateway
+  // mid-poll (the client then surfaces a "hasn't reported back" prompt) and the
+  // bootout+bootstrap against a service launchd only just respawned can fail
+  // with an I/O error and deregister it. Waiting out the delay keeps the gateway
+  // reachable so it reports the new SHA, and lets launchd settle so the reload
+  // (whose bootout terminates THIS gateway and re-bootstraps it from the
+  // regenerated plist) runs as a single race-free operation. The timer is
+  // in-process and unref'd: if the gateway is replaced before it fires the timer
+  // dies with the process, so the reload only fires once the gateway has been
+  // stable for the full delay, and the next gateway start re-schedules. We do
   // not touch the on-disk plist here (see the module header): a failed relaunch
   // must keep the stamp mismatched so the next gateway start retries.
-  const dispatched = spawnDetachedEnable(instance, options.spawnImpl);
+  const schedule = options.schedule ?? defaultSchedule;
+  const delayMs = options.delayMs ?? RECONCILE_RELOAD_DELAY_MS;
+  schedule(() => spawnDetachedEnable(instance, options.spawnImpl), delayMs);
 
   try {
     appendLog(instance, "autostart.reconcile.drift", {
       kinds: drifted,
-      dispatched
+      deferredMs: delayMs
     });
   } catch {
     /* observability is best-effort; never crash boot over a log write */
   }
 
-  return dispatched;
+  return true;
 }
 
 // Compute the stamp for a resolved service descriptor, mirroring exactly what

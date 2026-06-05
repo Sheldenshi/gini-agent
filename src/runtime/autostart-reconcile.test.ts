@@ -8,11 +8,17 @@
 //
 //   - no managed plist on disk      → no-op (no spawn)
 //   - all stamps match              → no-op (spawn recorder not called)
-//   - a missing/mismatched stamp    → spawns enable once, leaving the on-disk
+//   - a missing/mismatched stamp    → schedules enable once, leaving the on-disk
 //                                      plist UNTOUCHED (the detached enable owns
 //                                      the regenerate+reload; pre-stamping the
 //                                      file would mask drift if the relaunch failed)
+//   - the reload is deferred        → the detached enable does not spawn until
+//                                      the stabilization timer fires
 //   - a second call in-process      → guarded no-op (once-per-process latch)
+//
+// The drift cases that assert a synchronous spawn inject `schedule: (fn) => fn()`
+// so the deferred reload fires immediately; one case records the timer instead
+// to prove the deferral.
 //
 // macOS only: the gating is `process.platform === "darwin"`, so on other
 // platforms the suite is skipped (the reconcile returns immediately there).
@@ -28,7 +34,11 @@ import {
 } from "../cli/autostart";
 import { logDir } from "../paths";
 import type { RuntimeConfig } from "../types";
-import { __testing, reconcileAutostartPlistOnStartup } from "./autostart-reconcile";
+import {
+  __testing,
+  RECONCILE_RELOAD_DELAY_MS,
+  reconcileAutostartPlistOnStartup
+} from "./autostart-reconcile";
 
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
@@ -138,7 +148,11 @@ function writeCurrentPlists(instance: string): void {
     expect(readPlistStamp(gatewayPath)).toBe("staleaaaaaaa");
 
     const rec = makeSpawnRecorder();
-    const dispatched = await reconcileAutostartPlistOnStartup(config, { spawnImpl: rec.spawnImpl });
+    // Fire the deferred reload synchronously so the spawn assertions below hold.
+    const dispatched = await reconcileAutostartPlistOnStartup(config, {
+      spawnImpl: rec.spawnImpl,
+      schedule: (fn) => fn()
+    });
     expect(dispatched).toBe(true);
 
     // The reconcile must NOT pre-write/pre-stamp the on-disk plist — that's the
@@ -156,6 +170,46 @@ function writeCurrentPlists(instance: string): void {
     ]);
   });
 
+  test("on drift the reload is deferred — not spawned until the timer fires", async () => {
+    writeCurrentPlists(instance);
+    // Corrupt the gateway plist's stamp to force drift (same fixture as above).
+    const gatewayPath = plistPathFor(instance, "gateway");
+    const original = readFileSync(gatewayPath, "utf8");
+    const corrupted = original.replace(
+      /<key>GINI_PLIST_STAMP<\/key>\s*<string>[^<]*<\/string>/,
+      "<key>GINI_PLIST_STAMP</key><string>staleaaaaaaa</string>"
+    );
+    writeFileSync(gatewayPath, corrupted);
+    expect(readPlistStamp(gatewayPath)).toBe("staleaaaaaaa");
+
+    const rec = makeSpawnRecorder();
+    // Record the scheduled callback + delay instead of firing it, so we can
+    // assert nothing spawns until the deferral elapses.
+    let scheduledFn: (() => void) | undefined;
+    let scheduledMs: number | undefined;
+    const dispatched = await reconcileAutostartPlistOnStartup(config, {
+      spawnImpl: rec.spawnImpl,
+      schedule: (fn, ms) => {
+        scheduledFn = fn;
+        scheduledMs = ms;
+      }
+    });
+    expect(dispatched).toBe(true);
+
+    // Deferred: the detached enable has NOT been spawned yet, and the deferral
+    // uses the configured stabilization delay.
+    expect(rec.calls.length).toBe(0);
+    expect(scheduledMs).toBe(RECONCILE_RELOAD_DELAY_MS);
+    // The on-disk plist is untouched while deferred — no pre-stamping.
+    expect(readPlistStamp(gatewayPath)).toBe("staleaaaaaaa");
+
+    // Firing the timer dispatches the detached enable exactly once.
+    scheduledFn!();
+    expect(rec.calls.length).toBe(1);
+    // Still no pre-stamp after the spawn — the detached enable owns the rewrite.
+    expect(readPlistStamp(gatewayPath)).toBe("staleaaaaaaa");
+  });
+
   test("a missing-stamp (pre-stamp) plist is treated as drift", async () => {
     // Simulate a plist written before the stamp existed: no GINI_PLIST_STAMP
     // env entry at all. Only the gateway plist needs to exist for the gate.
@@ -167,7 +221,10 @@ function writeCurrentPlists(instance: string): void {
     expect(readPlistStamp(gatewayPath)).toBeNull();
 
     const rec = makeSpawnRecorder();
-    const dispatched = await reconcileAutostartPlistOnStartup(config, { spawnImpl: rec.spawnImpl });
+    const dispatched = await reconcileAutostartPlistOnStartup(config, {
+      spawnImpl: rec.spawnImpl,
+      schedule: (fn) => fn()
+    });
     expect(dispatched).toBe(true);
     expect(rec.calls.length).toBe(1);
     // The reconcile leaves the on-disk plist untouched (still stamp-less) —
@@ -184,13 +241,17 @@ function writeCurrentPlists(instance: string): void {
     );
 
     const first = makeSpawnRecorder();
-    expect(await reconcileAutostartPlistOnStartup(config, { spawnImpl: first.spawnImpl })).toBe(true);
+    expect(
+      await reconcileAutostartPlistOnStartup(config, { spawnImpl: first.spawnImpl, schedule: (fn) => fn() })
+    ).toBe(true);
     expect(first.calls.length).toBe(1);
 
     // Even with the plist still drifted (we don't reset it), the latch
     // prevents a second fire within this process lifetime.
     const second = makeSpawnRecorder();
-    expect(await reconcileAutostartPlistOnStartup(config, { spawnImpl: second.spawnImpl })).toBe(false);
+    expect(
+      await reconcileAutostartPlistOnStartup(config, { spawnImpl: second.spawnImpl, schedule: (fn) => fn() })
+    ).toBe(false);
     expect(second.calls.length).toBe(0);
   });
 
@@ -201,7 +262,7 @@ function writeCurrentPlists(instance: string): void {
       "<plist><dict><key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin</string></dict></dict></plist>"
     );
     const rec = makeSpawnRecorder();
-    await reconcileAutostartPlistOnStartup(config, { spawnImpl: rec.spawnImpl });
+    await reconcileAutostartPlistOnStartup(config, { spawnImpl: rec.spawnImpl, schedule: (fn) => fn() });
     const logPath = join(logDir(instance), "autostart-reconcile.log");
     expect(existsSync(logPath)).toBe(true);
     expect(readFileSync(logPath, "utf8")).toContain("autostart enable --instance");

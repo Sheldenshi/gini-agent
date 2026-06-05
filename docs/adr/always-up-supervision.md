@@ -65,12 +65,25 @@ false-positive reconcile loop. At gateway startup
 compares the stamp the current code would generate against the stamp baked into
 each on-disk plist (gateway/web/watchdog). When everything matches it is a
 silent no-op; it is also skipped entirely when no managed gateway plist exists
-(foreground / `gini run` / conductor). On drift it spawns a detached `gini
+(foreground / `gini run` / conductor). On drift it schedules a detached `gini
 autostart enable` — which regenerates the plist files AND reloads them
 (bootout+bootstrap) — whose `bootout` terminates this gateway and re-bootstraps
 it from the regenerated plist. It never self-SIGTERMs or exits — under
 always-respawn KeepAlive a clean exit would be respawned and race the detached
 enable, so letting the child's bootout do the killing avoids that race. The
+reload is **deferred by a stabilization delay** (`RECONCILE_RELOAD_DELAY_MS`)
+rather than dispatched the instant drift is seen, because a startup reconcile
+most often runs right after a self-update respawned this gateway while a client
+(the web UpdateReminder) polls `/api/status` for the new SHA. Dispatching
+immediately would bootout the gateway mid-poll — the client would surface a
+"hasn't reported back" prompt — and a bootout+bootstrap against a service
+launchd only just respawned can fail with an I/O error and deregister it. The
+delay comfortably exceeds the client's poll window, so the gateway stays
+reachable to report the new SHA and launchd settles, then the reload runs as a
+single race-free operation. The deferral timer is in-process and unref'd: if the
+gateway is replaced before it fires, the timer dies with the process and the
+next gateway start re-schedules, so the reload only fires once the gateway has
+been stable for the full delay. The
 reconcile deliberately does NOT pre-write the on-disk plist: writing disk alone
 does not reload launchd (it keeps the def it loaded until a bootout+bootstrap),
 and stamping the file before that reload actually happened would mask drift — a
