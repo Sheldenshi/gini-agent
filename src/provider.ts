@@ -149,7 +149,20 @@ export function providerCatalog(): ProviderCatalogItem[] {
       displayName: "Anthropic Compatible",
       baseUrl: DEFAULT_ANTHROPIC_BASE_URL,
       auth: "env",
-      models: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+      // All current Claude models, in both their first-party ids (default
+      // baseUrl) and their Bedrock Mantle anthropic.-prefixed ids (Bedrock
+      // baseUrl). The model picker lists every entry; pick the form matching
+      // the configured endpoint.
+      models: [
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "anthropic.claude-opus-4-8",
+        "anthropic.claude-opus-4-7",
+        "anthropic.claude-sonnet-4-6",
+        "anthropic.claude-haiku-4-5"
+      ],
       capabilities: ["messages", "tool-calling", "streaming", "vision"],
       costHint: "external"
     },

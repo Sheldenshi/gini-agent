@@ -41,7 +41,7 @@ SigV4 / IAM-role auth (the AWS-recommended Bedrock path) is intentionally **not*
 
 ## Operational Notes
 
-- **Bedrock model ids** carry an `anthropic.` provider prefix (e.g. `anthropic.claude-opus-4-8`). The catalog ships first-party ids as defaults; for Bedrock the user sets the prefixed id. The web Add-Provider form renders a free-text model input for `anthropic` so either form can be entered.
+- **Bedrock model ids** carry an `anthropic.` provider prefix (e.g. `anthropic.claude-opus-4-8`). The catalog lists all current Claude models (Opus 4.8, Opus 4.7, Sonnet 4.6, Haiku 4.5) in both their first-party and `anthropic.`-prefixed forms, so the Add/Edit Provider model dropdown offers the matching id for either endpoint.
 - **Bedrock bearer tokens expire at ≤ 12h and cannot be refreshed.** A long-lived gateway will start returning `401 authentication_error` once a token lapses; the existing `AUTH_EXPIRED_RE` / `providerReauth` note surfaces this as a re-authenticate prompt. Re-minting requires `aws-bedrock-token-generator` + AWS credentials and is a manual step.
 - **`baseUrl` path-prefix convention**: the builder appends `/v1/messages` to whatever `baseUrl` resolves to, so the Bedrock `baseUrl` must include the `/anthropic` prefix. The CLI help and the Add-Provider hint document the exact value.
 - **Configured badge** tracks `ANTHROPIC_API_KEY` (the canonical env var in `PROVIDER_API_KEY_ENV`). A Bedrock bearer stored under a custom env var via the CLI `--api-key-env` still works for calls, but the Settings "configured" badge keys off the canonical var.

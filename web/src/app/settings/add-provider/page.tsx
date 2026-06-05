@@ -8,7 +8,6 @@ import { toast } from "sonner";
 import {
   ArrowLeftIcon,
   CheckIcon,
-  SparklesIcon,
   Terminal as TerminalIcon,
   ZapIcon
 } from "lucide-react";
@@ -16,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { displayProviderName, type ProviderCatalogItem } from "../_components/ProviderCard";
 
@@ -27,7 +26,7 @@ const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "openrouter", "dee
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; description: string }> = {
   codex: { icon: TerminalIcon, description: "OAuth via codex --login" },
   openai: { icon: OpenAILogo, description: "GPT-5.4, GPT-5.4 mini, …" },
-  anthropic: { icon: SparklesIcon, description: "Claude Opus/Sonnet/Haiku (incl. Bedrock)" },
+  anthropic: { icon: AnthropicLogo, description: "Claude Opus/Sonnet/Haiku (incl. Bedrock)" },
   openrouter: { icon: ZapIcon, description: "Multi-model router" },
   deepseek: { icon: DeepSeekLogo, description: "DeepSeek V4 family" },
   local: { icon: OllamaLogo, description: "Ollama, LM Studio, vLLM" }
@@ -260,41 +259,26 @@ export default function AddProviderPage() {
 
                 <div className="grid gap-2">
                   <Label htmlFor="provider-model">Default model</Label>
-                  {isAnthropic ? (
-                    // Free-text so Bedrock's anthropic.-prefixed model ids
-                    // (e.g. anthropic.claude-opus-4-8) can be entered alongside
-                    // the first-party ids the catalog ships.
-                    <Input
-                      id="provider-model"
-                      type="text"
-                      autoComplete="off"
-                      placeholder="claude-opus-4-8"
-                      value={selectedModel}
-                      onChange={(e) => setSelectedModel(e.target.value)}
-                      disabled={save.isPending}
-                    />
-                  ) : (
-                    <Select
-                      key={providerName}
-                      defaultValue={selectedModel}
-                      onValueChange={setSelectedModel}
-                      disabled={!entry || save.isPending}
-                    >
-                      <SelectTrigger id="provider-model"><SelectValue placeholder="Select model" /></SelectTrigger>
-                      <SelectContent>
-                        {entry?.models.map((m) => (
-                          <SelectItem key={m} value={m}>{m}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
+                  <Select
+                    key={providerName}
+                    defaultValue={selectedModel}
+                    onValueChange={setSelectedModel}
+                    disabled={!entry || save.isPending}
+                  >
+                    <SelectTrigger id="provider-model"><SelectValue placeholder="Select model" /></SelectTrigger>
+                    <SelectContent>
+                      {entry?.models.map((m) => (
+                        <SelectItem key={m} value={m}>{m}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   {isAnthropic ? (
                     <p className="text-xs text-muted-foreground">
                       Leave Base URL blank for the first-party Claude API. For Amazon Bedrock, set it to{" "}
                       <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">
                         https://bedrock-mantle.&lt;region&gt;.api.aws/anthropic
                       </code>{" "}
-                      and use the <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">anthropic.</code>-prefixed model id.
+                      and pick an <code className="rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">anthropic.</code>-prefixed model.
                     </p>
                   ) : null}
                 </div>

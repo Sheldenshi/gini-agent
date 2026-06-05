@@ -9,7 +9,6 @@ import {
   CheckIcon,
   PencilIcon,
   PlusIcon,
-  SparklesIcon,
   Terminal as TerminalIcon,
   Trash2Icon,
   ZapIcon
@@ -21,7 +20,7 @@ import {
   DialogDescription,
   DialogTitle
 } from "@/components/ui/dialog";
-import { DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
+import { AnthropicLogo, DeepSeekLogo, OllamaLogo, OpenAILogo } from "@/components/provider-logos";
 import { api } from "@/lib/api";
 import { useInvalidate } from "@/lib/queries";
 import { EditProviderDialog } from "./EditProviderDialog";
@@ -68,7 +67,7 @@ const SELECTABLE_PROVIDERS = ["codex", "openai", "anthropic", "deepseek", "openr
 const PROVIDER_VISUAL: Record<string, { icon: React.ComponentType<{ className?: string }>; authLabel: string }> = {
   codex: { icon: TerminalIcon, authLabel: "OAuth" },
   openai: { icon: OpenAILogo, authLabel: "API key" },
-  anthropic: { icon: SparklesIcon, authLabel: "API key" },
+  anthropic: { icon: AnthropicLogo, authLabel: "API key" },
   deepseek: { icon: DeepSeekLogo, authLabel: "API key" },
   openrouter: { icon: ZapIcon, authLabel: "API key" },
   local: { icon: OllamaLogo, authLabel: "Local" }

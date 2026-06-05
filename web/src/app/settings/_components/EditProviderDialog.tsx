@@ -85,7 +85,6 @@ export function EditProviderDialog({
     apiKey.trim().length > 0 ||
     (model !== "" && model !== (currentModel ?? row.models[0] ?? ""));
   const canSubmit = dirty && !save.isPending;
-  const isAnthropic = row.name === "anthropic";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -140,37 +139,22 @@ export function EditProviderDialog({
             <div className="flex items-center justify-between">
               <Label htmlFor="edit-model" className="text-[13px] font-semibold text-[#C2C2C8]">Default model</Label>
               <span className="text-xs text-[#6A6A70]">
-                {isAnthropic ? "free text" : `${row.models.length} available`}
+                {row.models.length} available
               </span>
             </div>
-            {isAnthropic ? (
-              // Free-text so Bedrock's anthropic.-prefixed model ids can be
-              // edited here too (the catalog Select ships first-party ids only).
-              <Input
+            <Select value={model} onValueChange={setModel} disabled={save.isPending}>
+              <SelectTrigger
                 id="edit-model"
-                type="text"
-                autoComplete="off"
-                placeholder="claude-opus-4-8"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                disabled={save.isPending}
                 className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
-              />
-            ) : (
-              <Select value={model} onValueChange={setModel} disabled={save.isPending}>
-                <SelectTrigger
-                  id="edit-model"
-                  className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
-                >
-                  <SelectValue placeholder="Select model" />
-                </SelectTrigger>
-                <SelectContent>
-                  {row.models.map((m) => (
-                    <SelectItem key={m} value={m} className="font-mono text-[13px]">{m}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
+              >
+                <SelectValue placeholder="Select model" />
+              </SelectTrigger>
+              <SelectContent>
+                {row.models.map((m) => (
+                  <SelectItem key={m} value={m} className="font-mono text-[13px]">{m}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">

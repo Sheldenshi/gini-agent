@@ -2,11 +2,27 @@
 // authoritative Pencil design file (Logo / OpenAI, Logo / DeepSeek,
 // Logo / Ollama). DeepSeek keeps its brand-blue regardless of theme; the
 // OpenAI and Ollama marks ship as monochrome and inherit currentColor so
-// the surrounding icon wrap controls the tint.
+// the surrounding icon wrap controls the tint. The Anthropic mark is the
+// official single-path symbol (24×24 viewBox), monochrome via currentColor
+// to match the OpenAI/Ollama treatment.
 
 import * as React from "react";
 
 type LogoProps = React.SVGAttributes<SVGSVGElement>;
+
+export function AnthropicLogo({ className, ...rest }: LogoProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      aria-hidden
+      className={className}
+      {...rest}
+    >
+      <path d="M17.3041 3.541h-3.6718l6.696 16.918H24Zm-10.6082 0L0 20.459h3.7442l1.3693-3.5527h7.0052l1.3693 3.5528h3.7442L10.5363 3.5409Zm-.3712 10.2232 2.2914-5.9456 2.2914 5.9456Z" />
+    </svg>
+  );
+}
 
 export function OpenAILogo({ className, ...rest }: LogoProps) {
   return (
