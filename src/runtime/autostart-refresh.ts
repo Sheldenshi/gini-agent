@@ -31,12 +31,17 @@
 //      connections and could drop the response we just wrote.)
 //   3. After drain, the SIGTERM handler consumes the marker: removes it
 //      and execs `gini autostart enable --kind gateway` as a detached
-//      child. That child's `launchctl bootstrap` re-registers the plist
-//      with the new EnvironmentVariables (read from secrets.env at
-//      `enable` time).
-//   4. process.exit(0). launchctl honors KeepAlive.SuccessfulExit:false →
-//      does NOT respawn. The detached child does the bootstrap →
-//      launchd spawns a fresh gateway with the new env.
+//      child. That child boots out the old registration and bootstraps the
+//      plist anew with the fresh EnvironmentVariables (read from secrets.env
+//      at `enable` time).
+//   4. process.exit(0). The gateway plist's KeepAlive is a plain `<true/>`
+//      (always respawn), so launchd respawns this gateway on the clean exit
+//      regardless of code — and that respawn races the detached child's
+//      bootstrap for the gateway port. The handoff is made safe by `enable`
+//      itself: after its bootout of the gateway it awaits the port becoming
+//      free (waitForPortFree) before bootstrapping/kickstarting, so the
+//      relaunch never double-binds the port (EADDRINUSE). The end state is a
+//      single gateway running the new env, whichever respawn wins the race.
 //
 // This guarantees the response is fully written and the connection
 // closed before any launchctl interaction — shutdown only happens once
