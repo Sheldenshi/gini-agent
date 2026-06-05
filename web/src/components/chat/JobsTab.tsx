@@ -2,13 +2,12 @@
 
 import Link from "next/link";
 import { useMemo, useState } from "react";
-import { ArrowRight, ChevronDown, List, Calendar, Plus } from "lucide-react";
+import { ArrowRight, List, Calendar } from "lucide-react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { CreateJobDialog } from "./CreateJobDialog";
 import { scheduleLabel } from "@/app/jobs/_components/schedule-label";
 import { CalendarView } from "@/app/jobs/_components/calendar/calendar-view";
 import { adaptJob, adaptRun } from "@/app/jobs/_components/calendar/types";
@@ -26,17 +25,16 @@ const STATUS_FILTER_LABELS: Record<StatusFilter, string> = {
 };
 
 // Per-agent Jobs tab — design `pu4J9` ("Agent Page — Jobs list").
-// A Page Header (Jobs title + subtitle, a List⇆Calendar toggle, and a
-// "+ New job" button) sits above a two-column list body: jobs on the left,
-// recent runs on the right. `useJobs`/`useJobRuns` are already scoped to the
-// active agent, so both columns show only this agent's jobs and runs.
+// A Page Header (Jobs title + subtitle and a List⇆Calendar toggle) sits above
+// a two-column list body: jobs on the left, recent runs on the right.
+// `useJobs`/`useJobRuns` are already scoped to the active agent, so both
+// columns show only this agent's jobs and runs.
 export function JobsTab() {
   const jobs = useJobs();
   const runs = useJobRuns();
   const invalidate = useInvalidate();
   const [view, setView] = useState<View>("list");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [createOpen, setCreateOpen] = useState(false);
 
   const action = useMutation({
     mutationFn: ({ id, op }: { id: string; op: "run" | "pause" | "resume" }) =>
@@ -94,17 +92,7 @@ export function JobsTab() {
             Scheduled prompts and scripts owned by this agent
           </p>
         </div>
-        <div className="flex items-center gap-3">
-          <ViewToggle view={view} onChange={setView} />
-          <button
-            type="button"
-            onClick={() => setCreateOpen(true)}
-            className="flex items-center gap-1.5 rounded-[9px] bg-[#4277FB] px-4 py-[9px] text-[13px] font-bold text-white transition-colors hover:bg-[#3568f0]"
-          >
-            <Plus className="size-3.5" />
-            New job
-          </button>
-        </div>
+        <ViewToggle view={view} onChange={setView} />
       </div>
 
       {view === "list" ? (
@@ -188,8 +176,6 @@ export function JobsTab() {
           </div>
         </div>
       )}
-
-      <CreateJobDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>
   );
 }
