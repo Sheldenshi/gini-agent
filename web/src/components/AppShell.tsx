@@ -2,7 +2,6 @@
 
 import { usePathname } from "next/navigation";
 import { MobileTopBar, Sidebar } from "@/components/Sidebar";
-import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 
 // The /pair page is a pre-auth, standalone surface shown to a device that has
 // no session yet. Wrapping it in the authenticated app chrome (Sidebar +
@@ -23,11 +22,6 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className="flex flex-1 flex-col overflow-hidden">
         <MobileTopBar />
         <main className="relative flex flex-1 flex-col overflow-hidden">
-          <div className="pointer-events-none absolute right-4 top-4 z-30">
-            <div className="pointer-events-auto">
-              <TunnelMenu />
-            </div>
-          </div>
           {children}
         </main>
       </div>

@@ -58,6 +58,7 @@ export function TunnelMenu() {
         <TunnelTrigger connected={connected} />
       </PopoverTrigger>
       <PopoverContent
+        side="right"
         align="end"
         sideOffset={8}
         className="w-96 overflow-hidden p-0"

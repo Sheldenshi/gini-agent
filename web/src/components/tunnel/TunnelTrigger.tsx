@@ -21,7 +21,7 @@ export const TunnelTrigger = React.forwardRef<
       variant="ghost"
       aria-label={connected ? "Tunnel connected" : "Open tunnel"}
       className={cn(
-        "h-10 gap-0 overflow-hidden rounded-lg border border-border bg-card p-0 hover:bg-card",
+        "h-10 w-full justify-start gap-0 overflow-hidden rounded-lg border border-border bg-card p-0 hover:bg-card",
         className
       )}
       {...props}
@@ -35,7 +35,7 @@ export const TunnelTrigger = React.forwardRef<
           </span>
         )}
       </span>
-      <span className="flex w-[88px] flex-col justify-center gap-1 px-2.5 py-1.5 text-left">
+      <span className="flex flex-1 flex-col justify-center gap-1 px-2.5 py-1.5 text-left">
         <span className="flex items-center gap-1.5">
           <Signal
             className={cn(
