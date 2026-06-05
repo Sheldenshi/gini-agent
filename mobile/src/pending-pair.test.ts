@@ -55,7 +55,9 @@ describe("primePendingPair", () => {
   });
 
   test("later calls return the in-memory cache without touching storage", async () => {
-    throwOnGet = true; // would throw if prime hit storage again
+    store[KEY] = JSON.stringify(reqRecord);
+    await primePendingPair(); // prime the cache ourselves so the test is order-independent
+    throwOnGet = true; // would throw if a later prime hit storage again
     expect(await primePendingPair()).toEqual(reqRecord);
     throwOnGet = false;
   });
