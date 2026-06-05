@@ -315,8 +315,17 @@ export default function PairScreen() {
         } else if (status === "cancelled") {
           stopPolling();
           setPhase("cancelled");
+        } else if (status === "claimed") {
+          // Already claimed while we're still polling (not mid-claim — polling
+          // stops the instant we see "approved", before the claim effect runs).
+          // A prior claim committed but its one-time token never reached this
+          // device (lost response / the app was killed before we stored it). The
+          // token is unrecoverable, so stop spinning and let the user start over.
+          stopPolling();
+          setError("This pairing was already completed. Start over to pair this device.");
+          setPhase("claim-error");
         }
-        // "pending" / "claimed" → keep waiting.
+        // "pending" → keep waiting.
       } catch (e) {
         if (genRef.current !== myGen) return;
         // 401/403/404 are terminal for this request (gone/expired/binding lost);

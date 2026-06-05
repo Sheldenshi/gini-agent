@@ -227,6 +227,27 @@ describe("PairPage", () => {
     });
   });
 
+  test("a claimed poll is terminal (already completed), not an infinite spin", async () => {
+    jest.useFakeTimers();
+    // A prior claim committed but its one-time token never reached this client
+    // (lost response / a reload before the session cookie landed). Resuming and
+    // polling now returns "claimed"; the page must surface a restartable state
+    // instead of treating it as "keep waiting" and spinning forever.
+    pollStatus = "claimed";
+    render(<PairPage />);
+    await flush();
+    await act(async () => {
+      jest.advanceTimersByTime(POLL_MS);
+    });
+    await flush();
+    await waitFor(() => expect(screen.queryByText(/already completed/i)).not.toBeNull(), {
+      timeout: 2000,
+      interval: 10
+    });
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeNull();
+    expect(assignSpy).not.toHaveBeenCalled();
+  });
+
   test("a transient poll rejection is swallowed and the loop keeps waiting", async () => {
     jest.useFakeTimers();
     render(<PairPage />);

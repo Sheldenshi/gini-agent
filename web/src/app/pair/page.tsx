@@ -124,8 +124,18 @@ export default function PairPage() {
         } else if (status === "cancelled") {
           stopPolling();
           setPhase("cancelled");
+        } else if (status === "claimed") {
+          // We're polling (not mid-claim — polling stops the instant we see
+          // "approved", before the claim effect runs), yet the request is already
+          // claimed. That means a prior claim committed but its one-time token
+          // never reached us (lost response / a reload before the gini_session
+          // cookie landed). The token is unrecoverable, so surface a restartable
+          // state instead of spinning forever.
+          stopPolling();
+          setError("This pairing was already completed. Start a new one.");
+          setPhase("claim-error");
         }
-        // "pending" / "claimed" → keep waiting.
+        // "pending" → keep waiting.
       } catch (e) {
         if (cancelled || !activeRef.current) return;
         // A 404 (request gone/expired), 403 (binding mismatch — e.g. another
