@@ -2025,18 +2025,33 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
   const clear = bool(args.clear, false);
   try {
     return await withSession(taskId, async (session) => {
-      // Refuse to run agent JS on a loopback control-plane page. The
-      // agent's browser is barred from loopback origins (safetyCheck at
-      // browser_navigate time); this is the one tool that executes
-      // agent-supplied code in the page's origin, so a same-origin fetch
-      // from here would reach the bearer-injecting BFF. The in-page
-      // assertion in the evaluate below closes the check-to-use race;
-      // this server-side gate handles the common case deterministically
-      // and bounces the page away.
-      const loopbackBlock = await assertNotLoopbackPage(session.page);
-      if (loopbackBlock) {
-        return fail(`${loopbackBlock} (refusing to run console JS on a loopback control-plane page)`);
+      // Refuse to run agent JS on any origin the URL guard rejects (loopback
+      // control-plane, cloud metadata, link-local, ...). This is the one tool
+      // that executes agent-supplied code in the page's origin, so a
+      // same-origin fetch from a loopback document would reach the
+      // bearer-injecting BFF. Read the URL ONCE: validate it AND derive the
+      // origin the in-page race assertion pins against, so the two can't
+      // disagree across a navigation. Drop any console output captured while
+      // on a now-refused page so it can't surface on a later call.
+      const preUrl = typeof session.page.url === "function" ? session.page.url() : "";
+      if (preUrl && preUrl !== "about:blank") {
+        const preBlock = safetyCheck(preUrl);
+        if (preBlock) {
+          consoleLogs.delete(taskId);
+          if (typeof session.page.goto === "function") {
+            try {
+              await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
+            } catch {
+              /* best-effort */
+            }
+          }
+          return fail(`${preBlock} (refusing to run console JS on a disallowed origin)`);
+        }
       }
+      // The origin the in-page assertion pins against, derived from the same
+      // read we just validated (safetyCheck already confirmed it parses).
+      // "null" for about:blank / no-page sessions.
+      const validatedOrigin = preUrl && preUrl !== "about:blank" ? new URL(preUrl).origin : "null";
       // attachConsole is now called eagerly in getOrCreate; this is a
       // belt-and-braces re-attach in case the page was somehow swapped.
       attachConsole(taskId, session.page);
@@ -2058,36 +2073,25 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       if (expression) {
         try {
           evalResult = await session.page.evaluate(
-            ({ expr, loopbackHosts }: { expr: string; loopbackHosts: readonly string[] }) => {
-              // In-page origin assertion — runs in the SAME execution
-              // context the agent's expression (and any fetch it issues)
-              // will. assertNotLoopbackPage above read session.page.url()
-              // a moment earlier; a navigation that commits in the gap
-              // between that read and this eval would otherwise land the
-              // expression on a loopback document with a same-origin path
-              // to the bearer-injecting BFF. Re-checking here, where there
-              // is no gap between check and use, closes that race. Mirrors
-              // hostnameIsLoopback — the host set arrives as data; the
-              // 127.0.0.0/8, .localhost, and IPv4-mapped/compat IPv6 decode
-              // are inlined because page code can't import module helpers.
-              const h = location.hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
-              let loop = loopbackHosts.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost");
-              if (!loop) {
-                const m = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(h);
-                if (m) {
-                  const hi = parseInt(m[1]!, 16);
-                  const lo = parseInt(m[2]!, 16);
-                  const v4 = `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
-                  loop = loopbackHosts.includes(v4) || /^127\./.test(v4);
-                }
-              }
-              if (loop) {
-                throw new Error(`Blocked: ${h} is a loopback origin; the agent's browser may not execute JS here.`);
+            ({ expr, validatedOrigin }: { expr: string; validatedOrigin: string }) => {
+              // In-page race assertion — runs in the SAME execution context
+              // the agent's expression (and any fetch it issues) will. The
+              // server validated the page origin a moment earlier; if a
+              // navigation committed in the gap before this eval, the document
+              // origin no longer matches and we refuse — without re-implementing
+              // the URL policy in the page. Pinning the origin closes the whole
+              // race class (loopback control-plane, cloud metadata, link-local,
+              // any cross-origin): a same-origin BFF write needs the document
+              // origin to BE the control plane, and a changed origin no longer
+              // is. Same-origin client navigation (hash, pushState) keeps
+              // location.origin, so legitimate in-page interaction is unaffected.
+              if (location.origin !== validatedOrigin) {
+                throw new Error(`Blocked: page origin changed to ${location.origin} (expected ${validatedOrigin}); refusing to run console JS on a navigated origin.`);
               }
               // eslint-disable-next-line no-new-func
               return new Function(`return (${expr});`)();
             },
-            { expr: expression, loopbackHosts: [...LOOPBACK_HOSTS] }
+            { expr: expression, validatedOrigin }
           );
         } catch (error) {
           evalError = error instanceof Error ? error.message : String(error);
@@ -2095,13 +2099,15 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       }
       // The eval can navigate the page, and a navigation kicked off earlier
       // can commit during it — the race the in-page assertion blocks
-      // *execution* for. If the page is now on a loopback origin, refuse hard
-      // and bounce rather than returning session.page.url() (the loopback URL)
-      // or messages (console output the control-plane document emitted): the
-      // write is already blocked, but returning that state would still leak it.
+      // *execution* for. If the page is now on a refused origin, withhold the
+      // result rather than returning session.page.url() (the loopback URL) or
+      // messages (console output the page emitted): the write is already
+      // blocked, but returning — or later resurfacing — that state would still
+      // leak it, so drop the captured logs too.
       const postEvalBlock = await assertNotLoopbackPage(session.page);
       if (postEvalBlock) {
-        return fail(`${postEvalBlock} (refusing to return console state from a loopback control-plane page)`);
+        consoleLogs.delete(taskId);
+        return fail(`${postEvalBlock} (refusing to return console state from a disallowed origin)`);
       }
       const messages = consoleLogs.get(taskId) ?? [];
       // Redact data-gini-secret values from anywhere they could
@@ -2910,6 +2916,14 @@ export const __test = {
   // testing — snapshot() and browser_console both gate on it.
   assertNotLoopbackPageForTest(page: Page): Promise<string | undefined> {
     return assertNotLoopbackPage(page);
+  },
+  // Seed / read the per-task console-log buffer so tests can assert that a
+  // blocked browser_console call drops captured control-plane output.
+  seedConsoleLogsForTest(taskId: string, msgs: { type: string; text: string }[]): void {
+    consoleLogs.set(taskId, msgs);
+  },
+  getConsoleLogsForTest(taskId: string): { type: string; text: string }[] | undefined {
+    return consoleLogs.get(taskId);
   },
   // Expose the in-page walker for direct unit testing. Callers supply a
   // fake Page whose `evaluate(fn, arg)` runs `fn(arg)` locally against

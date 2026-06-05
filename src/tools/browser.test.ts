@@ -2929,7 +2929,7 @@ describe("browserConsole loopback guard", () => {
     browserTest.setInFlightDisconnectsForTest(0);
   });
 
-  test("refuses to run console JS on a loopback control-plane page and bounces it", async () => {
+  test("refuses to run console JS on a disallowed origin and bounces it", async () => {
     let gotoTarget: string | undefined;
     let evaluated = false;
     browserTest.installFakeSessionWithPageForTest("console-loopback", {
@@ -2954,26 +2954,22 @@ describe("browserConsole loopback guard", () => {
     expect(evaluated).toBe(false);
   });
 
-  test("in-page assertion blocks even when url() reads a benign origin (check-to-use race)", async () => {
+  test("in-page assertion blocks when the document origin changed during the race", async () => {
     const savedLocation = (globalThis as { location?: unknown }).location;
-    (globalThis as { location?: unknown }).location = { hostname: "127.0.0.1" };
+    // Server pre-check validated https://example.com, but the document has
+    // since committed to a loopback origin — origin mismatch must refuse.
+    (globalThis as { location?: unknown }).location = { origin: "http://127.0.0.1:7373" };
     try {
       browserTest.installFakeSessionWithPageForTest("console-race", {
-        // Server pre-check reads a benign URL and passes...
         url: () => "https://example.com/",
         on: (() => undefined) as unknown as import("playwright-core").Page["on"],
         goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
-        // ...but the page has actually committed to a loopback document.
-        // The mock runs the evaluated function in-process: the secret
-        // collector throws on the missing `document` (swallowed), and the
-        // agent function reads the stubbed global `location`.
         evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
       });
       const out = JSON.parse(
         await browserConsole("console-race", { expression: "(globalThis.__ranRace = true)" })
-      ) as { success: boolean; evalResult: unknown; evalError: string | null };
-      expect(out.success).toBe(true);
-      expect(out.evalError).toContain("loopback origin");
+      ) as { evalResult: unknown; evalError: string | null };
+      expect(out.evalError).toContain("origin changed");
       expect(out.evalResult).toBeNull();
       // The expression must never have executed.
       expect((globalThis as { __ranRace?: boolean }).__ranRace).toBeUndefined();
@@ -2983,32 +2979,33 @@ describe("browserConsole loopback guard", () => {
     }
   });
 
-  test("in-page assertion catches the IPv4-mapped IPv6 loopback form", async () => {
+  test("in-page assertion also blocks a race to a metadata / link-local origin", async () => {
     const savedLocation = (globalThis as { location?: unknown }).location;
-    // Chromium normalizes a navigation to [::ffff:127.0.0.1] to this host.
-    (globalThis as { location?: unknown }).location = { hostname: "[::ffff:7f00:1]" };
+    // Origin-pinning covers more than loopback: a race to the cloud-metadata
+    // origin (which safetyCheck also refuses) is caught the same way.
+    (globalThis as { location?: unknown }).location = { origin: "http://169.254.169.254" };
     try {
-      browserTest.installFakeSessionWithPageForTest("console-mapped", {
+      browserTest.installFakeSessionWithPageForTest("console-metadata", {
         url: () => "https://example.com/",
         on: (() => undefined) as unknown as import("playwright-core").Page["on"],
         goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
         evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
       });
       const out = JSON.parse(
-        await browserConsole("console-mapped", { expression: "(globalThis.__ranMapped = true)" })
+        await browserConsole("console-metadata", { expression: "(globalThis.__ranMeta = true)" })
       ) as { evalResult: unknown; evalError: string | null };
-      expect(out.evalError).toContain("loopback origin");
+      expect(out.evalError).toContain("origin changed");
       expect(out.evalResult).toBeNull();
-      expect((globalThis as { __ranMapped?: boolean }).__ranMapped).toBeUndefined();
+      expect((globalThis as { __ranMeta?: boolean }).__ranMeta).toBeUndefined();
     } finally {
       (globalThis as { location?: unknown }).location = savedLocation;
-      delete (globalThis as { __ranMapped?: boolean }).__ranMapped;
+      delete (globalThis as { __ranMeta?: boolean }).__ranMeta;
     }
   });
 
-  test("runs the expression normally on a public origin", async () => {
+  test("runs the expression normally when the origin is unchanged", async () => {
     const savedLocation = (globalThis as { location?: unknown }).location;
-    (globalThis as { location?: unknown }).location = { hostname: "example.com" };
+    (globalThis as { location?: unknown }).location = { origin: "https://example.com" };
     try {
       browserTest.installFakeSessionWithPageForTest("console-ok", {
         url: () => "https://example.com/",
@@ -3030,13 +3027,13 @@ describe("browserConsole loopback guard", () => {
     }
   });
 
-  // If a navigation commits *during* the eval so the page is on a loopback
-  // origin by the time the call returns, the result must be withheld — the
-  // loopback URL and the control-plane page's console output must not leak
-  // back to the agent even though the write was already blocked.
-  test("withholds console state if the page committed to loopback during the eval", async () => {
+  // If a navigation commits *during* the eval so the page is on a refused
+  // origin by the time the call returns, the result must be withheld AND the
+  // captured console output dropped — neither the URL nor the control-plane
+  // page's console logs may leak, now or on a later call.
+  test("withholds console state and clears captured logs on a post-eval block", async () => {
     const savedLocation = (globalThis as { location?: unknown }).location;
-    (globalThis as { location?: unknown }).location = { hostname: "example.com" };
+    (globalThis as { location?: unknown }).location = { origin: "https://example.com" };
     let urlCalls = 0;
     let gotoTarget: string | undefined;
     try {
@@ -3050,6 +3047,8 @@ describe("browserConsole loopback guard", () => {
         }) as unknown as import("playwright-core").Page["goto"],
         evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
       });
+      // Seed console output as if the control-plane page had logged it.
+      browserTest.seedConsoleLogsForTest("console-postrace", [{ type: "error", text: "LOOPBACK-LEAK" }]);
       const out = JSON.parse(await browserConsole("console-postrace", { expression: "1 + 1" })) as {
         success: boolean;
         error?: string;
@@ -3058,12 +3057,81 @@ describe("browserConsole loopback guard", () => {
       };
       expect(out.success).toBe(false);
       expect(out.error).toContain("loopback");
-      // The loopback URL and any captured console messages must be withheld.
       expect(out.url).toBeUndefined();
       expect(out.messages).toBeUndefined();
       expect(gotoTarget).toBe("about:blank");
+      // The captured loopback logs must be dropped so a later call can't return them.
+      expect(browserTest.getConsoleLogsForTest("console-postrace")).toBeUndefined();
     } finally {
       (globalThis as { location?: unknown }).location = savedLocation;
     }
+  });
+
+  test("drops captured console output when the pre-check refuses a loopback page", async () => {
+    browserTest.installFakeSessionWithPageForTest("console-preclear", {
+      url: () => "http://127.0.0.1:7373/api/runtime/setup-requests",
+      goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
+      evaluate: (async () => undefined) as unknown as import("playwright-core").Page["evaluate"]
+    });
+    browserTest.seedConsoleLogsForTest("console-preclear", [{ type: "error", text: "LOOPBACK-LEAK" }]);
+    const out = JSON.parse(await browserConsole("console-preclear", { expression: "1 + 1" })) as { success: boolean };
+    expect(out.success).toBe(false);
+    expect(browserTest.getConsoleLogsForTest("console-preclear")).toBeUndefined();
+  });
+
+  test("runs on an about:blank page (null origin)", async () => {
+    const savedLocation = (globalThis as { location?: unknown }).location;
+    (globalThis as { location?: unknown }).location = { origin: "null" };
+    try {
+      browserTest.installFakeSessionWithPageForTest("console-blank", {
+        url: () => "about:blank",
+        on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+        evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
+      });
+      const out = JSON.parse(await browserConsole("console-blank", { expression: "1 + 1" })) as {
+        success: boolean;
+        evalResult: unknown;
+        evalError: string | null;
+      };
+      expect(out.success).toBe(true);
+      expect(out.evalError).toBeNull();
+      expect(out.evalResult).toBe(2);
+    } finally {
+      (globalThis as { location?: unknown }).location = savedLocation;
+    }
+  });
+
+  test("redacts and returns captured console messages on success", async () => {
+    const savedLocation = (globalThis as { location?: unknown }).location;
+    (globalThis as { location?: unknown }).location = { origin: "https://example.com" };
+    try {
+      browserTest.installFakeSessionWithPageForTest("console-msgs", {
+        url: () => "https://example.com/",
+        on: (() => undefined) as unknown as import("playwright-core").Page["on"],
+        evaluate: (async (fn: (arg: unknown) => unknown, arg: unknown) => fn(arg)) as unknown as import("playwright-core").Page["evaluate"]
+      });
+      browserTest.seedConsoleLogsForTest("console-msgs", [{ type: "log", text: "hello-from-page" }]);
+      const out = JSON.parse(await browserConsole("console-msgs", { expression: "1 + 1" })) as {
+        success: boolean;
+        messages: { type: string; text: string }[];
+        evalResult: unknown;
+      };
+      expect(out.success).toBe(true);
+      expect(out.evalResult).toBe(2);
+      expect(out.messages).toEqual([{ type: "log", text: "hello-from-page" }]);
+    } finally {
+      (globalThis as { location?: unknown }).location = savedLocation;
+      browserTest.seedConsoleLogsForTest("console-msgs", []);
+    }
+  });
+
+  test("surfaces a thrown error from withSession as a failure envelope", async () => {
+    browserTest.setInFlightDisconnectsForTest(1);
+    const out = JSON.parse(await browserConsole("console-disconnect", { expression: "1 + 1" })) as {
+      success: boolean;
+      error?: string;
+    };
+    expect(out.success).toBe(false);
+    expect(out.error).toContain("disconnecting");
   });
 });
