@@ -51,7 +51,13 @@ bearer-injecting BFF calls to a foreign instance.
 ## Consequences
 
 - The product is reachable on one origin (gateway port), enabling single-port
-  tunnel exposure. Direct access to the Next.js port is unchanged.
+  tunnel exposure. Direct access to the inner Next.js port is unchanged except for
+  one loopback-only addition: because that port binds loopback (`127.0.0.1`), a
+  Next BFF passthrough (`web/src/app/api/pairing/[...path]`, forwarding via
+  `web/src/lib/pairing-proxy.ts`) bridges device pairing `/api/pairing/*` to the
+  gateway so the dev port's pairing UI works like the gateway origin; a
+  non-loopback front is refused (404). See ADR
+  [device-pairing-auth.md](./device-pairing-auth.md).
 - HMR works through the gateway via the WebSocket bridge. The bridge disables
   per-message deflate (the upstream client already decompresses; re-compressing
   on the browser leg risks RSV-bit mismatches), buffers frames that arrive

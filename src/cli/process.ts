@@ -225,8 +225,10 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
     : { running: true, url: url(config), instance: config.instance };
   // Advertise the GATEWAY origin as the operator's Web link, not the inner
   // Next port: the gateway is the single front that serves the UI AND natively
-  // handles /api/pairing/* (device pairing 404s on the direct Next port). The
-  // inner port is kept only for liveness detection (webUrlValue).
+  // handles /api/pairing/* for every relay/remote front. (The inner Next port
+  // bridges /api/pairing/* to the gateway only for loopback — see
+  // web/src/lib/pairing-proxy.ts — so the gateway origin is the one that works
+  // everywhere.) The inner port is kept only for liveness detection (webUrlValue).
   if (webUrlValue) banner.webUrl = operatorWebUrl(config);
   if (foreground) banner.foreground = true;
   return { runtimeStarted, banner, children };

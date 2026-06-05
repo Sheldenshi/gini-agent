@@ -26,6 +26,25 @@ function relativeTime(iso: string): string {
 }
 
 /**
+ * Operator-facing copy for a failed admin-list fetch. The gateway returns an
+ * identical `{error:"Forbidden"}` for both an expired/revoked session AND an
+ * Origin/Host mismatch (src/http.ts admin gate + webBoundRequestAllowed), so the
+ * 403 wording stays hedged — it never claims "your session expired" when the
+ * real cause might be the wrong origin. A 404 means /api/pairing isn't bridged on
+ * this address — e.g. a non-loopback front whose BFF refuses the pairing
+ * passthrough (web/src/lib/pairing-proxy.ts); the loopback dev port forwards it.
+ */
+function pairErrorCopy(status: number | undefined): string {
+  if (status === 403) {
+    return "This browser isn’t authorized to manage pairing. Reopen Gini from your gateway or relay link, then try again.";
+  }
+  if (status === 404) {
+    return "Pairing isn’t available on this address. Open Gini through your gateway link to approve devices.";
+  }
+  return "Couldn’t load pair requests. Check your connection and try again.";
+}
+
+/**
  * The admin "Pair requests" list. Shown to any PAIRED session — loopback OR a
  * relay browser paired earlier — both of which are admins that can approve/add
  * devices (see ADR device-pairing-auth.md, "Relay sessions mirror loopback").
@@ -39,33 +58,59 @@ function relativeTime(iso: string): string {
  * bridge is active).
  */
 export function PairRequestsPanel() {
-  const { data: requests = [] } = usePairingRequests();
+  const { data: requests = [], isError, error, isLoading, refetch } = usePairingRequests();
   const approve = useApprovePairing();
   const reject = useRejectPairing();
+
+  // react-query keeps the last successful `data` on a failed refetch, so a poll
+  // error after a good load still shows the live list rather than blanking it.
+  // The error and loading blocks below only take over when there is nothing to
+  // show — the failure must never be hidden behind the idle "waiting" copy.
+  const hasData = requests.length > 0;
+  const showError = isError && !hasData;
+  const showLoading = isLoading && !hasData && !isError;
+  const status = (error as (Error & { status?: number }) | null)?.status;
+  // A 403/404 is an authoritative disconnect (session gone / wrong origin) that
+  // won't self-heal, so the "Listening…" indicator must not keep claiming the
+  // poll is live — even while stale rows remain visible. A transient blip
+  // (no/other status) keeps the live indicator and recovers on the next poll.
+  const disconnected = showError || (isError && (status === 403 || status === 404));
 
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-semibold leading-none">Pair requests</span>
-        <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
-          <span className="relative flex h-2 w-2 shrink-0">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 motion-reduce:animate-none" />
-            <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+        {disconnected ? (
+          <span className="inline-flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+            <span className="inline-flex h-2 w-2 shrink-0 rounded-full bg-amber-500" />
+            Disconnected
           </span>
-          Listening…
-        </span>
+        ) : (
+          <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
+            <span className="relative flex h-2 w-2 shrink-0">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-500/60 motion-reduce:animate-none" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-500" />
+            </span>
+            Listening…
+          </span>
+        )}
       </div>
 
-      {requests.length === 0 ? (
-        <div className="grid place-items-center gap-1 rounded-lg border border-border bg-muted/20 px-3 py-6 text-center">
-          <p className="text-sm font-medium text-muted-foreground">
-            Waiting for a device to scan…
-          </p>
-          <p className="text-xs text-muted-foreground">
-            Open the link or scan the code on the device you want to add.
-          </p>
+      {showError ? (
+        <div
+          role="alert"
+          className="grid place-items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-5 text-center"
+        >
+          <p className="text-sm font-medium text-foreground">{pairErrorCopy(status)}</p>
+          <Button variant="outline" size="sm" onClick={() => refetch()}>
+            Try again
+          </Button>
         </div>
-      ) : (
+      ) : showLoading ? (
+        <div className="grid place-items-center rounded-lg border border-border bg-muted/20 px-3 py-6 text-center">
+          <p className="text-sm font-medium text-muted-foreground">Loading pair requests…</p>
+        </div>
+      ) : hasData ? (
         <ul className="max-h-72 divide-y divide-border overflow-y-auto overscroll-contain rounded-lg border border-border">
           {requests.map((item) => (
             <PairRequestRow
@@ -88,6 +133,15 @@ export function PairRequestsPanel() {
             />
           ))}
         </ul>
+      ) : (
+        <div className="grid place-items-center gap-1 rounded-lg border border-border bg-muted/20 px-3 py-6 text-center">
+          <p className="text-sm font-medium text-muted-foreground">
+            Waiting for a device to scan…
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Open the link or scan the code on the device you want to add.
+          </p>
+        </div>
       )}
     </div>
   );

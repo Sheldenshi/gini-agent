@@ -84,7 +84,16 @@ export function usePairingRequests() {
   return useQuery({
     queryKey: ["pairingRequests"],
     queryFn: async () => (await listPairingRequests()).requests,
-    refetchInterval: 3000
+    refetchInterval: 3000,
+    // retry: false turns off react-query's per-attempt retries for EVERY error,
+    // not only the terminal ones. A 403 (missing/expired session, wrong origin)
+    // or 404 (not served on this origin) won't self-heal by retrying, and a
+    // transient blip recovers on the next refetchInterval poll anyway — so
+    // retries only delay surfacing the failure behind the loading state, where
+    // the panel would otherwise show the idle "waiting" copy and hide that
+    // approve/reject is unreachable. The panel keeps the last good list and
+    // offers "Try again" while an error is showing.
+    retry: false
   });
 }
 

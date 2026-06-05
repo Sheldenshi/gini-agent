@@ -39,6 +39,18 @@ const realSonner = await import("sonner");
 // --- Controllable mock surface --------------------------------------------
 let requests: PairingRequestView[] = [];
 
+// The slice of react-query state the panel reads beyond `data`. Defaults to a
+// healthy resolved query; error/loading tests flip these per-case so every
+// render branch (loading / error / empty / list) is driven through one mocked
+// module instance.
+type QueryState = {
+  isError: boolean;
+  error: (Error & { status?: number }) | null;
+  isLoading: boolean;
+  refetch: ReturnType<typeof mock>;
+};
+let pairingQuery: QueryState;
+
 type Mutation = {
   mutate: ReturnType<typeof mock>;
   isPending: boolean;
@@ -54,7 +66,7 @@ let PairRequestsPanel: typeof import("./PairRequestsPanel").PairRequestsPanel;
 beforeAll(async () => {
   mock.module("@/lib/pairing", () => ({
     ...realPairing,
-    usePairingRequests: () => ({ data: requests }),
+    usePairingRequests: () => ({ data: requests, ...pairingQuery }),
     useApprovePairing: () => approve,
     useRejectPairing: () => reject
   }));
@@ -97,6 +109,7 @@ function renderPanel() {
 
 beforeEach(() => {
   requests = [];
+  pairingQuery = { isError: false, error: null, isLoading: false, refetch: mock(() => {}) };
   approve = { mutate: mock(() => {}), isPending: false };
   reject = { mutate: mock(() => {}), isPending: false };
   toastSuccess.mockClear();
@@ -227,5 +240,75 @@ describe("PairRequestsPanel", () => {
     renderPanel();
     expect(screen.queryByText("iPhone")).not.toBeNull();
     expect(screen.queryByText(/ago/)).toBeNull();
+  });
+
+  // --- Failure / loading states: a failed admin list must NEVER render as the
+  // idle "Waiting…" block (the approve/reject-never-displays bug). ------------
+
+  test("403 with no data: hedged auth error, Disconnected badge, no buttons, no idle copy", () => {
+    requests = [];
+    pairingQuery = { isError: true, error: Object.assign(new Error("Forbidden"), { status: 403 }), isLoading: false, refetch: mock(() => {}) };
+    renderPanel();
+    expect(screen.queryByRole("alert")).not.toBeNull();
+    expect(screen.queryByText(/isn’t authorized to manage pairing/)).not.toBeNull();
+    expect(screen.queryByText("Disconnected")).not.toBeNull();
+    expect(screen.queryByText("Waiting for a device to scan…")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reject" })).toBeNull();
+  });
+
+  test("404 with no data: origin-specific error copy, not the idle block", () => {
+    requests = [];
+    pairingQuery = { isError: true, error: Object.assign(new Error("Not found"), { status: 404 }), isLoading: false, refetch: mock(() => {}) };
+    renderPanel();
+    expect(screen.queryByText(/isn’t available on this address/)).not.toBeNull();
+    expect(screen.queryByText("Waiting for a device to scan…")).toBeNull();
+  });
+
+  test("generic error with no data: generic copy, and Try again calls refetch", async () => {
+    requests = [];
+    const refetch = mock(() => {});
+    pairingQuery = { isError: true, error: Object.assign(new Error("boom"), { status: 500 }), isLoading: false, refetch };
+    renderPanel();
+    expect(screen.queryByText(/Couldn’t load pair requests/)).not.toBeNull();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Try again" }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  test("error with an undefined status still renders the generic copy", () => {
+    requests = [];
+    pairingQuery = { isError: true, error: new Error("network"), isLoading: false, refetch: mock(() => {}) };
+    renderPanel();
+    expect(screen.queryByText(/Couldn’t load pair requests/)).not.toBeNull();
+  });
+
+  test("first load in flight (no data): shows the loading block, never the idle copy", () => {
+    requests = [];
+    pairingQuery = { isError: false, error: null, isLoading: true, refetch: mock(() => {}) };
+    renderPanel();
+    expect(screen.queryByText("Loading pair requests…")).not.toBeNull();
+    expect(screen.queryByText("Waiting for a device to scan…")).toBeNull();
+  });
+
+  test("auth error (403) AFTER a good load keeps the list but flips the badge to Disconnected (no blanking, no alert)", () => {
+    requests = [makeRequest()];
+    pairingQuery = { isError: true, error: Object.assign(new Error("Forbidden"), { status: 403 }), isLoading: false, refetch: mock(() => {}) };
+    renderPanel();
+    expect(screen.queryByRole("button", { name: "Approve" })).not.toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    // The poll is terminally failing, so the indicator must not claim "Listening…".
+    expect(screen.queryByText("Disconnected")).not.toBeNull();
+    expect(screen.queryByText("Listening…")).toBeNull();
+  });
+
+  test("transient error (no status) AFTER a good load keeps the list AND the live Listening indicator", () => {
+    requests = [makeRequest()];
+    pairingQuery = { isError: true, error: new Error("network blip"), isLoading: false, refetch: mock(() => {}) };
+    renderPanel();
+    expect(screen.queryByRole("button", { name: "Approve" })).not.toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    // A transient blip self-heals on the next poll, so the indicator stays live.
+    expect(screen.queryByText("Listening…")).not.toBeNull();
+    expect(screen.queryByText("Disconnected")).toBeNull();
   });
 });

@@ -231,7 +231,7 @@ export async function proxyRequest(
 // request must be refused outright. Used by proxyRequest to keep the regex
 // match honest about what the gateway will execute.
 const MAX_DECODE_DEPTH = 5;
-function canonicalizeSegments(segments: string[]): string[] | null {
+export function canonicalizeSegments(segments: string[]): string[] | null {
   const out: string[] = [];
   for (let segment of segments) {
     let stabilized = false;
@@ -297,7 +297,7 @@ function trustedOrigins(): ReadonlySet<string> | null {
 // Loopback hostnames the guard's local-dev fallback accepts when no
 // allowlist is configured. Anything else is DNS-rebindable from a public
 // origin and must be locked down with GINI_TRUSTED_ORIGINS.
-function isLoopbackHost(host: string): boolean {
+export function isLoopbackHost(host: string): boolean {
   // Strip the optional :port suffix. IPv6 literals are wrapped in brackets,
   // so look at everything up to the last ":" only when no closing bracket
   // follows. URL.host normalizes IPv6 to "[::1]:port" form.

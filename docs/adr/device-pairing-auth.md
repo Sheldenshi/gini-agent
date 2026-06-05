@@ -131,12 +131,27 @@ relay-Host CSRF rule) and the HttpOnly `gini_session` cookie that the route
 validates, so a paired relay session is admin exactly like loopback. An unpaired
 relay visitor has neither loopback Host nor a session, so it is refused (403).
 The device handshake routes (`/api/pairing/request*`) are public and `gini_pair`-bound
-for the unpaired device. (We do NOT route admin calls through the BFF: the
-BFF→gateway hop is a server-side fetch with no Origin, which `webBoundRequestAllowed`
-correctly rejects for unsafe methods — so a BFF-proxied approve/reject would 403.
-Native same-origin is both simpler and the only thing that works for the POSTs.)
+for the unpaired device.
 Legacy code creation (`POST /api/pairing`) is bearer-gated and is reached through
 the BFF (owner bearer), so any paired session can create codes.
+
+**Loopback dev-port bridge (`web/src/app/api/pairing/[...path]`).** In the
+gateway-fronted topology the browser is always on the gateway origin, so its
+same-origin `/api/pairing/*` calls reach the gateway natively and this BFF route
+never fires. But the inner Next dev server binds its own loopback port, and a page
+loaded from THAT origin sends its `/api/pairing` fetches to Next — which has no
+pairing route — so they 404 and the operator's approve/reject panel renders an
+empty queue. `web/src/lib/pairing-proxy.ts` bridges that gap for **loopback only**:
+it forwards `/api/pairing/*` to the gateway behind the same `guardCsrf` the
+`/api/runtime` lane uses, carrying the browser's `gini_pair` / `gini_session`
+cookies (NOT a bearer — the browser must never hold the gateway token) and a
+loopback `Origin`, so the gateway's `webBoundRequestAllowed` + loopback admin gate
+resolve exactly as for a direct loopback browser (this loopback `Origin` is what
+makes the approve/reject POSTs work — the obstacle that previously kept admin
+calls off the BFF). A non-loopback Host is refused (404), so pairing stays
+gateway-native and `loopback`-OR-`gini_session`-gated for every relay/remote
+front: the mirror gate below is unchanged, and the bridge grants no session-less
+admin to anything but the operator's own loopback dev port.
 
 > **Design invariant (intentional, not a gap).** A paired session — loopback OR
 > relay — is owner-equivalent. It can approve/reject/list pairing requests, create
