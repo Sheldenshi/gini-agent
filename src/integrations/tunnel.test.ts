@@ -150,7 +150,8 @@ function fakeStore(): Store {
     home: "/tmp/gini-relay-fake",
     deviceId: () => "device-1",
     readSession: () => SESSION,
-    writeSession: () => {}
+    writeSession: () => {},
+    clearSession: () => {}
   };
 }
 
@@ -160,7 +161,8 @@ function fakeStoreNoSession(): Store {
     home: "/tmp/gini-relay-fake",
     deviceId: () => "device-1",
     readSession: () => null,
-    writeSession: () => {}
+    writeSession: () => {},
+    clearSession: () => {}
   };
 }
 

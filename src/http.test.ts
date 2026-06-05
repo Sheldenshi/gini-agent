@@ -373,7 +373,7 @@ describe("runtime api", () => {
       stop: () => Promise.resolve(0),
       exited: Promise.withResolvers<number>().promise
     };
-    const store: Store = { home: "/tmp/h", deviceId: () => "d1", readSession: () => session, writeSession: () => {} };
+    const store: Store = { home: "/tmp/h", deviceId: () => "d1", readSession: () => session, writeSession: () => {}, clearSession: () => {} };
     const handle: LoginHandle = {
       url: "https://relay.test/consent", redirectUri: "http://127.0.0.1:8765/cb",
       waitForSession: () => Promise.resolve(session), cancel: () => {}

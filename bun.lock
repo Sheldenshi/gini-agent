@@ -180,7 +180,7 @@
 
     "frac": ["frac@1.1.2", "", {}, "sha512-w/XBfkibaTl3YDqASwfDUqkna4Z2p9cFSr1aHDt0WoMTECnRfBOv2WArlZILlqgWlmdIlALXGpM2AOhEk5W3IA=="],
 
-    "gini-relay": ["gini-relay@git+ssh://git@github.com/Lilac-Labs/gini-relay.git#2e491b87703f31c544886d186ea27611bf2756d8", { "bin": { "frp": "src/client/bin.ts" } }, "2e491b87703f31c544886d186ea27611bf2756d8"],
+    "gini-relay": ["gini-relay@git+ssh://git@github.com/Lilac-Labs/gini-relay.git#819fd007a34773eb5734ed1e797d5a3bcdd536e6", { "bin": { "frp": "src/client/bin.ts" } }, "819fd007a34773eb5734ed1e797d5a3bcdd536e6"],
 
     "global-agent": ["global-agent@3.0.0", "", { "dependencies": { "boolean": "^3.0.1", "es6-error": "^4.1.1", "matcher": "^3.0.0", "roarr": "^2.15.3", "semver": "^7.3.2", "serialize-error": "^7.0.1" } }, "sha512-PT6XReJ+D07JvGoxQMkT6qji/jVNfX/h364XHZOWeRzy64sSFr+xJ5OX7LI3b4MPQzdL4H8Y8M0xzPpsVMwA8Q=="],
 
