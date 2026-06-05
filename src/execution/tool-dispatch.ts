@@ -53,21 +53,20 @@ import {
   type IdentityFileStatus
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
-import { importContactsFromFile } from "../contacts";
+import {
+  importContactsFromFile,
+  mutualContacts,
+  relateContacts,
+  relationViews,
+  resolveContactRef,
+  upsertContact
+} from "../contacts";
 import {
   companyBreakdown,
   countContacts,
-  findContactByEmail,
-  findContactByUrl,
-  findContactsByName,
-  getContact,
-  insertContact,
-  mutualConnections,
   queryContacts,
-  relationsFor,
-  updateContact,
-  upsertRelation,
   type Contact,
+  type ContactInput,
   type ContactQuery
 } from "../state";
 import { resolveEmitContext, setToolCallRunningHint } from "./chat-task-emit";
@@ -1994,25 +1993,6 @@ function summarizeContact(c: Contact): Record<string, unknown> {
   return out;
 }
 
-// Resolve a contact reference that may be an id or a name. Returns the single
-// match, the candidate set when a name is ambiguous, or null when nothing
-// matched.
-function resolveContactRef(
-  config: RuntimeConfig,
-  agentId: string,
-  ref: string
-): { contact: Contact } | { candidates: Contact[] } | { none: true } {
-  const trimmed = ref.trim();
-  if (trimmed.startsWith("contact_")) {
-    const contact = getContact(config.instance, agentId, trimmed);
-    return contact ? { contact } : { none: true };
-  }
-  const matches = findContactsByName(config.instance, agentId, trimmed);
-  if (matches.length === 1) return { contact: matches[0]! };
-  if (matches.length > 1) return { candidates: matches };
-  return { none: true };
-}
-
 async function contactsImportTool(
   config: RuntimeConfig,
   taskId: string,
@@ -2076,7 +2056,7 @@ async function contactsCountTool(
 // Build a ContactInput patch from only the keys the model actually supplied, so
 // updateContact's merge semantics hold (an omitted key is left untouched; an
 // explicit "" clears the column).
-function collectContactInput(args: Record<string, unknown>): Record<string, unknown> {
+function collectContactInput(args: Record<string, unknown>): ContactInput {
   const patch: Record<string, unknown> = {};
   const fields = [
     "fullName", "firstName", "lastName", "company", "title",
@@ -2089,13 +2069,17 @@ function collectContactInput(args: Record<string, unknown>): Record<string, unkn
       patch[key] = value;
     }
   }
-  return patch;
+  return patch as ContactInput;
 }
 
-function deriveName(args: Record<string, unknown>): string {
-  const full = optStr(args, "fullName");
-  if (full) return full;
-  return [optStr(args, "firstName"), optStr(args, "lastName")].filter(Boolean).join(" ").trim();
+// Format a one-line message describing why a contact ref couldn't be resolved,
+// so the model gets an actionable next step instead of a bare failure.
+function unresolvedMessage(role: string, ref: string, candidates: Contact[] | undefined): string {
+  if (candidates && candidates.length > 0) {
+    const names = candidates.map((c) => `${c.fullName}${c.company ? ` (${c.company}, id ${c.id})` : ` (id ${c.id})`}`);
+    return `${role} "${ref}" is ambiguous: ${names.join("; ")}. Re-run with the contact id.`;
+  }
+  return `No contact found for ${role} "${ref}". Add them first with contacts_upsert.`;
 }
 
 async function contactsUpsertTool(
@@ -2104,77 +2088,22 @@ async function contactsUpsertTool(
   args: Record<string, unknown>
 ): Promise<string> {
   const agentId = requireAgentId(config, "save a contact");
-  const patch = collectContactInput(args);
+  const input: ContactInput & { id?: string } = collectContactInput(args);
   const explicitId = optStr(args, "id");
+  if (explicitId) input.id = explicitId;
 
-  // Targeted update by id.
-  if (explicitId) {
-    const existing = getContact(config.instance, agentId, explicitId);
-    if (!existing) throw new Error(`Contact not found: ${explicitId}`);
-    const updated = updateContact(config.instance, agentId, explicitId, patch);
-    await recordLowRiskAudit(config, taskId, "contacts.updated", updated.fullName, { id: updated.id });
-    return JSON.stringify({ action: "updated", contact: summarizeContact(updated) });
+  const result = upsertContact(config.instance, agentId, input, "chat");
+  if (result.action === "ambiguous") {
+    return JSON.stringify({
+      action: "ambiguous",
+      message: `More than one contact named "${result.name}". Confirm which one (pass its id), or include a distinguishing field.`,
+      candidates: result.candidates.map(summarizeContact)
+    });
   }
-
-  const name = deriveName(args);
-  const create = async (): Promise<string> => {
-    if (!name) throw new Error("Provide a fullName (or firstName/lastName) to create a contact.");
-    const created = insertContact(config.instance, agentId, { ...patch, fullName: name, source: "chat" });
-    await recordLowRiskAudit(config, taskId, "contacts.created", created.fullName, { id: created.id });
-    return JSON.stringify({ action: "created", contact: summarizeContact(created) });
-  };
-  const update = async (existing: Contact): Promise<string> => {
-    const updated = updateContact(config.instance, agentId, existing.id, patch);
-    await recordLowRiskAudit(config, taskId, "contacts.updated", updated.fullName, { id: updated.id });
-    return JSON.stringify({ action: "updated", contact: summarizeContact(updated) });
-  };
-
-  // A LinkedIn URL is a stable, unique identity. If one is supplied it alone
-  // decides the match: a hit updates that record, a miss means a genuinely new
-  // person — do NOT fall back to name-merge, which would collapse two distinct
-  // profiles that happen to share a name.
-  const url = optStr(args, "linkedinUrl");
-  if (url) {
-    const byUrl = findContactByUrl(config.instance, agentId, url);
-    return byUrl ? await update(byUrl) : await create();
-  }
-
-  // No URL: try email, then resolve by name.
-  const email = optStr(args, "email");
-  if (email) {
-    const byEmail = findContactByEmail(config.instance, agentId, email);
-    if (byEmail) return await update(byEmail);
-  }
-  if (name) {
-    const matches = findContactsByName(config.instance, agentId, name);
-    if (matches.length === 1) return await update(matches[0]!);
-    if (matches.length > 1) {
-      return JSON.stringify({
-        action: "ambiguous",
-        message: `More than one contact named "${name}". Confirm which one (pass its id), or include a distinguishing field.`,
-        candidates: matches.map(summarizeContact)
-      });
-    }
-  }
-  return await create();
-}
-
-// Resolve a relate/relations reference, returning either the contact or a
-// model-facing message describing why it couldn't (ambiguous / not found) so
-// the tool can hand the model a clear next step instead of throwing.
-function resolveOrExplain(
-  config: RuntimeConfig,
-  agentId: string,
-  ref: string,
-  role: string
-): { contact: Contact } | { error: string } {
-  const resolved = resolveContactRef(config, agentId, ref);
-  if ("contact" in resolved) return { contact: resolved.contact };
-  if ("candidates" in resolved) {
-    const names = resolved.candidates.map((c) => `${c.fullName}${c.company ? ` (${c.company}, id ${c.id})` : ` (id ${c.id})`}`);
-    return { error: `${role} "${ref}" is ambiguous: ${names.join("; ")}. Re-run with the contact id.` };
-  }
-  return { error: `No contact found for ${role} "${ref}". Add them first with contacts_upsert.` };
+  await recordLowRiskAudit(config, taskId, `contacts.${result.action}`, result.contact.fullName, {
+    id: result.contact.id
+  });
+  return JSON.stringify({ action: result.action, contact: summarizeContact(result.contact) });
 }
 
 async function contactsRelateTool(
@@ -2188,27 +2117,28 @@ async function contactsRelateTool(
   const relationType = optionalString(args, "relationType", "knows");
   const note = optStr(args, "note") ?? null;
 
-  const from = resolveOrExplain(config, agentId, fromRef, "from");
-  if ("error" in from) return JSON.stringify({ action: "unresolved", message: from.error });
-  const to = resolveOrExplain(config, agentId, toRef, "to");
-  if ("error" in to) return JSON.stringify({ action: "unresolved", message: to.error });
-  if (from.contact.id === to.contact.id) {
-    return JSON.stringify({ action: "error", message: "A contact cannot be related to itself." });
+  const result = relateContacts(config.instance, agentId, fromRef, toRef, relationType, note, "chat");
+  if (!result.ok) {
+    if (result.reason === "self") {
+      return JSON.stringify({ action: "error", message: "A contact cannot be related to itself." });
+    }
+    return JSON.stringify({
+      action: "unresolved",
+      message: unresolvedMessage(result.role ?? "contact", result.ref ?? "", result.candidates)
+    });
   }
-
-  upsertRelation(config.instance, agentId, from.contact.id, to.contact.id, relationType, note, "chat");
   await recordLowRiskAudit(
     config,
     taskId,
     "contacts.related",
-    `${from.contact.fullName} ${relationType} ${to.contact.fullName}`,
-    { from: from.contact.id, to: to.contact.id, relationType }
+    `${result.from.fullName} ${result.relationType} ${result.to.fullName}`,
+    { from: result.from.id, to: result.to.id, relationType: result.relationType }
   );
   return JSON.stringify({
     action: "related",
-    from: summarizeContact(from.contact),
-    to: summarizeContact(to.contact),
-    relationType
+    from: summarizeContact(result.from),
+    to: summarizeContact(result.to),
+    relationType: result.relationType
   });
 }
 
@@ -2220,14 +2150,24 @@ async function contactsRelationsTool(
   const agentId = requireAgentId(config, "read contact relations");
   const ref = optStr(args, "id") ?? optStr(args, "name");
   if (!ref) throw new Error("Provide a contact name or id.");
-  const primary = resolveOrExplain(config, agentId, ref, "contact");
-  if ("error" in primary) return JSON.stringify({ action: "unresolved", message: primary.error });
+  const primary = resolveContactRef(config.instance, agentId, ref);
+  if (!("contact" in primary)) {
+    return JSON.stringify({
+      action: "unresolved",
+      message: unresolvedMessage("contact", ref, "candidates" in primary ? primary.candidates : undefined)
+    });
+  }
 
   const mutualRef = optStr(args, "mutualWith");
   if (mutualRef) {
-    const other = resolveOrExplain(config, agentId, mutualRef, "mutualWith");
-    if ("error" in other) return JSON.stringify({ action: "unresolved", message: other.error });
-    const mutual = mutualConnections(config.instance, agentId, primary.contact.id, other.contact.id);
+    const other = resolveContactRef(config.instance, agentId, mutualRef);
+    if (!("contact" in other)) {
+      return JSON.stringify({
+        action: "unresolved",
+        message: unresolvedMessage("mutualWith", mutualRef, "candidates" in other ? other.candidates : undefined)
+      });
+    }
+    const mutual = mutualContacts(config.instance, agentId, primary.contact.id, other.contact.id);
     await recordLowRiskAudit(config, taskId, "contacts.mutual", `${primary.contact.fullName} ∩ ${other.contact.fullName}`, {
       count: mutual.length
     });
@@ -2238,15 +2178,11 @@ async function contactsRelationsTool(
     });
   }
 
-  const relations = relationsFor(config.instance, agentId, primary.contact.id).map((rel) => {
-    const otherId = rel.fromContactId === primary.contact.id ? rel.toContactId : rel.fromContactId;
-    const other = getContact(config.instance, agentId, otherId);
-    return {
-      relationType: rel.relationType,
-      note: rel.note ?? undefined,
-      contact: other ? summarizeContact(other) : { id: otherId }
-    };
-  });
+  const relations = relationViews(config.instance, agentId, primary.contact.id).map((view) => ({
+    relationType: view.relationType,
+    note: view.note ?? undefined,
+    contact: view.contact ? summarizeContact(view.contact) : undefined
+  }));
   await recordLowRiskAudit(config, taskId, "contacts.relations", primary.contact.fullName, { count: relations.length });
   return JSON.stringify({ contact: summarizeContact(primary.contact), relations });
 }

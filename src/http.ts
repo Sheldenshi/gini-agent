@@ -48,6 +48,22 @@ import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
+import {
+  countContacts,
+  companyBreakdown,
+  deleteContact,
+  getContact,
+  queryContacts,
+  type ContactInput,
+  type ContactQuery
+} from "./state";
+import {
+  importContactsFromFile,
+  mutualContacts,
+  relateContacts,
+  relationViews,
+  upsertContact
+} from "./contacts";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
 import {
   approvePairing,
@@ -1172,6 +1188,100 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
         limit
       });
       return json(units.map((unit) => ({ ...unit, kind: "hindsight" })));
+    }],
+    // People-CRM contacts routes (ADR people-crm-store.md). The same
+    // exhaustive structured store the contacts_* agent tools use, exposed to
+    // web/CLI/mobile clients. Scoped to the active agent like the memory
+    // routes. Specific paths precede the /contacts/:id catch-all.
+    ["GET", /^\/api\/contacts\/count$/, (request) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const url = new URL(request.url);
+      const query = contactQueryFromParams(url.searchParams);
+      const count = countContacts(config.instance, effective.agentId, query);
+      const out: Record<string, unknown> = { count };
+      if (url.searchParams.get("breakdown") === "company") {
+        out.companies = companyBreakdown(config.instance, effective.agentId, 50);
+      }
+      return json(out);
+    }],
+    ["GET", /^\/api\/contacts\/mutual$/, (request) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const url = new URL(request.url);
+      const a = url.searchParams.get("a");
+      const b = url.searchParams.get("b");
+      if (!a || !b) return json({ error: "both a and b contact ids are required" }, 400);
+      return json({ mutualConnections: mutualContacts(config.instance, effective.agentId, a, b) });
+    }],
+    ["POST", /^\/api\/contacts\/import$/, async (request) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const payload = await body(request);
+      const path = String(payload.path ?? "").trim();
+      if (!path) return json({ error: "path is required" }, 400);
+      const source = typeof payload.source === "string" ? payload.source : "linkedin_import";
+      const report = await importContactsFromFile(config, effective.agentId, path, source);
+      return json(report, 201);
+    }],
+    ["POST", /^\/api\/contacts\/relations$/, async (request) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const payload = await body(request);
+      const from = String(payload.from ?? "").trim();
+      const to = String(payload.to ?? "").trim();
+      if (!from || !to) return json({ error: "from and to are required" }, 400);
+      const result = relateContacts(
+        config.instance,
+        effective.agentId,
+        from,
+        to,
+        typeof payload.relationType === "string" ? payload.relationType : "knows",
+        typeof payload.note === "string" ? payload.note : null,
+        "api"
+      );
+      if (!result.ok) return json({ error: "unresolved", reason: result.reason, role: result.role, ref: result.ref }, 400);
+      return json(result, 201);
+    }],
+    ["GET", /^\/api\/contacts\/([^/]+)\/relations$/, (_request, params) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const contact = getContact(config.instance, effective.agentId, params[0]!);
+      if (!contact) return json({ error: "Contact not found" }, 404);
+      return json({ contact, relations: relationViews(config.instance, effective.agentId, contact.id) });
+    }],
+    ["GET", /^\/api\/contacts\/([^/]+)$/, (_request, params) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const contact = getContact(config.instance, effective.agentId, params[0]!);
+      if (!contact) return json({ error: "Contact not found" }, 404);
+      return json(contact);
+    }],
+    ["DELETE", /^\/api\/contacts\/([^/]+)$/, (_request, params) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const removed = deleteContact(config.instance, effective.agentId, params[0]!);
+      if (!removed) return json({ error: "Contact not found" }, 404);
+      return json({ ok: true, id: params[0] });
+    }],
+    ["GET", /^\/api\/contacts$/, (request) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const query = contactQueryFromParams(new URL(request.url).searchParams);
+      return json(queryContacts(config.instance, effective.agentId, query));
+    }],
+    ["POST", /^\/api\/contacts$/, async (request) => {
+      const effective = resolveEffectiveContext(readState(config.instance), config);
+      if (!effective.agentId) return json({ error: "no active agent" }, 400);
+      const payload = await body(request);
+      const input: ContactInput & { id?: string } = {};
+      for (const key of ["fullName", "firstName", "lastName", "company", "title", "location", "email", "linkedinUrl", "connectedAt", "notes", "source"] as const) {
+        if (typeof payload[key] === "string") (input as Record<string, unknown>)[key] = payload[key];
+      }
+      if (typeof payload.id === "string") input.id = payload.id;
+      const result = upsertContact(config.instance, effective.agentId, input, typeof payload.source === "string" ? payload.source : "api");
+      if (result.action === "ambiguous") return json({ error: "ambiguous", name: result.name, candidates: result.candidates }, 409);
+      return json(result, result.action === "created" ? 201 : 200);
     }],
     ["GET", /^\/api\/embedding\/status$/, () => json(embeddingStatus(config))],
     ["POST", /^\/api\/embedding\/reembed$/, async (request) => {
@@ -2813,6 +2923,34 @@ function requireDeviceToken(
 
 function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
+}
+
+// Translate the /api/contacts query string into a ContactQuery. Mirrors the
+// contacts_query tool's filter surface so web/CLI/mobile clients share the
+// exhaustive structured-query contract.
+function contactQueryFromParams(params: URLSearchParams): ContactQuery {
+  const query: ContactQuery = {};
+  const str = (key: keyof ContactQuery & string) => {
+    const v = params.get(key);
+    if (v && v.trim()) (query as Record<string, unknown>)[key] = v.trim();
+  };
+  str("company");
+  str("companyContains");
+  str("title");
+  str("location");
+  str("nameContains");
+  str("emailContains");
+  str("q");
+  str("connectedAfter");
+  str("connectedBefore");
+  const hasCompany = params.get("hasCompany");
+  if (hasCompany === "true") query.hasCompany = true;
+  else if (hasCompany === "false") query.hasCompany = false;
+  const limit = params.get("limit");
+  if (limit && Number.isFinite(Number(limit))) query.limit = Number(limit);
+  const offset = params.get("offset");
+  if (offset && Number.isFinite(Number(offset))) query.offset = Number(offset);
+  return query;
 }
 
 // Parse the `?agentId=` filter shared by GET endpoints that return per-agent

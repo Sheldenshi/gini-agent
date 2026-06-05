@@ -11,6 +11,7 @@ import { chat } from "./commands/chat";
 import { runs } from "./commands/runs";
 import { approval } from "./commands/approval";
 import { memory } from "./commands/memory";
+import { contacts } from "./commands/contacts";
 import { embedding } from "./commands/embedding";
 import { reranker } from "./commands/reranker";
 import { skill } from "./commands/skills";
@@ -111,6 +112,7 @@ export async function run(): Promise<void> {
     case "approval":
     case "approvals": await approval(ctx); break;
     case "memory": await memory(ctx); break;
+    case "contacts": await contacts(ctx); break;
     case "embedding":
     case "embeddings": await embedding(ctx); break;
     case "reranker":
