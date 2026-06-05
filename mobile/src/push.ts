@@ -510,6 +510,13 @@ function resolveBundleId(): string | null {
 export function __resetRegistrationForSignOut(): void {
   registrationStarted = false;
   void deviceTokenStore.clear();
+  // Zero the app-icon badge and clear delivered notifications so a stale count or
+  // a lingering banner doesn't outlive the credential that produced it (the badge
+  // reflects the signed-out account's unread total and is meaningless once gone).
+  if (Platform.OS === "ios") {
+    void Notifications.setBadgeCountAsync(0).catch(() => {});
+    void Notifications.dismissAllNotificationsAsync().catch(() => {});
+  }
   // Bump generation LAST so anything that resolves during a
   // sign-out's pre-bump drain (via awaitRegistrationInFlight) still
   // completes naturally; anything that resolves after the bump

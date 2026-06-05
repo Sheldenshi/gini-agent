@@ -223,9 +223,20 @@ export async function start(config: RuntimeConfig, options: WebOptions): Promise
   const banner: Record<string, unknown> = runtimeStarted
     ? { started: true, url: url(config), instance: config.instance }
     : { running: true, url: url(config), instance: config.instance };
-  if (webUrlValue) banner.webUrl = webUrlValue;
+  // Advertise the GATEWAY origin as the operator's Web link, not the inner
+  // Next port: the gateway is the single front that serves the UI AND natively
+  // handles /api/pairing/* (device pairing 404s on the direct Next port). The
+  // inner port is kept only for liveness detection (webUrlValue).
+  if (webUrlValue) banner.webUrl = operatorWebUrl(config);
   if (foreground) banner.foreground = true;
   return { runtimeStarted, banner, children };
+}
+
+// The web URL shown to the operator: the GATEWAY origin (it reverse-proxies the
+// UI and natively serves /api/pairing/*), not the inner Next port. localhost is
+// friendlier than 127.0.0.1 and resolves to the loopback the gateway binds.
+export function operatorWebUrl(config: RuntimeConfig): string {
+  return `http://localhost:${config.port}`;
 }
 
 /**
@@ -314,7 +325,14 @@ export async function startWeb(config: RuntimeConfig, options: WebOptions): Prom
   // is hostile to fresh-clone "gini start" workflows: a stale .next/ from a
   // previous checkout will silently serve outdated code. Dev mode compiles
   // on demand and always reflects the current source.
-  const command = ["run", "dev", "--", "-p", String(port)];
+  // Bind the inner Next server to loopback (-H 127.0.0.1). Next defaults to
+  // 0.0.0.0 (all interfaces), which would make the web port LAN-reachable; the
+  // BFF trusts a loopback `Host` for its owner-bearer injection, and a Host
+  // header is forgeable by a non-browser client, so a LAN peer hitting the inner
+  // port directly could obtain owner access and bypass the gateway's
+  // Host/Origin + relay-session gate. The gateway (the only intended ingress)
+  // already binds 127.0.0.1 and reverse-proxies to this child over loopback.
+  const command = ["run", "dev", "--", "-H", "127.0.0.1", "-p", String(port)];
   // detached: true puts the child in its own process group so we can SIGTERM
   // the entire group on stop (`bun run dev` re-execs into Next.js, leaving an
   // orphaned grandchild if we only kill the recorded pid).
@@ -568,9 +586,12 @@ export async function remoteOrLocalStatus(config: RuntimeConfig, options: WebOpt
   const webUrl = await existingWebUrl(config, options.webPort);
   try {
     const remote = await api(config, "/api/status");
-    return { ...remote, web: { running: Boolean(webUrl), url: webUrl } };
+    // The gateway answered, so it's up — safe to advertise its URL as the web front.
+    return { ...remote, web: { running: Boolean(webUrl), url: webUrl ? operatorWebUrl(config) : null } };
   } catch {
-    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: webUrl } };
+    // The gateway is unreachable; the gateway URL would only mislead. Report the
+    // inner web's liveness but no operator URL (the single front is down).
+    return { ...status(config), ok: false, running: false, web: { running: Boolean(webUrl), url: null } };
   }
 }
 
@@ -631,7 +652,10 @@ export async function doctor(config: RuntimeConfig, options: WebOptions) {
         recorded: recordedWebPort(config)
       }
     },
-    web: { running: webPidAlive, pid: webPid ?? null, url: webHealthyUrl },
+    // Advertise the gateway URL only when the gateway is actually up (running) —
+    // it's the single front, so a healthy inner web process behind a down
+    // gateway has no usable operator URL.
+    web: { running: webPidAlive, pid: webPid ?? null, url: running && webHealthyUrl ? operatorWebUrl(config) : null },
     tokenConfigured: Boolean(config.token),
     provider: providerHealth(config),
     tasks: state.tasks.length,

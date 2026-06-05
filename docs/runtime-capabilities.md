@@ -52,6 +52,7 @@ bun run gini evidence
 | Self-improvement proposals | `gini improvements propose/approve/reject`, trace-backed application |
 | Observability | `gini trace`, `gini audit`, `gini events`, `/api/events/stream`, `gini evidence` |
 | Web control plane | Next.js app at `web/`, launched by `gini start` or `gini run` unless `--no-web` is set |
+| Off-LAN access (tunnel) | `gini tunnel [select <provider> \| connect [provider] \| cancel \| disconnect]`, `/api/tunnel{,/select,/connect,/cancel,/disconnect}`. The gini-relay provider runs an OAuth-loopback login on the host, assigns a per-device subdomain, and runs a supervised `frpc` child exposing the gateway port (the single origin fronting UI + API) at `https://<subdomain>.<relayDomain>`; `tailscale`/`ngrok`/`cloudflare` are disabled catalog placeholders. See [tunnel-connectivity.md](adr/tunnel-connectivity.md) |
 
 ## Runtime Contracts
 
@@ -64,14 +65,21 @@ Stable local clients use the gateway API:
 - `/api/embedding/status`, `/api/embedding/reembed`, `/api/reranker/status`, `/api/stt/status`
 - `/api/uploads` (POST `image/*` or `audio/*`), `GET /api/uploads/:id`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
-- `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
+- `/api/pairing`, `/api/pairing/claim`, `/api/pairing/request*`, `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
+- `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/settings/auto-approve`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
-All routes require `Authorization: Bearer <token>` except health checks and the limited SSE token compatibility path.
+Native gateway `/api/*` routes require `Authorization: Bearer <token>` except health checks, the limited SSE token compatibility path, and the device-pairing routes under `/api/pairing/*`. Pairing has its own trust model (see [ADR: Device-pairing authentication](adr/device-pairing-auth.md)), and the two claim paths are distinct:
+
+- **Legacy code-claim** — `POST /api/pairing/claim` takes a one-time admin-generated code in the request body and returns a `gini_device_<uuid>` bearer token (the mobile/CLI flow). It is public and not `gini_pair`-bound, but is rate-limited (per-host + global token buckets) to throttle brute-forcing the 6-digit code now that the gateway fronts the relay. Codes are created by `POST /api/pairing`, an admin route (see Admin routes below).
+- **Relay device-request flow** — `POST /api/pairing/request`, `GET /api/pairing/request/:id`, and `POST /api/pairing/request/:id/{claim,cancel}` are public and bound to the single-use `gini_pair` binding cookie rather than a bearer; both `POST /api/pairing/request` and the legacy claim are rate-limited. `POST /api/pairing/request/:id/claim` sets the `gini_session` cookie instead of returning a bearer for a browser; a verified **native** client (the mobile app) instead receives the `gini_device_<uuid>` token in the response body and no cookie, and uses it as its `Authorization: Bearer` (see the ADR's "Native pairing client").
+- **Admin routes** — `GET /api/pairing/requests` and `POST /api/pairing/requests/:id/{approve,reject}` are admin actions, called same-origin on the native surface and gated by **loopback Host OR a valid `gini_session`**. A **paired** session (loopback OR relay) is admin: once paired, a relay session is a full mirror of loopback and can approve/add devices exactly like `127.0.0.1`. `POST /api/pairing` (legacy code create) is bearer-gated (reached via the BFF's owner bearer). The only relay-specific gate is the initial pairing handshake. See [ADR](adr/device-pairing-auth.md) ("Relay sessions mirror loopback").
+
+Separately, web-bound `/api/runtime/*` calls arriving on a non-loopback (relay/allowlisted) front are authenticated by the `gini_session` cookie minted at request-claim, not a bearer.
 
 ## Boundaries
 
-Current runtime work is local-first. Future mobile, relay, push notifications, and richer live external transports should consume these contracts rather than adding a second source of truth.
+Current runtime work is local-first, with off-LAN reach available through the gini-relay tunnel (see the capability map above). Future mobile, push notifications, and richer live external transports should consume these contracts rather than adding a second source of truth.

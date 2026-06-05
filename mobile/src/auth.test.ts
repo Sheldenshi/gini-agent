@@ -15,10 +15,25 @@ mock.module("@react-native-async-storage/async-storage", () => ({
   }
 }));
 
+// Stub the push module that saveCredentials lazy-requires on a credential swap,
+// so the push churn is observable without loading react-native. First-time
+// sign-in re-arms via resetRegistrationForCredentialSwap; a real swap deregisters
+// the old device via tryDeregisterCachedDevice, which (with no cached APNs token)
+// calls __resetRegistrationForSignOut.
+const resetSwapSpy = mock(() => {});
+const signOutResetSpy = mock(() => {});
+mock.module("./push", () => ({
+  resetRegistrationForCredentialSwap: resetSwapSpy,
+  getCachedDeviceToken: () => null,
+  awaitRegistrationInFlight: () => undefined,
+  __resetRegistrationForSignOut: signOutResetSpy
+}));
+
 import {
   isLocalGatewayHost,
   normalizeBaseUrl,
-  PUBLIC_HTTP_REJECTION
+  PUBLIC_HTTP_REJECTION,
+  saveCredentials
 } from "./auth";
 
 describe("isLocalGatewayHost", () => {
@@ -156,5 +171,50 @@ describe("normalizeBaseUrl", () => {
     expect(normalizeBaseUrl("https://example.com/path?token=leaked#frag")).toBe(
       "https://example.com"
     );
+  });
+});
+
+describe("saveCredentials push-registration handling on swap", () => {
+  // Each test establishes its own precondition so it passes in isolation (no
+  // reliance on `cached` left behind by a sibling test). A given identity is
+  // either the first save the module ever sees (re-arm path) or a swap from a
+  // prior one (deregister path) — both are exercised within each test as needed.
+  test("a same-identity re-save causes no push churn", async () => {
+    resetSwapSpy.mockClear();
+    signOutResetSpy.mockClear();
+    await saveCredentials({ baseUrl: "https://same.gini-relay.lilaclabs.ai", token: "s1" });
+    // After this identity is established, re-saving it must do nothing.
+    resetSwapSpy.mockClear();
+    signOutResetSpy.mockClear();
+    await saveCredentials({ baseUrl: "https://same.gini-relay.lilaclabs.ai", token: "s1" });
+    expect(resetSwapSpy).toHaveBeenCalledTimes(0);
+    expect(signOutResetSpy).toHaveBeenCalledTimes(0);
+  });
+
+  test("a real swap deregisters the old device (not the first-time re-arm)", async () => {
+    // Establish a prior identity so the next save is unambiguously a swap.
+    await saveCredentials({ baseUrl: "https://prior.gini-relay.lilaclabs.ai", token: "p0" });
+    resetSwapSpy.mockClear();
+    signOutResetSpy.mockClear();
+    // Different host with a prior identity → swap path: deregister old + re-arm via
+    // tryDeregisterCachedDevice, NOT the first-time resetRegistrationForCredentialSwap.
+    await saveCredentials({ baseUrl: "https://swap.gini-relay.lilaclabs.ai", token: "p0" });
+    expect(signOutResetSpy).toHaveBeenCalledTimes(1);
+    expect(resetSwapSpy).toHaveBeenCalledTimes(0);
+    // A different token on the same host is also a swap.
+    signOutResetSpy.mockClear();
+    await saveCredentials({ baseUrl: "https://swap.gini-relay.lilaclabs.ai", token: "p1" });
+    expect(signOutResetSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("a push-deregister failure does not break the swap", async () => {
+    // Establish a prior identity, then make the swap's deregister throw.
+    await saveCredentials({ baseUrl: "https://prior2.gini-relay.lilaclabs.ai", token: "q0" });
+    signOutResetSpy.mockClear();
+    signOutResetSpy.mockImplementationOnce(() => {
+      throw new Error("push unavailable");
+    });
+    await saveCredentials({ baseUrl: "https://swap2.gini-relay.lilaclabs.ai", token: "q0" });
+    expect(signOutResetSpy).toHaveBeenCalledTimes(1);
   });
 });

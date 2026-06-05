@@ -21,6 +21,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError, uploadImage, type UploadRef } from "@/src/api";
+import { clearCredentials } from "@/src/auth";
 import { AttachmentSheet } from "@/src/components/AttachmentSheet";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { BlockRenderer } from "@/src/components/chat/BlockRenderer";
@@ -164,7 +165,12 @@ export default function ChatDetailScreen() {
   const unauthorized =
     stream.error instanceof ApiError && stream.error.status === 401;
   useEffect(() => {
-    if (unauthorized) router.replace("/setup");
+    // Clear the dead token (revoked/expired) before redirecting so a cold start
+    // doesn't replay route-to-app → 401 → setup (the cold-start flash).
+    if (unauthorized) {
+      void clearCredentials();
+      router.replace("/setup");
+    }
   }, [unauthorized]);
 
   useEffect(() => {

@@ -62,10 +62,13 @@ bearer-injecting BFF calls to a foreign instance.
   Next.js process serves both the SPA and `/api/runtime/*`, a null port means
   the whole web surface is down, so a browser cannot be mid-session against a
   dead BFF — the banner is the correct self-describe.
-- External exposure still requires `GINI_TRUSTED_ORIGINS` to include the
-  gateway's external origin, because the BFF guard runs on the proxied
-  `/api/runtime/*` request and fails closed on a non-loopback `Host` (ADR
-  bff-trust-boundary.md).
+- The gateway is the single trust front: it validates every web-bound request's
+  `Host`/`Origin` (loopback / gini-relay subdomain / `GINI_TRUSTED_ORIGINS`,
+  fail-closed on a malformed allowlist, plus a `Sec-Fetch-Site` check) and then
+  rewrites `Host`/`Origin` to loopback before proxying, so the inner web child is
+  purely internal and needs no relay awareness. External (non-relay,
+  non-loopback) exposure still requires `GINI_TRUSTED_ORIGINS` to include the
+  gateway's external origin (ADR bff-trust-boundary.md).
 - `src/http.ts` no longer imports from `src/cli/*`; web-port discovery lives in
   the runtime-safe `src/web-target.ts`.
 - The healthz-validated port is cached briefly (`ttlMs`, default 5s) to keep the

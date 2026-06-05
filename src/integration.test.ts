@@ -144,17 +144,20 @@ describe("runtime proxy", () => {
   });
 
   test("allowlist branch fails closed when every entry in GINI_TRUSTED_ORIGINS is malformed", async () => {
-    // A typo in the env var that leaves zero parseable origins refuses
-    // every privileged POST rather than silently downgrading to the
-    // rebindable Host-equality fallback.
+    // A typo in the env var that leaves zero parseable origins refuses every
+    // privileged POST from a non-loopback origin rather than silently
+    // downgrading to the rebindable Host-equality fallback. (Loopback is trusted
+    // unconditionally — the gateway is the single front and a rebinding page
+    // cannot forge a loopback Host — so the failure must be exercised from a
+    // non-loopback origin.)
     process.env.GINI_TRUSTED_ORIGINS = "not-a-url, also-not-a-url, :::garbage";
 
     const fetcher = mockFetcher(() => {
       throw new Error("upstream should not be called");
     });
-    const request = new Request("http://localhost/api/runtime/update", {
+    const request = new Request("https://gini-server.tailnet.example/api/runtime/update", {
       method: "POST",
-      headers: { origin: "http://localhost" }
+      headers: { origin: "https://gini-server.tailnet.example", host: "gini-server.tailnet.example" }
     });
     const response = await proxyRequest(request, ["update"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
 
@@ -193,21 +196,27 @@ describe("runtime proxy", () => {
     expect(response.status).toBe(403);
   });
 
-  test("rejects Origin-less GETs when GINI_TRUSTED_ORIGINS is set (no Origin to validate)", async () => {
-    // With an allowlist configured, the operator opted in to strict
-    // Origin-based validation. There's no Origin to compare on, so the
-    // safest call is to refuse and let non-browser callers go directly
-    // to the gateway with their own token.
+  test("loopback Origin-less GET passes even with GINI_TRUSTED_ORIGINS set (gateway is the single front)", async () => {
+    // The BFF is internal now: in production the gateway validates the real
+    // Host/Origin and rewrites both to loopback before proxying here, and a
+    // top-level navigation carries no Origin. A loopback Host is therefore
+    // trusted unconditionally — a rebinding page cannot forge a loopback Host —
+    // so this no-Origin loopback GET reaches the upstream even with an allowlist
+    // configured for the gateway's external origin. (Origin-less GETs on
+    // non-loopback hosts still 403; see the test above.)
     process.env.GINI_TRUSTED_ORIGINS = "http://localhost:3000";
+    let called = false;
     const fetcher = mockFetcher(() => {
-      throw new Error("upstream should not be called");
+      called = true;
+      return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "content-type": "application/json" } });
     });
     const request = new Request("http://localhost:3000/api/runtime/state", {
       method: "GET",
       headers: { host: "localhost:3000" }
     });
     const response = await proxyRequest(request, ["state"], { runtimeUrl: RUNTIME_URL, token: TOKEN, fetcher });
-    expect(response.status).toBe(403);
+    expect(called).toBe(true);
+    expect(response.status).toBe(200);
   });
 
   test("rejects GETs whose Origin doesn't match Host on non-loopback hosts (DNS-rebinding for read-only state)", async () => {

@@ -28,6 +28,7 @@ import { messaging } from "./commands/messaging";
 import { importInspect } from "./commands/imports";
 import { agent } from "./commands/agents";
 import { relay } from "./commands/relay";
+import { tunnel } from "./commands/tunnel";
 import { notification } from "./commands/notifications";
 import { promotion } from "./commands/promotions";
 import { snapshot } from "./commands/snapshots";
@@ -142,6 +143,7 @@ export async function run(): Promise<void> {
     case "agents": await agent(ctx); break;
     case "relay":
     case "relays": await relay(ctx); break;
+    case "tunnel": await tunnel(ctx); break;
     case "notification":
     case "notifications": await notification(ctx); break;
     case "promotion":

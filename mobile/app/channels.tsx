@@ -13,6 +13,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api, ApiError } from "@/src/api";
+import { clearCredentials } from "@/src/auth";
 import { AgentAvatar } from "@/src/components/chat/AgentAvatar";
 import { chatListTime, jobCadence } from "@/src/format";
 import {
@@ -62,7 +63,12 @@ export default function ChannelsScreen() {
   const unauthorized =
     agents.error instanceof ApiError && agents.error.status === 401;
   useEffect(() => {
-    if (unauthorized) router.replace("/setup");
+    if (!unauthorized) return;
+    // A 401 means the stored token is dead (revoked/expired). Drop it before
+    // redirecting so the next cold start goes straight to /setup instead of
+    // optimistically routing here, 401-ing, and bouncing — the cold-start flash.
+    void clearCredentials();
+    router.replace("/setup");
   }, [unauthorized]);
 
   const agentList = useMemo<AgentRecord[]>(() => agents.data?.agents ?? [], [agents.data]);

@@ -38,8 +38,15 @@ export function mobileBootstrap(config: RuntimeConfig) {
 
 export function publicState(config: RuntimeConfig) {
   const state = readState(config.instance);
+  // pairingRequests is intentionally omitted: no client reads it off /api/state
+  // (the admin panel uses the GET /api/pairing/requests admin route), and a
+  // raw row carries the bindHash. Pull it OUT of the spread — `...state` would
+  // otherwise re-include the raw rows. `pairingCodes`/`devices` are spread then
+  // overridden with redacted forms below.
+  const { pairingRequests: _omitted, ...rest } = state;
+  void _omitted;
   return {
-    ...state,
+    ...rest,
     chatMessages: state.chatMessages.filter((m) => m.kind !== "tool_transcript"),
     pairingCodes: state.pairingCodes.map((pairing) => ({
       id: pairing.id,

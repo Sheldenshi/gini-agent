@@ -18,10 +18,13 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
-function makeRequest(opts: { url: string; host: string; method?: string }): NextRequest {
+function makeRequest(opts: { url: string; host: string; method?: string; secFetchDest?: string; accept?: string }): NextRequest {
+  const headers: Record<string, string> = { host: opts.host };
+  if (opts.secFetchDest) headers["sec-fetch-dest"] = opts.secFetchDest;
+  if (opts.accept) headers["accept"] = opts.accept;
   return new NextRequest(opts.url, {
     method: opts.method ?? "GET",
-    headers: { host: opts.host }
+    headers
   });
 }
 
@@ -46,6 +49,11 @@ describe("proxy Host classifier", () => {
     expect(res.status).toBe(404);
   });
 
+  test("relay-subdomain Host → 404 (BFF is relay-agnostic; the gateway fronts the tunnel)", async () => {
+    const res = await proxy(makeRequest({ url: "https://g31.gini-relay.lilaclabs.ai/", host: "g31.gini-relay.lilaclabs.ai" }));
+    expect(res.status).toBe(404);
+  });
+
   test("trusted Host (GINI_TRUSTED_ORIGINS) passes through without the setup gate", async () => {
     process.env.GINI_TRUSTED_ORIGINS = "https://gini.example";
     // A trusted-lane request must NOT hit the loopback-only setup probe.
@@ -62,23 +70,60 @@ describe("proxy loopback setup gate", () => {
     expect(res.status).toBe(200);
   });
 
+  test("every pass-through response carries the anti-framing headers", async () => {
+    failIfFetched("setup status must not be probed for /api/* paths");
+    const res = await proxy(makeRequest({ url: "http://localhost/api/runtime/chat", host: "localhost" }));
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+  });
+
   test("loopback + /setup is not redirected (avoids a redirect loop)", async () => {
     stubSetupStatus(false);
-    const res = await proxy(makeRequest({ url: "http://localhost/setup", host: "localhost" }));
+    const res = await proxy(makeRequest({ url: "http://localhost/setup", host: "localhost", secFetchDest: "document" }));
     expect(res.status).toBe(200);
   });
 
-  test("loopback + unconfigured provider → redirect to /setup", async () => {
+  test("loopback + /pair is not redirected to /setup (pairing entry must always render)", async () => {
+    // Regression: /pair is the device-pairing entry point. If the setup gate
+    // bounced it to /setup while setup is incomplete, an unpaired relay device
+    // would loop forever (gateway: /setup -> /pair; here: /pair -> /setup).
     stubSetupStatus(false);
-    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost" }));
+    const res = await proxy(makeRequest({ url: "http://localhost/pair", host: "localhost", secFetchDest: "document" }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
+  test("loopback + a /pair-prefixed route like /pairing IS still gated (exact match, not prefix)", async () => {
+    // The /pair exemption must be exact (/pair or /pair/*), not a broad prefix,
+    // so a future /pairing route is not accidentally exempted from the setup gate.
+    stubSetupStatus(false);
+    const res = await proxy(makeRequest({ url: "http://localhost/pairing", host: "localhost", secFetchDest: "document" }));
     expect(res.status).toBeGreaterThanOrEqual(300);
     expect(res.status).toBeLessThan(400);
     expect(res.headers.get("location")).toContain("/setup");
   });
 
+  test("loopback + unconfigured provider → redirect to /setup (top-level navigation)", async () => {
+    stubSetupStatus(false);
+    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost", secFetchDest: "document" }));
+    expect(res.status).toBeGreaterThanOrEqual(300);
+    expect(res.status).toBeLessThan(400);
+    expect(res.headers.get("location")).toContain("/setup");
+  });
+
+  test("loopback + static asset is NOT redirected to /setup even when unconfigured", async () => {
+    // Regression: a static image (Sec-Fetch-Dest=image) must be served, not
+    // 307'd to /setup. The setup gate only redirects top-level page navigations,
+    // and must not even probe the provider for an asset request.
+    failIfFetched("setup status must not be probed for asset requests");
+    const res = await proxy(makeRequest({ url: "http://localhost/gini-agent-logo.png", host: "localhost", secFetchDest: "image" }));
+    expect(res.status).toBe(200);
+    expect(res.headers.get("location")).toBeNull();
+  });
+
   test("loopback + configured provider → pass (no redirect)", async () => {
     stubSetupStatus(true);
-    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost" }));
+    const res = await proxy(makeRequest({ url: "http://localhost/chat", host: "localhost", secFetchDest: "document" }));
     expect(res.status).toBe(200);
   });
 });

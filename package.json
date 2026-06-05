@@ -12,7 +12,8 @@
     "gini": "bun run src/cli.ts",
     "server": "bun run src/server.ts",
     "smoke": "bun run src/cli.ts smoke",
-    "test": "bun test --parallel ./src ./web ./mobile/src ./mobile/plugins",
+    "test": "bun test --parallel ./src ./mobile/src ./mobile/plugins",
+    "posttest": "bun --cwd=web test --isolate",
     "typecheck": "bunx tsc --noEmit && cd web && bunx tsc --noEmit && cd ../mobile && bunx tsc --noEmit",
     "web:dev": "cd web && bun run dev",
     "web:build": "cd web && bun run build",
@@ -28,6 +29,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "croner": "^10.0.1",
+    "gini-relay": "git+ssh://git@github.com/Lilac-Labs/gini-relay.git",
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^6.0.227",
     "playwright-core": "^1.60.0",

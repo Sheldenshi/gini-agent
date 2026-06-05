@@ -24,6 +24,21 @@ read at request time:
   to be loopback — a non-loopback Host without an allowlist is
   refused regardless of method.
 
+- **gini-relay tunnel front** — when the app is served through the
+  gini-relay tunnel (see [Tunnel Connectivity](tunnel-connectivity.md)),
+  the public host is a per-device subdomain under the relay domain
+  (`<subdomain>.<relayDomain>`, `relayDomain` default
+  `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). A
+  request whose `Host`/`Origin` host is a relay subdomain is trusted
+  regardless of `GINI_TRUSTED_ORIGINS`, so an operator who connects a
+  tunnel does not also have to enumerate the (randomly assigned)
+  subdomain in the env var. This lane now lives at the **gateway front**
+  (`src/lib/origin-trust.ts`, `webBoundRequestAllowed`), which validates it
+  for every web-bound request and then rewrites `Host`/`Origin` to loopback
+  before proxying — so the inner BFF (`web/src/proxy.ts`,
+  `web/src/lib/runtime.ts`) carries no relay lane of its own and only ever
+  sees loopback.
+
 Method-tiered fail-closed behavior: unsafe methods (POST, PUT, PATCH,
 DELETE) additionally require `Origin` to be present at all. A modern
 browser always sends Origin on unsafe methods, so the only callers
@@ -31,7 +46,11 @@ that omit it are non-browsers (which should hit the gateway directly
 with their own token).
 
 `Sec-Fetch-Site` is checked as a secondary signal — it must be
-`same-origin`, `none`, or absent.
+`same-origin`, `none`, or absent, except for a top-level page navigation
+(`Sec-Fetch-Dest: document`), which is exempt so a user can open the
+tunnel URL from a cross-site link without being refused. The cross-site
+check still applies to credentialed subresources and fetches (any
+non-`document` destination), which is where the data-leak risk lives.
 
 The browser never receives the gateway bearer token; the BFF reads it
 server-side from the per-instance `config.json` and adds it to the
@@ -63,6 +82,19 @@ why the loopback fallback is safe — `Host` on a loopback BFF is always
 moves the attack into the operator's *own* browser, where `Host` is
 honestly attacker-controlled because the URL bar is attacker-controlled.
 
+The gini-relay lane is the same reasoning applied to the relay's DNS.
+The relay controls DNS for `*.<relayDomain>` and routes each random,
+per-device subdomain only to its owner's `frpc` tunnel — an attacker
+cannot make `<their-subdomain>.<relayDomain>` resolve to the operator's
+machine, and cannot rebind a relay subdomain because the relay (not the
+operator's resolver) owns those names. So a relay `Host` is as
+trustworthy as a loopback `Host`: it can only be present on a request
+that actually arrived through the operator's own tunnel. `Sec-Fetch-Site`
+still applies as the secondary signal — a genuine cross-site *subresource*
+request through the tunnel front is rejected just as it is on the other
+lanes, while a top-level document navigation is exempt (following a
+cross-site link to the tunnel URL is a legitimate way to reach it).
+
 ## Consequences
 
 - Operators running the BFF on loopback (the default for `gini run`) get
@@ -87,23 +119,27 @@ honestly attacker-controlled because the URL bar is attacker-controlled.
 
 ## Gateway reverse-proxy interaction
 
-The gateway can now front the BFF as a single origin (ADR
-[gateway-web-reverse-proxy.md](./gateway-web-reverse-proxy.md)): a browser
-request to the gateway port for `/api/runtime/*` is reverse-proxied to the
-Next.js BFF, which still runs this guard and injects the bearer server-side.
-The guard's inputs are unchanged in the common case — the gateway forwards the
-browser's original `Origin` and `Host`, and both the gateway and Next.js bind
-loopback, so a same-origin loopback browser session still presents a loopback
-`Host` and matching `Origin` and passes. The bearer boundary is preserved: the
+The gateway fronts the BFF as a single origin (ADR
+[gateway-web-reverse-proxy.md](./gateway-web-reverse-proxy.md)) and is the
+authoritative trust front. For every web-bound request (non-`/api` and
+`/api/runtime/*`) the gateway runs the host/origin guard
+(`webBoundRequestAllowed` in `src/lib/origin-trust.ts`) — the loopback /
+gini-relay / `GINI_TRUSTED_ORIGINS` lanes plus the `Sec-Fetch-Site` check (with
+the top-level-navigation exemption) — and
+only then reverse-proxies to the Next.js BFF, rewriting `Host` and `Origin` to
+loopback on the way. The BFF therefore always sees an internal loopback request:
+it keeps its own loopback/allowlist guard as defense-in-depth for direct access
+to the Next.js port (with a loopback short-circuit for the gateway's normalized
+traffic) but needs no relay awareness. The bearer boundary is preserved: the
 gateway hands `/api/runtime/*` to the BFF rather than answering it natively, so
 token injection remains the BFF's job and the browser still never sees the
 token.
 
-The operational consequence is the same knob as direct exposure: if the gateway
-is exposed on a non-loopback hostname (the tunnel case the single-origin proxy
-enables), the BFF guard sees a non-loopback `Host` and fails closed unless
-`GINI_TRUSTED_ORIGINS` includes the gateway's external origin. Fronting the BFF
-behind the gateway does not remove that requirement.
+The operational knob is the same as direct exposure, now enforced at the
+gateway: if the gateway is exposed on a non-loopback, non-relay hostname (the
+tailnet/public case), the gateway guard fails closed unless
+`GINI_TRUSTED_ORIGINS` includes the gateway's external origin. The relay lane is
+the only auto-trusted non-loopback case, because the relay owns its DNS.
 
 ## Alternatives considered
 
@@ -137,7 +173,14 @@ behind the gateway does not remove that requirement.
 - The same-origin loopback case (`Origin: http://localhost`,
   `Host: localhost`) passes whether the env var is set (and matches)
   or unset.
-- The `GINI_TRUSTED_ORIGINS` / loopback / Origin-match cases are pinned
-  by `bun test src/integration.test.ts`, with pure-helper coverage in
-  `web/src/lib/trusted-origins.test.ts`. End-to-end coverage of the
-  proxy / BFF interaction is a documented gap.
+- At the **gateway front**, a web-bound request whose `Origin`/`Host` is a
+  relay subdomain (`<subdomain>.<relayDomain>`) passes with
+  `GINI_TRUSTED_ORIGINS` unset, while a non-relay, non-loopback `Host` without
+  `GINI_TRUSTED_ORIGINS` returns 404 (page) / 403 (`/api/runtime/*`).
+- The gateway guard's `GINI_TRUSTED_ORIGINS` / loopback / relay / Origin-match
+  / `Sec-Fetch-Site` cases are pinned by `src/lib/origin-trust.test.ts`
+  (`webBoundRequestAllowed`), and the gate + `Host`/`Origin` rewrite by
+  `src/http.test.ts`. The inner BFF guard (loopback + allowlist + loopback
+  short-circuit, relay-agnostic) is pinned by `web/src/lib/runtime.test.ts`
+  (`guardCsrf`) and `web/src/proxy.test.ts` (`classifyHost`), with pure-helper
+  coverage in `web/src/lib/trusted-origins.test.ts`.

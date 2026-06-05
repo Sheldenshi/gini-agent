@@ -15,6 +15,7 @@ import type {
   NotificationRecord,
   PairedDevice,
   PairingCode,
+  PairingRequest,
   AgentRecord,
   PromotionProposal,
   RelayRecord,
@@ -25,6 +26,7 @@ import type {
   SnapshotRecord,
   SubagentRecord,
   Task,
+  TunnelSelectionRecord,
   PlanStepRecord
 } from "../types";
 import { id, now } from "./ids";
@@ -32,7 +34,7 @@ import { addAudit, appendEvent, type AgentContext } from "./audit";
 import { deleteChatBlocksForSession } from "./chat-blocks";
 import { tracePath } from "./trace";
 import { hashSecret, randomPairingCode } from "./security";
-import { expirePairingCodes } from "./store";
+import { expirePairingCodes, expirePairingRequests } from "./store";
 
 export function taskCounts(tasks: Task[]): Record<Task["status"], number> {
   return {
@@ -610,6 +612,17 @@ export function createPairingCode(
   return { pairing, code };
 }
 
+// Default capability scopes for a newly paired device/session. Shared by both
+// claimPairingCode (code-claimed mobile devices) and claimPairingRequest (relay
+// cookie sessions) so the two grant an identical surface and can't silently
+// drift when one is updated.
+//
+// NOTE: scopes are forward-looking capability/display metadata — they are NOT
+// consulted for authorization today. A paired device/session is owner-equivalent
+// (the mirror model; see ADR device-pairing-auth.md), so the bearer/cookie's
+// validity is the entire access decision. Do not assume per-scope enforcement.
+const DEFAULT_SESSION_SCOPES = ["tasks:read", "tasks:write", "approvals:write", "state:read"];
+
 export function claimPairingCode(
   state: RuntimeState,
   code: string,
@@ -628,7 +641,7 @@ export function claimPairingCode(
     name: deviceName.trim() || "Unnamed device",
     tokenHash: hashSecret(token),
     status: "active",
-    scopes: ["tasks:read", "tasks:write", "approvals:write", "state:read"],
+    scopes: [...DEFAULT_SESSION_SCOPES],
     createdAt: at,
     updatedAt: at
   };
@@ -670,17 +683,347 @@ export function revokeDevice(state: RuntimeState, deviceId: string): PairedDevic
     },
     { system: true }
   );
+  // A "pairing" tick so EVERY admin client's Active Sessions list refreshes the
+  // moment a session is revoked — RuntimeStreamBridge maps kind:"pairing" to the
+  // ["devices"] query. The audit row alone surfaces as kind:"runtime" (mapped to
+  // ["status"]), so without this a second open Settings tab would show the
+  // revoked session as active until it refetched. Matches claim/approve/reject.
+  appendEvent(
+    state,
+    { kind: "pairing", action: "resolved", target: device.id, risk: "low", summary: `Device revoked: ${device.name}` },
+    { system: true }
+  );
   return device;
 }
 
 export function findActiveDeviceByToken(state: RuntimeState, token: string): PairedDevice | undefined {
   const tokenHash = hashSecret(token);
   const device = state.devices.find((item) => item.tokenHash === tokenHash && item.status === "active");
-  if (device) {
-    device.lastSeenAt = now();
-    device.updatedAt = device.lastSeenAt;
-  }
+  if (!device) return undefined;
+  // Honor session expiry on the bearer path too, exactly as findActiveSessionByToken
+  // does for the cookie path — otherwise a relay-minted session token (which carries
+  // a finite expiresAt) would outlive its expiry when presented as a Bearer. Mobile/
+  // code-claimed devices have no expiresAt, so this is a no-op for them.
+  if (device.expiresAt && new Date(device.expiresAt).getTime() <= Date.now()) return undefined;
+  device.lastSeenAt = now();
+  device.updatedAt = device.lastSeenAt;
   return device;
+}
+
+// Default relay-browser session lifetime. Bearer/mobile devices (claimed via
+// createPairingCode/claimPairingCode) have no expiry; relay browser sessions
+// get a finite one so an abandoned cookie eventually dies even if the operator
+// never explicitly revokes it. Revocation still takes effect immediately,
+// independent of this TTL.
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// Cap on concurrent PENDING pairing requests so a public flood can't bury the
+// operator panel. Enforced INSIDE createPairingRequest (one mutateState txn) so
+// the check-and-create is atomic — a pre-read in the HTTP layer would be a
+// check-then-act race across two transactions.
+export const MAX_PENDING_PAIRING_REQUESTS = 20;
+
+// Thrown by createPairingRequest when the pending cap is hit; the HTTP layer
+// maps it to 429.
+export class PairingCapExceededError extends Error {
+  constructor() {
+    super("Too many pending pairing requests.");
+    this.name = "PairingCapExceededError";
+  }
+}
+
+// Derive a short human label ("Safari · iPhone") from a User-Agent for the
+// operator's approval panel and the Active Sessions list. Order matters:
+// Edge/Brave/Opera all embed "Chrome", and Chrome embeds "Safari", so the more
+// specific tokens are tested first.
+export function deviceNameFromUserAgent(userAgent: string): string {
+  const ua = userAgent || "";
+  const browser =
+    /\bEdg\//.test(ua) ? "Edge"
+    : /\bOPR\/|\bOpera\b/.test(ua) ? "Opera"
+    : /\bBrave\b/.test(ua) ? "Brave"
+    : /\bFirefox\//.test(ua) ? "Firefox"
+    : /\bChrome\//.test(ua) ? "Chrome"
+    : /\bSafari\//.test(ua) ? "Safari"
+    : null;
+  const os =
+    /\biPhone\b/.test(ua) ? "iPhone"
+    : /\biPad\b/.test(ua) ? "iPad"
+    : /\bAndroid\b/.test(ua) ? "Android"
+    : /\bMac OS X\b|\bMacintosh\b/.test(ua) ? "Mac"
+    : /\bWindows\b/.test(ua) ? "Windows"
+    : /\bLinux\b/.test(ua) ? "Linux"
+    : null;
+  if (browser && os) return `${browser} · ${os}`;
+  return browser ?? os ?? "Unknown device";
+}
+
+// A relay device opens a pairing request. The plaintext code is returned to the
+// caller (it is displayed on the device AND, via the loopback list, on the
+// operator's panel for visual comparison). `bindSecret` is the per-request
+// binding secret the route stored as an HttpOnly cookie on the requesting
+// browser; only its hash is persisted (credential hashing stays in this state
+// layer, matching claim/cancel/poll). ttlSeconds is clamped to the same
+// 60-3600s window as createPairing.
+export function createPairingRequest(
+  state: RuntimeState,
+  input: { userAgent: string; relayHost: string; bindSecret: string; ttlSeconds?: number; deviceName?: string }
+): PairingRequest {
+  expirePairingRequests(state);
+  if (state.pairingRequests.filter((r) => r.status === "pending").length >= MAX_PENDING_PAIRING_REQUESTS) {
+    throw new PairingCapExceededError();
+  }
+  const at = now();
+  const ttlSeconds = Math.min(3600, Math.max(60, Math.floor(input.ttlSeconds ?? 600)));
+  const request: PairingRequest = {
+    id: id("preq"),
+    instance: state.instance,
+    code: randomPairingCode(),
+    bindHash: hashSecret(input.bindSecret),
+    status: "pending",
+    deviceName: input.deviceName ?? deviceNameFromUserAgent(input.userAgent),
+    userAgent: input.userAgent,
+    relayHost: input.relayHost,
+    createdAt: at,
+    expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString()
+  };
+  state.pairingRequests.unshift(request);
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "pairing.requested",
+      target: request.id,
+      risk: "medium",
+      evidence: { deviceName: request.deviceName, relayHost: request.relayHost }
+    },
+    { system: true }
+  );
+  // A content-free tick for the admin "Pair Requests" panel. The plaintext code
+  // is deliberately NOT in the event data — the broadcast events stream is
+  // readable by any current session; an admin reads the code only from the
+  // admin-only request list (GET /api/pairing/requests: loopback OR a session).
+  appendEvent(
+    state,
+    {
+      kind: "pairing",
+      action: "request",
+      target: request.id,
+      risk: "low",
+      summary: `Pairing requested from ${request.deviceName}`
+    },
+    { system: true }
+  );
+  return request;
+}
+
+export function getPairingRequest(state: RuntimeState, requestId: string): PairingRequest | undefined {
+  expirePairingRequests(state);
+  return state.pairingRequests.find((item) => item.id === requestId);
+}
+
+export function listPendingPairingRequests(state: RuntimeState): PairingRequest[] {
+  expirePairingRequests(state);
+  return state.pairingRequests.filter((item) => item.status === "pending");
+}
+
+// Operator approves a pending request on the loopback front. The session device
+// is NOT minted here — only on the device's subsequent claim — so the raw token
+// never sits at rest. Throws on a missing or already-resolved request.
+export function approvePairingRequest(state: RuntimeState, requestId: string): PairingRequest {
+  expirePairingRequests(state);
+  const request = state.pairingRequests.find((item) => item.id === requestId);
+  if (!request) throw new Error("Pairing request not found.");
+  if (request.status !== "pending") throw new Error(`Pairing request is already ${request.status}.`);
+  request.status = "approved";
+  request.resolvedAt = now();
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "pairing.approved",
+      target: request.id,
+      risk: "high",
+      evidence: { deviceName: request.deviceName, relayHost: request.relayHost }
+    },
+    { system: true }
+  );
+  appendEvent(
+    state,
+    { kind: "pairing", action: "resolved", target: request.id, risk: "low", summary: `Pairing approved for ${request.deviceName}` },
+    { system: true }
+  );
+  return request;
+}
+
+// Operator rejects a pending request.
+export function rejectPairingRequest(state: RuntimeState, requestId: string): PairingRequest {
+  expirePairingRequests(state);
+  const request = state.pairingRequests.find((item) => item.id === requestId);
+  if (!request) throw new Error("Pairing request not found.");
+  if (request.status !== "pending") throw new Error(`Pairing request is already ${request.status}.`);
+  request.status = "rejected";
+  request.resolvedAt = now();
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "pairing.rejected",
+      target: request.id,
+      risk: "medium",
+      evidence: { deviceName: request.deviceName, relayHost: request.relayHost }
+    },
+    { system: true }
+  );
+  appendEvent(
+    state,
+    { kind: "pairing", action: "resolved", target: request.id, risk: "low", summary: `Pairing rejected for ${request.deviceName}` },
+    { system: true }
+  );
+  return request;
+}
+
+// The requesting device cancels its own pending/approved request (the spinner's
+// Cancel button). Requires the binding secret so a third party that learns the
+// request id can't cancel a victim's request. A request already claimed,
+// rejected, or expired is left unchanged and returned as-is.
+export function cancelPairingRequest(
+  state: RuntimeState,
+  requestId: string,
+  bindSecret: string
+): { ok: true; request: PairingRequest } | { ok: false; reason: "not_found" | "bind_mismatch" } {
+  expirePairingRequests(state);
+  const request = state.pairingRequests.find((item) => item.id === requestId);
+  if (!request) return { ok: false, reason: "not_found" };
+  if (hashSecret(bindSecret) !== request.bindHash) return { ok: false, reason: "bind_mismatch" };
+  if (request.status === "pending" || request.status === "approved") {
+    request.status = "cancelled";
+    request.resolvedAt = now();
+    appendEvent(
+      state,
+      { kind: "pairing", action: "resolved", target: request.id, risk: "low", summary: `Pairing cancelled by ${request.deviceName}` },
+      { system: true }
+    );
+  }
+  return { ok: true, request };
+}
+
+// The requesting device claims its approved request, minting the session
+// PairedDevice and returning the raw token exactly once (the route sets it as
+// the gini_session cookie; only tokenHash persists). Binding secret is required
+// so only the browser that created the request can claim its session.
+export function claimPairingRequest(
+  state: RuntimeState,
+  requestId: string,
+  bindSecret: string
+):
+  | { ok: true; device: PairedDevice; token: string }
+  | { ok: false; reason: "not_found" | "bind_mismatch" | "not_approved" } {
+  expirePairingRequests(state);
+  const request = state.pairingRequests.find((item) => item.id === requestId);
+  if (!request) return { ok: false, reason: "not_found" };
+  if (hashSecret(bindSecret) !== request.bindHash) return { ok: false, reason: "bind_mismatch" };
+  if (request.status !== "approved") return { ok: false, reason: "not_approved" };
+
+  const at = now();
+  const token = `gini_device_${crypto.randomUUID().replaceAll("-", "")}`;
+  const device: PairedDevice = {
+    id: id("device"),
+    instance: state.instance,
+    name: request.deviceName,
+    tokenHash: hashSecret(token),
+    status: "active",
+    scopes: [...DEFAULT_SESSION_SCOPES],
+    origin: request.relayHost,
+    userAgent: request.userAgent,
+    createdAt: at,
+    updatedAt: at,
+    lastSeenAt: at,
+    expiresAt: new Date(Date.now() + SESSION_TTL_MS).toISOString()
+  };
+  request.status = "claimed";
+  request.resolvedAt = at;
+  request.deviceId = device.id;
+  state.devices.unshift(device);
+  addAudit(
+    state,
+    {
+      actor: "user",
+      action: "device.paired",
+      target: device.id,
+      risk: "medium",
+      evidence: { pairingRequestId: request.id, name: device.name, origin: device.origin, scopes: device.scopes }
+    },
+    { system: true }
+  );
+  // A "pairing" tick so the operator's Active Sessions list refreshes the moment
+  // the new session is minted (the other pairing mutators emit one too).
+  appendEvent(
+    state,
+    { kind: "pairing", action: "resolved", target: request.id, risk: "low", summary: `Device paired: ${device.name}` },
+    { system: true }
+  );
+  return { ok: true, device, token };
+}
+
+// Bind-checked status read for the device's own poll. Unlike getPairingRequest,
+// it requires the binding secret so a holder of an unrelated gini_pair cookie
+// (plus a guessed request id) cannot read another request's status. Mirrors the
+// bind check in claim/cancel.
+export function pollPairingRequest(
+  state: RuntimeState,
+  requestId: string,
+  bindSecret: string
+): { ok: true; status: PairingRequest["status"] } | { ok: false; reason: "not_found" | "bind_mismatch" } {
+  expirePairingRequests(state);
+  const request = state.pairingRequests.find((item) => item.id === requestId);
+  if (!request) return { ok: false, reason: "not_found" };
+  if (hashSecret(bindSecret) !== request.bindHash) return { ok: false, reason: "bind_mismatch" };
+  return { ok: true, status: request.status };
+}
+
+// Read-only session resolution for the gateway's hot relay cookie gate. Unlike
+// findActiveDeviceByToken it does NOT bump lastSeenAt or mutate state — the gate
+// runs on every proxied asset/request, so a write per asset would thrash the
+// state file. Returns the active, unexpired device or undefined. lastSeenAt is
+// refreshed separately by touchSessionLastSeen on page navigations only.
+export function findActiveSessionByToken(state: RuntimeState, token: string): PairedDevice | undefined {
+  const tokenHash = hashSecret(token);
+  const device = state.devices.find((item) => item.tokenHash === tokenHash && item.status === "active");
+  if (!device) return undefined;
+  if (device.expiresAt && new Date(device.expiresAt).getTime() <= Date.now()) return undefined;
+  return device;
+}
+
+// Bump lastSeenAt for the session a token resolves to. Called by the gateway on
+// document navigations (infrequent) so the Active Sessions list shows a useful
+// "last seen" without a write on every asset request. Returns true when a
+// matching active session was found and touched.
+export function touchSessionLastSeen(state: RuntimeState, token: string): boolean {
+  const tokenHash = hashSecret(token);
+  const device = state.devices.find((item) => item.tokenHash === tokenHash && item.status === "active");
+  if (!device) return false;
+  device.lastSeenAt = now();
+  device.updatedAt = device.lastSeenAt;
+  return true;
+}
+
+// Strip the binding secret hash before a PairingRequest is sent to a client.
+// The operator panel needs the plaintext code (for comparison) and metadata,
+// but never the bindHash.
+export function redactPairingRequest(request: PairingRequest) {
+  return {
+    id: request.id,
+    instance: request.instance,
+    code: request.code,
+    status: request.status,
+    deviceName: request.deviceName,
+    relayHost: request.relayHost,
+    createdAt: request.createdAt,
+    expiresAt: request.expiresAt,
+    resolvedAt: request.resolvedAt,
+    deviceId: request.deviceId
+  };
 }
 
 export function createPromotionProposal(
@@ -1005,6 +1348,33 @@ export function createRelayRecord(
     { system: true }
   );
   return item;
+}
+
+// Mint (or, on re-entry, the field-default shape for) the tunnel selection
+// singleton. Unlike most create* helpers this does NOT push onto a list —
+// the tunnel is a singleton stored at `state.tunnel`, mirroring
+// `state.browser`. The integration module assigns the returned record to
+// `state.tunnel` inside its mutateState callback. No audit row here; the
+// integration emits action-specific audit rows (select/connect/disconnect)
+// at its side-effecting call sites, matching createRelayRecord's split of
+// "record shape" from "side-effect audit".
+export function createTunnelRecord(
+  state: RuntimeState,
+  tunnel: Omit<TunnelSelectionRecord, "instance" | "createdAt" | "updatedAt">
+): TunnelSelectionRecord {
+  const at = now();
+  // Authoritative metadata is spread LAST so it always wins: callers build
+  // `tunnel` by spreading the prior persisted record (`...state.tunnel`), which
+  // carries its own instance/createdAt/updatedAt — putting those first would let
+  // stale values survive and freeze `updatedAt`. `createdAt` is preserved from
+  // the prior record (or stamped now on first creation); `updatedAt` always
+  // advances to now.
+  return {
+    ...tunnel,
+    instance: state.instance,
+    createdAt: state.tunnel?.createdAt ?? at,
+    updatedAt: at
+  };
 }
 
 export function createNotificationRecord(

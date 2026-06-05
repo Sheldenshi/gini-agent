@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import type { Authorization, ConnectorRecord, Instance, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, SetupRequest, SetupRequestAction, SetupRequestStatus, TaskStatus } from "../types";
+import type { Authorization, ConnectorRecord, Instance, PairingRequestStatus, PairingStatus, ProviderConfig, RuntimeConfig, RuntimeState, SetupRequest, SetupRequestAction, SetupRequestStatus, TaskStatus } from "../types";
 import { ensureDir, instanceRoot, statePath } from "../paths";
 import { now } from "./ids";
 import { defaultAgent, defaultTools, defaultToolsets } from "./defaults";
@@ -46,6 +46,7 @@ export function createEmptyState(instance: Instance): RuntimeState {
     ],
     improvements: [],
     pairingCodes: [],
+    pairingRequests: [],
     devices: [],
     promotions: [],
     snapshots: [],
@@ -65,7 +66,8 @@ export function createEmptyState(instance: Instance): RuntimeState {
     chatMessages: [],
     messagingMessages: [],
     runs: [],
-    planSteps: []
+    planSteps: [],
+    tunnel: null
   };
 }
 
@@ -136,6 +138,52 @@ export function expirePairingCodes(state: RuntimeState): void {
   }
 }
 
+// Most recent terminal pairing requests retained for the operator's
+// recent-activity view; older terminal rows are pruned so a public create
+// endpoint can't grow durable state without bound (mirrors the events ring
+// buffer cap in src/state/audit.ts).
+const RETAINED_TERMINAL_PAIRING_REQUESTS = 50;
+// "approved" is deliberately NOT terminal: an approved request is still
+// claimable and cancellable, so it must never be pruned and must still expire.
+const TERMINAL_PAIRING_STATUSES = new Set<PairingRequestStatus>([
+  "rejected",
+  "cancelled",
+  "claimed",
+  "expired"
+]);
+
+// Lazily expire stale pairing requests, mirroring expirePairingCodes, then prune
+// terminal rows so the array stays bounded. Called at the top of every
+// pairing-request read/mutate. Both pending AND approved-but-unclaimed requests
+// expire once past their deadline — so a claim arriving after expiry sees
+// "expired", not a stale "approved".
+export function expirePairingRequests(state: RuntimeState): void {
+  const at = Date.now();
+  for (const request of state.pairingRequests) {
+    if (
+      (request.status === "pending" || request.status === "approved")
+      && new Date(request.expiresAt).getTime() <= at
+    ) {
+      request.status = "expired" satisfies PairingRequestStatus;
+      // Stamp the expiry moment unconditionally (not ??=) so an approved row that
+      // later expires sorts by its true expiry time in the retention prune below,
+      // not by its earlier approval timestamp — otherwise it could be evicted
+      // ahead of genuinely-older terminal rows and a claim would see 404 instead
+      // of an "expired"/not-approved state.
+      request.resolvedAt = now();
+    }
+  }
+  // Keep every non-terminal (pending) row plus the newest N terminal rows.
+  const pending = state.pairingRequests.filter((r) => !TERMINAL_PAIRING_STATUSES.has(r.status));
+  const terminal = state.pairingRequests
+    .filter((r) => TERMINAL_PAIRING_STATUSES.has(r.status))
+    .sort((a, b) => (b.resolvedAt ?? b.createdAt).localeCompare(a.resolvedAt ?? a.createdAt))
+    .slice(0, RETAINED_TERMINAL_PAIRING_REQUESTS);
+  if (terminal.length !== state.pairingRequests.length - pending.length) {
+    state.pairingRequests = [...pending, ...terminal];
+  }
+}
+
 // Pre-rename state files persisted a `lane` field on every record (top-level
 // state.lane plus a lane field on every Task/Audit/Memory/Skill/etc.). After
 // the lane→instance rename these files still exist on disk; we rewrite them
@@ -162,6 +210,7 @@ function migrateLaneFieldToInstance(state: RuntimeState): void {
     "connectors",
     "improvements",
     "pairingCodes",
+    "pairingRequests",
     "devices",
     "promotions",
     "snapshots",
@@ -1060,6 +1109,7 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
   state.skills ??= [];
   state.jobs ??= [];
   state.pairingCodes ??= [];
+  state.pairingRequests ??= [];
   state.devices ??= [];
   state.promotions ??= [];
   state.snapshots ??= [];
@@ -1308,6 +1358,10 @@ export function normalizeState(instance: Instance, state: RuntimeState): Runtime
       state.browser = null;
     }
   }
+  // Tunnel selection singleton is purely opt-in (see ADR
+  // tunnel-connectivity.md). Backfill null so legacy state files and
+  // hand-edited files alike present a consistent shape to consumers.
+  state.tunnel ??= null;
   expirePairingCodes(state);
   return state;
 }

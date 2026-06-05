@@ -18,7 +18,9 @@ import {
   markUnread,
   mutateState,
   now,
+  PairingCapExceededError,
   readState,
+  SESSION_TTL_MS,
   unreadCountsByDevice,
   readTrace,
   readUpload,
@@ -47,7 +49,22 @@ import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embeddin
 import { rerankerStatus } from "./memory/reranker";
 import { listBanks, listMemoryUnits, getBank, updateBank, ensureDefaultBank, ensureAgentBank, DEFAULT_BANK_ID, type Network } from "./state";
 import { proposeImprovement, reviewImprovement } from "./governance/improvements";
-import { authorizedBearer, claimPairing, createPairing, resolveCredentialFromBearer, revokePairedDevice } from "./governance/pairing";
+import {
+  approvePairing,
+  authorizedBearer,
+  cancelPairing,
+  claimPairing,
+  claimPairingSession,
+  createPairing,
+  listPairingRequests,
+  pollPairingStatus,
+  rejectPairing,
+  requestPairing,
+  resolveCredentialFromBearer,
+  resolveSessionFromCookie,
+  revokePairedDevice,
+  touchPairedSession
+} from "./governance/pairing";
 import { proposePromotion, reviewPromotion } from "./governance/promotions";
 import { status, updateAutoApproveSettings } from "./runtime";
 import { searchSessions } from "./execution/search";
@@ -79,6 +96,10 @@ import { resolveEffectiveContext } from "./execution/effective-context";
 import { completeBrowserConnectSetup, connectBrowser, disconnectBrowser, getBrowserConnection } from "./capabilities/browser-connect";
 import { hermesParityChecks } from "./runtime/parity";
 import { acknowledgeNotification, checkRelay, configureRelay, listRelays, queueNotification, sendQueuedNotifications } from "./integrations/relay";
+import { cancelTunnel, connectTunnel, disconnectTunnel, getTunnel, selectProvider } from "./integrations/tunnel";
+import { isLoopbackHost, isRelayHost, webBoundRequestAllowed } from "./lib/origin-trust";
+import { cookieValue, serializeCookie } from "./lib/cookies";
+import { RateLimiter } from "./lib/rate-limit";
 import { getSetupStatus, removeSetupProvider, setSetupProvider } from "./runtime/setup-api";
 import { getCacheWarmer, setCacheWarmer } from "./runtime/cache-warmer";
 import { createSkillFromInput, getSkill, grantConnectorToSkill, installSkillFromBody, listSkills, reloadSkills, rollbackSkill, searchSkills, setSkillStatus, testSkill, updateSkill, validateSkills } from "./capabilities/skills";
@@ -1615,6 +1636,20 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     ["GET", /^\/api\/relays$/, () => json(listRelays(config))],
     ["POST", /^\/api\/relays$/, async (request) => json(await configureRelay(config, await body(request)), 201)],
     ["POST", /^\/api\/relays\/([^/]+)\/health$/, async (_request, params) => json(await checkRelay(config, params[0]))],
+    // Tunnel connectivity (ADR tunnel-connectivity.md). Every route returns
+    // the full TunnelState so one fetch drives the selection/connect/connected
+    // UI. connect() flips to "connecting" and runs the gini-relay OAuth-loopback
+    // login + frpc handshake in the background; the UI polls GET /api/tunnel
+    // until status flips to "connected" (with url) or "error".
+    ["GET", /^\/api\/tunnel$/, () => json(getTunnel(config))],
+    ["POST", /^\/api\/tunnel\/select$/, async (request) => json(await selectProvider(config, String((await body(request)).provider ?? "")))],
+    ["POST", /^\/api\/tunnel\/connect$/, async (request) => {
+      const payload = await body(request);
+      const provider = typeof payload.provider === "string" && payload.provider.length > 0 ? payload.provider : undefined;
+      return json(await connectTunnel(config, provider));
+    }],
+    ["POST", /^\/api\/tunnel\/cancel$/, async () => json(await cancelTunnel(config))],
+    ["POST", /^\/api\/tunnel\/disconnect$/, async () => json(await disconnectTunnel(config))],
     ["GET", /^\/api\/notifications$/, () => json(readState(config.instance).notifications)],
     ["POST", /^\/api\/notifications$/, async (request) => json(await queueNotification(config, await body(request)), 201)],
     ["POST", /^\/api\/notifications\/send$/, async () => json(await sendQueuedNotifications(config))],
@@ -1635,6 +1670,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     if (request.method === "OPTIONS" && request.headers.get("access-control-request-method")) {
       return preflightResponse(request);
     }
+    // iOS universal-links association: a fixed public file served before the
+    // host/session gates so Apple's CDN (a no-Origin GET) can fetch it on any
+    // relay subdomain to validate the app's `applinks:*.<relayDomain>` claim.
+    if (request.method === "GET" && url.pathname === APPLE_APP_SITE_ASSOCIATION_PATH) {
+      return appleAppSiteAssociationResponse();
+    }
     // The gateway owns only its NATIVE /api/* surface. The Next BFF namespace
     // (/api/runtime/*) and all non-/api traffic are web-bound (isWebProxyPath)
     // and proxied to the web server instead, so the browser's token-injecting
@@ -1642,10 +1683,33 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
     // predicate gates WS routing in src/server.ts so the two can't drift.
     if (!isWebProxyPath(url.pathname)) {
       if (request.method === "POST" && url.pathname === "/api/pairing/claim") {
+        // This legacy code-claim endpoint is public (it predates the bearer gate)
+        // and, now that the gateway is the relay-facing front, reachable from the
+        // internet. The code is a 6-digit value, so without throttling an
+        // attacker could brute-force a pending code within its TTL to mint a
+        // device bearer. Rate-limit it the same way the new request flow is
+        // gated; a legitimate single mobile/CLI claim stays well under capacity.
+        if (!pairingClaimAllowed(request)) {
+          return withCors(request, json({ error: "Too many pairing attempts. Try again shortly." }, 429));
+        }
         try {
           return withCors(request, json(await claimPairing(config, await body(request)), 201));
         } catch (error) {
           return withCors(request, json({ error: error instanceof Error ? error.message : String(error) }, 400));
+        }
+      }
+      // Relay device-pairing API: gateway-handled before the bearer gate so it
+      // can enforce its own loopback-vs-public rules from the true inbound Host.
+      // The paths are enumerated (isDevicePairingPath) rather than prefix-matched
+      // so a future /api/pairing/request-* route can't silently bypass the bearer
+      // gate. The handler can throw (approve/reject of a stale request), so wrap
+      // it in the same JSON error envelope the route table uses.
+      if (isDevicePairingPath(url.pathname)) {
+        try {
+          return await handlePairingRoutes(request, url, config);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          return withCors(request, json({ error: message }, statusFromErrorMessage(message)));
         }
       }
       if (!await authorized(request, config)) return withCors(request, json({ error: "Unauthorized" }, 401));
@@ -1662,7 +1726,53 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }
       return withCors(request, json({ error: "Not found" }, 404));
     }
-    return proxyWeb(request, url, config);
+    // Single-front trust boundary: validate the inbound Host/Origin for every
+    // web-bound request BEFORE proxying. The inner web child binds loopback and
+    // is relay-agnostic, so this is the one place DNS-rebinding / CSRF are
+    // stopped for the token-injecting proxied surface. Page/asset paths 404
+    // (don't confirm the host); the /api/runtime/* BFF namespace 403s so a
+    // programmatic caller sees the refusal. See src/lib/origin-trust.ts.
+    if (!webBoundRequestAllowed(request)) {
+      return url.pathname.startsWith("/api/")
+        ? withCors(request, json({ error: "Forbidden" }, 403))
+        : withCors(request, new Response("Not found", { status: 404 }));
+    }
+    // Relay session gate: a web request on a non-loopback (relay/allowlisted)
+    // front must carry a valid gini_session cookie. Loopback is trusted with no
+    // pairing. Unpaired page navigations are redirected to /pair; unpaired
+    // /api/runtime/* calls get a 401. Bootstrap paths (the /pair page + assets)
+    // stay reachable so a new device can run the handshake.
+    //
+    // DELIBERATE: this pairing handshake is the ONLY relay-specific gate. Once a
+    // relay session is admitted here it is a full MIRROR of the loopback operator
+    // — same admin powers, including approving/adding devices and creating
+    // pairing codes via the BFF. Do NOT add per-route relay refusals downstream
+    // that make a paired relay session less capable than loopback. See ADR
+    // device-pairing-auth.md ("Relay sessions mirror loopback").
+    const webHost = request.headers.get("host") ?? url.host;
+    let gatedSessionToken: string | undefined;
+    if (relaySessionGateRequired(webHost, url.pathname)) {
+      const sessionToken = sessionCookieValue(request);
+      if (!sessionToken || !resolveSessionFromCookie(config, sessionToken)) {
+        return url.pathname.startsWith("/api/")
+          ? withCors(request, json({ error: "Unauthorized" }, 401))
+          : new Response(null, { status: 302, headers: { location: "/pair" } });
+      }
+      // Refresh last-seen on full page loads only (not every asset) so the
+      // Active Sessions list stays current without per-request writes. Swallow
+      // failures: this is a best-effort bookkeeping write, and an unhandled
+      // rejection here (e.g. a transient writeState ENOSPC/EROFS) would reach the
+      // global unhandledRejection handler, which exits the gateway process.
+      if (request.headers.get("sec-fetch-dest") === "document") {
+        void touchPairedSession(config, sessionToken).catch(() => {});
+      }
+      // Carry the validated token into proxyWeb so a long-lived SSE stream can be
+      // re-validated and torn down if this session is revoked mid-stream — the
+      // gate only runs once per connection, so without this an open event stream
+      // would outlive a revocation. Loopback (un-gated) needs no such check.
+      gatedSessionToken = sessionToken;
+    }
+    return proxyWeb(request, url, config, gatedSessionToken);
   };
 }
 
@@ -1733,24 +1843,129 @@ function proxyFallback(request: Request, url: URL, config: RuntimeConfig): Respo
   return runtimeBanner(request, config);
 }
 
-async function proxyWeb(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
+// How often a relay-gated SSE stream re-checks that its session is still valid.
+// The relay gate validates once at connect time; a revocation must also tear
+// down an already-open stream, so we re-resolve the session on this cadence and
+// abort the proxied connection when it's gone — bounding the post-revoke leak.
+// Overridable via env so tests can shrink the cadence instead of waiting 5s.
+function sessionRevalidateMs(): number {
+  const raw = Number(process.env.GINI_SESSION_REVALIDATE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5000;
+}
+
+// Drop the gateway's own cookies from a forwarded Cookie header, preserving all
+// other cookie segments verbatim (no decode/re-encode, so arbitrary inner-app
+// cookie values can't be corrupted).
+function stripGatewayCookies(headers: Headers): void {
+  const raw = headers.get("cookie");
+  if (!raw) return;
+  const kept = raw
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => {
+      if (!part) return false;
+      const eq = part.indexOf("=");
+      const name = (eq < 0 ? part : part.slice(0, eq)).trim();
+      return !GATEWAY_ONLY_COOKIES.has(name);
+    });
+  if (kept.length > 0) headers.set("cookie", kept.join("; "));
+  else headers.delete("cookie");
+}
+
+async function proxyWeb(request: Request, url: URL, config: RuntimeConfig, sessionToken?: string): Promise<Response> {
   const port = await resolveWebPort(config);
   if (port === null) return proxyFallback(request, url, config);
   const target = `http://127.0.0.1:${port}${url.pathname}${url.search}`;
+  // Present the inner web child a loopback request. It binds loopback and is
+  // relay-agnostic, so it must never see the external relay Host/Origin — the
+  // gateway already validated those in webBoundRequestAllowed. Rewriting both
+  // satisfies the child's loopback trust lane and lets it drop all relay
+  // awareness. A fresh Headers copy avoids mutating the original request.
+  const headers = new Headers(request.headers);
+  headers.set("host", `127.0.0.1:${port}`);
+  if (headers.has("origin")) headers.set("origin", `http://127.0.0.1:${port}`);
+  stripGatewayCookies(headers);
   // decompress: false tells Bun not to auto-decompress the upstream response.
   // That keeps Content-Encoding and Content-Length consistent so the browser
   // can decompress normally. Without it, Bun decompresses the body but leaves
   // the stale headers, causing ERR_CONTENT_DECODING_FAILED in browsers.
   const init: BunFetchRequestInit = {
     method: request.method,
-    headers: request.headers,
+    headers,
     redirect: "manual",
     decompress: false,
   };
-  if (request.signal) init.signal = request.signal;
+  // For a relay-gated request, drive the upstream fetch from our own
+  // AbortController (chained to the client's signal) so the stream re-validator
+  // below can abort the upstream connection on revocation. Un-gated (loopback)
+  // requests pass the client's signal straight through, unchanged.
+  let ac: AbortController | null = null;
+  if (sessionToken) {
+    ac = new AbortController();
+    if (request.signal) {
+      if (request.signal.aborted) ac.abort();
+      else request.signal.addEventListener("abort", () => ac!.abort(), { once: true });
+    }
+    init.signal = ac.signal;
+  } else if (request.signal) {
+    init.signal = request.signal;
+  }
   if (request.method !== "GET" && request.method !== "HEAD") init.body = request.body;
   try {
-    return await fetch(target, init);
+    const upstream = await fetch(target, init);
+    // Rewrite an absolute redirect that points back at the loopback web target
+    // into a relative path. The web child builds redirects (e.g. the setup
+    // gate's /setup) from the loopback Host the gateway forwarded, so an
+    // absolute Location would send a remote tunnel browser to its own
+    // 127.0.0.1. A relative Location resolves against the origin the browser
+    // actually used (relay or loopback).
+    const location = upstream.headers.get("location");
+    const loopbackBase = `http://127.0.0.1:${port}`;
+    if (location && location.startsWith(loopbackBase)) {
+      const headers = new Headers(upstream.headers);
+      headers.set("location", location.slice(loopbackBase.length) || "/");
+      return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+    }
+    // Re-validate long-lived relay SSE streams: a revoked/expired session must
+    // not keep receiving events just because its connection opened while valid.
+    // Poll the session on an interval and abort the proxied connection when it
+    // resolves to nothing; the browser then reconnects and the gate refuses it.
+    if (ac && upstream.body && (upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      const controller = ac;
+      const interval = setInterval(() => {
+        if (!resolveSessionFromCookie(config, sessionToken!)) controller.abort();
+      }, sessionRevalidateMs());
+      const clearTimer = () => clearInterval(interval);
+      // Clear the revalidation timer on EVERY termination path, not just a
+      // graceful close: abort (revocation / client disconnect), upstream error,
+      // graceful end, and downstream cancel. A TransformStream flush would only
+      // catch the graceful close and leak the interval on error/cancel, so wrap
+      // the upstream body in a reader loop that clears in all branches.
+      controller.signal.addEventListener("abort", clearTimer, { once: true });
+      const reader = upstream.body.getReader();
+      const body = new ReadableStream({
+        async pull(streamController) {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              clearTimer();
+              streamController.close();
+              return;
+            }
+            streamController.enqueue(value);
+          } catch (err) {
+            clearTimer();
+            streamController.error(err);
+          }
+        },
+        cancel(reason) {
+          clearTimer();
+          return reader.cancel(reason);
+        }
+      });
+      return new Response(body, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
+    }
+    return upstream;
   } catch {
     // The port validated but the upstream died inside the validation-cache
     // window (web restart/crash). Drop the stale entry so the next request
@@ -2153,6 +2368,384 @@ async function rollbackIdentityFile(
   return { ok: false, reason: "kind must be one of: user, soul" };
 }
 
+// --- Relay device-pairing (operator-approved cookie sessions) ---------------
+// See ADR device-pairing-auth.md. gini_pair carries the per-request binding
+// secret (scoped to /api/pairing so it only rides pairing calls); gini_session
+// carries the minted session token (scoped to the whole app).
+//
+// gini_session uses the `__Host-` prefix when issued over a secure transport and
+// the plain name otherwise. On the shared relay registrable domain
+// (*.gini-relay.lilaclabs.ai) a sibling tenant could set a Domain-scoped
+// `gini_session` that the browser also sends to the victim's subdomain; the
+// cookie parser's last-duplicate-wins would let it override the victim's
+// host-only cookie (a session/handshake denial — the tossed value still fails the
+// server-side hash check, so this is availability, not forgery). `__Host-`
+// cookies forbid a Domain attribute, so the browser rejects the sibling's tossed
+// cookie and the victim's prefixed cookie always wins. The prefix is conditional
+// because `__Host-` mandates Secure, which a deliberately-supported plain-http
+// GINI_TRUSTED_ORIGINS front cannot use (pairingCookieSecure() returns false
+// there) — that front keeps the plain name. gini_pair stays plain: it is
+// single-use, cleared on claim, and Path-scoped to /api/pairing (incompatible
+// with `__Host-`'s Path=/ requirement), whereas gini_session is the durable,
+// owner-equivalent credential and the high-value tossing target.
+const PAIR_BIND_COOKIE = "gini_pair";
+export const SESSION_COOKIE = "gini_session";
+const SESSION_COOKIE_SECURE = `__Host-${SESSION_COOKIE}`;
+
+// The session cookie NAME to issue: `__Host-`-prefixed on a secure front (so a
+// sibling-subdomain Domain cookie can't toss it), plain otherwise.
+function sessionCookieName(secure: boolean): string {
+  return secure ? SESSION_COOKIE_SECURE : SESSION_COOKIE;
+}
+
+// Read the session token from whichever name was issued: prefer the secure
+// `__Host-` cookie (authoritative on a secure front and un-tossable), fall back
+// to the plain name (a plain-http front, or a session minted before the prefix).
+export function sessionCookieValue(request: Request): string | undefined {
+  return cookieValue(request, SESSION_COOKIE_SECURE) ?? cookieValue(request, SESSION_COOKIE);
+}
+
+// Gateway-owned cookies that must never reach the inner web child: it is
+// relay-agnostic and authenticates via the BFF's owner bearer, never these, so
+// stripping them (in proxyWeb) keeps the pairing credentials from crossing into
+// the inner app. Both session cookie names are stripped.
+const GATEWAY_ONLY_COOKIES = new Set([SESSION_COOKIE, SESSION_COOKIE_SECURE, PAIR_BIND_COOKIE]);
+// Derived from the single source of truth so the cookie Max-Age and the
+// server-side device.expiresAt can't drift apart.
+const SESSION_COOKIE_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
+const PAIR_BIND_COOKIE_TTL_SECONDS = 3600;
+// Flood control on the public create endpoint. Keyed on the inbound Host (the
+// relay subdomain is un-forgeable — the relay owns its DNS), NOT on
+// X-Forwarded-For, which a client can spoof to mint fresh buckets. A separate
+// global bucket backstops the per-host limit so many distinct hosts can't add
+// up to an unbounded flood. The MAX_PENDING cap is enforced atomically inside
+// createPairingRequest (see src/state/records.ts), not here.
+const pairingHostLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
+const pairingGlobalLimiter = new RateLimiter({ capacity: 40, refillPerSec: 40 / 60 });
+// Separate buckets for the legacy public code-claim endpoint so brute-force
+// attempts there can't be confused with (or starve) the request-create budget,
+// and vice versa. Same capacity/refill shape — a real claim is a single POST.
+const pairingClaimHostLimiter = new RateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
+const pairingClaimGlobalLimiter = new RateLimiter({ capacity: 40, refillPerSec: 40 / 60 });
+
+// Test hook: drop the in-process pairing limiter buckets so a test file's many
+// create calls don't deplete the shared module-level buckets across tests.
+export function resetPairingLimiters(): void {
+  pairingHostLimiter.reset();
+  pairingGlobalLimiter.reset();
+  pairingClaimHostLimiter.reset();
+  pairingClaimGlobalLimiter.reset();
+}
+
+const sessionCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/" };
+const bindCookieAttributes = { httpOnly: true, sameSite: "Lax" as const, path: "/api/pairing" };
+
+function randomBindSecret(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Whether to set Secure on pairing cookies. The relay front is always HTTPS and
+// loopback is a secure context, so both get Secure. A plain-http
+// GINI_TRUSTED_ORIGINS front would otherwise have its Secure cookie silently
+// dropped by the browser; honor X-Forwarded-Proto / the request scheme so such
+// a front can still pair.
+function pairingCookieSecure(request: Request, host: string): boolean {
+  if (isRelayHost(host) || isLoopbackHost(host)) return true;
+  if ((request.headers.get("x-forwarded-proto") ?? "").toLowerCase() === "https") return true;
+  return new URL(request.url).protocol === "https:";
+}
+
+function pairingCreateAllowed(request: Request): boolean {
+  const host = request.headers.get("host") ?? new URL(request.url).host;
+  // Both buckets must admit the request; consume per-host first, then global.
+  return pairingHostLimiter.tryConsume(host) && pairingGlobalLimiter.tryConsume("global");
+}
+
+// Clamp a client-supplied device label before it is stored and shown on the
+// operator's approval row: strip control chars, collapse whitespace, trim, and
+// cap length. Returns undefined for absent/blank input so the state layer applies
+// the User-Agent-derived fallback ("…"/"Unknown device") in one place.
+function sanitizeDeviceName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  // Drop control characters (codepoint below 0x20, and DEL 0x7f) by codepoint so
+  // no literal control chars live in this source; then collapse whitespace, trim,
+  // and cap length.
+  const cleaned = Array.from(raw)
+    .filter((ch) => {
+      const code = ch.codePointAt(0) ?? 0;
+      return code >= 0x20 && code !== 0x7f;
+    })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 64);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+function pairingClaimAllowed(request: Request): boolean {
+  const host = request.headers.get("host") ?? new URL(request.url).host;
+  return pairingClaimHostLimiter.tryConsume(host) && pairingClaimGlobalLimiter.tryConsume("global");
+}
+
+// A non-browser pairing client (the native mobile app). It cannot read the
+// HttpOnly gini_pair / gini_session cookies, so it carries the per-request
+// binding secret in a header and needs the session token returned in the claim
+// BODY. Recognising it must be unforgeable from a browser: browsers always send
+// Sec-Fetch-* on fetch/XHR and JS cannot set or strip those (forbidden header
+// names), so their ABSENCE is a reliable "not a browser" signal — an XSS on the
+// /pair page can therefore never coax the token into the body. We also require
+// an explicit opt-in header (so a pre-Sec-Fetch browser that merely lacks the
+// headers is still excluded) and a trusted front (relay/loopback). This single
+// gate authorises BOTH the no-Origin CSRF exemption on the POST device routes
+// AND the in-body bind secret / session token — keeping the browser flow
+// (cookie-only, no body token) byte-for-byte unchanged. See ADR
+// device-pairing-auth.md ("Native pairing client").
+function isNativePairingClient(request: Request, host: string): boolean {
+  if (request.headers.get("x-gini-pair-client") !== "native") return false;
+  if (
+    request.headers.has("sec-fetch-site")
+    || request.headers.has("sec-fetch-mode")
+    || request.headers.has("sec-fetch-dest")
+  ) {
+    return false;
+  }
+  // Also require no Origin. Sec-Fetch absence alone is not enough: a pre-16.4
+  // Safari or an iOS-15 WKWebView/SFSafariViewController sends NO Sec-Fetch yet
+  // DOES send Origin on an unsafe POST (Origin-on-same-origin-POST shipped years
+  // before Fetch Metadata), so such a browser could otherwise forge native mode
+  // and an XSS on /pair could exfiltrate the in-body secret/token. The native
+  // client (Expo/RN fetch) sends no Origin, so this never affects it.
+  if (request.headers.has("origin")) return false;
+  return isRelayHost(host) || isLoopbackHost(host);
+}
+
+// The per-request binding secret, sourced by the single native gate: a verified
+// native client reads ONLY the X-Gini-Pair-Secret header, a browser ONLY the
+// HttpOnly gini_pair cookie. Header-only for native is deliberate — iOS
+// NSURLSession auto-attaches a persisted gini_pair cookie, and a cookie-first
+// read would prefer a STALE cookie from a prior/abandoned attempt over the fresh
+// header secret, yielding an intermittent bind_mismatch. Native is cookieless by
+// construction (create sets no cookie for it), so the header is the only source.
+function pairBindSecret(request: Request, native: boolean): string | undefined {
+  if (native) return request.headers.get("x-gini-pair-secret") ?? undefined;
+  return cookieValue(request, PAIR_BIND_COOKIE) ?? undefined;
+}
+
+// iOS universal-links association file. A wildcard associated domain
+// (`applinks:*.<relayDomain>`) is validated by Apple PER SUBDOMAIN, not at the
+// apex — so the gateway, which serves each relay subdomain through the tunnel,
+// hosts this. Must be public, reachable unpaired, and served with no redirect
+// (Apple's CDN refuses redirected AASA). The appID is the Apple Team ID +
+// bundle id; env-overridable so a team/bundle change needs no code edit. See
+// docs/adr/device-pairing-auth.md ("Native pairing client").
+const APPLE_APP_SITE_ASSOCIATION_PATH = "/.well-known/apple-app-site-association";
+
+function iosAppId(): string {
+  return process.env.GINI_IOS_APP_ID ?? "WB6Y3K67AB.ai.lilaclabs.gini.mobile";
+}
+
+export function appleAppSiteAssociationResponse(): Response {
+  // Modern `components` form. Claim the bare relay origin (the link a user taps)
+  // plus the /pair entry so a tap opens the app straight into the handshake;
+  // assets and /api are left to the browser/native surfaces.
+  const body = JSON.stringify({
+    applinks: {
+      details: [
+        {
+          appIDs: [iosAppId()],
+          components: [
+            { "/": "/", comment: "Bare relay origin opens the Gini app to pair." },
+            { "/": "/pair", comment: "Pairing entry." },
+            { "/": "/pair/*", comment: "Pairing entry subpaths." }
+          ]
+        }
+      ]
+    }
+  });
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      // Apple caches via its CDN regardless; a short max-age keeps a tunnel
+      // restart from pinning a stale association for long.
+      "cache-control": "public, max-age=3600"
+    }
+  });
+}
+
+// Paths an UNPAIRED relay browser may still reach so it can run the pairing
+// handshake: the /pair page, Next's build assets, and static files. Never an
+// /api path (those are gated separately).
+export function isPairingBootstrapPath(pathname: string): boolean {
+  if (pathname.startsWith("/api/")) return false;
+  if (pathname === "/pair" || pathname.startsWith("/pair/")) return true;
+  if (pathname.startsWith("/_next/")) return true;
+  if (pathname === "/favicon.ico") return true;
+  return /\.(png|jpe?g|svg|gif|webp|ico|woff2?|ttf|otf|css|js|map|json|txt)$/.test(pathname);
+}
+
+// True when a web-bound request must carry a valid gini_session cookie: a
+// non-loopback (relay/allowlisted) front on a non-bootstrap path. Shared by the
+// HTTP fall-through (src/http.ts) and the WS upgrade (src/server.ts) so the two
+// relay-session gates can't drift; each caller keeps its own transport-specific
+// rejection (HTTP redirects page navs / 401s the API; WS returns a flat 401).
+export function relaySessionGateRequired(host: string, pathname: string): boolean {
+  return !isLoopbackHost(host) && !isPairingBootstrapPath(pathname);
+}
+
+// Exactly the device-pairing paths the gateway handles natively before the
+// bearer gate — enumerated, not prefix-matched, so a future
+// /api/pairing/request-* route is NOT silently captured here and must be added
+// deliberately. Mirrors the route matching inside handlePairingRoutes.
+function isDevicePairingPath(pathname: string): boolean {
+  if (pathname === "/api/pairing/request" || pathname === "/api/pairing/requests") return true;
+  if (/^\/api\/pairing\/requests\/[^/]+\/(approve|reject)$/.test(pathname)) return true;
+  return /^\/api\/pairing\/request\/[^/]+(\/(claim|cancel))?$/.test(pathname);
+}
+
+// Gateway-handled pairing API. Lives on the native /api surface but is
+// special-cased BEFORE the bearer gate so it can apply its own trust rules from
+// the TRUE inbound Host/Origin: admin routes require loopback OR a valid
+// gini_session (the mirror model — a paired relay session is admin like
+// loopback); device routes are public but bound to the gini_pair cookie.
+async function handlePairingRoutes(request: Request, url: URL, config: RuntimeConfig): Promise<Response> {
+  const host = request.headers.get("host") ?? url.host;
+  // Host/Origin/CSRF trust for every pairing call (same gate as the proxied
+  // surface). Blocks cross-site POSTs and untrusted hosts. The native mobile
+  // app sends no Origin (so the browser CSRF gate would refuse its POSTs) and is
+  // not a confused deputy — a verified native client on a trusted front is
+  // exempt. Browsers still go through webBoundRequestAllowed; the admin routes
+  // below re-validate the session regardless.
+  const native = isNativePairingClient(request, host);
+  if (!webBoundRequestAllowed(request) && !native) return json({ error: "Forbidden" }, 403);
+  const path = url.pathname;
+  const method = request.method;
+
+  // Admin routes — an admin is the loopback operator OR any PAIRED session. A
+  // relay browser calls these SAME-ORIGIN (so webBoundRequestAllowed above already
+  // enforced relay-Origin==relay-Host CSRF trust) and carries its gini_session
+  // cookie, which we validate here: once paired, a relay session is a full mirror
+  // of loopback and can approve/add devices exactly like 127.0.0.1. An UNPAIRED
+  // relay visitor has no session, so it is refused. The only relay-specific gate
+  // is the initial pairing handshake. See ADR device-pairing-auth.md ("Relay
+  // sessions mirror loopback"). DELIBERATE — do not narrow this back to loopback.
+  const isList = path === "/api/pairing/requests";
+  const approve = path.match(/^\/api\/pairing\/requests\/([^/]+)\/approve$/);
+  const reject = path.match(/^\/api\/pairing\/requests\/([^/]+)\/reject$/);
+  if (isList || approve || reject) {
+    const sessionToken = sessionCookieValue(request);
+    const isAdmin = isLoopbackHost(host) || Boolean(sessionToken && resolveSessionFromCookie(config, sessionToken));
+    if (!isAdmin) return json({ error: "Forbidden" }, 403);
+    if (method === "GET" && isList) return json({ requests: await listPairingRequests(config) });
+    if (method === "POST" && approve) return json({ request: await approvePairing(config, approve[1]!) });
+    if (method === "POST" && reject) return json({ request: await rejectPairing(config, reject[1]!) });
+    return json({ error: "Not found" }, 404);
+  }
+
+  // Device: create a request (public, rate-limited, sets the binding cookie).
+  if (method === "POST" && path === "/api/pairing/request") {
+    if (!pairingCreateAllowed(request)) {
+      return json({ error: "Too many pairing requests. Try again shortly." }, 429);
+    }
+    const bindSecret = randomBindSecret();
+    // Optional human label the native client supplies in the body (e.g. its model
+    // name) so the operator's approval row reads "iPhone 16 Pro" rather than
+    // "Unknown device". Absent/blank → undefined, and the state layer falls back
+    // to the User-Agent-derived label.
+    const deviceName = sanitizeDeviceName((await body(request)).deviceName);
+    let created: Awaited<ReturnType<typeof requestPairing>>;
+    try {
+      created = await requestPairing(config, {
+        userAgent: request.headers.get("user-agent") ?? "",
+        relayHost: host,
+        bindSecret,
+        deviceName
+      });
+    } catch (error) {
+      // Cap enforced atomically inside the create mutation.
+      if (error instanceof PairingCapExceededError) return json({ error: error.message }, 429);
+      throw error;
+    }
+    // Browsers receive the binding secret ONLY as the HttpOnly gini_pair cookie.
+    // A verified native client is cookieless: it gets the secret in the body and
+    // echoes it back via X-Gini-Pair-Secret, and we set NO cookie for it — an iOS
+    // cookie jar would otherwise persist a gini_pair the gateway never reads and
+    // that could go stale across attempts.
+    const response = json(
+      native ? { id: created.id, code: created.code, bindSecret } : { id: created.id, code: created.code },
+      201
+    );
+    if (!native) {
+      response.headers.append(
+        "set-cookie",
+        serializeCookie(PAIR_BIND_COOKIE, bindSecret, {
+          ...bindCookieAttributes,
+          secure: pairingCookieSecure(request, host),
+          maxAge: PAIR_BIND_COOKIE_TTL_SECONDS
+        })
+      );
+    }
+    return response;
+  }
+
+  // Device: poll own request status (bind-checked — the binding cookie must
+  // match this request, not merely exist).
+  const poll = path.match(/^\/api\/pairing\/request\/([^/]+)$/);
+  if (method === "GET" && poll) {
+    const bindSecret = pairBindSecret(request, native);
+    if (!bindSecret) return json({ error: "Unauthorized" }, 401);
+    const result = pollPairingStatus(config, poll[1]!, bindSecret);
+    if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
+    return json({ status: result.status });
+  }
+
+  // Device: claim an approved request → mint the session, set the cookie.
+  const claim = path.match(/^\/api\/pairing\/request\/([^/]+)\/claim$/);
+  if (method === "POST" && claim) {
+    const bindSecret = pairBindSecret(request, native);
+    if (!bindSecret) return json({ error: "Unauthorized" }, 401);
+    const result = await claimPairingSession(config, claim[1]!, bindSecret);
+    if (!result.ok) {
+      const code = result.reason === "not_found" ? 404 : result.reason === "bind_mismatch" ? 403 : 409;
+      return json({ error: result.reason }, code);
+    }
+    const secure = pairingCookieSecure(request, host);
+    // Browsers: the success signal is the 200 + the gini_session Set-Cookie
+    // below, never the body (an HttpOnly cookie an XSS can't exfiltrate). A
+    // verified native client, which can't read Set-Cookie, gets the token in the
+    // body so it can store it and send it as `Authorization: Bearer` — the same
+    // token, just the transport a non-browser needs.
+    const response = json(native ? { ok: true, token: result.token } : { ok: true });
+    if (!native) {
+      response.headers.append(
+        "set-cookie",
+        serializeCookie(sessionCookieName(secure), result.token, { ...sessionCookieAttributes, secure, maxAge: SESSION_COOKIE_TTL_SECONDS })
+      );
+      // The binding cookie is single-use; clear it now that the session is minted.
+      // (A native client set no gini_pair cookie, so there's nothing to clear.)
+      response.headers.append("set-cookie", serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure, maxAge: 0 }));
+    }
+    return response;
+  }
+
+  // Device: cancel own pending/approved request (binding cookie required).
+  const cancel = path.match(/^\/api\/pairing\/request\/([^/]+)\/cancel$/);
+  if (method === "POST" && cancel) {
+    const bindSecret = pairBindSecret(request, native);
+    if (!bindSecret) return json({ error: "Unauthorized" }, 401);
+    const result = await cancelPairing(config, cancel[1]!, bindSecret);
+    if (!result.ok) return json({ error: result.reason }, result.reason === "not_found" ? 404 : 403);
+    const response = json({ ok: true });
+    response.headers.append(
+      "set-cookie",
+      serializeCookie(PAIR_BIND_COOKIE, "", { ...bindCookieAttributes, secure: pairingCookieSecure(request, host), maxAge: 0 })
+    );
+    return response;
+  }
+
+  return json({ error: "Not found" }, 404);
+}
+
 async function authorized(request: Request, config: RuntimeConfig): Promise<boolean> {
   const header = request.headers.get("authorization") ?? "";
   const queryToken = new URL(request.url).searchParams.get("token");
@@ -2239,6 +2832,9 @@ function agentIdFilter(request: Request): string | undefined {
 function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Job not found") || message.startsWith("Job run not found")) return 404;
   if (message.startsWith("Agent not found")) return 404;
+  // Pairing approve/reject of a missing or already-resolved request.
+  if (message === "Pairing request not found.") return 404;
+  if (message.startsWith("Pairing request is already")) return 409;
   // Chat-session and thread submit paths (submitChatMessage,
   // submitThreadReply) throw these when the target was deleted or never
   // existed. Map to 404 so a stale link surfaces a clean not-found rather
@@ -2298,6 +2894,12 @@ function statusFromErrorMessage(message: string): number {
   if (message.startsWith("Chat allowlist only applies")) return 400;
   if (message.startsWith("chatId must be")) return 400;
   if (/^Target '.+' not permitted by active agent/.test(message)) return 400;
+  // Tunnel selection/connect surface user-input failures (unknown or
+  // disabled provider, nothing selected) as plain Error strings. Map them
+  // to 400 so the panel can render the original reason rather than a 500.
+  if (message.startsWith("Unknown tunnel provider")) return 400;
+  if (message.startsWith("No tunnel provider selected")) return 400;
+  if (/^Tunnel provider .+ is not available/.test(message)) return 400;
   return 500;
 }
 

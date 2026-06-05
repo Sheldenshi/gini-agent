@@ -39,7 +39,7 @@ The gateway can also front the web app so the whole product is reachable on **on
 - everything else (HTML, `/_next/*` assets) — proxied to the Next.js server.
 - WebSocket upgrades (Next HMR at `/_next/webpack-hmr`) — bridged socket-to-socket (`src/server.ts` wires `proxyWebSocketUpgrade` + `webSocketProxyHandler`).
 
-When the web server is down (or a `--no-web` instance) the proxy falls back to the runtime banner. The upstream port is resolved through `src/web-target.ts`, which validates the recorded `web.port` against the BFF `/api/runtime/__healthz` (`service: "gini-web"` + matching `instance`) before forwarding — a reused/stale port can't route to a foreign instance. This single origin is what lets a tunnel expose UI + API over one public URL. Direct access to the Next.js port still works unchanged.
+When the web server is down (or a `--no-web` instance) the proxy falls back to the runtime banner. The upstream port is resolved through `src/web-target.ts`, which validates the recorded `web.port` against the BFF `/api/runtime/__healthz` (`service: "gini-web"` + matching `instance`) before forwarding — a reused/stale port can't route to a foreign instance. This single origin is what lets a tunnel expose UI + API over one public URL. The gateway is the single operator front (`gini run`/`start` advertise the gateway origin): direct access to the inner Next.js port still serves the proxied UI and the `/api/runtime/*` BFF, but the gateway-native `/api/*` surface (e.g. device pairing `/api/pairing/*`) is not present there, so the pairing UI only works through the gateway. The inner port also binds loopback (`-H 127.0.0.1`), so it is reachable only from the local machine, never the LAN.
 
 ## CLI
 
@@ -84,21 +84,19 @@ The `default` instance is pinned to memorable ports — web `7777`, runtime `777
 
 ## Auth
 
-The gateway uses per-instance bearer tokens. Paired devices can receive their own tokens through pairing endpoints. Tokens are stored in the instance `config.json`; the Next.js BFF reads the token server-side and does not expose it to client JavaScript.
+The gateway uses a per-instance owner bearer token stored in the instance `config.json`; the Next.js BFF reads it server-side and does not expose it to client JavaScript. Paired devices receive their own session tokens through the pairing endpoints — the raw token is returned to the device exactly once (or set as the `gini_session` cookie), and only its hash (`tokenHash`) is persisted, in `state.json` as revocable `PairedDevice` rows under `state.devices` (see [Device-Pairing Authentication](adr/device-pairing-auth.md)).
 
-Every BFF request to `/api/runtime/*` carries a CSRF guard before the gateway bearer is injected — both read-only GETs (which would otherwise leak RuntimeState contents under DNS rebinding) and mutating POST/PUT/PATCH/DELETEs. The guard uses one of two policies:
+The trust boundary lives at the **gateway front**. Every web-bound request (non-`/api` traffic and the `/api/runtime/*` BFF namespace) is validated by the gateway before it is reverse-proxied — both read-only GETs (which would otherwise leak RuntimeState contents under DNS rebinding) and mutating POST/PUT/PATCH/DELETEs — and the gateway then rewrites `Host`/`Origin` to loopback so the inner Next.js child is purely internal and relay-agnostic. The gateway accepts a web-bound request when its `Host`/`Origin` is one of:
 
-1. **`GINI_TRUSTED_ORIGINS` set** — comma-separated list of full origins (scheme + host + port), e.g.
+1. **Loopback** — `localhost` / `127.0.0.1` / `[::1]`. The operator's own machine; a DNS-rebinding page cannot forge a loopback `Host`.
+2. **A `GINI_TRUSTED_ORIGINS` entry** — comma-separated full origins (scheme + host + port), e.g. `GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000`. Required for tailnet and public-DNS exposures. If the var is set but every entry is malformed, the gate fails closed and refuses every web-bound request until fixed — a typo bricks loudly rather than silently downgrading.
+3. **A gini-relay subdomain** — independent of `GINI_TRUSTED_ORIGINS`. The relay domain (`GINI_RELAY_DOMAIN`, default `gini-relay.lilaclabs.ai`) or one of its per-device subdomains. Safe because the relay owns DNS for `*.<relayDomain>` and routes each random per-device subdomain only to its owner's `frpc` tunnel — an attacker cannot rebind a relay name to this machine.
 
-   ```
-   GINI_TRUSTED_ORIGINS=https://gini-server.tail-xyz.ts.net,http://localhost:3000
-   ```
+A cross-site `Sec-Fetch-Site` value is rejected on every lane, and an unsafe method (POST/PUT/PATCH/DELETE) without an `Origin` is rejected — a non-browser client must use the native `/api/*` surface with its own bearer. The one pre-bearer exception is the device-pairing handshake: a verified **native pairing client** (the mobile app — explicit `X-Gini-Pair-Client: native` opt-in, no `Sec-Fetch-*`, no `Origin`, on a relay/loopback `Host`) is admitted on the public `/api/pairing/*` device routes so it can complete pairing and obtain a bearer; see [ADR: Device-pairing authentication](adr/device-pairing-auth.md) ("Native pairing client"). The inner BFF keeps its own loopback/allowlist guard as defense-in-depth for direct access to the Next.js port; because the gateway only ever forwards a loopback `Host`/`Origin`, the BFF trusts that internal traffic via a loopback short-circuit and carries no relay awareness of its own. See [ADR: BFF trust boundary](adr/bff-trust-boundary.md) and [ADR: Tunnel connectivity](adr/tunnel-connectivity.md).
 
-   The guard accepts an `Origin` only if it exactly matches one of the listed entries. This is the required posture for tailnet and public-DNS exposures. If you set the env var but every entry is malformed, the guard fails closed and refuses every privileged POST until you fix the value — a typo bricks privileged routes loudly rather than silently downgrading.
+Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the gateway's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
 
-2. **`GINI_TRUSTED_ORIGINS` unset** — local-dev fallback. The guard accepts requests only when both the request `Host` is loopback (`localhost`, `127.0.0.1`, or `[::1]`) and the `Origin` matches `Host`. Any non-loopback Host is refused without an explicit allowlist, so a BFF run on a tailnet hostname without `GINI_TRUSTED_ORIGINS` will see every privileged POST 403'd — set the env var or bind the BFF to loopback only.
-
-Closing the non-loopback fallback path blocks the DNS-rebinding shape where an attacker page sets `Origin` to a hostname they control but rebinds DNS to the BFF's loopback / tailnet IP — the rebound host equals itself, so a Host-comparison alone would pass. The allowlist (or the loopback restriction) takes that codepath off the table.
+After the host/origin check passes, a second gate applies **per-device pairing**: a web request on a non-loopback front (relay subdomain or a `GINI_TRUSTED_ORIGINS` host) must also carry a valid `gini_session` cookie, or its page navigations are redirected to `/pair` and its `/api/runtime/*` calls return 401. Loopback is trusted with no pairing. A device obtains the cookie through an operator-approved handshake on the loopback "Pair a device" panel; sessions are revocable `PairedDevice` rows. See [ADR: Device-pairing authentication](adr/device-pairing-auth.md).
 
 ## Lifecycle Commands
 

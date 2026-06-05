@@ -17,6 +17,7 @@ const EVENT_KINDS = [
   "messaging",
   "provider",
   "runtime",
+  "pairing",
   "notification",
   "run"
 ] as const;

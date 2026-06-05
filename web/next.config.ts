@@ -9,6 +9,15 @@ import { resolve } from "node:path";
 // outside `gini start`.
 const distDir = process.env.GINI_DIST_DIR ?? ".next";
 
+// The relay domain whose per-device subdomains are allowed as dev origins.
+// This is purely a Next DEV-server concern (production ignores allowedDevOrigins)
+// and is NOT part of the gateway trust model: Next's CLIENT-side dev-origin
+// check uses the browser's Origin (the relay subdomain), which the gateway can't
+// rewrite, so without this entry HMR / dev resources are blocked when the app is
+// opened over a gini-relay tunnel. The actual host/origin TRUST decision lives
+// at the gateway (src/lib/origin-trust.ts); this only re-enables dev HMR.
+const relayDomain = process.env.GINI_RELAY_DOMAIN ?? "gini-relay.lilaclabs.ai";
+
 const nextConfig: NextConfig = {
   distDir,
   // Next.js 16 defaults to blocking dev-resource requests from any origin
@@ -16,8 +25,11 @@ const nextConfig: NextConfig = {
   // hydration when the user lands on http://127.0.0.1:<port>. The Gini
   // installer and CLI consistently open the app via 127.0.0.1, so we
   // allow both forms explicitly. Production builds don't read this —
-  // it's a dev-server concern only.
-  allowedDevOrigins: ["127.0.0.1", "localhost"],
+  // it's a dev-server concern only. The relay-domain wildcard lets dev `/_next/*`
+  // resources + the HMR WebSocket load when the app is opened over a gini-relay
+  // tunnel (the browser's Origin is the relay subdomain even though the gateway
+  // forwards a loopback Host). Dev-only; not a trust grant.
+  allowedDevOrigins: ["127.0.0.1", "localhost", `*.${relayDomain}`],
   turbopack: {
     root: resolve(import.meta.dirname)
   }

@@ -23,6 +23,7 @@ import { View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { primeCredentials, useAuth } from "@/src/auth";
+import { primePendingPair } from "@/src/pending-pair";
 import { FilePreviewProvider } from "@/src/components/FilePreview";
 import { ImagePreviewProvider } from "@/src/components/ImagePreview";
 import {
@@ -70,6 +71,10 @@ export default function RootLayout() {
     // registerForPushAsync.
     (async () => {
       await primeCredentials();
+      // Warm the pending-pair breadcrumb before the first render so the auth
+      // gate (app/index.tsx) can synchronously resume an interrupted pairing
+      // instead of bouncing to /setup on a cold relaunch.
+      await primePendingPair();
       await primeDeviceTokenFromStorage();
       await registerApprovalCategoryAsync();
       if (active) setPrimed(true);
@@ -131,6 +136,7 @@ export default function RootLayout() {
               <Stack screenOptions={screenOptions}>
                 <Stack.Screen name="index" options={{ headerShown: false }} />
                 <Stack.Screen name="setup" options={{ title: "Connect to Gini" }} />
+                <Stack.Screen name="pair" options={{ title: "Connect to Gini" }} />
                 {/* channels.tsx (the Channels home) draws its own header
                     with the brand title, inbox icon, and compose button. */}
                 <Stack.Screen name="channels" options={{ headerShown: false }} />

@@ -84,6 +84,65 @@ describe("guardCsrf — safe methods", () => {
   });
 });
 
+describe("guardCsrf — loopback short-circuit (gateway is the single front)", () => {
+  // The gateway validates the real Host/Origin and rewrites BOTH to loopback
+  // before proxying here, so a loopback Host is trusted even when the operator
+  // set GINI_TRUSTED_ORIGINS for the gateway's external origin.
+  test("POST + loopback Host + loopback Origin passes even with an allowlist set", () => {
+    process.env.GINI_TRUSTED_ORIGINS = "https://allowed.example";
+    const res = guardCsrf(
+      makeReq({ method: "POST", host: "127.0.0.1:7777", origin: "http://127.0.0.1:7777", url: "http://127.0.0.1:7777/api/runtime/chat" }),
+      []
+    );
+    expect(res).toBeNull();
+  });
+
+  test("POST + loopback Host + loopback Origin passes with no allowlist", () => {
+    const res = guardCsrf(
+      makeReq({ method: "POST", host: "127.0.0.1:7777", origin: "http://127.0.0.1:7777", url: "http://127.0.0.1:7777/api/runtime/chat" }),
+      []
+    );
+    expect(res).toBeNull();
+  });
+
+  test("loopback Host + non-loopback Origin (no allowlist) → 403", () => {
+    const res = guardCsrf(
+      makeReq({ method: "POST", host: "127.0.0.1:7777", origin: "https://evil.example", url: "http://127.0.0.1:7777/api/runtime/chat" }),
+      []
+    );
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
+  });
+
+  test("loopback Host + malformed Origin → 403", () => {
+    const res = guardCsrf(makeReq({ method: "POST", host: "127.0.0.1:7777", origin: "not a url" }), []);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
+  });
+});
+
+describe("guardCsrf — relay-agnostic BFF", () => {
+  // The BFF no longer carries a relay lane: the gateway owns relay trust and
+  // only ever proxies a loopback Host/Origin to the BFF. A relay Host reaching
+  // the BFF directly is therefore refused.
+  const SUB = "g3100.gini-relay.lilaclabs.ai";
+
+  test("relay-subdomain Origin POST is refused at the BFF", () => {
+    const res = guardCsrf(
+      makeReq({ method: "POST", origin: `https://${SUB}`, host: SUB, url: `https://${SUB}/api/runtime/tunnel` }),
+      []
+    );
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
+  });
+
+  test("relay-subdomain Host no-Origin GET is refused at the BFF", () => {
+    const res = guardCsrf(makeReq({ method: "GET", host: SUB, url: `https://${SUB}/api/runtime/tunnel` }), []);
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(403);
+  });
+});
+
 describe("guardCsrf — Sec-Fetch-Site", () => {
   test("GET on loopback with sec-fetch-site=cross-site → 403", () => {
     const res = guardCsrf(

@@ -1,5 +1,7 @@
 import { writeFileSync } from "node:fs";
-import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, webSocketProxyHandler, writePid } from "./http";
+import { createHandler, isWebProxyPath, proxyWebSocketUpgrade, relaySessionGateRequired, sessionCookieValue, webSocketProxyHandler, writePid } from "./http";
+import { webBoundRequestAllowed } from "./lib/origin-trust";
+import { resolveSessionFromCookie } from "./governance/pairing";
 import { runDueJobs } from "./jobs";
 import { runConnectorReprobe } from "./jobs/connector-reprobe";
 import { runConnectorDetection } from "./jobs/connector-detection";
@@ -17,6 +19,7 @@ import { createTelegramPollerSupervisor } from "./integrations/telegram-poller";
 import { createDiscordPollerSupervisor } from "./integrations/discord-poller";
 import { createApnsDispatcher } from "./integrations/apns/dispatcher";
 import { fireCacheWarmerProbe } from "./runtime/cache-warmer";
+import { reconcileTunnelOnStartup, stopAllTunnels } from "./integrations/tunnel";
 
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
@@ -74,6 +77,22 @@ setBrowserInstance(config.instance);
       });
   }
 }
+
+// Reconcile + resume the tunnel singleton on startup. The frpc child the runtime
+// spawned before this restart is gone, so the live status is stale. The tunnel
+// link is long-lasting (same deviceId-keyed URL on reconnect), so a tunnel that
+// was "connected" at shutdown is brought back AUTOMATICALLY: this flips it to
+// "connecting" (never a stale "connected" the first GET could read) and kicks off
+// a background reconnect that reuses the stored relay session and waits for the
+// web child to come back. Awaited BEFORE Bun.serve binds for the synchronous
+// status flip; the reconnect itself runs in the background (it probes the local
+// port with retry, so it tolerates serve binding a moment later). The .catch
+// keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
+await reconcileTunnelOnStartup(config).catch((error) => {
+  appendLog(config.instance, "tunnel.reconcile.error", {
+    error: error instanceof Error ? error.message : String(error)
+  });
+});
 
 // Legacy Hindsight-migration opportunistic seam. The
 // state.memories surface was retired in the memory-surface
@@ -164,6 +183,27 @@ const server = Bun.serve({
     // /api surface (which has no WS endpoints) falls through to normal HTTP.
     if ((request.headers.get("upgrade") ?? "").toLowerCase() === "websocket"
         && isWebProxyPath(new URL(request.url).pathname)) {
+      // Same single-front trust gate as the HTTP path (src/http.ts): refuse a
+      // rebound/untrusted WS upgrade before bridging it to the loopback web child.
+      if (!webBoundRequestAllowed(request)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      // Relay session gate, mirroring the HTTP path: a non-loopback WS upgrade
+      // must carry a valid session cookie unless it targets a bootstrap path
+      // (Next HMR lives at /_next/webpack-hmr, which the unpaired /pair page
+      // needs in dev). Reject fully before bridging so no frame is accepted.
+      const wsPath = new URL(request.url).pathname;
+      const wsHost = request.headers.get("host") ?? new URL(request.url).host;
+      if (relaySessionGateRequired(wsHost, wsPath)
+          && !resolveSessionFromCookie(config, sessionCookieValue(request))) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      // The session is validated once here, at upgrade — there is deliberately no
+      // mid-stream re-validation/teardown on revocation (unlike the SSE path,
+      // which aborts on revoke). That asymmetry is safe because the ONLY WS that
+      // rides the relay is non-privileged Next HMR; all live application data
+      // (chat, events) flows over SSE, which IS torn down. Add WS re-validation
+      // only if a future app/runtime WebSocket ever carries privileged data.
       return proxyWebSocketUpgrade(request, server, config);
     }
     return httpHandler(request);
@@ -403,7 +443,12 @@ process.on("SIGTERM", async () => {
       // processes exit cleanly with the runtime instead of being reaped
       // by the OS at the very end. Errors are swallowed — a stuck
       // close shouldn't block runtime shutdown.
-      closeBrowserSessions().catch(() => {})
+      closeBrowserSessions().catch(() => {}),
+      // Stop any live frpc tunnel child so it's torn down gracefully (its
+      // relay registration severed) with the runtime instead of left
+      // forwarding to a server that's going down. Errors swallowed — a stuck
+      // stop shouldn't block shutdown; the OS reaps the child on exit.
+      stopAllTunnels().catch(() => {})
     ]),
     Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
   ]);

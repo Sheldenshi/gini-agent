@@ -45,6 +45,11 @@ const KIND_TO_KEYS: Record<string, string[]> = {
   messaging: ["chat"],
   provider: ["status"],
   runtime: ["status"],
+  // Every pairing mutator (request/approve/reject/claim/cancel) emits a
+  // content-free kind:"pairing" tick; refresh the operator's pending-requests
+  // list AND the Active Sessions (devices) list — the latter so a device's
+  // claim shows up without the dialog being open.
+  pairing: ["pairingRequests", "devices"],
   notification: [],
   run: ["tasks", "task", "chat"]
 };

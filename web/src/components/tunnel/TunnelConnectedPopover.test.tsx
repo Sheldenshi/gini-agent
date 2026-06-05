@@ -1,0 +1,208 @@
+/// <reference lib="dom" />
+
+// TunnelConnectedPopover is presentational: it takes a TunnelState plus
+// onEdit/onDisconnect callbacks. These tests render it directly with props and
+// drive every interactive path — the two-way QR reveal, the masked URL toggle,
+// copy (success + reject + timer revert), Edit, Disconnect — plus the
+// providerName and url fallbacks. The clipboard stub is installed before render
+// because happy-dom omits navigator.clipboard. Every state-updating interaction
+// goes through async userEvent so React updates stay inside act().
+
+import { afterAll, afterEach, beforeAll, describe, expect, jest, mock, test } from "bun:test";
+import { act, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type { TunnelProvider, TunnelState } from "./types";
+
+// TunnelConnectedPopover now embeds the live PairRequestsPanel inline (the QR it
+// shows IS what a new device scans, so there's no separate "Pair a device" step).
+// That panel is a data-fetching leaf owned by its own test, so we stub it and
+// import the popover AFTER the mock (cache-busted) — the popover then binds to our
+// stub regardless of sibling files. LEAK SAFETY: ./PairRequestsPanel is also
+// mocked by PairDeviceDialog.test; we spread/revert the real module in afterAll,
+// and the cache-busted subject import scopes our stub to this file.
+const realPanel = await import("@/components/pairing/PairRequestsPanel");
+let TunnelConnectedPopover: typeof import("./TunnelConnectedPopover").TunnelConnectedPopover;
+
+beforeAll(async () => {
+  mock.module("@/components/pairing/PairRequestsPanel", () => ({
+    PairRequestsPanel: () => <div data-testid="pair-panel-stub">pair requests</div>
+  }));
+  const popoverPath = "./TunnelConnectedPopover?popover-test";
+  ({ TunnelConnectedPopover } = (await import(popoverPath)) as typeof import("./TunnelConnectedPopover"));
+});
+
+afterAll(() => {
+  mock.module("@/components/pairing/PairRequestsPanel", () => realPanel);
+});
+
+const PROVIDERS: TunnelProvider[] = [
+  { id: "gini-relay", name: "Gini Relay", enabled: true },
+  { id: "tailscale", name: "Tailscale", enabled: false, requires: "Tailscale network" },
+  { id: "ngrok", name: "ngrok", enabled: false, requires: "ngrok account" },
+  { id: "cloudflare", name: "Cloudflare", enabled: false, requires: "Cloudflare account" }
+];
+
+function makeState(over: Partial<TunnelState> = {}): TunnelState {
+  return {
+    providers: PROVIDERS,
+    selectedProvider: "tailscale",
+    status: "connected",
+    url: "https://g31.example",
+    ...over
+  };
+}
+
+// The copy button swaps the Copy glyph for Check; lucide tags each SVG with a
+// stable `lucide-<name>` class, so query the rendered icon to read copied-state.
+const copyButton = () => screen.getByRole("button", { name: "Copy public URL" });
+const hasCheck = () => copyButton().querySelector(".lucide-check") !== null;
+
+let writeText: ReturnType<typeof mock>;
+
+// userEvent.setup() installs its own navigator.clipboard, so stub it AFTER
+// setup to guarantee the component's writeText call lands on our mock.
+function stubClipboard(impl: () => Promise<void>) {
+  writeText = mock(impl);
+  Object.defineProperty(navigator, "clipboard", {
+    configurable: true,
+    value: { writeText }
+  });
+}
+
+// Some tests enable fake timers; always restore real timers so a failure can't
+// leak the fake clock into the next test.
+afterEach(() => {
+  jest.useRealTimers();
+});
+
+describe("TunnelConnectedPopover", () => {
+  test("the QR reveal is two-way: Reveal shows a Hide toggle, Hide re-blurs it", async () => {
+    const user = userEvent.setup();
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={() => {}} />
+    );
+    await user.click(screen.getByRole("button", { name: "Reveal QR" }));
+    // Revealed: the Reveal button is replaced by a Hide toggle.
+    expect(screen.queryByRole("button", { name: "Reveal QR" })).toBeNull();
+    const hide = screen.getByRole("button", { name: "Hide QR code" });
+    await user.click(hide);
+    // Hidden again: Reveal is back and the Hide toggle is gone.
+    expect(screen.queryByRole("button", { name: "Reveal QR" })).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Hide QR code" })).toBeNull();
+  });
+
+  test("the URL is masked until revealed and itself toggles the reveal", async () => {
+    const user = userEvent.setup();
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={() => {}} />
+    );
+    // Hidden by default: the real URL is not shown and the QR sits behind Reveal.
+    expect(screen.queryByText("https://g31.example")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Reveal QR" })).not.toBeNull();
+    const urlToggle = screen.getByRole("button", { name: "Reveal public URL" });
+    expect(urlToggle.textContent).not.toContain("g31.example");
+    // Clicking the URL reveals both the URL and the QR (shared state).
+    await user.click(urlToggle);
+    expect(screen.queryByText("https://g31.example")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Reveal QR" })).toBeNull();
+    // Clicking it again re-masks both.
+    await user.click(screen.getByRole("button", { name: "Hide public URL" }));
+    expect(screen.queryByText("https://g31.example")).toBeNull();
+  });
+
+  test("copy success writes the url, shows Check, then reverts after the timer", async () => {
+    jest.useFakeTimers();
+    const user = userEvent.setup({ delay: null, advanceTimers: jest.advanceTimersByTime });
+    stubClipboard(() => Promise.resolve());
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={() => {}} />
+    );
+    expect(hasCheck()).toBe(false);
+    await user.click(copyButton());
+    expect(writeText).toHaveBeenCalledWith("https://g31.example");
+    // Flush copy()'s continuation (await writeText -> setCopied(true)); with
+    // delay:null userEvent doesn't yield the microtask the way real delays do.
+    await act(async () => {});
+    expect(hasCheck()).toBe(true);
+    // Fire the setTimeout(1500) revert on the fake clock instead of burning real
+    // wall-clock; the inner callback flips copied back to false.
+    await act(async () => {
+      jest.advanceTimersByTime(1500);
+    });
+    expect(hasCheck()).toBe(false);
+  });
+
+  test("copy failure is swallowed and copied stays false", async () => {
+    const user = userEvent.setup();
+    stubClipboard(() => Promise.reject(new Error("nope")));
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={() => {}} />
+    );
+    await user.click(copyButton());
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(hasCheck()).toBe(false);
+  });
+
+  test("Edit selection routes to onEdit", async () => {
+    const user = userEvent.setup();
+    const onEdit = mock(() => {});
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={onEdit} onDisconnect={() => {}} />
+    );
+    await user.click(screen.getByRole("button", { name: "Edit selection" }));
+    expect(onEdit).toHaveBeenCalledTimes(1);
+  });
+
+  test("Disconnect routes to onDisconnect", async () => {
+    const user = userEvent.setup();
+    const onDisconnect = mock(() => {});
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={onDisconnect} />
+    );
+    await user.click(screen.getByRole("button", { name: "Disconnect" }));
+    expect(onDisconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test("providerName resolves the selected provider's name", () => {
+    render(
+      <TunnelConnectedPopover
+        state={makeState({ selectedProvider: "ngrok" })}
+        onEdit={() => {}}
+        onDisconnect={() => {}}
+      />
+    );
+    expect(screen.queryByText("ngrok")).not.toBeNull();
+  });
+
+  test("providerName falls back to Gini Relay when no provider matches", () => {
+    render(
+      <TunnelConnectedPopover
+        state={makeState({ selectedProvider: null })}
+        onEdit={() => {}}
+        onDisconnect={() => {}}
+      />
+    );
+    expect(screen.queryByText("Gini Relay")).not.toBeNull();
+  });
+
+  test("renders without crashing when url is undefined", () => {
+    render(
+      <TunnelConnectedPopover
+        state={makeState({ url: undefined })}
+        onEdit={() => {}}
+        onDisconnect={() => {}}
+      />
+    );
+    expect(screen.queryByRole("button", { name: "Copy public URL" })).not.toBeNull();
+  });
+
+  test("embeds the live Pair-requests panel inline, with no extra Pair-a-device button", () => {
+    render(
+      <TunnelConnectedPopover state={makeState()} onEdit={() => {}} onDisconnect={() => {}} />
+    );
+    // The approval panel is embedded right in the popover — no separate
+    // "Pair a device" dialog trigger to click first.
+    expect(screen.queryByTestId("pair-panel-stub")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Pair a device" })).toBeNull();
+  });
+});

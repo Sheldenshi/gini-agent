@@ -196,6 +196,14 @@ export function webPortPath(instance: Instance): string {
   return join(instanceRoot(instance), "web.port");
 }
 
+// The gini-relay credential store home for an instance (device.json +
+// session.json). Per-instance so multiple instances on one machine don't share
+// a single relay device/session and stomp each other's tunnel (the default
+// ~/.gini-relay is global). See ADR tunnel-connectivity.md.
+export function relayHome(instance: Instance): string {
+  return join(instanceRoot(instance), "relay");
+}
+
 export function traceDir(instance: Instance): string {
   return join(instanceRoot(instance), "traces");
 }

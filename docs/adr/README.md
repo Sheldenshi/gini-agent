@@ -34,6 +34,8 @@ Each file in this directory captures one architecture decision: the context, the
 - [Openclaw Migration](openclaw-migration.md)
 - [BFF Trust Boundary For Privileged POSTs](bff-trust-boundary.md)
 - [Gateway Reverse-Proxies The Web App As A Single Origin](gateway-web-reverse-proxy.md)
+- [Tunnel Connectivity](tunnel-connectivity.md)
+- [Device-Pairing Authentication (Loopback-Trusted, Relay-Gated)](device-pairing-auth.md)
 - [Mobile Push Notifications (APNs + NSE + Inline Actions)](mobile-push-notifications.md)
 - [Codex Session-Rotation Retry, UA Mirroring, And auth.json Race Handling](codex-session-rotation-retry.md)
 - [Authorization vs SetupRequest](authorization-vs-setup-request.md)

@@ -1,0 +1,27 @@
+# Web test config. Component tests need a DOM, so this preload registers
+# happy-dom (see happydom.ts); the same preload restores Bun's native network
+# globals so the DOM-free logic tests in this package keep their behavior.
+[test]
+preload = ["./happydom.ts", "./test-setup.ts"]
+
+coverage = true
+coverageReporter = ["text", "lcov"]
+coverageDir = "coverage"
+coverageSkipTestFiles = true
+
+# 100% line + function coverage. Bun reads these as 0-1 fractions; 1 means 100%.
+coverageThreshold = { lines = 1, functions = 1 }
+
+# The threshold is global across every non-ignored file that tests import. Scope
+# enforcement to the tunnel components this harness covers; shadcn primitives,
+# the existing lib/app/proxy logic, and generated Next types are excluded so they
+# don't drag (or falsely satisfy) the tunnel threshold.
+coveragePathIgnorePatterns = [
+  "src/components/ui/**",
+  "src/lib/**",
+  "src/app/**",
+  "src/proxy.ts",
+  "happydom.ts",
+  "test-setup.ts",
+  "**/*.d.ts"
+]

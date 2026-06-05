@@ -93,6 +93,11 @@ export function addAudit(
   };
   if (audit.redacted === true) audit.evidence = undefined;
   state.audit.unshift(audit);
+  // Ring-buffer cap, mirroring the events cap above. addAudit is reached by
+  // public, rate-limited endpoints (e.g. device-pairing create emits a
+  // pairing.requested row per call), so the durable audit log must be bounded —
+  // otherwise it grows without limit even after the source records are pruned.
+  state.audit = state.audit.slice(0, 5000);
   // Mirror the audit row as a runtime event so the activity feed sees a
   // unified stream. Pass the same agent context so attribution stays
   // consistent across the paired records. The mirrored event inherits

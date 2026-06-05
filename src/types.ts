@@ -86,6 +86,55 @@ export interface BrowserConnectionRecord {
 
 export type RelayStatus = "disabled" | "configured" | "degraded" | "error";
 
+// Tunnel connectivity (see ADR tunnel-connectivity.md). The tunnel gateway
+// exposes a remote URL for this instance through one of several providers.
+// Only "gini-relay" is enabled for now; the rest are catalog placeholders
+// surfaced to the UI with a `requires` explanation of what's missing.
+export type TunnelProviderId = "gini-relay" | "tailscale" | "ngrok" | "cloudflare";
+
+// One row in the provider catalog. Drives the selection panel: disabled
+// rows render their `requires` string as the reason they can't be picked.
+export interface TunnelProvider {
+  id: TunnelProviderId;
+  name: string;
+  enabled: boolean;
+  requires?: string;
+}
+
+// The connection lifecycle status surfaced to clients.
+//   idle       — no active tunnel; selection may or may not be set.
+//   connecting — a login/connect is pending; the panel shows "Pending Login…".
+//   connected  — the tunnel is live; `url` is present.
+//   error      — the last connect failed; `message` carries the reason.
+export type TunnelStatus = "idle" | "connecting" | "connected" | "error";
+
+// The full state object EVERY /api/tunnel route returns — one fetch drives
+// the whole panel. `providers` is the catalog, `selectedProvider`/`status`
+// derive the view, `url` is present only when connected, `message` only on
+// error.
+export interface TunnelState {
+  providers: TunnelProvider[];
+  selectedProvider: TunnelProviderId | null;
+  status: TunnelStatus;
+  url?: string;
+  message?: string;
+}
+
+// Persisted singleton on RuntimeState. Mirrors the BrowserConnectionRecord
+// opt-in shape: absent/null until the user first selects a provider. The
+// catalog itself is NOT persisted — it's rebuilt from code on every read so
+// adding a provider doesn't require a state migration.
+export interface TunnelSelectionRecord {
+  instance: Instance;
+  selectedProvider: TunnelProviderId | null;
+  status: TunnelStatus;
+  url?: string;
+  subdomain?: string;
+  message?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type NotificationStatus = "queued" | "sent" | "failed" | "acknowledged";
 export type MessagingMessageStatus = "received" | "queued" | "sent" | "failed";
 
@@ -101,6 +150,7 @@ export type RuntimeEventKind =
   | "messaging"
   | "provider"
   | "runtime"
+  | "pairing"
   | "notification";
 
 export type JobRunStatus = "running" | "completed" | "failed";
@@ -506,6 +556,7 @@ export interface RuntimeState {
   connectors: ConnectorRecord[];
   improvements: ImprovementProposal[];
   pairingCodes: PairingCode[];
+  pairingRequests: PairingRequest[];
   devices: PairedDevice[];
   promotions: PromotionProposal[];
   snapshots: SnapshotRecord[];
@@ -532,6 +583,10 @@ export interface RuntimeState {
   // so authenticated state lives in the user's Chrome profile, not the
   // ephemeral test context. Purely opt-in; legacy state files omit it.
   browser?: BrowserConnectionRecord | null;
+  // Optional tunnel selection singleton (see ADR tunnel-connectivity.md).
+  // Populated by the tunnel integration when the user selects/connects a
+  // provider; null until then. Mirrors the `browser` opt-in field above.
+  tunnel?: TunnelSelectionRecord | null;
   // Per-conversation snapshot of the runtime identity last shown to the
   // agent (instance, port, agent, provider, toolsets, namespace). Drives
   // tell-once-plus-delta system-prompt injection in runChatTask:
@@ -1583,6 +1638,59 @@ export interface PairedDevice {
   updatedAt: string;
   lastSeenAt?: string;
   revokedAt?: string;
+  // Network front the session connected over: "loopback" for a local browser
+  // or LAN-paired device, or the relay Host (e.g.
+  // <sub>.gini-relay.lilaclabs.ai) for a tunnel-paired browser. Surfaced in the
+  // Active Sessions UI to distinguish local vs remote sessions. Absent on
+  // legacy/mobile rows minted before browser pairing existed.
+  origin?: string;
+  // Raw User-Agent captured at pairing time, for the Active Sessions list.
+  // Absent on legacy/mobile rows.
+  userAgent?: string;
+  // Optional session expiry for relay browser sessions. Bearer/mobile devices
+  // omit it (no expiry). The read-only session validator treats a past
+  // expiresAt as inactive even while status is still "active".
+  expiresAt?: string;
+}
+
+export type PairingRequestStatus =
+  | "pending"
+  | "approved"
+  | "rejected"
+  | "claimed"
+  | "expired"
+  | "cancelled";
+
+// A relay device's request to be paired, awaiting operator approval on the
+// loopback front. Distinct from PairingCode (which is operator-initiated,
+// device-claimed-by-code): a PairingRequest is device-initiated and
+// operator-approved. The `code` is stored in plaintext on purpose — it is a
+// human-comparison artifact shown on BOTH the device screen and the operator's
+// approval panel so the operator can confirm they are approving the device in
+// front of them, not a concurrent attacker's request. The actual credential is
+// the device token minted on claim (hashed), never the code.
+export interface PairingRequest {
+  id: string;
+  instance: Instance;
+  code: string;
+  // hashSecret(binding secret). The binding secret is returned to the requester at
+  // creation — to a browser as an HttpOnly `gini_pair` cookie, to a verified native
+  // client (the mobile app) in the response body — and re-sent on poll/claim/cancel
+  // (cookie for browsers, `X-Gini-Pair-Secret` header for native), so only the
+  // requester that created the request can claim its approved session or cancel it;
+  // knowing the request id alone is not enough.
+  bindHash: string;
+  status: PairingRequestStatus;
+  // Human-readable label derived from the User-Agent (e.g. "Safari · iPhone").
+  deviceName: string;
+  userAgent: string;
+  // The Host the request arrived on, for operator display.
+  relayHost: string;
+  createdAt: string;
+  expiresAt: string;
+  resolvedAt?: string;
+  // Set when a claim mints the session device, linking request → PairedDevice.
+  deviceId?: string;
 }
 
 export interface PromotionProposal {

@@ -97,6 +97,13 @@ function notFound(): NextResponse {
 function applyResponsePolicy(res: NextResponse): NextResponse {
   // Outbound clicks send only the origin, never the full path.
   res.headers.set("referrer-policy", "strict-origin");
+  // Defense-in-depth against clickjacking: the control plane is never meant to be
+  // framed. gini_session is SameSite=Lax, so it isn't sent on a cross-site iframe
+  // load (a framed relay app is unpaired and only shows /pair, never the approve
+  // UI) — but a deny-all anti-framing header is the cheap, standard backstop and
+  // guards against any future SameSite relaxation.
+  res.headers.set("x-frame-options", "DENY");
+  res.headers.set("content-security-policy", "frame-ancestors 'none'");
   return res;
 }
 
@@ -113,11 +120,39 @@ export async function proxy(request: NextRequest): Promise<NextResponse> {
   const next = NextResponse.next();
   // Setup gate runs ONLY on loopback — /setup is a localhost-only experience,
   // so a Tailscale-front caller hitting `/` should not be redirected there.
+  // (When the gateway reverse-proxies the app it rewrites Host to loopback, so
+  // gateway-fronted requests land on this lane too.) Redirect ONLY top-level
+  // page navigations — never asset/subresource requests (images, JS chunks,
+  // fetches), so e.g. /gini-agent-logo.png is served instead of 307'd to
+  // /setup. Sec-Fetch-Dest=document marks a top-level navigation; clients that
+  // omit the header fall back to the Accept: text/html heuristic.
   if (classification === "loopback") {
     const { pathname } = url;
-    if (!pathname.startsWith("/setup") && !pathname.startsWith("/api/")) {
+    const dest = request.headers.get("sec-fetch-dest");
+    const isPageNav = dest === "document"
+      || (dest === null && (request.headers.get("accept") ?? "").includes("text/html"));
+    // /pair is the device-pairing entry point and, like /setup, must render
+    // regardless of provider-setup state — otherwise an unpaired relay device
+    // bounces /pair -> /setup (here) while the gateway bounces /setup -> /pair
+    // (its relay session gate), an infinite redirect. Match /pair exactly (and
+    // /pair/*), NOT a broad prefix, so a future /pairing route isn't also
+    // exempted from the setup gate (mirrors AppShell.tsx and providers.tsx).
+    // See ADR device-pairing-auth.md.
+    if (
+      isPageNav
+      && !pathname.startsWith("/setup")
+      && pathname !== "/pair"
+      && !pathname.startsWith("/pair/")
+      && !pathname.startsWith("/api/")
+    ) {
       const configured = await isProviderConfigured();
       if (configured === false) {
+        // The gateway rewrites Host to loopback before proxying, so this absolute
+        // redirect resolves to the loopback web port — which would point a remote
+        // tunnel browser at its own 127.0.0.1. The gateway rewrites a loopback
+        // Location back to a relative path on the way out (see src/http.ts
+        // proxyWeb), so the browser resolves /setup against the origin it used
+        // (relay or loopback).
         const setupUrl = new URL("/setup", request.url);
         return applyResponsePolicy(NextResponse.redirect(setupUrl));
       }

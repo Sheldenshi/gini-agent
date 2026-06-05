@@ -1,12 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
-import { addAudit, appendEvent, insertChatBlock, mutateState, readState, readTrace, isPlausibleMime, storeUpload, uploadStat, sanitizeFilename } from "./state";
+import { webPortPath } from "./paths";
+import { clearWebTargetCache } from "./web-target";
+import { dirname } from "node:path";
+import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
 import { getOrCreateAgentChat } from "./execution/chat";
 import { listAllDevices } from "./state/devices";
 import { removeMemoryDb } from "./state/memory-db";
 import { listProviders } from "./integrations/connectors/registry";
+import { awaitTunnelSettled, setTunnelDeps, type TunnelChild } from "./integrations/tunnel";
 import type { RuntimeConfig } from "./types";
+import type { LoginHandle, RelayDefaults, Session, Store, TunnelOptions } from "gini-relay";
 
 // Stub a provider's host-environment `detect()` so the connector-detection
 // endpoint test stays deterministic AND fast regardless of what's installed
@@ -349,6 +354,109 @@ describe("runtime api", () => {
     expect(health.status).toBe("degraded");
     expect(notification.status).toBe("queued");
     expect(sent.some((item: { id: string; status: string }) => item.id === notification.id && item.status === "sent")).toBe(true);
+  });
+
+  test("tunnel routes return the full TunnelState across the select/connect/disconnect flow", async () => {
+    const config = testConfig("tunnel-routes");
+    const handler = createHandler(config);
+
+    // Inject fake gini-relay seams so the connect flow exercises the
+    // connecting -> connected transition without OAuth, the host browser, or a
+    // spawned frpc child. Restored in the finally.
+    const session: Session = { token: "gsk_x", subdomain: "subroute", account: "u@test" };
+    const relay: RelayDefaults = {
+      relayUrl: "https://relay.test", frpsAddr: "relay.test", frpsPort: 7000,
+      relayDomain: "relay.test", tlsServerName: "relay.test", frpToken: "t",
+      caFile: "/tmp/ca", loopbackPorts: [8765], bandwidth: "1220KB"
+    };
+    const child: TunnelChild = {
+      start: () => Promise.resolve(),
+      stop: () => Promise.resolve(0),
+      exited: Promise.withResolvers<number>().promise
+    };
+    const store: Store = { home: "/tmp/h", deviceId: () => "d1", readSession: () => session, writeSession: () => {}, clearSession: () => {} };
+    const handle: LoginHandle = {
+      url: "https://relay.test/consent", redirectUri: "http://127.0.0.1:8765/cb",
+      waitForSession: () => Promise.resolve(session), cancel: () => {}
+    };
+    setTunnelDeps({
+      loginUrl: () => Promise.resolve(handle),
+      buildTunnel: (_opts: TunnelOptions) => child,
+      createStore: () => store,
+      resolveDefaults: () => relay,
+      openBrowser: () => {},
+      resolveLocalPort: () => 4321,
+      probeLocalPort: () => Promise.resolve(true)
+    });
+
+    try {
+      // GET on a fresh instance: catalog present, nothing selected, idle.
+      const initial = await call(handler, config, "/api/tunnel");
+      expect(initial.status).toBe("idle");
+      expect(initial.selectedProvider).toBeNull();
+      expect(initial.providers.map((p: { id: string }) => p.id)).toEqual([
+        "gini-relay",
+        "tailscale",
+        "ngrok",
+        "cloudflare"
+      ]);
+
+      // select saves the choice without connecting.
+      const selected = await call(handler, config, "/api/tunnel/select", {
+        method: "POST",
+        body: JSON.stringify({ provider: "gini-relay" })
+      });
+      expect(selected.selectedProvider).toBe("gini-relay");
+      expect(selected.status).toBe("idle");
+
+      // connect (no body provider) uses the saved selection; the route returns
+      // "connecting" immediately while the background handshake runs.
+      const connecting = await call(handler, config, "/api/tunnel/connect", {
+        method: "POST",
+        body: JSON.stringify({})
+      });
+      expect(connecting.status).toBe("connecting");
+      expect(connecting.url).toBeUndefined();
+
+      // Let the background flow settle, then GET reflects connected + url.
+      await awaitTunnelSettled(config.instance);
+      const connected = await call(handler, config, "/api/tunnel");
+      expect(connected.status).toBe("connected");
+      expect(connected.url).toBe("https://subroute.relay.test");
+
+      // cancel returns to idle keeping the selection.
+      const cancelled = await call(handler, config, "/api/tunnel/cancel", { method: "POST" });
+      expect(cancelled.status).toBe("idle");
+      expect(cancelled.selectedProvider).toBe("gini-relay");
+
+      // connect with an explicit provider in the body overrides selection.
+      const reconnecting = await call(handler, config, "/api/tunnel/connect", {
+        method: "POST",
+        body: JSON.stringify({ provider: "gini-relay" })
+      });
+      expect(reconnecting.status).toBe("connecting");
+      await awaitTunnelSettled(config.instance);
+      expect((await call(handler, config, "/api/tunnel")).status).toBe("connected");
+
+      // disconnect tears down, keeps the selection.
+      const disconnected = await call(handler, config, "/api/tunnel/disconnect", { method: "POST" });
+      expect(disconnected.status).toBe("idle");
+      expect(disconnected.selectedProvider).toBe("gini-relay");
+    } finally {
+      setTunnelDeps();
+    }
+  });
+
+  test("POST /api/tunnel/select rejects a disabled provider with a 400", async () => {
+    const config = testConfig("tunnel-reject");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/tunnel/select", {
+      method: "POST",
+      body: JSON.stringify({ provider: "ngrok" })
+    }, config.token);
+    expect(response.status).toBe(400);
+    const value = await response.json();
+    expect(value.error).toContain("not available");
   });
 
   test("supports V1 skill governance and job run history workflows", async () => {
@@ -695,6 +803,205 @@ describe("runtime api", () => {
     expect(page.status).toBe(200);
     const body = (await page.json()) as { name?: string };
     expect(body.name).toBe("gini-runtime");
+  });
+
+  // The gateway is the single trust front: every web-bound request is validated
+  // before proxying so the inner web child stays relay-agnostic. An untrusted
+  // (non-loopback, non-relay, non-allowlisted) Host is refused here.
+  test("web-bound requests from an untrusted Host are refused before proxying", async () => {
+    const config = testConfig("web-proxy-gate");
+    const handler = createHandler(config);
+    // Page/asset path → 404 (don't confirm the host exists).
+    const page = await handler(new Request("http://evil.example/some/app/route", { headers: { host: "evil.example" } }));
+    expect(page.status).toBe(404);
+    // /api/runtime/* BFF namespace → 403 so a programmatic caller sees the refusal.
+    const bff = await handler(new Request("http://evil.example/api/runtime/status", { headers: { host: "evil.example" } }));
+    expect(bff.status).toBe(403);
+  });
+
+  // After validating the real Host/Origin, the gateway presents the inner web
+  // child a loopback Host AND Origin so the child needs no relay awareness.
+  test("proxyWeb rewrites Host and Origin to loopback before forwarding to the web child", async () => {
+    const config = testConfig("web-proxy-rewrite");
+    const handler = createHandler(config);
+    const captured: { host: string | null; origin: string | null } = { host: null, origin: null };
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        captured.host = req.headers.get("host");
+        captured.origin = req.headers.get("origin");
+        return new Response("ok");
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      // Loopback Host passes the gate; the original Origin points at the gateway
+      // port, so a correct rewrite makes the child see the loopback web port.
+      await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`, {
+        headers: { origin: `http://127.0.0.1:${config.port}` }
+      }));
+      expect(captured.host).toBe(`127.0.0.1:${upstream.port}`);
+      expect(captured.origin).toBe(`http://127.0.0.1:${upstream.port}`);
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+    }
+  });
+
+  // The web child builds redirects from the loopback Host the gateway forwarded,
+  // so an absolute Location points at the loopback web port — which would send a
+  // remote tunnel browser to its own 127.0.0.1. The gateway rewrites it to a
+  // relative path so the browser resolves it against the origin it used.
+  test("proxyWeb rewrites an absolute loopback redirect Location to a relative path", async () => {
+    const config = testConfig("web-proxy-redirect");
+    const handler = createHandler(config);
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        // Emulate the setup gate building an absolute redirect from its (gateway-
+        // rewritten, loopback) Host.
+        return new Response(null, { status: 307, headers: { location: `http://${req.headers.get("host")}/setup` } });
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      const res = await handler(new Request(`http://127.0.0.1:${config.port}/chat`, {
+        headers: { origin: `http://127.0.0.1:${config.port}` }
+      }));
+      expect(res.status).toBe(307);
+      expect(res.headers.get("location")).toBe("/setup");
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+    }
+  });
+
+  // Gateway-owned pairing cookies must not cross into the inner web child, which
+  // is relay-agnostic and authenticates via the BFF bearer. Other cookies pass.
+  test("proxyWeb strips gini_session/gini_pair from the forwarded Cookie header", async () => {
+    const config = testConfig("web-proxy-cookie-strip");
+    const handler = createHandler(config);
+    const captured: { cookie: string | null } = { cookie: null };
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        captured.cookie = req.headers.get("cookie");
+        return new Response("ok");
+      }
+    });
+    try {
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      // Loopback front (un-gated), so the request reaches proxyWeb directly with
+      // a Cookie carrying both a gateway cookie and an unrelated app cookie.
+      await handler(new Request(`http://127.0.0.1:${config.port}/some/app/route`, {
+        headers: {
+          origin: `http://127.0.0.1:${config.port}`,
+          cookie: "gini_session=sekret; theme=dark; gini_pair=bindy"
+        }
+      }));
+      expect(captured.cookie).toBe("theme=dark");
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+    }
+  });
+
+  // The relay session gate validates gini_session once at connect time; an open
+  // SSE stream must still be torn down when the session is revoked mid-stream,
+  // or a revoked relay device would keep receiving the owner's event feed.
+  test("proxyWeb tears down a relay SSE stream when its session is revoked", async () => {
+    const config = testConfig("web-proxy-sse-revoke");
+    const handler = createHandler(config);
+    const relay = "sse.gini-relay.lilaclabs.ai";
+    // Mint an active relay session (request → approve → claim) and grab its token.
+    const minted = await mutateState(config.instance, (state) => {
+      const req = createPairingRequest(state, { userAgent: "Mozilla/5.0 Safari", relayHost: relay, bindSecret: "bindy" });
+      approvePairingRequest(state, req.id);
+      const claimed = claimPairingRequest(state, req.id, "bindy");
+      if (!claimed.ok) throw new Error("mint failed");
+      return { token: claimed.token, deviceId: claimed.device.id };
+    });
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/api/runtime/__healthz") {
+          return Response.json({ ok: true, service: "gini-web", instance: config.instance });
+        }
+        // A long-lived SSE: emit one comment, then hold the connection open.
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(": open\n\n"));
+          }
+        });
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+      }
+    });
+    try {
+      // Set inside the try so the finally always reverts it; shrink the cadence so
+      // the post-revoke teardown lands in tens of ms.
+      process.env.GINI_SESSION_REVALIDATE_MS = "20";
+      mkdirSync(dirname(webPortPath(config.instance)), { recursive: true });
+      writeFileSync(webPortPath(config.instance), String(upstream.port));
+      clearWebTargetCache(config.instance);
+      const res = await handler(new Request(`http://127.0.0.1:${config.port}/api/runtime/events/stream`, {
+        headers: {
+          host: relay,
+          origin: `https://${relay}`,
+          "sec-fetch-site": "same-origin",
+          cookie: `gini_session=${encodeURIComponent(minted.token)}`
+        }
+      }));
+      expect(res.headers.get("content-type")).toContain("text/event-stream");
+      const reader = res.body!.getReader();
+      await reader.read(); // first chunk arrives while the session is valid
+      // Revoke mid-stream; the re-validation tick (20ms) must abort the stream.
+      await mutateState(config.instance, (state) => revokeDevice(state, minted.deviceId));
+      // Bounded drain (1s ≈ 50 revalidation ticks of headroom) so a teardown
+      // regression fails fast instead of hanging to the 10s global cap.
+      let ended = false;
+      const deadline = Date.now() + 1000;
+      try {
+        while (Date.now() < deadline) {
+          const { done } = await Promise.race([
+            reader.read(),
+            new Promise<{ done: boolean }>((resolve) =>
+              setTimeout(() => resolve({ done: false }), Math.max(0, deadline - Date.now()))
+            )
+          ]);
+          if (done) { ended = true; break; }
+        }
+      } catch {
+        ended = true; // aborted upstream surfaces as a stream error — also terminal
+      }
+      expect(ended).toBe(true);
+    } finally {
+      await upstream.stop(true);
+      clearWebTargetCache(config.instance);
+      delete process.env.GINI_SESSION_REVALIDATE_MS;
+    }
   });
 
   test("preserves full terminal stdout in a trace artifact when audit evidence is truncated", async () => {

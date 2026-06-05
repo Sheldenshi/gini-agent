@@ -48,6 +48,29 @@ The setup screen calls `GET /api/status` once to validate; if it
 returns JSON, the credentials are persisted with `AsyncStorage` and
 you're routed to the agent picker.
 
+### Pair with a relay link (no token copy)
+
+If the gateway has a relay tunnel connected, you can skip the manual
+token paste. Opening the relay link
+(`https://<sub>.gini-relay.lilaclabs.ai`) on the phone opens the app
+straight into the pairing screen (iOS universal link, declared via
+`ios.associatedDomains` + the gateway-served
+`/.well-known/apple-app-site-association`). The screen shows a code;
+approve it from the **Pair requests** panel on the web app and the
+device connects — the gateway returns a device token the app stores as
+its bearer. You can also reach the same screen from setup ("Have a Gini
+link? Pair this device instead") and paste the link if the universal
+link hasn't resolved yet. See ADR
+[device-pairing-auth.md](../docs/adr/device-pairing-auth.md) ("Native
+pairing client").
+
+A relay-paired session is a finite-lifetime credential (it inherits the
+relay session TTL, 30 days), so the app re-prompts for pairing once it
+expires — re-open the link to re-pair (a same-host re-pair skips the
+confirmation). The manual token from `gini status` does not expire.
+Opening a link for a *different* gateway than the one you're connected to
+asks you to confirm the switch first.
+
 ## Behavior
 
 - **Agents** is the home screen. Tapping an agent activates it on the
@@ -85,10 +108,20 @@ under your own Apple developer account. Two files to edit.
 | `expo.updates.url`                                                               | `https://u.expo.dev/<your-eas-project-id>`    |
 | `expo.extra.eas.build.experimental.ios.appExtensions[0].bundleIdentifier`        | `<your-bundle-id>.notificationservice`        |
 | `expo.plugins[…with-approval-notification-service].appleTeamId`                  | developer.apple.com → Membership → Team ID    |
+| `expo.ios.associatedDomains`                                                      | `applinks:*.<your-relay-domain>` (relay-link pairing) |
 
 **2. `mobile/eas.json` submit profile:** replace `appleTeamId` and
 `ascAppId` under `submit.production.ios` with your own before running
 `eas submit`.
+
+**Relay-link pairing (optional):** the "open the link → pair" flow assumes
+the Lilac relay domain. If you run your own relay, also (a) point
+`expo.ios.associatedDomains` at `applinks:*.<your-relay-domain>` and the
+`RELAY_DOMAIN` constant in `mobile/src/relay-link.ts` at the same domain, and
+(b) on the gateway set `GINI_RELAY_DOMAIN=<your-relay-domain>` and
+`GINI_IOS_APP_ID=<TeamID>.<your-bundle-id>` (the app id the gateway serves in
+`/.well-known/apple-app-site-association`). The manual token-paste flow needs
+none of this.
 
 Then regenerate the native project:
 

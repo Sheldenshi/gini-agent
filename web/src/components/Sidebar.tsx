@@ -28,6 +28,7 @@ import { useInvalidate, useStatus, useThreadsInbox } from "@/lib/queries";
 import { useChatReadState, useThreadReadState } from "@/lib/use-chat-read-state";
 import { AgentAvatar } from "@/components/chat/AgentAvatar";
 import { CreateAgentDialog } from "@/components/CreateAgentDialog";
+import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
 import type { GiniUpdateResult, GiniVersionInfo, JobRecord } from "@runtime/types";
 
@@ -296,6 +297,9 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
         </div>
       </ScrollArea>
 
+      <div className="border-t border-[#1C1C1E] px-3 pb-2 pt-3">
+        <TunnelMenu />
+      </div>
       <UpdateReminder />
       <CreateAgentDialog open={createOpen} onOpenChange={setCreateOpen} />
     </div>

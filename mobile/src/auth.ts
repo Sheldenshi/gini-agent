@@ -136,8 +136,44 @@ export async function saveCredentials(creds: AuthCredentials): Promise<void> {
     baseUrl: normalizeBaseUrl(creds.baseUrl),
     token: creds.token.trim()
   };
+  // Detect a real credential SWAP (vs re-saving the same identity) BEFORE the
+  // broadcast updates `cached`, so we only churn push state when the gateway/token
+  // actually changed. `hadPrior` is captured here too: a swap that replaces an
+  // existing identity must deregister the OLD device before `cached` is overwritten.
+  const changed =
+    !cached || cached.baseUrl !== normalized.baseUrl || cached.token !== normalized.token;
+  const hadPrior = Boolean(cached);
+  if (changed && hadPrior) {
+    // Real swap: deregister the old device from the OLD gateway (tryDeregister
+    // reads the still-cached old creds + token to DELETE /push/devices/:token, then
+    // re-arms registration). MUST run before broadcast() overwrites `cached`, or the
+    // DELETE would target the new gateway. Best-effort + bounded — never blocks the
+    // swap. Without it the old gateway keeps a live device row and pushes stale
+    // notifications to this device (the APNs token doesn't rotate on a swap, so the
+    // old row never gets a 410 to prune it).
+    await tryDeregisterCachedDevice();
+  }
   await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
   broadcast(normalized);
+  // First-time sign-in (no prior creds, nothing to deregister): just re-arm push so
+  // the new gateway gets a fresh registration. Without this the in-process "already
+  // registered" guard in push.ts would suppress re-registration. The swap path above
+  // already re-armed via tryDeregisterCachedDevice.
+  if (changed && !hadPrior) resetPushRegistrationForSwap();
+}
+
+// Re-arm push registration after a credential swap. Lazy `require` (mirroring
+// tryDeregisterCachedDevice) keeps the auth → push import graph acyclic and lets
+// non-RN test/web bundles that never load push.ts skip this path entirely.
+function resetPushRegistrationForSwap(): void {
+  try {
+    const pushModule = require("./push") as {
+      resetRegistrationForCredentialSwap?: () => void;
+    };
+    pushModule.resetRegistrationForCredentialSwap?.();
+  } catch {
+    // require("./push") can throw in non-RN envs — best effort.
+  }
 }
 
 export async function clearCredentials(): Promise<void> {

@@ -24,7 +24,7 @@ Gini is not just a chat box, CLI, messaging bot, or pile of tools. Chat is an in
 
 ## Architecture In One Sentence
 
-Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, future mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract. See [Architecture Overview](docs/architecture-overview.md) for the design.
+Gini's **runtime is the gateway**: a single Bun process per instance owns state and performs work. The Next.js web app, CLI, Expo mobile app, MCP surfaces, and messaging bridges are clients of the same authenticated `/api/*` contract. See [Architecture Overview](docs/architecture-overview.md) for the design.
 
 ```text
                  GATEWAY (Bun runtime, one per instance)
@@ -32,7 +32,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns state 
                               ^
           --------------------+--------------------
           |                    |                   |
-      Next.js BFF          CLI / scripts       future clients
+      Next.js BFF          CLI / scripts       other clients
       browser UI           bearer token        mobile, MCP, messaging
       no browser token
 ```

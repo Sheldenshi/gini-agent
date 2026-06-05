@@ -36,9 +36,9 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 │   Next.js     │                  │  Expo mobile    │                  │   CLI          │
 │   BFF + UI    │                  │  app            │                  │   scripts      │
 │               │                  │                 │                  │   MCP clients  │
-│   one per     │                  │  user pastes    │                  │                │
-│   instance    │                  │  URL + token,   │                  │  direct API    │
-│   localhost   │                  │  AsyncStorage   │                  │  client        │
+│   one per     │                  │  pair via relay │                  │                │
+│   instance    │                  │  link or paste  │                  │  direct API    │
+│   localhost   │                  │  URL + token    │                  │  client        │
 └───────┬───────┘                  └─────────────────┘                  └────────────────┘
         │
         │ HTML / JS / SSE
@@ -68,7 +68,7 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - Server-side BFF attaches the gateway bearer token.
 - Uses the same API that CLI and future clients use.
 - Can be disabled with `--no-web` for smoke and runtime-only testing.
-- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`src/web-target.ts`). This single origin is the foundation a future relay would front; off-LAN access itself is not built yet (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
+- Reachable two ways: directly on its own port, or **through the gateway as a single origin** — the gateway reverse-proxies non-`/api` traffic and the `/api/runtime/*` BFF namespace to Next.js and bridges the HMR WebSocket, so UI + API share one origin. The upstream is healthz-validated per instance (`src/web-target.ts`). This single origin is what the gini-relay tunnel exposes for off-LAN access (see [Off-LAN Access](#off-lan-access)). See [Gateway And Control Plane](./gateway.md) and ADR [gateway-web-reverse-proxy.md](./adr/gateway-web-reverse-proxy.md).
 
 ### CLI
 
@@ -78,13 +78,13 @@ Gini's **runtime is the gateway**: a single Bun process per instance owns all du
 - Also owns local process management for install/start/run/stop/smoke workflows.
 - The `gini import apply openclaw` migrator is the one documented exception to "all writes go through the gateway." It refuses to run while the instance's gateway is alive (see [Openclaw Migration](./adr/openclaw-migration.md)) and writes directly to `state.json`, `secrets.env`, workspace files, skills, and `memory.db` through the in-process `mutateState` path. Single-process serialization is what makes the offline-only constraint necessary.
 
-### Future Clients
+### Other Clients
 
-Mobile, MCP, messaging bridges, and scripts should connect through the gateway contract. Clients that can safely hold a token may call the gateway directly. Browser clients should go through a BFF.
+The Expo mobile app is a gateway client (it holds its own bearer token and can obtain one via relay-link pairing — see [Device-Pairing Authentication](adr/device-pairing-auth.md)). MCP, messaging bridges, and scripts connect through the same gateway contract. Clients that can safely hold a token may call the gateway directly; browser clients go through a BFF.
 
 ## Why This Shape
 
-1. **Single source of truth.** Reloading the web app, running a CLI command, and opening a future mobile app all observe the same runtime state.
+1. **Single source of truth.** Reloading the web app, running a CLI command, and opening the mobile app all observe the same runtime state.
 2. **Clear token boundary.** The browser never receives a bearer token. Local clients that can safely store credentials can hold their own tokens.
 3. **Replaceable clients.** New surfaces do not require a second backend or a duplicated state model.
 4. **Parallel agent support.** Instances isolate ports, state, logs, workspaces, and runtime processes.
@@ -122,8 +122,9 @@ The current capability map is in [Runtime Capabilities](./runtime-capabilities.m
 - `/api/tasks`, `/api/chat`, `/api/runs`, `/api/authorizations`, `/api/setup-requests`
 - `/api/memory/retain`, `/api/memory/recall`, `/api/memory/reflect`, `/api/memory/units`, `/api/memory/banks`, `/api/embedding/*`, `/api/reranker/status`
 - `/api/skills`, `/api/jobs`, `/api/connectors`, `/api/toolsets`
-- `/api/pairing`, `/api/devices`, `/api/mobile/bootstrap`
+- `/api/pairing`, `/api/pairing/request*` (relay device pairing), `/api/devices`, `/api/mobile/bootstrap`
 - `/api/messaging`, `/api/mcp`, `/api/subagents`, `/api/agents`
+- `/api/tunnel`, `/api/tunnel/select`, `/api/tunnel/connect`, `/api/tunnel/cancel`, `/api/tunnel/disconnect`
 - `/api/audit`, `/api/events`, `/api/events/stream`
 - `/api/parity/hermes`, `/api/readiness/v1`
 
@@ -133,11 +134,10 @@ On macOS a launchd-managed instance is supervised to stay up across crashes, cle
 
 ## Off-LAN Access
 
-Off-LAN access is not built today — the gateway binds to loopback and the web control plane is reached over localhost or a same-network / Tailscale address. The planned surface is a relay: a hosted (and self-hostable) switchboard that splices outbound connections from the gateway and clients and forwards opaque, end-to-end-encrypted bytes it cannot read, with the gateway staying the sole authority for access. See "Not Yet Built" below.
+Off-LAN access is available through the **gini-relay tunnel**. The user picks a tunnel provider and connects (`gini tunnel`, or the web tunnel panel over `/api/tunnel*`); the gateway runs an OAuth-loopback login in a browser on the host, the relay assigns the device a session and a subdomain, and a supervised native `frpc` child exposes the instance's gateway port (the single origin fronting UI + API). The instance is then reachable at `https://<subdomain>.<relayDomain>` (`relayDomain` default `gini-relay.lilaclabs.ai`, overridable via `GINI_RELAY_DOMAIN`). `gini-relay` is the only enabled provider today; `tailscale`, `ngrok`, and `cloudflare` are catalog placeholders surfaced with the prerequisite they require. The gateway owns the relay / loopback / `GINI_TRUSTED_ORIGINS` trust decision for web-bound requests and rewrites `Host`/`Origin` to loopback before proxying, so the inner web child (BFF) stays relay-agnostic. On top of that host trust, a web request on a non-loopback front must also be **paired**: it needs a `gini_session` cookie minted through an operator-approved device-pairing handshake, or its page navigations are redirected to `/pair` and its `/api/runtime/*` calls 401. Loopback is trusted with no pairing. See [Tunnel Connectivity](./adr/tunnel-connectivity.md), [BFF Trust Boundary](./adr/bff-trust-boundary.md), and [Device-Pairing Authentication](./adr/device-pairing-auth.md).
 
 ## Not Yet Built
 
-- Production relay for off-LAN access (a hosted, self-hostable switchboard that forwards end-to-end-encrypted bytes; the gateway stays the source of truth and sole authority for access).
 - Push notification delivery.
 
 A basic Expo mobile client lives under `mobile/` — agent picker, per-agent chat list, and chat detail with task polling. It speaks the same `/api/*` contract directly with its own bearer token (no BFF), so it does not change the runtime/source-of-truth model.

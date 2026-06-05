@@ -106,6 +106,7 @@ Usage:
   bun run gini import apply openclaw [path] [--force]
   bun run gini agents list|create|use
   bun run gini relays list|add|health
+  bun run gini tunnel [status] | select <provider> | connect [provider] | cancel | disconnect
   bun run gini notifications list|queue|send|ack
   bun run gini promotions list|propose|approve|reject
   bun run gini snapshots list|create|restore

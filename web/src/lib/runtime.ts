@@ -325,78 +325,62 @@ function isLoopbackHost(host: string): boolean {
 const UNSAFE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 export function guardCsrf(request: Request, _pathSegments: string[]): Response | null {
+  const forbidden = () => Response.json({ error: "Forbidden" }, { status: 403 });
   const origin = request.headers.get("origin");
   const isUnsafe = UNSAFE_METHODS.has(request.method);
-  if (!origin) {
-    // Mobile React Native fetch never sends Origin. An unsafe-method POST
-    // without Origin should talk to the gateway directly with its own token,
-    // not the BFF's bearer-injection surface, so reject it here.
-    if (isUnsafe) {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
+  const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
+  // Host/Origin trust decision. The Sec-Fetch-Site check below runs regardless,
+  // so this resolves a `trusted` flag rather than returning early.
+  //
+  // Loopback short-circuit: this BFF is an internal service — in production it is
+  // reached only through the gateway's reverse-proxy, which validates the real
+  // Host/Origin at the single front and rewrites BOTH to loopback before
+  // forwarding (see src/http.ts proxyWeb + src/lib/origin-trust.ts). A loopback
+  // Host is therefore trusted regardless of GINI_TRUSTED_ORIGINS: a DNS-rebinding
+  // page cannot forge a loopback Host (the browser sends the real visited host),
+  // and direct local-dev access lands on this same lane. This is what lets the
+  // BFF stay relay-agnostic — it never sees a relay host of its own.
+  let trusted = false;
+  if (isLoopbackHost(expectedHost)) {
+    if (!origin) {
+      // Safe methods (top-level GET/HEAD) pass; an unsafe method without Origin
+      // must use the gateway's native /api/* with its own token.
+      trusted = !isUnsafe;
+    } else {
+      try {
+        trusted = isLoopbackHost(new URL(origin).host);
+      } catch {
+        return forbidden();
+      }
     }
-    // Safe method (GET/HEAD) without Origin. Browsers may omit Origin on
-    // same-origin safe requests, which is the exact shape a DNS-rebound page
-    // produces (the browser thinks it's same-origin to attacker.example
-    // post-rebind). Validate the Host here so a non-loopback exposure still
-    // requires GINI_TRUSTED_ORIGINS to be set — Origin-less GETs from a
-    // rebound page hitting a tailnet BFF will 403 because Host is
-    // non-loopback. Non-browser callers on loopback (curl, scripts) keep
-    // working.
-    const allowlist = trustedOrigins();
-    if (allowlist) {
-      // Operator opted into the strict allowlist. There's no Origin to
-      // compare, so fail closed: any non-browser caller can hit the gateway
-      // directly with its own token, and a browser would have sent Origin.
-      return Response.json({ error: "Forbidden" }, { status: 403 });
-    }
-    const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-    if (!isLoopbackHost(expectedHost)) {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
-    }
-  } else {
+  }
+  if (!trusted) {
+    if (!origin) return forbidden();
     let originUrl: URL;
     try {
       originUrl = new URL(origin);
     } catch {
-      return Response.json({ error: "Forbidden" }, { status: 403 });
+      return forbidden();
     }
-    // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS
-    // rebinding. When set, only requests whose Origin exactly matches one of
-    // the listed scheme+host[+port] entries pass. A rebinding attack sets
-    // Origin honestly to the attacker-controlled hostname (the browser sets
-    // Origin to the URL the operator visited), so an explicit allowlist
-    // breaks the bypass a Host-equality check alone cannot. If the operator
-    // set the env var but every entry was malformed (empty Set), we fail
-    // closed rather than silently downgrading to the rebindable fallback.
+    // GINI_TRUSTED_ORIGINS is the production-shape defense against DNS rebinding.
+    // When set, only requests whose Origin exactly matches one of the listed
+    // scheme+host[+port] entries pass; an env var set with only malformed
+    // entries yields an empty Set and fails closed.
     const allowlist = trustedOrigins();
     if (allowlist) {
-      const normalized = `${originUrl.protocol}//${originUrl.host}`;
-      if (!allowlist.has(normalized)) {
-        return Response.json({ error: "Forbidden" }, { status: 403 });
-      }
+      if (!allowlist.has(`${originUrl.protocol}//${originUrl.host}`)) return forbidden();
     } else {
-      // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset. Compare the
-      // browser-supplied Origin host against the Host header the browser
-      // actually used. Restrict the fallback to loopback Host values
-      // (localhost, 127.0.0.1, [::1]) so a BFF exposed on a tailnet /
-      // public-DNS hostname cannot be approached by a DNS-rebinding page that
-      // legitimately sets both Origin and Host to an attacker-controlled
-      // name. Operators running on a non-loopback hostname MUST set
-      // GINI_TRUSTED_ORIGINS — without it the guard refuses every request so
-      // the rebindable path is fully closed. See docs/adr/bff-trust-boundary.md.
-      const expectedHost = request.headers.get("host") ?? new URL(request.url).host;
-      if (!isLoopbackHost(expectedHost)) {
-        return Response.json({ error: "Forbidden" }, { status: 403 });
-      }
-      if (originUrl.host !== expectedHost) {
-        return Response.json({ error: "Forbidden" }, { status: 403 });
-      }
+      // Local-dev fallback when GINI_TRUSTED_ORIGINS is unset: the Origin host
+      // must equal a loopback Host (a non-loopback exposure requires the
+      // allowlist, closing the rebindable path).
+      if (!isLoopbackHost(expectedHost)) return forbidden();
+      if (originUrl.host !== expectedHost) return forbidden();
     }
   }
 
   const fetchSite = request.headers.get("sec-fetch-site");
   if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
-    return Response.json({ error: "Forbidden" }, { status: 403 });
+    return forbidden();
   }
 
   return null;

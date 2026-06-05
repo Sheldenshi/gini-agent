@@ -71,6 +71,7 @@ function buildState(overrides: Partial<RuntimeState> = {}): RuntimeState {
     connectors: [],
     improvements: [],
     pairingCodes: [],
+    pairingRequests: [],
     devices: [],
     promotions: [],
     snapshots: [],
