@@ -55,6 +55,14 @@ Page filenames are **lowercase, hyphenated slugs, no spaces**: `acme-robotics.md
 equals the slugified display name, so `[[Acme Robotics]]` and `[[acme-robotics]]`
 both point at `pages/acme-robotics.md`.
 
+## Reading the wiki
+
+When the user asks how to read or browse what you've built, tell them: it's
+plain markdown they can open in any editor, and the pages are **Obsidian-native
+by design** — they can open the `wiki/` folder as an Obsidian vault to get graph
+view, backlinks, and clickable `[[wikilinks]]` for free. (The files live in the
+workspace, so point the vault at the workspace `wiki/` folder.)
+
 ## Frontmatter contract (mandatory on every page)
 
 ```yaml
@@ -111,13 +119,18 @@ If `wiki/` does not exist yet, go to **Init**.
    If the domain is unclear, ask the user one question to scope it.
 3. Write an empty-ish `index.md` (an `# Index` heading) and `log.md` (`# Log`).
 
-### 2. Ingest a source (URL, document, pasted text)
+### 2. Ingest a source
+
+A source is anything worth remembering. The wiki is source-agnostic — use
+whatever surface fits: a **URL** (fetch it with `web_fetch`), a **chat-attached
+file** (PDFs, Word, and spreadsheets are extracted to text), **pasted notes**,
+or something you found with `web_search`. The steps are the same regardless.
 
 1. **Orient** (step 0).
 2. **Capture the source** verbatim into `raw/` (e.g. `raw/articles/<slug>.md`)
-   with a tiny header (`source_url`, `ingested` date). For a URL, fetch it with
-   `web_fetch` first. Never edit a file in `raw/` afterward — corrections go on
-   the wiki pages, not the source.
+   with a tiny header (`source_url` when there is one, `ingested` date). Fetch a
+   URL with `web_fetch` first. Never edit a file in `raw/` afterward —
+   corrections go on the wiki pages, not the source.
 3. **Extract** the entities/concepts worth pages (apply the threshold above).
 4. For each, **check for an existing page**: `file_search` the name and scan
    `index.md`. Update the existing page rather than creating a duplicate.
