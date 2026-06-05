@@ -128,12 +128,24 @@ describe("deriveActivation: service skill defers to the setup skill", () => {
   // The label always defers (status text lives on the setup card), but the
   // pill's TONE mirrors the setup connector's sign-in liveness so signing in
   // visibly changes the row.
-  test("signed in → green deferral (ok), not its own standalone active", () => {
+  test("signed in (no per-service map) → green deferral (ok), via back-compat fallback", () => {
     const conn = connector({ session: { installed: true, clientConfigured: true, signedIn: true, message: "Signed in to Google" } });
     expect(activationFor(serviceSkill, [conn])).toEqual({
       label: "via Google Workspace setup",
       tone: "ok"
     });
+  });
+
+  test("signed in AND this service's scope granted → green", () => {
+    const conn = connector({ session: { installed: true, clientConfigured: true, signedIn: true, services: { calendar: true, gmail: false, drive: false, docs: false, sheets: false, forms: false, meet: false }, message: "Signed in to Google" } });
+    expect(activationFor(serviceSkill, [conn])).toEqual({ label: "via Google Workspace setup", tone: "ok" });
+  });
+
+  test("signed in but this service's scope NOT granted (partial consent) → amber, not falsely green", () => {
+    // google-calendar with calendar:false — the bug this fixes: a Gmail-only
+    // consent must not light up Calendar.
+    const conn = connector({ session: { installed: true, clientConfigured: true, signedIn: true, services: { calendar: false, gmail: true, drive: false, docs: false, sheets: false, forms: false, meet: false }, message: "Signed in to Google" } });
+    expect(activationFor(serviceSkill, [conn])).toEqual({ label: "via Google Workspace setup", tone: "warn" });
   });
 
   test("session expired → amber deferral (warn)", () => {

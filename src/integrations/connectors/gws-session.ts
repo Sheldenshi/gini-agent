@@ -25,8 +25,36 @@ export interface GwsSessionStatus {
   clientConfigured: boolean;
   // Whether the user session token is currently valid (the live signal).
   signedIn: boolean;
+  // Per-service grant derived from the granted OAuth scopes, keyed by the
+  // google-* skill suffix. A partial consent (e.g. only Gmail) is still
+  // signedIn:true but lights up only its own keys.
+  services: Record<GwsService, boolean>;
   // Short human string for the UI / model.
   message: string;
+}
+
+// The seven Workspace services the google-* skills cover, keyed by skill
+// suffix, mapped to the scope substrings that imply the service is granted.
+// (docs→documents, sheets→spreadsheets, meet→meetings on Google's side.)
+const SERVICE_SCOPES = {
+  calendar: ["/auth/calendar"],
+  gmail: ["/auth/gmail", "mail.google.com"],
+  drive: ["/auth/drive"],
+  docs: ["/auth/documents"],
+  sheets: ["/auth/spreadsheets"],
+  forms: ["/auth/forms"],
+  meet: ["/auth/meetings"]
+} as const;
+export type GwsService = keyof typeof SERVICE_SCOPES;
+
+function servicesFromScopes(scopes: string[]): Record<GwsService, boolean> {
+  const out = {} as Record<GwsService, boolean>;
+  for (const service of Object.keys(SERVICE_SCOPES) as GwsService[]) {
+    out[service] = SERVICE_SCOPES[service].some((needle) =>
+      scopes.some((scope) => scope.includes(needle))
+    );
+  }
+  return out;
 }
 
 // Parse the JSON `gws auth status` emits into a session status. Pure and
@@ -44,10 +72,16 @@ export function parseGwsAuthStatus(stdout: string): GwsSessionStatus {
   const obj = parsed as Record<string, unknown>;
   const clientConfigured = obj.client_config_exists === true;
   const signedIn = obj.token_valid === true;
+  // gws reports `scopes` only for a live session; when signed out it's absent,
+  // so every service resolves false.
+  const scopes = Array.isArray(obj.scopes)
+    ? obj.scopes.filter((s): s is string => typeof s === "string")
+    : [];
   return {
     installed: true,
     clientConfigured,
     signedIn,
+    services: servicesFromScopes(scopes),
     message: signedIn
       ? "Signed in to Google"
       : clientConfigured
@@ -61,6 +95,7 @@ function notInstalled(): GwsSessionStatus {
     installed: false,
     clientConfigured: false,
     signedIn: false,
+    services: servicesFromScopes([]),
     message: "gws not installed"
   };
 }

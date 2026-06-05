@@ -73,11 +73,15 @@ export function deriveActivation(
       providerByCredentialName.get(credentialName);
     const setupSkillName = provider?.setupSkill;
     if (setupSkillName && setupSkillName !== skill.name) {
-      // Tone mirrors the setup connector's sign-in liveness (same `session`
-      // the setup card reads) so these rows turn green on sign-in, amber when
-      // the session expires, and stay muted before setup.
+      // Tone mirrors the setup connector's sign-in liveness, narrowed to THIS
+      // service's own scope: a partial consent (e.g. Gmail only) leaves the
+      // other rows amber instead of falsely green. `services` keys are the
+      // google-* skill suffix; fall back to the overall session when absent.
       const session = matches.find((c) => c.status === "configured")?.session;
-      const tone: Activation["tone"] = session?.signedIn
+      const serviceKey = skill.name.replace(/^google-/, "");
+      const serviceConnected =
+        Boolean(session?.signedIn) && (session?.services?.[serviceKey] ?? true);
+      const tone: Activation["tone"] = serviceConnected
         ? "ok"
         : session?.clientConfigured
         ? "warn"
