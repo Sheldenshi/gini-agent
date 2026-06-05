@@ -33,6 +33,7 @@
 import { mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isLocalModelCached } from "./local-model-cache";
 
 // Default local model — onnx-community/whisper-small. Small keeps short-clip
 // transcription fast (~1.5s on CPU) since whisper's fixed 30s-window encoder
@@ -221,19 +222,11 @@ async function loadTranscriber(modelId: string): Promise<Transcriber> {
       : (await import("@huggingface/transformers")) as unknown as TransformersModule;
     if (mod.env) mod.env.cacheDir = cacheDir;
 
-    // First-use download notice. We can't cheaply tell whether *this* model
-    // is already cached without poking inside the cache layout, so heuristic:
-    // if the cache dir has no entry containing the model id slug, assume a
-    // first download. Conservative — at worst a stale cache prints once.
-    const slug = modelId.split("/").pop() ?? modelId;
-    const looksUncached = (() => {
-      try {
-        const entries = readdirSync(cacheDir);
-        return !entries.some((entry) => entry.includes(slug));
-      } catch {
-        return true;
-      }
-    })();
+    // First-use download notice. Transformers.js nests the model under
+    // <cacheDir>/<org>/<model>/, so checking that nested directory (not a flat
+    // top-level scan) tells us whether this model is already cached and the
+    // notice should print.
+    const looksUncached = !isLocalModelCached(cacheDir, modelId);
     if (looksUncached) {
       process.stderr.write(`Downloading speech-to-text model ${modelId}... this happens once.\n`);
     }

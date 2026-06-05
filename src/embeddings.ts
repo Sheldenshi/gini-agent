@@ -30,9 +30,10 @@
 // the same process commonly hits the same query, and the cache shaves a
 // network round-trip without persistence concerns.
 
-import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { isLocalModelCached } from "./local-model-cache";
 import type { RuntimeConfig } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -162,20 +163,12 @@ async function loadFeatureExtractor(modelId: string): Promise<FeatureExtractor> 
       : (await import("@huggingface/transformers")) as unknown as TransformersModule;
     if (mod.env) mod.env.cacheDir = cacheDir;
 
-    // First-use download notice. We can't cheaply tell whether *this* model
-    // is already cached without poking inside the cache layout, so fall back
-    // to "is the cache dir empty" — good enough for the typical first run.
-    const cacheLooksEmpty = (() => {
-      try {
-        // If the directory has no entries (or doesn't exist), this is the
-        // first download. We just created the dir, so check after.
-        const entries = readdirSync(cacheDir);
-        return entries.length === 0;
-      } catch {
-        return true;
-      }
-    })();
-    if (cacheLooksEmpty) {
+    // First-use download notice. Transformers.js nests the model under
+    // <cacheDir>/<org>/<model>/, so checking that nested directory (not a flat
+    // top-level scan) tells us whether this model is already cached and the
+    // notice should print.
+    const looksUncached = !isLocalModelCached(cacheDir, modelId);
+    if (looksUncached) {
       process.stderr.write(`Downloading embedding model ${modelId} (~25MB)... this happens once.\n`);
     }
 

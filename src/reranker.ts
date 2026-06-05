@@ -21,9 +21,10 @@
 // stays in RRF order — cross-encoder cost grows linearly with candidates,
 // and tail entries rarely survive the token-budget filter anyway.
 
-import { mkdirSync, readdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isLocalModelCached } from "./local-model-cache";
 import type { RuntimeConfig } from "./types";
 
 // Default cross-encoder — `Xenova/ms-marco-MiniLM-L-6-v2`. The ms-marco
@@ -168,19 +169,11 @@ async function loadTextClassifier(modelId: string): Promise<TextClassifier> {
       : (await import("@huggingface/transformers")) as unknown as TransformersModule;
     if (mod.env) mod.env.cacheDir = cacheDir;
 
-    // First-use download notice. We can't cheaply tell whether *this* model
-    // is already cached without poking inside the cache layout, so heuristic:
-    // if the cache dir has no entries containing the model id slug, assume
-    // first download. Conservative — at worst a stale cache prints once.
-    const slug = modelId.split("/").pop() ?? modelId;
-    const looksUncached = (() => {
-      try {
-        const entries = readdirSync(cacheDir);
-        return !entries.some((entry) => entry.includes(slug));
-      } catch {
-        return true;
-      }
-    })();
+    // First-use download notice. Transformers.js nests the model under
+    // <cacheDir>/<org>/<model>/, so checking that nested directory (not a flat
+    // top-level scan) tells us whether this model is already cached and the
+    // notice should print.
+    const looksUncached = !isLocalModelCached(cacheDir, modelId);
     if (looksUncached) {
       process.stderr.write(`Downloading reranker model ${modelId} (~100MB)... this happens once.\n`);
     }
