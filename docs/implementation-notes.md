@@ -10,10 +10,11 @@ These notes describe the current source layout and boundaries. Product direction
 - `src/http.ts` is the authenticated local API router.
 - `src/agent.ts` owns task execution and approval-gated tool actions.
 - `src/provider.ts` owns provider normalization, health checks, and model calls.
-- `src/state/` contains persistence, JSON state store helpers, audit/trace records, IDs, security helpers, and SQLite memory storage.
+- `src/state/` contains persistence, JSON state store helpers, audit/trace records, IDs, security helpers, SQLite memory storage, and the sandboxed per-agent SQLite database (`agent-data-db.ts`).
 - `src/runtime/` contains install/status, public runtime views, parity/readiness checks, and local harness helpers.
 - `src/execution/` contains chat, runs, and search behavior.
 - `src/memory/` contains retain, recall, reflect, reinforce, embeddings/reranker status, entity, temporal, migration, and schema logic.
+- `src/data/` contains the deterministic tabular (CSV/XLSX) → table importer for the agent database.
 - `src/jobs/` contains scheduler job creation, execution, replay, and run history behavior.
 - `src/governance/` contains approvals-adjacent runtime workflows such as pairing, improvements, and promotions.
 - `src/capabilities/` contains skills, toolsets, agents, and subagent records.
