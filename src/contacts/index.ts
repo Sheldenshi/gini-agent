@@ -16,12 +16,12 @@ import {
   findContactsByName,
   getContact,
   insertContact,
-  mutualConnections,
   relationsFor,
   updateContact,
   upsertRelation,
   type Contact,
-  type ContactInput
+  type ContactInput,
+  type ContactQuery
 } from "../state";
 import { ContactImportError, importContactsFromCsv, type ImportReport } from "./import";
 
@@ -76,6 +76,28 @@ export async function importContactsFromFile(
 
 // ---- Shared operations (used by both the agent tools and the /api/contacts
 // routes, so the URL-first dedup and name-ambiguity rules live in one place) ----
+
+// Build a ContactQuery from generic field getters, so the tool (args object),
+// the API (URLSearchParams), and any future caller share one filter surface
+// and field list instead of re-deriving it three times.
+export function buildContactQuery(
+  getStr: (key: string) => string | undefined,
+  getBool: (key: string) => boolean | undefined,
+  getNum: (key: string) => number | undefined
+): ContactQuery {
+  const query: ContactQuery = {};
+  for (const key of ["company", "companyContains", "title", "location", "nameContains", "emailContains", "q", "connectedAfter", "connectedBefore"] as const) {
+    const value = getStr(key);
+    if (value) (query as Record<string, unknown>)[key] = value;
+  }
+  const hasCompany = getBool("hasCompany");
+  if (hasCompany !== undefined) query.hasCompany = hasCompany;
+  const limit = getNum("limit");
+  if (limit !== undefined) query.limit = limit;
+  const offset = getNum("offset");
+  if (offset !== undefined) query.offset = offset;
+  return query;
+}
 
 export type ContactRef = string; // a contact id (contact_…) or a name.
 
@@ -182,10 +204,6 @@ export function relationViews(instance: Instance, agentId: string, contactId: st
     const otherId = rel.fromContactId === contactId ? rel.toContactId : rel.fromContactId;
     return { relationType: rel.relationType, note: rel.note, contact: getContact(instance, agentId, otherId) };
   });
-}
-
-export function mutualContacts(instance: Instance, agentId: string, aId: string, bId: string): Contact[] {
-  return mutualConnections(instance, agentId, aId, bId);
 }
 
 export {

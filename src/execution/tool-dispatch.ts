@@ -54,8 +54,8 @@ import {
 } from "../runtime/identity-files";
 import { resolveEffectiveContext } from "./effective-context";
 import {
+  buildContactQuery as buildContactQueryFromGetters,
   importContactsFromFile,
-  mutualContacts,
   relateContacts,
   relationViews,
   resolveContactRef,
@@ -64,6 +64,7 @@ import {
 import {
   companyBreakdown,
   countContacts,
+  mutualConnections,
   queryContacts,
   type Contact,
   type ContactInput,
@@ -1962,21 +1963,11 @@ function optBool(args: Record<string, unknown>, key: string): boolean | undefine
 }
 
 function buildContactQuery(args: Record<string, unknown>): ContactQuery {
-  const query: ContactQuery = {};
-  if (optStr(args, "company")) query.company = optStr(args, "company");
-  if (optStr(args, "companyContains")) query.companyContains = optStr(args, "companyContains");
-  if (optStr(args, "title")) query.title = optStr(args, "title");
-  if (optStr(args, "location")) query.location = optStr(args, "location");
-  if (optStr(args, "nameContains")) query.nameContains = optStr(args, "nameContains");
-  if (optStr(args, "emailContains")) query.emailContains = optStr(args, "emailContains");
-  if (optStr(args, "q")) query.q = optStr(args, "q");
-  if (optStr(args, "connectedAfter")) query.connectedAfter = optStr(args, "connectedAfter");
-  if (optStr(args, "connectedBefore")) query.connectedBefore = optStr(args, "connectedBefore");
-  const hasCompany = optBool(args, "hasCompany");
-  if (hasCompany !== undefined) query.hasCompany = hasCompany;
-  if (args.limit !== undefined && args.limit !== null) query.limit = optionalNumber(args, "limit", 0) || undefined;
-  if (args.offset !== undefined && args.offset !== null) query.offset = optionalNumber(args, "offset", 0);
-  return query;
+  return buildContactQueryFromGetters(
+    (key) => optStr(args, key),
+    (key) => optBool(args, key),
+    (key) => (args[key] === undefined || args[key] === null ? undefined : optionalNumber(args, key, 0))
+  );
 }
 
 // Compact contact shape for tool output — drop nulls so the model isn't paying
@@ -2167,7 +2158,7 @@ async function contactsRelationsTool(
         message: unresolvedMessage("mutualWith", mutualRef, "candidates" in other ? other.candidates : undefined)
       });
     }
-    const mutual = mutualContacts(config.instance, agentId, primary.contact.id, other.contact.id);
+    const mutual = mutualConnections(config.instance, agentId, primary.contact.id, other.contact.id);
     await recordLowRiskAudit(config, taskId, "contacts.mutual", `${primary.contact.fullName} ∩ ${other.contact.fullName}`, {
       count: mutual.length
     });

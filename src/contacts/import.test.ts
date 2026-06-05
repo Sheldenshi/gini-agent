@@ -102,6 +102,20 @@ describe("importContactsFromCsv", () => {
     expect(() => importContactsFromCsv("imp-noheader", A, "foo,bar\n1,2\n")).toThrow(ContactImportError);
   });
 
+  test("maps alternate headers (City→location) and tolerates a missing email column", () => {
+    const inst = "imp-altheaders";
+    const csv = `Name,Company,Role,City\nJin Park,Figma,Design Engineer,Toronto\nMei Suzuki,Notion,Sales,Singapore\n`;
+    const report = importContactsFromCsv(inst, A, csv);
+    expect(report.created).toBe(2);
+    expect(report.detectedColumns).toContain("location");
+    expect(report.detectedColumns).toContain("title"); // "Role"
+    const jin = queryContacts(inst, A, { nameContains: "Jin" }).contacts[0]!;
+    expect(jin.location).toBe("Toronto");
+    expect(jin.title).toBe("Design Engineer");
+    expect(jin.email).toBeNull(); // no email column at all
+    expect(countContacts(inst, A, { location: "singapore" })).toBe(1);
+  });
+
   test("report includes a company breakdown and sample", () => {
     const inst = "imp-report";
     const report = importContactsFromCsv(inst, A, LINKEDIN_CSV);

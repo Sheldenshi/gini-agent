@@ -102,7 +102,7 @@ describe("contacts-db", () => {
     expect(u2.company).toBe("Notion");
   });
 
-  test("substring + multi-attribute queries", () => {
+  test("substring + multi-attribute queries (case-insensitive)", () => {
     const inst = "ct-filter";
     insertContact(inst, A, { fullName: "Ana Costa", company: "Google", title: "Product Manager", location: "London" });
     insertContact(inst, A, { fullName: "Ben Cohen", company: "Google", title: "Software Engineer", location: "Berlin" });
@@ -112,6 +112,10 @@ describe("contacts-db", () => {
     expect(countContacts(inst, A, { location: "London" })).toBe(2);
     expect(countContacts(inst, A, { q: "cohen" })).toBe(1);
     expect(countContacts(inst, A, { nameContains: "an" })).toBe(1); // "Ana"
+    // COLLATE NOCASE: lower-case filters match mixed-case data.
+    expect(countContacts(inst, A, { company: "google" })).toBe(2);
+    expect(countContacts(inst, A, { title: "product manager" })).toBe(2);
+    expect(countContacts(inst, A, { location: "london" })).toBe(2);
   });
 
   test("LIKE wildcards in input are matched literally", () => {
@@ -170,6 +174,24 @@ describe("contacts-db", () => {
     // Upsert is idempotent on (from,to,type).
     upsertRelation(inst, A, me.id, carol.id, "colleague", "worked together at Google");
     expect(relationsFor(inst, A, me.id).length).toBe(2); // carol + dave, not 3
+  });
+
+  test("relations are isolated per agent", () => {
+    const inst = "ct-rel-iso";
+    // Same names + same relation type under two agents must not cross.
+    const x1 = insertContact(inst, "agent_x", { fullName: "Alice" });
+    const x2 = insertContact(inst, "agent_x", { fullName: "Bob" });
+    const y1 = insertContact(inst, "agent_y", { fullName: "Alice" });
+    const y2 = insertContact(inst, "agent_y", { fullName: "Bob" });
+    const yMid = insertContact(inst, "agent_y", { fullName: "Mid" });
+    upsertRelation(inst, "agent_x", x1.id, x2.id, "knows");
+    upsertRelation(inst, "agent_y", y1.id, yMid.id, "knows");
+    upsertRelation(inst, "agent_y", y2.id, yMid.id, "knows");
+    // agent_x sees only its own edge; agent_y sees only its two.
+    expect(relationsFor(inst, "agent_x", x1.id).length).toBe(1);
+    expect(relationsFor(inst, "agent_y", x1.id).length).toBe(0); // x1 isn't agent_y's
+    expect(mutualConnections(inst, "agent_x", x1.id, x2.id).length).toBe(0);
+    expect(mutualConnections(inst, "agent_y", y1.id, y2.id).map((c) => c.fullName)).toEqual(["Mid"]);
   });
 
   test("deleting a contact cascades its relations", () => {

@@ -53,13 +53,13 @@ import {
   companyBreakdown,
   deleteContact,
   getContact,
+  mutualConnections,
   queryContacts,
-  type ContactInput,
-  type ContactQuery
+  type ContactInput
 } from "./state";
 import {
+  buildContactQuery,
   importContactsFromFile,
-  mutualContacts,
   relateContacts,
   relationViews,
   upsertContact
@@ -1212,7 +1212,12 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const a = url.searchParams.get("a");
       const b = url.searchParams.get("b");
       if (!a || !b) return json({ error: "both a and b contact ids are required" }, 400);
-      return json({ mutualConnections: mutualContacts(config.instance, effective.agentId, a, b) });
+      // Validate both endpoints belong to the active agent so a stray id
+      // returns 404 rather than a misleading empty result.
+      if (!getContact(config.instance, effective.agentId, a) || !getContact(config.instance, effective.agentId, b)) {
+        return json({ error: "Contact not found" }, 404);
+      }
+      return json({ mutualConnections: mutualConnections(config.instance, effective.agentId, a, b) });
     }],
     ["POST", /^\/api\/contacts\/import$/, async (request) => {
       const effective = resolveEffectiveContext(readState(config.instance), config);
@@ -1275,7 +1280,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       if (!effective.agentId) return json({ error: "no active agent" }, 400);
       const payload = await body(request);
       const input: ContactInput & { id?: string } = {};
-      for (const key of ["fullName", "firstName", "lastName", "company", "title", "location", "email", "linkedinUrl", "connectedAt", "notes", "source"] as const) {
+      for (const key of ["fullName", "firstName", "lastName", "company", "title", "location", "email", "linkedinUrl", "connectedAt", "notes"] as const) {
         if (typeof payload[key] === "string") (input as Record<string, unknown>)[key] = payload[key];
       }
       if (typeof payload.id === "string") input.id = payload.id;
@@ -2925,32 +2930,21 @@ function json(value: unknown, statusCode = 200): Response {
   return Response.json(value, { status: statusCode });
 }
 
-// Translate the /api/contacts query string into a ContactQuery. Mirrors the
-// contacts_query tool's filter surface so web/CLI/mobile clients share the
-// exhaustive structured-query contract.
-function contactQueryFromParams(params: URLSearchParams): ContactQuery {
-  const query: ContactQuery = {};
-  const str = (key: keyof ContactQuery & string) => {
-    const v = params.get(key);
-    if (v && v.trim()) (query as Record<string, unknown>)[key] = v.trim();
-  };
-  str("company");
-  str("companyContains");
-  str("title");
-  str("location");
-  str("nameContains");
-  str("emailContains");
-  str("q");
-  str("connectedAfter");
-  str("connectedBefore");
-  const hasCompany = params.get("hasCompany");
-  if (hasCompany === "true") query.hasCompany = true;
-  else if (hasCompany === "false") query.hasCompany = false;
-  const limit = params.get("limit");
-  if (limit && Number.isFinite(Number(limit))) query.limit = Number(limit);
-  const offset = params.get("offset");
-  if (offset && Number.isFinite(Number(offset))) query.offset = Number(offset);
-  return query;
+// Translate the /api/contacts query string into a ContactQuery via the shared
+// builder, so web/CLI/mobile clients use the exact filter surface the
+// contacts_query tool does.
+function contactQueryFromParams(params: URLSearchParams): ReturnType<typeof buildContactQuery> {
+  return buildContactQuery(
+    (key) => params.get(key)?.trim() || undefined,
+    (key) => {
+      const v = params.get(key);
+      return v === "true" ? true : v === "false" ? false : undefined;
+    },
+    (key) => {
+      const v = params.get(key);
+      return v !== null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : undefined;
+    }
+  );
 }
 
 // Parse the `?agentId=` filter shared by GET endpoints that return per-agent
@@ -2993,6 +2987,13 @@ function statusFromErrorMessage(message: string): number {
   // agent is active. Map to 400 so callers see a clean user-input error
   // rather than a 500.
   if (message.includes("no active agent")) return 400;
+  // Contacts surface: upsert by a missing id → 404; the importer's
+  // user-correctable parse failures (no header row, empty spreadsheet) and
+  // the create-without-name guard → 400, rather than collapsing to 500.
+  if (message.startsWith("Contact not found")) return 404;
+  if (message.startsWith("Could not find a recognizable contact header")) return 400;
+  if (message.startsWith("Spreadsheet has no sheets")) return 400;
+  if (message.startsWith("Provide a fullName")) return 400;
   // Browser-connect surfaces user-input failures with these prefixes;
   // forward them to 400 so the webapp can surface the original error text
   // rather than a generic "internal error". Connectivity failures

@@ -465,7 +465,7 @@ export function upsertRelation(
   db.run(
     `INSERT INTO contact_relations (agent_id, from_contact_id, to_contact_id, relation_type, note, source, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(from_contact_id, to_contact_id, relation_type)
+     ON CONFLICT(agent_id, from_contact_id, to_contact_id, relation_type)
      DO UPDATE SET note = excluded.note, source = excluded.source`,
     [agentId, fromContactId, toContactId, type, clean(note ?? null), clean(source ?? null), at]
   );

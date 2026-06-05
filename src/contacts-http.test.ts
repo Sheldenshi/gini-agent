@@ -125,14 +125,28 @@ describe("/api/contacts", () => {
     expect(gone.status).toBe(404);
   });
 
-  test("upsert with id of a missing contact 400s; ambiguous name 409s", async () => {
+  test("upsert with id of a missing contact 404s; ambiguous name 409s", async () => {
     const config = testConfig("http-upsert-edge");
     const handler = createHandler(config);
+    // Updating a non-existent id is a clean 404, not a 500.
+    const missing = await call(handler, config, "/api/contacts", {
+      method: "POST",
+      body: JSON.stringify({ id: "contact_doesnotexist", company: "X" })
+    });
+    expect(missing.status).toBe(404);
     // Two same-name people via distinct URLs.
     await call(handler, config, "/api/contacts", { method: "POST", body: JSON.stringify({ fullName: "Sam Twin", linkedinUrl: "https://linkedin.com/in/sam1" }) });
     await call(handler, config, "/api/contacts", { method: "POST", body: JSON.stringify({ fullName: "Sam Twin", linkedinUrl: "https://linkedin.com/in/sam2" }) });
     const ambiguous = await call(handler, config, "/api/contacts", { method: "POST", body: JSON.stringify({ fullName: "Sam Twin", company: "X" }) });
     expect(ambiguous.status).toBe(409);
     expect(ambiguous.body.candidates.length).toBe(2);
+  });
+
+  test("import with no recognizable header returns 400, not 500", async () => {
+    const config = testConfig("http-import-bad");
+    writeFileSync(join(config.workspaceRoot, "junk.csv"), "alpha,beta\n1,2\n");
+    const handler = createHandler(config);
+    const res = await call(handler, config, "/api/contacts/import", { method: "POST", body: JSON.stringify({ path: "junk.csv" }) });
+    expect(res.status).toBe(400);
   });
 });

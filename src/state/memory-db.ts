@@ -511,7 +511,7 @@ function applyMigrations(db: Database): void {
       note TEXT,
       source TEXT,
       created_at TEXT NOT NULL,
-      PRIMARY KEY (from_contact_id, to_contact_id, relation_type)
+      PRIMARY KEY (agent_id, from_contact_id, to_contact_id, relation_type)
     );
     CREATE INDEX IF NOT EXISTS idx_contact_relations_to ON contact_relations(to_contact_id);
     CREATE INDEX IF NOT EXISTS idx_contact_relations_agent ON contact_relations(agent_id);
