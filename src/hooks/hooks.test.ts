@@ -19,16 +19,17 @@ import {
   clearEchoToolCallingResponses,
   normalizeProvider,
   setEchoToolCallingResponse
-} from "../../provider";
-import { createScheduledJob, runJobNow } from "../index";
-import { mutateState, readState } from "../../state";
+} from "../provider";
+import { createScheduledJob, runJobNow } from "../jobs";
+import { mutateState, readState } from "../state";
 import {
-  __registerPreRunHookForTest,
-  __resetPreRunHooksForTest,
-  isKnownPreRunHook,
-  resolvePreRunHook
+  __registerHookForTest,
+  __resetHooksForTest,
+  isKnownHook,
+  resolveHook
 } from "./registry";
-import type { RuntimeConfig } from "../../types";
+import "./builtins";
+import type { RuntimeConfig } from "../types";
 
 function buildConfig(workspaceRoot: string, instance: string): RuntimeConfig {
   return {
@@ -94,29 +95,29 @@ describe("pre-run hook primitive", () => {
     process.env.GINI_LOG_ROOT = `${root}-logs`;
     clearEchoToolCallingResponses();
     // Register the stub handlers the tests resolve by id.
-    __registerPreRunHookForTest("test-shortcircuit", async () => ({ kind: "shortCircuit", summary: "[SILENT]" }));
-    __registerPreRunHookForTest("test-context", async () => ({
+    __registerHookForTest("test-shortcircuit", async () => ({ kind: "shortCircuit", summary: "[SILENT]" }));
+    __registerHookForTest("test-context", async () => ({
       kind: "context",
       items: [{ text: "<<<INJECTED-FENCE>>>\nmatched data\n<<<END>>>", untrusted: false }]
     }));
-    __registerPreRunHookForTest("test-context-untrusted", async () => ({
+    __registerHookForTest("test-context-untrusted", async () => ({
       kind: "context",
       items: [{ text: "raw untrusted text", untrusted: true }]
     }));
-    __registerPreRunHookForTest("test-error", async () => ({ kind: "error", message: "deliberate hook failure" }));
-    __registerPreRunHookForTest("test-timeout", () => new Promise(() => {})); // never resolves
-    __registerPreRunHookForTest("test-bigcontext", async () => ({
+    __registerHookForTest("test-error", async () => ({ kind: "error", message: "deliberate hook failure" }));
+    __registerHookForTest("test-timeout", () => new Promise(() => {})); // never resolves
+    __registerHookForTest("test-bigcontext", async () => ({
       kind: "context",
       items: [{ text: "X".repeat(20_000), untrusted: false }]
     }));
-    __registerPreRunHookForTest("test-bigcontext-untrusted", async () => ({
+    __registerHookForTest("test-bigcontext-untrusted", async () => ({
       kind: "context",
       items: [{ text: "Y".repeat(20_000), untrusted: true }]
     }));
   });
 
   afterEach(() => {
-    __resetPreRunHooksForTest();
+    __resetHooksForTest();
     if (prevState === undefined) delete process.env.GINI_STATE_ROOT;
     else process.env.GINI_STATE_ROOT = prevState;
     if (prevLog === undefined) delete process.env.GINI_LOG_ROOT;
@@ -249,7 +250,7 @@ describe("pre-run hook primitive", () => {
     await createSession(config, sessionId);
     let committedWithTaskCount = -1;
     let jobIdUnderTest = "";
-    __registerPreRunHookForTest("test-context-commit", async () => ({
+    __registerHookForTest("test-context-commit", async () => ({
       kind: "context",
       items: [{ text: "matched", untrusted: false }],
       onDispatched: () => {
@@ -310,7 +311,7 @@ describe("pre-run hook primitive", () => {
       const j = state.jobs.find((x) => x.id === job.id)!;
       j.nextRunAt = new Date(Date.now() - 1000).toISOString();
     });
-    const { runDueJobs } = await import("../index");
+    const { runDueJobs } = await import("../jobs");
     await runDueJobs(config);
 
     const state = readState(config.instance);
@@ -365,7 +366,7 @@ describe("pre-run hook primitive", () => {
       const j = state.jobs.find((x) => x.id === job.id)!;
       j.nextRunAt = new Date(Date.now() - 1000).toISOString();
     });
-    const { runDueJobs } = await import("../index");
+    const { runDueJobs } = await import("../jobs");
     await runDueJobs(config);
 
     const state = readState(config.instance);
@@ -382,16 +383,16 @@ describe("pre-run hook primitive", () => {
 
   test("a malformed handler result takes the fatal config-error path, not a throw past the catch", async () => {
     // A result whose kind isn't in the union (e.g. a prototype-resolved JS
-    // built-in or a buggy handler) must be validated INSIDE runPreRunHook so the
+    // built-in or a buggy handler) must be validated INSIDE the runner so the
     // run finalizes failed (fatal, scheduled => job.status="failed") instead of
     // throwing past the catch and stranding the run "running" forever.
     const config = buildConfig(workspaceRoot, "hook-malformed");
     const sessionId = "session_malformed";
     await createSession(config, sessionId);
-    __registerPreRunHookForTest(
+    __registerHookForTest(
       "test-malformed",
       // deliberately returns an off-union shape
-      (async () => ({ kind: "bogus" })) as unknown as Parameters<typeof __registerPreRunHookForTest>[1]
+      (async () => ({ kind: "bogus" })) as unknown as Parameters<typeof __registerHookForTest>[1]
     );
     const job = await createScheduledJob(config, {
       name: "malformed",
@@ -405,7 +406,7 @@ describe("pre-run hook primitive", () => {
       const j = state.jobs.find((x) => x.id === job.id)!;
       j.nextRunAt = new Date(Date.now() - 1000).toISOString();
     });
-    const { runDueJobs } = await import("../index");
+    const { runDueJobs } = await import("../jobs");
     await runDueJobs(config);
 
     const state = readState(config.instance);
@@ -420,12 +421,12 @@ describe("pre-run hook primitive", () => {
   test("registry rejects Object.prototype keys at membership and resolution", () => {
     // Prototype-chain keys must not be members or resolve to a JS built-in.
     for (const key of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
-      expect(isKnownPreRunHook(key)).toBe(false);
-      expect(resolvePreRunHook(key)).toBeUndefined();
+      expect(isKnownHook(key)).toBe(false);
+      expect(resolveHook(key)).toBeUndefined();
     }
     // The genuine built-in still resolves.
-    expect(isKnownPreRunHook("gmail-delta")).toBe(true);
-    expect(resolvePreRunHook("gmail-delta")).toBeDefined();
+    expect(isKnownHook("gmail-delta")).toBe(true);
+    expect(resolveHook("gmail-delta")).toBeDefined();
   });
 
   test("createScheduledJob rejects a prototype-key handlerId at create time", async () => {
@@ -550,12 +551,15 @@ describe("pre-run hook primitive", () => {
     // run to a terminal JobRunStatus; we flip it to "failed" here (the terminal
     // value cancellation maps onto) and assert the short-circuit finalize leaves
     // it untouched.
+    // The generic HookContext no longer carries the run, so the stub locates the
+    // in-flight run from state (the only running run in this ephemeral instance)
+    // to model a cancel landing between the claim and the finalize.
     let capturedRunId: string | undefined;
-    __registerPreRunHookForTest("test-cancelrace", async (ctx) => {
-      capturedRunId = ctx.run.id;
+    __registerHookForTest("test-cancelrace", async () => {
       await mutateState(config.instance, (state) => {
-        const run = state.jobRuns.find((r) => r.id === ctx.run.id);
+        const run = state.jobRuns.find((r) => r.status === "running");
         if (run) {
+          capturedRunId = run.id;
           run.status = "failed";
           run.error = "Cancelled";
           run.completedAt = new Date().toISOString();
