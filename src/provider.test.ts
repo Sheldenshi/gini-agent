@@ -3681,27 +3681,30 @@ describe("anthropic provider", () => {
 
   test("generateTaskSummary routes anthropic and falls back on empty text", async () => {
     const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
-    const withText = installFetch(() =>
-      anthropicJson({ id: "s1", type: "message", role: "assistant", content: [{ type: "text", text: "Summary here." }], stop_reason: "end_turn", usage: {} })
-    );
     try {
-      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
-      const result = await generateTaskSummary(config(provider), "summarize");
-      expect(result.text).toBe("Summary here.");
-      expect(result.provider.name).toBe("anthropic");
-      expect(withText.calls[0]!.url).toBe("https://api.anthropic.com/v1/messages");
+      const withText = installFetch(() =>
+        anthropicJson({ id: "s1", type: "message", role: "assistant", content: [{ type: "text", text: "Summary here." }], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const result = await generateTaskSummary(config(provider), "summarize");
+        expect(result.text).toBe("Summary here.");
+        expect(result.provider.name).toBe("anthropic");
+        expect(withText.calls[0]!.url).toBe("https://api.anthropic.com/v1/messages");
+      } finally {
+        withText.restore();
+      }
+      const empty = installFetch(() =>
+        anthropicJson({ id: "s2", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
+      );
+      try {
+        const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+        const result = await generateTaskSummary(config(provider), "summarize");
+        expect(result.text).toBe("The model returned no text output.");
+      } finally {
+        empty.restore();
+      }
     } finally {
-      withText.restore();
-    }
-    const empty = installFetch(() =>
-      anthropicJson({ id: "s2", type: "message", role: "assistant", content: [], stop_reason: "end_turn", usage: {} })
-    );
-    try {
-      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
-      const result = await generateTaskSummary(config(provider), "summarize");
-      expect(result.text).toBe("The model returned no text output.");
-    } finally {
-      empty.restore();
       restoreEnv();
     }
   });

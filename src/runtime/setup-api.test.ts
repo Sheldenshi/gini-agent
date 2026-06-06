@@ -39,6 +39,7 @@ describe("setup-api", () => {
     HOME?: string;
     GINI_STATE_ROOT?: string;
     OPENAI_API_KEY?: string;
+    ANTHROPIC_API_KEY?: string;
     CODEX_AUTH_JSON?: string;
     GINI_PROVIDER?: string;
     GINI_MODEL?: string;
@@ -53,6 +54,7 @@ describe("setup-api", () => {
       HOME: process.env.HOME,
       GINI_STATE_ROOT: process.env.GINI_STATE_ROOT,
       OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
       CODEX_AUTH_JSON: process.env.CODEX_AUTH_JSON,
       GINI_PROVIDER: process.env.GINI_PROVIDER,
       GINI_MODEL: process.env.GINI_MODEL
@@ -61,6 +63,7 @@ describe("setup-api", () => {
     process.env.HOME = s.home;
     process.env.GINI_STATE_ROOT = s.stateRoot;
     delete process.env.OPENAI_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
     // Scrub provider/model env so the test's assertions about the
     // platform default ("codex"/gpt-5.5) are not skewed by an ambient
     // GINI_PROVIDER=echo or similar in the caller's shell.
@@ -90,6 +93,8 @@ describe("setup-api", () => {
     else process.env.GINI_STATE_ROOT = env.GINI_STATE_ROOT;
     if (env.OPENAI_API_KEY === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = env.OPENAI_API_KEY;
+    if (env.ANTHROPIC_API_KEY === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY;
     if (env.CODEX_AUTH_JSON === undefined) delete process.env.CODEX_AUTH_JSON;
     else process.env.CODEX_AUTH_JSON = env.CODEX_AUTH_JSON;
     if (env.GINI_PROVIDER === undefined) delete process.env.GINI_PROVIDER;
@@ -253,6 +258,41 @@ describe("setup-api", () => {
     } finally {
       if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+  });
+
+  test("editing/rotating an active anthropic provider honors a CLI-set custom apiKeyEnv", async () => {
+    const prevBedrock = process.env.BEDROCK_BEARER_TOKEN;
+    process.env.BEDROCK_BEARER_TOKEN = "bedrock-old";
+    // Simulate a CLI-configured provider keyed on a custom env var, with the
+    // canonical ANTHROPIC_API_KEY left unset (scrubbed in beforeEach).
+    config.provider = {
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN"
+    };
+    try {
+      // Model-only edit, blank key, ANTHROPIC_API_KEY unset → must succeed
+      // (the env-already-set check honors the custom var) and keep the env var.
+      const edited = await setSetupProvider(config, { provider: "anthropic", model: "anthropic.claude-haiku-4-5" });
+      expect(edited.ok).toBe(true);
+      expect(config.provider.model).toBe("anthropic.claude-haiku-4-5");
+      expect(config.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+
+      // Rotating the key lands in the custom var (not the canonical one), and
+      // the config keeps reading from it.
+      const rotated = await setSetupProvider(config, { provider: "anthropic", apiKey: "bedrock-new" });
+      expect(rotated.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+      expect(process.env.BEDROCK_BEARER_TOKEN).toBe("bedrock-new");
+      expect(process.env.ANTHROPIC_API_KEY).toBeUndefined();
+      const secrets = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(secrets).toContain("BEDROCK_BEARER_TOKEN=");
+      expect(secrets).not.toContain("ANTHROPIC_API_KEY=");
+    } finally {
+      if (prevBedrock === undefined) delete process.env.BEDROCK_BEARER_TOKEN;
+      else process.env.BEDROCK_BEARER_TOKEN = prevBedrock;
     }
   });
 

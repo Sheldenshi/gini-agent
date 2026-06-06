@@ -127,12 +127,21 @@ export async function setSetupProvider(
   }
   const envKeySpec = ENV_KEY_PROVIDERS[providerName];
   if (envKeySpec) {
+    // Resolve the env var this config actually reads from: for an edit of the
+    // already-active provider, honor its configured apiKeyEnv (e.g. a CLI-set
+    // custom var); otherwise the canonical default. Routing the "already set?"
+    // probe, the key write, and the preserved apiKeyEnv all through one
+    // targetEnvVar keeps write-target == stored-config == read-source, so a
+    // custom-apiKeyEnv provider can be edited/rotated from the web without
+    // being rejected or silently flipped back to the canonical var.
+    const existing = config.provider?.name === providerName ? config.provider : undefined;
+    const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
     // Accept a no-key payload when the env var is already set — the Edit
-    // Provider dialog uses this to update just the default model without
-    // making the user re-type their key. Initial Add Provider still
-    // requires a key because the env var is empty there.
-    const envAlreadySet = Boolean(process.env[envKeySpec.envVar]);
+    // Provider dialog uses this to update just the model/baseUrl without
+    // making the user re-type their key. Initial Add Provider still requires a
+    // key because the env var is empty there.
+    const envAlreadySet = Boolean(process.env[targetEnvVar]);
     if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
         ok: false,
@@ -142,14 +151,11 @@ export async function setSetupProvider(
       };
     }
     if (apiKey) {
-      // Persist to secrets.env so the wrapper-sourced env carries it on
-      // future shell launches. The shared writer lives in src/state/ —
-      // both CLI and runtime are allowed to depend on src/state/.
-      writeKeyToSecretsEnv(envKeySpec.envVar, apiKey);
-      // Make the running gateway use the new key on its very next
-      // provider call. readOpenAIBearer reads process.env on each call,
-      // so this assignment is enough — no restart needed.
-      process.env[envKeySpec.envVar] = apiKey;
+      // Persist to secrets.env so the wrapper-sourced env carries it on future
+      // shell launches, and update process.env so the running gateway uses it
+      // on the very next call (readers read process.env each call — no restart).
+      writeKeyToSecretsEnv(targetEnvVar, apiKey);
+      process.env[targetEnvVar] = apiKey;
     }
 
     // Default omitted model/baseUrl from the already-active provider so the
@@ -157,11 +163,8 @@ export async function setSetupProvider(
     // baseUrl) don't silently reset a configured endpoint (e.g. a Bedrock
     // Mantle URL) back to the per-provider default. Add Provider targets a
     // not-yet-active provider, so `existing` is undefined there and behavior is
-    // unchanged. We deliberately do NOT preserve a custom apiKeyEnv: the key is
-    // always (re)written to envKeySpec.envVar, so keeping a CLI-set custom env
-    // var would make a web key update land in a var the resolved config never
-    // reads.
-    const existing = config.provider?.name === providerName ? config.provider : undefined;
+    // unchanged. apiKeyEnv is preserved so it stays in lockstep with the
+    // targetEnvVar the key was written to.
     const model = typeof payload.model === "string" && payload.model.length > 0
       ? payload.model
       : (existing?.model ?? envKeySpec.defaultModel);
@@ -171,7 +174,8 @@ export async function setSetupProvider(
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
-      ...(baseUrl ? { baseUrl } : {})
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
