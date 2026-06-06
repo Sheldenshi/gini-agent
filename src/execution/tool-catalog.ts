@@ -1425,7 +1425,7 @@ const TOOL_DEFS: Array<ToolFunctionSpec & { toolset: string; displayLabel?: stri
             description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
           },
           model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-          baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+          baseUrl: { type: "string", description: "Override base URL. For OpenAI-compatible providers (openai, openrouter, deepseek, local) this is the chat-completions endpoint; for anthropic it is the Messages API endpoint (e.g. a Bedrock Mantle URL). Ignored for codex/echo." },
           apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
         },
         required: []
