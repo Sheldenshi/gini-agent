@@ -14,7 +14,7 @@
 import type { EmailWatcherRecord, RuntimeConfig, RuntimeState } from "../types";
 import { id, now } from "./ids";
 import { addAudit } from "./audit";
-import { createChatSession } from "./records";
+import { createChatSession, deleteChatSession } from "./records";
 import { deleteEmailSeenForWatcher } from "./memory-db";
 import { mutateState, readState } from "./store";
 
@@ -85,19 +85,26 @@ export async function addEmailWatcher(
   // state). On failure roll the watcher back so a half-provisioned watcher never
   // lingers without a scheduler.
   try {
-    const { createScheduledJob } = await import("../jobs");
-    const job = await createScheduledJob(
-      config,
-      {
-        name: input.sender ? `Email watch: ${input.sender}` : "Email watch",
-        prompt: EMAIL_WATCH_JOB_PROMPT,
-        intervalSeconds: EMAIL_WATCH_INTERVAL_SECONDS,
-        chatSessionId: watcher.chatSessionId,
-        preRunHook: { handlerId: "gmail-delta", config: { watcherId: watcher.id } }
-      },
-      { originatingAgentId: watcher.agentId }
-    );
-    const updated = await updateEmailWatcher(config, watcher.id, { jobId: job.id });
+    // Adopt an already-provisioned backing job if one exists for this watcher
+    // (a retry after a crash between createScheduledJob and the jobId stamp)
+    // rather than creating a duplicate.
+    let jobId = findBackingJob(config, watcher.id);
+    if (!jobId) {
+      const { createScheduledJob } = await import("../jobs");
+      const job = await createScheduledJob(
+        config,
+        {
+          name: input.sender ? `Email watch: ${input.sender}` : "Email watch",
+          prompt: EMAIL_WATCH_JOB_PROMPT,
+          intervalSeconds: EMAIL_WATCH_INTERVAL_SECONDS,
+          chatSessionId: watcher.chatSessionId,
+          preRunHook: { handlerId: "gmail-delta", config: { watcherId: watcher.id } }
+        },
+        { originatingAgentId: watcher.agentId }
+      );
+      jobId = job.id;
+    }
+    const updated = await updateEmailWatcher(config, watcher.id, { jobId });
     return updated ?? watcher;
   } catch (error) {
     await removeEmailWatcher(config, watcher.id);
@@ -179,6 +186,15 @@ export async function removeEmailWatcher(config: RuntimeConfig, watcherId: strin
     const index = state.emailWatchers.findIndex((candidate) => candidate.id === watcherId);
     if (index < 0) throw new Error(`Email watcher not found: ${watcherId}`);
     const [item] = state.emailWatchers.splice(index, 1);
+    // Drop the watcher's dedicated chat session. It's an auto-created job
+    // channel that exists only to host this watcher's drafting turns, so it
+    // must not outlive the watcher (it would leak an empty channel + its
+    // messages/blocks/identity snapshot). Guarded: a session already removed
+    // out-of-band (e.g. a failed createScheduledJob rollback that never got a
+    // session, or a manual delete) is a no-op.
+    if (item!.chatSessionId && state.chatSessions.some((s) => s.id === item!.chatSessionId)) {
+      deleteChatSession(state, item!.chatSessionId);
+    }
     addAudit(
       state,
       {
@@ -220,10 +236,27 @@ export async function setEmailWatcherEnabled(
   return updated;
 }
 
+// Find an existing backing job for a watcher by its hook config, so a watcher
+// whose jobId wasn't stamped (a crash between createScheduledJob and the jobId
+// write) is ADOPTED rather than duplicated. The pointer of record is the hook's
+// declarative config (preRunHook.config.watcherId), which createScheduledJob
+// persisted atomically with the job.
+function findBackingJob(config: RuntimeConfig, watcherId: string): string | undefined {
+  const job = readState(config.instance).jobs.find(
+    (j) =>
+      j.preRunHook?.handlerId === "gmail-delta" &&
+      (j.preRunHook.config as { watcherId?: unknown }).watcherId === watcherId
+  );
+  return job?.id;
+}
+
 // Provision a backing job for any enabled watcher that lacks a resolvable one
 // (legacy watchers created before the hooks cutover, or a watcher whose job was
-// removed out-of-band). Idempotent: re-running finds the job and does nothing,
-// so it's safe to call on every startup. Returns the count of jobs provisioned.
+// removed out-of-band). Idempotent: a watcher with a live jobId is skipped, and
+// a watcher whose job exists but whose jobId wasn't stamped (crash between
+// createScheduledJob and the jobId write) ADOPTS that job instead of creating a
+// duplicate. Safe to call on every startup. Returns the count of jobs newly
+// provisioned (adoptions are not counted as new provisions).
 export async function backfillEmailWatcherJobs(config: RuntimeConfig): Promise<number> {
   const watchers = readState(config.instance).emailWatchers;
   let provisioned = 0;
@@ -233,6 +266,13 @@ export async function backfillEmailWatcherJobs(config: RuntimeConfig): Promise<n
     if (watcher.jobId) {
       const live = readState(config.instance).jobs.find((j) => j.id === watcher.jobId);
       if (live) continue;
+    }
+    // Adopt an orphan backing job (created but jobId never stamped) instead of
+    // creating a second one — otherwise the watcher double-polls + double-drafts.
+    const orphanJobId = findBackingJob(config, watcher.id);
+    if (orphanJobId) {
+      await updateEmailWatcher(config, watcher.id, { jobId: orphanJobId });
+      continue;
     }
     const { createScheduledJob } = await import("../jobs");
     const job = await createScheduledJob(

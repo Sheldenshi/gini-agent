@@ -7,14 +7,17 @@ import { join } from "node:path";
 import type { RuntimeConfig } from "../types";
 import {
   addEmailWatcher,
+  backfillEmailWatcherJobs,
   buildWatcherQuery,
   closeAllMemoryDbs,
   getEmailWatcher,
   isEmailSeen,
   listEmailWatchers,
   markEmailSeen,
+  mutateState,
   readState,
   removeEmailWatcher,
+  setEmailWatcherEnabled,
   updateEmailWatcher
 } from ".";
 
@@ -103,6 +106,127 @@ describe("watcher CRUD", () => {
   test("remove on a missing watcher throws", async () => {
     const config = buildConfig("ew-remove-missing");
     await expect(removeEmailWatcher(config, "nope")).rejects.toThrow("Email watcher not found");
+  });
+});
+
+describe("backing job lifecycle", () => {
+  function backingJob(config: ReturnType<typeof buildConfig>, watcherId: string) {
+    return readState(config.instance).jobs.find(
+      (j) => j.preRunHook?.handlerId === "gmail-delta" &&
+        (j.preRunHook.config as { watcherId?: string }).watcherId === watcherId
+    );
+  }
+
+  test("add provisions a correctly-shaped backing job and stamps jobId", async () => {
+    const config = buildConfig("ew-job-add");
+    const watcher = await addEmailWatcher(config, { sender: "dave@x.com" });
+    expect(watcher.jobId).toBeString();
+    const job = backingJob(config, watcher.id);
+    expect(job).toBeDefined();
+    expect(job?.id).toBe(watcher.jobId!);
+    expect(job?.preRunHook?.handlerId).toBe("gmail-delta");
+    expect((job?.preRunHook?.config as { watcherId?: string }).watcherId).toBe(watcher.id);
+    expect(job?.chatSessionId).toBe(watcher.chatSessionId);
+    expect(job?.intervalSeconds).toBe(60);
+  });
+
+  test("remove deletes the backing job, the dedup rows, and the dedicated session", async () => {
+    const config = buildConfig("ew-job-remove");
+    const watcher = await addEmailWatcher(config, { sender: "erin@x.com" });
+    markEmailSeen(config.instance, watcher.id, "msg-1");
+    const jobId = watcher.jobId!;
+    const sessionId = watcher.chatSessionId!;
+    await removeEmailWatcher(config, watcher.id);
+    const state = readState(config.instance);
+    // Watcher, job, and dedicated session all gone.
+    expect(state.emailWatchers.find((w) => w.id === watcher.id)).toBeUndefined();
+    expect(state.jobs.find((j) => j.id === jobId)).toBeUndefined();
+    expect(state.chatSessions.find((s) => s.id === sessionId)).toBeUndefined();
+    // Dedup rows dropped.
+    expect(isEmailSeen(config.instance, watcher.id, "msg-1")).toBe(false);
+  });
+
+  test("removeEmailWatcher cleans the session even when the backing job is already gone (rollback shape)", async () => {
+    // The addEmailWatcher rollback path (createScheduledJob threw) calls
+    // removeEmailWatcher on a watcher whose job-create never completed. Model
+    // that shape: a watcher with no jobId and no backing job. removeEmailWatcher
+    // must still drop the dedicated session (no orphan channel).
+    const config = buildConfig("ew-job-rollback");
+    const watcher = await addEmailWatcher(config, { sender: "frank@x.com" });
+    const sessionId = watcher.chatSessionId!;
+    await updateEmailWatcher(config, watcher.id, { jobId: undefined });
+    await mutateState(config.instance, (state) => {
+      state.jobs = state.jobs.filter(
+        (j) => (j.preRunHook?.config as { watcherId?: string })?.watcherId !== watcher.id
+      );
+    });
+    await removeEmailWatcher(config, watcher.id);
+    const state = readState(config.instance);
+    expect(state.chatSessions.find((s) => s.id === sessionId)).toBeUndefined();
+  });
+
+  test("backfill adopts an orphan job (jobId never stamped) instead of duplicating", async () => {
+    const config = buildConfig("ew-job-adopt");
+    const watcher = await addEmailWatcher(config, { sender: "grace@x.com" });
+    const jobId = watcher.jobId!;
+    // Model the crash window: the job exists but the watcher's jobId was never
+    // stamped.
+    await updateEmailWatcher(config, watcher.id, { jobId: undefined });
+    const provisioned = await backfillEmailWatcherJobs(config);
+    // Adoption is not a new provision.
+    expect(provisioned).toBe(0);
+    const after = getEmailWatcher(config, watcher.id);
+    // jobId re-stamped to the SAME job — no duplicate created.
+    expect(after?.jobId).toBe(jobId);
+    const jobsForWatcher = readState(config.instance).jobs.filter(
+      (j) => (j.preRunHook?.config as { watcherId?: string })?.watcherId === watcher.id
+    );
+    expect(jobsForWatcher).toHaveLength(1);
+  });
+
+  test("backfill provisions a job for a legacy watcher that has none", async () => {
+    const config = buildConfig("ew-job-backfill-legacy");
+    const watcher = await addEmailWatcher(config, { sender: "heidi@x.com" });
+    // Model a legacy watcher: no jobId AND no backing job at all.
+    await updateEmailWatcher(config, watcher.id, { jobId: undefined });
+    await mutateState(config.instance, (state) => {
+      state.jobs = state.jobs.filter(
+        (j) => (j.preRunHook?.config as { watcherId?: string })?.watcherId !== watcher.id
+      );
+    });
+    const provisioned = await backfillEmailWatcherJobs(config);
+    expect(provisioned).toBe(1);
+    expect(getEmailWatcher(config, watcher.id)?.jobId).toBeString();
+  });
+
+  test("backfill skips disabled watchers", async () => {
+    const config = buildConfig("ew-job-backfill-disabled");
+    const watcher = await addEmailWatcher(config, { sender: "ivan@x.com" });
+    await setEmailWatcherEnabled(config, watcher.id, false);
+    // Strip its job + jobId so backfill would re-provision IF it ran.
+    await updateEmailWatcher(config, watcher.id, { jobId: undefined });
+    await mutateState(config.instance, (state) => {
+      state.jobs = state.jobs.filter(
+        (j) => (j.preRunHook?.config as { watcherId?: string })?.watcherId !== watcher.id
+      );
+    });
+    const provisioned = await backfillEmailWatcherJobs(config);
+    expect(provisioned).toBe(0);
+    expect(getEmailWatcher(config, watcher.id)?.jobId).toBeUndefined();
+  });
+
+  test("disable pauses the backing job; enable resumes it", async () => {
+    const config = buildConfig("ew-job-toggle");
+    const watcher = await addEmailWatcher(config, { sender: "judy@x.com" });
+    const jobId = watcher.jobId!;
+    const jobStatus = () => readState(config.instance).jobs.find((j) => j.id === jobId)?.status;
+    expect(jobStatus()).toBe("active");
+    await setEmailWatcherEnabled(config, watcher.id, false);
+    expect(getEmailWatcher(config, watcher.id)?.enabled).toBe(false);
+    expect(jobStatus()).toBe("paused");
+    await setEmailWatcherEnabled(config, watcher.id, true);
+    expect(getEmailWatcher(config, watcher.id)?.enabled).toBe(true);
+    expect(jobStatus()).toBe("active");
   });
 });
 
