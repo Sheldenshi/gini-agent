@@ -22,19 +22,26 @@ import { createApnsDispatcher } from "./integrations/apns/dispatcher";
 import { fireCacheWarmerProbe } from "./runtime/cache-warmer";
 import { reconcileTunnelOnStartup, stopAllTunnels } from "./integrations/tunnel";
 
+// Marks the moment this module finished loading (ms since process start), so
+// the runtime.started log can split total boot into module-load vs. the boot
+// steps below. Captured first so it reflects import/parse cost before any work.
+const moduleLoadedMs = performance.now();
+
 // Shutdown drain budgets. Centralized so both timeouts are visible in one
 // place — each guards a different unwind step on SIGTERM.
 //
-// SERVER_DRAIN_TIMEOUT_MS: how long we wait for in-flight HTTP responses
-// (server.stop(false)) to finish writing before tearing the process down.
-// A single stalled client (broken pipe) shouldn't block shutdown forever;
-// 5s is a comfortable bound for normal local HTTP latencies.
+// SERVER_DRAIN_GRACE_MS: how long we let genuine in-flight HTTP responses
+// (server.stop(false)) finish writing before we force-close the rest.
+// Idle keep-alive connections linger up to idleTimeout (255s), so the
+// graceful stop never resolves on its own; this brief grace bounds the
+// wait, then server.stop(true) force-closes whatever's left.
 //
 // SCHEDULER_DRAIN_TIMEOUT_MS: bounds the wait for the in-flight scheduler
 // tick to unwind. A hung tick (e.g. a script job blocking on stdio)
 // shouldn't keep the runtime alive forever — the OS reaps the child
-// process tree on exit anyway.
-const SERVER_DRAIN_TIMEOUT_MS = 5000;
+// process tree on exit anyway. With abortable loop sleeps this resolves
+// promptly unless a real job tick is genuinely mid-execution.
+const SERVER_DRAIN_GRACE_MS = 500;
 const SCHEDULER_DRAIN_TIMEOUT_MS = 5000;
 
 const instance = parseInstance();
@@ -44,7 +51,9 @@ const config = loadConfig(instance);
 // redacted report; nothing is filed here — the on-restart consent flow
 // (maybeAskAboutCrashes) asks the user before any report is published.
 installCrashHandlers({ instance, source: "runtime" });
+const installStartedMs = performance.now();
 await install(config);
+const installFinishedMs = performance.now();
 writePid(config);
 
 // Inform the browser session manager which instance to consult for the
@@ -94,6 +103,7 @@ await reconcileTunnelOnStartup(config).catch((error) => {
     error: error instanceof Error ? error.message : String(error)
   });
 });
+const tunnelReconcileFinishedMs = performance.now();
 
 // Reconcile the installed launchd plists against the current supervision
 // template. For a launchd-managed instance whose on-disk plist predates a
@@ -109,6 +119,7 @@ await reconcileAutostartPlistOnStartup(config).catch((error) => {
     error: error instanceof Error ? error.message : String(error)
   });
 });
+const autostartReconcileFinishedMs = performance.now();
 
 // Legacy Hindsight-migration opportunistic seam. The
 // state.memories surface was retired in the memory-surface
@@ -236,7 +247,15 @@ const server = Bun.serve({
 // SIGTERM below.
 writeFileSync(runtimePortPath(config.instance), String(server.port));
 
-appendLog(config.instance, "runtime.started", { port: server.port, pid: process.pid });
+appendLog(config.instance, "runtime.started", {
+  port: server.port,
+  pid: process.pid,
+  bootMs: Math.round(performance.now()),
+  moduleLoadMs: Math.round(moduleLoadedMs),
+  installMs: Math.round(installFinishedMs - installStartedMs),
+  tunnelReconcileMs: Math.round(tunnelReconcileFinishedMs - installFinishedMs),
+  autostartReconcileMs: Math.round(autostartReconcileFinishedMs - tunnelReconcileFinishedMs)
+});
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);
 
 // If crashes were captured while we were down, offer (default + launchd only)
@@ -244,6 +263,13 @@ console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=
 maybeAskAboutCrashes(config).catch((err) =>
   appendLog(config.instance, "crash.recovery.error", { error: String(err) })
 );
+
+// Resolves the moment shutdown begins so the background loops below interrupt
+// their inter-tick sleep and unwind immediately instead of sleeping out their
+// full interval (up to 60s for the reprobe loop) while the drain waits on them.
+let beginShutdown: () => void = () => {};
+const shuttingDown = new Promise<void>((resolve) => { beginShutdown = resolve; });
+const sleepUnlessStopping = (ms: number): Promise<unknown> => Promise.race([Bun.sleep(ms), shuttingDown]);
 
 // Self-rescheduling scheduler loop. We await runDueJobs(config) before
 // scheduling the next tick so a slow tick (e.g. spawning N script jobs
@@ -268,7 +294,7 @@ const schedulerDone: Promise<void> = (async function schedulerLoop(): Promise<vo
       });
     }
     if (schedulerStopped) break;
-    await Bun.sleep(1000);
+    await sleepUnlessStopping(1000);
   }
 })();
 
@@ -296,7 +322,7 @@ const reprobeDone: Promise<void> = (async function reprobeLoop(): Promise<void> 
       });
     }
     if (reprobeStopped) break;
-    await Bun.sleep(REPROBE_TICK_INTERVAL_MS);
+    await sleepUnlessStopping(REPROBE_TICK_INTERVAL_MS);
   }
 })();
 
@@ -326,7 +352,7 @@ const telegramDone: Promise<void> = (async function telegramReconcileLoop(): Pro
       });
     }
     if (telegramStopped) break;
-    await Bun.sleep(MESSAGING_RECONCILE_INTERVAL_MS);
+    await sleepUnlessStopping(MESSAGING_RECONCILE_INTERVAL_MS);
   }
 })();
 
@@ -346,7 +372,7 @@ const discordDone: Promise<void> = (async function discordReconcileLoop(): Promi
       });
     }
     if (discordStopped) break;
-    await Bun.sleep(MESSAGING_RECONCILE_INTERVAL_MS);
+    await sleepUnlessStopping(MESSAGING_RECONCILE_INTERVAL_MS);
   }
 })();
 
@@ -364,7 +390,7 @@ const cacheWarmerDone: Promise<void> = (async function cacheWarmerLoop(): Promis
   while (!cacheWarmerStopped) {
     const minutes = config.cacheWarmerMinutes ?? 0;
     if (minutes > 0) {
-      await Bun.sleep(minutes * 54_000);
+      await sleepUnlessStopping(minutes * 54_000);
       if (cacheWarmerStopped) break;
       try {
         await fireCacheWarmerProbe(config);
@@ -375,7 +401,7 @@ const cacheWarmerDone: Promise<void> = (async function cacheWarmerLoop(): Promis
         });
       }
     } else {
-      await Bun.sleep(CACHE_WARMER_IDLE_TICK_MS);
+      await sleepUnlessStopping(CACHE_WARMER_IDLE_TICK_MS);
     }
   }
 })();
@@ -392,12 +418,16 @@ let shutdownStarted = false;
 process.on("SIGTERM", async () => {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  const shutdownStartedMs = performance.now();
   appendLog(config.instance, "runtime.stopped", { signal: "SIGTERM" });
   schedulerStopped = true;
   reprobeStopped = true;
   telegramStopped = true;
   discordStopped = true;
   cacheWarmerStopped = true;
+  // Wake every loop out of its inter-tick sleep so it checks the flag and
+  // unwinds now instead of sleeping out its full interval.
+  beginShutdown();
   // Tear down the chat-blocks subscription so the dispatcher stops
   // emitting pushes during drain. The APNs HTTP/2 client owns its own
   // session and will close lazily when garbage-collected.
@@ -409,28 +439,18 @@ process.on("SIGTERM", async () => {
   void telegramSupervisor.stopAll().catch(() => {});
   void discordSupervisor.stopAll().catch(() => {});
   // Drain in-flight HTTP responses BEFORE we start tearing the process
-  // down. `server.stop(false)` returns a promise that resolves when
-  // active requests have completed writing — without this, a setup POST
-  // that triggered the SIGTERM (see src/runtime/autostart-refresh.ts)
-  // could have its response body cut mid-stream when the process exits.
-  //
-  // Bun's server.stop(true) FORCE-closes connections (per
-  // node_modules/bun-types/docs/runtime/http/server.mdx:251-258). We
-  // want stop(false) — the polite "wait for in-flight" variant.
-  //
-  // Failsafe: if a single connection is hung (stalled client, broken
-  // pipe), don't block shutdown indefinitely. Race the drain against
-  // SERVER_DRAIN_TIMEOUT_MS; on timeout, log and proceed (a force-stop
-  // happens implicitly on process.exit).
+  // down. `server.stop(false)` only resolves once every connection has
+  // closed, but idle keep-alive connections linger up to idleTimeout
+  // (255s), so the graceful stop never resolves and shutdown burned the
+  // full timeout. Give genuine in-flight responses a brief grace to finish
+  // writing, then force-close the rest with server.stop(true). The
+  // in-flight setup POST (/api/update) that triggered the SIGTERM (see
+  // src/runtime/autostart-refresh.ts) is already flushed by here — the
+  // handler returns its response before scheduling the self-SIGTERM — so
+  // force-closing doesn't truncate it.
   try {
-    await Promise.race([
-      server.stop(false),
-      Bun.sleep(SERVER_DRAIN_TIMEOUT_MS).then(() => {
-        appendLog(config.instance, "runtime.stop.timeout", {
-          waited_ms: SERVER_DRAIN_TIMEOUT_MS
-        });
-      })
-    ]);
+    await Promise.race([server.stop(false), Bun.sleep(SERVER_DRAIN_GRACE_MS)]);
+    server.stop(true);
   } catch (error) {
     appendLog(config.instance, "runtime.stop.error", {
       error: error instanceof Error ? error.message : String(error)
@@ -446,6 +466,7 @@ process.on("SIGTERM", async () => {
   // script job that spawned a child blocking on stdio) shouldn't block
   // shutdown forever. After the timeout we proceed even if the tick
   // hasn't unwound — the OS will reap the child process tree on exit.
+  const SCHEDULER_DRAIN_TIMED_OUT = Symbol("scheduler-drain-timed-out");
   const drained = Promise.race([
     Promise.all([
       schedulerDone.catch(() => {}),
@@ -466,8 +487,17 @@ process.on("SIGTERM", async () => {
       // stop shouldn't block shutdown; the OS reaps the child on exit.
       stopAllTunnels().catch(() => {})
     ]),
-    Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS)
-  ]);
+    Bun.sleep(SCHEDULER_DRAIN_TIMEOUT_MS).then(() => SCHEDULER_DRAIN_TIMED_OUT)
+  ]).then((result) => {
+    // With abortable loop sleeps the drain resolves promptly; the timeout is
+    // now a rarely-hit failsafe for a genuinely hung in-flight tick. Surface
+    // it when it does fire so the cost is visible in the event stream.
+    if (result === SCHEDULER_DRAIN_TIMED_OUT) {
+      appendLog(config.instance, "runtime.stop.scheduler-timeout", {
+        waited_ms: SCHEDULER_DRAIN_TIMEOUT_MS
+      });
+    }
+  });
   // Print a stable shutdown marker so the foreground log capture (and any
   // human tailing the file) can see that the runtime is going down. Without
   // this, the SIGTERM path emits no stdio at all and observability of clean
@@ -498,6 +528,9 @@ process.on("SIGTERM", async () => {
       });
     }
     process.stdout.write(`Gini runtime shutting down (SIGTERM) instance=${config.instance}\n`, () => {
+      appendLog(config.instance, "runtime.stop.drained", {
+        drainMs: Math.round(performance.now() - shutdownStartedMs)
+      });
       process.exit(0);
     });
   });
