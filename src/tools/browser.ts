@@ -2500,6 +2500,15 @@ export async function browserVision(
   const full = bool(args.full, false);
   try {
     return await withSession(taskId, async (session) => {
+      // Refuse to screenshot a page on a refused origin (loopback
+      // control-plane, cloud metadata, link-local). browser_vision ships the
+      // rendered pixels to the vision provider, so an unguarded screenshot of
+      // a loopback page would exfiltrate control-plane state as an image —
+      // the same surface browser_console and snapshot() already gate.
+      const visionBlock = await assertNotLoopbackPage(session.page);
+      if (visionBlock) {
+        return fail(`${visionBlock} (refusing to screenshot a disallowed origin)`);
+      }
       // Capture the disconnect generation BEFORE the screenshot. A slow
       // screenshot (large full-page captures can take seconds) followed by
       // a disconnect mid-await would otherwise slip past the post-fetch
@@ -2558,6 +2567,13 @@ export async function browserVision(
         return fail(
           `Screenshot too large (${buf.length} bytes > 5MB cap). Try full:false or scroll to a specific section.`
         );
+      }
+      // Re-check after the capture: if the page navigated to a refused origin
+      // while the screenshot was in flight, discard the buffer rather than
+      // sending its pixels to the vision provider.
+      const postShotBlock = await assertNotLoopbackPage(session.page);
+      if (postShotBlock) {
+        return fail(`${postShotBlock} (page navigated to a disallowed origin during capture; discarding screenshot)`);
       }
       const imageBase64 = Buffer.from(buf).toString("base64");
       const result = await generateVisionAnalysis(config, {

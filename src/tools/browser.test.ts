@@ -3125,3 +3125,53 @@ describe("browserConsole loopback guard", () => {
     expect(out.error).toContain("disconnecting");
   });
 });
+
+// browser_vision ships rendered pixels to the vision provider, so it must
+// refuse a loopback / metadata / link-local page just like browser_console
+// and snapshot() do — otherwise the control plane is exfiltrated as an image.
+describe("browserVision loopback guard", () => {
+  afterEach(() => {
+    browserTest.clearFakeSessionsForTest();
+    browserTest.setInFlightDisconnectsForTest(0);
+  });
+
+  test("refuses to screenshot a loopback control-plane page and bounces it", async () => {
+    let gotoTarget: string | undefined;
+    let screenshotCalled = false;
+    browserTest.installFakeSessionWithPageForTest("vision-loopback", {
+      url: () => "http://127.0.0.1:7373/api/runtime/setup-requests",
+      goto: (async (u: string) => {
+        gotoTarget = u;
+        return null;
+      }) as unknown as import("playwright-core").Page["goto"],
+      screenshot: (async () => {
+        screenshotCalled = true;
+        return Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+      }) as unknown as import("playwright-core").Page["screenshot"]
+    });
+    const out = JSON.parse(
+      await browserVision("vision-loopback", { question: "what is shown?" }, {} as unknown as RuntimeConfig)
+    ) as { success: boolean; error?: string };
+    expect(out.success).toBe(false);
+    expect(out.error).toContain("loopback");
+    expect(gotoTarget).toBe("about:blank");
+    // The screenshot must never have been taken.
+    expect(screenshotCalled).toBe(false);
+  });
+
+  test("discards the screenshot if the page navigated to a refused origin during capture", async () => {
+    let urlCalls = 0;
+    browserTest.installFakeSessionWithPageForTest("vision-postshot", {
+      // Benign on the pre-screenshot read; loopback on the post-capture read.
+      url: () => (++urlCalls === 1 ? "https://example.com/" : "http://127.0.0.1:7373/"),
+      goto: (async () => null) as unknown as import("playwright-core").Page["goto"],
+      evaluate: (async () => []) as unknown as import("playwright-core").Page["evaluate"],
+      screenshot: (async () => Buffer.from([0x89, 0x50, 0x4e, 0x47])) as unknown as import("playwright-core").Page["screenshot"]
+    });
+    const out = JSON.parse(
+      await browserVision("vision-postshot", { question: "what is shown?" }, {} as unknown as RuntimeConfig)
+    ) as { success: boolean; error?: string };
+    expect(out.success).toBe(false);
+    expect(out.error).toContain("loopback");
+  });
+});
