@@ -920,10 +920,10 @@ function isBlockedIpv6(host: string): string | undefined {
   return undefined;
 }
 
-// The bare loopback hostnames the agent's browser may never reach. This
-// is the single source for the list: safetyCheck consumes it server-side,
-// and browser_console's in-page origin assertion receives it as a
-// page.evaluate argument. One array means the two checks can't drift.
+// The bare loopback hostnames the agent's browser may never reach.
+// safetyCheck and hostnameIsLoopback share this one array so they can't
+// drift. (browser_console's in-page guard pins the validated origin rather
+// than re-classifying hosts, so it does not consume this list.)
 const LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "0.0.0.0", "localhost", "::1"];
 
 // True when `hostname` denotes a loopback origin: an exact LOOPBACK_HOSTS
@@ -932,10 +932,8 @@ const LOOPBACK_HOSTS: readonly string[] = ["127.0.0.1", "0.0.0.0", "localhost", 
 // (browsers normalize [::ffff:127.0.0.1] / [::127.0.0.1] to the hex forms
 // [::ffff:7f00:1] / [::7f00:1]). Strips IPv6 brackets and a trailing root
 // dot and lowercases first, so bracketed / fully-qualified / mixed-case
-// forms classify the same as their bare form. Exported so the predicate is
-// unit-testable on its own; the same rules are mirrored inline in
-// browser_console's in-page guard, which can't import module code into the
-// page context.
+// forms classify the same as their bare form. Used by safetyCheck and
+// exported so the predicate is unit-testable on its own.
 export function hostnameIsLoopback(hostname: string): boolean {
   const h = hostname.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
   if (LOOPBACK_HOSTS.includes(h) || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || h.endsWith(".localhost")) {
