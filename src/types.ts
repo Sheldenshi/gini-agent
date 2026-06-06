@@ -172,10 +172,11 @@ export interface ProviderConfig {
   // bodies (tool-calling, structured JSON, vision, and the chat-completions
   // branch of generateTaskSummary). The local and openrouter providers route
   // every call through chat-completions, so extraBody applies everywhere for
-  // them. The openai provider uses /responses for generateTaskSummary, so
-  // extraBody only applies on its tool-calling, structured, and vision
-  // calls. Codex uses /responses with its own shape and ignores extraBody;
-  // echo bypasses HTTP entirely.
+  // them. Standard openai uses /responses for generateTaskSummary, so extraBody
+  // applies there only on its tool-calling, structured, and vision calls — but
+  // in Azure mode generateTaskSummary routes through chat-completions too, so
+  // extraBody also applies to the summary call. Codex uses /responses with its
+  // own shape and ignores extraBody; echo bypasses HTTP entirely.
   //
   // Reserved keys are stripped at send time so extraBody can never override
   // runtime-controlled fields. The base denylist covers fields the runtime
