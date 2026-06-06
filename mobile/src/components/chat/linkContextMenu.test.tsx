@@ -16,6 +16,7 @@ const {
   isWebUrl,
   linkHostname,
   openLink,
+  openLinkExternally,
   copyLink,
   shareLink,
   handleMarkdownLinkPress,
@@ -76,6 +77,15 @@ describe("link actions", () => {
     openLink("https://x.com");
     expect(linkingOpenURL).toHaveBeenCalledWith("https://x.com");
     expect(openBrowserAsync).not.toHaveBeenCalled();
+  });
+
+  test("openLinkExternally opens the system default browser for web urls only", () => {
+    openLinkExternally("https://x.com");
+    expect(linkingOpenURL).toHaveBeenCalledWith("https://x.com");
+    expect(openBrowserAsync).not.toHaveBeenCalled();
+    linkingOpenURL.mockClear();
+    openLinkExternally("tel:123");
+    expect(linkingOpenURL).not.toHaveBeenCalled();
   });
 
   test("copyLink writes to the clipboard", () => {
@@ -159,14 +169,17 @@ describe("LinkContextMenuHost", () => {
     backdrop.props.onPress();
     expect(setRequest).toHaveBeenCalledWith(null);
 
-    const card = backdrop.props.children;
+    // backdrop -> shadow wrapper -> clipped card -> rows.
+    const cardShadow = backdrop.props.children;
+    const card = cardShadow.props.children;
     const rows = (card.props.children as any[]).filter(
       (c) => c && typeof c === "object" && typeof c.type === "function" && c.props?.label
     );
     expect(rows.map((r) => r.props.label)).toEqual(["Open Link", "Copy Link", "Share…"]);
 
+    // Menu "Open Link" hands off to the system default browser, not in-app.
     rows[0].props.onPress();
-    expect(openBrowserAsync).toHaveBeenCalledWith("https://lego.com/x");
+    expect(linkingOpenURL).toHaveBeenCalledWith("https://lego.com/x");
     rows[1].props.onPress();
     expect(setStringAsync).toHaveBeenCalledWith("https://lego.com/x");
     rows[2].props.onPress();

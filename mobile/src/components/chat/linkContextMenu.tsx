@@ -53,6 +53,15 @@ export function openLink(href: string): void {
   WebBrowser.openBrowserAsync(href).catch(ignore);
 }
 
+// Open a link in the system DEFAULT browser (external Safari/Chrome), leaving
+// the app. Used by the long-press menu's "Open Link" action to match the native
+// iOS link menu, whose "Open Link" hands off to the default browser — distinct
+// from a plain tap, which stays in the in-app browser via openLink.
+export function openLinkExternally(href: string): void {
+  if (!isWebUrl(href)) return;
+  Linking.openURL(href).catch(ignore);
+}
+
 export function copyLink(href: string): void {
   Clipboard.setStringAsync(href).catch(ignore);
 }
@@ -162,24 +171,29 @@ export function LinkContextMenuHost() {
   // An overlay has no view controller to dismiss, so the open is clean.
   return (
     <Pressable style={styles.backdrop} onPress={close}>
-      <View style={[styles.card, { left, top }]}>
-        <View style={styles.preview}>
-          <Feather name="globe" size={16} color={theme.subtle} />
-          <View style={styles.previewText}>
-            <Text numberOfLines={1} style={styles.previewHost}>
-              {linkHostname(request.href)}
-            </Text>
-            <Text numberOfLines={1} style={styles.previewUrl}>
-              {request.href}
-            </Text>
+      {/* Outer wrapper carries the shadow; the inner card clips its rows to
+          the rounded corners. They're split because `overflow: hidden`
+          (needed to clip the rows) also clips the shadow on iOS. */}
+      <View style={[styles.cardShadow, { left, top }]}>
+        <View style={styles.card}>
+          <View style={styles.preview}>
+            <Feather name="globe" size={16} color={theme.subtle} />
+            <View style={styles.previewText}>
+              <Text numberOfLines={1} style={styles.previewHost}>
+                {linkHostname(request.href)}
+              </Text>
+              <Text numberOfLines={1} style={styles.previewUrl}>
+                {request.href}
+              </Text>
+            </View>
           </View>
+          <View style={styles.sep} />
+          <MenuRow icon="compass" label="Open Link" onPress={run(openLinkExternally)} />
+          <View style={styles.sep} />
+          <MenuRow icon="link" label="Copy Link" onPress={run(copyLink)} />
+          <View style={styles.sep} />
+          <MenuRow icon="share" label="Share…" onPress={run(shareLink)} />
         </View>
-        <View style={styles.sep} />
-        <MenuRow icon="compass" label="Open Link" onPress={run(openLink)} />
-        <View style={styles.sep} />
-        <MenuRow icon="link" label="Copy Link" onPress={run(copyLink)} />
-        <View style={styles.sep} />
-        <MenuRow icon="share" label="Share…" onPress={run(shareLink)} />
       </View>
     </Pressable>
   );
@@ -195,20 +209,28 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
+    // Dim the screen behind the menu so a white card reads against white chat.
+    backgroundColor: "rgba(0, 0, 0, 0.25)",
     zIndex: 1001,
     elevation: 1001
   },
-  card: {
+  cardShadow: {
     position: "absolute",
     width: MENU_WIDTH,
+    borderRadius: 14,
     backgroundColor: theme.surface,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.3,
+    shadowRadius: 24,
+    elevation: 16
+  },
+  card: {
     borderRadius: 14,
     overflow: "hidden",
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.18,
-    shadowRadius: 16,
-    elevation: 8
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: theme.borderStrong,
+    backgroundColor: theme.surface
   },
   preview: {
     flexDirection: "row",

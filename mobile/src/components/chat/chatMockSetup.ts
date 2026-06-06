@@ -110,6 +110,7 @@ mock.module("@/src/theme", () => ({
     muted: "#8A8A8A",
     codeChipText: "#3A3A3C",
     border: "#ECECEC",
+    borderStrong: "#D1D1D6",
     accent: "#007AFF",
     assistantBubble: "#E9E9EB",
     assistantBubbleText: "#1A1A1A"
