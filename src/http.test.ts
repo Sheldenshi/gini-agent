@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import "./hooks/builtins"; // the email-watch routes provision a backing job, which validates isKnownHook("gmail-delta")
 import { createHandler } from "./http";
 import { webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
