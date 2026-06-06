@@ -24,7 +24,9 @@ import { createScheduledJob, runJobNow } from "../index";
 import { mutateState, readState } from "../../state";
 import {
   __registerPreRunHookForTest,
-  __resetPreRunHooksForTest
+  __resetPreRunHooksForTest,
+  isKnownPreRunHook,
+  resolvePreRunHook
 } from "./registry";
 import type { RuntimeConfig } from "../../types";
 
@@ -376,6 +378,29 @@ describe("pre-run hook primitive", () => {
     expect(state.tasks.filter((t) => t.jobId === job.id)).toHaveLength(0);
     // Malformed result is a config error => fatal => scheduled job deactivated.
     expect(state.jobs.find((x) => x.id === job.id)?.status).toBe("failed");
+  });
+
+  test("registry rejects Object.prototype keys at membership and resolution", () => {
+    // Prototype-chain keys must not be members or resolve to a JS built-in.
+    for (const key of ["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"]) {
+      expect(isKnownPreRunHook(key)).toBe(false);
+      expect(resolvePreRunHook(key)).toBeUndefined();
+    }
+    // The genuine built-in still resolves.
+    expect(isKnownPreRunHook("gmail-delta")).toBe(true);
+    expect(resolvePreRunHook("gmail-delta")).toBeDefined();
+  });
+
+  test("createScheduledJob rejects a prototype-key handlerId at create time", async () => {
+    const config = buildConfig(workspaceRoot, "hook-proto-create");
+    await expect(
+      createScheduledJob(config, {
+        name: "proto",
+        intervalSeconds: 60,
+        prompt: "x",
+        preRunHook: { handlerId: "constructor", config: {} }
+      })
+    ).rejects.toThrow(/not a known hook handler/);
   });
 
   test("createScheduledJob rejects an unknown handlerId at create time", async () => {
