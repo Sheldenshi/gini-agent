@@ -2023,7 +2023,6 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
       if (preUrl && preUrl !== "about:blank") {
         const preBlock = safetyCheck(preUrl);
         if (preBlock) {
-          consoleLogs.delete(taskId);
           if (typeof session.page.goto === "function") {
             try {
               await session.page.goto("about:blank", { waitUntil: "domcontentloaded" });
@@ -2031,6 +2030,10 @@ export async function browserConsole(taskId: string, args: Record<string, unknow
               /* best-effort */
             }
           }
+          // Clear AFTER the bounce: the console listener stays attached, so a
+          // log the blocked page emits as it is navigated away would otherwise
+          // repopulate the buffer after an earlier clear.
+          consoleLogs.delete(taskId);
           return fail(`${preBlock} (refusing to run console JS on a disallowed origin)`);
         }
       }
