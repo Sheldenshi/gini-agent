@@ -138,7 +138,7 @@ The migrator only reads from the openclaw state, never writes. But openclaw's ga
 Run `openclaw doctor` — it prints the active state root. Or check `OPENCLAW_STATE_DIR` in your shell environment.
 
 **My openclaw agents use Anthropic. What happens?**
-The migrator creates the agent record but skips the API key (Anthropic isn't in gini's native provider list yet). The `unsupported` array in the report lists `provider:anthropic`. Add the key manually via `gini provider set` once gini supports Anthropic, or point the agent at OpenRouter as an interim alternative.
+The migrator creates the agent record but skips the API key — it deliberately doesn't auto-map Anthropic credentials, so the `unsupported` array in the report lists `provider:anthropic`. Gini now ships a native `anthropic` provider, so wire it up directly with `gini provider set anthropic <model>` (first-party Claude API or Amazon Bedrock), or point the agent at OpenRouter as an alternative.
 
 **Will my chat history come over?**
 Yes. Each `<state>/agents/<id>/sessions/<sessionId>.jsonl` becomes one `ChatSessionRecord` plus one `ChatMessageRecord` per `type: "message"` line under the matching gini agent. Tool_use and tool_result blocks are dropped from the migrated message text (`ChatMessageRecord.content` is a single string), but the full verbatim transcript stays in `<instance>/imports/openclaw-<timestamp>.zip` for anyone who needs the original tool-call detail. Session timestamps are rebased to the openclaw values so recent-chats sort matches what you remember from openclaw.

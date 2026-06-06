@@ -202,11 +202,11 @@ describe("direct self tools — query", () => {
     };
     const prevCustom = process.env.BEDROCK_BEARER_TOKEN_SELFREG;
     const prevCanonical = process.env.ANTHROPIC_API_KEY;
-    process.env.BEDROCK_BEARER_TOKEN_SELFREG = "bedrock-live";
-    // Canonical unset so the custom-env credit is the only path to configured.
-    delete process.env.ANTHROPIC_API_KEY;
-    const taskId = await newTask(config);
     try {
+      process.env.BEDROCK_BEARER_TOKEN_SELFREG = "bedrock-live";
+      // Canonical unset so the custom-env credit is the only path to configured.
+      delete process.env.ANTHROPIC_API_KEY;
+      const taskId = await newTask(config);
       const result = await dispatchToolCall(config, taskId, "list_providers", "call_1", "{}");
       expect(result.kind).toBe("sync");
       if (result.kind === "sync") {
