@@ -98,6 +98,7 @@ setBrowserInstance(config.instance);
 // status flip; the reconnect itself runs in the background (it probes the local
 // port with retry, so it tolerates serve binding a moment later). The .catch
 // keeps the never-crash-boot guarantee. See ADR tunnel-connectivity.md.
+const tunnelReconcileStartedMs = performance.now();
 await reconcileTunnelOnStartup(config).catch((error) => {
   appendLog(config.instance, "tunnel.reconcile.error", {
     error: error instanceof Error ? error.message : String(error)
@@ -253,7 +254,7 @@ appendLog(config.instance, "runtime.started", {
   bootMs: Math.round(performance.now()),
   moduleLoadMs: Math.round(moduleLoadedMs),
   installMs: Math.round(installFinishedMs - installStartedMs),
-  tunnelReconcileMs: Math.round(tunnelReconcileFinishedMs - installFinishedMs),
+  tunnelReconcileMs: Math.round(tunnelReconcileFinishedMs - tunnelReconcileStartedMs),
   autostartReconcileMs: Math.round(autostartReconcileFinishedMs - tunnelReconcileFinishedMs)
 });
 console.log(`Gini runtime listening on http://127.0.0.1:${server.port} instance=${config.instance}`);

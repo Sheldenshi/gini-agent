@@ -1,20 +1,22 @@
 // Integration test for the SIGTERM-drain ordering in src/server.ts.
 //
-// What we're proving: the gateway's SIGTERM handler awaits
-// `server.stop(false)` (the polite "wait for in-flight requests" variant)
-// BEFORE the process exits, so a response that's mid-stream when SIGTERM
-// arrives still reaches the client in full.
+// What we're proving: the gateway's SIGTERM handler gives in-flight
+// responses a short grace (`SERVER_DRAIN_GRACE_MS`) to finish writing,
+// then force-closes (`server.stop(true)`) so idle keep-alive connections
+// don't stall shutdown. A response that completes within the grace is
+// delivered in full before the force-close.
 //
-// This is the round-4 HIGH-1 fix. The pre-fix code called
-// `server.stop(true)` synchronously — force-close — which could drop the
-// last bytes of a slow setup POST when /api/setup/provider triggered the
-// shutdown-self pattern.
+// The graceful `server.stop(false)` alone never resolves while idle
+// keep-alive connections linger (up to idleTimeout), so racing it against
+// a short grace and then force-closing is what keeps shutdown prompt
+// without truncating an in-flight response that finishes in time.
 //
 // We can't easily stand up the real `src/server.ts` in a unit test (it
 // runs migrations, loads the scheduler, etc.). Instead we write a tiny
 // throwaway server that mirrors ONLY the SIGTERM handler's structure
-// (await server.stop(false) with a 5s failsafe, then process.exit(0))
-// and exercise that on a real port with a real fetch over the wire.
+// (race server.stop(false) against the grace, force-close, then
+// process.exit(0)) and exercise that on a real port with a real fetch
+// over the wire.
 //
 // Gated by `GINI_AUTOSTART_E2E=1` because it binds a real ephemeral port
 // and spawns a real Bun subprocess. ~1-2 seconds when it runs.
@@ -35,9 +37,11 @@ const E2E = process.env.GINI_AUTOSTART_E2E === "1";
 //
 // Keep this in sync with src/server.ts's SIGTERM handler. The key
 // behaviors under test:
-//   1. await server.stop(false)  ← drains in-flight responses
-//   2. 5s failsafe so a hung connection can't block shutdown
-//   3. process.exit(0) only after the drain races to completion
+//   1. race server.stop(false) against a short grace  ← lets an
+//      in-flight response finish writing
+//   2. server.stop(true)  ← force-close so idle keep-alive connections
+//      can't stall shutdown
+//   3. process.exit(0) only after the drain
 const SERVER_SOURCE = `
 const server = Bun.serve({
   port: 0,
@@ -48,10 +52,13 @@ const server = Bun.serve({
         const enc = new TextEncoder();
         controller.enqueue(enc.encode("CHUNK-1;"));
         // Hold the response open long enough for the test to send
-        // SIGTERM after reading the first chunk. 400ms is comfortable.
-        await Bun.sleep(400);
+        // SIGTERM after reading the first chunk, but finish the whole
+        // body comfortably within the 500ms grace (~150ms total) so the
+        // grace-then-force-close path delivers it in full without racing
+        // the deadline.
+        await Bun.sleep(120);
         controller.enqueue(enc.encode("CHUNK-2;"));
-        await Bun.sleep(50);
+        await Bun.sleep(30);
         controller.enqueue(enc.encode("CHUNK-3-END"));
         controller.close();
       }
@@ -65,8 +72,8 @@ const server = Bun.serve({
 // Tell the parent test which port we bound on.
 console.log("PORT=" + server.port);
 
-// Mirror src/server.ts:97-102 idempotency guard. Two concurrent SIGTERMs
-// must not run the handler body twice. To make the second SIGTERM
+// Mirror src/server.ts's SIGTERM idempotency guard. Two concurrent
+// SIGTERMs must not run the handler body twice. To make the second SIGTERM
 // reliably observable (POSIX may coalesce signals delivered back-to-back
 // at the same moment), the handler does an artificial Bun.sleep(150ms)
 // AFTER setting shutdownStarted but BEFORE running server.stop. That
@@ -90,10 +97,13 @@ process.on("SIGTERM", async () => {
   await Bun.sleep(150);
   try {
     stopCalls += 1;
+    // Give an in-flight response a short grace to finish writing, then
+    // force-close so idle keep-alive connections can't stall shutdown.
     await Promise.race([
       server.stop(false),
-      Bun.sleep(5000)
+      Bun.sleep(500)
     ]);
+    server.stop(true);
   } catch {
     /* swallow */
   }
@@ -152,8 +162,8 @@ describe("server SIGTERM drain", () => {
 
         // Issue a real HTTP request. Read the body as a stream so we
         // can send SIGTERM AFTER the first chunk arrives but BEFORE the
-        // server finishes streaming. That's the exact window the
-        // pre-fix `server.stop(true)` would drop bytes in.
+        // server finishes streaming — the window in which a response is
+        // genuinely in-flight when shutdown begins.
         const response = await fetch(`http://127.0.0.1:${port}/`);
         expect(response.status).toBe(200);
         const reader = response.body!.getReader();
@@ -168,12 +178,12 @@ describe("server SIGTERM drain", () => {
           accumulated += dec.decode(value, { stream: true });
           if (!signaledAfterFirstChunk && accumulated.includes("CHUNK-1")) {
             signaledAfterFirstChunk = true;
-            // The headline assertion: SIGTERM lands AFTER first chunk
-            // is on the wire but BEFORE the second + third chunks have
-            // been enqueued (the controller sleeps for 400ms between
-            // chunks). With server.stop(false), the drain MUST wait
-            // for all chunks to be written before letting process.exit
-            // run.
+            // The headline assertion: SIGTERM lands AFTER the first
+            // chunk is on the wire but BEFORE the second + third chunks
+            // have been enqueued (the controller sleeps between chunks).
+            // The whole body still finishes within SERVER_DRAIN_GRACE_MS,
+            // so the grace lets every chunk be written before the
+            // force-close and process.exit run.
             proc.kill("SIGTERM");
           }
         }
@@ -183,8 +193,8 @@ describe("server SIGTERM drain", () => {
         await exited;
 
         // The full body must be present — including chunks emitted
-        // AFTER SIGTERM landed mid-stream. This is the regression we're
-        // guarding against.
+        // AFTER SIGTERM landed mid-stream. The grace must deliver an
+        // in-flight response that completes in time, in full.
         expect(accumulated).toContain("CHUNK-1");
         expect(accumulated).toContain("CHUNK-2");
         expect(accumulated).toContain("CHUNK-3-END");
@@ -203,8 +213,8 @@ describe("server SIGTERM drain", () => {
     15000
   );
 
-  // Round-4 HIGH-2: SIGTERM idempotency. Two concurrent SIGTERMs to the
-  // same gateway must not run the shutdown handler body twice. With the
+  // SIGTERM idempotency. Two concurrent SIGTERMs to the same gateway
+  // must not run the shutdown handler body twice. With the
   // shutdownStarted flag, the second invocation returns early. We
   // assert via stdout that STOP_CALLS=1 (server.stop called once) and
   // that at least one SUPPRESSED= line appeared.

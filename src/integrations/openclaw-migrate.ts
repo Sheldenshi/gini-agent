@@ -2166,9 +2166,9 @@ export async function applyMigration(
   // mutateState write. The pidfile lifecycle has timing windows on
   // both ends: `gini stop` removes the file before the runtime's
   // SIGTERM drain has finished (server.ts pins
-  // SERVER_DRAIN_TIMEOUT_MS=5000ms and SCHEDULER_DRAIN_TIMEOUT_MS=5000ms,
+  // SERVER_DRAIN_GRACE_MS=500ms and SCHEDULER_DRAIN_TIMEOUT_MS=5000ms,
   // so the gateway may still be issuing state.json writes for up to
-  // 10000ms after the pidfile is gone), and `gini start` spawns the
+  // ~5500ms after the pidfile is gone), and `gini start` spawns the
   // child before the child writes its own pidfile. The single
   // up-front check leaves both windows open. Re-checking inside this
   // closure narrows the race to "gateway started or finished
