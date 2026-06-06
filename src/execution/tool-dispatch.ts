@@ -26,7 +26,7 @@ import {
   now,
   readState
 } from "../state";
-import { addEmailWatcher, listEmailWatchers, removeEmailWatcher } from "../state/email-watchers";
+import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled } from "../state/email-watchers";
 import { ApprovalRaceLostError, ApprovedActionFailedError, TaskAlreadyTerminalError, cancelTask, findTask, resolveAuthorization, runTerminalCommand } from "../agent";
 import { walkFiles, simpleDiff } from "../tools/file";
 import { codeExecutionCommand } from "../tools/code";
@@ -1879,8 +1879,23 @@ async function emailWatchTool(
     return `Removed email watcher ${removed.id} (query: ${removed.query}).`;
   }
 
+  if (action === "disable" || action === "enable") {
+    const id = requireString(args, "id");
+    const enabled = action === "enable";
+    const updated = await setEmailWatcherEnabled(config, id, enabled);
+    if (!updated) throw new Error(`Email watcher not found: ${id}`);
+    appendTrace(config.instance, taskId, {
+      type: "tool",
+      message: enabled ? "Enabled email watcher" : "Disabled email watcher",
+      data: { watcherId: updated.id }
+    });
+    return enabled
+      ? `Enabled email watcher ${updated.id} (query: ${updated.query}); polling resumed.`
+      : `Disabled email watcher ${updated.id} (query: ${updated.query}); polling paused.`;
+  }
+
   if (action !== "add") {
-    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" (got ${action}).`);
+    throw new Error(`Invalid input: action must be one of "add" | "list" | "remove" | "disable" | "enable" (got ${action}).`);
   }
 
   // action === "add". Build the Gmail query: a raw `query` wins; otherwise

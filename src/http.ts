@@ -44,7 +44,7 @@ import { gwsSessionStatus } from "./integrations/connectors/gws-session";
 import { listProviders } from "./integrations/connectors/registry";
 import { runConnectorDetection } from "./jobs/connector-detection";
 import { createScheduledJob, listJobRuns, removeJob, replayJobRun, runJobNow, updateJob, updateJobStatus } from "./jobs";
-import { addEmailWatcher, listEmailWatchers, removeEmailWatcher } from "./state/email-watchers";
+import { addEmailWatcher, listEmailWatchers, removeEmailWatcher, setEmailWatcherEnabled } from "./state/email-watchers";
 import { migrateLegacyMemories, recall, reflect, retain } from "./memory";
 import { embeddingStatus, reembedAllBanks, reembedBank } from "./memory/embedding";
 import { rerankerStatus } from "./memory/reranker";
@@ -1344,6 +1344,16 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       }), 201);
     }],
     ["DELETE", /^\/api\/email\/watchers\/([^/]+)$/, async (_request, params) => json(await removeEmailWatcher(config, params[0]))],
+    // PATCH toggles a watcher's enabled flag, pausing/resuming its backing job.
+    ["PATCH", /^\/api\/email\/watchers\/([^/]+)$/, async (request, params) => {
+      const payload = await body(request);
+      if (typeof payload.enabled !== "boolean") {
+        return json({ error: "Invalid input: enabled must be a boolean" }, 400);
+      }
+      const updated = await setEmailWatcherEnabled(config, params[0], payload.enabled);
+      if (!updated) return json({ error: `Email watcher not found: ${params[0]}` }, 404);
+      return json(updated);
+    }],
     ["GET", /^\/api\/connectors$/, async () => {
       const connectors = readState(config.instance).connectors;
       // Enrich google-oauth-desktop records with the SEPARATE sign-in

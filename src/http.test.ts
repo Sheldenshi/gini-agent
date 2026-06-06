@@ -5306,6 +5306,66 @@ describe("agent-chat and thread endpoints", () => {
   });
 });
 
+describe("email watcher routes", () => {
+  test("PATCH /api/email/watchers/:id toggles enabled and pauses/resumes the backing job", async () => {
+    const config = testConfig("http-email-patch");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/email/watchers", {
+      method: "POST",
+      body: JSON.stringify({ sender: "alice@example.com" })
+    });
+    const id = (created as { id: string }).id;
+    const jobId = (created as { jobId: string }).jobId;
+    expect(jobId).toBeString();
+    expect(readState(config.instance).jobs.find((j) => j.id === jobId)?.status).toBe("active");
+
+    const disabled = await call(handler, config, `/api/email/watchers/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: false })
+    });
+    expect((disabled as { enabled: boolean }).enabled).toBe(false);
+    expect(readState(config.instance).jobs.find((j) => j.id === jobId)?.status).toBe("paused");
+
+    const enabled = await call(handler, config, `/api/email/watchers/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: true })
+    });
+    expect((enabled as { enabled: boolean }).enabled).toBe(true);
+    expect(readState(config.instance).jobs.find((j) => j.id === jobId)?.status).toBe("active");
+  });
+
+  test("PATCH /api/email/watchers/:id rejects a non-boolean enabled with 400", async () => {
+    const config = testConfig("http-email-patch-bad");
+    const handler = createHandler(config);
+    const created = await call(handler, config, "/api/email/watchers", {
+      method: "POST",
+      body: JSON.stringify({ sender: "bob@example.com" })
+    });
+    const id = (created as { id: string }).id;
+    const response = await rawCall(
+      handler,
+      config,
+      `/api/email/watchers/${id}`,
+      { method: "PATCH", body: JSON.stringify({ enabled: "yes" }) },
+      config.token
+    );
+    expect(response.status).toBe(400);
+  });
+
+  test("PATCH /api/email/watchers/:id returns 404 for an unknown watcher", async () => {
+    const config = testConfig("http-email-patch-404");
+    const handler = createHandler(config);
+    const response = await rawCall(
+      handler,
+      config,
+      "/api/email/watchers/nope",
+      { method: "PATCH", body: JSON.stringify({ enabled: false }) },
+      config.token
+    );
+    expect(response.status).toBe(404);
+  });
+});
+
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
   return callWithToken(handler, config, config.token, path, init);
 }
