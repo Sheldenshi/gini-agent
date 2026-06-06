@@ -157,8 +157,9 @@ export function providerCatalog(): ProviderCatalogItem[] {
       // Claude API with an ANTHROPIC_API_KEY; overriding baseUrl to
       // "https://bedrock-mantle.{region}.api.aws/anthropic" (with a minted
       // bearer token in the same key slot) targets Claude in Amazon Bedrock.
-      // The catalog ships first-party model ids; for Bedrock the user sets the
-      // anthropic.-prefixed id (e.g. "anthropic.claude-opus-4-8").
+      // The catalog ships first-party model ids; against a Bedrock baseUrl they
+      // are auto-mapped to the anthropic.-prefixed form at request time (see the
+      // models note below), so the same clean id works for either target.
       id: "anthropic",
       name: "anthropic",
       displayName: "Anthropic Compatible",
