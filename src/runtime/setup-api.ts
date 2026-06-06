@@ -141,9 +141,9 @@ export async function setSetupProvider(
     // get its key written to OPENAI_API_KEY and read back as unconfigured.
     const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
     // Accept a no-key payload when the env var is already set — the Edit
-    // Provider dialog uses this to update just the default model without
-    // making the user re-type their key. Initial Add Provider still
-    // requires a key because the env var is empty there.
+    // Provider dialog uses this to update the model or transport config
+    // (base URL, Azure routing) without making the user re-type their key.
+    // Initial Add Provider still requires a key because the env var is empty.
     const envAlreadySet = Boolean(process.env[targetEnvVar]);
     if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {

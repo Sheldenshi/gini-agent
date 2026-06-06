@@ -130,7 +130,7 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
 }
 
 async function listProviders(config: RuntimeConfig, taskId: string): Promise<string> {
-  const catalog = providerCatalogWithStatus(config.provider?.name);
+  const catalog = providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv);
   const providers = catalog.map((item) => ({
     id: item.id,
     name: item.name,

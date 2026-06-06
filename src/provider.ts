@@ -68,10 +68,21 @@ const PROVIDER_API_KEY_ENV: Record<string, string> = {
 // accept no-auth requests so the env var is optional — we still gate
 // the row on the user having explicitly opted in by either setting the
 // env var or making local the active provider.
-export function isProviderConfigured(name: string, activeProviderName?: string): boolean {
+export function isProviderConfigured(
+  name: string,
+  activeProviderName?: string,
+  activeApiKeyEnv?: string
+): boolean {
   if (name === "echo") return false;
   if (name === "codex") return hasUsableCodexCredentials();
-  const envVar = PROVIDER_API_KEY_ENV[name];
+  // For the active provider, honor a custom apiKeyEnv (e.g. AZURE_OPENAI_API_KEY
+  // set via `gini provider set --api-key-env`) — the same var readOpenAIBearer /
+  // providerHealth read at call time — so a custom-env config isn't reported
+  // unconfigured and silently hidden by the settings UI. Non-active rows carry
+  // no stored config, so they fall back to the per-provider default env var.
+  const envVar = name === activeProviderName && activeApiKeyEnv
+    ? activeApiKeyEnv
+    : PROVIDER_API_KEY_ENV[name];
   if (envVar && process.env[envVar]) return true;
   if (name === "local" && activeProviderName === "local") return true;
   return false;
@@ -80,13 +91,16 @@ export function isProviderConfigured(name: string, activeProviderName?: string):
 // Catalog enriched with the per-provider configured flag. Used by the
 // settings UI to hide rows the user hasn't connected; the static
 // providerCatalog() stays in place for callers that just need the list of
-// known provider shapes (e.g. setup-api default-model resolution).
+// known provider shapes (e.g. setup-api default-model resolution). Pass the
+// active provider's apiKeyEnv so a custom-env active provider reads as
+// configured rather than being hidden.
 export function providerCatalogWithStatus(
-  activeProviderName?: string
+  activeProviderName?: string,
+  activeApiKeyEnv?: string
 ): Array<ProviderCatalogItem & { configured: boolean }> {
   return providerCatalog().map((item) => ({
     ...item,
-    configured: isProviderConfigured(item.name, activeProviderName)
+    configured: isProviderConfigured(item.name, activeProviderName, activeApiKeyEnv)
   }));
 }
 

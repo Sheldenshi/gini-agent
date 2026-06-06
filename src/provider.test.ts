@@ -12,6 +12,7 @@ import {
   generateToolCallingResponse,
   generateVisionAnalysis,
   isAuthExpiredError,
+  isProviderConfigured,
   normalizeProvider,
   providerAuthFailureText,
   providerAuthNote,
@@ -3173,6 +3174,28 @@ describe("azure openai routing", () => {
     // A URL that merely contains "azure" but isn't the canonical Azure host →
     // not forced into deployment routing.
     expect(azureBaseUrlNeedsApiVersion("openai", undefined, "https://my-azure-proxy.example.com/v1")).toBe(false);
+  });
+
+  test("isProviderConfigured honors a custom apiKeyEnv for the active provider", () => {
+    const origDefault = process.env.OPENAI_API_KEY;
+    const origCustom = process.env.AZURE_OPENAI_API_KEY;
+    try {
+      delete process.env.OPENAI_API_KEY;
+      delete process.env.AZURE_OPENAI_API_KEY;
+      // Active openai provider whose key lives in a custom env var: with both
+      // vars empty it reads unconfigured.
+      expect(isProviderConfigured("openai", "openai", "AZURE_OPENAI_API_KEY")).toBe(false);
+      // Setting only the custom var marks it configured (not the default).
+      process.env.AZURE_OPENAI_API_KEY = "sk-azure";
+      expect(isProviderConfigured("openai", "openai", "AZURE_OPENAI_API_KEY")).toBe(true);
+      // A non-active openai row ignores the custom var and uses the default.
+      expect(isProviderConfigured("openai", "codex", "AZURE_OPENAI_API_KEY")).toBe(false);
+    } finally {
+      if (origDefault === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = origDefault;
+      if (origCustom === undefined) delete process.env.AZURE_OPENAI_API_KEY;
+      else process.env.AZURE_OPENAI_API_KEY = origCustom;
+    }
   });
 
   test("azure tool-calling posts to the deployment-scoped url with the api-key header", async () => {
