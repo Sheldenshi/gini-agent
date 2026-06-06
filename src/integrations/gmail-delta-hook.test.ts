@@ -12,11 +12,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { EmailWatcherRecord, JobRecord, JobRunRecord, RuntimeConfig } from "../../types";
-import { addEmailWatcher, closeAllMemoryDbs, closeMemoryDb, isEmailSeen, readState } from "../../state";
-import { WINDOW_PAGE_LIMIT, type EmailMetadata } from "../../integrations/gmail-poll-worker";
-import { gmailDeltaHandler, type GmailDeltaDeps } from "./gmail-delta";
-import type { JobPreRunHookResult, PreRunHookContext } from "./types";
+import type { EmailWatcherRecord, RuntimeConfig } from "../types";
+import { addEmailWatcher, closeAllMemoryDbs, closeMemoryDb, isEmailSeen, readState } from "../state";
+import { WINDOW_PAGE_LIMIT, type EmailMetadata } from "./gmail-poll-worker";
+import { gmailDeltaHandler, type GmailDeltaDeps } from "./gmail-delta-hook";
+import type { HookResult, HookContext } from "../hooks/types";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-gmail-delta-test-"));
 
@@ -161,23 +161,21 @@ function afterHonoringStub(
 }
 
 // Invoke the hook for a watcher. Returns the typed result. Builds the minimal
-// PreRunHookContext the handler reads (config + hookConfig); job/run are inert.
+// HookContext the handler reads (config + hookConfig).
 async function fire(
   config: RuntimeConfig,
   watcherId: string,
   deps: GmailDeltaDeps
-): Promise<JobPreRunHookResult> {
-  const ctx: PreRunHookContext = {
+): Promise<HookResult> {
+  const ctx: HookContext = {
     config,
-    job: { id: "job-stub" } as JobRecord,
-    run: { id: "run-stub" } as JobRunRecord,
     hookConfig: { watcherId }
   };
   return gmailDeltaHandler(ctx, deps);
 }
 
 // Count the per-email draft items in a result (each is a JSON+nonce fence).
-function draftCount(result: JobPreRunHookResult): number {
+function draftCount(result: HookResult): number {
   if (result.kind !== "context") return 0;
   return result.items.filter((i) => i.text.includes("UNTRUSTED_EMAIL_METADATA")).length;
 }
@@ -187,7 +185,7 @@ function draftCount(result: JobPreRunHookResult): number {
 // it). The scheduler awaits this only after dispatchPromptRun resolves; skipping
 // it models a dispatch FAILURE, which must leave the matches un-committed so they
 // re-trigger next fire.
-async function commitDelivery(result: JobPreRunHookResult): Promise<void> {
+async function commitDelivery(result: HookResult): Promise<void> {
   if (result.kind === "context" && result.onDispatched) await result.onDispatched();
 }
 
@@ -197,7 +195,7 @@ async function fireAndCommit(
   config: RuntimeConfig,
   watcherId: string,
   deps: GmailDeltaDeps
-): Promise<JobPreRunHookResult> {
+): Promise<HookResult> {
   const result = await fire(config, watcherId, deps);
   await commitDelivery(result);
   return result;
@@ -210,10 +208,8 @@ async function seedWatcher(config: RuntimeConfig, sender: string): Promise<Email
 describe("gmail-delta hook — config validation", () => {
   test("missing watcherId => error", async () => {
     const config = buildConfig("delta-no-watcher");
-    const ctx: PreRunHookContext = {
+    const ctx: HookContext = {
       config,
-      job: { id: "j" } as JobRecord,
-      run: { id: "r" } as JobRunRecord,
       hookConfig: {}
     };
     const result = await gmailDeltaHandler(ctx, {});
@@ -344,7 +340,7 @@ describe("gmail-delta hook — regimes", () => {
     expect(seed.listCalls).toHaveLength(1);
     expect(seed.listCalls[0]).not.toContain("after:");
 
-    const { updateEmailWatcher } = await import("../../state");
+    const { updateEmailWatcher } = await import("../state");
     await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "3000" });
     const tick = capturingStub([], {});
     await fire(config, watcher.id, tick.deps);
@@ -364,7 +360,7 @@ describe("gmail-delta hook — regimes", () => {
       from: "Alice <alice@x.com>",
       subject: `m${i}`
     }));
-    const { updateEmailWatcher } = await import("../../state");
+    const { updateEmailWatcher } = await import("../state");
     await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
     const deps = afterHonoringStub(corpus);
 
@@ -393,7 +389,7 @@ describe("gmail-delta hook — regimes", () => {
     const config = buildConfig("delta-truncated");
     const watcher = await seedWatcher(config, "alice@x.com");
     await fire(config, watcher.id, stubSpawn([], {}));
-    const { updateEmailWatcher } = await import("../../state");
+    const { updateEmailWatcher } = await import("../state");
     await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
 
     const ids = Array.from({ length: 60 }, (_, i) => `c${i}`);
@@ -425,7 +421,7 @@ describe("gmail-delta hook — regimes", () => {
     const config = buildConfig("delta-truncated-badget");
     const watcher = await seedWatcher(config, "alice@x.com");
     await fire(config, watcher.id, stubSpawn([], {}));
-    const { updateEmailWatcher } = await import("../../state");
+    const { updateEmailWatcher } = await import("../state");
     await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
 
     const newestId = "stuck-newest";
@@ -584,7 +580,7 @@ describe("gmail-delta hook — auth + error isolation", () => {
     const config = buildConfig("delta-deliver-throw");
     const watcher = await seedWatcher(config, "alice@x.com");
     await fire(config, watcher.id, stubSpawn([], {})); // seed -> cursor
-    const { updateEmailWatcher } = await import("../../state");
+    const { updateEmailWatcher } = await import("../state");
     await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
 
     const deps = stubSpawn(["d1"], {
@@ -608,7 +604,7 @@ describe("gmail-delta hook — auth + error isolation", () => {
   test("a disabled watcher short-circuits without polling", async () => {
     const config = buildConfig("delta-disabled");
     const watcher = await seedWatcher(config, "alice@x.com");
-    const { updateEmailWatcher } = await import("../../state");
+    const { updateEmailWatcher } = await import("../state");
     await updateEmailWatcher(config, watcher.id, { enabled: false });
     let spawned = false;
     const result = await fire(config, watcher.id, {

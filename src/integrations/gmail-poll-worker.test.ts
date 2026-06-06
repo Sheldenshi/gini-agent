@@ -5,7 +5,7 @@
 // breakout + nested-rejoin hardening). The watcher-state regimes (seeding,
 // dedup, truncation, backlog drain, same-second siblings, signed-out, gws
 // error) are exercised through the gmail-delta hook entrypoint in
-// src/jobs/hooks/gmail-delta.test.ts with an injected gws boundary.
+// src/integrations/gmail-delta-hook.test.ts with an injected gws boundary.
 
 import { describe, expect, test } from "bun:test";
 import type { EmailWatcherRecord } from "../types";

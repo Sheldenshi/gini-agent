@@ -6,9 +6,9 @@
 // (drop automated senders + self), and COLLECTS a fenced draft prompt per
 // surviving NEW match (returning them to the caller) — it reads ONLY metadata
 // (From/Subject/Date/snippet), never message bodies. The `gmail-delta` pre-run
-// hook (src/jobs/hooks/gmail-delta.ts) drives it: zero collected prompts =>
-// short-circuit (no model turn); one or more => the drafting turn runs with the
-// fenced matches injected as context.
+// hook (src/integrations/gmail-delta-hook.ts) drives it: zero collected prompts
+// => short-circuit (no model turn); one or more => the drafting turn runs with
+// the fenced matches injected as context.
 //
 // The gws subprocess boundary is injectable so unit tests stub it without
 // spawning a child.

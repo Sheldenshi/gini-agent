@@ -7,8 +7,12 @@
 //     ("[SILENT]") => the run finalizes with NO model turn.
 //   - 1+ collected prompts => context(items) => the drafting turn runs with the
 //     fenced matches injected (each prompt is already JSON+nonce-fenced by the
-//     engine, so the item is untrusted:false and the scheduler doesn't
-//     re-wrap it).
+//     engine, so the item is untrusted:false and the runner doesn't re-wrap it).
+//
+// This is email-domain code that REGISTERS into the generic hooks primitive (see
+// the registerHook call at the bottom). It imports only the primitive's TYPES
+// (type-only, erased) + registerHook; it never imports the runner or any other
+// hooks internals.
 //
 // Error policy is deliberate: a gws/transport failure stamps the WATCHER status
 // `error` (with a scrubbed lastError) and returns shortCircuit so the backing
@@ -16,16 +20,17 @@
 // job.status="failed" and stop scheduling. The hook's `error` kind is reserved
 // for broken config (missing/unknown watcher) where a draft is meaningless.
 
-import { appendLog, getEmailWatcher, now, updateEmailWatcher } from "../../state";
-import { gwsSessionStatus, type GwsSessionStatus } from "../../integrations/connectors/gws-session";
+import { appendLog, getEmailWatcher, now, updateEmailWatcher } from "../state";
+import { gwsSessionStatus, type GwsSessionStatus } from "./connectors/gws-session";
 import {
   defaultGwsSpawn,
   processWatcher,
   resolveSelfEmail,
   sanitizeWatcherError,
   type GwsSpawn
-} from "../../integrations/gmail-poll-worker";
-import type { PreRunHookContext, JobPreRunHookResult } from "./types";
+} from "./gmail-poll-worker";
+import type { HookContext, HookResult } from "../hooks/types";
+import { registerHook } from "../hooks/registry";
 
 // Injectable subprocess + session boundaries, mirroring the old worker's deps
 // bag. Production leaves these unset and the handler shells `gws`; unit tests
@@ -37,9 +42,9 @@ export interface GmailDeltaDeps {
 }
 
 export async function gmailDeltaHandler(
-  ctx: PreRunHookContext,
+  ctx: HookContext,
   deps: GmailDeltaDeps = {}
-): Promise<JobPreRunHookResult> {
+): Promise<HookResult> {
   const { config, hookConfig } = ctx;
   const gwsSpawn = deps.gwsSpawn ?? defaultGwsSpawn;
 
@@ -92,3 +97,8 @@ export async function gmailDeltaHandler(
     return { kind: "shortCircuit", summary: "[SILENT]" };
   }
 }
+
+// Self-register into the trusted hooks registry as a load side-effect. The
+// optional `deps` arg defaults, so gmailDeltaHandler satisfies HookHandler's
+// 1-arg signature. Reached at composition time via src/hooks/builtins.ts.
+registerHook("gmail-delta", gmailDeltaHandler);
