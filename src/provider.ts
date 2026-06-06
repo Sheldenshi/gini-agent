@@ -1262,7 +1262,7 @@ async function callAnthropicMessages(
   const wantStream = Boolean(onDelta);
   const safeMessages = stripDocumentPartsIfUnsupported(messages, provider);
   const { system, messages: anthropicMessages } = translateMessagesToAnthropic(safeMessages);
-  const extras = sanitizeExtraBody(provider.extraBody);
+  const extras = sanitizeExtraBody(provider.extraBody, ANTHROPIC_RESERVED_EXTRA_BODY_KEYS);
   const resolvedMaxTokens =
     maxTokensOverride ?? (typeof extras.max_tokens === "number" ? extras.max_tokens : DEFAULT_ANTHROPIC_MAX_TOKENS);
   const body: Record<string, unknown> = {
@@ -1272,10 +1272,10 @@ async function callAnthropicMessages(
     max_tokens: resolvedMaxTokens,
     stream: wantStream
   };
-  // Set AFTER the extras spread so a stray extraBody.system can't shadow the
-  // hoisted system prompt (the spread-order guard the chat-completions
-  // builders use for prompt_cache_retention). When no system messages were
-  // present we leave any user-supplied extraBody.system untouched.
+  // `system` is stripped from extras by ANTHROPIC_RESERVED_EXTRA_BODY_KEYS, so
+  // the hoisted system prompt is the only source of body.system. On a turn with
+  // no system messages, body.system is simply omitted — a stray
+  // extraBody.system can no longer leak through, independent of spread order.
   if (system.length > 0) body.system = system;
   const anthropicTools = translateToolsToAnthropic(tools);
   if (anthropicTools.length > 0) {
@@ -3009,6 +3009,14 @@ const VISION_RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   "max_tokens",
   "max_completion_tokens"
 ]);
+
+// `system` is owned by the Anthropic Messages builder, which hoists every
+// system message into the top-level `system` field. Deny it in extraBody so a
+// stray `extraBody.system` can't shadow the runtime-built system prompt — nor
+// silently become it on a turn that carries no system message. Scoped to the
+// anthropic path via extraDeny because `system` is not a top-level field on the
+// OpenAI chat-completions wire shape, where it stays a normal message.
+const ANTHROPIC_RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set(["system"]);
 
 // Strip trailing slashes from a baseUrl so callers can write either
 // `http://x/v1` or `http://x/v1/` and the resulting request URL stays

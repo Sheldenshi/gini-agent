@@ -30,11 +30,13 @@ The CLI flags exist because the alternative — hand-editing `~/.gini/instances/
 
 Vision passes an additional per-call denylist (`max_tokens`, `max_completion_tokens`) so neither budget field can leak through alongside the runtime-set one — OpenAI's o-series rejects requests carrying both, and other gateways would silently take the larger of the two and defeat the cap. Non-vision callers (chat, structured, tool-calling, summary) leave these keys allowed so users can legitimately set their own budget via `extraBody`.
 
+The Anthropic Messages builder passes its own per-call denylist (`system`) through the same mechanism: the runtime hoists every system message into the top-level `system` field, so a stray `extraBody.system` must not shadow it — nor silently become it on a turn that carries no system message. `system` stays out of the base `RESERVED_EXTRA_BODY_KEYS` because it is not a top-level field on the OpenAI chat-completions wire shape (there the system prompt is a normal message).
+
 OpenRouter routing fields (`provider`, `models`, `route`, `transforms`) are intentionally NOT in the denylist. Selecting which underlying provider routes a request is the entire point of OpenRouter; locking that out would force users into OpenRouter's default routing.
 
 ## Reserved-Key Maintenance Rule
 
-When you add a runtime-owned chat-completions request field anywhere in `src/provider.ts`, add it to `RESERVED_EXTRA_BODY_KEYS`. The denylist is the single source of truth — if a maintainer adds a new field but forgets the denylist entry, the protection silently weakens. This rule is also documented inline above the constant.
+When you add a runtime-owned request field anywhere in `src/provider.ts`, add it to the relevant denylist — a chat-completions field to `RESERVED_EXTRA_BODY_KEYS`, or a Messages-API field (like `system`) to the anthropic per-call denylist (`ANTHROPIC_RESERVED_EXTRA_BODY_KEYS`). The denylist is the single source of truth — if a maintainer adds a new field but forgets the denylist entry, the protection silently weakens. This rule is also documented inline above each constant.
 
 ## Agent Override Inheritance
 

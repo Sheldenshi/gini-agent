@@ -3449,6 +3449,31 @@ describe("anthropic provider", () => {
     }
   });
 
+  test("extraBody.system is denied: hoisted system wins, and a stray extraBody.system can't leak with no system message", async () => {
+    const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
+    const fetchStub = installFetch(() =>
+      anthropicJson({ id: "m", type: "message", role: "assistant", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: {} })
+    );
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8", extraBody: { system: "poisoned" } });
+      // No system message in the transcript → a stray extraBody.system must NOT
+      // survive into the request (it is stripped by the anthropic denylist).
+      await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []);
+      const sentNoSys = JSON.parse(String(fetchStub.calls[0]!.init.body));
+      expect(sentNoSys.system).toBeUndefined();
+      // A real system message is hoisted and is the sole source of body.system.
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "system", content: "real system" }, { role: "user", content: "hi" }],
+        []
+      );
+      const sentWithSys = JSON.parse(String(fetchStub.calls[1]!.init.body));
+      expect(sentWithSys.system).toBe("real system");
+    } finally {
+      restoreEnv();
+    }
+  });
+
   test("message translation: system hoist, tool grouping, image/document/invalid parts, assistant shapes", async () => {
     const restoreEnv = setEnv("ANTHROPIC_API_KEY", "sk-ant-test");
     const fetchStub = installFetch(() =>
