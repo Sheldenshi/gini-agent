@@ -234,6 +234,39 @@ describe("pre-run hook primitive", () => {
     expect(tasks[0]!.input).toContain("draft a reply");
   });
 
+  test("a context result's onDispatched commit runs after the turn dispatches", async () => {
+    // The scheduler awaits onDispatched ONLY after dispatchPromptRun resolves
+    // (the at-least-once delivery boundary). Pin that it runs on a successful
+    // dispatch and that the task already exists when it runs.
+    const config = buildConfig(workspaceRoot, "hook-ondispatched");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_ondispatched";
+    await createSession(config, sessionId);
+    let committedWithTaskCount = -1;
+    let jobIdUnderTest = "";
+    __registerPreRunHookForTest("test-context-commit", async () => ({
+      kind: "context",
+      items: [{ text: "matched", untrusted: false }],
+      onDispatched: () => {
+        // By the time the commit runs, the drafting turn's task exists.
+        committedWithTaskCount = readState(config.instance).tasks.filter((t) => t.jobId === jobIdUnderTest).length;
+      }
+    }));
+    const job = await createScheduledJob(config, {
+      name: "ctxcommit",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-context-commit", config: {} }
+    });
+    jobIdUnderTest = job.id;
+
+    await runJobNow(config, job.id, "manual");
+    // The commit ran AND saw the dispatched task.
+    expect(committedWithTaskCount).toBe(1);
+  });
+
   test("an untrusted context item is wrapped in a matched-context fence", async () => {
     const config = buildConfig(workspaceRoot, "hook-context-untrusted");
     const provider = normalizeProvider(config.provider);

@@ -495,7 +495,7 @@ async function runPreRunHook(
   job: JobRecord,
   run: JobRunRecord
 ): Promise<
-  | { action: "proceed"; context: string[] }
+  | { action: "proceed"; context: string[]; onDispatched?: () => void | Promise<void> }
   | { action: "shortCircuit"; summary?: string }
   | { action: "error"; message: string; fatal: boolean }
 > {
@@ -536,7 +536,13 @@ async function runPreRunHook(
   // forever and brick the job under overlap protection.
   if (raced.kind === "shortCircuit") return { action: "shortCircuit", summary: raced.summary };
   if (raced.kind === "error") return { action: "error", message: raced.message, fatal: true };
-  if (raced.kind === "context") return { action: "proceed", context: renderHookContext(raced.items) };
+  if (raced.kind === "context") {
+    return {
+      action: "proceed",
+      context: renderHookContext(raced.items),
+      ...(raced.onDispatched ? { onDispatched: raced.onDispatched } : {})
+    };
+  }
   return {
     action: "error",
     message: `preRun hook ${hook.handlerId} returned an unknown result kind: ${String((raced as { kind?: unknown }).kind)}`,
@@ -777,6 +783,11 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
         continue;
       }
       await dispatchPromptRun(config, job, run, "schedule", hook.context);
+      // Commit the hook's deferred post-delivery state ONLY after dispatch
+      // resolved (the drafting turn is spawned). dispatchPromptRun finalizes its
+      // own run + rethrows on a spawn failure, so a throw skips this — leaving
+      // the items un-committed to re-trigger next tick (at-least-once).
+      if (hook.onDispatched) await hook.onDispatched();
     } catch (error) {
       appendLog(config.instance, "scheduler.iteration.error", {
         jobId: job.id,
@@ -1063,7 +1074,12 @@ export async function runJobNow(
     await finalizeHookError(config, job, run, hook.message, trigger, hook.fatal);
     return { jobId: job.id, runId: run.id, error: hook.message };
   }
-  return dispatchPromptRun(config, job, run, trigger, hook.context);
+  const dispatched = await dispatchPromptRun(config, job, run, trigger, hook.context);
+  // Commit the hook's deferred post-delivery state only after dispatch resolved.
+  // A spawn failure rethrows from dispatchPromptRun (skipping this), so the
+  // un-committed items re-trigger on the next fire (at-least-once).
+  if (hook.onDispatched) await hook.onDispatched();
+  return dispatched;
 }
 
 export async function updateJobStatus(

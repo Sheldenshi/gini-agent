@@ -182,6 +182,27 @@ function draftCount(result: JobPreRunHookResult): number {
   return result.items.filter((i) => i.text.includes("UNTRUSTED_EMAIL_METADATA")).length;
 }
 
+// Model a SUCCESSFUL drafting-turn dispatch: invoke the result's onDispatched
+// commit thunk (the engine defers surviving-match markSeen + cursor-advance into
+// it). The scheduler awaits this only after dispatchPromptRun resolves; skipping
+// it models a dispatch FAILURE, which must leave the matches un-committed so they
+// re-trigger next fire.
+async function commitDelivery(result: JobPreRunHookResult): Promise<void> {
+  if (result.kind === "context" && result.onDispatched) await result.onDispatched();
+}
+
+// Fire the hook and, on a context result, commit delivery (the common
+// happy-path: matches are drafted AND the deferred state lands).
+async function fireAndCommit(
+  config: RuntimeConfig,
+  watcherId: string,
+  deps: GmailDeltaDeps
+): Promise<JobPreRunHookResult> {
+  const result = await fire(config, watcherId, deps);
+  await commitDelivery(result);
+  return result;
+}
+
 async function seedWatcher(config: RuntimeConfig, sender: string): Promise<EmailWatcherRecord> {
   return addEmailWatcher(config, { sender });
 }
@@ -267,13 +288,15 @@ describe("gmail-delta hook — regimes", () => {
     }));
     expect(seedRes.kind).toBe("shortCircuit");
 
-    const result = await fire(config, watcher.id, stubSpawn(["m2", "m3", "m4"], {
+    const result = await fireAndCommit(config, watcher.id, stubSpawn(["m2", "m3", "m4"], {
       m2: { id: "m2", internalDate: "3000", from: "Alice <alice@x.com>", subject: "new" },
       m3: { id: "m3", internalDate: "3100", from: "no-reply@alice.com", subject: "auto" },
       m4: { id: "m4", internalDate: "3200", from: "me@example.com", subject: "self" }
     }));
     expect(result.kind).toBe("context");
     expect(draftCount(result)).toBe(1);
+    // m2 (surviving) is marked seen only after delivery commits; m3/m4 (dropped)
+    // commit inline at drop time.
     expect(isEmailSeen(config.instance, watcher.id, "m2")).toBe(true);
     expect(isEmailSeen(config.instance, watcher.id, "m3")).toBe(true);
     expect(isEmailSeen(config.instance, watcher.id, "m4")).toBe(true);
@@ -304,7 +327,7 @@ describe("gmail-delta hook — regimes", () => {
     const deps = stubSpawn(["m9"], {
       m9: { id: "m9", internalDate: "5000", from: "alice@x.com", subject: "new" }
     });
-    const r1 = await fire(config, watcher.id, deps);
+    const r1 = await fireAndCommit(config, watcher.id, deps);
     expect(draftCount(r1)).toBe(1);
     // Simulate a process restart: drop the cached memory.db handle so the next
     // fire reads email_seen back from disk.
@@ -346,7 +369,8 @@ describe("gmail-delta hook — regimes", () => {
     const deps = afterHonoringStub(corpus);
 
     // Fire 1: caps at MAX_MESSAGES_PER_TICK (25) items, oldest-first (b0..b24).
-    const r1 = await fire(config, watcher.id, deps);
+    // Delivery commits => deferred markSeen + cursor advance land.
+    const r1 = await fireAndCommit(config, watcher.id, deps);
     expect(draftCount(r1)).toBe(25);
     const drafted1 = r1.kind === "context" ? r1.items.map((i) => i.text.match(/"id":"(b\d+)"/)![1]) : [];
     expect(drafted1).toEqual(ids.slice(0, 25));
@@ -354,7 +378,7 @@ describe("gmail-delta hook — regimes", () => {
     expect(afterT1?.lastSeenInternalDate).toBe(String(11_000_000 + 24 * 1000));
 
     // Fire 2: `after:` excludes b0..b24; the remaining 5 drain.
-    const r2 = await fire(config, watcher.id, deps);
+    const r2 = await fireAndCommit(config, watcher.id, deps);
     expect(draftCount(r2)).toBe(5);
     const drafted2 = r2.kind === "context" ? r2.items.map((i) => i.text.match(/"id":"(b\d+)"/)![1]) : [];
     expect(drafted2).toEqual(ids.slice(25));
@@ -544,12 +568,41 @@ describe("gmail-delta hook — auth + error isolation", () => {
     expect(isEmailSeen(config.instance, watcher.id, "m5")).toBe(false);
 
     // Fire 2: healthy => m5 drafts (at-least-once) and the watcher clears to ok.
-    const r2 = await fire(config, watcher.id, stubSpawn(["m5"], {
+    const r2 = await fireAndCommit(config, watcher.id, stubSpawn(["m5"], {
       m5: { id: "m5", internalDate: "7000", from: "Alice <alice@x.com>", subject: "hi" }
     }));
     expect(draftCount(r2)).toBe(1);
     expect(isEmailSeen(config.instance, watcher.id, "m5")).toBe(true);
     expect(readState(config.instance).emailWatchers.find((w) => w.id === watcher.id)?.status).toBe("ok");
+  });
+
+  test("a draft collected but NOT delivered (commit skipped) re-triggers on the next fire", async () => {
+    // Delivery boundary: the engine defers a surviving match's markSeen +
+    // cursor-advance into the commit thunk the scheduler runs ONLY after
+    // dispatchPromptRun resolves. Modelling a dispatch throw (commit NOT called)
+    // must leave the id un-seen + un-cursored so it re-triggers next fire.
+    const config = buildConfig("delta-deliver-throw");
+    const watcher = await seedWatcher(config, "alice@x.com");
+    await fire(config, watcher.id, stubSpawn([], {})); // seed -> cursor
+    const { updateEmailWatcher } = await import("../../state");
+    await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: "1000" });
+
+    const deps = stubSpawn(["d1"], {
+      d1: { id: "d1", internalDate: "6000", from: "Alice <alice@x.com>", subject: "hi" }
+    });
+
+    // Fire 1: collect the draft but DO NOT commit (dispatch threw).
+    const r1 = await fire(config, watcher.id, deps);
+    expect(draftCount(r1)).toBe(1);
+    expect(isEmailSeen(config.instance, watcher.id, "d1")).toBe(false);
+    // Cursor was NOT advanced past the un-delivered match.
+    expect(readState(config.instance).emailWatchers.find((w) => w.id === watcher.id)?.lastSeenInternalDate).toBe("1000");
+
+    // Fire 2: the same id re-triggers (at-least-once). This time commit.
+    const r2 = await fireAndCommit(config, watcher.id, deps);
+    expect(draftCount(r2)).toBe(1);
+    expect(isEmailSeen(config.instance, watcher.id, "d1")).toBe(true);
+    expect(readState(config.instance).emailWatchers.find((w) => w.id === watcher.id)?.lastSeenInternalDate).toBe("6000");
   });
 
   test("a disabled watcher short-circuits without polling", async () => {

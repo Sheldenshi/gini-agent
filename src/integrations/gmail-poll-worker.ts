@@ -379,12 +379,26 @@ async function fetchInternalDate(gwsSpawn: GwsSpawn, id: string): Promise<number
 //     draft the backlog and don't skip it silently — jump the cursor to the
 //     NEWEST, markSeen that boundary id, and collect exactly ONE notice prompt
 //     so the user is told a backlog accumulated.
+// Result of processing one watcher. `prompts` are the items to inject into the
+// drafting turn. `commit` is an OPTIONAL post-delivery thunk: it is present only
+// when there are surviving (to-be-DRAFTED) matches, and it defers their
+// markSeen + the cursor advance until AFTER the drafting turn dispatches — so a
+// dispatch failure leaves those ids un-seen and they re-trigger next tick
+// (at-least-once across the delivery boundary). Intentional skips with no
+// delivery (dropped/safety-floored items, the seeding baseline, the
+// truncated-window notice) commit INLINE here and need no thunk.
+export interface ProcessWatcherResult {
+  prompts: string[];
+  seeded: boolean;
+  commit?: () => Promise<void>;
+}
+
 export async function processWatcher(
   config: RuntimeConfig,
   watcher: EmailWatcherRecord,
   gwsSpawn: GwsSpawn,
   selfEmail: string | undefined
-): Promise<{ prompts: string[]; seeded: boolean }> {
+): Promise<ProcessWatcherResult> {
   // Bound the query with `after:<epochSec>` once we have a watermark so we
   // don't re-list the whole unread history every tick. Gmail's `after:`
   // takes epoch seconds.
@@ -483,6 +497,9 @@ export async function processWatcher(
   // item we stopped before.
   let lastConsumedInternalDate = 0;
   const prompts: string[] = [];
+  // Surviving (to-be-drafted) ids whose markSeen is DEFERRED until after the
+  // drafting turn dispatches — the at-least-once delivery boundary.
+  const survivingIds: string[] = [];
 
   for (const id of ids) {
     // Already handled in a prior tick — skip without re-fetching metadata. It's
@@ -504,7 +521,8 @@ export async function processWatcher(
     const internalDate = meta.internalDate ? Number(meta.internalDate) : 0;
 
     if (shouldDropMessage(meta, selfEmail)) {
-      // Safety floor dropped it — still mark seen so it's never reconsidered.
+      // Safety floor dropped it — an intentional skip with NO delivery, so mark
+      // it seen INLINE (right now) and it never reconsidered.
       markEmailSeen(config.instance, watcher.id, id);
       appendLog(config.instance, "email.watch.dropped", {
         watcherId: watcher.id,
@@ -517,32 +535,53 @@ export async function processWatcher(
       continue;
     }
 
-    // Surviving match: collect the fenced draft prompt, then markSeen
-    // (committed per item) so a crash mid-batch never replays it. The cursor is
-    // advanced once at the end, not here. The handler converts these prompts
-    // into the drafting turn's injected context; the markSeen-after-collect
-    // order preserves the at-least-once-on-failure delivery contract (a hook
-    // throw before finalize leaves the item un-cursored for the next tick).
+    // Surviving match: collect the fenced draft prompt; DEFER its markSeen +
+    // the cursor advance to the commit thunk so they only land after the
+    // drafting turn dispatches. A dispatch throw leaves these ids un-seen and
+    // un-cursored, so they re-trigger on the next healthy fire (at-least-once
+    // across the delivery boundary — markSeen-before-spawn would silently lose
+    // them). email_seen remains the replay-safety mechanism; the cursor is the
+    // `after:` optimization.
     prompts.push(buildWatchPrompt(watcher, meta));
-    markEmailSeen(config.instance, watcher.id, id);
+    survivingIds.push(id);
     if (Number.isFinite(internalDate) && internalDate > lastConsumedInternalDate) {
       lastConsumedInternalDate = internalDate;
     }
     appendLog(config.instance, "email.watch.triggered", { watcherId: watcher.id, messageId: id });
   }
 
-  // Advance the watermark ONCE to the last-consumed item's internalDate
-  // (forward progress; a backlog drains over successive ticks). When nothing
-  // was consumed this tick keep the prior cursor.
+  // The watermark advance target: the last-consumed item's internalDate
+  // (forward progress; a backlog drains over successive ticks).
   const cursor = lastConsumedInternalDate > 0 ? String(lastConsumedInternalDate) : undefined;
+
+  if (survivingIds.length === 0) {
+    // No delivery this tick (only dropped items, or nothing new): everything is
+    // already committed inline, so advance the cursor + clear status NOW.
+    await updateEmailWatcher(config, watcher.id, {
+      ...(cursor ? { lastSeenInternalDate: cursor } : {}),
+      lastPolledAt: now(),
+      status: "ok",
+      lastError: undefined
+    });
+    return { prompts, seeded: false };
+  }
+
+  // Surviving matches exist: defer their markSeen AND the cursor advance to the
+  // commit thunk. Advancing the cursor inline would step past these un-delivered
+  // items (it covers them too), so on a dispatch throw they'd fall below `after:`
+  // and be lost. Stamp lastPolledAt/status now (observability, not delivery);
+  // the cursor + markSeen land only on a successful dispatch.
   await updateEmailWatcher(config, watcher.id, {
-    ...(cursor ? { lastSeenInternalDate: cursor } : {}),
     lastPolledAt: now(),
     status: "ok",
     lastError: undefined
   });
+  const commit = async () => {
+    for (const id of survivingIds) markEmailSeen(config.instance, watcher.id, id);
+    if (cursor) await updateEmailWatcher(config, watcher.id, { lastSeenInternalDate: cursor });
+  };
 
-  return { prompts, seeded: false };
+  return { prompts, seeded: false, commit };
 }
 
 // Scrub absolute filesystem paths (gws config / credential paths can appear

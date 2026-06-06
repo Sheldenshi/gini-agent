@@ -52,7 +52,16 @@ export type JobPreRunHookResult =
   // chat + bridge delivery, exactly like a completed-with-nothing turn.
   | { kind: "shortCircuit"; summary?: string }
   // additionalContext analog: run the drafting turn with these items injected.
-  | { kind: "context"; items: PreRunHookContextItem[] }
+  //
+  // `onDispatched` is an OPTIONAL post-delivery commit thunk: the scheduler
+  // awaits it ONLY after dispatchPromptRun has successfully spawned the drafting
+  // turn — never if dispatch throws. A handler whose items represent
+  // about-to-be-DELIVERED work (gmail-delta defers markSeen + cursor-advance for
+  // the surviving matches) puts that commit here so a dispatch failure leaves
+  // the items un-committed and they re-trigger on the next fire (at-least-once
+  // across the delivery boundary). Intentional skips with no delivery
+  // (drop/seeding-baseline/truncated-notice) still commit inline in the handler.
+  | { kind: "context"; items: PreRunHookContextItem[]; onDispatched?: () => void | Promise<void> }
   // non-blocking-error analog: finalize the run as failed; no draft.
   | { kind: "error"; message: string };
 

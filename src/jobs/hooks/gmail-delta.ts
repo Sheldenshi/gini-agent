@@ -67,11 +67,18 @@ export async function gmailDeltaHandler(
 
   try {
     const selfEmail = await (deps.resolveSelfEmail ?? (() => resolveSelfEmail(gwsSpawn)))();
-    const { prompts } = await processWatcher(config, watcher, gwsSpawn, selfEmail);
+    const { prompts, commit } = await processWatcher(config, watcher, gwsSpawn, selfEmail);
     if (prompts.length === 0) return { kind: "shortCircuit", summary: "[SILENT]" };
     // The engine already JSON+nonce-fences each prompt, so the scheduler must
-    // not double-fence — untrusted:false passes it through verbatim.
-    return { kind: "context", items: prompts.map((text) => ({ text, untrusted: false })) };
+    // not double-fence — untrusted:false passes it through verbatim. The engine's
+    // commit thunk (present only for to-be-drafted matches) defers markSeen +
+    // cursor-advance until AFTER the drafting turn dispatches, so a dispatch
+    // failure re-triggers the matches next tick (at-least-once).
+    return {
+      kind: "context",
+      items: prompts.map((text) => ({ text, untrusted: false })),
+      ...(commit ? { onDispatched: commit } : {})
+    };
   } catch (error) {
     // Per-watcher error isolation: stamp the watcher `error` (visible in the
     // typed surface) but short-circuit so the JOB stays active and retries.
