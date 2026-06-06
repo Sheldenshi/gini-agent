@@ -6,7 +6,10 @@ An email watcher is an `EmailWatcherRecord` (per `(account, sender-query)`) on
 `RuntimeState`. Each watcher is driven by a backing interval-driven scheduled job
 whose **pre-run hook** (`handlerId: "gmail-delta"`, see
 [Pre-LLM Job Hooks](job-pre-run-hooks.md)) runs the delta engine
-(`src/integrations/gmail-poll-worker.ts`) before any model turn: it polls the
+(`src/integrations/gmail-poll-worker.ts`) before any model turn. The `gmail-delta`
+handler (`src/integrations/gmail-delta-hook.ts`) is email-domain code that
+*registers into* the top-level hooks primitive (`src/hooks/`) at load time — the
+primitive itself stays domain-free. It polls the
 user's Gmail through the existing `gws` CLI for new matching message ids, dedups
 them, applies a deterministic safety floor, and COLLECTS a fenced draft prompt
 per surviving new match. The hook maps the result onto the scheduler's typed
@@ -84,5 +87,5 @@ were rejected as the wrong shape for a local-first, consent-gated runtime.
 ## Verification
 
 - `bun test src/integrations/gmail-poll-worker.test.ts` exercises the pure delta-engine helpers: the message-list JSON parse (incl. the `gws` preamble and multi-page NDJSON window), metadata parse, the safety floor (automated + self dropped, with no false-drop of a human whose address contains self's), the untrusted-metadata fence under a breakout attack and a nested-rejoin attack (hostile subject/snippet carrying the close sentinel + injected instruction stay escaped inside the JSON data container; exactly one physical line is the legitimate nonce-suffixed close marker), and the error path scrub.
-- `bun test src/jobs/hooks/gmail-delta.test.ts` exercises the watcher-state regimes through the `gmail-delta` hook entrypoint with an injected `gwsSpawn` + ephemeral instance dir + ephemeral `memory.db`: startup seeding (short-circuit, no turn on first fire), dedup + cursor advance (surviving a simulated restart), the oldest-first backlog drain + cap (cursor advances to the last consumed item, the remainder drains on later fires), the truncated-window single notice (cursor jumps to newest, no re-loop, at-most-once even with a bad newest metadata-get), same-second seeding siblings, the `after:<epochSec>` watermark bound (present once a cursor exists, absent on seeding), at-least-once delivery on a poll failure (re-triggers on the next healthy fire), the signed-out → `needs_auth` path (job stays active), a gws error → watcher `error` + scrubbed message + short-circuit (job NOT failed), and config-broken → `error`.
-- `bun test src/jobs/hooks/hooks.test.ts` covers the general pre-run hook primitive (see [Pre-LLM Job Hooks](job-pre-run-hooks.md)). `bun test src/state` covers the `EmailWatcherRecord` CRUD + `email_seen` helpers.
+- `bun test src/integrations/gmail-delta-hook.test.ts` exercises the watcher-state regimes through the `gmail-delta` hook entrypoint with an injected `gwsSpawn` + ephemeral instance dir + ephemeral `memory.db`: startup seeding (short-circuit, no turn on first fire), dedup + cursor advance (surviving a simulated restart), the oldest-first backlog drain + cap (cursor advances to the last consumed item, the remainder drains on later fires), the truncated-window single notice (cursor jumps to newest, no re-loop, at-most-once even with a bad newest metadata-get), same-second seeding siblings, the `after:<epochSec>` watermark bound (present once a cursor exists, absent on seeding), at-least-once delivery on a poll failure (re-triggers on the next healthy fire), the signed-out → `needs_auth` path (job stays active), a gws error → watcher `error` + scrubbed message + short-circuit (job NOT failed), and config-broken → `error`.
+- `bun test src/hooks` covers the general pre-run hook primitive and its module boundary (see [Pre-LLM Job Hooks](job-pre-run-hooks.md)). `bun test src/state` covers the `EmailWatcherRecord` CRUD + `email_seen` helpers.
