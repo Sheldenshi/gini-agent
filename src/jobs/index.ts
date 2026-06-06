@@ -1,10 +1,10 @@
 import { submitTask } from "../agent";
-import type { JobPreRunHookConfig, JobRecord, JobRunRecord, RuntimeConfig, RuntimeState, Task } from "../types";
+import type { JobPreRunHookConfig, JobRecord, JobRunRecord, RuntimeConfig, RuntimeState } from "../types";
 import { addAudit, appendEvent, appendLog, appendTrace, createChatSession, createJob, createJobRun, createRun, isTerminalTaskStatus, mutateState, now, readState } from "../state";
 import { resolveEffectiveContext } from "../execution/effective-context";
 import { isKnownPreRunHook, resolvePreRunHook } from "./hooks/registry";
 import type { JobPreRunHookResult, PreRunHookContextItem } from "./hooks/types";
-import { finalizeJobRunFromTask } from "./finalize";
+import { syncChatTaskResult } from "../execution/chat";
 import { spawn } from "bun";
 import { Cron } from "croner";
 
@@ -506,15 +506,26 @@ async function runPreRunHook(
   return { action: "proceed", context: renderHookContext(result.items) };
 }
 
-// Finalize a short-circuited run with NO model turn. Reuses the same finalize
-// path a completed task takes (finalizeJobRunFromTask) so the run gets oneShot
-// auto-pause, chat sync, and bridge mirror with the [SILENT]/empty suppression
-// for free. The run never spawned a task, so it has no taskId; we synthesize a
-// terminal Task-shaped object and let finalizeJobRunFromTask's secondary
-// "most-recent running run for this job" match bind it to THIS run (overlap
-// protection guarantees one running run per job). A cancelTask that landed
-// between the claim and here already flipped the run terminal, so the
-// finalizer's `status === "running"` guard makes this a no-op (no double
+// Finalize a short-circuited run with NO model turn. The run never spawned a
+// task (no taskId), so we finalize it INLINE by run.id rather than routing a
+// synthetic Task through finalizeJobRunFromTask — that path's chat sync calls
+// syncChatTaskResult, which throws "Task not found" for a task that was never in
+// state.tasks (the dominant idle 60s email path), leaving the [SILENT]
+// suppression dead and spamming job.chat.sync.error every tick. Binding by
+// run.id is exact (no order-dependent "most-recent running run" heuristic, which
+// mis-binds under concurrent manual/replay runs). We replicate the parts of the
+// completed-run finalize that apply with no task: completed status, job
+// lastSuccessAt + cleared lastError, oneShot auto-pause + its audit, and the
+// job.run.completed event.
+//
+// Delivery: a short-circuited run has nothing to materialize into chat, so we
+// emit the chat.message.suppressed_silent audit explicitly for the silent/empty
+// case (preserving the suppression audit the dead path used to produce only by a
+// swallowed throw). syncChatTaskResult is reached only in the theoretical edge
+// of a genuinely non-silent summary attached to a real spawned task.
+//
+// A cancelTask that landed between the claim and here already flipped the run
+// terminal, so the `status === "running"` guard makes this a no-op (no double
 // finalize).
 async function finalizeShortCircuit(
   config: RuntimeConfig,
@@ -522,16 +533,91 @@ async function finalizeShortCircuit(
   run: JobRunRecord,
   summary?: string
 ): Promise<void> {
-  const synthetic = {
-    id: run.taskId ?? `shortcircuit-${run.id}`,
-    jobId: job.id,
-    status: "completed",
-    // Empty / "[SILENT]" suppresses chat + bridge delivery — a "nothing new"
-    // tick delivers nothing.
-    summary: summary ?? "[SILENT]",
-    agentId: job.agentId
-  } as Task;
-  await finalizeJobRunFromTask(config, synthetic);
+  // Empty / "[SILENT]" suppresses chat + bridge delivery — a "nothing new" tick
+  // delivers nothing. The match is exact-trimmed, mirroring the chat-side
+  // suppression contract (src/execution/chat.ts) and the cron-hint instruction.
+  const effectiveSummary = summary ?? "[SILENT]";
+  const trimmed = effectiveSummary.trim();
+  const isSilent = trimmed.length === 0 || trimmed === "[SILENT]";
+
+  const outcome = await mutateState(config.instance, (state) => {
+    const runItem = state.jobRuns.find((candidate) => candidate.id === run.id);
+    const jobItem = state.jobs.find((candidate) => candidate.id === job.id);
+    if (!runItem) return undefined;
+    if (runItem.status !== "running") return undefined;
+    const completedAt = now();
+    runItem.status = "completed";
+    runItem.summary = effectiveSummary;
+    runItem.error = undefined;
+    runItem.completedAt = completedAt;
+    runItem.updatedAt = completedAt;
+    if (jobItem) {
+      jobItem.lastSuccessAt = completedAt;
+      jobItem.lastError = undefined;
+      // One-shot reminders auto-pause after the FIRST terminal run, matching
+      // finalizeJobRunFromTask's oneShot handling.
+      if (jobItem.oneShot === true && jobItem.status === "active") {
+        jobItem.status = "paused";
+        jobItem.updatedAt = completedAt;
+        addAudit(
+          state,
+          {
+            actor: "runtime",
+            action: "job.oneshot.completed",
+            target: jobItem.id,
+            risk: "low",
+            evidence: { runId: run.id, runStatus: runItem.status }
+          },
+          { jobId: jobItem.id, agentId: jobItem.agentId }
+        );
+      }
+    }
+    // The silent/empty short-circuit delivers nothing — record the suppression
+    // audit explicitly so the audit trail still shows the run produced no chat
+    // message (the chat-side suppression path never runs because no task synced).
+    if (isSilent && job.chatSessionId) {
+      addAudit(
+        state,
+        {
+          actor: "runtime",
+          action: "chat.message.suppressed_silent",
+          target: job.chatSessionId,
+          risk: "low",
+          evidence: { runId: run.id }
+        },
+        { jobId: job.id, agentId: job.agentId }
+      );
+    }
+    appendEvent(
+      state,
+      {
+        kind: "job",
+        action: "job.run.completed",
+        target: job.id,
+        jobId: job.id,
+        risk: "low",
+        summary: "Pre-run hook short-circuited the run.",
+        data: { runId: run.id, shortCircuit: true }
+      },
+      { jobId: job.id, agentId: job.agentId }
+    );
+    return { taskId: runItem.taskId };
+  });
+
+  // Only deliver when there's a genuinely non-silent summary AND a real spawned
+  // task to materialize — a short-circuited run normally has neither.
+  if (outcome && !isSilent && outcome.taskId && job.chatSessionId) {
+    try {
+      await syncChatTaskResult(config, job.chatSessionId, outcome.taskId);
+    } catch (error) {
+      appendLog(config.instance, "job.chat.sync.error", {
+        jobId: job.id,
+        taskId: outcome.taskId,
+        sessionId: job.chatSessionId,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
 }
 
 // Finalize a run that the hook failed (error kind or timeout). No model turn,

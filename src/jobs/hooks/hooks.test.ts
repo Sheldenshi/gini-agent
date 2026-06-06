@@ -12,7 +12,7 @@
 //   - char cap      => an oversized context item is truncated before injection
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -49,6 +49,17 @@ async function waitForJobRun(config: RuntimeConfig, runId: string, timeoutMs = 5
     await Bun.sleep(20);
   }
   throw new Error(`Job run ${runId} did not settle within ${timeoutMs}ms`);
+}
+
+// Read the runtime.jsonl messages for an instance (GINI_LOG_ROOT/<instance>).
+function readRuntimeLogMessages(logRoot: string, instance: string): string[] {
+  const path = join(logRoot, instance, "runtime.jsonl");
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => (JSON.parse(line) as { message: string }).message);
 }
 
 async function createSession(config: RuntimeConfig, id: string): Promise<void> {
@@ -134,6 +145,62 @@ describe("pre-run hook primitive", () => {
     // No assistant chat message materialized ([SILENT] suppression).
     const assistantMsgs = state.chatMessages.filter((m) => m.sessionId === sessionId && m.role === "assistant");
     expect(assistantMsgs).toHaveLength(0);
+  });
+
+  test("a silent short-circuit emits the suppressed_silent audit and never logs job.chat.sync.error", async () => {
+    // The run is finalized INLINE by run.id — it must NOT route a synthetic Task
+    // through finalizeJobRunFromTask -> syncChatTaskResult (which throws
+    // "Task not found" and logs job.chat.sync.error every idle tick). Pin both
+    // the explicit suppression audit AND the absence of the sync-error log.
+    const config = buildConfig(workspaceRoot, "hook-sc-audit");
+    const sessionId = "session_sc_audit";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "sc-audit",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-shortcircuit", config: {} }
+    });
+
+    await runJobNow(config, job.id, "manual");
+
+    const state = readState(config.instance);
+    // The job.lastSuccessAt was stamped and lastError cleared (inline completed).
+    const finalJob = state.jobs.find((j) => j.id === job.id);
+    expect(finalJob?.lastSuccessAt).toBeString();
+    expect(finalJob?.lastError).toBeUndefined();
+    // Suppression audit present, keyed to the chat session.
+    const suppressed = state.audit.find(
+      (a) => a.action === "chat.message.suppressed_silent" && a.target === sessionId
+    );
+    expect(suppressed).toBeDefined();
+    // No "Task not found" sync-error spam.
+    const messages = readRuntimeLogMessages(config.logRoot, config.instance);
+    expect(messages).not.toContain("job.chat.sync.error");
+  });
+
+  test("a silent short-circuit on a oneShot job auto-pauses with the oneshot.completed audit", async () => {
+    const config = buildConfig(workspaceRoot, "hook-sc-oneshot");
+    const sessionId = "session_sc_oneshot";
+    await createSession(config, sessionId);
+    const job = await createScheduledJob(config, {
+      name: "sc-oneshot",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      oneShot: true,
+      preRunHook: { handlerId: "test-shortcircuit", config: {} }
+    });
+
+    await runJobNow(config, job.id, "manual");
+
+    const state = readState(config.instance);
+    expect(state.jobs.find((j) => j.id === job.id)?.status).toBe("paused");
+    const audit = state.audit.find(
+      (a) => a.action === "job.oneshot.completed" && a.target === job.id
+    );
+    expect(audit).toBeDefined();
   });
 
   test("context injects the fenced item into exactly one spawned turn", async () => {
