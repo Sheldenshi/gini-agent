@@ -16,17 +16,19 @@ export function ChatTabBar({
   active,
   onChange,
   threadCount,
-  jobCount
+  jobCount,
+  hideJobsTab
 }: {
   active: ChatTab;
   onChange: (tab: ChatTab) => void;
   threadCount?: number;
   jobCount?: number;
+  hideJobsTab?: boolean;
 }) {
   const tabs: TabSpec[] = [
     { id: "messages", label: "Messages" },
     { id: "threads", label: "Threads", count: threadCount },
-    { id: "jobs", label: "Jobs", count: jobCount }
+    ...(hideJobsTab ? [] : [{ id: "jobs", label: "Jobs", count: jobCount } as TabSpec])
   ];
   return (
     <div className="flex shrink-0 items-end gap-1.5 border-b border-[#1C1C1E] px-7">

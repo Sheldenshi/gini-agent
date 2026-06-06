@@ -32,14 +32,6 @@ import { TunnelMenu } from "@/components/tunnel/TunnelMenu";
 import type { AgentRow, ChatSession } from "@/lib/view-types";
 import type { GiniUpdateResult, GiniVersionInfo, JobRecord } from "@runtime/types";
 
-// "Online" is a coarse status hint on the sidebar agent rows. The runtime
-// reports a richer AgentStatus; anything that isn't an explicit error/paused
-// state reads as ready, matching the green dot in the design.
-function isAgentOnline(status: string | undefined): boolean {
-  if (!status) return true;
-  return !["error", "paused", "disabled", "stopped"].includes(status);
-}
-
 function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
   const pathname = usePathname();
   const params = useSearchParams();
@@ -198,8 +190,6 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
                         </span>
                         {unread ? (
                           <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#4277FB]" />
-                        ) : isAgentOnline(agent.status) ? (
-                          <span aria-hidden className="size-[7px] shrink-0 rounded-full bg-[#39C36E]" />
                         ) : null}
                       </button>
                     </li>

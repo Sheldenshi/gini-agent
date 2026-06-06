@@ -10,6 +10,7 @@ import { BlockToolCallsCollapsed } from "@/components/chat/BlockToolCallsCollaps
 import { GeneratedFilesCard } from "@/components/chat/GeneratedFilesCard";
 import { Composer } from "@/components/chat/Composer";
 import { AgentChatHeader } from "@/components/chat/AgentChatHeader";
+import { ChannelViewJob } from "@/components/chat/ChannelViewJob";
 import { ChatSearchBox } from "@/components/chat/ChatSearchBox";
 import { ChatTabBar, type ChatTab } from "@/components/chat/ChatTabBar";
 import { ThreadChip } from "@/components/chat/ThreadChip";
@@ -23,6 +24,7 @@ import { groupExchanges, type ChatRenderItem } from "@/lib/group-exchanges";
 import {
   splitBlocks,
   useAgentChat,
+  useAllJobs,
   useCancelTask,
   useChatBlocks,
   useChatSessions,
@@ -78,8 +80,8 @@ export default function ChatPage() {
     <div className="flex min-h-0 flex-1 overflow-hidden bg-[#0B0B0E]">
       {!sessionId ? (
         <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <AgentChatHeader name={headerName} seed={headerSeed} />
-          <ChatTabBar active="messages" onChange={() => {}} />
+          <AgentChatHeader name={headerName} seed={headerSeed} showAvatar={!isChannel} />
+          <ChatTabBar active="messages" onChange={() => {}} hideJobsTab={isChannel} />
           <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
             {resolving ? "Loading…" : "No chat yet — say hello below."}
           </div>
@@ -96,6 +98,7 @@ export default function ChatPage() {
           headerSeed={headerSeed}
           isChannel={isChannel}
           messageAgent={messageAgent}
+          activeAgentId={activeAgentId}
         />
       )}
     </div>
@@ -108,7 +111,8 @@ function ChatSurface({
   headerName,
   headerSeed,
   isChannel,
-  messageAgent
+  messageAgent,
+  activeAgentId
 }: {
   sessionId: string;
   session: ChatSession;
@@ -116,6 +120,7 @@ function ChatSurface({
   headerSeed: string;
   isChannel: boolean;
   messageAgent?: { id: string; name: string };
+  activeAgentId?: string;
 }) {
   const [tab, setTab] = useState<ChatTab>("messages");
   const [openThread, setOpenThread] = useState<ThreadSummary | null>(null);
@@ -126,6 +131,16 @@ function ChatSurface({
   const [activeMatch, setActiveMatch] = useState(0);
   const invalidate = useInvalidate();
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  // On a channel, resolve the originating job by its linked chat session so the
+  // header can offer a "Back to job" link. The session carries no jobId, so we
+  // match `job.chatSessionId === sessionId` against the unscoped jobs list.
+  const allJobs = useAllJobs();
+  const job = useMemo(
+    () =>
+      isChannel ? (allJobs.data ?? []).find((j) => j.chatSessionId === sessionId) : undefined,
+    [allJobs.data, isChannel, sessionId]
+  );
 
   const { blocks, isLoading: blocksLoading } = useChatBlocks(sessionId);
   const threadsQuery = useThreads(sessionId);
@@ -278,6 +293,12 @@ function ChatSurface({
           seed={headerSeed}
           lastActiveAt={session.updatedAt}
           subtitle={isChannel ? "recurring job channel" : undefined}
+          showAvatar={!isChannel}
+          titleAction={
+            isChannel && job ? (
+              <ChannelViewJob jobId={job.id} agentId={job.agentId} activeAgentId={activeAgentId} />
+            ) : undefined
+          }
           right={
             <ChatSearchBox
               value={query}
@@ -297,7 +318,12 @@ function ChatSurface({
             />
           }
         />
-        <ChatTabBar active={tab} onChange={setTab} threadCount={unreadThreadCount} />
+        <ChatTabBar
+          active={tab}
+          onChange={setTab}
+          threadCount={unreadThreadCount}
+          hideJobsTab={isChannel}
+        />
 
         {tab === "messages" ? (
           <>

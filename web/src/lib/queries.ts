@@ -155,6 +155,17 @@ export function useJobs() {
   });
 }
 
+// Unscoped jobs list (all agents) — mirrors the sidebar's inline query so the
+// React Query cache key is shared and the two dedupe. Used by the chat surface
+// to resolve a recurring-job channel back to its originating job.
+export function useAllJobs() {
+  return useQuery<JobRecord[]>({
+    queryKey: ["jobs", "all"],
+    queryFn: () => api<JobRecord[]>("/jobs"),
+    refetchInterval: 3000
+  });
+}
+
 export function useJobRuns(jobId?: string) {
   const agentId = useActiveAgentId();
   return useQuery<JobRunRecord[]>({

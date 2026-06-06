@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useSearchParams } from "next/navigation";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,7 +9,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader, EmptyState } from "@/components/PageHeader";
 import { api } from "@/lib/api";
-import { useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
+import { useAllJobs, useInvalidate, useJobRuns, useJobs } from "@/lib/queries";
 import type { JobRecord, JobRunRecord } from "@runtime/types";
 import { JobList } from "./_components/JobList";
 import { JobDetail } from "./_components/JobDetail";
@@ -18,7 +19,13 @@ import { adaptJob, adaptRun } from "./_components/calendar/types";
 
 export default function JobsPage() {
   const jobs = useJobs();
-  const [selected, setSelected] = useState<string | null>(null);
+  // Warm unscoped list (shared with the sidebar) — fallback for resolving a
+  // deep-linked job whose owning agent isn't the active one yet.
+  const allJobs = useAllJobs();
+  const params = useSearchParams();
+  // Deep-link from a channel's "Back to job" link: ?job=<id> preselects that
+  // job in JobDetail. The initializer runs once on mount, which is sufficient.
+  const [selected, setSelected] = useState<string | null>(params?.get("job") ?? null);
   const runs = useJobRuns(selected ?? undefined);
   // For the calendar tab we need every run (across all jobs), not just the
   // selected job's runs. `useJobRuns(undefined)` resolves to `/job-runs`.
@@ -73,7 +80,11 @@ export default function JobsPage() {
               <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
                 {selected ? (
                   <JobDetail
-                    job={(jobs.data ?? []).find((j) => j.id === selected) ?? null}
+                    job={
+                      (jobs.data ?? []).find((j) => j.id === selected) ??
+                      (allJobs.data ?? []).find((j) => j.id === selected) ??
+                      null
+                    }
                     runs={runs.data ?? []}
                     replayPending={replay.isPending}
                     onReplay={(id) => replay.mutate(id)}
