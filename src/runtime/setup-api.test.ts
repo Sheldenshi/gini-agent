@@ -354,6 +354,41 @@ describe("setup-api", () => {
     }
   });
 
+  test("remove scrubs a custom apiKeyEnv (not just the canonical var) for an active anthropic provider", async () => {
+    const prevBedrock = process.env.BEDROCK_BEARER_TOKEN;
+    process.env.BEDROCK_BEARER_TOKEN = "bedrock-old";
+    // Active anthropic provider keyed on a custom env var, as
+    // `gini provider set anthropic --api-key-env BEDROCK_BEARER_TOKEN` persists.
+    config.provider = {
+      name: "anthropic",
+      model: "anthropic.claude-opus-4-8",
+      baseUrl: "https://bedrock-mantle.us-east-1.api.aws/anthropic",
+      apiKeyEnv: "BEDROCK_BEARER_TOKEN"
+    };
+    try {
+      // Rotate the key so the bearer actually lands in secrets.env under the
+      // custom var (setSetupProvider routes the write through apiKeyEnv).
+      const rotated = await setSetupProvider(config, { provider: "anthropic", apiKey: "bedrock-live" });
+      expect(rotated.ok).toBe(true);
+      expect(config.provider.apiKeyEnv).toBe("BEDROCK_BEARER_TOKEN");
+      expect(process.env.BEDROCK_BEARER_TOKEN).toBe("bedrock-live");
+      const before = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(before).toContain("BEDROCK_BEARER_TOKEN=");
+
+      const result = removeSetupProvider(config, "anthropic");
+      expect(result.ok).toBe(true);
+      expect(result.switched).toBe(true);
+      // The live token must be gone from BOTH stores — the canonical-only
+      // scrub would have left it behind under the custom var.
+      expect(process.env.BEDROCK_BEARER_TOKEN).toBeUndefined();
+      const after = readFileSync(join(s.home, ".gini", "secrets.env"), "utf8");
+      expect(after).not.toContain("BEDROCK_BEARER_TOKEN=");
+    } finally {
+      if (prevBedrock === undefined) delete process.env.BEDROCK_BEARER_TOKEN;
+      else process.env.BEDROCK_BEARER_TOKEN = prevBedrock;
+    }
+  });
+
   test("plistRefreshNeeded:true when an autostart plist already exists (macOS only)", async () => {
     if (process.platform !== "darwin") {
       // Linux: function returns false regardless.

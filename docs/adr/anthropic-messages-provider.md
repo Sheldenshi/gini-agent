@@ -61,6 +61,6 @@ SigV4 / IAM-role auth (the AWS-recommended Bedrock path) is intentionally **not*
 
 ## Consequences
 
-- Claude is reachable end-to-end with full Messages-API fidelity (prompt caching, tool use, streaming, vision, documents) from both the first-party API and Amazon Bedrock, selected by configuration alone.
+- Claude is reachable end-to-end with full Messages-API fidelity (tool use, streaming, vision, documents) from both the first-party API and Amazon Bedrock, selected by configuration alone. Messages-API prompt caching is not yet wired — the path sends no `cache_control` markers, so the stable system prefix goes uncached (a follow-up; see ADR stable-system-prefix.md).
 - The provider is the first non-OpenAI-shaped transport in `src/provider.ts`; the translation helpers (`translateMessagesToAnthropic`, `translateToolsToAnthropic`, `parseAnthropicMessage`, `readAnthropicMessagesStream`) are self-contained and reuse the existing `resolveBaseUrl` / `sanitizeExtraBody` / `estimateCost` helpers.
 - `apiKeyEnv` + `baseUrl` being first-class on `ProviderConfig` (see `provider-extra-body.md`) is what makes the dual-target design require zero schema change.

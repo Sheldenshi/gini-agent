@@ -264,10 +264,21 @@ export function removeSetupProvider(
   }
 
   // Wipe the bearer from both stores so the running process and future
-  // shell launches stop seeing it. removeKeyFromSecretsEnv is a no-op if
-  // the file or the line is already absent — safe to call unconditionally.
-  removeKeyFromSecretsEnv(envKeySpec.envVar);
-  delete process.env[envKeySpec.envVar];
+  // shell launches stop seeing it. When the provider being removed is the
+  // active one and was configured with a custom apiKeyEnv (e.g. a Bedrock
+  // bearer under BEDROCK_BEARER_TOKEN), the live token lives under that var,
+  // not the canonical one — scrub it alongside the canonical var so removal
+  // never leaves a usable token behind. removeKeyFromSecretsEnv is a no-op
+  // when the line is already absent, so scrubbing both unconditionally (and
+  // deduped) is safe.
+  const activeCustomEnv =
+    config.provider?.name === providerName ? config.provider?.apiKeyEnv : undefined;
+  for (const envVar of new Set(
+    activeCustomEnv ? [envKeySpec.envVar, activeCustomEnv] : [envKeySpec.envVar]
+  )) {
+    removeKeyFromSecretsEnv(envVar);
+    delete process.env[envVar];
+  }
 
   let switched = false;
   if (config.provider?.name === providerName) {
