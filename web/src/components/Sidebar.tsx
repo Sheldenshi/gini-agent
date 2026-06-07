@@ -12,6 +12,7 @@ import {
   Moon,
   Plus,
   RefreshCw,
+  ScrollText,
   Settings,
   Sun,
   WandSparkles
@@ -275,6 +276,12 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
               <Link href="/skills" onClick={onNavigate} className={navItem(pathname === "/skills")}>
                 <WandSparkles className="size-3.5 text-[#8A8A90]" />
                 Skills
+              </Link>
+            </li>
+            <li>
+              <Link href="/logs" onClick={onNavigate} className={navItem(pathname === "/logs")}>
+                <ScrollText className="size-3.5 text-[#8A8A90]" />
+                Logs
               </Link>
             </li>
             <li>
