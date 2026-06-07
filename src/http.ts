@@ -113,6 +113,9 @@ import { getRun, listRuns } from "./execution/runs";
 import { assertCurrentRuntimeUpdateSupported, currentVersionInfo, refreshVersionInfo, scheduleRuntimeRestart, updateRuntime } from "./runtime/update";
 import { projectRoot } from "./paths";
 import { readDocSection } from "./docs";
+import { isLogStream, readLogTail } from "./state/logs";
+import { redactLogTail } from "./runtime/log-redaction";
+import { readSecretsEnvBody } from "./state/secrets-env";
 import { clearWebTargetCache, resolveWebPort } from "./web-target";
 import { basename } from "node:path";
 import type { Server, ServerWebSocket } from "bun";
@@ -1087,6 +1090,22 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       return json(agentId ? events.filter((event) => event.agentId === agentId) : events);
     }],
     ["GET", /^\/api\/events\/stream$/, (request) => eventStream(config, request)],
+    // Instance log tail for the in-app Logs viewer (ADR logs-viewing.md).
+    // Raw by default (the gateway is loopback + bearer-gated and the operator
+    // already has filesystem access); `redact=true` reuses crash-report
+    // redaction so a copy is safe to attach to a report.
+    ["GET", /^\/api\/logs$/, (request) => {
+      const url = new URL(request.url);
+      const stream = url.searchParams.get("stream") ?? "runtime";
+      if (!isLogStream(stream)) return json({ error: `Unknown log stream: ${stream}` }, 400);
+      const rawLimit = Number(url.searchParams.get("limit") ?? 500);
+      const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.floor(rawLimit), 5000) : 500;
+      const redactParam = url.searchParams.get("redact");
+      const redact = redactParam === "true" || redactParam === "1";
+      const tail = readLogTail(config.instance, stream, limit);
+      const out = redact ? redactLogTail(tail, { secretsEnvBody: readSecretsEnvBody() }) : tail;
+      return json({ ...out, redacted: redact });
+    }],
     // Hindsight phase 6: one-time migration trigger.
     ["POST", /^\/api\/memory\/migrate$/, async () => {
       const report = await migrateLegacyMemories(config);

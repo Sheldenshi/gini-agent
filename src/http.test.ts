@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHandler } from "./http";
-import { webPortPath } from "./paths";
+import { logDir, webPortPath } from "./paths";
 import { clearWebTargetCache } from "./web-target";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { addAudit, appendEvent, approvePairingRequest, claimPairingRequest, createPairingRequest, insertChatBlock, isPlausibleMime, mutateState, readState, readTrace, revokeDevice, sanitizeFilename, storeUpload, uploadStat } from "./state";
 import { getOrCreateAgentChat } from "./execution/chat";
 import { listAllDevices } from "./state/devices";
@@ -5304,6 +5304,70 @@ describe("agent-chat and thread endpoints", () => {
     const all = await call(handler, config, "/api/threads?filter=unread");
     expect(all).toHaveLength(2);
   });
+
+  test("GET /api/logs requires the bearer", async () => {
+    const config = testConfig("logs-auth");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/logs");
+    expect(response.status).toBe(401);
+  });
+
+  test("GET /api/logs returns parsed runtime entries by default", async () => {
+    const config = testConfig("logs-runtime");
+    const handler = createHandler(config);
+    seedLogFile(config, "runtime.jsonl",
+      `${JSON.stringify({ at: "2026-06-07T00:00:00.000Z", message: "boot", data: { token: "sk-secret-1" } })}\n` +
+      `${JSON.stringify({ at: "2026-06-07T00:00:01.000Z", message: "ready" })}\n`
+    );
+    const tail = await call(handler, config, "/api/logs");
+    expect(tail.stream).toBe("runtime");
+    expect(tail.redacted).toBe(false);
+    expect(tail.entries).toHaveLength(2);
+    // Raw mode keeps the data payload untouched.
+    expect(tail.entries[0].data).toEqual({ token: "sk-secret-1" });
+    expect(tail.lines).toBeUndefined();
+  });
+
+  test("GET /api/logs honors the stream param and returns raw lines", async () => {
+    const config = testConfig("logs-stream");
+    const handler = createHandler(config);
+    seedLogFile(config, "web.log", "web line 1\nweb line 2\n");
+    const tail = await call(handler, config, "/api/logs?stream=web");
+    expect(tail.stream).toBe("web");
+    expect(tail.lines).toEqual(["web line 1", "web line 2"]);
+    expect(tail.entries).toBeUndefined();
+  });
+
+  test("GET /api/logs with redact=true drops data and scrubs secrets", async () => {
+    const config = testConfig("logs-redact");
+    const handler = createHandler(config);
+    seedLogFile(config, "runtime.jsonl",
+      `${JSON.stringify({ at: "2026-06-07T00:00:00.000Z", message: "auth Bearer sk-leak-123", data: { token: "sk-leak-123" } })}\n`
+    );
+    const tail = await call(handler, config, "/api/logs?redact=true");
+    expect(tail.redacted).toBe(true);
+    expect(tail.entries).toHaveLength(1);
+    expect(tail.entries[0].data).toBeUndefined();
+    expect(tail.entries[0].message).not.toContain("sk-leak-123");
+    expect(tail.entries[0].message).toContain("[redacted]");
+  });
+
+  test("GET /api/logs rejects an unknown stream with 400", async () => {
+    const config = testConfig("logs-unknown");
+    const handler = createHandler(config);
+    const response = await rawCall(handler, config, "/api/logs?stream=audit", {}, config.token);
+    expect(response.status).toBe(400);
+  });
+
+  test("GET /api/logs clamps the limit to the most recent lines", async () => {
+    const config = testConfig("logs-limit");
+    const handler = createHandler(config);
+    const body = Array.from({ length: 6 }, (_, i) => JSON.stringify({ message: `m${i}` })).join("\n") + "\n";
+    seedLogFile(config, "runtime.jsonl", body);
+    const tail = await call(handler, config, "/api/logs?limit=2");
+    expect(tail.truncated).toBe(true);
+    expect(tail.entries.map((e: { message: string }) => e.message)).toEqual(["m4", "m5"]);
+  });
 });
 
 async function call(handler: ReturnType<typeof createHandler>, config: RuntimeConfig, path: string, init: RequestInit = {}) {
@@ -5376,6 +5440,15 @@ function testConfig(instance: string): RuntimeConfig {
     // are exercised in approval-mode.test.ts.
     approvalMode: "strict"
   };
+}
+
+// Write a log file under the test config's instance log dir so the /api/logs
+// route reads it. testConfig nukes the instance state dir and points
+// GINI_LOG_ROOT at a sibling tree, so this lands in a clean per-instance dir.
+function seedLogFile(config: RuntimeConfig, filename: string, body: string): void {
+  const dir = logDir(config.instance);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, filename), body);
 }
 
 // Seed a typed api-key credential so the per-(skill, credential) consent gate
