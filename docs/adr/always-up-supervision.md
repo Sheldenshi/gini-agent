@@ -114,7 +114,13 @@ Auto-update no longer orphans the runtime. For a launchd instance,
 `scheduleRuntimeRestart` (`src/runtime/update.ts`) self-SIGTERMs after the
 update has already run `git reset --hard` + `bun install` synchronously;
 the server's SIGTERM handler drains and exits 0, and KeepAlive respawns
-the gateway with the freshly checked-out code. A detached
+the gateway with the freshly checked-out code. The drain is bounded so the
+restart's downtime window stays short: in-flight responses get a brief grace
+(`SERVER_DRAIN_GRACE_MS`) to finish writing, then the server force-closes —
+idle keep-alive connections would otherwise never let the graceful
+`server.stop(false)` resolve — and every background loop interrupts its
+inter-tick sleep on shutdown instead of sleeping out its full interval (up to
+60s for the connector re-probe). A detached
 `gini autostart kick --kind web` re-execs the web service so any new `web/`
 dependencies take effect. Foreground keeps the existing detached
 stop+start helper because there is no KeepAlive to respawn it. See
