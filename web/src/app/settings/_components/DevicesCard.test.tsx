@@ -8,7 +8,7 @@
 // component coverage gate by this logic test.
 
 import { afterEach, describe, expect, setSystemTime, test } from "bun:test";
-import { effectiveStatus, isExpired } from "./deviceStatus";
+import { effectiveStatus, isExpired, isListedSession } from "./deviceStatus";
 
 describe("effectiveStatus", () => {
   afterEach(() => setSystemTime());
@@ -31,5 +31,24 @@ describe("effectiveStatus", () => {
   test("a non-active status is reported verbatim regardless of expiry", () => {
     setSystemTime(new Date("2025-06-01T00:00:00.000Z"));
     expect(effectiveStatus({ status: "revoked", expiresAt: "2025-05-01T00:00:00.000Z" })).toBe("revoked");
+  });
+});
+
+// isListedSession is the Active sessions list filter: a revoked device drops out
+// (it can never become active again; the row survives in durable state for audit),
+// while active/pending/expired devices stay listed.
+describe("isListedSession", () => {
+  afterEach(() => setSystemTime());
+
+  test("a revoked device is excluded from the list", () => {
+    expect(isListedSession({ status: "revoked" })).toBe(false);
+  });
+
+  test("active, pending, and expired devices stay listed", () => {
+    setSystemTime(new Date("2025-06-01T00:00:00.000Z"));
+    expect(isListedSession({ status: "active" })).toBe(true);
+    expect(isListedSession({ status: "pending" })).toBe(true);
+    // an active row past its expiresAt reads as expired — still shown, not revoked
+    expect(isListedSession({ status: "active", expiresAt: "2025-05-01T00:00:00.000Z" })).toBe(true);
   });
 });

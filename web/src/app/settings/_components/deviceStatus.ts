@@ -20,3 +20,10 @@ export function isExpired(device: DeviceStatusInput): boolean {
 export function effectiveStatus(device: DeviceStatusInput): string {
   return device.status === "active" && isExpired(device) ? "expired" : device.status;
 }
+
+// A revoked device is permanently dead — it can never become active again — so
+// the Active sessions list drops it. Revocation stays in durable state (the row
+// keeps its revokedAt timestamp) for the audit trail; it's just not shown.
+export function isListedSession(device: DeviceStatusInput): boolean {
+  return effectiveStatus(device) !== "revoked";
+}

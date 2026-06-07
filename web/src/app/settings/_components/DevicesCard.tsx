@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/PageHeader";
 import { StatusPill } from "@/components/StatusPill";
 import { PairDeviceDialog } from "@/components/pairing/PairDeviceDialog";
-import { effectiveStatus } from "./deviceStatus";
+import { effectiveStatus, isListedSession } from "./deviceStatus";
 
 export interface DeviceRow { id: string; name: string; status: string; origin?: string; lastSeenAt?: string; expiresAt?: string }
 
@@ -35,6 +35,9 @@ export function DevicesCard({
   onRevoke: (id: string) => void;
   onCreatePairing: () => void;
 }) {
+  // Revoked devices stay in durable state for the audit trail but drop out of
+  // the Active sessions list — they can never become active again.
+  const visibleDevices = devices.filter(isListedSession);
   return (
     <Card>
       <CardHeader>
@@ -52,11 +55,11 @@ export function DevicesCard({
         </div>
       </CardHeader>
       <CardContent>
-        {devices.length === 0 ? (
+        {visibleDevices.length === 0 ? (
           <EmptyState title="No devices" description="Create a pairing code, then claim it from a device." />
         ) : (
           <ul className="divide-y divide-border">
-            {devices.map((item) => (
+            {visibleDevices.map((item) => (
               <li key={item.id} className="flex items-center justify-between gap-2 py-2">
                 <div className="min-w-0">
                   <p className="text-sm">{item.name}</p>
@@ -76,7 +79,7 @@ export function DevicesCard({
                   <Button
                     size="sm"
                     variant="outline"
-                    disabled={revokePending || item.status === "revoked"}
+                    disabled={revokePending}
                     onClick={() => onRevoke(item.id)}
                   >
                     Revoke
