@@ -35,6 +35,25 @@ function shellSingleQuote(value: string): string {
   return "'" + value.replace(/'/g, "'\\''") + "'";
 }
 
+// A POSIX `set -a` env-var name: a leading letter/underscore then letters,
+// digits, underscores. The writer and remover interpolate `name` into the
+// secrets.env line AND the matching regex, so a name carrying `=`, a newline,
+// or regex metacharacters could inject an extra `export …` line into a file the
+// gini wrapper shell-sources, or corrupt the match. Historically every caller
+// passed a fixed constant; this guard hardens the path now that a
+// user-configurable apiKeyEnv can reach here.
+const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export function isValidEnvVarName(name: string): boolean {
+  return ENV_VAR_NAME_RE.test(name);
+}
+
+function assertValidEnvName(name: string): void {
+  if (!isValidEnvVarName(name)) {
+    throw new Error(`Invalid environment variable name: ${JSON.stringify(name)}`);
+  }
+}
+
 // Write a `KEY=value` (or replace an existing one) into ~/.gini/secrets.env
 // in a shell-sourceable form. Always lands at mode 0600 — even when the
 // file pre-existed at a more permissive mode.
@@ -48,6 +67,7 @@ function shellSingleQuote(value: string): string {
 // keeps that permission. Explicit chmod after the write ensures 0600 on
 // every call so secrets aren't world-readable.
 export function writeKeyToSecretsEnv(name: string, value: string): void {
+  assertValidEnvName(name);
   const path = secretsEnvPath();
   // mkdir if missing — secrets.env may be the first file we ever write
   // here on a fresh install.
@@ -72,6 +92,7 @@ export function writeKeyToSecretsEnv(name: string, value: string): void {
 // log / nudge a plist refresh. Mode stays 0600 via the same chmod the
 // writer enforces.
 export function removeKeyFromSecretsEnv(name: string): boolean {
+  assertValidEnvName(name);
   const path = secretsEnvPath();
   if (!existsSync(path)) return false;
   const existing = readFileSync(path, "utf8");
@@ -142,6 +163,7 @@ export function readSecretsEnvBody(): string | undefined {
 // so `gini setup` and `gini import apply openclaw` agree on what
 // counts as "the operator has configured this key."
 export function secretsEnvHasKey(name: string): boolean {
+  assertValidEnvName(name);
   const path = secretsEnvPath();
   if (!existsSync(path)) return false;
   const contents = readFileSync(path, "utf8");

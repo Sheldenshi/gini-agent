@@ -133,7 +133,7 @@ async function getSelf(config: RuntimeConfig, taskId: string): Promise<string> {
 }
 
 async function listProviders(config: RuntimeConfig, taskId: string): Promise<string> {
-  const catalog = providerCatalogWithStatus(config.provider?.name);
+  const catalog = providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv);
   const providers = catalog.map((item) => ({
     id: item.id,
     name: item.name,
@@ -293,8 +293,15 @@ async function setProvider(
   }
   const payload: Record<string, unknown> = { provider: targetProvider };
   if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
-  if (typeof args.baseUrl === "string" && args.baseUrl.trim().length > 0) payload.baseUrl = args.baseUrl.trim();
   if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
+  // Transport fields pass through when PRESENT (even blank), so the agent can
+  // CLEAR them — a blank baseUrl/apiVersion swaps an Azure config back to
+  // standard OpenAI — matching the setup API's present-clears / absent-preserves
+  // rule. Omitting an arg entirely preserves the persisted value.
+  if (typeof args.baseUrl === "string") payload.baseUrl = args.baseUrl.trim();
+  if (typeof args.apiVersion === "string") payload.apiVersion = args.apiVersion.trim();
+  if (typeof args.deployment === "string") payload.deployment = args.deployment.trim();
+  if (args.authScheme === "api-key" || args.authScheme === "bearer") payload.authScheme = args.authScheme;
   const result = await setSetupProvider(config, payload);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -906,10 +913,13 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       properties: {
         provider: {
           type: "string",
-          description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+          description: "Provider id (e.g. 'codex', 'openai', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` (and any Azure routing fields) are updated."
         },
         model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo." },
+        baseUrl: { type: "string", description: "Override base URL for OpenAI-compatible providers (openai, openrouter, deepseek, local). Ignored for codex/echo. For Azure OpenAI, set this to the resource endpoint (https://<resource>.openai.azure.com)." },
+        apiVersion: { type: "string", description: "Azure OpenAI api-version (e.g. '2024-12-01-preview'). Setting it routes the openai provider to Azure's deployment-scoped endpoint. openai provider only." },
+        deployment: { type: "string", description: "Azure OpenAI deployment name. Defaults to the model id when omitted. openai provider only." },
+        authScheme: { type: "string", enum: ["bearer", "api-key"], description: "Auth header style. 'bearer' (default) sends Authorization: Bearer; 'api-key' sends Azure's api-key header. openai provider only." },
         apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
       },
       required: []

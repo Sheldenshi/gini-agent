@@ -48,5 +48,6 @@ Each file in this directory captures one architecture decision: the context, the
 - [One Chat Per Agent, Threads, And Job Channels](agent-chat-threads-and-channels.md)
 - [Connector-Backed Web Search](web-search-connectors.md)
 - [In-App Doc References Render Inline](in-app-doc-references.md)
+- [Azure OpenAI Routing on the OpenAI Provider](azure-openai-provider.md)
 - [Per-Agent Structured Database Primitive](agent-database.md)
 - [In-App Log Viewing](logs-viewing.md)

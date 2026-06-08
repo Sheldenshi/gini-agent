@@ -11,8 +11,10 @@
 //     provider name when configured; null otherwise. `providerConfigured`
 //     is true when the active provider has valid creds — same definition
 //     `providerHealth` uses.
-//   - POST /api/setup/provider accepts {provider: "openai", apiKey} or
-//     {provider: "codex"}. OpenAI flow writes to ~/.gini/secrets.env using
+//   - POST /api/setup/provider accepts {provider: "openai", apiKey, model?,
+//     baseUrl?} — plus apiVersion/deployment/authScheme to point the openai
+//     provider at an Azure OpenAI deployment — or {provider: "codex"}. The
+//     OpenAI flow writes to ~/.gini/secrets.env using
 //     the existing helper, then updates process.env so the running
 //     gateway picks up the new key on the very next provider call (no
 //     restart needed — readOpenAIBearer in src/provider.ts reads from
@@ -44,8 +46,8 @@
 
 import { writeFileSync } from "node:fs";
 import { configPath, writeRuntimeConfig } from "../paths";
-import { hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
-import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
+import { azureBaseUrlNeedsApiVersion, azureModeNeedsHttps, azureRoutingNeedsBaseUrl, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { isValidEnvVarName, removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
 
@@ -122,11 +124,40 @@ export async function setSetupProvider(
   const envKeySpec = ENV_KEY_PROVIDERS[providerName];
   if (envKeySpec) {
     const apiKey = typeof payload.apiKey === "string" ? payload.apiKey.trim() : "";
+    // On a same-provider edit, preserve transport config the caller didn't
+    // resend. A partial caller — the Settings model picker or the set_provider
+    // tool — posts only { provider, model? }, so without this fallback a
+    // model-only save would wipe a configured baseUrl, apiKeyEnv, and the Azure
+    // routing fields (apiVersion / deployment / authScheme), silently turning a
+    // configured Azure deployment into a plain api.openai.com call. (The full
+    // Edit Provider dialog posts every transport field, so it clears via blanks
+    // rather than relying on this fallback.) A provider SWITCH (different name)
+    // starts clean — `existing` is undefined — matching the cross-provider
+    // non-inheritance rule resolveEffectiveContext enforces for agents.
+    const existing = config.provider?.name === providerName ? config.provider : undefined;
+    // The env var that actually holds this provider's key. A same-provider edit
+    // honors a custom apiKeyEnv (set via `gini provider set --api-key-env`) so
+    // the "already set?" check and the secret write target the SAME var the
+    // gateway reads at call time (readOpenAIBearer / providerHealth read
+    // provider.apiKeyEnv). Otherwise a config naming AZURE_OPENAI_API_KEY would
+    // get its key written to OPENAI_API_KEY and read back as unconfigured.
+    const targetEnvVar = existing?.apiKeyEnv ?? envKeySpec.envVar;
+    // A persisted apiKeyEnv flows into the secrets.env writer; reject a
+    // malformed name (it would otherwise be caught by the writer's guard and
+    // surface as an unhandled 500) rather than try to write it.
+    if (!isValidEnvVarName(targetEnvVar)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: `The configured apiKeyEnv (${targetEnvVar}) is not a valid environment variable name.`
+      };
+    }
     // Accept a no-key payload when the env var is already set — the Edit
-    // Provider dialog uses this to update just the default model without
-    // making the user re-type their key. Initial Add Provider still
-    // requires a key because the env var is empty there.
-    const envAlreadySet = Boolean(process.env[envKeySpec.envVar]);
+    // Provider dialog uses this to update the model or transport config
+    // (base URL, Azure routing) without making the user re-type their key.
+    // Initial Add Provider still requires a key because the env var is empty.
+    const envAlreadySet = Boolean(process.env[targetEnvVar]);
     if (!apiKey && !envKeySpec.allowEmptyKey && !envAlreadySet) {
       return {
         ok: false,
@@ -135,27 +166,83 @@ export async function setSetupProvider(
         error: `apiKey is required for the ${providerName} provider.`
       };
     }
+    // Field resolution rule: a key PRESENT in the payload (even blank) is
+    // applied, with blank/invalid clearing the field; a key ABSENT preserves
+    // the existing value. This lets the full web Edit Provider form clear a
+    // field — blanking baseUrl/apiVersion swaps an Azure config back to
+    // standard OpenAI — while a partial `{ provider, model }` save (the model
+    // picker, the set_provider tool) still preserves transport config the
+    // caller didn't resend. normalizeProvider carries apiVersion/deployment/
+    // authScheme only for the openai provider, so they are inert elsewhere.
+    const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(payload, key);
+    const trimmedString = (value: unknown): string | undefined =>
+      typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+    const model = typeof payload.model === "string" && payload.model.length > 0
+      ? payload.model
+      : (existing?.model || envKeySpec.defaultModel);
+    const baseUrl = has("baseUrl") ? trimmedString(payload.baseUrl) : existing?.baseUrl;
+    const apiVersion = has("apiVersion") ? trimmedString(payload.apiVersion) : existing?.apiVersion;
+    const deployment = has("deployment") ? trimmedString(payload.deployment) : existing?.deployment;
+    const authScheme = has("authScheme")
+      ? (payload.authScheme === "api-key" || payload.authScheme === "bearer" ? payload.authScheme : undefined)
+      : existing?.authScheme;
+    // Preserve a custom apiKeyEnv (set via `gini provider set --api-key-env`)
+    // across a same-provider edit; the web Edit dialog can't resend it.
+    const apiKeyEnv = existing?.apiKeyEnv;
+    // Likewise preserve a CLI-set extraBody (e.g. chat_template_kwargs) — no web
+    // surface sends it, so a same-provider edit must not silently drop it.
+    const extraBody = existing?.extraBody;
+
+    // Azure routing needs a real resource endpoint. Reject apiVersion paired
+    // with a missing/default OpenAI baseUrl BEFORE persisting the key, so we
+    // never half-apply an impossible config whose deployment URL would resolve
+    // against api.openai.com and 404. Covers the set_provider tool too, which
+    // funnels through here.
+    if (azureRoutingNeedsBaseUrl(providerName, apiVersion, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "apiVersion selects Azure OpenAI routing and requires a baseUrl of https://<resource>.openai.azure.com."
+      };
+    }
+    if (azureBaseUrlNeedsApiVersion(providerName, apiVersion, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "An Azure OpenAI endpoint requires an api-version (e.g. 2024-12-01-preview)."
+      };
+    }
+    if (azureModeNeedsHttps(providerName, apiVersion, baseUrl)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: "Azure OpenAI requires an https:// endpoint (the credential is sent on every request)."
+      };
+    }
+
     if (apiKey) {
       // Persist to secrets.env so the wrapper-sourced env carries it on
       // future shell launches. The shared writer lives in src/state/ —
       // both CLI and runtime are allowed to depend on src/state/.
-      writeKeyToSecretsEnv(envKeySpec.envVar, apiKey);
+      writeKeyToSecretsEnv(targetEnvVar, apiKey);
       // Make the running gateway use the new key on its very next
       // provider call. readOpenAIBearer reads process.env on each call,
       // so this assignment is enough — no restart needed.
-      process.env[envKeySpec.envVar] = apiKey;
+      process.env[targetEnvVar] = apiKey;
     }
 
-    const model = typeof payload.model === "string" && payload.model.length > 0
-      ? payload.model
-      : (config.provider?.name === providerName && config.provider.model ? config.provider.model : envKeySpec.defaultModel);
-    const baseUrl = typeof payload.baseUrl === "string" && payload.baseUrl.trim().length > 0
-      ? payload.baseUrl.trim()
-      : undefined;
     config.provider = normalizeProvider({
       name: providerName as ProviderConfig["name"],
       model,
-      ...(baseUrl ? { baseUrl } : {})
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(apiKeyEnv ? { apiKeyEnv } : {}),
+      ...(extraBody ? { extraBody } : {}),
+      ...(apiVersion ? { apiVersion } : {}),
+      ...(deployment ? { deployment } : {}),
+      ...(authScheme ? { authScheme } : {})
     });
     writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
 
@@ -243,11 +330,20 @@ export function removeSetupProvider(
     };
   }
 
-  // Wipe the bearer from both stores so the running process and future
-  // shell launches stop seeing it. removeKeyFromSecretsEnv is a no-op if
-  // the file or the line is already absent — safe to call unconditionally.
-  removeKeyFromSecretsEnv(envKeySpec.envVar);
-  delete process.env[envKeySpec.envVar];
+  // Wipe the bearer from both stores so the running process and future shell
+  // launches stop seeing it. Scrub the env var the active config actually used
+  // (a custom apiKeyEnv like AZURE_OPENAI_API_KEY) as well as the provider
+  // default — the write path stores the key under `apiKeyEnv ?? envKeySpec.envVar`,
+  // so disconnect must clear the same target or the secret survives.
+  // removeKeyFromSecretsEnv / delete are no-ops when the var is already absent.
+  const scrubVars = new Set<string>([envKeySpec.envVar]);
+  if (config.provider?.name === providerName && config.provider.apiKeyEnv && isValidEnvVarName(config.provider.apiKeyEnv)) {
+    scrubVars.add(config.provider.apiKeyEnv);
+  }
+  for (const envVar of scrubVars) {
+    removeKeyFromSecretsEnv(envVar);
+    delete process.env[envVar];
+  }
 
   let switched = false;
   if (config.provider?.name === providerName) {

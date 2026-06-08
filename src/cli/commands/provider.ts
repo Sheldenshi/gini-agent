@@ -2,12 +2,13 @@ import { writeFileSync } from "node:fs";
 import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
-import { normalizeProvider, providerHealth } from "../../provider";
+import { azureBaseUrlNeedsApiVersion, azureModeNeedsHttps, azureRoutingNeedsBaseUrl, normalizeProvider, providerHealth } from "../../provider";
+import { isValidEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
 
-const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>]";
+const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deepseek [model] [--base-url <url>] [--api-key-env <NAME>] [--extra-body <JSON>] [--api-version <VERSION>] [--deployment <NAME>] [--auth-scheme bearer|api-key]";
 
 // Single source of truth for value-bearing flags on `gini provider set`.
 // `parseSubArgs` uses this to both partition positionals and extract flag
@@ -16,7 +17,13 @@ const USAGE = "Usage: gini provider set echo|openai|codex|openrouter|local|deeps
 const PROVIDER_SET_FLAGS: ReadonlySet<string> = new Set([
   "--base-url",
   "--api-key-env",
-  "--extra-body"
+  "--extra-body",
+  // Azure OpenAI routing (openai provider only): --api-version selects the
+  // deployment-scoped surface, --deployment names the path segment (defaults
+  // to the model), --auth-scheme picks the api-key vs Bearer header.
+  "--api-version",
+  "--deployment",
+  "--auth-scheme"
 ]);
 
 export async function provider(ctx: CliContext): Promise<void> {
@@ -50,6 +57,21 @@ export async function provider(ctx: CliContext): Promise<void> {
 
     const baseUrl = flags["--base-url"];
     const apiKeyEnv = flags["--api-key-env"];
+    const apiVersion = flags["--api-version"];
+    const deployment = flags["--deployment"];
+    const authSchemeRaw = flags["--auth-scheme"];
+    let authScheme: "bearer" | "api-key" | undefined;
+    if (authSchemeRaw !== undefined) {
+      if (authSchemeRaw !== "bearer" && authSchemeRaw !== "api-key") {
+        throw new Error(`--auth-scheme must be 'bearer' or 'api-key' (got '${authSchemeRaw}')`);
+      }
+      authScheme = authSchemeRaw;
+    }
+    // The apiKeyEnv name is interpolated into ~/.gini/secrets.env (a
+    // shell-sourced file); reject anything that isn't a plain env-var name.
+    if (apiKeyEnv !== undefined && !isValidEnvVarName(apiKeyEnv)) {
+      throw new Error("--api-key-env must be a valid environment variable name (letters, digits, underscore; not starting with a digit).");
+    }
     const extraBodyRaw = flags["--extra-body"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {
@@ -78,6 +100,9 @@ export async function provider(ctx: CliContext): Promise<void> {
       if (baseUrl !== undefined) ignored.push("--base-url");
       if (apiKeyEnv !== undefined) ignored.push("--api-key-env");
       if (extraBody !== undefined) ignored.push("--extra-body");
+      if (apiVersion !== undefined) ignored.push("--api-version");
+      if (deployment !== undefined) ignored.push("--deployment");
+      if (authSchemeRaw !== undefined) ignored.push("--auth-scheme");
       if (ignored.length > 0) {
         process.stderr.write(`gini: warning — ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored for the echo provider; echo bypasses HTTP entirely.\n`);
       }
@@ -85,12 +110,43 @@ export async function provider(ctx: CliContext): Promise<void> {
       process.stderr.write("gini: warning — --extra-body is ignored for the codex provider; codex uses the /responses API with its own request shape.\n");
     }
 
+    // Azure routing flags only affect the openai provider; normalizeProvider
+    // drops them for everyone else. Warn so a misplaced flag isn't silently
+    // ignored (echo is already covered above).
+    if (name !== "openai" && name !== "echo") {
+      const azureIgnored: string[] = [];
+      if (apiVersion !== undefined) azureIgnored.push("--api-version");
+      if (deployment !== undefined) azureIgnored.push("--deployment");
+      if (authSchemeRaw !== undefined) azureIgnored.push("--auth-scheme");
+      if (azureIgnored.length > 0) {
+        process.stderr.write(`gini: warning — ${azureIgnored.join(", ")} ${azureIgnored.length > 1 ? "are" : "is"} ignored for the ${name} provider; Azure routing applies only to the openai provider.\n`);
+      }
+    }
+
+    // Azure routing needs a real resource endpoint; --api-version against the
+    // default api.openai.com base would build a 404-ing deployment URL.
+    if (azureRoutingNeedsBaseUrl(name, apiVersion, baseUrl)) {
+      throw new Error("--api-version selects Azure OpenAI routing and requires --base-url <https://<resource>.openai.azure.com>.");
+    }
+    // The inverse: an Azure resource base URL without --api-version would build
+    // a flat path against the Azure host, which 404s.
+    if (azureBaseUrlNeedsApiVersion(name, apiVersion, baseUrl)) {
+      throw new Error("An Azure OpenAI base URL requires --api-version (e.g. 2024-12-01-preview).");
+    }
+    // Azure mode sends a credential on every call; never over plaintext http.
+    if (azureModeNeedsHttps(name, apiVersion, baseUrl)) {
+      throw new Error("Azure OpenAI (--api-version) requires an https:// --base-url.");
+    }
+
     config.provider = normalizeProvider({
       name,
       model: model ?? (name === "echo" ? "gini-echo-v0" : name === "codex" ? "gpt-5.5" : name === "openrouter" ? "openrouter/auto" : name === "local" ? "local/default" : name === "deepseek" ? "deepseek-v4-flash" : "gpt-5.4-mini"),
       ...(baseUrl ? { baseUrl } : {}),
       ...(apiKeyEnv ? { apiKeyEnv } : {}),
-      ...(extraBody ? { extraBody } : {})
+      ...(extraBody ? { extraBody } : {}),
+      ...(apiVersion ? { apiVersion } : {}),
+      ...(deployment ? { deployment } : {}),
+      ...(authScheme ? { authScheme } : {})
     });
     writeRuntimeConfig(config);
     // If an autostart plist already exists for this instance, refresh it

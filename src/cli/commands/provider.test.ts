@@ -241,6 +241,115 @@ describe("provider CLI", () => {
     }
     expect(captured.join("")).toBe("");
   });
+
+  // ---------------- Azure routing flags ----------------
+
+  test("set openai with azure flags persists baseUrl, apiVersion, deployment and authScheme", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.4",
+      "--base-url", "https://lilac-labs-w.openai.azure.com",
+      "--api-version", "2024-12-01-preview",
+      "--deployment", "gpt-5.4",
+      "--auth-scheme", "api-key"
+    ]);
+    await provider(ctx);
+    const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");
+    const persisted = JSON.parse(readFileSync(cfgPath, "utf8")) as RuntimeConfig;
+    expect(persisted.provider.name).toBe("openai");
+    expect(persisted.provider.model).toBe("gpt-5.4");
+    expect(persisted.provider.baseUrl).toBe("https://lilac-labs-w.openai.azure.com");
+    expect(persisted.provider.apiVersion).toBe("2024-12-01-preview");
+    expect(persisted.provider.deployment).toBe("gpt-5.4");
+    expect(persisted.provider.authScheme).toBe("api-key");
+  });
+
+  test("--auth-scheme rejects values other than bearer|api-key", async () => {
+    const ctx = makeCtx(["provider", "set", "openai", "gpt-5.4", "--auth-scheme", "basic"]);
+    await expect(provider(ctx)).rejects.toThrow(/--auth-scheme must be 'bearer' or 'api-key'/);
+  });
+
+  test("openai with azure flags emits NO warning (they apply to openai)", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "openai", "gpt-5.4",
+        "--base-url", "https://lilac-labs-w.openai.azure.com",
+        "--api-version", "2024-12-01-preview",
+        "--deployment", "gpt-5.4",
+        "--auth-scheme", "bearer"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    expect(captured.join("")).toBe("");
+  });
+
+  test("--api-version without --base-url is rejected (azure needs a resource endpoint)", async () => {
+    const ctx = makeCtx(["provider", "set", "openai", "gpt-5.4", "--api-version", "2024-12-01-preview"]);
+    await expect(provider(ctx)).rejects.toThrow(/--api-version selects Azure OpenAI routing and requires --base-url/);
+  });
+
+  test("--api-version with the default api.openai.com base is rejected", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.4",
+      "--base-url", "https://api.openai.com/v1",
+      "--api-version", "2024-12-01-preview"
+    ]);
+    await expect(provider(ctx)).rejects.toThrow(/requires --base-url/);
+  });
+
+  test("--base-url azure endpoint without --api-version is rejected", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.4",
+      "--base-url", "https://lilac-labs-w.openai.azure.com"
+    ]);
+    await expect(provider(ctx)).rejects.toThrow(/requires --api-version/);
+  });
+
+  test("--auth-scheme api-key with an http --base-url is rejected", async () => {
+    const ctx = makeCtx([
+      "provider", "set", "openai", "gpt-5.4",
+      "--base-url", "http://x.openai.azure.com",
+      "--api-version", "2024-12-01-preview",
+      "--auth-scheme", "api-key"
+    ]);
+    await expect(provider(ctx)).rejects.toThrow(/https/);
+  });
+
+  test("--api-key-env rejects a malformed environment variable name", async () => {
+    const ctx = makeCtx(["provider", "set", "openai", "gpt-5.4", "--api-key-env", "FOO=evil"]);
+    await expect(provider(ctx)).rejects.toThrow(/valid environment variable name/);
+  });
+
+  test("azure flags on a non-openai provider warn that they are ignored", async () => {
+    const captured: string[] = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: unknown) => {
+      captured.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const ctx = makeCtx([
+        "provider", "set", "deepseek", "deepseek-v4-pro",
+        "--api-version", "2024-12-01-preview",
+        "--deployment", "x"
+      ]);
+      await provider(ctx);
+    } finally {
+      process.stderr.write = original;
+    }
+    const msg = captured.join("");
+    expect(msg).toContain("--api-version");
+    expect(msg).toContain("--deployment");
+    expect(msg).toContain("deepseek provider");
+    expect(msg).toContain("openai provider");
+  });
 });
 
 function makeCtx(cliArgs: string[]): CliContext {
