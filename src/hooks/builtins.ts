@@ -7,6 +7,7 @@
 //
 // It is NOT imported by the generic primitive (types/registry/runner/index) —
 // those stay domain-free, so a consumer importing the primitive never drags a
-// domain handler into its load path.
+// handler into its load path.
 
-import "../integrations/gmail-delta-hook"; // self-registers "gmail-delta"
+import "../capabilities/skill-script-hook"; // self-registers "skill-script"
+import "../integrations/gmail-delta-hook"; // self-registers "gmail-delta" (removed once email-watch is on skill-script)
