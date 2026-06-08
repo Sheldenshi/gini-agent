@@ -16,10 +16,10 @@ export function GeneratedFilesCard({ files }: { files: { path: string; toolName:
 
   return (
     <>
-      <div className="flex flex-col rounded-xl border border-[#26272D] bg-[#101116]">
-        <div className="flex items-center gap-2.5 border-b border-[#22232A] px-4 py-3">
-          <FolderTree className="size-3.5 shrink-0 text-[#7A7A80]" aria-hidden="true" />
-          <span className="text-xs font-semibold text-[#9A9AA0]">
+      <div className="flex flex-col rounded-xl border border-border bg-card">
+        <div className="flex items-center gap-2.5 border-b border-border px-4 py-3">
+          <FolderTree className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+          <span className="text-xs font-semibold text-muted-foreground">
             {files.length} file{files.length === 1 ? "" : "s"} generated
           </span>
         </div>
@@ -45,7 +45,7 @@ function FileRow({ path, first, onView }: { path: string; first: boolean; onView
 
   return (
     <div
-      className={`flex items-center gap-3.5 px-4 py-3.5 ${first ? "" : "border-t border-[#22232A]"}`}
+      className={`flex items-center gap-3.5 px-4 py-3.5 ${first ? "" : "border-t border-border"}`}
     >
       <span
         className="flex size-10 shrink-0 items-center justify-center rounded-[9px]"
@@ -55,14 +55,14 @@ function FileRow({ path, first, onView }: { path: string; first: boolean; onView
         <FileText className="size-[19px]" style={{ color: accent.fg }} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-[3px]">
-        <span className="truncate font-mono text-[13px] font-semibold text-white">{filename}</span>
-        {dir ? <span className="truncate text-xs text-[#9A9AA0]">{dir}</span> : null}
+        <span className="truncate font-mono text-[13px] font-semibold text-foreground">{filename}</span>
+        {dir ? <span className="truncate text-xs text-muted-foreground">{dir}</span> : null}
       </span>
       <div className="flex shrink-0 items-center gap-1.5">
         <a
           href={fileRawUrl(path)}
           download={filename}
-          className="flex items-center gap-1.5 rounded-[7px] border border-[#2A2B33] bg-transparent px-2.5 py-1.5 text-xs font-semibold text-[#B6B6BC] transition-colors hover:bg-[#1B1C22]"
+          className="flex items-center gap-1.5 rounded-[7px] border border-border bg-transparent px-2.5 py-1.5 text-xs font-semibold text-foreground transition-colors hover:bg-muted"
         >
           <Download className="size-3.5" aria-hidden="true" />
           Download
@@ -70,7 +70,7 @@ function FileRow({ path, first, onView }: { path: string; first: boolean; onView
         <button
           type="button"
           onClick={onView}
-          className="flex items-center gap-1.5 rounded-[7px] border border-[#2A3A6A] bg-[#1B2540] px-2.5 py-1.5 text-xs font-semibold text-[#8FB1FF] transition-colors hover:bg-[#22305A]"
+          className="flex items-center gap-1.5 rounded-[7px] border border-[#D7DEFA] bg-[#EEF2FF] px-2.5 py-1.5 text-xs font-semibold text-[#4277FB] transition-colors hover:bg-[#E0E8FF] dark:border-[#2A3A6A] dark:bg-[#1B2540] dark:text-[#8FB1FF] dark:hover:bg-[#22305A]"
         >
           <Eye className="size-3.5" aria-hidden="true" />
           View file
