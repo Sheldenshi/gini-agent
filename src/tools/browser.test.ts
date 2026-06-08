@@ -11,6 +11,7 @@ import {
   browserUploadFile,
   browserVision,
   browserWaitFor,
+  chromeProfileDirFor,
   closeAll,
   currentDisconnectGeneration,
   disconnectSharedBrowser,
@@ -222,6 +223,8 @@ describe("browser disconnect lifecycle", () => {
     browserTest.setInFlightDisconnectsForTest(0);
     browserTest.clearPendingSharedForTest();
     browserTest.resetTeardownCloseTimeoutForTest();
+    browserTest.resetChromeKillerForTest();
+    browserTest.resetBrowserInstanceForTest();
   });
 
   test("in-flight disconnect rejects new browser_navigate admissions", async () => {
@@ -331,24 +334,25 @@ describe("browser disconnect lifecycle", () => {
   test("disconnectSharedBrowser bounds a wedged context.close() and force-kills the child", async () => {
     // Reproduces the connect/disconnect hang: a Chromium wedged on a heavy
     // navigation never resolves context.close(). Teardown must give up at
-    // the bounded budget and SIGKILL the child so the profile-dir lock
-    // frees for the relaunch — instead of hanging for minutes.
+    // the bounded budget and reap the child by its profile-dir pid so the
+    // lock frees for the relaunch — instead of hanging for minutes.
+    setBrowserInstance("teardown-test-instance");
     browserTest.setTeardownCloseTimeoutForTest(50);
-    let killed = false;
+    let killerCalled = false;
+    let killerDir: string | undefined;
+    browserTest.setChromeKillerForTest((dir) => {
+      killerCalled = true;
+      killerDir = dir;
+      return 1;
+    });
     browserTest.installFakeManagedContextForTest({
-      close: () => new Promise(() => {}),
-      browser: () => ({
-        process: () => ({
-          kill: () => {
-            killed = true;
-          }
-        })
-      })
+      close: () => new Promise(() => {})
     });
     const started = Date.now();
     await disconnectSharedBrowser();
     const elapsed = Date.now() - started;
-    expect(killed).toBe(true);
+    expect(killerCalled).toBe(true);
+    expect(killerDir).toBe(chromeProfileDirFor("teardown-test-instance"));
     expect(elapsed).toBeLessThan(7_000);
   });
 
