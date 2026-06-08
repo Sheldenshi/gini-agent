@@ -129,11 +129,19 @@ const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
 const MAX_INLINE_SKILL_ROWS = 40;
 const MAX_INLINE_SKILL_SCRIPT_ROWS = 40;
 
-// Loop-breaker: how many consecutive iterations of the IDENTICAL tool call(s)
-// yielding the IDENTICAL result(s) we tolerate before deciding the model is
-// stuck (e.g. a guard that keeps refusing the same cold call) and routing to
-// the graceful tool-less summary exit instead of grinding to MAX_LOOP_ITERATIONS.
+// Loop-breakers: two thresholds steer a stuck model to the graceful tool-less
+// summary exit instead of grinding to MAX_LOOP_ITERATIONS. Either one tripping
+// breaks the loop.
+//   1. Exact match (name+args+result): the IDENTICAL call yielding the
+//      IDENTICAL result — e.g. a guard that keeps refusing the same cold call.
+//   2. Action only (name+args, ignoring the result): the IDENTICAL call whose
+//      result jitters every iteration — e.g. repeated browser_navigate to the
+//      same URL, where each page snapshot differs (rotating banners, fresh
+//      element refs) so the exact-match guard never fires. Repeating the same
+//      action with no progress is itself the stuck signal, so this coarser
+//      threshold is higher.
 const MAX_IDENTICAL_TOOL_REPEATS = 3;
+const MAX_SAME_ACTION_REPEATS = 6;
 
 // Resolve the effective iteration cap from config, falling back to the
 // default when the user hasn't set one or set an invalid value. Validation
@@ -1514,11 +1522,15 @@ async function runLoop(
   // to finalizeTurnRoute, which runs after the per-iteration assignment.
   let isFirstModelCall = false;
 
-  // Loop-breaker bookkeeping: detect the model repeating the identical tool
-  // call(s) and getting the identical result(s) several iterations in a row.
+  // Loop-breaker bookkeeping: two run-length counters detect a stuck model.
+  // The exact-match counter tracks the identical tool call(s) AND result(s);
+  // the action-only counter tracks the identical call(s) regardless of result
+  // (to catch jittery-result loops the exact-match guard would miss).
   // `brokeOnRepeat` steers the post-loop summary exit toward the right wording.
   let lastIterationSignature: string | undefined;
   let identicalRunLength = 0;
+  let lastActionSignature: string | undefined;
+  let sameActionRunLength = 0;
   let brokeOnRepeat = false;
 
   while (iterations < cap) {
@@ -2237,10 +2249,12 @@ async function runLoop(
     }
 
     // Loop-breaker: this iteration is all-sync and will loop again. Signature
-    // the tool call(s) by tool_call_id (don't assume index alignment) plus
-    // their results, and bail to the graceful summary exit if the model has
-    // repeated the IDENTICAL call(s) with the IDENTICAL result(s) too many
-    // times in a row — a guard or tool that keeps refusing the same input.
+    // the tool call(s) by tool_call_id (don't assume index alignment) and bail
+    // to the graceful summary exit if the model is stuck. Two guards: the
+    // exact-match guard (name+args+result) catches a tool that keeps refusing
+    // the same input; the action-only guard (name+args, ignoring the result)
+    // catches a call whose result jitters every iteration (e.g. browser_navigate
+    // re-fetching a live page) so the exact-match guard never fires.
     const resultById = new Map(toolResultMessages.map((m) => [m.tool_call_id, m.content]));
     const iterationSignature = JSON.stringify(
       result.toolCalls.map((c) => [c.function.name, c.function.arguments, resultById.get(c.id) ?? null])
@@ -2251,12 +2265,30 @@ async function runLoop(
       identicalRunLength = 1;
       lastIterationSignature = iterationSignature;
     }
-    if (identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS) {
+    const actionSignature = JSON.stringify(
+      result.toolCalls.map((c) => [c.function.name, c.function.arguments])
+    );
+    if (actionSignature === lastActionSignature) {
+      sameActionRunLength += 1;
+    } else {
+      sameActionRunLength = 1;
+      lastActionSignature = actionSignature;
+    }
+    if (identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS || sameActionRunLength >= MAX_SAME_ACTION_REPEATS) {
       brokeOnRepeat = true;
+      const tripped =
+        identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS
+          ? `${identicalRunLength} iterations with the identical tool call(s) and result(s)`
+          : `${sameActionRunLength} iterations repeating the same tool call(s) with identical arguments`;
       appendTrace(config.instance, taskId, {
         type: "warning",
-        message: `Stopped after ${identicalRunLength} identical consecutive tool iterations (loop-breaker).`,
-        data: { iterations, toolNames: result.toolCalls.map((c) => c.function.name) }
+        message: `Stopped after ${tripped} (loop-breaker).`,
+        data: {
+          iterations,
+          identicalRunLength,
+          sameActionRunLength,
+          toolNames: result.toolCalls.map((c) => c.function.name)
+        }
       });
       break;
     }
@@ -2272,8 +2304,8 @@ async function runLoop(
   // model call. If the summary call itself fails (provider error, etc.),
   // fall back to the legacy failure path so we don't lose the user's work.
   const summaryInstruction = brokeOnRepeat
-    ? `You repeated the same tool call(s) with identical arguments and received ` +
-      `the identical result each time, which means that path is blocked. No ` +
+    ? `You repeated the same tool call(s) with identical arguments several ` +
+      `times without making progress, which means that path is blocked. No ` +
       `further tools are available now. Write a final answer for the user: ` +
       `explain what you were able to determine, what is blocking you (e.g. a ` +
       `sign-in or tool that keeps refusing), and what they could do next.`

@@ -749,7 +749,71 @@ describe("chat-task loop", () => {
     const { readTrace } = await import("../state");
     const traces = readTrace(config.instance, task.id);
     const breaker = traces.find(
-      (t) => t.type === "warning" && /identical consecutive tool iterations/.test(t.message)
+      (t) => t.type === "warning" && /identical tool call\(s\) and result\(s\) \(loop-breaker\)/.test(t.message)
+    );
+    expect(breaker).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Action-only loop-breaker. A model that emits the IDENTICAL tool call
+  // (same name + arguments) but gets a DIFFERENT result every iteration —
+  // the real browser_navigate case, where each live-page snapshot jitters —
+  // slips past the exact-match guard, so the coarser action-only guard must
+  // catch it at MAX_SAME_ACTION_REPEATS (6) instead of running to the 90-cap.
+  // We drive get_current_time, whose result (a timestamp) differs each call.
+  test("stops at the action-only loop-breaker when results jitter but the action repeats", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-action-loop-breaker");
+    const provider = normalizeProvider(config.provider);
+
+    // Six identical get_current_time calls: same name + args every turn, but
+    // the clock advances so each result differs. The exact-match guard never
+    // fires; the action-only guard trips on the sixth pass (runLength 6).
+    for (let i = 0; i < 6; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_clock_${i}`,
+            type: "function",
+            function: { name: "get_current_time", arguments: JSON.stringify({}) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn — what the loop-breaker exit should consume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "I kept checking the time without making progress on your request.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "what time is it", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(
+      "I kept checking the time without making progress on your request."
+    );
+    expect(finished.currentStep).toBe("Completed (stopped: repeated identical tool calls)");
+    expect(finished.error).toBeUndefined();
+
+    // Exactly seven model calls: six repeated tool turns + one tool-less
+    // summary — proving the action-only guard stopped us at 6, not the 90-cap.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(7);
+
+    // Trace records the action-only loop-breaker stop (not the exact-match one).
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const breaker = traces.find(
+      (t) =>
+        t.type === "warning" &&
+        /repeating the same tool call\(s\) with identical arguments \(loop-breaker\)/.test(t.message)
     );
     expect(breaker).toBeDefined();
 

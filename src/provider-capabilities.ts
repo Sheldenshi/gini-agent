@@ -29,6 +29,13 @@ export interface ProviderModality {
 export const PRIOR_CONTEXT_WINDOW_FRACTION = 0.65;
 export const FALLBACK_CONTEXT_WINDOW_TOKENS = 32_000;
 
+// The ChatGPT Codex backend enforces a ~275k effective context window
+// regardless of the underlying model's nominal window: gpt-5.5 is 1M on the
+// direct OpenAI API but only 275k when served through Codex. Cap the codex
+// provider at this backend limit so prior-context packing budgets against the
+// real window instead of the model's larger nominal one.
+export const CODEX_BACKEND_CONTEXT_WINDOW_TOKENS = 275_000;
+
 // Known OpenAI vision/document model families. The `openai` provider name
 // also covers custom OpenAI-compatible endpoints (a user-set baseUrl + an
 // arbitrary model id), so gating on a known family keeps an unrecognized or
@@ -81,8 +88,11 @@ export function resolveProviderContextWindowTokens(provider: ProviderConfig): nu
   const model = provider.model ?? "";
   switch (provider.name) {
     case "openai":
-    case "codex":
       return openaiContextWindowTokens(model);
+    case "codex":
+      // Clamp to the backend cap; min() stays correct if codex is ever pointed
+      // at a model whose nominal window is already below the cap.
+      return Math.min(CODEX_BACKEND_CONTEXT_WINDOW_TOKENS, openaiContextWindowTokens(model));
     case "openrouter":
       return openrouterContextWindowTokens(model);
     case "deepseek":

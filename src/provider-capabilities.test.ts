@@ -92,7 +92,7 @@ describe("resolveProviderModality", () => {
 });
 
 describe("resolveProviderContextWindowTokens", () => {
-  test("openai/codex known model families resolve to their context windows", () => {
+  test("openai known model families resolve to their context windows", () => {
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.5"))).toBe(1_000_000);
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.4"))).toBe(1_050_000);
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.4-mini"))).toBe(400_000);
@@ -100,7 +100,13 @@ describe("resolveProviderContextWindowTokens", () => {
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.2-chat-latest"))).toBe(128_000);
     expect(resolveProviderContextWindowTokens(provider("openai", "gpt-4.1-mini"))).toBe(1_047_576);
     expect(resolveProviderContextWindowTokens(provider("openai", "o4-mini"))).toBe(200_000);
-    expect(resolveProviderContextWindowTokens(provider("codex", "gpt-5.5"))).toBe(1_000_000);
+  });
+
+  test("codex caps at the backend context window even when the model's nominal window is larger", () => {
+    // gpt-5.5 is 1M on the direct OpenAI API but only 275k through the Codex
+    // backend; openai must stay unchanged at the model's nominal window.
+    expect(resolveProviderContextWindowTokens(provider("codex", "gpt-5.5"))).toBe(275_000);
+    expect(resolveProviderContextWindowTokens(provider("openai", "gpt-5.5"))).toBe(1_000_000);
   });
 
   test("deepseek v4 models and compatibility aliases resolve to one million tokens", () => {
@@ -129,7 +135,9 @@ describe("resolveProviderContextWindowTokens", () => {
 
 describe("resolveDefaultPriorContextTokenBudget", () => {
   test("defaults to sixty-five percent of the provider context window", () => {
-    expect(resolveDefaultPriorContextTokenBudget(provider("codex", "gpt-5.5"))).toBe(650_000);
+    // codex gpt-5.5 budgets against the 275k backend cap, not the 1M nominal window.
+    expect(resolveDefaultPriorContextTokenBudget(provider("codex", "gpt-5.5"))).toBe(178_750);
+    expect(resolveDefaultPriorContextTokenBudget(provider("openai", "gpt-5.5"))).toBe(650_000);
     expect(resolveDefaultPriorContextTokenBudget(provider("openai", "gpt-5.4-mini"))).toBe(260_000);
     expect(resolveDefaultPriorContextTokenBudget(provider("openai", "gpt-4.1-mini"))).toBe(680_924);
     expect(resolveDefaultPriorContextTokenBudget(provider("echo", "gini-echo-v0"))).toBe(20_800);
