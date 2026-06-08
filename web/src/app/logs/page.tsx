@@ -73,6 +73,7 @@ export default function LogsPage() {
 
   const isEmpty =
     tail !== undefined && (tail.entries?.length ?? 0) === 0 && (tail.lines?.length ?? 0) === 0;
+  const showTruncatedNotice = !logs.isError && !isEmpty && tail?.truncated === true;
 
   return (
     <>
@@ -119,6 +120,11 @@ export default function LogsPage() {
             ))}
           </TabsList>
         </Tabs>
+        {showTruncatedNotice ? (
+          <p className="text-xs text-muted-foreground">
+            Showing the most recent 500 lines — older entries were trimmed.
+          </p>
+        ) : null}
         <Card className="flex flex-1 flex-col overflow-hidden">
           <CardContent className="flex-1 overflow-hidden p-0">
             <ScrollArea className="h-full">
