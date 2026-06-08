@@ -59,7 +59,7 @@ If a change links to an issue, PR, or ADR that adds important context, append it
 
 ## Release process
 
-A release is a version bump, a tag, a GitHub release, and a CHANGELOG section — done together, from `main`.
+A release is a version bump, a tag, a GitHub release, and a CHANGELOG section. You author the version bump and CHANGELOG in a release PR; **merging it to `main` tags `vX.Y.Z` and publishes the GitHub release automatically.** No manual tagging in the normal flow.
 
 ### 1. Survey what changed
 
@@ -106,41 +106,35 @@ git push -u origin release/X.Y.Z
 
 Open the PR. Title: `vX.Y.Z`. Body: paste the new CHANGELOG section.
 
-### 3. Merge, then tag from `main`
+### 3. Merge — tagging and the GitHub release happen automatically
 
-After the release PR is approved and merged (squash or merge — both work because the tag is created *after* the merge lands on `main`):
+Merge the release PR (squash or merge — both work). When the merge lands on `main`, the [`.github/workflows/tag-on-version-bump.yml`](../.github/workflows/tag-on-version-bump.yml) workflow reads the new `package.json` version, confirms a matching `## [X.Y.Z]` CHANGELOG section exists, creates the annotated `vX.Y.Z` tag on the merge commit, and publishes the GitHub release from that CHANGELOG section. Watch it from the Actions tab and confirm the release page renders correctly.
+
+The workflow is idempotent: it does nothing if the `vX.Y.Z` tag already exists, and a `package.json` change that doesn't touch the version (e.g. a dependency bump) is a no-op. Bumping the version field is the release signal, so a release PR is the only PR that should change it.
+
+#### Publishing by hand
+
+If you ever need to release without the automatic path (workflow disabled, or you're cutting a tag manually), push the tag yourself:
 
 ```bash
-git checkout main
-git pull
+git checkout main && git pull
 git tag -a vX.Y.Z -m "vX.Y.Z"
 git push origin vX.Y.Z
 ```
 
-The tag is created on the merge commit, so it's always reachable from `main`.
+A human-pushed tag triggers [`.github/workflows/release.yml`](../.github/workflows/release.yml), which publishes the release from the same CHANGELOG section. (The automatic workflow pushes its tag with `GITHUB_TOKEN`, which GitHub intentionally does not let trigger other workflows, so it publishes the release itself; a tag you push by hand goes through `release.yml` instead.)
 
-### 4. Publish the GitHub release
-
-The `.github/workflows/release.yml` workflow fires on tag push, extracts the matching `[X.Y.Z]` section from `CHANGELOG.md`, and publishes a GitHub release automatically. Watch it from the Actions tab and confirm the release page renders correctly.
-
-If you need to publish by hand (workflow disabled, broken, etc.):
+To build the notes locally — or to publish entirely by hand — use the shared extractor:
 
 ```bash
 VERSION=X.Y.Z
-NOTES=$(mktemp)
-awk -v v="$VERSION" '
-  $0 ~ "^## \\[" v "\\]" { in_section=1; next }
-  in_section && /^## \[/ { exit }
-  in_section && /^\[.*\]:/ { exit }
-  in_section { print }
-' CHANGELOG.md > "$NOTES"
-gh release create "v$VERSION" --title "v$VERSION" --notes-file "$NOTES"
-rm "$NOTES"
+gh release create "v$VERSION" --title "v$VERSION" \
+  --notes-file <(scripts/changelog-notes.sh "$VERSION")
 ```
 
 Don't use `--generate-notes` — it duplicates work and produces lower-quality notes than the curated CHANGELOG section.
 
-### 5. Verify
+### 4. Verify
 
 ```bash
 gini update                       # on a test machine, picks up the new tag
@@ -159,5 +153,4 @@ For an urgent fix to the latest release:
 
 1. Branch from the tag: `git checkout -b hotfix/X.Y.Z+1 vX.Y.Z`.
 2. Apply the minimal fix.
-3. Add a `Fixed` entry to `[Unreleased]` and follow the normal release process for `X.Y.Z+1`.
-4. Merge `main` into the hotfix branch (or rebase) so `main` includes the fix before the tag.
+3. Follow the normal release process for `X.Y.Z+1`: add a dated `## [X.Y.Z+1]` section with the `Fixed` entry, bump `package.json`, open the release PR against `main`, and merge it. The merge lands the fix on `main` and auto-tags `vX.Y.Z+1` from that merge commit, so `main` always contains the fix before the tag exists.
