@@ -451,23 +451,52 @@ async function runPreRunHook(
   job: JobRecord,
   _run: JobRunRecord
 ): Promise<
-  | { action: "proceed"; context: string[]; onDispatched?: () => void | Promise<void> }
-  | { action: "shortCircuit"; summary?: string }
+  | { action: "proceed"; context: string[]; onDispatched?: () => void | Promise<void>; state?: Record<string, unknown> }
+  | { action: "shortCircuit"; summary?: string; state?: Record<string, unknown> }
   | { action: "error"; message: string; fatal: boolean }
 > {
   const hook = job.preRunHook;
   if (!hook) return { action: "proceed", context: [] };
 
-  const outcome = await runHook(config, hook);
-  if (outcome.kind === "shortCircuit") return { action: "shortCircuit", summary: outcome.summary };
+  // The JOB owns the hook's state: thread the current blob in as the run's input
+  // (the runner merges `payload` into the handler's hookConfig, so a pure handler
+  // reads hookConfig.state) and carry the handler's newState back out. The
+  // persistence TIMING below preserves J4 at-least-once.
+  const outcome = await runHook(config, hook, { state: job.hookState });
+  if (outcome.kind === "shortCircuit") {
+    return {
+      action: "shortCircuit",
+      summary: outcome.summary,
+      ...(outcome.state !== undefined ? { state: outcome.state } : {})
+    };
+  }
   if (outcome.kind === "context") {
     return {
       action: "proceed",
       context: outcome.context,
-      ...(outcome.onDispatched ? { onDispatched: outcome.onDispatched } : {})
+      ...(outcome.onDispatched ? { onDispatched: outcome.onDispatched } : {}),
+      ...(outcome.state !== undefined ? { state: outcome.state } : {})
     };
   }
   return { action: "error", message: outcome.message, fatal: !outcome.transient };
+}
+
+// Persist a pure handler's new state onto the backing job inside the per-instance
+// lock. Used at the J4-correct commit moment: immediately for a shortCircuit
+// (nothing was delivered), and only after the drafting turn dispatches for a
+// context result (so a dispatch failure leaves the OLD state and the matches
+// re-detect next tick — at-least-once across the delivery boundary). No state =
+// no-op.
+async function persistHookState(
+  config: RuntimeConfig,
+  jobId: string,
+  state: Record<string, unknown> | undefined
+): Promise<void> {
+  if (state === undefined) return;
+  await mutateState(config.instance, (s) => {
+    const job = s.jobs.find((candidate) => candidate.id === jobId);
+    if (job) job.hookState = state;
+  });
 }
 
 // Finalize a short-circuited run with NO model turn. The run never spawned a
@@ -695,6 +724,9 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // draft; proceed dispatches the drafting turn with any injected context.
       const hook = await runPreRunHook(config, job, run);
       if (hook.action === "shortCircuit") {
+        // A shortCircuit delivered nothing, so the handler's new state commits
+        // IMMEDIATELY (no at-least-once concern).
+        await persistHookState(config, job.id, hook.state);
         await finalizeShortCircuit(config, job, run, hook.summary);
         continue;
       }
@@ -706,7 +738,9 @@ export async function runDueJobs(config: RuntimeConfig): Promise<void> {
       // Commit the hook's deferred post-delivery state ONLY after dispatch
       // resolved (the drafting turn is spawned). dispatchPromptRun finalizes its
       // own run + rethrows on a spawn failure, so a throw skips this — leaving
-      // the items un-committed to re-trigger next tick (at-least-once).
+      // the handler's newState un-committed so the matches re-detect next tick
+      // (at-least-once across the delivery boundary).
+      await persistHookState(config, job.id, hook.state);
       if (hook.onDispatched) await hook.onDispatched();
     } catch (error) {
       appendLog(config.instance, "scheduler.iteration.error", {
@@ -987,6 +1021,8 @@ export async function runJobNow(
   // Manual/replay runs honor the preRun hook too.
   const hook = await runPreRunHook(config, job, run);
   if (hook.action === "shortCircuit") {
+    // Nothing delivered => commit the handler's new state immediately.
+    await persistHookState(config, job.id, hook.state);
     await finalizeShortCircuit(config, job, run, hook.summary);
     return { jobId: job.id, runId: run.id, shortCircuited: true };
   }
@@ -997,7 +1033,9 @@ export async function runJobNow(
   const dispatched = await dispatchPromptRun(config, job, run, trigger, hook.context);
   // Commit the hook's deferred post-delivery state only after dispatch resolved.
   // A spawn failure rethrows from dispatchPromptRun (skipping this), so the
-  // un-committed items re-trigger on the next fire (at-least-once).
+  // un-committed newState leaves the matches to re-detect on the next fire
+  // (at-least-once).
+  await persistHookState(config, job.id, hook.state);
   if (hook.onDispatched) await hook.onDispatched();
   return dispatched;
 }

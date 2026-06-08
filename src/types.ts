@@ -1482,6 +1482,15 @@ export interface JobRecord {
   // type keeps the dependency one-directional (the primitive imports
   // RuntimeConfig from here, never the reverse). See ADR job-pre-run-hooks.md.
   preRunHook?: import("./hooks").HookConfig;
+  // Job-owned hook state. A pure hook handler (the skill-script handler running a
+  // pure detection script) is a function of {config, hookState} -> {result,
+  // newState}; the scheduler threads this blob in as the run's input and persists
+  // the handler's newState back here at the at-least-once commit boundary (a
+  // shortCircuit persists immediately; a context result persists only AFTER the
+  // drafting turn dispatches). Opaque to the runtime — its shape is owned by the
+  // handler/script (e.g. the gmail-watch cursor + a small boundary dedup set).
+  // See ADR job-pre-run-hooks.md.
+  hookState?: Record<string, unknown>;
   // Interval-driven schedule. Optional — cron-driven jobs (cronExpression
   // set) carry no intervalSeconds at all. Exactly one of (intervalSeconds,
   // cronExpression) is the active driver per job. The pair is validated

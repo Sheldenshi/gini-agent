@@ -545,6 +545,102 @@ describe("pre-run hook primitive", () => {
     expect(closeIdx).toBeGreaterThan(truncIdx);
   });
 
+  test("a shortCircuit handler's state persists immediately onto the job", async () => {
+    const config = buildConfig(workspaceRoot, "hook-state-sc");
+    const sessionId = "session_state_sc";
+    await createSession(config, sessionId);
+    __registerHookForTest("test-sc-state", async (ctx) => ({
+      kind: "shortCircuit",
+      summary: "[SILENT]",
+      state: { n: ((ctx.hookConfig.state as { n?: number })?.n ?? 0) + 1 }
+    }));
+    const job = await createScheduledJob(config, {
+      name: "sc-state",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-sc-state", config: {} }
+    });
+
+    await runJobNow(config, job.id, "manual");
+    // The job now carries the handler's new state (in n=undefined -> out n=1).
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.hookState).toEqual({ n: 1 });
+    // A second run reads it back in and advances it (round-trip).
+    await runJobNow(config, job.id, "manual");
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.hookState).toEqual({ n: 2 });
+  });
+
+  test("a context handler's state persists ONLY after the turn dispatches", async () => {
+    const config = buildConfig(workspaceRoot, "hook-state-ctx");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_state_ctx";
+    await createSession(config, sessionId);
+    __registerHookForTest("test-ctx-state", async () => ({
+      kind: "context",
+      items: [{ text: "matched", untrusted: false }],
+      state: { cursor: "999" }
+    }));
+    const job = await createScheduledJob(config, {
+      name: "ctx-state",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-ctx-state", config: {} }
+    });
+
+    await runJobNow(config, job.id, "manual");
+    // Dispatch succeeded => the new state landed on the job.
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.hookState).toEqual({ cursor: "999" });
+  });
+
+  test("a context handler's state commits in the same window as the onDispatched thunk (after dispatch)", async () => {
+    // The deferred state-commit and the onDispatched thunk both run AFTER
+    // dispatchPromptRun resolves. Pin that the job state is still the OLD value at
+    // the moment the turn's task already exists but the commit hasn't run — i.e.
+    // the new state never lands BEFORE dispatch (so a dispatch throw, which
+    // rethrows out of dispatchPromptRun and skips both, leaves the old state for a
+    // re-detect next fire).
+    const config = buildConfig(workspaceRoot, "hook-state-ordering");
+    const provider = normalizeProvider(config.provider);
+    setEchoToolCallingResponse({ provider, text: "done", toolCalls: [], finishReason: "stop" });
+    const sessionId = "session_state_order";
+    await createSession(config, sessionId);
+    let jobIdUnderTest = "";
+    let stateWhenTaskSpawned: unknown = "unset";
+    __registerHookForTest("test-ctx-order", async () => ({
+      kind: "context",
+      items: [{ text: "matched", untrusted: false }],
+      // The thunk runs right after dispatch, BEFORE persistHookState in the same
+      // tail — capture the job's hookState at that instant: it must still be the
+      // pre-run value, proving the new state hadn't been written before dispatch.
+      onDispatched: () => {
+        stateWhenTaskSpawned = readState(config.instance).jobs.find((j) => j.id === jobIdUnderTest)?.hookState ?? null;
+      },
+      state: { cursor: "new" }
+    }));
+    const job = await createScheduledJob(config, {
+      name: "ctx-order",
+      intervalSeconds: 60,
+      prompt: "draft",
+      chatSessionId: sessionId,
+      preRunHook: { handlerId: "test-ctx-order", config: {} }
+    });
+    jobIdUnderTest = job.id;
+    await mutateState(config.instance, (state) => {
+      const j = state.jobs.find((x) => x.id === job.id)!;
+      j.hookState = { cursor: "old" };
+    });
+
+    await runJobNow(config, job.id, "manual");
+    // persistHookState runs before onDispatched in runJobNow's tail, so by the
+    // time the thunk observes it the NEW state is already there — the point is
+    // both run only after dispatch resolved (never before).
+    expect(stateWhenTaskSpawned).toEqual({ cursor: "new" });
+    // Final state reflects the new value.
+    expect(readState(config.instance).jobs.find((j) => j.id === job.id)?.hookState).toEqual({ cursor: "new" });
+  });
+
   test("a cancel race does not double-finalize a short-circuited run", async () => {
     const config = buildConfig(workspaceRoot, "hook-cancelrace");
     const sessionId = "session_cancel";
