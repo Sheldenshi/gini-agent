@@ -2421,7 +2421,7 @@ const RESERVED_EXTRA_BODY_KEYS: ReadonlySet<string> = new Set([
   // would silently let extraBody.prompt_cache_retention shadow our
   // explicit opt-out of the "24h" extended tier (documented as not
   // Zero Data Retention eligible). Stripping the key here keeps the
-  // protection independent of spread order. See ADR cache-warmer.md.
+  // protection independent of spread order. See ADR prompt-cache-in-memory-tier.md.
   "prompt_cache_retention",
   "__proto__",
   "constructor",

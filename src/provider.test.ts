@@ -2819,6 +2819,50 @@ describe("provider", () => {
     }
   });
 
+  // Baseline demonstration of the caching posture: Gini relies on automatic
+  // prefix caching (the pinned in_memory tier), NOT Anthropic-style explicit
+  // markers. On this representative OpenAI-compatible chat-completions request
+  // the body carries no `cache_control` field — the system message is a plain
+  // string and the messages are sent verbatim. This pins the "automatic only"
+  // decision from ADR stable-system-prefix.md so a future refactor can't
+  // silently start emitting dead Anthropic-shaped breakpoints (no provider in
+  // the catalog speaks the Anthropic Messages API).
+  test("openai chat-completions emits no Anthropic cache_control markers", async () => {
+    const original = process.env.OPENAI_API_KEY;
+    const originalFetch = globalThis.fetch;
+    process.env.OPENAI_API_KEY = "test-key";
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      return Promise.resolve(new Response(JSON.stringify({
+        id: "resp_no_cc",
+        choices: [{ finish_reason: "stop", message: { role: "assistant", content: "ok" } }]
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "openai", model: "gpt-test" });
+      await generateToolCallingResponse(
+        config(provider),
+        [{ role: "system", content: "stable prefix" }, { role: "user", content: "hi" }],
+        []
+      );
+      const rawBody = String(captured!.init!.body);
+      expect(rawBody).not.toContain("cache_control");
+      const sent = JSON.parse(rawBody);
+      // Automatic caching is on (the tier is pinned)...
+      expect(sent.prompt_cache_retention).toBe("in_memory");
+      // ...and the system message is a plain string, not a content-parts
+      // array carrying an ephemeral breakpoint.
+      expect(typeof sent.messages[0].content).toBe("string");
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (original === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = original;
+    }
+  });
+
   test("openai structured chat-completions pins prompt_cache_retention to in_memory", async () => {
     const original = process.env.OPENAI_API_KEY;
     const originalFetch = globalThis.fetch;
@@ -3059,6 +3103,84 @@ describe("provider", () => {
         [{ role: "user", content: "hi" }],
         tools
       );
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex structured /responses omits prompt_cache_retention", async () => {
+    const { restore } = installCodexAuth("codex-pcr-omit-structured");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const enc = new TextEncoder();
+          controller.enqueue(enc.encode(
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", delta: "{\"ok\":true}" })}\n\n`
+          ));
+          controller.enqueue(enc.encode(
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "r_pcr_codex_structured", output: [] } })}\n\n`
+          ));
+          controller.close();
+        }
+      });
+      return Promise.resolve(new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      await generateStructured(config(provider), {
+        system: "be brief",
+        user: "say ok",
+        schemaName: "Ok",
+        validator: { parse: (v) => v as { ok: boolean } }
+      });
+      expect(captured?.url.endsWith("/responses")).toBe(true);
+      const sent = JSON.parse(String(captured!.init!.body));
+      expect(sent.prompt_cache_retention).toBeUndefined();
+    } finally {
+      globalThis.fetch = originalFetch;
+      restore();
+    }
+  });
+
+  test("codex vision /responses omits prompt_cache_retention", async () => {
+    const { restore } = installCodexAuth("codex-pcr-omit-vision");
+    const originalFetch = globalThis.fetch;
+
+    let captured: { url: string; init: RequestInit } | undefined;
+    globalThis.fetch = ((input: RequestInfo | URL, init: RequestInit = {}) => {
+      captured = { url: String(input), init };
+      const body = {
+        id: "resp_pcr_codex_vision",
+        output: [
+          { id: "msg_1", type: "message", content: [{ type: "output_text", text: "described." }] }
+        ],
+        usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 }
+      };
+      return Promise.resolve(new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }));
+    }) as unknown as typeof fetch;
+
+    try {
+      const provider = normalizeProvider({ name: "codex", model: "gpt-test" });
+      await generateVisionAnalysis(config(provider), {
+        prompt: "what is shown?",
+        imageBase64: "AAAA",
+        mimeType: "image/png"
+      });
       expect(captured?.url.endsWith("/responses")).toBe(true);
       const sent = JSON.parse(String(captured!.init!.body));
       expect(sent.prompt_cache_retention).toBeUndefined();

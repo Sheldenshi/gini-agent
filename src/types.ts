@@ -284,12 +284,6 @@ export interface RuntimeConfig {
     // falls back to the provider-derived default.
     priorContextTokens?: number;
   };
-  // Cache warmer interval in minutes. 0 / undefined disables the warmer.
-  // When > 0 the runtime fires a minimal probe against the active
-  // provider every `cacheWarmerMinutes * 0.9` minutes so the prompt
-  // cache stays warm. Bounded to 0..1440 by the setter. See
-  // src/runtime/cache-warmer.ts.
-  cacheWarmerMinutes?: number;
 }
 
 // ChatBlock — semantic, typed conversation block emitted by the runtime so
