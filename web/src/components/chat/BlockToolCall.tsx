@@ -53,18 +53,18 @@ export function BlockToolCall({
       disabled={!canExpand}
       onClick={canExpand ? () => setExpanded((v) => !v) : undefined}
     >
-      <Icon className="size-[15px] shrink-0 text-[#9A9AA0]" aria-hidden="true" />
-      <span className="shrink-0 text-[13px] font-semibold text-[#D6D6DC]">
+      <Icon className="size-[15px] shrink-0 text-muted-foreground" aria-hidden="true" />
+      <span className="shrink-0 text-[13px] font-semibold text-foreground">
         {block.displayLabel}
       </span>
       {block.argsPreview ? (
-        <span className="min-w-0 flex-1 truncate rounded-md bg-[#2B2B31] px-2 py-[3px] font-mono text-[12px] text-[#C8C8D2]">
+        <span className="min-w-0 flex-1 truncate rounded-md bg-muted px-2 py-[3px] font-mono text-[12px] text-foreground">
           {block.argsPreview}
         </span>
       ) : null}
       {inlineSpinner ? (
         <Loader2
-          className="size-[14px] shrink-0 animate-spin text-[#9A9AA0]"
+          className="size-[14px] shrink-0 animate-spin text-muted-foreground"
           aria-label="Running"
         />
       ) : null}
@@ -88,7 +88,7 @@ export function BlockToolCall({
           />
         </div>
         {block.runningHint ? (
-          <p className="text-[13px] leading-snug text-[#cfcfcf]">{block.runningHint}</p>
+          <p className="text-[13px] leading-snug text-foreground">{block.runningHint}</p>
         ) : null}
         <div className="flex items-center justify-between">
           <span className="text-[11px] uppercase tracking-wide text-amber-400/80">
@@ -113,14 +113,14 @@ export function BlockToolCall({
       {failed && block.errorMessage ? (
         <span
           className={`pl-[23px] text-[12px] ${
-            block.errorSeverity === "info" ? "text-[#9A9AA0]" : "text-red-400/90"
+            block.errorSeverity === "info" ? "text-muted-foreground" : "text-red-400/90"
           }`}
         >
           {block.errorMessage}
         </span>
       ) : null}
       {expanded && result ? (
-        <pre className="ml-[23px] max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-[#2B2B31] p-2.5 font-mono text-[12px] text-[#C8C8D2]">
+        <pre className="ml-[23px] max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted p-2.5 font-mono text-[12px] text-foreground">
           {result.preview}
           {result.truncated ? "\n\n[truncated]" : ""}
         </pre>

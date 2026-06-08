@@ -46,14 +46,14 @@ export function BlockToolCallsCollapsed({
         className="flex items-center gap-[13px] self-start py-0.5 text-left"
       >
         <ChevronRight
-          className={`size-4 shrink-0 text-[#7A7A80] transition-transform ${expanded ? "rotate-90" : ""}`}
+          className={`size-4 shrink-0 text-muted-foreground transition-transform ${expanded ? "rotate-90" : ""}`}
           aria-hidden="true"
         />
-        <span className="text-[14px] font-medium text-[#9A9AA0]">{summary}</span>
+        <span className="text-[14px] font-medium text-muted-foreground">{summary}</span>
         {uniqueIcons.length > 0 ? (
           <span className="flex items-center gap-[9px]">
             {uniqueIcons.map(({ key, Icon }) => (
-              <Icon key={key} className="size-4 text-[#7A7A80]" aria-hidden="true" />
+              <Icon key={key} className="size-4 text-muted-foreground" aria-hidden="true" />
             ))}
           </span>
         ) : null}

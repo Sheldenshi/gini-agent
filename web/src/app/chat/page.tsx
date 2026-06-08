@@ -77,7 +77,7 @@ export default function ChatPage() {
   const resolving = !sessionId && (pinnedSessionId ? !pinnedSession : agentChat.isLoading);
 
   return (
-    <div className="flex min-h-0 flex-1 overflow-hidden bg-[#0B0B0E]">
+    <div className="flex min-h-0 flex-1 overflow-hidden bg-background">
       {!sessionId ? (
         <section className="flex min-h-0 min-w-0 flex-1 flex-col">
           <AgentChatHeader name={headerName} seed={headerSeed} showAvatar={!isChannel} />

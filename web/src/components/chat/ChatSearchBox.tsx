@@ -44,7 +44,7 @@ export function ChatSearchBox({
       <button
         type="button"
         onClick={() => setFocused(true)}
-        className="hidden items-center gap-2 rounded-md border border-[#2A2A2E] bg-[#15161C] px-2.5 py-1.5 text-[12px] font-medium text-[#7A7A80] transition-colors hover:text-[#C2C2C8] sm:flex"
+        className="hidden items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground sm:flex"
       >
         <Search className="size-3.5" />
         Search in chat
@@ -56,8 +56,8 @@ export function ChatSearchBox({
     matchCount > 0 ? `${activeIndex + 1}/${matchCount}` : value !== "" ? "No results" : "";
 
   return (
-    <div className="flex items-center gap-1.5 rounded-md border border-[#2A2A2E] bg-[#15161C] pl-2.5 pr-1.5 py-1">
-      <Search className="size-3.5 shrink-0 text-[#7A7A80]" />
+    <div className="flex items-center gap-1.5 rounded-md border border-border bg-card pl-2.5 pr-1.5 py-1">
+      <Search className="size-3.5 shrink-0 text-muted-foreground" />
       <input
         ref={inputRef}
         type="text"
@@ -75,10 +75,10 @@ export function ChatSearchBox({
           }
         }}
         placeholder="Search in chat"
-        className="w-36 bg-transparent text-[12px] font-medium text-[#C2C2C8] placeholder:text-[#7A7A80] focus:outline-none"
+        className="w-36 bg-transparent text-[12px] font-medium text-foreground placeholder:text-muted-foreground focus:outline-none"
       />
       {readout ? (
-        <span className="shrink-0 text-[11px] font-medium tabular-nums text-[#7A7A80]">
+        <span className="shrink-0 text-[11px] font-medium tabular-nums text-muted-foreground">
           {readout}
         </span>
       ) : null}
@@ -87,7 +87,7 @@ export function ChatSearchBox({
         onClick={onPrev}
         disabled={matchCount === 0}
         aria-label="Previous match"
-        className="rounded p-0.5 text-[#7A7A80] transition-colors hover:text-[#C2C2C8] disabled:opacity-40 disabled:hover:text-[#7A7A80]"
+        className="rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
       >
         <ChevronUp className="size-3.5" />
       </button>
@@ -96,7 +96,7 @@ export function ChatSearchBox({
         onClick={onNext}
         disabled={matchCount === 0}
         aria-label="Next match"
-        className="rounded p-0.5 text-[#7A7A80] transition-colors hover:text-[#C2C2C8] disabled:opacity-40 disabled:hover:text-[#7A7A80]"
+        className="rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40 disabled:hover:text-muted-foreground"
       >
         <ChevronDown className="size-3.5" />
       </button>
@@ -104,7 +104,7 @@ export function ChatSearchBox({
         type="button"
         onClick={close}
         aria-label="Close search"
-        className="rounded p-0.5 text-[#7A7A80] transition-colors hover:text-[#C2C2C8]"
+        className="rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground"
       >
         <X className="size-3.5" />
       </button>

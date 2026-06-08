@@ -85,10 +85,10 @@ export function JobsTab() {
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Page Header — design `ZR4lj` */}
-      <div className="flex shrink-0 items-center justify-between border-b border-[#1C1C1E] px-8 py-[22px]">
+      <div className="flex shrink-0 items-center justify-between border-b border-border px-8 py-[22px]">
         <div className="flex flex-col gap-1.5">
-          <h2 className="text-[28px] font-bold leading-none text-white">Jobs</h2>
-          <p className="text-sm font-medium text-[#7A7A80]">
+          <h2 className="text-[28px] font-bold leading-none text-foreground">Jobs</h2>
+          <p className="text-sm font-medium text-muted-foreground">
             Scheduled prompts and scripts owned by this agent
           </p>
         </div>
@@ -101,13 +101,13 @@ export function JobsTab() {
             {/* Jobs column */}
             <div className="flex w-[520px] shrink-0 flex-col gap-3.5">
               <div className="flex items-center justify-between px-1">
-                <span className="text-[11px] font-bold uppercase tracking-[0.6px] text-[#9A9AA0]">
+                <span className="text-[11px] font-bold uppercase tracking-[0.6px] text-muted-foreground">
                   Jobs · {allJobs.length}
                 </span>
                 <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as StatusFilter)}>
                   <SelectTrigger
                     size="sm"
-                    className="h-auto gap-1 border-0 bg-transparent px-0 py-0 text-[11px] font-semibold text-white shadow-none focus-visible:ring-0 [&_svg]:text-[#9A9AA0]"
+                    className="h-auto gap-1 border-0 bg-transparent px-0 py-0 text-[11px] font-semibold text-foreground shadow-none focus-visible:ring-0 [&_svg]:text-muted-foreground"
                   >
                     <SelectValue>{STATUS_FILTER_LABELS[statusFilter]}</SelectValue>
                   </SelectTrigger>
@@ -135,15 +135,15 @@ export function JobsTab() {
             {/* Runs column */}
             <div className="flex min-w-0 flex-1 flex-col gap-3.5">
               <div className="flex items-center justify-between px-1">
-                <span className="text-[11px] font-bold uppercase tracking-[0.6px] text-[#9A9AA0]">
+                <span className="text-[11px] font-bold uppercase tracking-[0.6px] text-muted-foreground">
                   Recent runs · {runsLast24h} in the last 24h
                 </span>
                 <Link
                   href="/jobs"
-                  className="flex items-center gap-1 text-[11px] font-semibold text-white transition-opacity hover:opacity-80"
+                  className="flex items-center gap-1 text-[11px] font-semibold text-foreground transition-opacity hover:opacity-80"
                 >
                   View all runs
-                  <ArrowRight className="size-[11px] text-[#9A9AA0]" />
+                  <ArrowRight className="size-[11px] text-muted-foreground" />
                 </Link>
               </div>
               {recentRuns.length === 0 ? (
@@ -163,7 +163,7 @@ export function JobsTab() {
         </ScrollArea>
       ) : (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden p-8">
-          <div className="flex h-full flex-col overflow-hidden rounded-[10px] border border-[#1C1C1E] bg-[#141418]">
+          <div className="flex h-full flex-col overflow-hidden rounded-[10px] border border-border bg-card">
             <CalendarView
               status={{ enabled: true }}
               jobs={calendarJobs}
@@ -189,7 +189,7 @@ function ViewToggle({ view, onChange }: { view: View; onChange: (v: View) => voi
     { id: "calendar", label: "Calendar", Icon: Calendar }
   ];
   return (
-    <div className="flex gap-1 rounded-[10px] border border-[#1C1C1E] bg-[#141418] p-1">
+    <div className="flex gap-1 rounded-[10px] border border-border bg-card p-1">
       {segments.map(({ id, label, Icon }) => {
         const isActive = view === id;
         return (
@@ -199,7 +199,7 @@ function ViewToggle({ view, onChange }: { view: View; onChange: (v: View) => voi
             onClick={() => onChange(id)}
             className={cn(
               "flex items-center gap-1.5 rounded-[7px] px-4 py-[7px] text-[13px] transition-colors",
-              isActive ? "bg-[#E8E8EC] font-semibold text-[#0B0B0E]" : "font-bold text-[#9A9AA0] hover:text-white"
+              isActive ? "bg-primary font-semibold text-primary-foreground" : "font-bold text-muted-foreground hover:text-foreground"
             )}
           >
             <Icon className="size-[13px]" />
@@ -222,20 +222,20 @@ function JobCard({
   onAction: (op: "run" | "pause" | "resume") => void;
 }) {
   return (
-    <div className="flex flex-col gap-3.5 rounded-[10px] border border-[#1C1C1E] bg-[#141418] p-4">
+    <div className="flex flex-col gap-3.5 rounded-[10px] border border-border bg-card p-4">
       <div className="flex items-start justify-between gap-2.5">
         <div className="flex min-w-0 flex-col gap-1.5">
-          <p className="truncate text-[15px] font-semibold text-white">{job.name}</p>
-          <p className="truncate font-mono text-[11.5px] text-[#8A8A90]" title={job.cronExpression ?? undefined}>
+          <p className="truncate text-[15px] font-semibold text-foreground">{job.name}</p>
+          <p className="truncate font-mono text-[11.5px] text-muted-foreground" title={job.cronExpression ?? undefined}>
             {job.id} · {scheduleLabel(job)}
           </p>
         </div>
         <JobStatusBadge status={job.status} />
       </div>
-      <div className="flex flex-col gap-[5px] text-[12.5px] text-[#8A8A90]">
+      <div className="flex flex-col gap-[5px] text-[12.5px] text-muted-foreground">
         <span>last run {job.lastRunAt ? new Date(job.lastRunAt).toLocaleString() : "—"}</span>
         <span>next {job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : "—"}</span>
-        <span className="font-medium text-[#6A6A70]">
+        <span className="font-medium text-muted-foreground">
           {job.runCount} runs · {job.missedRuns} missed
         </span>
       </div>
@@ -244,7 +244,7 @@ function JobCard({
           type="button"
           disabled={actionPending}
           onClick={() => onAction("run")}
-          className="rounded-lg bg-[#E8E8EC] px-4 py-2 text-[13px] font-semibold text-[#0B0B0E] transition-opacity hover:opacity-90 disabled:opacity-50"
+          className="rounded-lg bg-primary px-4 py-2 text-[13px] font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
         >
           Run
         </button>
@@ -253,7 +253,7 @@ function JobCard({
             type="button"
             disabled={actionPending}
             onClick={() => onAction("pause")}
-            className="rounded-lg border border-[#2A2A30] bg-[#141418] px-4 py-2 text-[13px] font-semibold text-[#E4E4E8] transition-colors hover:bg-[#1C1C22] disabled:opacity-50"
+            className="rounded-lg border border-border bg-card px-4 py-2 text-[13px] font-semibold text-foreground transition-colors hover:bg-muted disabled:opacity-50"
           >
             Pause
           </button>
@@ -262,7 +262,7 @@ function JobCard({
             type="button"
             disabled={actionPending}
             onClick={() => onAction("resume")}
-            className="rounded-lg border border-[#2A2A30] bg-[#141418] px-4 py-2 text-[13px] font-semibold text-[#E4E4E8] transition-colors hover:bg-[#1C1C22] disabled:opacity-50"
+            className="rounded-lg border border-border bg-card px-4 py-2 text-[13px] font-semibold text-foreground transition-colors hover:bg-muted disabled:opacity-50"
           >
             Resume
           </button>
@@ -283,11 +283,11 @@ function RunCard({
   onReplay: () => void;
 }) {
   return (
-    <div className="flex flex-col gap-3 rounded-[10px] border border-[#1C1C1E] bg-[#141418] p-4">
+    <div className="flex flex-col gap-3 rounded-[10px] border border-border bg-card p-4">
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 flex-col gap-[5px]">
-          <p className="truncate font-mono text-[13px] font-medium text-white">{run.id}</p>
-          <p className="truncate text-[12px] text-[#6A6A70]">
+          <p className="truncate font-mono text-[13px] font-medium text-foreground">{run.id}</p>
+          <p className="truncate text-[12px] text-muted-foreground">
             {run.trigger} · attempt {run.attempt} · {new Date(run.createdAt).toLocaleString()}
           </p>
         </div>
@@ -296,7 +296,7 @@ function RunCard({
           {run.taskId ? (
             <Link
               href={`/tasks?id=${run.taskId}`}
-              className="rounded-[7px] border border-[#2A2A30] bg-[#141418] px-3 py-1.5 text-[12px] font-semibold text-[#E4E4E8] transition-colors hover:bg-[#1C1C22]"
+              className="rounded-[7px] border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground transition-colors hover:bg-muted"
             >
               View trace
             </Link>
@@ -305,21 +305,21 @@ function RunCard({
             type="button"
             disabled={replayPending}
             onClick={onReplay}
-            className="rounded-[7px] border border-[#2A2A30] bg-[#141418] px-3 py-1.5 text-[12px] font-semibold text-[#E4E4E8] transition-colors hover:bg-[#1C1C22] disabled:opacity-50"
+            className="rounded-[7px] border border-border bg-card px-3 py-1.5 text-[12px] font-semibold text-foreground transition-colors hover:bg-muted disabled:opacity-50"
           >
             Replay
           </button>
         </div>
       </div>
       {run.summary ? (
-        <p className="whitespace-pre-wrap text-[13px] leading-[1.6] text-[#B6B6BC]">{run.summary}</p>
+        <p className="whitespace-pre-wrap text-[13px] leading-[1.6] text-foreground">{run.summary}</p>
       ) : null}
       {run.error ? (
         <p className="whitespace-pre-wrap text-[13px] leading-[1.6] text-red-400">{run.error}</p>
       ) : null}
       {run.taskId ? (
-        <div className="border-t border-[#1C1C1E] pt-2.5">
-          <p className="font-mono text-[11.5px] text-[#6A6A70]">
+        <div className="border-t border-border pt-2.5">
+          <p className="font-mono text-[11.5px] text-muted-foreground">
             task {run.taskId} · {run.status}
           </p>
         </div>
@@ -362,7 +362,7 @@ function RunStatusBadge({ status }: { status: JobRunRecord["status"] }) {
 
 function EmptyColumn({ label }: { label: string }) {
   return (
-    <div className="rounded-[10px] border border-dashed border-[#1C1C1E] bg-[#141418]/40 px-4 py-8 text-center text-[13px] text-[#6A6A70]">
+    <div className="rounded-[10px] border border-dashed border-border bg-card/40 px-4 py-8 text-center text-[13px] text-muted-foreground">
       {label}
     </div>
   );

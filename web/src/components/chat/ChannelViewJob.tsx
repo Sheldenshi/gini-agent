@@ -43,7 +43,7 @@ export function ChannelViewJob({
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center gap-2 rounded-md border border-[#2A2A2E] bg-[#15161C] px-2.5 py-1.5 text-[12px] font-medium text-[#C2C2C8] transition-colors hover:bg-[#1C1C22] hover:text-white"
+      className="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-1.5 text-[12px] font-medium text-foreground transition-colors hover:bg-muted hover:text-foreground"
     >
       View job
       <ArrowUpRight className="size-3.5" />
