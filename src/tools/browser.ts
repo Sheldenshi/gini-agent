@@ -25,6 +25,7 @@
 // risk) because it can exfiltrate workspace files to a remote site.
 import type { Browser, BrowserContext, Locator, Page } from "playwright-core";
 import { existsSync, realpathSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
@@ -495,6 +496,35 @@ async function settledWithin(op: Promise<unknown>, ms: number): Promise<boolean>
   }
 }
 
+// The managed Chromium child isn't reachable via the playwright-core
+// client API (Browser has no process()), so when context.close() times
+// out we reap it by OS pid: find the process whose --user-data-dir is
+// this instance's profile dir and SIGKILL it, releasing the profile lock
+// for the next launchPersistentContext. Best-effort and overridable for
+// tests. Returns the number of pids signalled.
+let chromeKiller: (profileDir: string) => number = killChromeByProfileDir;
+function killChromeByProfileDir(profileDir: string): number {
+  try {
+    const out = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+    let n = 0;
+    for (const line of out.split("\n")) {
+      if (!line.includes(`--user-data-dir=${profileDir}`)) continue;
+      const pid = Number(line.trim().split(/\s+/)[0]);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+          n++;
+        } catch {
+          /* gone */
+        }
+      }
+    }
+    return n;
+  } catch {
+    return 0;
+  }
+}
+
 // Mode-aware teardown of a SharedHandle. Persistent: close the
 // BrowserContext, which also terminates the Chromium child Playwright
 // launched. The profile dir on disk stays put (sign-ins persist).
@@ -510,16 +540,17 @@ async function teardownHandle(handle: SharedHandle): Promise<void> {
       // On timeout, force-kill the underlying child to release the
       // profile-dir lock that the next launchPersistentContext needs.
       const settled = await settledWithin(handle.context.close(), teardownCloseTimeoutMs);
-      if (!settled) {
-        // Duck-typed Browser.process() — the Node-side handle exposes it
-        // but the public typing doesn't (mirrors browser-connect.ts). The
-        // browser()/process() lookups can throw or be absent (tests), so
-        // guard the whole chain and treat any failure as best-effort.
+      if (!settled && runtimeInstance) {
+        // The close() wedged. Reap the Chromium child by its profile-dir
+        // pid so the lock frees for the relaunch. Best-effort — a kill
+        // failure must never throw out of teardown.
         try {
-          const browserAny = handle.context.browser() as unknown as
-            | { process?: () => { kill?: (signal?: NodeJS.Signals | number) => void } | undefined }
-            | null;
-          browserAny?.process?.()?.kill?.("SIGKILL");
+          const killed = chromeKiller(chromeProfileDirFor(runtimeInstance));
+          if (killed >= 1) {
+            // Give the OS a moment to release the profile-dir lock before
+            // launchManaged relaunches against the same directory.
+            await new Promise((r) => setTimeout(r, 300));
+          }
         } catch {
           // best effort
         }
@@ -2738,13 +2769,26 @@ export const __test = {
   resetTeardownCloseTimeoutForTest(): void {
     teardownCloseTimeoutMs = 5_000;
   },
+  // Swap the profile-dir Chromium reaper so the wedged-close test can
+  // assert it's invoked on timeout without scanning real `ps`.
+  setChromeKillerForTest(fn: (profileDir: string) => number): void {
+    chromeKiller = fn;
+  },
+  resetChromeKillerForTest(): void {
+    chromeKiller = killChromeByProfileDir;
+  },
+  // Clear the registered runtime instance so a test that set one via
+  // setBrowserInstance() doesn't leak it into sibling tests.
+  resetBrowserInstanceForTest(): void {
+    runtimeInstance = undefined;
+  },
   // Install a fake shared handle so the close-path tests can assert
   // teardown behavior without launching Chromium. The `headed` flag
   // signals whether the test simulates the visible-window (managed) or
   // the headless-default state — both go through the same persistent
   // arm of teardownHandle, so the test impact is purely informational.
   installFakeManagedContextForTest(
-    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[]; browser: () => unknown }>
+    context: Pick<BrowserContext, "close"> & Partial<{ pages: () => Page[] }>
   ): void {
     shared = { kind: "persistent", context: context as BrowserContext, headed: true };
   },
