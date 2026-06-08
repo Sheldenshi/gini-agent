@@ -216,7 +216,7 @@ export function ProviderCard({
                   toggleRow();
                 }
               }}
-              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-border bg-card p-5 transition hover:border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
+              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-border bg-card p-5 transition hover:border-foreground/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
             >
               {/* Radio is purely visual now — the row itself is the
                   control. Kept aria-hidden so screen readers don't
