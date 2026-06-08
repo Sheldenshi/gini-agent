@@ -163,11 +163,11 @@ export function ProviderCard({
       </header>
 
       {rows.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-[#23232B] bg-[#0F0F13] p-10 text-center">
+        <div className="rounded-2xl border border-dashed border-border bg-background p-10 text-center">
           <p className="text-sm font-medium text-foreground">No providers connected yet</p>
           <p className="mx-auto mt-1.5 max-w-md text-xs text-muted-foreground">
             Add a provider to start chatting. Gini stores keys locally in
-            <code className="mx-1 rounded bg-[#1C1C22] px-1 py-0.5 font-mono text-[11px]">~/.gini/secrets.env</code>
+            <code className="mx-1 rounded bg-muted px-1 py-0.5 font-mono text-[11px]">~/.gini/secrets.env</code>
             and never proxies them anywhere except the provider you pick.
           </p>
         </div>
@@ -184,7 +184,7 @@ export function ProviderCard({
           const showRadioFill = switching ? isPending : isActive;
           const radioBorderClass = isPending || (!switching && isActive)
             ? "border-[#4277FB]"
-            : "border-[#3A3A40]";
+            : "border-border";
           const visual = PROVIDER_VISUAL[row.name] ?? { icon: TerminalIcon, authLabel: row.auth };
           const Icon = visual.icon;
           const model = isActive
@@ -216,7 +216,7 @@ export function ProviderCard({
                   toggleRow();
                 }
               }}
-              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-[#1F1F24] bg-[#141418] p-5 transition hover:border-[#2A2A30] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
+              className="flex cursor-pointer items-center gap-4 rounded-2xl border border-border bg-card p-5 transition hover:border-border focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#4277FB]/40 aria-disabled:cursor-not-allowed"
             >
               {/* Radio is purely visual now — the row itself is the
                   control. Kept aria-hidden so screen readers don't
@@ -228,13 +228,13 @@ export function ProviderCard({
               >
                 {showRadioFill ? <span className="size-2.5 rounded-full bg-[#4277FB]" /> : null}
               </span>
-              <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-[#1C1C22]">
-                <Icon className="size-5 text-[#C2C2C8]" />
+              <span className="flex size-[42px] items-center justify-center rounded-[11px] bg-muted">
+                <Icon className="size-5 text-foreground" />
               </span>
               <div className="flex-1 space-y-1.5">
                 <div className="flex items-center gap-2.5">
                   <span className="text-[15px] font-semibold text-foreground">{displayProviderName(row)}</span>
-                  <span className="rounded-md bg-[#1C1C22] px-2 py-0.5 text-[11px] font-semibold text-[#9A9AA0]">
+                  <span className="rounded-md bg-muted px-2 py-0.5 text-[11px] font-semibold text-muted-foreground">
                     {visual.authLabel}
                   </span>
                   {isActive ? (
@@ -246,7 +246,7 @@ export function ProviderCard({
                 <div className="flex items-center gap-2.5 text-xs text-muted-foreground">
                   <span className="size-2 rounded-full bg-emerald-400" aria-hidden />
                   <span>Connected</span>
-                  <span className="text-[#4A4A50]">·</span>
+                  <span className="text-muted-foreground">·</span>
                   <span className="font-mono">{model}</span>
                 </div>
               </div>
@@ -272,7 +272,7 @@ export function ProviderCard({
                       setEditingRow(row);
                     }}
                   >
-                    <PencilIcon className="size-4 text-[#9A9AA0]" />
+                    <PencilIcon className="size-4 text-muted-foreground" />
                   </Button>
                   {REMOVABLE_PROVIDERS.has(row.name) ? (
                     <Button
@@ -292,7 +292,7 @@ export function ProviderCard({
                         setRemovingRow(row);
                       }}
                     >
-                      <Trash2Icon className="size-4 text-[#9A9AA0]" />
+                      <Trash2Icon className="size-4 text-muted-foreground" />
                     </Button>
                   ) : null}
                 </div>
@@ -308,14 +308,14 @@ export function ProviderCard({
           if (!open && !removeProvider.isPending) setRemovingRow(null);
         }}
       >
-        <DialogContent className="gap-5 border-[#1F1F24] bg-[#141418] p-7 sm:max-w-md">
+        <DialogContent className="gap-5 border-border bg-card p-7 sm:max-w-md">
           <DialogTitle className="text-base font-bold text-foreground">
             Remove {removingRow ? displayProviderName(removingRow) : "provider"}?
           </DialogTitle>
           <DialogDescription className="text-[13px] text-muted-foreground">
             You can reconnect anytime.
           </DialogDescription>
-          <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">
+          <div className="flex items-center justify-end gap-2.5 border-t border-border pt-4">
             <Button
               type="button"
               variant="outline"
@@ -350,10 +350,10 @@ export function ProviderCard({
       ) : null}
 
       {switching && pendingRow ? (
-        <div className="flex items-center justify-between gap-4 rounded-xl border border-[#2E3650] bg-[#15171F] px-5 py-4">
+        <div className="flex items-center justify-between gap-4 rounded-xl border border-[#D7DEFA] bg-[#EEF2FF] px-5 py-4 dark:border-[#2E3650] dark:bg-[#15171F]">
           <div className="flex items-center gap-3">
-            <span className="flex size-[30px] items-center justify-center rounded-lg bg-[#1D2333]">
-              <ArrowLeftRightIcon className="size-4 text-[#9DB4FF]" />
+            <span className="flex size-[30px] items-center justify-center rounded-lg bg-[#E0E8FF] dark:bg-[#1D2333]">
+              <ArrowLeftRightIcon className="size-4 text-[#4277FB] dark:text-[#9DB4FF]" />
             </span>
             <div className="space-y-0.5">
               <p className="text-sm font-semibold text-foreground">

@@ -88,10 +88,10 @@ export function EditProviderDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="gap-5 border-[#1F1F24] bg-[#141418] p-7 sm:max-w-md">
+      <DialogContent className="gap-5 border-border bg-card p-7 sm:max-w-md">
         <div className="flex items-start gap-3">
-          <span className="flex size-[38px] shrink-0 items-center justify-center rounded-[10px] bg-[#1D2333]">
-            <Icon className="size-5 text-[#C2C2C8]" />
+          <span className="flex size-[38px] shrink-0 items-center justify-center rounded-[10px] bg-muted">
+            <Icon className="size-5 text-foreground" />
           </span>
           <div className="flex-1 space-y-0.5">
             <DialogTitle className="text-base font-bold text-foreground">Edit provider</DialogTitle>
@@ -110,8 +110,8 @@ export function EditProviderDialog({
         >
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <Label htmlFor="edit-api-key" className="text-[13px] font-semibold text-[#C2C2C8]">API key</Label>
-              <span className="text-xs text-[#6A6A70]">Stored encrypted</span>
+              <Label htmlFor="edit-api-key" className="text-[13px] font-semibold text-foreground">API key</Label>
+              <span className="text-xs text-muted-foreground">Stored encrypted</span>
             </div>
             <div className="relative">
               <Input
@@ -122,13 +122,13 @@ export function EditProviderDialog({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 disabled={save.isPending}
-                className="h-11 border-[#2A2A2E] bg-[#0E0E11] pr-11 font-mono text-[13px]"
+                className="h-11 border-border bg-secondary pr-11 font-mono text-[13px]"
               />
               <button
                 type="button"
                 aria-label={showKey ? "Hide API key" : "Show API key"}
                 onClick={() => setShowKey((v) => !v)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-[#7A7A80] hover:text-foreground"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
               >
                 {showKey ? <EyeIcon className="size-4" /> : <EyeOffIcon className="size-4" />}
               </button>
@@ -137,15 +137,15 @@ export function EditProviderDialog({
 
           <div className="space-y-2">
             <div className="flex items-center justify-between">
-              <Label htmlFor="edit-model" className="text-[13px] font-semibold text-[#C2C2C8]">Default model</Label>
-              <span className="text-xs text-[#6A6A70]">
+              <Label htmlFor="edit-model" className="text-[13px] font-semibold text-foreground">Default model</Label>
+              <span className="text-xs text-muted-foreground">
                 {row.models.length} available
               </span>
             </div>
             <Select value={model} onValueChange={setModel} disabled={save.isPending}>
               <SelectTrigger
                 id="edit-model"
-                className="h-11 border-[#2A2A2E] bg-[#0E0E11] font-mono text-[13px]"
+                className="h-11 border-border bg-secondary font-mono text-[13px]"
               >
                 <SelectValue placeholder="Select model" />
               </SelectTrigger>
@@ -157,7 +157,7 @@ export function EditProviderDialog({
             </Select>
           </div>
 
-          <div className="flex items-center justify-end gap-2.5 border-t border-[#1F1F26] pt-4">
+          <div className="flex items-center justify-end gap-2.5 border-t border-border pt-4">
             <Button
               type="button"
               variant="outline"
