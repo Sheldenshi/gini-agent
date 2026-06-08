@@ -1,0 +1,88 @@
+name: Tag on version bump
+
+# When a commit lands on main that changes package.json's version to one that
+# has no matching tag yet, create the annotated vX.Y.Z tag and publish the
+# GitHub release from the CHANGELOG section — so merging the release PR is the
+# whole release. Idempotent: re-runs and version-unchanged package.json edits
+# (e.g. dependency bumps) are no-ops once the tag exists.
+#
+# The tag is pushed with GITHUB_TOKEN, which by design does NOT trigger other
+# workflows, so this job creates the release itself rather than relying on
+# release.yml's tag-push trigger. release.yml remains the path for tags pushed
+# by a human (hotfixes, manual re-publishes).
+
+on:
+  push:
+    branches: [main]
+    paths: ["package.json"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tag-on-version-bump
+  cancel-in-progress: false
+
+jobs:
+  tag-and-release:
+    name: Tag and publish on version bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read version from package.json
+        id: v
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r .version package.json)"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "package.json has no version field" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the tag already exists
+        id: check
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag v${VERSION} already exists — nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify a CHANGELOG section exists
+        if: steps.check.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$(scripts/changelog-notes.sh "$VERSION")" ]; then
+            echo "No CHANGELOG section found for [$VERSION] — refusing to tag." >&2
+            exit 1
+          fi
+
+      - name: Create and push the tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: Create the GitHub release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES="$(mktemp)"
+          scripts/changelog-notes.sh "$VERSION" > "$NOTES"
+          gh release create "v${VERSION}" --title "v${VERSION}" --notes-file "$NOTES"

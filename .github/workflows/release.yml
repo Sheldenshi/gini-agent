@@ -21,12 +21,7 @@ jobs:
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES="$(mktemp)"
-          awk -v v="$VERSION" '
-            $0 ~ "^## \\[" v "\\]" { in_section=1; next }
-            in_section && /^## \[/ { exit }
-            in_section && /^\[.*\]:/ { exit }
-            in_section { print }
-          ' CHANGELOG.md > "$NOTES"
+          scripts/changelog-notes.sh "$VERSION" > "$NOTES"
           if [ ! -s "$NOTES" ]; then
             echo "No CHANGELOG section found for [$VERSION]" >&2
             exit 1
