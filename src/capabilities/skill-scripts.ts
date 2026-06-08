@@ -150,6 +150,12 @@ export async function invokeSkillScript(
     GINI_UPLOADS_DIR: uploadsDir(config.instance),
     GINI_WORKSPACE: config.workspaceRoot,
     GINI_TASK_ID: options.taskId ?? "",
+    // Non-secret ambient session vars that real CLIs rely on (e.g. gws's
+    // macOS keychain decryption resolves the login keychain via USER/LOGNAME).
+    // These are session identity/locale, not secrets — connector SECRETS
+    // still come only via resolveSkillEnv above, so this stays within the
+    // skill-env containment boundary (see ADR skill-connector-consent.md).
+    ...ambientEnv(),
     ...connectorEnv,
     ...(options.envOverride ?? {})
   };
@@ -237,6 +243,22 @@ export async function invokeSkillScript(
   });
 
   return { ok, stdout, stderr, exitCode, parsed, error };
+}
+
+// Benign, non-secret ambient session/locale vars to pass through from the
+// gateway's process env when present. CLIs like gws need USER/LOGNAME to
+// resolve the macOS login keychain; locale/term/tmpdir keep tool output
+// well-behaved. Only forward keys that are actually set so we never inject
+// empty strings.
+const AMBIENT_ENV_KEYS = ["USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM"] as const;
+
+function ambientEnv(): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of AMBIENT_ENV_KEYS) {
+    const value = process.env[key];
+    if (value !== undefined) out[key] = value;
+  }
+  return out;
 }
 
 // Pick the right interpreter based on the script's extension. Unknown
