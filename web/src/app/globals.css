@@ -2,7 +2,6 @@
 @plugin "@tailwindcss/typography";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "highlight.js/styles/github-dark.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -87,6 +86,23 @@
   --sidebar-accent-foreground: #15171C;
   --sidebar-border: #E6E8EC;
   --sidebar-ring: #4277FB;
+  /* highlight.js syntax tokens (GitHub Light palette). Recessed onto --muted so
+     code blocks read as a distinct surface on the white page. */
+  --hljs-bg: var(--muted);
+  --hljs-fg: #24292e;
+  --hljs-keyword: #d73a49;
+  --hljs-entity: #6f42c1;
+  --hljs-constant: #005cc5;
+  --hljs-string: #032f62;
+  --hljs-variable: #e36209;
+  --hljs-comment: #6a737d;
+  --hljs-entity-tag: #22863a;
+  --hljs-section: #005cc5;
+  --hljs-bullet: #735c0f;
+  --hljs-addition-fg: #22863a;
+  --hljs-addition-bg: #f0fff4;
+  --hljs-deletion-fg: #b31d28;
+  --hljs-deletion-bg: #ffeef0;
 }
 
 .dark {
@@ -121,6 +137,22 @@
   --sidebar-accent-foreground: #FFFFFF;
   --sidebar-border: #1C1C1E;
   --sidebar-ring: oklch(0.78 0 0);
+  /* highlight.js syntax tokens (GitHub Dark palette). */
+  --hljs-bg: #0d1117;
+  --hljs-fg: #c9d1d9;
+  --hljs-keyword: #ff7b72;
+  --hljs-entity: #d2a8ff;
+  --hljs-constant: #79c0ff;
+  --hljs-string: #a5d6ff;
+  --hljs-variable: #ffa657;
+  --hljs-comment: #8b949e;
+  --hljs-entity-tag: #7ee787;
+  --hljs-section: #1f6feb;
+  --hljs-bullet: #f2cc60;
+  --hljs-addition-fg: #aff5b4;
+  --hljs-addition-bg: #033a16;
+  --hljs-deletion-fg: #ffdcd7;
+  --hljs-deletion-bg: #67060c;
 }
 
 @layer base {
@@ -169,6 +201,30 @@
 .chat-markdown blockquote { margin: 0.5rem 0; padding-left: 0.75rem; border-left: 2px solid var(--color-border); color: var(--color-muted-foreground); }
 .chat-markdown table { border-collapse: collapse; margin: 0.5rem 0; }
 .chat-markdown th, .chat-markdown td { border: 1px solid var(--color-border); padding: 0.25rem 0.5rem; }
+
+/* Theme-aware syntax highlighting. Replaces the unconditional github-dark
+   stylesheet with variable-driven rules so fenced code blocks follow the
+   active theme instead of always rendering dark. Token roles and colors
+   mirror GitHub's prettylights palette (see --hljs-* in :root / .dark). */
+.hljs { color: var(--hljs-fg); background: var(--hljs-bg); }
+pre code.hljs { display: block; overflow-x: auto; padding: 1em; }
+code.hljs { padding: 3px 5px; }
+.hljs-doctag, .hljs-keyword, .hljs-meta .hljs-keyword, .hljs-template-tag,
+.hljs-template-variable, .hljs-type, .hljs-variable.language_ { color: var(--hljs-keyword); }
+.hljs-title, .hljs-title.class_, .hljs-title.class_.inherited__, .hljs-title.function_ { color: var(--hljs-entity); }
+.hljs-attr, .hljs-attribute, .hljs-literal, .hljs-meta, .hljs-number, .hljs-operator,
+.hljs-variable, .hljs-selector-attr, .hljs-selector-class, .hljs-selector-id { color: var(--hljs-constant); }
+.hljs-regexp, .hljs-string, .hljs-meta .hljs-string { color: var(--hljs-string); }
+.hljs-built_in, .hljs-symbol { color: var(--hljs-variable); }
+.hljs-comment, .hljs-code, .hljs-formula { color: var(--hljs-comment); }
+.hljs-name, .hljs-quote, .hljs-selector-tag, .hljs-selector-pseudo { color: var(--hljs-entity-tag); }
+.hljs-subst { color: var(--hljs-fg); }
+.hljs-section { color: var(--hljs-section); font-weight: bold; }
+.hljs-bullet { color: var(--hljs-bullet); }
+.hljs-emphasis { color: var(--hljs-fg); font-style: italic; }
+.hljs-strong { color: var(--hljs-fg); font-weight: bold; }
+.hljs-addition { color: var(--hljs-addition-fg); background-color: var(--hljs-addition-bg); }
+.hljs-deletion { color: var(--hljs-deletion-fg); background-color: var(--hljs-deletion-bg); }
 
 /* Inline doc panel: bump heading sizes so sections stand out in the slide-over
    (the flat chat sizing reads as undifferentiated for a docs page). */
