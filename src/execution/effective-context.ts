@@ -53,15 +53,12 @@ export function resolveEffectiveContext(state: RuntimeState, config: RuntimeConf
   // fall back to the instance config so a partially-configured agent doesn't
   // break inference.
   //
-  // Only inherit the instance's transport config — baseUrl / apiKeyEnv /
-  // extraBody and the Azure routing fields (apiVersion / deployment /
-  // authScheme) — when the agent is routing to the SAME provider as the
-  // instance. The same-provider branch spreads config.provider, so every one
-  // of those fields rides along automatically. A cross-provider agent (e.g. an
-  // OpenRouter-routed agent on an OpenAI/Azure-configured instance) must take
-  // normalizeProvider's per-provider defaults — spreading config.provider
-  // unconditionally would carry the wrong baseUrl + apiKeyEnv (and a stray
-  // Azure deployment/api-version) onto the override and silently send the
+  // Only inherit the instance's baseUrl / apiKeyEnv / extraBody when the
+  // agent is routing to the SAME provider as the instance. A cross-
+  // provider agent (e.g. an OpenRouter-routed agent on an OpenAI-
+  // configured instance) must take normalizeProvider's per-provider
+  // defaults — spreading config.provider unconditionally would carry the
+  // wrong baseUrl + apiKeyEnv onto the override and silently send the
   // agent's requests to the instance's endpoint with the instance's key.
   let provider: ProviderConfig;
   let providerSource: "agent" | "instance";

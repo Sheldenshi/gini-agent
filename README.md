@@ -112,13 +112,9 @@ gini provider set codex gpt-5.5            # Codex OAuth (reads ~/.codex/auth.js
 gini provider set openai gpt-5.4-mini      # uses $OPENAI_API_KEY
 gini provider set openrouter <model>       # uses $OPENROUTER_API_KEY
 gini provider set local <model> --base-url http://127.0.0.1:8000/v1
-# Azure OpenAI: point the openai provider at a deployment
-gini provider set openai gpt-5.4 \
-  --base-url https://<resource>.openai.azure.com \
-  --api-version 2024-12-01-preview --deployment <deployment> --auth-scheme api-key
 ```
 
-The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). The `openai` provider also targets **Azure OpenAI** when given an `--api-version` and an Azure `--base-url`: requests route to the deployment-scoped Azure endpoint, with `--auth-scheme api-key` for a resource key or `bearer` for an Entra token (the same fields are exposed in Settings → Providers in the web UI). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [Azure OpenAI Routing](docs/adr/azure-openai-provider.md) and [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
+The `local` provider works with any OpenAI-compatible server (oMLX, vLLM, LM Studio, llama.cpp). API keys are read from environment variables, and Codex OAuth is read from `~/.codex/auth.json` (or `CODEX_AUTH_JSON`) — nothing is written to Gini config. Run `gini --help` for the full flag set, or see [provider-extra-body.md](docs/adr/provider-extra-body.md) for the `--extra-body` contract. When a credential fails mid-chat, see [Codex re-authentication](docs/providers/codex.md#re-authentication) and [Provider Re-Authentication Guidance](docs/adr/provider-reauth-guidance.md).
 
 ## Parallel Instances
 

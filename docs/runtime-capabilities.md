@@ -42,7 +42,7 @@ bun run gini evidence
 | Terminal/code tools | task inputs: `shell`, `code js|python :: ...`, approval gated under `approvalMode: "strict"`; under the default `"yolo"` mode every gate is bypassed, and the safe-middle `"auto"` mode (which operators can switch to) auto-runs safe commands while dangerous shapes still gate (see ADR approval-mode.md) |
 | Approval settings | `GET/PATCH /api/settings/auto-approve` for `approvalMode` (`strict`/`auto`/`yolo`), `autoApproveCommands` (shell-glob allowlist for `terminal_exec`), and `dangerousTerminalPatterns` (operator extension to the built-in blocklist) |
 | Toolsets | `gini toolsets list/enable/disable`, `/api/toolsets` |
-| Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI (incl. Azure OpenAI via `--api-version`/`--deployment`/`--auth-scheme` — see ADR azure-openai-provider.md), OpenRouter / DeepSeek / local OpenAI-compatible records, echo |
+| Providers | `gini provider show/catalog/set`, Codex OAuth, OpenAI, OpenRouter-compatible records, echo |
 | Runtime updates | `gini update`, `/api/version`, `/api/update/check`, `/api/update`; installer-managed web runtimes show the current package/git version and can trigger an update |
 | Delegation records | `gini subagents list/spawn`, `/api/subagents` |
 | MCP/plugin records | `gini mcp list/add/health/invoke/disable` |

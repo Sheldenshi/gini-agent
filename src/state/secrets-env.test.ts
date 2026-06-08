@@ -11,8 +11,6 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  isValidEnvVarName,
-  removeKeyFromSecretsEnv,
   secretsEnvHasKey,
   secretsEnvPath,
   unquoteSecretsValue,
@@ -103,27 +101,6 @@ describe("writeKeyToSecretsEnv", () => {
 
     const body = readFileSync(path, "utf8");
     expect(body).toBe("FIRST_KEY=value\nexport OPENAI_API_KEY='sk-second'\n");
-  });
-});
-
-describe("env-var name validation", () => {
-  test("isValidEnvVarName accepts POSIX identifiers and rejects the rest", () => {
-    expect(isValidEnvVarName("OPENAI_API_KEY")).toBe(true);
-    expect(isValidEnvVarName("AZURE_OPENAI_API_KEY")).toBe(true);
-    expect(isValidEnvVarName("_x9")).toBe(true);
-    expect(isValidEnvVarName("9LEADING")).toBe(false);
-    expect(isValidEnvVarName("HAS SPACE")).toBe(false);
-    expect(isValidEnvVarName("FOO=bar")).toBe(false);
-    expect(isValidEnvVarName("FOO\nexport EVIL")).toBe(false);
-    expect(isValidEnvVarName("")).toBe(false);
-  });
-
-  test("the writer and remover reject a malformed name instead of injecting it", () => {
-    // A name carrying `=` or a newline would otherwise inject an extra line
-    // into the shell-sourced secrets.env. The guard runs before any filesystem
-    // access, so no sandbox is needed.
-    expect(() => writeKeyToSecretsEnv("FOO=evil\nexport BAR", "v")).toThrow(/Invalid environment variable name/);
-    expect(() => removeKeyFromSecretsEnv("FOO=evil\nexport BAR")).toThrow(/Invalid environment variable name/);
   });
 });
 

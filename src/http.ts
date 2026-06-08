@@ -1613,7 +1613,7 @@ export function createHandler(config: RuntimeConfig): (request: Request) => Resp
       const chatId = parseChatIdStrict(payload.chatId);
       return json(await rejectPendingChat(config, params[0], chatId));
     }],
-    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name, config.provider?.apiKeyEnv))],
+    ["GET", /^\/api\/providers\/catalog$/, () => json(providerCatalogWithStatus(config.provider?.name))],
     // Browser-driven onboarding endpoints. The webapp's /setup route polls
     // /api/setup/status to decide whether to render the form, and POSTs
     // /api/setup/provider to set credentials. The runtime writes

@@ -58,33 +58,6 @@ export default function AddProviderPage() {
   const [providerName, setProviderName] = useState<string>("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [apiKey, setApiKey] = useState("");
-  // Transport overrides. baseUrl applies to every OpenAI-compatible provider;
-  // the Azure fields (apiVersion/deployment/authScheme) only matter for openai
-  // and are what point it at an Azure deployment.
-  const [baseUrl, setBaseUrl] = useState("");
-  const [apiVersion, setApiVersion] = useState("");
-  const [deployment, setDeployment] = useState("");
-  const [authScheme, setAuthScheme] = useState("bearer");
-
-  // Show the Azure fields when the base URL looks like an Azure endpoint OR an
-  // api-version is already set (the runtime's actual Azure-mode signal), so a
-  // custom Azure domain isn't hidden. A standard OpenAI setup has neither.
-  // Blanking the base URL clears apiVersion/deployment (see onBaseUrlChange),
-  // which drives this false so the section collapses.
-  const isAzure = /azure/i.test(baseUrl) || apiVersion.trim().length > 0;
-
-  // Blanking the Base URL is an explicit "leave this endpoint" action: clear the
-  // Azure routing fields too so the section collapses and a later save reverts to
-  // the standard OpenAI endpoint, rather than leaving a stranded apiVersion that
-  // the backend rejects (apiVersion without an Azure base URL would 404).
-  const onBaseUrlChange = (next: string) => {
-    setBaseUrl(next);
-    if (next.trim().length === 0) {
-      setApiVersion("");
-      setDeployment("");
-      setAuthScheme("bearer");
-    }
-  };
 
   // Seed once the catalog arrives: honor a ?provider= preselection from the
   // settings list (Edit button on a row), else fall back to the first tile.
@@ -100,10 +73,6 @@ export default function AddProviderPage() {
     const entry = tiles.find((t) => t.name === next);
     setSelectedModel(entry?.models[0] ?? "");
     setApiKey("");
-    setBaseUrl("");
-    setApiVersion("");
-    setDeployment("");
-    setAuthScheme("bearer");
   };
 
   const entry = tiles.find((t) => t.name === providerName);
@@ -127,16 +96,7 @@ export default function AddProviderPage() {
         body: JSON.stringify({
           provider: providerName,
           ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-          ...(selectedModel ? { model: selectedModel } : {}),
-          // baseUrl applies to any OpenAI-compatible provider; the Azure fields
-          // are openai-only. Sent verbatim (blank included) so the backend
-          // treats an empty value as "use the default endpoint".
-          ...(!isCodex ? { baseUrl: baseUrl.trim() } : {}),
-          ...(providerName === "openai"
-            ? isAzure
-              ? { apiVersion: apiVersion.trim(), deployment: deployment.trim(), authScheme }
-              : { apiVersion: "", deployment: "", authScheme: "bearer" }
-            : {})
+          ...(selectedModel ? { model: selectedModel } : {})
         })
       });
     },
@@ -150,16 +110,12 @@ export default function AddProviderPage() {
           ? "Codex OAuth verified."
           : `Provider set to ${providerName} (${selectedModel}).`
       );
-      // Refetch BOTH providers and status BEFORE navigating, so the settings
-      // list mounts with the row present AND the Edit dialog's /status-sourced
-      // prefill is fresh (a fast edit otherwise reopens with stale transport
-      // fields). We can't use useInvalidate here — it debounces 80ms and its
-      // unmount cleanup clears the pending set when this page unmounts, so the
-      // invalidation never fires.
-      await Promise.all([
-        queryClient.refetchQueries({ queryKey: ["providers"] }),
-        queryClient.refetchQueries({ queryKey: ["status"] })
-      ]);
+      // Refetch providers BEFORE navigating so the settings list mounts
+      // with the row already present. We can't use useInvalidate here —
+      // it debounces 80ms and its unmount cleanup clears the pending set
+      // when this page unmounts, so the invalidation never fires.
+      queryClient.invalidateQueries({ queryKey: ["status"] });
+      await queryClient.refetchQueries({ queryKey: ["providers"] });
       router.push("/settings");
     },
     onError: (error: Error) => toast.error(error.message)
@@ -292,65 +248,6 @@ export default function AddProviderPage() {
                     </SelectContent>
                   </Select>
                 </div>
-
-                <div className="grid gap-2">
-                  <Label htmlFor="provider-base-url">
-                    Base URL <span className="font-normal text-muted-foreground">(optional)</span>
-                  </Label>
-                  <Input
-                    id="provider-base-url"
-                    autoComplete="off"
-                    placeholder={
-                      providerName === "openai"
-                        ? "https://api.openai.com/v1 · Azure: https://<resource>.openai.azure.com"
-                        : "Override the default endpoint"
-                    }
-                    value={baseUrl}
-                    onChange={(e) => onBaseUrlChange(e.target.value)}
-                    disabled={save.isPending}
-                  />
-                </div>
-
-                {providerName === "openai" && isAzure ? (
-                  <div className="grid gap-3">
-                    <p className="text-xs font-semibold text-[#C2C2C8]">
-                      Azure OpenAI{" "}
-                      <span className="font-normal text-muted-foreground">— deployment settings for this endpoint</span>
-                    </p>
-                    <div className="grid gap-2">
-                      <Label htmlFor="provider-api-version">API version</Label>
-                      <Input
-                        id="provider-api-version"
-                        autoComplete="off"
-                        placeholder="e.g. 2024-12-01-preview"
-                        value={apiVersion}
-                        onChange={(e) => setApiVersion(e.target.value)}
-                        disabled={save.isPending}
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="provider-deployment">Deployment</Label>
-                      <Input
-                        id="provider-deployment"
-                        autoComplete="off"
-                        placeholder="Defaults to the model name"
-                        value={deployment}
-                        onChange={(e) => setDeployment(e.target.value)}
-                        disabled={save.isPending}
-                      />
-                    </div>
-                    <div className="grid gap-2">
-                      <Label htmlFor="provider-auth-scheme">Auth scheme</Label>
-                      <Select value={authScheme} onValueChange={setAuthScheme} disabled={save.isPending}>
-                        <SelectTrigger id="provider-auth-scheme"><SelectValue /></SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="bearer">Bearer (OpenAI / Azure Entra token)</SelectItem>
-                          <SelectItem value="api-key">api-key (Azure resource key)</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  </div>
-                ) : null}
               </>
             )}
 

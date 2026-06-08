@@ -89,20 +89,6 @@ describe("resolveProviderModality", () => {
     expect(resolveProviderModality({ name: "mystery" as ProviderConfig["name"], model: "x" }))
       .toEqual({ vision: false, nativeDocs: false });
   });
-
-  test("azure-mode openai keeps vision but disables nativeDocs (no file parts on Azure)", () => {
-    // Azure deployment-scoped chat/completions has no `file` content part, so a
-    // native document part would 400 — disable nativeDocs in Azure mode.
-    expect(resolveProviderModality({
-      name: "openai",
-      model: "gpt-5.4",
-      baseUrl: "https://x.openai.azure.com",
-      apiVersion: "2024-12-01-preview"
-    })).toEqual({ vision: true, nativeDocs: false });
-    // Standard OpenAI (no apiVersion) keeps native document ingestion.
-    expect(resolveProviderModality({ name: "openai", model: "gpt-5.4" }))
-      .toEqual({ vision: true, nativeDocs: true });
-  });
 });
 
 describe("resolveProviderContextWindowTokens", () => {

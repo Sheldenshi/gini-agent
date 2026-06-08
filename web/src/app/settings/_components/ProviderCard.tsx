@@ -80,16 +80,11 @@ interface SetProviderResult {
 export function ProviderCard({
   catalog,
   activeProviderName,
-  activeProviderModel,
-  activeProvider
+  activeProviderModel
 }: {
   catalog: ProviderCatalogItem[];
   activeProviderName?: string;
   activeProviderModel?: string;
-  // The active provider's persisted transport config, used to prefill the
-  // Edit dialog (baseUrl + Azure routing). Only the active provider has a
-  // stored config; non-active rows open the dialog blank.
-  activeProvider?: { baseUrl?: string; apiVersion?: string; deployment?: string; authScheme?: string };
 }) {
   const invalidate = useInvalidate();
   const rows = SELECTABLE_PROVIDERS
@@ -347,10 +342,6 @@ export function ProviderCard({
           authLabel={PROVIDER_VISUAL[editingRow.name]?.authLabel ?? editingRow.auth}
           icon={PROVIDER_VISUAL[editingRow.name]?.icon ?? TerminalIcon}
           currentModel={editingRow.name === activeProviderName ? activeProviderModel : undefined}
-          currentBaseUrl={editingRow.name === activeProviderName ? activeProvider?.baseUrl : undefined}
-          currentApiVersion={editingRow.name === activeProviderName ? activeProvider?.apiVersion : undefined}
-          currentDeployment={editingRow.name === activeProviderName ? activeProvider?.deployment : undefined}
-          currentAuthScheme={editingRow.name === activeProviderName ? activeProvider?.authScheme : undefined}
           open={Boolean(editingRow)}
           onOpenChange={(open) => {
             if (!open) setEditingRow(null);

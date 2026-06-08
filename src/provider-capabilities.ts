@@ -115,20 +115,14 @@ function openrouterModality(model: string): ProviderModality {
 export function resolveProviderModality(provider: ProviderConfig): ProviderModality {
   const model = provider.model ?? "";
   switch (provider.name) {
-    case "openai": {
+    case "openai":
       // gpt-4o / 4.1 / 5.x / o-series accept image input and ingest files
       // natively (Responses input_file / Chat-Completions file). Gate on a
       // known family so an unknown model id (or a custom OpenAI-compatible
       // endpoint pointed at a text-only model) stays conservatively false.
-      const visionCapable = OPENAI_NATIVE_FAMILY.test(model);
-      // Azure OpenAI's deployment-scoped chat/completions does NOT accept the
-      // `file` content part (its content schema is text/image/audio), so a
-      // native `document` part would 400. Never emit one in Azure mode —
-      // detected by apiVersion, the same signal the provider routes on. Image
-      // input is supported on Azure, so vision still follows the model family.
-      const azureMode = (provider.apiVersion?.trim().length ?? 0) > 0;
-      return { vision: visionCapable, nativeDocs: visionCapable && !azureMode };
-    }
+      return OPENAI_NATIVE_FAMILY.test(model)
+        ? { vision: true, nativeDocs: true }
+        : { vision: false, nativeDocs: false };
     case "openrouter":
       return openrouterModality(model);
     case "deepseek":
