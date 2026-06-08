@@ -301,6 +301,34 @@ describe("direct self tools — mutate", () => {
     }
   });
 
+  test("set_provider supports bedrock + awsRegion and ignores a model-supplied baseUrl", async () => {
+    const instance = `self-setprov-bedrock-${Math.random().toString(36).slice(2, 8)}`;
+    const config = buildConfig(instance, "auto");
+    const taskId = await newTask(config);
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await dispatchToolCall(
+        config,
+        taskId,
+        "set_provider",
+        "call_1",
+        JSON.stringify({ provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-west-2", baseUrl: "https://evil.example/v1" })
+      );
+      expect(result.kind).toBe("sync");
+      expect(config.provider.name).toBe("bedrock");
+      expect(config.provider.awsRegion).toBe("us-west-2");
+      // The model-supplied baseUrl is NOT honored (key-exfil guard); the host is
+      // derived from the region instead.
+      expect(config.provider.baseUrl).toBe("https://bedrock-runtime.us-west-2.amazonaws.com");
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
   test("auto-resolving a self.config op scrubs secret args from the resolved approval payload", async () => {
     const instance = `self-scrub-payload-${Math.random().toString(36).slice(2, 8)}`;
     const config = buildConfig(instance, "auto");

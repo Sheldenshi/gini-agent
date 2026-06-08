@@ -338,6 +338,21 @@ describe("setup-api", () => {
     }
   });
 
+  test("bedrock: rejects a malformed awsRegion before persisting", async () => {
+    const prevAk = process.env.AWS_ACCESS_KEY_ID;
+    const prevSk = process.env.AWS_SECRET_ACCESS_KEY;
+    process.env.AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE";
+    process.env.AWS_SECRET_ACCESS_KEY = "secret";
+    try {
+      const result = await setSetupProvider(config, { provider: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1/evil" });
+      expect(result.ok).toBe(false);
+      expect(result.error).toMatch(/awsRegion is invalid/);
+    } finally {
+      if (prevAk === undefined) delete process.env.AWS_ACCESS_KEY_ID; else process.env.AWS_ACCESS_KEY_ID = prevAk;
+      if (prevSk === undefined) delete process.env.AWS_SECRET_ACCESS_KEY; else process.env.AWS_SECRET_ACCESS_KEY = prevSk;
+    }
+  });
+
   test("remove rejects codex, local, and unknown providers", () => {
     expect(removeSetupProvider(config, "codex")).toMatchObject({ ok: false, error: expect.stringContaining("codex CLI") });
     expect(removeSetupProvider(config, "local")).toMatchObject({ ok: false });

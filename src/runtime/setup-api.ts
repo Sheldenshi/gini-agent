@@ -42,9 +42,8 @@
 // handler itself; the actual launchctl interaction is the detached
 // child's responsibility.
 
-import { writeFileSync } from "node:fs";
-import { configPath, writeRuntimeConfig } from "../paths";
-import { hasUsableAwsCredentials, hasUsableCodexCredentials, normalizeProvider, providerCatalog, providerHealth } from "../provider";
+import { writeRuntimeConfig } from "../paths";
+import { hasUsableAwsCredentials, hasUsableCodexCredentials, isValidAwsRegion, normalizeProvider, providerCatalog, providerHealth } from "../provider";
 import { removeKeyFromSecretsEnv, writeKeyToSecretsEnv } from "../state/secrets-env";
 import { requestAutostartRefresh } from "./autostart-refresh";
 import type { ProviderConfig, RuntimeConfig } from "../types";
@@ -177,7 +176,7 @@ export async function setSetupProvider(
       ...(baseUrl ? { baseUrl } : {}),
       ...(existing?.apiKeyEnv ? { apiKeyEnv: existing.apiKeyEnv } : {})
     });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
 
     // Request plist refresh via a marker file + SIGTERM. A simpler
     // approach (setImmediate → setTimeout(200ms) → detached spawn)
@@ -219,12 +218,22 @@ export async function setSetupProvider(
     const awsRegion = typeof payload.awsRegion === "string" && payload.awsRegion.trim().length > 0
       ? payload.awsRegion.trim()
       : existing?.awsRegion;
+    // The region lands in the Converse request host, so reject a malformed one
+    // here (the self-tool can supply it) before it ever persists.
+    if (awsRegion !== undefined && !isValidAwsRegion(awsRegion)) {
+      return {
+        ok: false,
+        provider: providerHealth(config),
+        plistRefreshNeeded: false,
+        error: `awsRegion is invalid: '${awsRegion}' (must match /^[a-z0-9-]+$/, e.g. us-east-1).`
+      };
+    }
     config.provider = normalizeProvider({
       name: "bedrock",
       model: model ?? "",
       ...(awsRegion ? { awsRegion } : {})
     });
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
     return { ok: true, provider: providerHealth(config), plistRefreshNeeded: false };
   }
   // providerName === "codex"
@@ -325,7 +334,7 @@ export function removeSetupProvider(
     } else {
       config.provider = normalizeProvider({ name: "echo", model: "gini-echo-v0" });
     }
-    writeFileSync(configPath(config.instance), `${JSON.stringify(config, null, 2)}\n`);
+    writeRuntimeConfig(config);
     switched = true;
   }
 

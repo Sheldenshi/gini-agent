@@ -70,15 +70,19 @@ export function resolveProviderModality(provider: ProviderConfig): ProviderModal
       // document parts into the corresponding base64 source blocks.
       return { vision: true, nativeDocs: true };
     case "bedrock": {
-      // Bedrock Converse exposes image/document content blocks, but support is
-      // per-model. Enable for the families that accept them (Claude 3+, the
-      // multimodal Nova tiers, Mistral Pixtral, Llama 4, and the Llama 3.2
-      // vision variants); text-only ids (DeepSeek R1, Llama 3.3, Nova Micro)
-      // stay conservatively false so the vision path never sends a block the
-      // model rejects. Conservative default for unrecognized ids.
-      const multimodal =
+      // Bedrock Converse exposes image content blocks per-model; enable vision
+      // for the families that accept them (Claude 3+, the multimodal Nova tiers,
+      // Mistral Pixtral, Llama 4, the Llama 3.2 vision variants). Text-only ids
+      // (DeepSeek R1, Llama 3.3, Nova Micro) and unrecognized ids stay false so
+      // the vision path never sends a block the model rejects.
+      //
+      // nativeDocs is false regardless: the Converse translator (converseUserContent)
+      // does not emit `document` blocks, so document parts must flow through the
+      // runtime's extract-to-text fallback rather than being passed "natively"
+      // and silently dropped. (Native Converse document blocks are a follow-up.)
+      const visionFamily =
         /anthropic\.claude|amazon\.nova-(?:pro|lite|premier)|pixtral|llama4|llama3-2-(?:11b|90b)/i.test(model);
-      return multimodal ? { vision: true, nativeDocs: true } : { vision: false, nativeDocs: false };
+      return { vision: visionFamily, nativeDocs: false };
     }
     case "codex":
       // Verified empirically against the live ChatGPT-backend /responses

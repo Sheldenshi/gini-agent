@@ -11,6 +11,7 @@ import {
   generateVisionAnalysis,
   isAuthExpiredError,
   isProviderConfigured,
+  isValidAwsRegion,
   normalizeProvider,
   providerAuthFailureText,
   providerAuthNote,
@@ -4159,6 +4160,45 @@ describe("anthropic provider", () => {
       });
       expect(result.data).toEqual({ ok: true });
       expect(fetchStub.calls[0]!.url).toContain("/converse");
+    } finally {
+      fetchStub.restore();
+      restoreSk();
+      restoreAk();
+    }
+  });
+
+  test("bedrock: isValidAwsRegion accepts region tokens and rejects URL-injection", () => {
+    expect(isValidAwsRegion("us-east-1")).toBe(true);
+    expect(isValidAwsRegion("ap-southeast-2")).toBe(true);
+    expect(isValidAwsRegion("us-east-1/evil")).toBe(false);
+    expect(isValidAwsRegion("x.evil.com")).toBe(false);
+    expect(isValidAwsRegion("a@b")).toBe(false);
+    expect(isValidAwsRegion("")).toBe(false);
+  });
+
+  test("bedrock: normalizeProvider honors AWS_REGION when no explicit region is set", () => {
+    const restoreRegion = setEnv("AWS_REGION", "eu-west-1");
+    const restoreDef = setEnv("AWS_DEFAULT_REGION", undefined);
+    try {
+      const p = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0" });
+      expect(p.awsRegion).toBe("eu-west-1");
+      expect(p.baseUrl).toBe("https://bedrock-runtime.eu-west-1.amazonaws.com");
+    } finally {
+      restoreDef();
+      restoreRegion();
+    }
+  });
+
+  test("bedrock: a malformed awsRegion is rejected before any request is built", async () => {
+    const restoreAk = setEnv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE");
+    const restoreSk = setEnv("AWS_SECRET_ACCESS_KEY", "secret");
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "bedrock", model: "us.amazon.nova-pro-v1:0", awsRegion: "us-east-1/evil.example" });
+      await expect(
+        generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], [])
+      ).rejects.toThrow(/awsRegion is invalid/);
+      expect(fetchStub.calls.length).toBe(0);
     } finally {
       fetchStub.restore();
       restoreSk();

@@ -138,6 +138,11 @@ describe("provider CLI", () => {
     expect(persisted.provider.model).toBe("us.anthropic.claude-opus-4-8");
   });
 
+  test("set rejects an unsafe --api-key-env name (shell-injection guard)", async () => {
+    const ctx = makeCtx(["provider", "set", "anthropic", "--api-key-env", "FOO=x; rm -rf /"]);
+    await expect(provider(ctx)).rejects.toThrow(/--api-key-env must be a valid env var name/);
+  });
+
   test("set anthropic with no model falls back to the catalog default", async () => {
     await provider(makeCtx(["provider", "set", "anthropic"]));
     const cfgPath = join(process.env.GINI_STATE_ROOT!, "instances", "test-instance", "config.json");

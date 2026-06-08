@@ -6,7 +6,7 @@ import { loadInstructions, loadSoul, loadUserProfile } from "./runtime/identity-
 import { readState } from "./state";
 import { appendTrace } from "./state/trace";
 import { resolveProviderModality } from "./provider-capabilities";
-import { resolveAwsCredentials, resolveAwsRegion, signAwsRequest } from "./aws-sigv4";
+import { resolveAwsCredentials, signAwsRequest } from "./aws-sigv4";
 import type { CostRecord, ProviderCatalogItem, ProviderConfig, ProviderName, ProviderResult, RuntimeConfig, SystemNoteAuthError } from "./types";
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1";
@@ -1772,6 +1772,14 @@ interface ConverseTranslation {
   messages: Array<Record<string, unknown>>;
 }
 
+// An AWS region token is lowercase letters, digits, and hyphens (e.g.
+// us-east-1). Guard it because the bedrock region is interpolated into the
+// request host — and the model-callable set_provider can supply it — so a value
+// containing '/', '@', or '.' could repoint the request off-AWS or inject a path.
+export function isValidAwsRegion(region: string): boolean {
+  return /^[a-z0-9-]+$/.test(region);
+}
+
 // Signing region for a bedrock provider. normalizeProvider always sets
 // awsRegion (default us-east-1); the env/default fallbacks guard an
 // un-normalized config.
@@ -1784,6 +1792,12 @@ function bedrockRegion(provider: ProviderConfig): string {
 // it (':' -> %3A). signAwsRequest canonicalizes url.pathname verbatim and fetch
 // sends the same encoded path, so the SigV4 signature matches the wire request.
 function bedrockConverseUrl(region: string, modelId: string, stream: boolean): string {
+  // Defense in depth: setup rejects a malformed region before persisting, but
+  // also refuse to build a host from an unvalidated region here (it lands in the
+  // URL authority).
+  if (!isValidAwsRegion(region)) {
+    throw new Error(`bedrock awsRegion is invalid: '${region}' (must match /^[a-z0-9-]+$/).`);
+  }
   return `${bedrockRuntimeBaseUrl(region)}/model/${encodeURIComponent(modelId)}/${stream ? "converse-stream" : "converse"}`;
 }
 
@@ -2417,7 +2431,7 @@ function toolCallDedupKey(name: string, argsJson: string): string {
     // Leave as-is — non-JSON arguments are vanishingly rare and the raw
     // string is still a stable key for dedup.
   }
-  return `${name} ${normalized}`;
+  return `${name}\0${normalized}`;
 }
 
 // Synthesize a deterministic call id for a text-extracted call. Using a
@@ -2900,7 +2914,13 @@ export function normalizeProvider(provider: ProviderConfig): ProviderConfig {
     };
   }
   if (provider.name === "bedrock") {
-    const awsRegion = provider.awsRegion || DEFAULT_BEDROCK_REGION;
+    // Honor the documented resolution order (explicit region → AWS_REGION →
+    // AWS_DEFAULT_REGION → built-in default) here at the single source of truth.
+    // normalizeProvider always populates awsRegion, so resolving the env here is
+    // what makes a user's AWS_REGION actually take effect for both the Converse
+    // endpoint and the SigV4 scope.
+    const awsRegion =
+      provider.awsRegion || process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || DEFAULT_BEDROCK_REGION;
     return {
       name: "bedrock",
       model: provider.model || DEFAULT_BEDROCK_MODEL,

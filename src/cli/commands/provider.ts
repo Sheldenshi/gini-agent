@@ -3,6 +3,7 @@ import type { CliContext } from "../context";
 import { parseSubArgs, restAfter } from "../args";
 import { configPath, writeRuntimeConfig } from "../../paths";
 import { normalizeProvider, providerHealth } from "../../provider";
+import { isSafeEnvVarName } from "../../state/secrets-env";
 import { api } from "../api";
 import { print } from "../output";
 import { maybeRefreshAutostart } from "./autostart";
@@ -53,6 +54,11 @@ export async function provider(ctx: CliContext): Promise<void> {
 
     const baseUrl = flags["--base-url"];
     const apiKeyEnv = flags["--api-key-env"];
+    // The env-var name is written into the shell-sourced secrets.env, so reject
+    // anything that isn't a plain identifier before it can be persisted.
+    if (apiKeyEnv !== undefined && !isSafeEnvVarName(apiKeyEnv)) {
+      throw new Error(`--api-key-env must be a valid env var name (letters, digits, underscore; not starting with a digit). Got: ${apiKeyEnv}`);
+    }
     const extraBodyRaw = flags["--extra-body"];
     let extraBody: Record<string, unknown> | undefined;
     if (extraBodyRaw !== undefined) {

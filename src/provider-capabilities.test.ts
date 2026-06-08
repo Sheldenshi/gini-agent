@@ -84,4 +84,22 @@ describe("resolveProviderModality", () => {
     expect(resolveProviderModality({ name: "mystery" as ProviderConfig["name"], model: "x" }))
       .toEqual({ vision: false, nativeDocs: false });
   });
+
+  test("bedrock: vision is per-model, nativeDocs always false (Converse sends no document blocks)", () => {
+    // Multimodal families → vision true.
+    for (const m of [
+      "us.anthropic.claude-opus-4-8",
+      "us.amazon.nova-pro-v1:0",
+      "us.amazon.nova-lite-v1:0",
+      "us.mistral.pixtral-large-2502-v1:0",
+      "us.meta.llama4-maverick-17b-instruct-v1:0",
+      "us.meta.llama3-2-11b-instruct-v1:0"
+    ]) {
+      expect(resolveProviderModality(provider("bedrock", m))).toEqual({ vision: true, nativeDocs: false });
+    }
+    // Text-only / unrecognized ids → vision false. nativeDocs is false either way.
+    for (const m of ["us.deepseek.r1-v1:0", "us.meta.llama3-3-70b-instruct-v1:0", "us.amazon.nova-micro-v1:0", ""]) {
+      expect(resolveProviderModality(provider("bedrock", m))).toEqual({ vision: false, nativeDocs: false });
+    }
+  });
 });

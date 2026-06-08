@@ -288,8 +288,12 @@ async function setProvider(
   }
   const payload: Record<string, unknown> = { provider: targetProvider };
   if (typeof args.model === "string" && args.model.trim().length > 0) payload.model = args.model.trim();
-  if (typeof args.baseUrl === "string" && args.baseUrl.trim().length > 0) payload.baseUrl = args.baseUrl.trim();
+  if (typeof args.awsRegion === "string" && args.awsRegion.trim().length > 0) payload.awsRegion = args.awsRegion.trim();
   if (typeof args.apiKey === "string" && args.apiKey.trim().length > 0) payload.apiKey = args.apiKey.trim();
+  // Deliberately NOT forwarding a model-supplied `baseUrl`: an env-keyed
+  // provider's API key is sent to whatever baseUrl is configured, so letting a
+  // (possibly prompt-injected) model repoint the endpoint is a key-exfiltration
+  // vector. Custom endpoints stay a human-only action via the CLI / web setup.
   const result = await setSetupProvider(config, payload);
   appendTrace(config.instance, taskId, {
     type: "tool",
@@ -901,11 +905,11 @@ export const SELF_OPERATIONS: SelfOperation[] = [
       properties: {
         provider: {
           type: "string",
-          description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`baseUrl` are updated."
+          description: "Provider id (e.g. 'codex', 'openai', 'anthropic', 'bedrock', 'openrouter', 'deepseek', 'local', 'echo'). When omitted, the current provider is kept and only `model`/`awsRegion` are updated."
         },
-        model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5'). Defaults to the provider's first catalog model when omitted." },
-        baseUrl: { type: "string", description: "Override base URL. For OpenAI-compatible providers (openai, openrouter, deepseek, local) this is the chat-completions endpoint; for anthropic it is the Messages API endpoint (e.g. a Bedrock Mantle URL). Ignored for codex/echo." },
-        apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env." }
+        model: { type: "string", description: "Model identifier on the target provider (e.g. 'deepseek-v4-pro', 'gpt-5.5', or a Bedrock inference-profile id like 'us.amazon.nova-pro-v1:0'). Defaults to the provider's first catalog model when omitted." },
+        awsRegion: { type: "string", description: "AWS region for the 'bedrock' provider's Converse endpoint/signing (e.g. 'us-east-1'). Ignored by other providers." },
+        apiKey: { type: "string", description: "API key — only required when the env var for this provider isn't already set. Persisted to secrets.env and process.env. Not used by bedrock (AWS SigV4) or codex (OAuth)." }
       },
       required: []
     },
