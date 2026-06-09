@@ -14,7 +14,8 @@ import {
   clearEchoToolCallingResponses,
   getEchoToolCallingCalls,
   setEchoToolCallingResponse,
-  normalizeProvider
+  normalizeProvider,
+  type ToolCallingMessage
 } from "../provider";
 import { submitTask, decideApproval, resolveSetupRequest } from "../agent";
 import {
@@ -36,7 +37,15 @@ import { echoEmbed } from "../embeddings";
 import { resolveDefaultPriorContextTokenBudget } from "../provider-capabilities";
 import type { AgentIdentity, JobRecord, RuntimeConfig, RuntimeState, SkillRecord, Task, ToolsetRecord } from "../types";
 import { createSkillFromInput, setSkillStatus } from "../capabilities/skills";
-import { buildAgentIdentity, buildEnabledSkillsBlock, buildInactiveSkillsBlock, buildMcpServersBlock, buildSkillScriptsBlock } from "./chat-task";
+import {
+  buildAgentIdentity,
+  buildEnabledSkillsBlock,
+  buildInactiveSkillsBlock,
+  buildMcpServersBlock,
+  buildSkillScriptsBlock,
+  elideOldToolResultsToBudget,
+  nextNavWithoutAction
+} from "./chat-task";
 import type { EffectiveContext } from "./effective-context";
 
 function buildConfig(workspaceRoot: string, instance: string, opts: Partial<RuntimeConfig> = {}): RuntimeConfig {
@@ -731,7 +740,7 @@ describe("chat-task loop", () => {
     expect(finished.summary).toBe(
       "That sign-in path keeps refusing. Try connecting the service from settings, then ask again."
     );
-    expect(finished.currentStep).toBe("Completed (stopped: repeated identical tool calls)");
+    expect(finished.currentStep).toBe("Completed (stopped: tool loop made no progress)");
     expect(finished.error).toBeUndefined();
 
     // Exactly four model calls: three repeated tool turns + one tool-less
@@ -749,7 +758,71 @@ describe("chat-task loop", () => {
     const { readTrace } = await import("../state");
     const traces = readTrace(config.instance, task.id);
     const breaker = traces.find(
-      (t) => t.type === "warning" && /identical consecutive tool iterations/.test(t.message)
+      (t) => t.type === "warning" && /identical tool call\(s\) and result\(s\) \(loop-breaker\)/.test(t.message)
+    );
+    expect(breaker).toBeDefined();
+
+    rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+
+  // Action-only loop-breaker. A model that emits the IDENTICAL tool call
+  // (same name + arguments) but gets a DIFFERENT result every iteration —
+  // the real browser_navigate case, where each live-page snapshot jitters —
+  // slips past the exact-match guard, so the coarser action-only guard must
+  // catch it at MAX_SAME_ACTION_REPEATS (6) instead of running to the 90-cap.
+  // We drive get_current_time, whose result (a timestamp) differs each call.
+  test("stops at the action-only loop-breaker when results jitter but the action repeats", async () => {
+    const workspaceRoot = mkdtempSync(join(tmpdir(), "gini-chat-ws-"));
+    const config = buildConfig(workspaceRoot, "chat-task-action-loop-breaker");
+    const provider = normalizeProvider(config.provider);
+
+    // Six identical get_current_time calls: same name + args every turn, but
+    // the clock advances so each result differs. The exact-match guard never
+    // fires; the action-only guard trips on the sixth pass (runLength 6).
+    for (let i = 0; i < 6; i++) {
+      setEchoToolCallingResponse({
+        provider,
+        text: "",
+        toolCalls: [
+          {
+            id: `call_clock_${i}`,
+            type: "function",
+            function: { name: "get_current_time", arguments: JSON.stringify({}) }
+          }
+        ],
+        finishReason: "tool_calls"
+      });
+    }
+    // Tool-less summary turn — what the loop-breaker exit should consume.
+    setEchoToolCallingResponse({
+      provider,
+      text: "I kept checking the time without making progress on your request.",
+      toolCalls: [],
+      finishReason: "stop"
+    });
+
+    const task = await submitTask(config, "what time is it", { mode: "chat" });
+    const finished = await waitForTerminal(config, task.id, 10000);
+
+    expect(finished.status).toBe("completed");
+    expect(finished.summary).toBe(
+      "I kept checking the time without making progress on your request."
+    );
+    expect(finished.currentStep).toBe("Completed (stopped: tool loop made no progress)");
+    expect(finished.error).toBeUndefined();
+
+    // Exactly seven model calls: six repeated tool turns + one tool-less
+    // summary — proving the action-only guard stopped us at 6, not the 90-cap.
+    const calls = getEchoToolCallingCalls();
+    expect(calls.length).toBe(7);
+
+    // Trace records the action-only loop-breaker stop (not the exact-match one).
+    const { readTrace } = await import("../state");
+    const traces = readTrace(config.instance, task.id);
+    const breaker = traces.find(
+      (t) =>
+        t.type === "warning" &&
+        /repeating the same tool call\(s\) with identical arguments \(loop-breaker\)/.test(t.message)
     );
     expect(breaker).toBeDefined();
 
@@ -2767,6 +2840,117 @@ describe("chat-task loop", () => {
     expect(stateAfter.agents.some((a) => a.name === "E2E2")).toBe(true);
 
     rmSync(workspaceRoot, { recursive: true, force: true });
+  });
+});
+
+// Navigation-without-action counter (loop-breaker guard 3). Driving the real
+// browser tool through the loop would launch Chromium — heavy and flaky in a
+// unit test — so the counter step is a pure helper tested directly. The model's
+// emitted tool names per iteration are all the input it needs.
+describe("nextNavWithoutAction", () => {
+  test("navigation tools increment, page-actions reset, neutral tools are unchanged", () => {
+    // A run of navigations climbs.
+    expect(nextNavWithoutAction(0, ["browser_navigate"])).toBe(1);
+    expect(nextNavWithoutAction(1, ["browser_navigate"])).toBe(2);
+    expect(nextNavWithoutAction(2, ["browser_back"])).toBe(3);
+    // A page-action resets to zero.
+    expect(nextNavWithoutAction(7, ["browser_click"])).toBe(0);
+    expect(nextNavWithoutAction(3, ["browser_type"])).toBe(0);
+    // Neutral tools (snapshot, scroll, time, etc.) leave the count alone.
+    expect(nextNavWithoutAction(4, ["browser_snapshot"])).toBe(4);
+    expect(nextNavWithoutAction(4, ["get_current_time"])).toBe(4);
+    expect(nextNavWithoutAction(0, [])).toBe(0);
+  });
+
+  test("multiple tools in one iteration apply in order (last write wins on reset)", () => {
+    // navigate then click in the same turn nets a reset.
+    expect(nextNavWithoutAction(5, ["browser_navigate", "browser_click"])).toBe(0);
+    // click then navigate ends incremented from zero.
+    expect(nextNavWithoutAction(5, ["browser_click", "browser_navigate"])).toBe(1);
+    // two navigations in one turn climb by two.
+    expect(nextNavWithoutAction(2, ["browser_navigate", "browser_navigate"])).toBe(4);
+  });
+
+  test("oscillation between two URLs climbs to the threshold (the case guard 2 misses)", () => {
+    // Alternating navigate targets keep the ACTION signature flipping, so the
+    // action-only guard resets every turn — but the navigation counter climbs
+    // monotonically because no page-action ever intervenes.
+    let count = 0;
+    for (let i = 0; i < 8; i++) {
+      count = nextNavWithoutAction(count, ["browser_navigate"]);
+    }
+    expect(count).toBe(8);
+  });
+});
+
+// In-loop tool-result elision. A pure function over a messages array + budget,
+// so a direct unit test is deterministic — no need to force a real provider
+// overflow through the loop.
+describe("elideOldToolResultsToBudget", () => {
+  const ELISION_MARKER =
+    "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+
+  function bigToolResult(id: string, fill: string): ToolCallingMessage {
+    return { role: "tool", tool_call_id: id, content: fill.repeat(400) };
+  }
+
+  test("no-op when already within budget", () => {
+    const messages: ToolCallingMessage[] = [
+      { role: "user", content: "hi" },
+      { role: "tool", tool_call_id: "call_0", content: "small result" }
+    ];
+    const before = JSON.stringify(messages);
+    expect(elideOldToolResultsToBudget(messages, 1_000_000)).toBe(0);
+    expect(JSON.stringify(messages)).toBe(before);
+  });
+
+  test("shrinks oldest tool results first while protecting the most-recent six", () => {
+    // Ten oversized tool results plus interleaving assistant rows. With a tiny
+    // budget, the elidable set is everything but the most-recent six; the
+    // helper walks oldest→newest until it fits.
+    const messages: ToolCallingMessage[] = [{ role: "user", content: "go" }];
+    for (let i = 0; i < 10; i++) {
+      messages.push({ role: "assistant", content: null, tool_calls: [] });
+      messages.push(bigToolResult(`call_${i}`, `X${i}-`));
+    }
+
+    const elided = elideOldToolResultsToBudget(messages, 100);
+    expect(elided).toBeGreaterThan(0);
+
+    const toolMessages = messages.filter((m) => m.role === "tool");
+    // The four oldest tool results (10 total − 6 protected) are elided…
+    for (let i = 0; i < 4; i++) {
+      expect(toolMessages[i]!.content).toBe(ELISION_MARKER);
+      // role + tool_call_id stay intact so codex call/output pairing survives.
+      expect(toolMessages[i]!.tool_call_id).toBe(`call_${i}`);
+    }
+    // …and the most-recent six are never touched.
+    for (let i = 4; i < 10; i++) {
+      expect(toolMessages[i]!.content).not.toBe(ELISION_MARKER);
+    }
+  });
+
+  test("never drops a message — only shrinks content", () => {
+    const messages: ToolCallingMessage[] = [{ role: "user", content: "go" }];
+    for (let i = 0; i < 10; i++) {
+      messages.push(bigToolResult(`call_${i}`, `Y${i}-`));
+    }
+    const lengthBefore = messages.length;
+    elideOldToolResultsToBudget(messages, 50);
+    expect(messages.length).toBe(lengthBefore);
+  });
+
+  test("leaves small tool results and non-tool messages alone", () => {
+    // A short tool result (≤ 200 chars) isn't worth shrinking; assistant/user
+    // rows are never elidable regardless of size.
+    const messages: ToolCallingMessage[] = [
+      { role: "assistant", content: "Z".repeat(5000), tool_calls: [] },
+      { role: "tool", tool_call_id: "call_small", content: "tiny" },
+      bigToolResult("call_big", "W-")
+    ];
+    elideOldToolResultsToBudget(messages, 10);
+    expect(messages[0]!.content).not.toBe(ELISION_MARKER);
+    expect(messages[1]!.content).toBe("tiny");
   });
 });
 

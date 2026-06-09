@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mutateState, createChatSession, createMcpServerRecord, createTask, readState, upsertTask } from "../state";
 import type { RuntimeConfig } from "../types";
-import { dispatchToolCall, ToolDisplayError } from "./tool-dispatch";
+import { capToolResultText, dispatchToolCall, ToolDisplayError } from "./tool-dispatch";
 
 const ROOT = mkdtempSync(join(tmpdir(), "gini-mcp-dispatch-"));
 process.env.GINI_STATE_ROOT = ROOT;
@@ -1616,5 +1616,46 @@ describe("get_current_time dispatch", () => {
     if (res.kind !== "sync") throw new Error("expected sync");
     expect(res.result).toMatch(/UTC: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
     expect(res.result).toMatch(/\b20\d{2}\b/); // a real year, not a guess
+  });
+});
+
+describe("capToolResultText", () => {
+  // The cap is 40_000 chars internally; tests probe around that boundary
+  // without importing the constant (it's module-private by design).
+  const CAP = 40_000;
+
+  test("under the cap returns the identical string reference (no-op)", () => {
+    const small = "x".repeat(1_000);
+    const out = capToolResultText(small, "read_skill");
+    // Byte-identical AND same reference — proves zero allocation/work on
+    // the common path (the performance-safety guarantee).
+    expect(out).toBe(small);
+  });
+
+  test("exactly at the cap is unchanged", () => {
+    const atCap = "y".repeat(CAP);
+    const out = capToolResultText(atCap, "db_schema");
+    expect(out).toBe(atCap);
+    expect(out.length).toBe(CAP);
+  });
+
+  test("over the cap truncates middle-out within the cap, keeping head and tail", () => {
+    // Distinct head and tail sentinels with a unique middle so we can
+    // assert the middle is gone but both ends survive.
+    const head = "HEAD_SENTINEL_";
+    const tail = "_TAIL_SENTINEL";
+    const middle = "M".repeat(CAP * 2);
+    const big = `${head}${middle}${tail}`;
+    const out = capToolResultText(big, "vision_query");
+
+    expect(out.length).toBeLessThanOrEqual(CAP);
+    // Recovery marker present, names the tool, states an elided count.
+    expect(out).toContain("characters elided from vision_query");
+    expect(out).toContain("Re-run this tool with a narrower scope");
+    // Middle-out: both original ends preserved.
+    expect(out.startsWith(head)).toBe(true);
+    expect(out.endsWith(tail)).toBe(true);
+    // The middle was dropped: the full middle run can't fit under the cap.
+    expect(out).not.toContain(middle);
   });
 });

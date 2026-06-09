@@ -148,6 +148,15 @@ tool-less model call asking for a summary of what was learned and what
 remained undone, and completes the task with that text. A warning trace
 records the cap hit so the activity is auditable.
 
+The loop also stops early when it detects a stuck pattern — repeating the
+same tool call, or navigating pages without acting on them — and takes the
+same graceful summary exit, completing the task with a "stopped: tool loop
+made no progress" note rather than failing. Within a long turn the model
+context is kept bounded too: older tool-result content is trimmed before
+each model call and each individual tool result is size-capped, so a heavy
+tool loop cannot overflow the provider context window. See ADR
+chat-context-window.md and ADR agent-loop-tool-calling.md.
+
 To override the cap for a single instance, edit
 `~/.gini/instances/<instance>/config.json` and add an `agent` object:
 

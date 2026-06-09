@@ -14,8 +14,10 @@ Gini keeps complete chat history durable, but the model prompt receives a bounde
 - For thread replies, rows from the active thread and main chat are preferred before unrelated thread rows. Main-chat turns prefer main-chat rows before thread rows. Legacy rows without thread metadata are treated as main-chat context.
 - When any prior rows are omitted, the prompt gets a fixed `role:"user"` elision note telling the model that older history is still stored, that tool-call/result pairs are omitted together, and that it should use `recall_memory`, `search_history`, or `read_skill` again when needed.
 - `ChatMessageRecord` now carries optional `threadId` / `parentBlockId` for provider replay. ChatBlock remains the UI source of truth; the JSON fields exist so the packer can prioritize the active thread.
+- Turn-start packing bounds *prior* history, but a single long turn (e.g. a browser tool loop) keeps appending tool results within the turn. Before each provider call the loop also elides the *content* of older tool results down to the live budget (provider window minus the response reserve and tool schemas), replacing them with a short marker while keeping the message and its `tool_call_id` so call/result pairing stays valid. The most-recent results are protected so the model keeps fresh state to act on.
+- Every individual tool result is capped at dispatch (`MAX_TOOL_RESULT_CHARS`, truncated middle-out — head + marker + tail) so no single oversized result (a large file read, schema dump, or search) can dominate the window or evade the recent-result protection. Tools that already self-cap below the ceiling are unaffected.
 
-This is not summarizing compaction. It is bounded replay plus retrieval. Durable recall continues through automatic Hindsight retain, automatic per-turn recall, explicit `recall_memory`, and exact substring `search_history`.
+This is not summarizing compaction. It is bounded replay plus retrieval. Durable recall continues through automatic Hindsight retain, automatic per-turn recall, explicit `recall_memory`, and exact substring `search_history`. Summarize-and-continue compaction (standard in single-session agents like Codex CLI and Claude Code) is deliberately avoided: those agents must summarize because evicted context is otherwise lost, whereas Gini rebuilds a bounded projection from durable storage every turn and keeps the full history searchable, so a dropped span stays retrievable rather than gone.
 
 ## Context
 
@@ -46,6 +48,7 @@ Deleting or rewriting old chat would violate the product promise that the agent 
 ## Critical Files
 
 - `src/execution/context-window.ts` — prior-history packing, approximate token accounting, tool-call grouping, thread priority, elision note.
-- `src/execution/chat-task.ts` — rebuilds durable prior rows, applies the packer, and records retained/omitted context metrics in task trace.
-- `src/execution/chat.ts` and `src/execution/tool-dispatch.ts` — stamp thread metadata onto provider-replay chat rows.
+- `src/execution/chat-task.ts` — rebuilds durable prior rows, applies the packer, records retained/omitted context metrics in task trace, and within the loop elides older tool-result content to the live budget (`elideOldToolResultsToBudget`) before each provider call.
+- `src/execution/chat.ts` and `src/execution/tool-dispatch.ts` — stamp thread metadata onto provider-replay chat rows; `tool-dispatch.ts` also caps each tool result at dispatch (`capToolResultText`, `MAX_TOOL_RESULT_CHARS`).
+- `src/provider-capabilities.ts` — per-provider/model context-window sizes that set the budget (the codex backend is capped at its real effective window via `CODEX_BACKEND_CONTEXT_WINDOW_TOKENS`).
 - `src/types.ts` — `RuntimeConfig.agent.priorContextTokens` and provider-replay `ChatMessageRecord.threadId` / `parentBlockId`.

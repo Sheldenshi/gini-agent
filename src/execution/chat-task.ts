@@ -129,11 +129,89 @@ const MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS = 1_024;
 const MAX_INLINE_SKILL_ROWS = 40;
 const MAX_INLINE_SKILL_SCRIPT_ROWS = 40;
 
-// Loop-breaker: how many consecutive iterations of the IDENTICAL tool call(s)
-// yielding the IDENTICAL result(s) we tolerate before deciding the model is
-// stuck (e.g. a guard that keeps refusing the same cold call) and routing to
-// the graceful tool-less summary exit instead of grinding to MAX_LOOP_ITERATIONS.
+// Loop-breakers: three thresholds steer a stuck model to the graceful tool-less
+// summary exit instead of grinding to MAX_LOOP_ITERATIONS. Any one tripping
+// breaks the loop.
+//   1. Exact match (name+args+result): the IDENTICAL call yielding the
+//      IDENTICAL result — e.g. a guard that keeps refusing the same cold call.
+//   2. Action only (name+args, ignoring the result): the IDENTICAL call whose
+//      result jitters every iteration — e.g. repeated browser_navigate to the
+//      same URL, where each page snapshot differs (rotating banners, fresh
+//      element refs) so the exact-match guard never fires. Repeating the same
+//      action with no progress is itself the stuck signal, so this coarser
+//      threshold is higher.
+//   3. Navigation without action: navigate/reload pages many times with zero
+//      intervening page-action (click/type/etc). Catches oscillation between
+//      a few URLs (action signature flips so guard 2 resets) and "navigate,
+//      never interact" — both have zero page-actions.
 const MAX_IDENTICAL_TOOL_REPEATS = 3;
+const MAX_SAME_ACTION_REPEATS = 6;
+const MAX_NAVIGATION_WITHOUT_ACTION = 8;
+// Navigation advances/reloads a page; a page-action commits an interaction.
+// Everything else (snapshot, scroll, hover, console, vision, wait_for, tabs,
+// connect, close) is neutral — it neither increments nor resets the counter.
+const NAVIGATION_TOOLS = new Set(["browser_navigate", "browser_back"]);
+const PAGE_ACTION_TOOLS = new Set([
+  "browser_click",
+  "browser_type",
+  "browser_press",
+  "browser_select_option",
+  "browser_upload_file",
+  "browser_fill_secrets",
+  "browser_drag"
+]);
+
+// Protect the most-recent tool results from in-loop content elision: the model
+// needs fresh page state to act on. Older results are shrunk (not dropped) once
+// `workingMessages` would exceed the live context budget.
+const KEEP_RECENT_TOOL_RESULTS = 6;
+const ELIDED_TOOL_RESULT_MARKER =
+  "[Earlier tool result elided to fit the context window. Re-run the tool if you still need its output.]";
+
+// Pure step for the navigation-without-action counter. Given the prior count
+// and the tool names emitted this iteration (in order), returns the next count:
+// a navigation tool increments, a page-action resets to 0, anything neutral
+// leaves it unchanged. Exported for direct unit testing.
+export function nextNavWithoutAction(prev: number, toolNames: string[]): number {
+  let count = prev;
+  for (const name of toolNames) {
+    if (NAVIGATION_TOOLS.has(name)) count += 1;
+    else if (PAGE_ACTION_TOOLS.has(name)) count = 0;
+  }
+  return count;
+}
+
+// Shrink the CONTENT of older `role:"tool"` messages until the estimated token
+// count fits `budget`. Never drops a message (that would orphan a codex
+// function_call/function_call_output pair); only replaces oversized string
+// content with a short marker, preserving role + tool_call_id. The most-recent
+// KEEP_RECENT_TOOL_RESULTS tool results are protected. Mutates `messages` in
+// place and returns the number of messages elided. Exported for unit testing.
+export function elideOldToolResultsToBudget(messages: ToolCallingMessage[], budget: number): number {
+  if (estimateToolCallingMessagesTokens(messages) <= budget) return 0;
+  // Indices of elidable tool results: string content, not already elided,
+  // longer than a small floor (tiny results aren't worth shrinking).
+  const elidable = messages
+    .map((m, i) => ({ m, i }))
+    .filter(
+      ({ m }) =>
+        m.role === "tool" &&
+        typeof m.content === "string" &&
+        m.content !== ELIDED_TOOL_RESULT_MARKER &&
+        m.content.length > 200
+    )
+    .map(({ i }) => i);
+  // Protect the most-recent KEEP_RECENT_TOOL_RESULTS by trimming them off the
+  // tail; walk the rest oldest→newest, shrinking until we fit.
+  const candidates = elidable.slice(0, Math.max(0, elidable.length - KEEP_RECENT_TOOL_RESULTS));
+  let elided = 0;
+  for (const i of candidates) {
+    messages[i]!.content = ELIDED_TOOL_RESULT_MARKER;
+    elided += 1;
+    if (estimateToolCallingMessagesTokens(messages) <= budget) break;
+  }
+  return elided;
+}
 
 // Resolve the effective iteration cap from config, falling back to the
 // default when the user hasn't set one or set an invalid value. Validation
@@ -1396,6 +1474,19 @@ async function runLoop(
     toolsHash = hashCatalog(tools);
   };
 
+  // In-loop context budget. `packPriorContext` trims ONCE at turn start; inside
+  // the loop every tool result accumulates in `workingMessages` with no further
+  // trimming, so a long tool loop (e.g. browser navigation) can overflow the
+  // window even at 275k. Before each provider call we elide the CONTENT of older
+  // tool results down to this budget. Computed once per runLoop entry.
+  const contextWindowTokens = resolveProviderContextWindowTokens(effective.provider);
+  const responseReserveTokens = Math.max(
+    MIN_PRIOR_CONTEXT_RESPONSE_RESERVE_TOKENS,
+    Math.floor(contextWindowTokens * PRIOR_CONTEXT_RESPONSE_RESERVE_FRACTION)
+  );
+  // One elision warning trace per turn (not per iteration).
+  let elisionTraced = false;
+
   const { cap, warnReason } = resolveIterationCap(config);
   if (warnReason) {
     // Only emit the invalid-config warning once per task. resumeChatTask
@@ -1514,12 +1605,18 @@ async function runLoop(
   // to finalizeTurnRoute, which runs after the per-iteration assignment.
   let isFirstModelCall = false;
 
-  // Loop-breaker bookkeeping: detect the model repeating the identical tool
-  // call(s) and getting the identical result(s) several iterations in a row.
-  // `brokeOnRepeat` steers the post-loop summary exit toward the right wording.
+  // Loop-breaker bookkeeping: run-length counters detect a stuck model.
+  // The exact-match counter tracks the identical tool call(s) AND result(s);
+  // the action-only counter tracks the identical call(s) regardless of result
+  // (to catch jittery-result loops the exact-match guard would miss); the
+  // navigation counter tracks page navigations with no intervening page-action.
+  // `loopStallReason` steers the post-loop summary exit toward the right wording.
   let lastIterationSignature: string | undefined;
   let identicalRunLength = 0;
-  let brokeOnRepeat = false;
+  let lastActionSignature: string | undefined;
+  let sameActionRunLength = 0;
+  let navWithoutAction = 0;
+  let loopStallReason: "repeat" | "navigation" | undefined;
 
   while (iterations < cap) {
     iterations += 1;
@@ -1672,6 +1769,22 @@ async function runLoop(
     // synthesize from currentStep today. Subsequent per-tool phases
     // ("Working: <toolName>") emit per dispatch inside the loop below.
     emitPhase(emitCtx, "Thinking");
+
+    // Trim accumulated tool-result content to fit the live context window before
+    // the call. `providerTools` is recomputed by recompute(), so re-estimate the
+    // schema cost each iteration. Elision mutates `workingMessages` in place, so
+    // an old result stays elided once shrunk — bounding growth across the loop.
+    const toolSchemaTokens = estimateTextTokens(JSON.stringify(providerTools));
+    const liveMessageBudget = Math.max(0, contextWindowTokens - responseReserveTokens - toolSchemaTokens);
+    const elided = elideOldToolResultsToBudget(workingMessages, liveMessageBudget);
+    if (elided > 0 && !elisionTraced) {
+      elisionTraced = true;
+      appendTrace(config.instance, taskId, {
+        type: "warning",
+        message: `Elided ${elided} earlier tool result(s) to fit the context window.`,
+        data: { iterations, elided, liveMessageBudget }
+      });
+    }
 
     let result: Awaited<ReturnType<typeof generateToolCallingResponse>>;
     try {
@@ -2237,10 +2350,14 @@ async function runLoop(
     }
 
     // Loop-breaker: this iteration is all-sync and will loop again. Signature
-    // the tool call(s) by tool_call_id (don't assume index alignment) plus
-    // their results, and bail to the graceful summary exit if the model has
-    // repeated the IDENTICAL call(s) with the IDENTICAL result(s) too many
-    // times in a row — a guard or tool that keeps refusing the same input.
+    // the tool call(s) by tool_call_id (don't assume index alignment) and bail
+    // to the graceful summary exit if the model is stuck. Three guards: the
+    // exact-match guard (name+args+result) catches a tool that keeps refusing
+    // the same input; the action-only guard (name+args, ignoring the result)
+    // catches a call whose result jitters every iteration (e.g. browser_navigate
+    // re-fetching a live page) so the exact-match guard never fires; the
+    // navigation guard catches repeated page navigations with no intervening
+    // page-action (covers oscillation between URLs the action-only guard misses).
     const resultById = new Map(toolResultMessages.map((m) => [m.tool_call_id, m.content]));
     const iterationSignature = JSON.stringify(
       result.toolCalls.map((c) => [c.function.name, c.function.arguments, resultById.get(c.id) ?? null])
@@ -2251,12 +2368,39 @@ async function runLoop(
       identicalRunLength = 1;
       lastIterationSignature = iterationSignature;
     }
-    if (identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS) {
-      brokeOnRepeat = true;
+    const actionSignature = JSON.stringify(
+      result.toolCalls.map((c) => [c.function.name, c.function.arguments])
+    );
+    if (actionSignature === lastActionSignature) {
+      sameActionRunLength += 1;
+    } else {
+      sameActionRunLength = 1;
+      lastActionSignature = actionSignature;
+    }
+    navWithoutAction = nextNavWithoutAction(
+      navWithoutAction,
+      result.toolCalls.map((c) => c.function.name)
+    );
+    const trippedRepeat =
+      identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS || sameActionRunLength >= MAX_SAME_ACTION_REPEATS;
+    const trippedNavigation = navWithoutAction >= MAX_NAVIGATION_WITHOUT_ACTION;
+    if (trippedRepeat || trippedNavigation) {
+      loopStallReason = trippedRepeat ? "repeat" : "navigation";
+      const tripped = trippedRepeat
+        ? identicalRunLength >= MAX_IDENTICAL_TOOL_REPEATS
+          ? `${identicalRunLength} iterations with the identical tool call(s) and result(s)`
+          : `${sameActionRunLength} iterations repeating the same tool call(s) with identical arguments`
+        : `${navWithoutAction} navigations with no intervening page-action`;
       appendTrace(config.instance, taskId, {
         type: "warning",
-        message: `Stopped after ${identicalRunLength} identical consecutive tool iterations (loop-breaker).`,
-        data: { iterations, toolNames: result.toolCalls.map((c) => c.function.name) }
+        message: `Stopped after ${tripped} (loop-breaker).`,
+        data: {
+          iterations,
+          identicalRunLength,
+          sameActionRunLength,
+          navWithoutAction,
+          toolNames: result.toolCalls.map((c) => c.function.name)
+        }
       });
       break;
     }
@@ -2264,22 +2408,30 @@ async function runLoop(
     // All sync — keep looping.
   }
 
-  // Loop ended without a final answer — either the iteration cap or the
-  // identical-repeat loop-breaker. Instead of failing outright, give the model
-  // one last turn with NO tools available and an explicit instruction to write
-  // a final answer summarizing what it learned and what it couldn't finish.
+  // Loop ended without a final answer — either the iteration cap or one of the
+  // loop-breaker guards. Instead of failing outright, give the model one last
+  // turn with NO tools available and an explicit instruction to write a final
+  // answer summarizing what it learned and what it couldn't finish.
   // The summary call's cost is recorded on the task just like any other
   // model call. If the summary call itself fails (provider error, etc.),
   // fall back to the legacy failure path so we don't lose the user's work.
-  const summaryInstruction = brokeOnRepeat
-    ? `You repeated the same tool call(s) with identical arguments and received ` +
-      `the identical result each time, which means that path is blocked. No ` +
-      `further tools are available now. Write a final answer for the user: ` +
-      `explain what you were able to determine, what is blocking you (e.g. a ` +
-      `sign-in or tool that keeps refusing), and what they could do next.`
-    : `You have reached the maximum number of tool-calling iterations (${cap}). ` +
-      `No further tools are available. Please write a final answer summarizing ` +
-      `what you have learned so far and what you were unable to complete.`;
+  const stoppedOnStall = loopStallReason !== undefined;
+  const summaryInstruction =
+    loopStallReason === "repeat"
+      ? `You repeated the same tool call(s) with identical arguments several ` +
+        `times without making progress, which means that path is blocked. No ` +
+        `further tools are available now. Write a final answer for the user: ` +
+        `explain what you were able to determine, what is blocking you (e.g. a ` +
+        `sign-in or tool that keeps refusing), and what they could do next.`
+      : loopStallReason === "navigation"
+        ? `You navigated or reloaded pages several times without clicking, ` +
+          `typing, or otherwise acting on them — that usually means a sign-in, ` +
+          `address/zip, or page state is blocking you. No further tools are ` +
+          `available now. Write a final answer: what you determined, what's ` +
+          `blocking you, and what the user could do next.`
+        : `You have reached the maximum number of tool-calling iterations (${cap}). ` +
+          `No further tools are available. Please write a final answer summarizing ` +
+          `what you have learned so far and what you were unable to complete.`;
   const summaryMessages: ToolCallingMessage[] = [
     ...workingMessages,
     { role: "user", content: summaryInstruction }
@@ -2311,8 +2463,8 @@ async function runLoop(
       // Respect a prior terminal status.
       if (isTerminalTaskStatus(item.status)) return item;
       item.status = "completed";
-      item.currentStep = brokeOnRepeat
-        ? "Completed (stopped: repeated identical tool calls)"
+      item.currentStep = stoppedOnStall
+        ? "Completed (stopped: tool loop made no progress)"
         : `Completed (iteration cap reached: ${cap})`;
       item.summary = finalText;
       item.cost = accumulatedCost;
@@ -2331,16 +2483,16 @@ async function runLoop(
       if (block?.id) finalizeAssistantText(emitCtx, block.id, finalText);
       emitSystemNote(
         emitCtx,
-        brokeOnRepeat
-          ? "Stopped after repeated identical tool calls. Returning best-effort summary."
+        stoppedOnStall
+          ? "Stopped: the tool loop made no progress. Returning best-effort summary."
           : `Iteration cap reached (${cap}). Returning best-effort summary.`
       );
       emitPhase(emitCtx, "Completed");
     }
     appendTrace(config.instance, taskId, {
       type: "warning",
-      message: brokeOnRepeat
-        ? "Loop-breaker stopped repeated identical tool calls; produced summary in tool-less final turn."
+      message: stoppedOnStall
+        ? "Loop-breaker stopped a no-progress tool loop; produced summary in tool-less final turn."
         : `Iteration cap (${cap}) reached; produced summary in tool-less final turn.`,
       data: { iterations }
     });
@@ -2385,8 +2537,8 @@ async function runLoop(
       item.currentStep = "Failed";
       item.error = authProvider
         ? message
-        : brokeOnRepeat
-          ? "Chat task stopped after repeated identical tool calls."
+        : stoppedOnStall
+          ? "Chat task stopped: tool loop made no progress."
           : `Chat task exceeded ${cap} model iterations.`;
       if (authProvider) item.authErrorProvider = authProvider;
       // Preserve the accumulated cost from the loop so the audit row
@@ -2407,16 +2559,16 @@ async function runLoop(
     } else {
       emitSystemNote(
         emitCtx,
-        brokeOnRepeat
-          ? `Stopped after repeated identical tool calls and summary call failed: ${message}`
+        stoppedOnStall
+          ? `Stopped: the tool loop made no progress and the summary call failed: ${message}`
           : `Iteration cap reached (${cap}) and summary call failed: ${message}`
       );
     }
     emitPhase(emitCtx, "Failed");
     appendTrace(config.instance, taskId, {
       type: "error",
-      message: brokeOnRepeat
-        ? "Chat task stopped on repeated identical tool calls and tool-less summary call failed"
+      message: stoppedOnStall
+        ? "Chat task stopped on a no-progress tool loop and tool-less summary call failed"
         : "Chat task hit iteration cap and tool-less summary call failed",
       data: { iterations, summaryError: message }
     });

@@ -69,11 +69,23 @@ through the same loop. So the loop comes first.
   instance via `config.agent.maxIterations`, counted across pauses).
   Hitting it gives the model one final tool-less turn to summarize what it
   learned and what it could not finish, then marks the task `completed`.
-- A tighter loop-breaker trips earlier when the model repeats the identical
-  tool call(s) and gets the identical result `MAX_IDENTICAL_TOOL_REPEATS`
-  (3) times in a row: it routes into that same final-summary exit, so a stuck
-  retry loop (e.g. a tool that keeps refusing) ends with a useful answer
-  instead of spinning to the cap.
+- Tighter loop-breakers trip earlier when the model is stuck, routing into
+  that same final-summary exit so a stuck loop ends with a useful answer
+  instead of spinning to the cap. Three guards fire: repeating the identical
+  tool call(s) with the identical result `MAX_IDENTICAL_TOOL_REPEATS` (3)
+  times (a tool that keeps refusing the same input); repeating the identical
+  call(s) by name+arguments `MAX_SAME_ACTION_REPEATS` (6) times regardless of
+  result (a jittery result — e.g. a live page snapshot that differs on every
+  fetch — defeats the exact-match guard); and `MAX_NAVIGATION_WITHOUT_ACTION`
+  (8) page navigations with no intervening page-action (click/type/etc.),
+  which catches reload and URL-oscillation loops that never act on the page.
+- The model-facing window is bounded both across turns (prior history packed
+  at turn start) and within a turn: before each provider call the loop elides
+  the content of older tool results, and every tool result is size-capped at
+  dispatch. See ADR chat-context-window.md. Summarization-based compaction is
+  deliberately not used — durable history plus retrieval (`search_history` /
+  `recall_memory`) already covers what compaction provides for single-session
+  agents that lack a durable searchable store.
 - All tool dispatches still write `audit` and `trace` records — same
   shape as the legacy path, with `(chat-task)` suffixes in trace
   messages so the timeline is unambiguous.
@@ -135,11 +147,6 @@ being re-read every turn.
   catalog and map it through this same loop.
 - Codex tool calling (responses API supports it; we'd need a separate
   parser).
-- Transcript compaction. The replayed transcript (see "Durable
-  tool-calling transcript" below) grows unbounded, the same way prior
-  text history already does. A future ADR can introduce
-  summarization-based compaction (e.g. re-attach the most-recent skill
-  body after a summary boundary) to bound the model-facing window.
 
 ## Consequences For Coding Agents
 
