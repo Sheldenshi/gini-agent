@@ -108,9 +108,9 @@ export async function provider(ctx: CliContext): Promise<void> {
     // --extra-body — but it DOES honor --base-url (the codex backend URL)
     // and --api-key-env (codexAuthPath reads process.env[apiKeyEnv] to
     // locate the auth.json file). bedrock derives its endpoint from --aws-region
-    // and signs with AWS creds, so --base-url / --api-key-env don't apply — but
-    // it DOES honor --extra-body (e.g. extraBody.max_tokens caps the Converse
-    // inferenceConfig). Warn precisely.
+    // and signs with AWS creds, so --base-url / --api-key-env don't apply — and
+    // it honors only extraBody.max_tokens (as the Converse inferenceConfig
+    // budget); other --extra-body keys are dropped. Warn precisely.
     if (name === "echo") {
       const ignored: string[] = [];
       if (baseUrl !== undefined) ignored.push("--base-url");
