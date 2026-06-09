@@ -128,14 +128,18 @@ export function UpdateGateProvider({ children }: { children: ReactNode }) {
       writePersistedGate({ phase: "updating", targetSha: result.afterSha, beforeSha: beforeSha ?? undefined });
     },
     onError: (error: Error) => {
-      // A dropped connection (fetch rejects with TypeError) most likely means
-      // the gateway applied the update and restarted before the response could
-      // flush. Keep the blur up and let the new-revision detector / stall timer
-      // resolve it rather than handing the app back mid-update. A structured
-      // gateway error is a genuine pre-flight failure → release and surface it.
-      if (error instanceof TypeError) return;
-      reset();
-      toast.error(error.message);
+      // Release the blur only on a structured gateway error — one that carries
+      // an HTTP status, meaning the gateway responded non-2xx (a genuine
+      // pre-flight failure). Any other rejection (fetch failing, or the body
+      // parse throwing on a truncated response) means the gateway most likely
+      // applied the update and restarted before the response flushed: keep the
+      // blur and let the new-revision detector / stall timer resolve it rather
+      // than handing the app back mid-update.
+      const status = (error as Error & { status?: number }).status;
+      if (typeof status === "number") {
+        reset();
+        toast.error(error.message);
+      }
     }
   });
   const { mutate, isPending } = update;
