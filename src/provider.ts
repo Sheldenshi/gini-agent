@@ -1478,7 +1478,9 @@ function readAnthropicKey(provider: ProviderConfig): string {
   const envName = provider.apiKeyEnv ?? "ANTHROPIC_API_KEY";
   const apiKey = process.env[envName];
   if (!apiKey) {
-    throw new Error(`Anthropic provider is configured but ${envName} is not set.`);
+    // Typed so the chat-task classifier routes a key unset mid-turn to the
+    // provider reauth CTA instead of a generic failure (mirrors bedrock).
+    throw new ProviderAuthError("anthropic", `Anthropic provider is configured but ${envName} is not set.`);
   }
   return apiKey;
 }
@@ -3853,20 +3855,26 @@ export function azureNeedsHttps(name: string, baseUrl: string | undefined): bool
 // The anthropic provider sends ANTHROPIC_API_KEY in an x-api-key header on every
 // request, so a plaintext http custom baseUrl would leak the key in transit.
 // Refuse a non-https custom endpoint — EXCEPT an explicit loopback host (a local
-// http proxy is a deliberate, low-risk dev setup). An empty baseUrl uses the
-// https first-party default, so it's left alone.
+// http proxy is a deliberate, low-risk dev setup). Parse the URL rather than
+// prefix-matching so a hostless value like a bare "https://" (which would build
+// an unreachable "https:///v1/messages") is refused too. An empty baseUrl uses
+// the https first-party default, so it's left alone.
 export function anthropicNeedsHttps(name: string, baseUrl: string | undefined): boolean {
   if (name !== "anthropic") return false;
   const value = (baseUrl ?? "").trim();
   if (value.length === 0) return false;
-  if (value.toLowerCase().startsWith("https://")) return false;
+  let host: string;
   try {
     // URL.hostname returns an IPv6 literal in brackets, e.g. "[::1]".
-    const host = new URL(value).hostname.toLowerCase();
-    if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") return false;
+    const parsed = new URL(value);
+    host = parsed.hostname.toLowerCase();
+    if (host.length === 0) return true; // e.g. bare "https://" — no host to reach
+    if (parsed.protocol === "https:") return false; // https with a real host is fine
   } catch {
     return true; // unparseable → not a safe https endpoint
   }
+  // Non-https with a real host: allow only explicit loopback (a local dev proxy).
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]") return false;
   return true; // non-https, non-loopback → refuse (key would go in cleartext)
 }
 

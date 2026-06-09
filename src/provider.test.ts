@@ -3683,9 +3683,32 @@ describe("anthropic provider", () => {
     // Plaintext non-loopback and unparseable endpoints are refused.
     expect(anthropicNeedsHttps("anthropic", "http://proxy.example/v1")).toBe(true);
     expect(anthropicNeedsHttps("anthropic", "not a url")).toBe(true);
+    // A bare, hostless "https://" is refused (it throws on parse) rather than
+    // passing a naive prefix check and building an unreachable endpoint.
+    expect(anthropicNeedsHttps("anthropic", "https://")).toBe(true);
     // No-op for every other provider.
     expect(anthropicNeedsHttps("openai", "http://proxy.example/v1")).toBe(false);
     expect(anthropicNeedsHttps("bedrock", "http://proxy.example/v1")).toBe(false);
+  });
+
+  test("anthropic: a missing API key surfaces as a typed ProviderAuthError, not a generic failure", async () => {
+    const restoreKey = setEnv("ANTHROPIC_API_KEY", undefined);
+    const fetchStub = installFetch(() => anthropicJson({}));
+    try {
+      const provider = normalizeProvider({ name: "anthropic", model: "claude-opus-4-8" });
+      const err = await generateToolCallingResponse(config(provider), [{ role: "user", content: "hi" }], []).catch(
+        (e) => e
+      );
+      expect(err).toBeInstanceOf(ProviderAuthError);
+      expect((err as ProviderAuthError).provider).toBe("anthropic");
+      expect((err as Error).message).toMatch(/ANTHROPIC_API_KEY is not set/);
+      // No request is attempted without a key.
+      expect(fetchStub.calls.length).toBe(0);
+      expect(providerReauth("anthropic")).toEqual({ kind: "settings", url: "/settings" });
+    } finally {
+      fetchStub.restore();
+      restoreKey();
+    }
   });
 
   test("normalizeProvider applies defaults and preserves overrides", () => {
